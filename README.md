@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="160" alt="Silkworm logo"></p>
+
 # Silkworm 🪱
 
 *Spins its own threads.*
