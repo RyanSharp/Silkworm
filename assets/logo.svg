@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="0.35" cy="0.25" r="1.1">
+      <stop offset="0" stop-color="#5C2160"/>
+      <stop offset="1" stop-color="#3D1140"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ground -->
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+
+  <!-- silk thread (drawn first so the worm sits on top of it) -->
+  <path d="M414,254 C 442,238 452,210 438,186 C 420,155 350,128 268,140 C 186,152 108,196 74,244 C 52,276 62,310 104,314"
+        fill="none" stroke="#ECB22E" stroke-width="11"
+        stroke-linecap="round" stroke-dasharray="24 18"/>
+
+  <!-- worm, tail to head -->
+  <circle cx="118" cy="318" r="30" fill="#EFE2CC"/>
+  <circle cx="170" cy="296" r="38" fill="#F6EEDF"/>
+  <circle cx="228" cy="282" r="45" fill="#EFE2CC"/>
+  <circle cx="290" cy="276" r="51" fill="#F6EEDF"/>
+  <circle cx="360" cy="286" r="57" fill="#F6EEDF"/>
+
+  <!-- face -->
+  <circle cx="346" cy="270" r="7.5" fill="#331233"/>
+  <circle cx="382" cy="272" r="7.5" fill="#331233"/>
+  <circle cx="348.5" cy="267.5" r="2.5" fill="#FFFFFF"/>
+  <circle cx="384.5" cy="269.5" r="2.5" fill="#FFFFFF"/>
+  <path d="M352,296 q12,10 26,2" fill="none" stroke="#331233" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="330" cy="294" r="7" fill="#E8A4B8" opacity="0.55"/>
+  <circle cx="399" cy="298" r="7" fill="#E8A4B8" opacity="0.55"/>
+</svg>
