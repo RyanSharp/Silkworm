@@ -10,7 +10,6 @@ import json
 import logging
 import threading
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("silkworm.approvals")
 
@@ -34,51 +33,19 @@ def describe_tool(name: str, tool_input: dict) -> str:
 
 
 class ApprovalManager:
-    def __init__(self, client, *, port: int, timeout: float,
+    def __init__(self, client, *, timeout: float,
                  auto_allow: set[str], allowed_users: set[str],
                  resolve_thread):
         """resolve_thread(session_id) -> (channel, thread_ts) | None"""
         self.client = client
-        self.port = port
         self.timeout = timeout
         self.auto_allow = auto_allow
         self.allowed_users = allowed_users
         self.resolve_thread = resolve_thread
         self._pending: dict[str, dict] = {}
         self._lock = threading.Lock()
-        self._server: ThreadingHTTPServer | None = None
 
-    # -- HTTP side (called by approval_hook.py) -----------------------------
-
-    def start(self) -> None:
-        manager = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):  # quiet
-                pass
-
-            def do_POST(self):
-                if self.path != "/approve":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                length = int(self.headers.get("Content-Length", 0))
-                try:
-                    payload = json.loads(self.rfile.read(length))
-                except Exception:
-                    payload = {}
-                answer = manager.handle_request(payload)
-                body = json.dumps(answer).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        threading.Thread(target=self._server.serve_forever, daemon=True,
-                         name="approval-http").start()
-        log.info("approval server listening on 127.0.0.1:%d", self.port)
+    # -- HTTP side: registered as the /approve route on the shared LocalServer
 
     def handle_request(self, payload: dict) -> dict:
         tool_name = payload.get("tool_name", "unknown")

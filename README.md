@@ -123,7 +123,19 @@ Every thread is a normal Claude Code session, so it works both ways: send
 `!terminal` in a thread and Silkworm replies with the exact
 `cd … && claude --resume <session-id>` to continue it interactively. Turns you
 take in the terminal become part of the thread's history — the next Slack
-message picks up right where you left off. (Don't run both at the same moment.)
+message picks up right where you left off.
+
+`!terminal` also *checks the thread out*: while checked out, Slack messages are
+held with a warning instead of running (an interactive session loads history
+once at launch, so Slack turns would be invisible to it). The checkout releases
+itself automatically — run `python3 install_hooks.py` once to add
+SessionStart/SessionEnd hooks to your `~/.claude/settings.json`, and the bot
+gets notified when your terminal session opens and exits, reclaiming the thread
+(with a note in Slack) the moment you quit. Escape hatches: `!back` reclaims
+manually, `!takeover` force-closes a live terminal session (SIGTERM — completed
+turns are already saved; only an in-flight generation is lost). Set
+`HANDOFF_SLACK_WINS=1` to skip the warning entirely and have any Slack message
+auto-close the terminal and take over.
 
 ## Session visualizer
 

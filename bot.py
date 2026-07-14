@@ -13,6 +13,8 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +29,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, run_turn
+from localserver import LocalServer
 from store import SessionStore
 
 load_dotenv()
@@ -77,6 +80,11 @@ CHANNEL_DIRS = _parse_channel_dirs(os.environ.get("CLAUDE_CHANNEL_DIRS", ""))
 
 SESSION_MAX_AGE_DAYS = float(os.environ.get("SESSION_MAX_AGE_DAYS", "30"))
 SLACK_MSG_LIMIT = 3800
+
+# When a thread is checked out to the terminal (!terminal), a Slack message
+# normally gets held with a warning. With this on, Slack wins: the terminal
+# session is force-closed and the message runs.
+HANDOFF_SLACK_WINS = os.environ.get("HANDOFF_SLACK_WINS", "0") not in ("0", "false", "no", "")
 
 OUTBOX_ROOT = BASE_DIR / "outbox"
 HOOK_PATH = BASE_DIR / "approval_hook.py"
@@ -207,10 +215,85 @@ def permission_args() -> list[str]:
 
 def claude_env() -> dict:
     env = dict(os.environ)
+    env["SILKWORM_BOT"] = "1"  # lets the global session_hook ignore our own runs
     if CLAUDE_APPROVAL_MODE == "slack":
         env["SLACK_BOT_APPROVAL_PORT"] = str(APPROVAL_PORT)
         env["SLACK_BOT_APPROVAL_TIMEOUT"] = str(APPROVAL_TIMEOUT)
     return env
+
+
+# --- Terminal handoff ---------------------------------------------------------
+
+def kill_terminal(session_id: str) -> bool:
+    """Force-close an interactive `claude --resume <session_id>` process.
+
+    Completed turns are already persisted in the session log, so this only
+    loses an in-flight generation. Returns True if a process was killed.
+    """
+    if not session_id:
+        return False
+    out = subprocess.run(["pgrep", "-f", f"claude.*{session_id}"],
+                         capture_output=True, text=True)
+    pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if not any(_alive(p) for p in pids):
+            return True
+        time.sleep(0.2)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return True
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def handle_session_event(payload: dict) -> dict:
+    """Route for /session-event, POSTed by the global session_hook."""
+    sid = payload.get("session_id")
+    event = payload.get("hook_event_name")
+    if not sid or event not in ("SessionStart", "SessionEnd"):
+        return {}
+    key = store.find_by_session(sid)
+    if not key:
+        return {}
+    entry = store.get(key) or {}
+    if not entry.get("checked_out"):
+        return {}
+    channel, thread_ts = key.split(":", 1)
+    try:
+        if event == "SessionStart":
+            store.update(key, terminal_live=True)
+            app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=":desktop_computer: Terminal session opened — this thread is live in the terminal.")
+        else:  # SessionEnd
+            store.update(key, checked_out=False, terminal_live=False)
+            app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=":leftwards_arrow_with_hook: Terminal session ended — thread reclaimed; "
+                     "Slack messages run here again.")
+        log.info("session event %s for %s", event, key)
+    except Exception:
+        log.exception("failed to handle session event for %s", key)
+    return {}
 
 
 # --- Files in / out ----------------------------------------------------------
@@ -313,7 +396,9 @@ HELP = """*Commands* (send inside a thread):
 • `!reset` / `!new` — start this thread's session over
 • `!model <alias>` — switch this thread's model (`opus`, `sonnet`, `haiku`, …); `!model reset` for default
 • `!stop` — kill the currently running turn in this thread
-• `!terminal` — get the command to continue this thread in your terminal
+• `!terminal` — check this thread out to your terminal (Slack messages held until you're done)
+• `!back` — reclaim a checked-out thread for Slack
+• `!takeover` — force-close the live terminal session and reclaim the thread
 • `!stats` — this thread's session info (model, turns, cost)
 • `!sessions` — list all active thread sessions
 • `!help` — this message
@@ -354,12 +439,31 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
         if not entry or not entry.get("session_id"):
             say(text="No session in this thread yet — send a prompt first.", thread_ts=thread_ts)
         else:
+            store.update(key, checked_out=True, terminal_live=False)
             cwd = entry.get("cwd", str(CLAUDE_CWD))
-            say(text=(f"Continue this thread in your terminal:\n"
+            say(text=(f":outbox_tray: Thread checked out to the terminal. Continue it with:\n"
                       f"```cd {cwd} && claude --resume {entry['session_id']}```\n"
-                      "_Same session both ways: terminal turns become part of this thread's "
-                      "history, and the next Slack message here picks up where the terminal "
-                      "left off. Just don't run both at the same moment._"),
+                      "_Slack messages are held while it's checked out. When you exit the "
+                      "terminal session the thread reclaims itself; `!back` reclaims without "
+                      "the terminal, `!takeover` force-closes a live terminal session._"),
+                thread_ts=thread_ts)
+    elif lower == "!back":
+        entry = store.get(key) or {}
+        if not entry.get("checked_out"):
+            say(text="This thread isn't checked out.", thread_ts=thread_ts)
+        else:
+            store.update(key, checked_out=False, terminal_live=False)
+            say(text=":leftwards_arrow_with_hook: Thread reclaimed — Slack messages run here again.",
+                thread_ts=thread_ts)
+    elif lower == "!takeover":
+        entry = store.get(key) or {}
+        if not entry.get("checked_out"):
+            say(text="This thread isn't checked out — nothing to take over.", thread_ts=thread_ts)
+        else:
+            killed = kill_terminal(entry.get("session_id", ""))
+            store.update(key, checked_out=False, terminal_live=False)
+            note = "closed the live terminal session and " if killed else "no terminal process found; "
+            say(text=f":leftwards_arrow_with_hook: Took over — {note}the thread is back on Slack.",
                 thread_ts=thread_ts)
     elif lower == "!stats":
         entry = store.get(key)
@@ -393,6 +497,9 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 BOT_USER_ID = app.client.auth_test()["user_id"]
 
+server = LocalServer(APPROVAL_PORT)
+server.route("/session-event", handle_session_event)
+
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
     def _resolve_thread(session_id: str):
@@ -405,11 +512,13 @@ if CLAUDE_APPROVAL_MODE == "slack":
         return None
 
     approvals = ApprovalManager(
-        app.client, port=APPROVAL_PORT, timeout=APPROVAL_TIMEOUT,
+        app.client, timeout=APPROVAL_TIMEOUT,
         auto_allow=APPROVAL_AUTO_ALLOW, allowed_users=ALLOWED_USERS,
         resolve_thread=_resolve_thread)
     approvals.register(app)
-    approvals.start()
+    server.route("/approve", approvals.handle_request)
+
+server.start()
 
 
 def handle_prompt(event: dict, say, client) -> None:
@@ -436,6 +545,23 @@ def handle_prompt(event: dict, say, client) -> None:
         return
 
     entry = store.get(key) or {}
+
+    if entry.get("checked_out"):
+        if HANDOFF_SLACK_WINS:
+            killed = kill_terminal(entry.get("session_id", ""))
+            store.update(key, checked_out=False, terminal_live=False)
+            if killed:
+                say(text=":leftwards_arrow_with_hook: _Closed the live terminal session — Slack takes over._",
+                    thread_ts=thread_ts)
+            entry = store.get(key) or {}
+        else:
+            live = " (a terminal session is live right now)" if entry.get("terminal_live") else ""
+            say(text=f":no_entry_sign: This thread is checked out to the terminal{live}. "
+                     "Send `!takeover` to force-close it and run your message here, or `!back` "
+                     "if the terminal is already done.",
+                thread_ts=thread_ts)
+            return
+
     session_id = entry.get("session_id")
     model = entry.get("model") or CLAUDE_MODEL
     cwd = Path(entry.get("cwd")) if entry.get("cwd") else resolve_cwd(client, channel)
