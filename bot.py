@@ -86,11 +86,17 @@ SLACK_MSG_LIMIT = 3800
 # session is force-closed and the message runs.
 HANDOFF_SLACK_WINS = os.environ.get("HANDOFF_SLACK_WINS", "0") not in ("0", "false", "no", "")
 
+# Channel (or DM channel) where terminal-initiated sessions (bin/silkworm)
+# get their Slack anchor thread. Falls back to the bot's most recent DM.
+SILKWORM_HOME_CHANNEL = os.environ.get("SILKWORM_HOME_CHANNEL", "").strip()
+
 OUTBOX_ROOT = BASE_DIR / "outbox"
+ARTIFACTS_ROOT = BASE_DIR / "artifacts"
 HOOK_PATH = BASE_DIR / "approval_hook.py"
 
 CLAUDE_CWD.mkdir(parents=True, exist_ok=True)
 OUTBOX_ROOT.mkdir(exist_ok=True)
+ARTIFACTS_ROOT.mkdir(exist_ok=True)
 
 # --- Shared state -----------------------------------------------------------
 store = SessionStore(BASE_DIR / "sessions.json")
@@ -280,10 +286,12 @@ def handle_session_event(payload: dict) -> dict:
     channel, thread_ts = key.split(":", 1)
     try:
         if event == "SessionStart":
+            already_live = entry.get("terminal_live")
             store.update(key, terminal_live=True)
-            app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=":desktop_computer: Terminal session opened — this thread is live in the terminal.")
+            if not already_live:
+                app.client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=":desktop_computer: Terminal session opened — this thread is live in the terminal.")
         else:  # SessionEnd
             store.update(key, checked_out=False, terminal_live=False)
             app.client.chat_postMessage(
@@ -298,7 +306,7 @@ def handle_session_event(payload: dict) -> dict:
 
 # --- Files in / out ----------------------------------------------------------
 
-def download_attachments(files: list[dict], dest_dir: Path) -> list[Path]:
+def download_attachments(files: list[dict], dest_dir: Path, key: str) -> list[Path]:
     saved = []
     dest_dir.mkdir(parents=True, exist_ok=True)
     token = os.environ["SLACK_BOT_TOKEN"]
@@ -313,20 +321,35 @@ def download_attachments(files: list[dict], dest_dir: Path) -> list[Path]:
             with urllib.request.urlopen(req, timeout=60) as resp, open(path, "wb") as out:
                 shutil.copyfileobj(resp, out)
             saved.append(path)
+            store.add_file(key, {"name": name, "path": str(path),
+                                 "direction": "in", "ts": time.time()})
         except Exception:
             log.exception("failed to download attachment %s", name)
     return saved
 
 
-def upload_outbox(client, outbox: Path, channel: str, thread_ts: str) -> int:
+def upload_outbox(client, outbox: Path, channel: str, thread_ts: str, key: str) -> int:
+    """Upload outbox files to the thread, then archive them for the visualizer."""
     count = 0
+    archive_dir = ARTIFACTS_ROOT / key.replace(":", "__")
     for path in sorted(p for p in outbox.rglob("*") if p.is_file()):
+        uploaded = False
         try:
             client.files_upload_v2(channel=channel, thread_ts=thread_ts,
                                    file=str(path), title=path.name)
+            uploaded = True
             count += 1
         except Exception:
             log.exception("failed to upload %s", path)
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            dest = archive_dir / f"{int(time.time())}-{path.name}"
+            shutil.move(str(path), dest)
+            store.add_file(key, {"name": path.name, "path": str(dest),
+                                 "direction": "out", "ts": time.time(),
+                                 "uploaded": uploaded})
+        except Exception:
+            log.exception("failed to archive %s", path)
     shutil.rmtree(outbox, ignore_errors=True)
     return count
 
@@ -497,8 +520,92 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 BOT_USER_ID = app.client.auth_test()["user_id"]
 
+def handle_status(payload: dict) -> dict:
+    """Route for /status — thread runtime state for the visualizer."""
+    threads = {}
+    for key, entry in store.all().items():
+        threads[key] = {
+            "running": key in RUNNING,
+            "checked_out": bool(entry.get("checked_out")),
+            "terminal_live": bool(entry.get("terminal_live")),
+        }
+    return {"online": True, "threads": threads}
+
+
+def handle_web_message(payload: dict) -> dict:
+    """Route for /web-message — a prompt or !command sent from the visualizer.
+
+    Localhost-only by construction (the LocalServer binds 127.0.0.1), so it is
+    trusted like the machine owner: it bypasses the Slack allowlist.
+    """
+    key = payload.get("key", "")
+    text = (payload.get("text") or "").strip()
+    if not text or key not in store.all():
+        return {"ok": False, "error": "unknown thread or empty message"}
+    channel, thread_ts = key.split(":", 1)
+
+    def say(text, thread_ts=thread_ts, **kwargs):
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, **kwargs)
+
+    def run():
+        try:
+            if not text.startswith("!"):
+                say(f":globe_with_meridians: _via visualizer:_ {text}")
+            event = {"channel": channel, "ts": f"{time.time():.6f}",
+                     "thread_ts": thread_ts, "user": "", "text": text, "_web": True}
+            handle_prompt(event, say, app.client)
+        except Exception:
+            log.exception("web message failed for %s", key)
+
+    threading.Thread(target=run, daemon=True, name="web-message").start()
+    return {"ok": True}
+
+
+def handle_register_terminal(payload: dict) -> dict:
+    """Route for /register-terminal — bin/silkworm starting a tracked session.
+
+    Posts an anchor message in Slack so the session has a thread from birth;
+    the checkout/handoff machinery then treats it like any handed-off thread.
+    """
+    sid = payload.get("session_id", "").strip()
+    if not sid:
+        return {"ok": False, "error": "missing session_id"}
+    cwd = payload.get("cwd") or str(CLAUDE_CWD)
+    title = payload.get("title") or Path(cwd).name
+
+    channel = SILKWORM_HOME_CHANNEL
+    if not channel:  # fall back to the bot's most recently used DM
+        dms = [k for k, v in sorted(store.all().items(),
+                                    key=lambda kv: -kv[1].get("updated", 0))
+               if k.startswith("D")]
+        channel = dms[0].split(":", 1)[0] if dms else ""
+    if not channel:
+        return {"ok": False, "error": "set SILKWORM_HOME_CHANNEL in .env (no DM history to fall back to)"}
+
+    try:
+        resp = app.client.chat_postMessage(
+            channel=channel,
+            text=(f":thread: *{title}* — terminal session started via the silkworm CLI "
+                  f"in `{cwd}`.\n_This thread follows it: when the terminal exits, "
+                  "reply here to continue the session from Slack._"))
+    except Exception as e:
+        log.exception("failed to post terminal anchor")
+        return {"ok": False, "error": f"could not post to {channel}: {e}"}
+
+    ts = resp["ts"]
+    key = f"{channel}:{ts}"
+    store.update(key, session_id=sid, cwd=cwd, checked_out=True, terminal_live=False)
+    ACTIVE_SESSIONS[sid] = (channel, ts)
+    log.info("registered terminal session %s -> %s", sid[:8], key)
+    return {"ok": True, "key": key,
+            "link": f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"}
+
+
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
+server.route("/status", handle_status)
+server.route("/web-message", handle_web_message)
+server.route("/register-terminal", handle_register_terminal)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -530,7 +637,7 @@ def handle_prompt(event: dict, say, client) -> None:
 
     if _dedup(channel, msg_ts):
         return
-    if ALLOWED_USERS and user not in ALLOWED_USERS:
+    if ALLOWED_USERS and not event.get("_web") and user not in ALLOWED_USERS:
         say(text="Sorry, you're not on this bot's allowlist.", thread_ts=thread_ts)
         return
 
@@ -573,7 +680,7 @@ def handle_prompt(event: dict, say, client) -> None:
         if ctx:
             prompt = ctx + "The user now says: " + prompt
     if files:
-        saved = download_attachments(files, cwd / "slack-uploads")
+        saved = download_attachments(files, cwd / "slack-uploads", key)
         if saved:
             listing = "\n".join(f"- {p}" for p in saved)
             prompt += f"\n\n[The user attached file(s), saved locally at:\n{listing}]"
@@ -634,7 +741,7 @@ def handle_prompt(event: dict, say, client) -> None:
                 store.add_cost(key, result.cost_usd)
                 if result.session_id:
                     ACTIVE_SESSIONS[result.session_id] = (channel, thread_ts)
-                uploaded = upload_outbox(client, outbox, channel, thread_ts)
+                uploaded = upload_outbox(client, outbox, channel, thread_ts, key)
             finally:
                 shutil.rmtree(outbox, ignore_errors=True)
 

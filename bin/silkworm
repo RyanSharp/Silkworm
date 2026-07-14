@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Start a Silkworm-tracked Claude Code session from the terminal.
+
+    silkworm                     # session in the current directory
+    silkworm "refactor auth"     # with a title for the Slack thread
+    silkworm --dir ~/code/myapp "fix the tests"
+
+Registers the session with the running Silkworm bot, which posts an anchor
+message in Slack — so the session has a thread (and shows in the visualizer)
+from the moment it starts. When you exit, the thread reclaims itself and you
+can continue the conversation from Slack. If the bot is down, the session
+still starts, just untracked.
+
+Stdlib only.
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import uuid
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def bot_port() -> str:
+    port = "8787"
+    try:
+        for line in (REPO / ".env").read_text().splitlines():
+            if line.strip().startswith("APPROVAL_PORT="):
+                port = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return port
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    cwd = os.getcwd()
+    title_parts = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--dir" and i + 1 < len(args):
+            cwd = str(Path(args[i + 1]).expanduser().resolve())
+            i += 2
+        else:
+            title_parts.append(args[i])
+            i += 1
+    title = " ".join(title_parts) or Path(cwd).name
+
+    session_id = str(uuid.uuid4())
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{bot_port()}/register-terminal",
+        data=json.dumps({"session_id": session_id, "cwd": cwd, "title": title}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            answer = json.loads(resp.read())
+    except Exception:
+        answer = {}
+
+    if answer.get("ok"):
+        print(f"\033[33m🪱 silkworm:\033[0m thread anchored in Slack → {answer['link']}")
+    else:
+        reason = answer.get("error", "bot not reachable")
+        print(f"\033[33m🪱 silkworm:\033[0m untracked session ({reason})")
+
+    os.chdir(cwd)
+    os.execvp("claude", ["claude", "--session-id", session_id])
+
+
+if __name__ == "__main__":
+    main()

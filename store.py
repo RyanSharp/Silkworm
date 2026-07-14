@@ -39,6 +39,14 @@ class SessionStore:
             self._save()
             return dict(entry)
 
+    def add_file(self, key: str, record: dict) -> None:
+        with self._lock:
+            entry = self._data.setdefault(key, {})
+            files = entry.setdefault("files", [])
+            files.append(record)
+            del files[:-200]  # cap per thread
+            self._save()
+
     def add_cost(self, key: str, cost: float) -> None:
         with self._lock:
             entry = self._data.setdefault(key, {})

@@ -137,16 +137,44 @@ turns are already saved; only an in-flight generation is lost). Set
 `HANDOFF_SLACK_WINS=1` to skip the warning entirely and have any Slack message
 auto-close the terminal and take over.
 
+## Starting a session from the terminal
+
+The reverse direction also works — start in the terminal, continue in Slack:
+
+```sh
+./bin/silkworm "refactor auth" --dir ~/code/myapp
+# add to PATH for convenience: ln -s ~/workspace/Silkworm/bin/silkworm /usr/local/bin/
+```
+
+The CLI registers the session with the bot, which posts an anchor message in
+`SILKWORM_HOME_CHANNEL` (default: your most recent DM with the bot) — so the
+session has a Slack thread and shows in the visualizer from the moment it
+starts. Exit the terminal and the thread reclaims itself; reply in Slack to
+keep going. If the bot is down, the session starts untracked.
+
 ## Session visualizer
 
 ```sh
 python3 visualizer.py    # http://127.0.0.1:8790
 ```
 
-A local, read-only web view of every thread session: turns, cost, model, and
-the full transcript (including tool calls and thinking, parsed from Claude
-Code's own session files) — plus one-click copy of each session's terminal
-resume command. Refreshes every 10 s, so you can watch a running turn.
+A local web dashboard for every thread session (localhost-only):
+
+- **Cost & cache analytics** — stat tiles (total spend, 14-day tokens, cache
+  hit rate) and a daily stacked bar chart of cache-read / fresh-input / output
+  tokens, with hover tooltips and a table view. Cache misses show up as blue
+  bars — if the gold disappears, something is invalidating your prompt cache.
+- **Live status badges** — running / checked out / in-terminal per thread,
+  polled from the bot; a dot in the header shows whether the bot is up.
+- **Transcripts** — markdown-rendered messages with per-turn token usage and
+  cache-hit %, collapsible tool calls, results, and thinking.
+- **Full-text search** across all thread transcripts.
+- **Files** — everything exchanged with a thread (Slack uploads in, generated
+  files out) listed with download links; outbound files are archived under
+  `artifacts/`.
+- **Reply from the web** — a composer that relays messages (and `!commands`,
+  wired to the Stop / Take over / Model / Reset buttons) through the bot, so
+  everything also lands in the Slack thread.
 
 ## Notes & limits
 
