@@ -594,7 +594,8 @@ def handle_register_terminal(payload: dict) -> dict:
 
     ts = resp["ts"]
     key = f"{channel}:{ts}"
-    store.update(key, session_id=sid, cwd=cwd, checked_out=True, terminal_live=False)
+    store.update(key, session_id=sid, cwd=cwd, checked_out=True,
+                 terminal_live=bool(payload.get("live")))
     ACTIVE_SESSIONS[sid] = (channel, ts)
     log.info("registered terminal session %s -> %s", sid[:8], key)
     return {"ok": True, "key": key,

@@ -35,8 +35,89 @@ def bot_port() -> str:
     return port
 
 
+def find_transcript_sid(cwd: str) -> str | None:
+    """Most recently written session in cwd's Claude project dir."""
+    proj = Path.home() / ".claude" / "projects" / cwd.replace("/", "-")
+    files = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0].stem if files else None
+
+
+def latest_summary(session_id: str, cwd: str) -> str | None:
+    path = Path.home() / ".claude" / "projects" / cwd.replace("/", "-") / f"{session_id}.jsonl"
+    summary = None
+    try:
+        for line in path.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") == "summary" and d.get("summary"):
+                summary = d["summary"]
+    except OSError:
+        pass
+    return summary
+
+
+def do_import() -> None:
+    """Register every running interactive claude session with Silkworm."""
+    import subprocess
+    known = set()
+    try:
+        sessions = json.loads((REPO / "sessions.json").read_text())
+        known = {(v.get("session_id") if isinstance(v, dict) else v) for v in sessions.values()}
+    except OSError:
+        pass
+
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
+    pids = []
+    for line in out.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if cmd.strip().startswith("claude") and "--session-id" not in cmd and " -p" not in cmd:
+            pids.append(int(pid))
+
+    if not pids:
+        print("🪱 no running claude sessions found")
+        return
+    port = bot_port()
+    for pid in pids:
+        lsof = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                              capture_output=True, text=True)
+        cwd = next((l[1:] for l in lsof.stdout.splitlines() if l.startswith("n")), None)
+        if not cwd:
+            print(f"  pid {pid}: could not determine cwd — skipped")
+            continue
+        sid = find_transcript_sid(cwd)
+        if not sid:
+            print(f"  pid {pid} ({cwd}): no session transcript found — skipped")
+            continue
+        if sid in known:
+            print(f"  pid {pid} ({cwd}): session {sid[:8]}… already tracked — skipped")
+            continue
+        title = latest_summary(sid, cwd) or Path(cwd).name or "home"
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/register-terminal",
+            data=json.dumps({"session_id": sid, "cwd": cwd,
+                             "title": title[:80], "live": True}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                answer = json.loads(resp.read())
+        except Exception as e:
+            print(f"  pid {pid} ({cwd}): bot unreachable ({e})")
+            return
+        if answer.get("ok"):
+            known.add(sid)
+            print(f"  ✔ pid {pid} ({Path(cwd).name or 'home'}) {sid[:8]}… → {answer['link']}")
+        else:
+            print(f"  ✘ pid {pid} ({cwd}): {answer.get('error')}")
+
+
 def main() -> None:
     args = sys.argv[1:]
+    if args and args[0] == "import":
+        print("🪱 importing running claude sessions into Silkworm…")
+        do_import()
+        return
     cwd = os.getcwd()
     title_parts = []
     i = 0
