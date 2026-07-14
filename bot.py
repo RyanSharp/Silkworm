@@ -785,6 +785,31 @@ def on_message(event, say, client):
 
 # --- Housekeeping -----------------------------------------------------------------
 
+def system_boot_time() -> float:
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                                 capture_output=True, text=True).stdout
+            m = re.search(r"sec = (\d+)", out)
+            return float(m.group(1)) if m else 0.0
+        with open("/proc/uptime") as f:  # linux
+            return time.time() - float(f.read().split()[0])
+    except Exception:
+        return 0.0
+
+
+def reconcile_checkouts() -> None:
+    """Release checkouts that predate the current boot — their terminal
+    sessions cannot have survived the reboot."""
+    boot = system_boot_time()
+    if not boot:
+        return
+    for key, entry in store.all().items():
+        if entry.get("checked_out") and entry.get("updated", 0) < boot:
+            store.update(key, checked_out=False, terminal_live=False)
+            log.info("released stale pre-boot checkout %s", key)
+
+
 def _sweeper() -> None:
     while True:
         removed = store.sweep(SESSION_MAX_AGE_DAYS)
@@ -797,6 +822,7 @@ def _sweeper() -> None:
 
 
 if __name__ == "__main__":
+    reconcile_checkouts()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

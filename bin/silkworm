@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
-"""Start a Silkworm-tracked Claude Code session from the terminal.
+"""Silkworm CLI — start tracked sessions and manage the install.
 
-    silkworm                     # session in the current directory
-    silkworm "refactor auth"     # with a title for the Slack thread
-    silkworm --dir ~/code/myapp "fix the tests"
+    silkworm [title] [--dir PATH]   start a tracked Claude session here
+    silkworm import                 adopt running claude sessions into Silkworm
+    silkworm setup                  first-run bootstrap: deps, hooks, services
+    silkworm install | uninstall    (un)install the login services (bot + visualizer)
+    silkworm status                 health check: services, bot, visualizer, hooks
+    silkworm restart                restart the services
+    silkworm logs                   tail the bot log
+    silkworm doctor                 check prerequisites
 
-Registers the session with the running Silkworm bot, which posts an anchor
-message in Slack — so the session has a thread (and shows in the visualizer)
-from the moment it starts. When you exit, the thread reclaims itself and you
-can continue the conversation from Slack. If the bot is down, the session
-still starts, just untracked.
-
-Stdlib only.
+Runs on macOS today (launchd LaunchAgents); Linux (systemd user units) planned —
+the ServiceManager below is the only platform-specific part. Stdlib only.
 """
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import urllib.request
 import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+VENV_PY = REPO / ".venv" / "bin" / "python"
+LOGS = REPO / "logs"
+
+Y = "\033[33m"; G = "\033[32m"; R = "\033[31m"; N = "\033[0m"
+WORM = f"{Y}🪱 silkworm:{N}"
 
 
 def bot_port() -> str:
@@ -34,6 +41,200 @@ def bot_port() -> str:
         pass
     return port
 
+
+def viz_port() -> str:
+    return os.environ.get("SILKWORM_VIZ_PORT", "8790")
+
+
+def bot_call(path: str, payload: dict, timeout: float = 3) -> dict:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{bot_port()}{path}", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return {}
+
+
+# --- service management (platform-specific) -----------------------------------
+
+class LaunchdManager:
+    """macOS: per-user LaunchAgents, started at login, kept alive."""
+
+    AGENTS = Path.home() / "Library" / "LaunchAgents"
+    SERVICES = {
+        "com.silkworm.bot": ["bot.py"],
+        "com.silkworm.viz": ["visualizer.py"],
+    }
+
+    def _plist(self, label: str, script: str) -> str:
+        claude_dir = os.path.dirname(shutil.which("claude") or "/opt/homebrew/bin/claude")
+        path_env = ":".join(dict.fromkeys(
+            [claude_dir, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{label}</string>
+    <key>ProgramArguments</key>
+    <array><string>{VENV_PY}</string><string>{REPO / script}</string></array>
+    <key>WorkingDirectory</key><string>{REPO}</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>{path_env}</string></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>{LOGS / (label.split('.')[-1] + '.log')}</string>
+    <key>StandardErrorPath</key><string>{LOGS / (label.split('.')[-1] + '.err.log')}</string>
+</dict>
+</plist>
+"""
+
+    def _kill_adhoc(self) -> None:
+        for pattern in ("Silkworm/bot.py", "Silkworm/visualizer.py",
+                        f"{REPO}/bot.py", f"{REPO}/visualizer.py"):
+            subprocess.run(["pkill", "-f", pattern], capture_output=True)
+
+    def install(self) -> None:
+        LOGS.mkdir(exist_ok=True)
+        self.AGENTS.mkdir(parents=True, exist_ok=True)
+        self._kill_adhoc()
+        for label, (script,) in ((k, tuple(v)) for k, v in self.SERVICES.items()):
+            plist = self.AGENTS / f"{label}.plist"
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            plist.write_text(self._plist(label, script))
+            subprocess.run(["launchctl", "load", str(plist)], check=True)
+            print(f"  {G}✔{N} {label} installed and started")
+
+    def uninstall(self) -> None:
+        for label in self.SERVICES:
+            plist = self.AGENTS / f"{label}.plist"
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            plist.unlink(missing_ok=True)
+            print(f"  {G}✔{N} {label} removed")
+
+    def restart(self) -> None:
+        for label in self.SERVICES:
+            plist = self.AGENTS / f"{label}.plist"
+            if not plist.exists():
+                print(f"  {R}✘{N} {label} not installed — run: silkworm install")
+                return
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            subprocess.run(["launchctl", "load", str(plist)], check=True)
+            print(f"  {G}✔{N} {label} restarted")
+
+    def loaded(self, label: str) -> bool:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        return label in out.stdout
+
+
+def service_manager():
+    if sys.platform == "darwin":
+        return LaunchdManager()
+    sys.exit(f"{WORM} services on {sys.platform} aren't supported yet (macOS only for now)")
+
+
+# --- checks ---------------------------------------------------------------------
+
+def check(label: str, ok: bool, hint: str = "") -> bool:
+    mark = f"{G}✔{N}" if ok else f"{R}✘{N}"
+    print(f"  {mark} {label}" + ("" if ok else (f" — {hint}" if hint else "")))
+    return ok
+
+
+def env_tokens_present() -> bool:
+    try:
+        text = (REPO / ".env").read_text()
+    except OSError:
+        return False
+    return "SLACK_BOT_TOKEN=xoxb-" in text.replace(" ", "") and \
+           "SLACK_APP_TOKEN=xapp-" in text.replace(" ", "") and \
+           "xoxb-your-token" not in text
+
+
+def hooks_installed() -> bool:
+    try:
+        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text())
+    except OSError:
+        return False
+    return "session_hook.py" in json.dumps(settings.get("hooks", {}))
+
+
+def viz_up() -> bool:
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{viz_port()}/api/stats", timeout=2).read()
+        return True
+    except Exception:
+        return False
+
+
+def do_doctor() -> bool:
+    print(f"{WORM} checking prerequisites…")
+    ok = True
+    ok &= check("claude CLI on PATH", shutil.which("claude") is not None,
+                "install Claude Code first: https://claude.com/claude-code")
+    ok &= check(f"python {sys.version_info.major}.{sys.version_info.minor} >= 3.10",
+                sys.version_info >= (3, 10))
+    ok &= check("virtualenv + deps", VENV_PY.exists(), "silkworm setup creates it")
+    ok &= check("Slack tokens in .env", env_tokens_present(),
+                f"cp .env.example .env and add both tokens (see README), in {REPO}")
+    ok &= check("session hooks in ~/.claude/settings.json", hooks_installed(),
+                "silkworm setup installs them")
+    return ok
+
+
+def do_status() -> None:
+    mgr = service_manager()
+    print(f"{WORM} status")
+    for label in mgr.SERVICES:
+        check(f"service {label} loaded", mgr.loaded(label), "run: silkworm install")
+    bot = bot_call("/status", {}, timeout=2)
+    check(f"bot reachable on :{bot_port()}", bool(bot.get("online")),
+          "silkworm logs may say why")
+    check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
+    check("session hooks installed", hooks_installed())
+    threads = bot.get("threads", {})
+    if threads:
+        running = sum(1 for t in threads.values() if t.get("running"))
+        out = sum(1 for t in threads.values() if t.get("checked_out"))
+        print(f"    {len(threads)} threads · {running} running · {out} checked out to terminal")
+
+
+def do_setup() -> None:
+    print(f"{WORM} setting up in {REPO}")
+    if not check("claude CLI on PATH", shutil.which("claude") is not None,
+                 "install Claude Code first, then re-run"):
+        sys.exit(1)
+
+    if not VENV_PY.exists():
+        print("  creating virtualenv + installing deps…")
+        subprocess.run([sys.executable, "-m", "venv", str(REPO / ".venv")], check=True)
+        subprocess.run([str(REPO / ".venv" / "bin" / "pip"), "install", "-q",
+                        "-r", str(REPO / "requirements.txt")], check=True)
+    check("virtualenv + deps", True)
+
+    env = REPO / ".env"
+    if not env.exists():
+        shutil.copy(REPO / ".env.example", env)
+        print(f"  created {env}")
+    if not env_tokens_present():
+        print(f"\n{WORM} add your Slack tokens to {env} first:")
+        print("  1. https://api.slack.com/apps → Create New App → From a manifest → paste manifest.json")
+        print("  2. Basic Information → App-Level Tokens → generate with connections:write → SLACK_APP_TOKEN")
+        print("  3. Install App → Bot User OAuth Token → SLACK_BOT_TOKEN")
+        print(f"  then re-run: silkworm setup")
+        sys.exit(1)
+    check("Slack tokens in .env", True)
+
+    subprocess.run([sys.executable, str(REPO / "install_hooks.py")], check=True)
+    print(f"{WORM} installing login services…")
+    service_manager().install()
+    print()
+    do_status()
+    print(f"\n{WORM} done — DM your bot in Slack, and open http://127.0.0.1:{viz_port()}")
+
+
+# --- session launch / import ------------------------------------------------------
 
 def find_transcript_sid(cwd: str) -> str | None:
     """Most recently written session in cwd's Claude project dir."""
@@ -60,7 +261,6 @@ def latest_summary(session_id: str, cwd: str) -> str | None:
 
 def do_import() -> None:
     """Register every running interactive claude session with Silkworm."""
-    import subprocess
     known = set()
     try:
         sessions = json.loads((REPO / "sessions.json").read_text())
@@ -76,9 +276,8 @@ def do_import() -> None:
             pids.append(int(pid))
 
     if not pids:
-        print("🪱 no running claude sessions found")
+        print(f"{WORM} no running claude sessions found")
         return
-    port = bot_port()
     for pid in pids:
         lsof = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
                               capture_output=True, text=True)
@@ -94,30 +293,20 @@ def do_import() -> None:
             print(f"  pid {pid} ({cwd}): session {sid[:8]}… already tracked — skipped")
             continue
         title = latest_summary(sid, cwd) or Path(cwd).name or "home"
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/register-terminal",
-            data=json.dumps({"session_id": sid, "cwd": cwd,
-                             "title": title[:80], "live": True}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                answer = json.loads(resp.read())
-        except Exception as e:
-            print(f"  pid {pid} ({cwd}): bot unreachable ({e})")
-            return
+        answer = bot_call("/register-terminal",
+                          {"session_id": sid, "cwd": cwd, "title": title[:80], "live": True},
+                          timeout=5)
         if answer.get("ok"):
             known.add(sid)
-            print(f"  ✔ pid {pid} ({Path(cwd).name or 'home'}) {sid[:8]}… → {answer['link']}")
+            print(f"  {G}✔{N} pid {pid} ({Path(cwd).name or 'home'}) {sid[:8]}… → {answer['link']}")
+        elif answer:
+            print(f"  {R}✘{N} pid {pid} ({cwd}): {answer.get('error')}")
         else:
-            print(f"  ✘ pid {pid} ({cwd}): {answer.get('error')}")
+            print(f"  {R}✘{N} bot unreachable — is it running? (silkworm status)")
+            return
 
 
-def main() -> None:
-    args = sys.argv[1:]
-    if args and args[0] == "import":
-        print("🪱 importing running claude sessions into Silkworm…")
-        do_import()
-        return
+def do_launch(args: list[str]) -> None:
     cwd = os.getcwd()
     title_parts = []
     i = 0
@@ -131,24 +320,42 @@ def main() -> None:
     title = " ".join(title_parts) or Path(cwd).name
 
     session_id = str(uuid.uuid4())
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{bot_port()}/register-terminal",
-        data=json.dumps({"session_id": session_id, "cwd": cwd, "title": title}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            answer = json.loads(resp.read())
-    except Exception:
-        answer = {}
-
+    answer = bot_call("/register-terminal",
+                      {"session_id": session_id, "cwd": cwd, "title": title}, timeout=3)
     if answer.get("ok"):
-        print(f"\033[33m🪱 silkworm:\033[0m thread anchored in Slack → {answer['link']}")
+        print(f"{WORM} thread anchored in Slack → {answer['link']}")
     else:
-        reason = answer.get("error", "bot not reachable")
-        print(f"\033[33m🪱 silkworm:\033[0m untracked session ({reason})")
+        print(f"{WORM} untracked session ({answer.get('error', 'bot not reachable')})")
 
     os.chdir(cwd)
     os.execvp("claude", ["claude", "--session-id", session_id])
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    if cmd == "import":
+        print(f"{WORM} importing running claude sessions…")
+        do_import()
+    elif cmd == "setup":
+        do_setup()
+    elif cmd == "doctor":
+        sys.exit(0 if do_doctor() else 1)
+    elif cmd == "install":
+        LOGS.mkdir(exist_ok=True)
+        service_manager().install()
+    elif cmd == "uninstall":
+        service_manager().uninstall()
+    elif cmd == "restart":
+        service_manager().restart()
+    elif cmd == "status":
+        do_status()
+    elif cmd == "logs":
+        os.execvp("tail", ["tail", "-n", "40", "-f", str(LOGS / "bot.log")])
+    elif cmd in ("help", "-h", "--help"):
+        print(__doc__.strip())
+    else:
+        do_launch(args)
 
 
 if __name__ == "__main__":

@@ -67,28 +67,35 @@ Claude Code session**.
 > into **App Manifest** on the app page and **reinstall** so the new scopes
 > (files, history, users) and interactivity take effect.
 
-## 2. Configure and run
+## 2. Install
 
 ```sh
 git clone https://github.com/RyanSharp/Silkworm.git ~/workspace/Silkworm
 cd ~/workspace/Silkworm
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env    # paste your two tokens; review the options
-python3 bot.py
+./bin/silkworm setup
 ```
 
-### Run on boot (launchd)
+`setup` checks prerequisites, creates the venv, copies `.env.example` → `.env`
+(it stops and tells you exactly where to paste the two Slack tokens, then you
+re-run it), installs the session hooks, and installs **two login services**
+(`com.silkworm.bot`, `com.silkworm.viz`) so the bot and visualizer start at
+login and restart on crash. Service definitions are generated from your actual
+paths at install time — clone anywhere.
+
+Day-to-day management (macOS today; Linux/systemd planned):
 
 ```sh
-cp com.silkworm.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.silkworm.plist
-# logs land in ./logs/bot.log and ./logs/bot.err.log
-# stop with: launchctl unload ~/Library/LaunchAgents/com.silkworm.plist
+silkworm status      # services, bot, visualizer, hooks — one health check
+silkworm restart     # bounce both services (e.g. after git pull)
+silkworm logs        # tail the bot log
+silkworm uninstall   # remove the services (repo and sessions untouched)
 ```
 
-> The plist assumes the project lives at `~/workspace/Silkworm`; edit the paths if you
-> cloned elsewhere.
+Tip: put it on your PATH — `ln -s ~/workspace/Silkworm/bin/silkworm /usr/local/bin/silkworm`.
+
+Reboots are a non-event: sessions and thread mappings live on disk, the
+services come back at login, and the bot releases any terminal checkouts that
+predate the boot (those terminals are gone).
 
 The plist reads config from `.env` (loaded by the bot itself), so no secrets
 live in the plist.
