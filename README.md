@@ -42,6 +42,7 @@ Claude Code session**.
 | `!reset` / `!new` | Start this thread's session over |
 | `!model <alias>` / `!model reset` | Switch this thread's model |
 | `!stop` | Kill the currently running turn |
+| `!terminal` | Get the command to continue this thread in your terminal |
 | `!stats` | This thread's session info (model, turns, cost) |
 | `!sessions` | List all active thread sessions |
 
@@ -115,6 +116,25 @@ to the bot on `127.0.0.1:8787`; the bot posts Approve/Deny buttons in the
 thread and blocks until someone clicks (default-deny after `APPROVAL_TIMEOUT`).
 Read-only tools in `APPROVAL_AUTO_ALLOW` skip the buttons. Fails closed: if the
 bot or hook is unreachable, the tool is denied.
+
+## Moving a thread to the terminal
+
+Every thread is a normal Claude Code session, so it works both ways: send
+`!terminal` in a thread and Silkworm replies with the exact
+`cd … && claude --resume <session-id>` to continue it interactively. Turns you
+take in the terminal become part of the thread's history — the next Slack
+message picks up right where you left off. (Don't run both at the same moment.)
+
+## Session visualizer
+
+```sh
+python3 visualizer.py    # http://127.0.0.1:8790
+```
+
+A local, read-only web view of every thread session: turns, cost, model, and
+the full transcript (including tool calls and thinking, parsed from Claude
+Code's own session files) — plus one-click copy of each session's terminal
+resume command. Refreshes every 10 s, so you can watch a running turn.
 
 ## Notes & limits
 

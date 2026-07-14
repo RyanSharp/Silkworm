@@ -313,6 +313,7 @@ HELP = """*Commands* (send inside a thread):
 • `!reset` / `!new` — start this thread's session over
 • `!model <alias>` — switch this thread's model (`opus`, `sonnet`, `haiku`, …); `!model reset` for default
 • `!stop` — kill the currently running turn in this thread
+• `!terminal` — get the command to continue this thread in your terminal
 • `!stats` — this thread's session info (model, turns, cost)
 • `!sessions` — list all active thread sessions
 • `!help` — this message
@@ -348,6 +349,18 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             else:
                 store.update(key, model=choice)
                 say(text=f"This thread now uses `{choice}`.", thread_ts=thread_ts)
+    elif lower in ("!terminal", "!handoff"):
+        entry = store.get(key)
+        if not entry or not entry.get("session_id"):
+            say(text="No session in this thread yet — send a prompt first.", thread_ts=thread_ts)
+        else:
+            cwd = entry.get("cwd", str(CLAUDE_CWD))
+            say(text=(f"Continue this thread in your terminal:\n"
+                      f"```cd {cwd} && claude --resume {entry['session_id']}```\n"
+                      "_Same session both ways: terminal turns become part of this thread's "
+                      "history, and the next Slack message here picks up where the terminal "
+                      "left off. Just don't run both at the same moment._"),
+                thread_ts=thread_ts)
     elif lower == "!stats":
         entry = store.get(key)
         if not entry:
@@ -439,8 +452,10 @@ def handle_prompt(event: dict, say, client) -> None:
             listing = "\n".join(f"- {p}" for p in saved)
             prompt += f"\n\n[The user attached file(s), saved locally at:\n{listing}]"
 
-    outbox = OUTBOX_ROOT / uuid.uuid4().hex
-    outbox.mkdir()
+    # Stable per-thread outbox path: this string ends up in --append-system-prompt,
+    # and prompt caching is a byte-exact prefix match — a path that changes every
+    # message invalidates the cache and re-bills the whole history at full price.
+    outbox = OUTBOX_ROOT / key.replace(":", "__")
     system_note = (
         "You are replying inside Slack; keep responses conversational. "
         f"If you create a file the user should receive, copy it into {outbox} "
@@ -473,22 +488,29 @@ def handle_prompt(event: dict, say, client) -> None:
                 extra_args=CLAUDE_EXTRA_ARGS, env=claude_env(), timeout=CLAUDE_TIMEOUT,
                 on_init=on_init, on_activity=on_activity, on_start=on_start,
             )
+            # The outbox dir is shared by every turn in this thread, so its
+            # whole lifecycle (create -> upload -> remove) stays inside the lock.
+            outbox.mkdir(parents=True, exist_ok=True)
             try:
-                result = run_turn(prompt, session_id=session_id, **kwargs)
-            except ClaudeStopped:
-                raise
-            except ClaudeError as e:
-                if session_id is None:
+                try:
+                    result = run_turn(prompt, session_id=session_id, **kwargs)
+                except ClaudeStopped:
                     raise
-                log.warning("resume failed for %s (%s); retrying with a fresh session", key, e)
-                store.drop(key)
-                progress.update(":hourglass_flowing_sand: _Old session was gone — starting fresh…_")
-                result = run_turn(prompt, session_id=None, **kwargs)
+                except ClaudeError as e:
+                    if session_id is None:
+                        raise
+                    log.warning("resume failed for %s (%s); retrying with a fresh session", key, e)
+                    store.drop(key)
+                    progress.update(":hourglass_flowing_sand: _Old session was gone — starting fresh…_")
+                    result = run_turn(prompt, session_id=None, **kwargs)
 
-            store.update(key, session_id=result.session_id, model=entry.get("model"), cwd=str(cwd))
-            store.add_cost(key, result.cost_usd)
-            if result.session_id:
-                ACTIVE_SESSIONS[result.session_id] = (channel, thread_ts)
+                store.update(key, session_id=result.session_id, model=entry.get("model"), cwd=str(cwd))
+                store.add_cost(key, result.cost_usd)
+                if result.session_id:
+                    ACTIVE_SESSIONS[result.session_id] = (channel, thread_ts)
+                uploaded = upload_outbox(client, outbox, channel, thread_ts)
+            finally:
+                shutil.rmtree(outbox, ignore_errors=True)
 
         total = (store.get(key) or {}).get("cost", 0.0)
         footer = (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
@@ -499,7 +521,6 @@ def handle_prompt(event: dict, say, client) -> None:
         for part in parts[1:]:
             say(text=part, thread_ts=thread_ts)
 
-        uploaded = upload_outbox(client, outbox, channel, thread_ts)
         if uploaded:
             log.info("uploaded %d file(s) from outbox for %s", uploaded, key)
 
@@ -512,7 +533,6 @@ def handle_prompt(event: dict, say, client) -> None:
         progress.finalize(":warning: Something went wrong — check the bot logs.")
     finally:
         RUNNING.pop(key, None)
-        shutil.rmtree(outbox, ignore_errors=True)
 
 
 @app.event("app_mention")
