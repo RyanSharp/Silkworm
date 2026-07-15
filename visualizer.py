@@ -70,6 +70,7 @@ def load_sessions() -> dict:
         st = threads.get(key, {})
         out.append({
             "key": key,
+            "title": entry.get("title") or "",
             "session_id": sid,
             "model": entry.get("model"),
             "cwd": cwd,
@@ -345,6 +346,10 @@ PAGE = r"""<!doctype html>
   .card.active { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold); }
   .card .key { font-family: var(--mono); font-size: 12px; color: var(--silk);
                word-break: break-all; display: flex; gap: 6px; align-items: center; }
+  .card .key .title { font-family: inherit; font-size: 13.5px; font-weight: 600;
+                      color: var(--ink); }
+  .card .subkey { font-family: var(--mono); font-size: 10px; color: var(--muted);
+                  word-break: break-all; margin-top: 1px; }
   .badge { font-size: 10px; border-radius: 6px; padding: 1px 7px; font-family: var(--mono);
            flex: none; }
   .badge.run { background: #2EB67D22; color: #2EB67D; border: 1px solid #2EB67D66; }
@@ -594,7 +599,9 @@ async function loadList() {
     div.className = "card" + (active && active.key === s.key ? " active" : "");
     const badges = (s.running ? '<span class="badge run">running</span>' : "") +
       (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
-    div.innerHTML = `<div class="key"><span>${esc(s.key)}</span>${badges}</div>
+    const label = s.title ? `<span class="title">${esc(s.title)}</span>` : `<span>${esc(s.key)}</span>`;
+    div.innerHTML = `<div class="key">${label}${badges}</div>
+      ${s.title ? `<div class="subkey">${esc(s.key)}</div>` : ""}
       <div class="meta"><span><b>${s.turns}</b> turns</span>
       <span><b>$${(s.cost||0).toFixed(2)}</b></span>
       <span>${esc(s.model || "default")}</span>

@@ -45,6 +45,7 @@ CLAUDE_CWD = Path(os.environ.get("CLAUDE_CWD", BASE_DIR / "workspace"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "900"))
+NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
 
 # skip  = --dangerously-skip-permissions (full autonomy)
 # slack = gated: every non-trivial tool call posts Approve/Deny buttons
@@ -226,6 +227,26 @@ def claude_env() -> dict:
         env["SLACK_BOT_APPROVAL_PORT"] = str(APPROVAL_PORT)
         env["SLACK_BOT_APPROVAL_TIMEOUT"] = str(APPROVAL_TIMEOUT)
     return env
+
+
+def name_thread(key: str, prompt: str, reply: str) -> None:
+    """Title a new thread with a cheap model; runs in the background."""
+    if not NAMING_MODEL:
+        return
+    try:
+        proc = subprocess.run(
+            [CLAUDE_BIN, "-p", "--model", NAMING_MODEL, "--output-format", "text"],
+            input=("Write a terse 3-6 word title for this conversation. "
+                   "Reply with the title only — no quotes, no punctuation at the end.\n\n"
+                   f"User: {prompt[:500]}\n\nAssistant: {reply[:500]}"),
+            capture_output=True, text=True, timeout=60, cwd=CLAUDE_CWD, env=claude_env())
+        title = proc.stdout.strip().strip("\"'").splitlines()
+        title = title[0].strip()[:60] if title else ""
+        if title:
+            store.update(key, title=title)
+            log.info("named thread %s: %r", key, title)
+    except Exception:
+        log.exception("naming failed for %s", key)
 
 
 # --- Terminal handoff ---------------------------------------------------------
@@ -507,7 +528,8 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             lines = []
             for k, v in sorted(entries.items(), key=lambda kv: -kv[1].get("updated", 0))[:20]:
                 ch, ts = k.split(":", 1)
-                link = f"<https://slack.com/archives/{ch}/p{ts.replace('.', '')}|thread>"
+                name = v.get("title") or "thread"
+                link = f"<https://slack.com/archives/{ch}/p{ts.replace('.', '')}|{name}>"
                 lines.append(f"• {link} — {v.get('turns', 0)} turns, ${v.get('cost', 0):.2f}, {fmt_age(v.get('updated', 0))}")
             say(text=f"*Active sessions ({len(entries)}):*\n" + "\n".join(lines), thread_ts=thread_ts)
     else:
@@ -540,7 +562,9 @@ def handle_web_message(payload: dict) -> dict:
     """
     key = payload.get("key", "")
     text = (payload.get("text") or "").strip()
-    if not text or key not in store.all():
+    # Key must look like channel:ts. Store membership isn't required — !reset
+    # drops the entry, but the thread remains valid and messages recreate it.
+    if not text or ":" not in key or not re.fullmatch(r"[A-Z0-9]+:[0-9.]+", key):
         return {"ok": False, "error": "unknown thread or empty message"}
     channel, thread_ts = key.split(":", 1)
 
@@ -595,7 +619,7 @@ def handle_register_terminal(payload: dict) -> dict:
     ts = resp["ts"]
     key = f"{channel}:{ts}"
     store.update(key, session_id=sid, cwd=cwd, checked_out=True,
-                 terminal_live=bool(payload.get("live")))
+                 terminal_live=bool(payload.get("live")), title=title[:60])
     ACTIVE_SESSIONS[sid] = (channel, ts)
     log.info("registered terminal session %s -> %s", sid[:8], key)
     return {"ok": True, "key": key,
@@ -740,6 +764,9 @@ def handle_prompt(event: dict, say, client) -> None:
 
                 store.update(key, session_id=result.session_id, model=entry.get("model"), cwd=str(cwd))
                 store.add_cost(key, result.cost_usd)
+                if session_id is None and not entry.get("title"):
+                    threading.Thread(target=name_thread, args=(key, text, result.text),
+                                     daemon=True, name="namer").start()
                 if result.session_id:
                     ACTIVE_SESSIONS[result.session_id] = (channel, thread_ts)
                 uploaded = upload_outbox(client, outbox, channel, thread_ts, key)

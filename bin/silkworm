@@ -90,37 +90,58 @@ class LaunchdManager:
 </plist>
 """
 
-    def _kill_adhoc(self) -> None:
-        for pattern in ("Silkworm/bot.py", "Silkworm/visualizer.py",
-                        f"{REPO}/bot.py", f"{REPO}/visualizer.py"):
-            subprocess.run(["pkill", "-f", pattern], capture_output=True)
+    def _domain(self) -> str:
+        return f"gui/{os.getuid()}"
+
+    def _stop(self, label: str) -> None:
+        subprocess.run(["launchctl", "bootout", f"{self._domain()}/{label}"],
+                       capture_output=True)
+
+    def _start(self, plist: Path) -> None:
+        subprocess.run(["launchctl", "bootstrap", self._domain(), str(plist)], check=True)
+        # From a non-GUI shell (ssh, scripts) launchd may pend the RunAtLoad
+        # spawn — kickstart makes it immediate either way.
+        label = plist.stem
+        subprocess.run(["launchctl", "kickstart", f"{self._domain()}/{label}"],
+                       capture_output=True)
+
+    def _free_ports(self) -> None:
+        """Kill whatever holds our ports — a stale ad-hoc bot/visualizer would
+        otherwise make the launchd copies crash-loop on bind."""
+        for port in (bot_port(), viz_port()):
+            out = subprocess.run(["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                                 capture_output=True, text=True)
+            for pid in out.stdout.split():
+                if pid.strip().isdigit() and int(pid) != os.getpid():
+                    subprocess.run(["kill", pid.strip()], capture_output=True)
 
     def install(self) -> None:
         LOGS.mkdir(exist_ok=True)
         self.AGENTS.mkdir(parents=True, exist_ok=True)
-        self._kill_adhoc()
         for label, (script,) in ((k, tuple(v)) for k, v in self.SERVICES.items()):
             plist = self.AGENTS / f"{label}.plist"
-            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            self._stop(label)
             plist.write_text(self._plist(label, script))
-            subprocess.run(["launchctl", "load", str(plist)], check=True)
+        self._free_ports()
+        for label in self.SERVICES:
+            self._start(self.AGENTS / f"{label}.plist")
             print(f"  {G}✔{N} {label} installed and started")
 
     def uninstall(self) -> None:
         for label in self.SERVICES:
-            plist = self.AGENTS / f"{label}.plist"
-            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
-            plist.unlink(missing_ok=True)
+            self._stop(label)
+            (self.AGENTS / f"{label}.plist").unlink(missing_ok=True)
             print(f"  {G}✔{N} {label} removed")
 
     def restart(self) -> None:
         for label in self.SERVICES:
-            plist = self.AGENTS / f"{label}.plist"
-            if not plist.exists():
+            if not (self.AGENTS / f"{label}.plist").exists():
                 print(f"  {R}✘{N} {label} not installed — run: silkworm install")
                 return
-            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
-            subprocess.run(["launchctl", "load", str(plist)], check=True)
+            self._stop(label)
+        self._free_ports()
+        for label in self.SERVICES:
+            self._start(self.AGENTS / f"{label}.plist")
             print(f"  {G}✔{N} {label} restarted")
 
     def loaded(self, label: str) -> bool:
