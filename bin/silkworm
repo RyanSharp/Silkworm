@@ -4,6 +4,8 @@
     silkworm [title] [--dir PATH]   start a tracked Claude session here
     silkworm import                 adopt running claude sessions into Silkworm
     silkworm harvest                run the learning harvester now
+    silkworm learnings sync         commit/pull/push shared learnings via git
+    silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
     silkworm install | uninstall    (un)install the login services (bot + visualizer)
     silkworm status                 health check: services, bot, visualizer, hooks
@@ -45,6 +47,20 @@ def bot_port() -> str:
 
 def viz_port() -> str:
     return os.environ.get("SILKWORM_VIZ_PORT", "8790")
+
+
+DEFAULT_LEARNINGS = REPO / "learnings.json"
+
+
+def learnings_file() -> Path:
+    val = ""
+    try:
+        for line in (REPO / ".env").read_text().splitlines():
+            if line.strip().startswith("LEARNINGS_FILE="):
+                val = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return Path(val).expanduser() if val else DEFAULT_LEARNINGS
 
 
 def bot_call(path: str, payload: dict, timeout: float = 3) -> dict:
@@ -373,6 +389,28 @@ def main() -> None:
                   f"{r.get('added', 0)} new learnings")
         else:
             print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+    elif cmd == "learnings":
+        sub = args[1] if len(args) > 1 else ""
+        lf = learnings_file()
+        if sub == "init":
+            import learnings_git
+            r = learnings_git.init(lf, args[2] if len(args) > 2 else "")
+            if r.get("ok"):
+                print(f"  {G}✔{N} learnings git repo ready at {r['dir']}")
+                if lf != DEFAULT_LEARNINGS:
+                    print(f"  add to .env:  LEARNINGS_FILE={lf}")
+                else:
+                    print(f"  {Y}note:{N} sharing works best with LEARNINGS_FILE pointing at a "
+                          f"dedicated dir; see README.")
+                print("  then: silkworm learnings sync")
+            else:
+                print(f"  {R}✘{N} {r.get('error')}")
+        elif sub == "sync":
+            r = bot_call("/learnings", {"action": "sync"}, timeout=60)
+            mark = f"{G}✔{N}" if r.get("ok") else f"{R}✘{N}"
+            print(f"  {mark} {r.get('note') or r.get('error') or 'bot unreachable'}")
+        else:
+            print("usage: silkworm learnings [init [remote] | sync]")
     elif cmd == "setup":
         do_setup()
     elif cmd == "doctor":

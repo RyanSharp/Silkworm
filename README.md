@@ -139,12 +139,35 @@ and they're injected into the system prompt of matching sessions:
 !unlearn lrn_ab12cd                        # remove one
 ```
 
-A learning is **global** (every session) or **scoped to a path** — scoped
-learnings apply only to threads whose working directory is under that path, so
-project-specific rules don't leak between repos. Manage them visually from the
-🧠 **Learnings** panel in the visualizer (add, scope, delete). Because a
-thread's directory is stable, the injected block is prompt-cache-friendly — it
-only changes when you edit learnings.
+Mostly, though, you don't write these — a **harvester** does. Every few hours
+(`HARVEST_INTERVAL_H`) it reads each session's *new* activity since it last
+looked and distills durable do/avoid/note learnings with a model
+(`HARVEST_MODEL`), deduped against what's already stored. Run it on demand with
+`silkworm harvest` or the ✨ button in the 🧠 panel.
+
+**Scope is by repository, not path.** A learning is either **global** or scoped
+to a **repo identity** (the normalized `git remote origin`, e.g.
+`github.com/you/app`). Because that identity is shared across every worktree and
+clone of a repo, a learning harvested in one workspace applies to all of them —
+spin up five worktrees of the same repo and they share one body of knowledge.
+Directories without a git remote fall back to path scope.
+
+**Auditing:** the 🧠 **Learnings** panel in the visualizer lists every learning
+with an `auto`/`manual` badge, a link to its source session, and an enable
+toggle — flip one off to stop injecting it without losing the record.
+
+**Sharing across machines (git).** Point `LEARNINGS_FILE` at a file in a git
+repo and Silkworm can sync learnings:
+
+```sh
+silkworm learnings init git@github.com:you/silkworm-learnings.git
+# set LEARNINGS_FILE=~/silkworm-learnings/learnings.json in .env, then:
+silkworm learnings sync        # commit + pull + push (or the ⇅ button)
+```
+
+Concurrent edits from two machines are reconciled by a **union merge** (dedup by
+learning id), so appending on both sides never produces a conflict to resolve by
+hand. Set `LEARNINGS_AUTOSYNC=1` to push automatically after each harvest.
 
 ## Moving a thread to the terminal
 

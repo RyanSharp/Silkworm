@@ -526,7 +526,8 @@ PAGE = r"""<!doctype html>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
     <h2 style="display:flex;align-items:center;gap:12px">🧠 Learnings
-      <button class="ghost" style="font-size:12px" onclick="harvestNow(this)">✨ Harvest now</button></h2>
+      <button class="ghost" style="font-size:12px" onclick="harvestNow(this)">✨ Harvest now</button>
+      <button class="ghost" style="font-size:12px" onclick="syncLearnings(this)">⇅ Sync</button></h2>
     <div class="hint">Auto-distilled from session activity by the harvester, plus any you add
       here. Toggle one off to stop injecting it without losing the record. Global learnings apply
       to every thread; a scope path limits one to threads working under it.</div>
@@ -801,6 +802,13 @@ async function harvestNow(btn) {
   const r = await learnCall({action: "harvest"});
   btn.disabled = false; btn.textContent = "✨ Harvest now";
   toast(r.ok ? `Harvested ${r.added} from ${r.scanned} sessions` : "Failed: " + (r.error || "unknown"));
+  renderLearnings();
+}
+async function syncLearnings(btn) {
+  btn.disabled = true; btn.textContent = "⇅ Syncing…";
+  const r = await learnCall({action: "sync"});
+  btn.disabled = false; btn.textContent = "⇅ Sync";
+  toast(r.ok ? (r.note || "Synced") : "Sync: " + (r.error || "unknown"));
   renderLearnings();
 }
 async function addLearning() {

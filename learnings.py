@@ -19,6 +19,8 @@ import time
 import uuid
 from pathlib import Path
 
+import repos
+
 TYPES = ("do", "avoid", "note")
 _LABELS = {"do": "ALWAYS", "avoid": "NEVER", "note": "CONTEXT"}
 
@@ -90,15 +92,29 @@ class LearningStore:
             return [x["text"] for x in self._data]
 
     def applicable(self, cwd: str) -> list[dict]:
-        """Enabled global learnings + those whose scope is a prefix of cwd."""
+        """Enabled learnings that apply to a session working in cwd.
+
+        A learning applies if it is global, if its scope equals the session's
+        repo identity (shared across all worktrees/clones of that repo), or —
+        for non-repo dirs and legacy path scopes — if cwd is under a path scope.
+        """
         cwd = str(cwd)
+        repo = repos.identity(cwd)
         with self._lock:
             out = [dict(x) for x in self._data
-                   if x.get("enabled", True) and
-                   (not x["scope"] or cwd == x["scope"]
-                    or cwd.startswith(x["scope"].rstrip("/") + "/"))]
+                   if x.get("enabled", True) and _matches(x["scope"], cwd, repo)]
         out.sort(key=lambda x: (TYPES.index(x["type"]), x["created"]))
         return out
+
+
+def _matches(scope: str, cwd: str, repo: str) -> bool:
+    if not scope:
+        return True                       # global
+    if repo and scope == repo:
+        return True                       # same repo identity
+    if scope.startswith("/"):             # path scope (non-repo dirs, legacy)
+        return cwd == scope or cwd.startswith(scope.rstrip("/") + "/")
+    return False
 
 
 def render_block(learnings: list[dict]) -> str:

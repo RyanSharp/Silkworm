@@ -28,6 +28,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import harvester
+import learnings_git
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, run_turn
 from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
@@ -105,7 +106,11 @@ ARTIFACTS_ROOT.mkdir(exist_ok=True)
 
 # --- Shared state -----------------------------------------------------------
 store = SessionStore(BASE_DIR / "sessions.json")
-learnings = LearningStore(BASE_DIR / "learnings.json")
+# LEARNINGS_FILE can point at a file inside a git repo to share across machines.
+LEARNINGS_FILE = Path(os.environ.get("LEARNINGS_FILE", BASE_DIR / "learnings.json")).expanduser()
+LEARNINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+LEARNINGS_AUTOSYNC = os.environ.get("LEARNINGS_AUTOSYNC", "0") not in ("0", "false", "no", "")
+learnings = LearningStore(LEARNINGS_FILE)
 _thread_locks: dict[str, threading.Lock] = {}
 _thread_locks_guard = threading.Lock()
 RUNNING: dict[str, object] = {}          # thread key -> RunHandle
@@ -683,9 +688,15 @@ _harvest_lock = threading.Lock()
 
 def run_harvest() -> dict:
     with _harvest_lock:
-        return harvester.harvest(store, learnings, binary=CLAUDE_BIN,
-                                 model=HARVEST_MODEL, env=claude_env(),
-                                 state_path=HARVEST_STATE)
+        result = harvester.harvest(store, learnings, binary=CLAUDE_BIN,
+                                   model=HARVEST_MODEL, env=claude_env(),
+                                   state_path=HARVEST_STATE)
+    if result.get("added") and LEARNINGS_AUTOSYNC and learnings_git.is_git_backed(LEARNINGS_FILE):
+        try:
+            learnings_git.sync(LEARNINGS_FILE)
+        except Exception:
+            log.exception("auto-sync after harvest failed")
+    return result
 
 
 def handle_learnings(payload: dict) -> dict:
@@ -707,6 +718,12 @@ def handle_learnings(payload: dict) -> dict:
             return {"ok": True, **run_harvest()}
         except Exception as e:
             log.exception("manual harvest failed")
+            return {"ok": False, "error": str(e)}
+    if action == "sync":
+        try:
+            return learnings_git.sync(LEARNINGS_FILE)
+        except Exception as e:
+            log.exception("learnings sync failed")
             return {"ok": False, "error": str(e)}
     # list (optionally filtered to a thread's cwd)
     cwd = payload.get("cwd")

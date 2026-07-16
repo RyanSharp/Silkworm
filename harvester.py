@@ -14,6 +14,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import repos
+
 log = logging.getLogger("silkworm.harvester")
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -140,12 +142,15 @@ def harvest(store, learnings, *, binary: str, model: str, env: dict,
         scanned += 1
         items = _extract(binary, model, env, learnings.texts(), convo)
         cwd = entry.get("cwd", "")
+        # Prefer the repo identity so worktrees/clones of the same repo share
+        # the learning; fall back to the cwd path for non-repo directories.
+        project_scope = repos.identity(cwd) or cwd
         for it in items:
             ltype = str(it.get("type", "")).lower()
             text = str(it.get("text", "")).strip()
             if ltype not in ("do", "avoid", "note") or not text:
                 continue
-            scope = cwd if str(it.get("scope", "")).lower() == "project" and cwd else ""
+            scope = project_scope if str(it.get("scope", "")).lower() == "project" else ""
             rec = learnings.add_deduped(ltype, text, scope,
                                         origin="harvest", source=key)
             if rec:
