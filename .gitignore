@@ -7,3 +7,4 @@ outbox/
 logs/
 artifacts/
 learnings.json
+harvest_state.json

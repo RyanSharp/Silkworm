@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import harvester
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, run_turn
 from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
@@ -47,6 +48,8 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "900"))
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
+HARVEST_MODEL = os.environ.get("HARVEST_MODEL", "sonnet")
+HARVEST_INTERVAL_H = float(os.environ.get("HARVEST_INTERVAL_H", "6"))  # 0 disables auto-harvest
 
 # skip  = --dangerously-skip-permissions (full autonomy)
 # slack = gated: every non-trivial tool call posts Approve/Deny buttons
@@ -674,8 +677,19 @@ def handle_register_terminal(payload: dict) -> dict:
             "link": f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"}
 
 
+HARVEST_STATE = BASE_DIR / "harvest_state.json"
+_harvest_lock = threading.Lock()
+
+
+def run_harvest() -> dict:
+    with _harvest_lock:
+        return harvester.harvest(store, learnings, binary=CLAUDE_BIN,
+                                 model=HARVEST_MODEL, env=claude_env(),
+                                 state_path=HARVEST_STATE)
+
+
 def handle_learnings(payload: dict) -> dict:
-    """Route for /learnings — CRUD from the visualizer (localhost-trusted)."""
+    """Route for /learnings — CRUD + harvest from the visualizer (localhost-trusted)."""
     action = payload.get("action")
     if action == "add":
         try:
@@ -686,6 +700,14 @@ def handle_learnings(payload: dict) -> dict:
             return {"ok": False, "error": str(e)}
     if action == "delete":
         return {"ok": learnings.delete(payload.get("id", ""))}
+    if action == "toggle":
+        return {"ok": learnings.set_enabled(payload.get("id", ""), bool(payload.get("enabled")))}
+    if action == "harvest":
+        try:
+            return {"ok": True, **run_harvest()}
+        except Exception as e:
+            log.exception("manual harvest failed")
+            return {"ok": False, "error": str(e)}
     # list (optionally filtered to a thread's cwd)
     cwd = payload.get("cwd")
     return {"ok": True, "learnings": learnings.applicable(cwd) if cwd else learnings.all()}
@@ -917,9 +939,22 @@ def _sweeper() -> None:
         time.sleep(6 * 3600)
 
 
+def _harvester() -> None:
+    if HARVEST_INTERVAL_H <= 0:
+        return
+    time.sleep(120)  # let the bot settle after boot before the first pass
+    while True:
+        try:
+            run_harvest()
+        except Exception:
+            log.exception("scheduled harvest failed")
+        time.sleep(HARVEST_INTERVAL_H * 3600)
+
+
 if __name__ == "__main__":
     reconcile_checkouts()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
+    threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))

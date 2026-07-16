@@ -3,6 +3,7 @@
 
     silkworm [title] [--dir PATH]   start a tracked Claude session here
     silkworm import                 adopt running claude sessions into Silkworm
+    silkworm harvest                run the learning harvester now
     silkworm setup                  first-run bootstrap: deps, hooks, services
     silkworm install | uninstall    (un)install the login services (bot + visualizer)
     silkworm status                 health check: services, bot, visualizer, hooks
@@ -364,6 +365,14 @@ def main() -> None:
     if cmd == "import":
         print(f"{WORM} importing running claude sessions…")
         do_import()
+    elif cmd == "harvest":
+        print(f"{WORM} harvesting learnings from new session activity…")
+        r = bot_call("/learnings", {"action": "harvest"}, timeout=600)
+        if r.get("ok"):
+            print(f"  {G}✔{N} {r.get('scanned', 0)} sessions scanned · "
+                  f"{r.get('added', 0)} new learnings")
+        else:
+            print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
     elif cmd == "setup":
         do_setup()
     elif cmd == "doctor":

@@ -482,8 +482,13 @@ PAGE = r"""<!doctype html>
   .lrow .t.note { background: #2D9FD022; color: #2D9FD0; }
   .lrow .body { flex: 1; }
   .lrow .scope { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .lrow.off { opacity: .45; }
   .lrow .del { cursor: pointer; color: var(--muted); border: 0; background: none; font-size: 15px; }
   .lrow .del:hover { color: #D8517F; }
+  .lrow .tog { cursor: pointer; border: 0; background: none; font-size: 15px; flex: none; }
+  .lrow .origin { font-family: var(--mono); font-size: 10px; padding: 1px 6px; border-radius: 5px;
+                  flex: none; border: 1px solid var(--line); color: var(--muted); }
+  .lrow .origin.harvest { color: var(--gold); border-color: #C08A1C66; }
 </style>
 </head>
 <body>
@@ -520,12 +525,14 @@ PAGE = r"""<!doctype html>
 <div id="toast"></div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
-    <h2>🧠 Learnings</h2>
-    <div class="hint">Injected into session system prompts. Global learnings apply to every thread;
-      a scope path limits a learning to threads whose working directory is under it.</div>
+    <h2 style="display:flex;align-items:center;gap:12px">🧠 Learnings
+      <button class="ghost" style="font-size:12px" onclick="harvestNow(this)">✨ Harvest now</button></h2>
+    <div class="hint">Auto-distilled from session activity by the harvester, plus any you add
+      here. Toggle one off to stop injecting it without losing the record. Global learnings apply
+      to every thread; a scope path limits one to threads working under it.</div>
     <div class="lform">
       <select id="ltype"><option value="do">always</option><option value="avoid">never</option><option value="note">context</option></select>
-      <input class="text" id="ltext" placeholder="e.g. run pytest, never unittest">
+      <input class="text" id="ltext" placeholder="add one manually…">
       <input class="scope" id="lscope" placeholder="scope path (blank = global)">
       <button class="act" onclick="addLearning()">Add</button>
     </div>
@@ -773,11 +780,28 @@ async function renderLearnings() {
   const r = await learnCall({action: "list"});
   const list = document.getElementById("llist");
   const items = r.learnings || [];
-  if (!items.length) { list.innerHTML = `<div class="hint">No learnings yet.</div>`; return; }
-  list.innerHTML = items.map(x =>
-    `<div class="lrow"><span class="t ${x.type}">${x.type}</span>
-       <span class="body">${esc(x.text)}<div class="scope">${x.scope ? "📁 " + esc(x.scope) : "🌍 global"} · ${x.id}</div></span>
-       <button class="del" title="delete" onclick="delLearning('${x.id}')">✕</button></div>`).join("");
+  if (!items.length) { list.innerHTML = `<div class="hint">No learnings yet — run a few sessions, then Harvest.</div>`; return; }
+  list.innerHTML = items.map(x => {
+    const on = x.enabled !== false;
+    const src = x.source && x.source.includes(":")
+      ? `<a href="https://slack.com/archives/${x.source.replace(":", "/p").replace(".", "")}" target="_blank">source</a>` : "";
+    return `<div class="lrow ${on ? "" : "off"}">
+      <button class="tog" title="${on ? "disable" : "enable"}" onclick="toggleLearning('${x.id}', ${!on})">${on ? "🟢" : "⚪️"}</button>
+      <span class="t ${x.type}">${x.type}</span>
+      <span class="origin ${x.origin === "harvest" ? "harvest" : ""}">${x.origin === "harvest" ? "auto" : "manual"}</span>
+      <span class="body">${esc(x.text)}<div class="scope">${x.scope ? "📁 " + esc(x.scope) : "🌍 global"} · ${x.id} ${src}</div></span>
+      <button class="del" title="delete" onclick="delLearning('${x.id}')">✕</button></div>`;
+  }).join("");
+}
+async function toggleLearning(id, enabled) {
+  await learnCall({action: "toggle", id, enabled}); renderLearnings();
+}
+async function harvestNow(btn) {
+  btn.disabled = true; btn.textContent = "✨ Harvesting…";
+  const r = await learnCall({action: "harvest"});
+  btn.disabled = false; btn.textContent = "✨ Harvest now";
+  toast(r.ok ? `Harvested ${r.added} from ${r.scanned} sessions` : "Failed: " + (r.error || "unknown"));
+  renderLearnings();
 }
 async function addLearning() {
   const text = document.getElementById("ltext").value.trim();
