@@ -29,6 +29,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, run_turn
+from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
 from localserver import LocalServer
 from store import SessionStore
 
@@ -101,6 +102,7 @@ ARTIFACTS_ROOT.mkdir(exist_ok=True)
 
 # --- Shared state -----------------------------------------------------------
 store = SessionStore(BASE_DIR / "sessions.json")
+learnings = LearningStore(BASE_DIR / "learnings.json")
 _thread_locks: dict[str, threading.Lock] = {}
 _thread_locks_guard = threading.Lock()
 RUNNING: dict[str, object] = {}          # thread key -> RunHandle
@@ -440,6 +442,9 @@ HELP = """*Commands* (send inside a thread):
 • `!reset` / `!new` — start this thread's session over
 • `!model <alias>` — switch this thread's model (`opus`, `sonnet`, `haiku`, …); `!model reset` for default
 • `!stop` — kill the currently running turn in this thread
+• `!learn do|avoid|note <text>` — add a learning for threads in this dir; prefix `global` for everywhere
+• `!learnings` — show learnings that apply to this thread
+• `!unlearn <id>` — remove a learning
 • `!terminal` — check this thread out to your terminal (Slack messages held until you're done)
 • `!back` — reclaim a checked-out thread for Slack
 • `!takeover` — force-close the live terminal session and reclaim the thread
@@ -478,6 +483,49 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             else:
                 store.update(key, model=choice)
                 say(text=f"This thread now uses `{choice}`.", thread_ts=thread_ts)
+    elif lower.startswith("!learn") and not lower.startswith("!learnings"):
+        entry = store.get(key) or {}
+        cwd = entry.get("cwd") or str(CLAUDE_CWD)
+        rest = cmd[len("!learn"):].strip()
+        scope = cwd
+        if rest.lower().startswith("global"):
+            rest = rest[len("global"):].strip()
+            scope = ""
+        parts = rest.split(None, 1)
+        ltype = parts[0].lower() if parts else ""
+        body = parts[1].strip() if len(parts) > 1 else ""
+        if ltype not in LEARNING_TYPES or not body:
+            say(text="Usage: `!learn do|avoid|note <text>` (add `global` before the type "
+                     "to apply everywhere). Example: `!learn avoid force-push to main`.",
+                thread_ts=thread_ts)
+        else:
+            rec = learnings.add(ltype, body, scope, source=key)
+            where = "everywhere" if not scope else f"threads under `{scope}`"
+            say(text=f":brain: Learned ({ltype}, {where}): {body}\n_`{rec['id']}` — remove with "
+                     f"`!unlearn {rec['id']}`. Applies to new turns in matching threads._",
+                thread_ts=thread_ts)
+    elif lower == "!learnings":
+        entry = store.get(key) or {}
+        cwd = entry.get("cwd") or str(CLAUDE_CWD)
+        applic = learnings.applicable(cwd)
+        if not applic:
+            say(text="No learnings apply to this thread yet. Add one with "
+                     "`!learn do|avoid|note <text>`.", thread_ts=thread_ts)
+        else:
+            lines = []
+            for x in applic:
+                tag = "🌍" if not x["scope"] else "📁"
+                lines.append(f"{tag} *{x['type']}* — {x['text']}  `{x['id']}`")
+            say(text=f"*Learnings for this thread ({len(applic)}):*\n" + "\n".join(lines),
+                thread_ts=thread_ts)
+    elif lower.startswith("!unlearn"):
+        parts = cmd.split(None, 1)
+        if len(parts) < 2:
+            say(text="Usage: `!unlearn <id>` (get the id from `!learnings`).", thread_ts=thread_ts)
+        elif learnings.delete(parts[1].strip()):
+            say(text=":wastebasket: Removed.", thread_ts=thread_ts)
+        else:
+            say(text="No learning with that id.", thread_ts=thread_ts)
     elif lower in ("!terminal", "!handoff"):
         entry = store.get(key)
         if not entry or not entry.get("session_id"):
@@ -626,11 +674,29 @@ def handle_register_terminal(payload: dict) -> dict:
             "link": f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"}
 
 
+def handle_learnings(payload: dict) -> dict:
+    """Route for /learnings — CRUD from the visualizer (localhost-trusted)."""
+    action = payload.get("action")
+    if action == "add":
+        try:
+            rec = learnings.add(payload.get("type", ""), payload.get("text", ""),
+                                payload.get("scope", ""), source="web")
+            return {"ok": True, "learning": rec}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+    if action == "delete":
+        return {"ok": learnings.delete(payload.get("id", ""))}
+    # list (optionally filtered to a thread's cwd)
+    cwd = payload.get("cwd")
+    return {"ok": True, "learnings": learnings.applicable(cwd) if cwd else learnings.all()}
+
+
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
 server.route("/web-message", handle_web_message)
 server.route("/register-terminal", handle_register_terminal)
+server.route("/learnings", handle_learnings)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -719,6 +785,9 @@ def handle_prompt(event: dict, say, client) -> None:
         f"If you create a file the user should receive, copy it into {outbox} "
         "and it will be uploaded to the Slack thread automatically."
     )
+    learn_block = render_block(learnings.applicable(str(cwd)))
+    if learn_block:
+        system_note += "\n\n" + learn_block
 
     progress = ProgressMessage(client, channel, thread_ts)
     lock = _thread_lock(key)

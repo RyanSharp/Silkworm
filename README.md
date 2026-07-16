@@ -42,6 +42,8 @@ Claude Code session**.
 | `!reset` / `!new` | Start this thread's session over |
 | `!model <alias>` / `!model reset` | Switch this thread's model |
 | `!stop` | Kill the currently running turn |
+| `!learn do\|avoid\|note <text>` | Add a learning (prefix `global` for all threads) |
+| `!learnings` / `!unlearn <id>` | List / remove learnings |
 | `!terminal` | Get the command to continue this thread in your terminal |
 | `!stats` | This thread's session info (model, turns, cost) |
 | `!sessions` | List all active thread sessions |
@@ -123,6 +125,26 @@ to the bot on `127.0.0.1:8787`; the bot posts Approve/Deny buttons in the
 thread and blocks until someone clicks (default-deny after `APPROVAL_TIMEOUT`).
 Read-only tools in `APPROVAL_AUTO_ALLOW` skip the buttons. Fails closed: if the
 bot or hook is unreachable, the tool is denied.
+
+## Learnings
+
+Teach Silkworm things to **always do**, **never do**, or just **keep in mind**,
+and they're injected into the system prompt of matching sessions:
+
+```
+!learn avoid force-push to main            # applies to threads working in this dir
+!learn do run pytest, never unittest
+!learn global do reply concisely in Slack  # applies everywhere
+!learnings                                 # what applies to this thread
+!unlearn lrn_ab12cd                        # remove one
+```
+
+A learning is **global** (every session) or **scoped to a path** — scoped
+learnings apply only to threads whose working directory is under that path, so
+project-specific rules don't leak between repos. Manage them visually from the
+🧠 **Learnings** panel in the visualizer (add, scope, delete). Because a
+thread's directory is stable, the injected block is prompt-cache-friendly — it
+only changes when you edit learnings.
 
 ## Moving a thread to the terminal
 

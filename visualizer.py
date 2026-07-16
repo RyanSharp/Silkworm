@@ -300,9 +300,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
         if url.path == "/api/send":
             answer = bot_call("/web-message", payload, timeout=3)
-            if not answer:
-                answer = {"ok": False, "error": "bot is offline"}
-            self._json(answer)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/learnings":
+            answer = bot_call("/learnings", payload, timeout=3)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -461,6 +462,28 @@ PAGE = r"""<!doctype html>
   #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
            background: #1E0620; border: 1px solid var(--gold); color: var(--ink);
            border-radius: 8px; padding: 8px 16px; font-size: 13px; display: none; z-index: 30; }
+
+  #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
+                display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; }
+  #learnmodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+                     width: 720px; max-width: 100%; max-height: 80vh; overflow-y: auto; padding: 20px 22px; }
+  #learnmodal h2 { margin: 0 0 4px; font-size: 18px; }
+  #learnmodal .hint { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  .lform { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+  .lform select, .lform input { background: var(--panel); color: var(--ink);
+        border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 14px; }
+  .lform input.text { flex: 1; min-width: 200px; }
+  .lform input.scope { width: 230px; font-family: var(--mono); font-size: 12px; }
+  .lrow { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0;
+          border-bottom: 1px solid var(--line2); font-size: 14px; }
+  .lrow .t { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 6px; flex: none; }
+  .lrow .t.do { background: #2EB67D22; color: #2EB67D; }
+  .lrow .t.avoid { background: #D8517F22; color: #D8517F; }
+  .lrow .t.note { background: #2D9FD022; color: #2D9FD0; }
+  .lrow .body { flex: 1; }
+  .lrow .scope { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .lrow .del { cursor: pointer; color: var(--muted); border: 0; background: none; font-size: 15px; }
+  .lrow .del:hover { color: #D8517F; }
 </style>
 </head>
 <body>
@@ -476,6 +499,7 @@ PAGE = r"""<!doctype html>
   </svg>
   <h1>Silkworm sessions</h1>
   <span id="botdot" title="bot status"></span>
+  <button class="ghost" style="margin-left:16px" onclick="toggleLearn()">🧠 Learnings</button>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
 </header>
 <div id="searchresults"></div>
@@ -494,6 +518,20 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="tip"></div>
 <div id="toast"></div>
+<div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
+  <div class="box">
+    <h2>🧠 Learnings</h2>
+    <div class="hint">Injected into session system prompts. Global learnings apply to every thread;
+      a scope path limits a learning to threads whose working directory is under it.</div>
+    <div class="lform">
+      <select id="ltype"><option value="do">always</option><option value="avoid">never</option><option value="note">context</option></select>
+      <input class="text" id="ltext" placeholder="e.g. run pytest, never unittest">
+      <input class="scope" id="lscope" placeholder="scope path (blank = global)">
+      <button class="act" onclick="addLearning()">Add</button>
+    </div>
+    <div id="llist"></div>
+  </div>
+</div>
 <script>
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtTok = n => n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(n);
@@ -718,6 +756,41 @@ document.addEventListener("click", e => {
   if (!e.target.closest("#searchresults") && e.target.id !== "search")
     document.getElementById("searchresults").style.display = "none";
 });
+
+// --- learnings ---
+async function learnCall(payload) {
+  return (await (await fetch("/api/learnings", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)})).json());
+}
+function toggleLearn() {
+  const m = document.getElementById("learnmodal");
+  const open = m.style.display !== "flex";
+  m.style.display = open ? "flex" : "none";
+  if (open) { document.getElementById("lscope").value = active ? active.cwd : ""; renderLearnings(); }
+}
+async function renderLearnings() {
+  const r = await learnCall({action: "list"});
+  const list = document.getElementById("llist");
+  const items = r.learnings || [];
+  if (!items.length) { list.innerHTML = `<div class="hint">No learnings yet.</div>`; return; }
+  list.innerHTML = items.map(x =>
+    `<div class="lrow"><span class="t ${x.type}">${x.type}</span>
+       <span class="body">${esc(x.text)}<div class="scope">${x.scope ? "📁 " + esc(x.scope) : "🌍 global"} · ${x.id}</div></span>
+       <button class="del" title="delete" onclick="delLearning('${x.id}')">✕</button></div>`).join("");
+}
+async function addLearning() {
+  const text = document.getElementById("ltext").value.trim();
+  if (!text) return;
+  const r = await learnCall({action: "add", type: document.getElementById("ltype").value,
+    text, scope: document.getElementById("lscope").value.trim()});
+  if (r.ok) { document.getElementById("ltext").value = ""; renderLearnings(); toast("Learning added"); }
+  else toast("Failed: " + (r.error || "unknown"));
+}
+async function delLearning(id) {
+  const r = await learnCall({action: "delete", id});
+  if (r.ok) renderLearnings();
+}
 
 // --- polling ---
 loadList(); loadStats();

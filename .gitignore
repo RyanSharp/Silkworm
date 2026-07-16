@@ -6,3 +6,4 @@ workspace/
 outbox/
 logs/
 artifacts/
+learnings.json

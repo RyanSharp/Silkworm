@@ -107,10 +107,16 @@ class LaunchdManager:
 
     def _free_ports(self) -> None:
         """Kill whatever holds our ports — a stale ad-hoc bot/visualizer would
-        otherwise make the launchd copies crash-loop on bind."""
+        otherwise make the launchd copies crash-loop on bind. Best-effort."""
+        lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+        if not os.path.exists(lsof):
+            return
         for port in (bot_port(), viz_port()):
-            out = subprocess.run(["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
-                                 capture_output=True, text=True)
+            try:
+                out = subprocess.run([lsof, "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                                     capture_output=True, text=True)
+            except OSError:
+                return
             for pid in out.stdout.split():
                 if pid.strip().isdigit() and int(pid) != os.getpid():
                     subprocess.run(["kill", pid.strip()], capture_output=True)
