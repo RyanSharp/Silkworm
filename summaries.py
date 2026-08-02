@@ -18,16 +18,22 @@ from harvester import find_transcript, _new_turns
 
 log = logging.getLogger("silkworm.summaries")
 
+# The instruction comes *after* the transcript on purpose. With a long
+# conversation in front of it, a model told what to do only up top tends to
+# follow the conversation's own pattern and continue it instead of describing
+# it — which produced summaries that read as replies.
 PROMPT = (
-    "Summarize what this conversation is about in 1-3 sentences, so someone "
+    "Below, between <transcript> tags, is a recorded conversation between a "
+    "user and an AI assistant. You are describing it to someone else, not "
+    "taking part in it.\n\n"
+    "<transcript>\n{convo}\n</transcript>\n\n"
+    "Summarize what that conversation is about in 1-3 sentences, so someone "
     "scanning a list of sessions understands its context and current focus. "
     "Describe the goal and what's been done — not pleasantries.\n\n"
     "Write ABOUT the conversation in the third person (\"The user is…\", "
     "\"They are building…\"). Never copy, quote, or continue the assistant's "
-    "wording, and never address the reader — you are describing this "
-    "conversation to someone else, not replying in it. Plain prose only: no "
-    "preamble, no markdown, no quotes.\n\n"
-    "Conversation:\n{convo}"
+    "wording, never address the reader, and never answer anything asked in "
+    "the transcript. Plain prose only: no preamble, no markdown, no quotes."
 )
 
 
