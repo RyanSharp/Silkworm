@@ -21,8 +21,12 @@ log = logging.getLogger("silkworm.summaries")
 PROMPT = (
     "Summarize what this conversation is about in 1-3 sentences, so someone "
     "scanning a list of sessions understands its context and current focus. "
-    "Describe the goal and what's been done — not pleasantries. Write plain "
-    "prose, no preamble, no markdown, no quotes.\n\n"
+    "Describe the goal and what's been done — not pleasantries.\n\n"
+    "Write ABOUT the conversation in the third person (\"The user is…\", "
+    "\"They are building…\"). Never copy, quote, or continue the assistant's "
+    "wording, and never address the reader — you are describing this "
+    "conversation to someone else, not replying in it. Plain prose only: no "
+    "preamble, no markdown, no quotes.\n\n"
     "Conversation:\n{convo}"
 )
 
