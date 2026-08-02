@@ -214,6 +214,62 @@ class ProgressMessage:
             self.ts = None
 
 
+WORKING, DONE, FAILED = "hourglass", "white_check_mark", "bangbang"
+
+
+class ThreadReactions:
+    """Status reactions on the thread parent and the message being answered.
+
+    The parent carries the thread's *current* state, so a new turn clears the
+    last outcome before working; each answered message keeps its own result
+    permanently, as a record of how that turn went.
+    """
+
+    def __init__(self, client, channel: str, thread_ts: str, msg_ts: str | None):
+        self.client = client
+        self.channel = channel
+        self.parent = thread_ts
+        # In a DM the first message *is* the thread parent — reacting to both
+        # would double up on one message. Web-relayed prompts have no real ts.
+        self.msg = msg_ts if msg_ts and msg_ts != thread_ts else None
+
+    def _apply(self, ts: str | None, add: str | None = None, remove: tuple = ()) -> None:
+        if not ts:
+            return
+        for name in remove:
+            self._call(self.client.reactions_remove, ts, name)
+        if add:
+            self._call(self.client.reactions_add, ts, name=add)
+
+    def _call(self, fn, ts: str, name: str) -> None:
+        try:
+            fn(channel=self.channel, timestamp=ts, name=name)
+        except Exception as e:
+            # already_reacted / no_reaction just mean we're already in the
+            # desired state; message_not_found means the message is gone.
+            err = getattr(getattr(e, "response", None), "data", {}) or {}
+            if err.get("error") not in ("already_reacted", "no_reaction",
+                                        "message_not_found"):
+                log.debug("reaction %s on %s failed: %s", name, ts, e)
+
+    def working(self) -> None:
+        self._apply(self.parent, add=WORKING, remove=(DONE,))
+        self._apply(self.msg, add=WORKING)
+
+    def done(self) -> None:
+        self._apply(self.parent, add=DONE, remove=(WORKING, FAILED))
+        self._apply(self.msg, add=DONE, remove=(WORKING,))
+
+    def failed(self) -> None:
+        self._apply(self.parent, add=FAILED, remove=(WORKING,))
+        self._apply(self.msg, add=FAILED, remove=(WORKING,))
+
+    def cleared(self) -> None:
+        """Neither outcome — e.g. the user stopped the turn."""
+        self._apply(self.parent, remove=(WORKING,))
+        self._apply(self.msg, remove=(WORKING,))
+
+
 # --- Permission / approval plumbing ----------------------------------------
 
 def permission_args() -> list[str]:
@@ -829,6 +885,9 @@ def handle_prompt(event: dict, say, client) -> None:
         system_note += "\n\n" + learn_block
 
     progress = ProgressMessage(client, channel, thread_ts)
+    reactions = ThreadReactions(client, channel, thread_ts,
+                                None if event.get("_web") else msg_ts)
+    reactions.working()
     lock = _thread_lock(key)
     if lock.locked():
         progress.update(":hourglass_flowing_sand: _Queued behind an earlier message in this thread…_")
@@ -892,14 +951,18 @@ def handle_prompt(event: dict, say, client) -> None:
 
         if uploaded:
             log.info("uploaded %d file(s) from outbox for %s", uploaded, key)
+        reactions.done()
 
     except ClaudeStopped:
         progress.finalize(":octagonal_sign: Stopped.")
+        reactions.cleared()
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
+        reactions.failed()
     except Exception:
         log.exception("unhandled error in thread %s", key)
         progress.finalize(":warning: Something went wrong — check the bot logs.")
+        reactions.failed()
     finally:
         RUNNING.pop(key, None)
 
