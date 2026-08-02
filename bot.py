@@ -29,6 +29,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import harvester
 import learnings_git
+import procs
 import recovery
 import summaries
 from approvals import ApprovalManager, describe_tool
@@ -341,11 +342,7 @@ def kill_terminal(session_id: str) -> bool:
     Completed turns are already persisted in the session log, so this only
     loses an in-flight generation. Returns True if a process was killed.
     """
-    if not session_id:
-        return False
-    out = subprocess.run(["pgrep", "-f", f"claude.*{session_id}"],
-                         capture_output=True, text=True)
-    pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    pids = procs.session_pids(session_id)
     if not pids:
         return False
     for pid in pids:

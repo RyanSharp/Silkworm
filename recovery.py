@@ -15,16 +15,17 @@ instead. Either way the thread ends in a truthful state rather than a stuck one.
 
 import json
 import logging
-import subprocess
 import time
 from datetime import datetime, timezone
 
+import procs
 from harvester import find_transcript
 
 log = logging.getLogger("silkworm.recovery")
 
-WAIT_S = 600      # how long to keep waiting on a still-running orphan
+WAIT_S = 3600     # cap on waiting for a still-running orphan
 POLL_S = 5
+STILL_RUNNING = object()  # sentinel: gave up waiting, but the turn is genuinely live
 
 
 def now_iso() -> str:
@@ -58,11 +59,7 @@ def clear_pending(store, key: str) -> None:
 
 
 def _claude_alive(session_id: str) -> bool:
-    if not session_id:
-        return False
-    out = subprocess.run(["pgrep", "-f", f"claude.*{session_id}"],
-                         capture_output=True, text=True)
-    return bool(out.stdout.split())
+    return procs.session_alive(session_id)
 
 
 def final_reply(path, since_iso: str) -> str:
@@ -91,19 +88,21 @@ def final_reply(path, since_iso: str) -> str:
     return latest
 
 
-def _await_reply(session_id: str, since_iso: str, wait_s: int) -> str:
-    """Poll the transcript for a reply, while the orphaned child still lives."""
+def _await_reply(session_id: str, since_iso: str, wait_s: int):
+    """Wait for the orphaned child to finish, then read its reply.
+
+    Only a *finished* child gives a trustworthy answer: while it is still
+    running, the newest assistant message is mid-turn narration, not the reply.
+    So if the wait cap is hit with the child still alive we return
+    STILL_RUNNING and leave the turn pending rather than posting a fragment.
+    """
     deadline = time.time() + wait_s
     while True:
         path = find_transcript(session_id) if session_id else None
-        if path:
-            text = final_reply(path, since_iso)
-            if text and not _claude_alive(session_id):
-                return text          # finished and written
         if not _claude_alive(session_id):
             return final_reply(path, since_iso) if path else ""
         if time.time() >= deadline:
-            return final_reply(path, since_iso) if path else ""
+            return STILL_RUNNING
         time.sleep(POLL_S)
 
 
@@ -114,7 +113,7 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
     message, `reactions_for(channel, thread_ts, msg_ts)` builds a
     ThreadReactions, and `say(channel, thread_ts, text)` posts a fresh message.
     """
-    stats = {"recovered": 0, "interrupted": 0}
+    stats = {"recovered": 0, "interrupted": 0, "still_running": 0}
     for key, entry in store.all().items():
         pending = entry.get("pending")
         if not pending:
@@ -129,6 +128,12 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
         except Exception:
             log.exception("recovery read failed for %s", key)
             text = ""
+        if text is STILL_RUNNING:
+            # Genuinely mid-turn after a long wait: the ⏳ is accurate, so leave
+            # the marker in place for the next start rather than guessing.
+            log.warning("gave up waiting on %s — turn still running, left pending", key)
+            stats["still_running"] += 1
+            continue
 
         rx = reactions_for(channel, thread_ts, pending.get("msg_ts"))
         note = ("_:leftwards_arrow_with_hook: Recovered after a restart — "
@@ -156,7 +161,7 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
         finally:
             clear_pending(store, key)
 
-    if stats["recovered"] or stats["interrupted"]:
-        log.info("recovery: %d reply/replies recovered, %d interrupted",
-                 stats["recovered"], stats["interrupted"])
+    if any(stats.values()):
+        log.info("recovery: %d recovered, %d interrupted, %d still running",
+                 stats["recovered"], stats["interrupted"], stats["still_running"])
     return stats
