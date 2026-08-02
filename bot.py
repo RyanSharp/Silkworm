@@ -140,6 +140,25 @@ def _dedup(channel: str, ts: str) -> bool:
     return False
 
 
+def _already_handled(key: str, msg_ts: str) -> bool:
+    """True if this thread has already started a turn for this message.
+
+    _seen_events only lives as long as the process, so an event Slack
+    redelivers after a restart (its ack died with the old process) looks new
+    and runs a second time. Message timestamps within a thread only move
+    forward, so anything at or behind the last one we picked up is a
+    redelivery. The watermark is written when a turn *starts*, which is safe
+    because recovery.py delivers the reply if that turn is cut short.
+    """
+    last = (store.get(key) or {}).get("last_msg_ts")
+    if not last:
+        return False
+    try:
+        return float(msg_ts) <= float(last)
+    except (TypeError, ValueError):
+        return False
+
+
 # --- Slack formatting -------------------------------------------------------
 MENTION_RE = re.compile(r"<@[UW][A-Z0-9]+>")
 
@@ -859,6 +878,9 @@ def handle_prompt(event: dict, say, client) -> None:
 
     if _dedup(channel, msg_ts):
         return
+    if not event.get("_web") and _already_handled(key, msg_ts):
+        log.info("ignoring redelivered message %s on %s", msg_ts, key)
+        return
     if ALLOWED_USERS and not event.get("_web") and user not in ALLOWED_USERS:
         say(text="Sorry, you're not on this bot's allowlist.", thread_ts=thread_ts)
         return
@@ -938,6 +960,8 @@ def handle_prompt(event: dict, say, client) -> None:
             recovery.mark_pending(store, key, msg_ts=reactions.msg,
                                   progress_ts=progress.ts,
                                   session_id=session_id, prompt=text)
+            if not event.get("_web"):  # web prompts have a synthetic ts
+                store.update(key, last_msg_ts=msg_ts)
 
             def on_init(sid: str) -> None:
                 ACTIVE_SESSIONS[sid] = (channel, thread_ts)

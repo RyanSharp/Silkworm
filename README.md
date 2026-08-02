@@ -207,6 +207,13 @@ note that it was recovered. If the turn produced nothing, it says so and clears
 the ⏳ instead of leaving the thread looking busy forever. Either way no thread
 is left stuck, and `silkworm restart` is safe to run at any time.
 
+The other half of a restart is Slack **redelivering** an event whose ack died
+with the old process. Each thread records the timestamp of the last message it
+picked up, and since timestamps within a thread only move forward, anything at
+or behind that mark is a redelivery and is ignored — so a restart can't run the
+same message twice. The two work together: the watermark suppresses the
+duplicate run, recovery supplies the reply the interrupted run owed you.
+
 ## Moving a thread to the terminal
 
 Every thread is a normal Claude Code session, so it works both ways: send
