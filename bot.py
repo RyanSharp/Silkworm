@@ -29,6 +29,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import harvester
 import learnings_git
+import recovery
+import summaries
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, run_turn
 from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
@@ -49,6 +51,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "900"))
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "haiku")  # empty string disables
 HARVEST_MODEL = os.environ.get("HARVEST_MODEL", "sonnet")
 HARVEST_INTERVAL_H = float(os.environ.get("HARVEST_INTERVAL_H", "6"))  # 0 disables auto-harvest
 
@@ -313,6 +316,21 @@ def name_thread(key: str, prompt: str, reply: str) -> None:
             log.info("named thread %s: %r", key, title)
     except Exception:
         log.exception("naming failed for %s", key)
+
+
+def refresh_summary(key: str) -> None:
+    """Re-summarize a thread in the background after a turn completes."""
+    if not SUMMARY_MODEL:
+        return
+
+    def run():
+        try:
+            summaries.summarize_one(store, key, binary=CLAUDE_BIN,
+                                    model=SUMMARY_MODEL, env=claude_env())
+        except Exception:
+            log.exception("summary refresh failed for %s", key)
+
+    threading.Thread(target=run, daemon=True, name="summarizer").start()
 
 
 # --- Terminal handoff ---------------------------------------------------------
@@ -786,12 +804,33 @@ def handle_learnings(payload: dict) -> dict:
     return {"ok": True, "learnings": learnings.applicable(cwd) if cwd else learnings.all()}
 
 
+def handle_summaries(payload: dict) -> dict:
+    """Route for /summaries — regenerate thread summaries (localhost-trusted)."""
+    if not SUMMARY_MODEL:
+        return {"ok": False, "error": "SUMMARY_MODEL is empty (summaries disabled)"}
+    force = bool(payload.get("force"))
+    key = payload.get("key")
+    try:
+        if key:
+            ok = summaries.summarize_one(store, key, binary=CLAUDE_BIN,
+                                         model=SUMMARY_MODEL, env=claude_env(),
+                                         force=True)
+            return {"ok": ok, "summary": (store.get(key) or {}).get("summary", "")}
+        return {"ok": True, **summaries.backfill(store, binary=CLAUDE_BIN,
+                                                 model=SUMMARY_MODEL,
+                                                 env=claude_env(), force=force)}
+    except Exception as e:
+        log.exception("summarize failed")
+        return {"ok": False, "error": str(e)}
+
+
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
 server.route("/web-message", handle_web_message)
 server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
+server.route("/summaries", handle_summaries)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -897,9 +936,17 @@ def handle_prompt(event: dict, say, client) -> None:
             entry = store.get(key) or {}
             session_id = entry.get("session_id")
             log.info("thread=%s session=%s cwd=%s prompt=%r", key, session_id or "NEW", cwd, text[:120])
+            # Recorded before the run so a restart mid-turn can find and finish
+            # it. Inside the lock, so it describes the turn actually running.
+            recovery.mark_pending(store, key, msg_ts=reactions.msg,
+                                  progress_ts=progress.ts,
+                                  session_id=session_id, prompt=text)
 
             def on_init(sid: str) -> None:
                 ACTIVE_SESSIONS[sid] = (channel, thread_ts)
+                # A new session has no id until now; recovery needs it to find
+                # the transcript if this process dies mid-turn.
+                recovery.note_session(store, key, sid)
 
             def on_activity(name: str, tool_input: dict) -> None:
                 progress.update(f":hourglass_flowing_sand: `{name}` {describe_tool(name, tool_input)[:120]}")
@@ -952,6 +999,7 @@ def handle_prompt(event: dict, say, client) -> None:
         if uploaded:
             log.info("uploaded %d file(s) from outbox for %s", uploaded, key)
         reactions.done()
+        refresh_summary(key)
 
     except ClaudeStopped:
         progress.finalize(":octagonal_sign: Stopped.")
@@ -965,6 +1013,7 @@ def handle_prompt(event: dict, say, client) -> None:
         reactions.failed()
     finally:
         RUNNING.pop(key, None)
+        recovery.clear_pending(store, key)
 
 
 @app.event("app_mention")
@@ -1008,6 +1057,32 @@ def reconcile_checkouts() -> None:
             log.info("released stale pre-boot checkout %s", key)
 
 
+def run_recovery() -> dict:
+    """Finish turns the previous process was running when it went away."""
+    def finalize(channel: str, thread_ts: str, ts: str, text: str) -> None:
+        parts = chunk(to_mrkdwn(text))
+        app.client.chat_update(channel=channel, ts=ts, text=parts[0])
+        for part in parts[1:]:
+            app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
+
+    def say(channel: str, thread_ts: str, text: str) -> None:
+        for part in chunk(to_mrkdwn(text)):
+            app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
+
+    def reactions_for(channel: str, thread_ts: str, msg_ts):
+        return ThreadReactions(app.client, channel, thread_ts, msg_ts)
+
+    return recovery.recover(store, finalize=finalize, reactions_for=reactions_for,
+                            say=say)
+
+
+def _recoverer() -> None:
+    try:
+        run_recovery()
+    except Exception:
+        log.exception("startup recovery failed")
+
+
 def _sweeper() -> None:
     while True:
         removed = store.sweep(SESSION_MAX_AGE_DAYS)
@@ -1033,6 +1108,8 @@ def _harvester() -> None:
 
 if __name__ == "__main__":
     reconcile_checkouts()
+    # Background: an orphaned turn may still be writing, so this waits on it.
+    threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",

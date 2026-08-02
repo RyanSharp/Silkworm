@@ -71,6 +71,7 @@ def load_sessions() -> dict:
         out.append({
             "key": key,
             "title": entry.get("title") or "",
+            "summary": entry.get("summary") or "",
             "session_id": sid,
             "model": entry.get("model"),
             "cwd": cwd,
@@ -304,6 +305,10 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/summaries":
+            # Generating a summary runs a model, so allow a generous timeout.
+            answer = bot_call("/summaries", payload, timeout=180)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -351,6 +356,15 @@ PAGE = r"""<!doctype html>
                       color: var(--ink); }
   .card .subkey { font-family: var(--mono); font-size: 10px; color: var(--muted);
                   word-break: break-all; margin-top: 1px; }
+  /* Sidebar gets a 3-line clamp; the full text lives in the detail header. */
+  .card .summary { font-size: 11.5px; line-height: 1.45; color: var(--muted);
+                   margin-top: 5px; word-break: normal; display: -webkit-box;
+                   -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .ctx { background: var(--panel2, #00000014); border-left: 2px solid var(--gold);
+         border-radius: 0 6px 6px 0; padding: 8px 11px; margin: 0 0 10px;
+         font-size: 12.5px; line-height: 1.5; color: var(--ink); }
+  .ctx .lbl { font-family: var(--mono); font-size: 10px; color: var(--muted);
+              text-transform: uppercase; letter-spacing: .06em; margin-right: 6px; }
   .badge { font-size: 10px; border-radius: 6px; padding: 1px 7px; font-family: var(--mono);
            flex: none; }
   .badge.run { background: #2EB67D22; color: #2EB67D; border: 1px solid #2EB67D66; }
@@ -648,6 +662,7 @@ async function loadList() {
     const label = s.title ? `<span class="title">${esc(s.title)}</span>` : `<span>${esc(s.key)}</span>`;
     div.innerHTML = `<div class="key">${label}${badges}</div>
       ${s.title ? `<div class="subkey">${esc(s.key)}</div>` : ""}
+      ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
       <div class="meta"><span><b>${s.turns}</b> turns</span>
       <span><b>$${(s.cost||0).toFixed(2)}</b></span>
       <span>${esc(s.model || "default")}</span>
@@ -681,6 +696,9 @@ async function loadTranscript(scroll) {
     <button class="ghost" onclick="const m=prompt('Model alias (opus / sonnet / haiku / fable, or reset):'); if(m) cmdSend('!model '+m)">Model…</button>
     <button class="ghost" onclick="if(confirm('Reset this thread\\'s session?')) cmdSend('!reset')">Reset</button>
   </div>`;
+  h += `<div class="ctx"><span class="lbl">context</span>${
+    s.summary ? esc(s.summary) : `<i>No summary yet.</i>`
+  } <button class="ghost" style="margin-left:6px" onclick="resummarize()">↻</button></div>`;
   if (data.error) {
     h += `<div class="empty">${esc(data.error)}</div>`;
   } else {
@@ -770,6 +788,15 @@ async function learnCall(payload) {
   return (await (await fetch("/api/learnings", {method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
+}
+async function resummarize() {
+  if (!active) return;
+  toast("Summarizing…");
+  const r = await (await fetch("/api/summaries", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({key: active.key})})).json();
+  if (r.ok) { toast("Summary updated"); await loadList(); loadTranscript(false); }
+  else toast(r.error || "Could not summarize");
 }
 function toggleLearn() {
   const m = document.getElementById("learnmodal");

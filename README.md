@@ -29,6 +29,12 @@ Claude Code session**.
   behind Approve/Deny buttons in the thread (via a Claude Code PreToolUse hook).
 - **Per-channel working dirs** — map `#myapp` → `~/code/myapp` so threads in
   that channel run Claude inside that repo.
+- **Status reactions** — ⏳ while a turn runs, ✅ when it lands, ‼️ if it fails,
+  on both the thread parent and the message being answered.
+- **Context summaries** — each thread gets a 1–3 sentence "what is this about",
+  refreshed after every turn and shown in the visualizer.
+- **Restart recovery** — if the bot is restarted mid-turn, the next start
+  recovers the reply from the session transcript and delivers it.
 - **Session hygiene** — stale thread sessions are swept after 30 days;
   `!sessions` lists active ones.
 - **Runs as a service** — launchd plist included (starts on boot, restarts on crash).
@@ -168,6 +174,38 @@ silkworm learnings sync        # commit + pull + push (or the ⇅ button)
 Concurrent edits from two machines are reconciled by a **union merge** (dedup by
 learning id), so appending on both sides never produces a conflict to resolve by
 hand. Set `LEARNINGS_AUTOSYNC=1` to push automatically after each harvest.
+
+## Thread summaries
+
+Every thread carries a short **context summary** — one to three sentences on
+what the conversation is about and where it got to — written by a cheap model
+(`SUMMARY_MODEL`) from the session transcript and refreshed in the background
+after each turn. It shows under the thread name in the visualizer's sidebar and
+in full at the top of the transcript, so a list of nine threads reads as nine
+descriptions instead of nine timestamps.
+
+A watermark means a thread is only re-summarized when it actually has new
+activity. Backfill or rebuild them all:
+
+```sh
+silkworm summarize            # only threads that don't have one yet
+silkworm summarize --force    # rebuild every summary
+```
+
+The ↻ button on a thread regenerates just that one.
+
+## Surviving a restart mid-turn
+
+A turn runs inside the bot, but Claude runs in its own process group — so
+restarting the bot (a deploy, a crash) leaves the child working with nobody
+reading its output: the reply is lost and the placeholder message stays frozen.
+
+Silkworm records a marker on the session before each turn. On the next start it
+walks those markers, waits for any still-running child, and **recovers the reply
+from the session transcript**, posting it into the frozen placeholder with a
+note that it was recovered. If the turn produced nothing, it says so and clears
+the ⏳ instead of leaving the thread looking busy forever. Either way no thread
+is left stuck, and `silkworm restart` is safe to run at any time.
 
 ## Moving a thread to the terminal
 
