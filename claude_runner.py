@@ -174,6 +174,12 @@ def run_turn(
         proc.wait()
     finally:
         timer.cancel()
+        # Cancelling the timer removes the child's only deadline, so if we are
+        # leaving while it is still alive (any error path out of the read loop)
+        # it would run forever with nobody reading it. Never abandon a child.
+        if proc.poll() is None:
+            log.warning("child %s still alive as the turn unwinds — stopping it", proc.pid)
+            handle.stop()
         try:
             proc.stdout.close()
             proc.stderr.close()
