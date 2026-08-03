@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 
 log = logging.getLogger("silkworm.runner")
@@ -22,6 +23,14 @@ class ClaudeError(Exception):
 
 class ClaudeStopped(ClaudeError):
     """Turn was killed by an explicit !stop."""
+
+
+class ClaudeTimeout(ClaudeError):
+    """Turn exceeded its time budget and was killed.
+
+    Distinct from a plain ClaudeError because it says nothing about whether the
+    session is still valid — callers must not discard the session over one.
+    """
 
 
 @dataclass
@@ -40,13 +49,39 @@ class RunHandle:
     stopped: bool = field(default=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def stop(self) -> None:
+    def stop(self, grace: float = 5.0) -> None:
+        """Stop the turn, escalating to SIGKILL if SIGTERM is ignored.
+
+        A child that ignores SIGTERM stays alive with the output pipe open, so
+        the reader blocks forever and the thread's lock is never released --
+        every later message in that thread queues behind it indefinitely. The
+        escalation is what guarantees the turn actually ends.
+        """
         with self._lock:
             self.stopped = True
+        if not self._signal(signal.SIGTERM):
+            return
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            if self._exited():
+                return
+            time.sleep(0.2)
+        log.warning("pid %s ignored SIGTERM after %.0fs — sending SIGKILL",
+                    self.proc.pid, grace)
+        self._signal(signal.SIGKILL)
+
+    def _signal(self, sig) -> bool:
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+            os.killpg(os.getpgid(self.proc.pid), sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    def _exited(self) -> bool:
+        try:
+            return self.proc.poll() is not None
+        except Exception:
+            return False
 
 
 def run_turn(
@@ -147,7 +182,7 @@ def run_turn(
 
     if handle.stopped:
         if timed_out.is_set():
-            raise ClaudeError(f"Claude timed out after {timeout}s.")
+            raise ClaudeTimeout(f"Claude timed out after {timeout}s.")
         raise ClaudeStopped("Stopped by user.")
 
     if not saw_result:

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 import urllib.request
 import uuid
 from collections import OrderedDict
@@ -33,7 +34,7 @@ import procs
 import recovery
 import summaries
 from approvals import ApprovalManager, describe_tool
-from claude_runner import ClaudeError, ClaudeStopped, run_turn
+from claude_runner import ClaudeError, ClaudeStopped, ClaudeTimeout, run_turn
 from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
 from localserver import LocalServer
 from store import SessionStore
@@ -987,7 +988,10 @@ def handle_prompt(event: dict, say, client) -> None:
             try:
                 try:
                     result = run_turn(prompt, session_id=session_id, **kwargs)
-                except ClaudeStopped:
+                except (ClaudeStopped, ClaudeTimeout):
+                    # A stop or a timeout says nothing about whether the session
+                    # is still good — discarding it would throw away the whole
+                    # thread's history over one slow turn.
                     raise
                 except ClaudeError as e:
                     if session_id is None:
@@ -1104,6 +1108,60 @@ def _recoverer() -> None:
         log.exception("startup recovery failed")
 
 
+def reap_runaways(max_age_s: float) -> int:
+    """Kill claude children that have outlived any plausible turn.
+
+    A turn's deadline lives in a threading.Timer inside this process, so a
+    child orphaned by a restart has no deadline at all and can run forever --
+    holding its thread's pending marker open and its lock unreleasable. Turns
+    this process is actually running are left alone; they have their timer.
+    """
+    killed = 0
+    for key, entry in store.all().items():
+        pending = entry.get("pending")
+        if not pending or key in RUNNING:
+            continue
+        started = pending.get("started", "")
+        try:
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if age < max_age_s:
+            continue
+        sid = pending.get("session_id") or entry.get("session_id") or ""
+        pids = procs.session_pids(sid)
+        if not pids:
+            continue
+        log.warning("reaping runaway turn on %s (session=%s, running %.1fh)",
+                    key, sid[:8], age / 3600)
+        for pid in pids:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(5)
+        for pid in pids:
+            if _alive(pid):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+        killed += 1
+    return killed
+
+
+def _watchdog() -> None:
+    # Generous: a legitimate long turn must never be mistaken for a runaway.
+    bound = max(CLAUDE_TIMEOUT * 2, 3600)
+    while True:
+        time.sleep(300)
+        try:
+            reap_runaways(bound)
+        except Exception:
+            log.exception("watchdog sweep failed")
+
+
 def _sweeper() -> None:
     while True:
         removed = store.sweep(SESSION_MAX_AGE_DAYS)
@@ -1132,6 +1190,7 @@ if __name__ == "__main__":
     # Background: an orphaned turn may still be writing, so this waits on it.
     threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
+    threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
