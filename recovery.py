@@ -130,7 +130,8 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
             text = ""
         if text is STILL_RUNNING:
             # Genuinely mid-turn after a long wait: the ⏳ is accurate, so leave
-            # the marker in place for the next start rather than guessing.
+            # the marker in place for the next start rather than guessing. No
+            # event -- nothing happened to it, and it would repeat every restart.
             log.warning("gave up waiting on %s — turn still running, left pending", key)
             stats["still_running"] += 1
             continue
@@ -146,6 +147,7 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
                 else:
                     say(channel, thread_ts, body)
                 rx.done()
+                store.add_event(key, "recovered", "reply rescued from the transcript")
                 stats["recovered"] += 1
             else:
                 msg = (":warning: _This turn was interrupted by a bot restart and "
@@ -155,6 +157,7 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
                 else:
                     say(channel, thread_ts, msg)
                 rx.failed()
+                store.add_event(key, "lost", "interrupted turn produced no reply")
                 stats["interrupted"] += 1
         except Exception:
             log.exception("recovery delivery failed for %s", key)

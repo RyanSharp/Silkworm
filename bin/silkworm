@@ -5,6 +5,7 @@
     silkworm import                 adopt running claude sessions into Silkworm
     silkworm harvest                run the learning harvester now
     silkworm summarize [--force]    (re)generate thread context summaries
+    silkworm titles [--force]       name threads from their summaries
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -398,6 +399,14 @@ def main() -> None:
         if r.get("ok"):
             print(f"  {G}✔{N} {r.get('summarized', 0)} summarized · "
                   f"{r.get('skipped', 0)} skipped · {r.get('failed', 0)} failed")
+        else:
+            print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+    elif cmd == "titles":
+        force = "--force" in args
+        print(f"{WORM} naming threads{' (all)' if force else ' (untitled only)'}…")
+        r = bot_call("/titles", {"force": force}, timeout=1800)
+        if r.get("ok"):
+            print(f"  {G}✔{N} {r.get('titled', 0)} named · {r.get('skipped', 0)} skipped")
         else:
             print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
     elif cmd == "learnings":

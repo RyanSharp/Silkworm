@@ -52,7 +52,26 @@ class SessionStore:
             entry = self._data.setdefault(key, {})
             entry["cost"] = round(entry.get("cost", 0.0) + (cost or 0.0), 6)
             entry["turns"] = entry.get("turns", 0) + 1
+            # Per-turn history, so a turn that costs wildly more than this
+            # thread's norm can be spotted (a cache regression looks like this).
+            costs = entry.setdefault("costs", [])
+            costs.append(round(cost or 0.0, 6))
+            del costs[:-50]
             entry["updated"] = time.time()
+            self._save()
+
+    def add_event(self, key: str, kind: str, detail: str = "") -> None:
+        """Record something notable that happened to this thread.
+
+        Recovery, reaping and releases all used to leave no trace outside the
+        log, so a thread that had been interrupted looked identical to one that
+        had simply been quiet.
+        """
+        with self._lock:
+            entry = self._data.setdefault(key, {})
+            events = entry.setdefault("events", [])
+            events.append({"at": time.time(), "kind": kind, "detail": detail[:200]})
+            del events[:-50]
             self._save()
 
     def drop(self, key: str) -> bool:

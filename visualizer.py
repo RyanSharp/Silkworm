@@ -92,6 +92,26 @@ def turn_health(entry: dict, live: set) -> dict | None:
     }
 
 
+def cost_anomaly(entry: dict) -> dict | None:
+    """Flag a last turn that cost far more than this thread's own norm.
+
+    Compared against the thread's median rather than a fixed number, since a
+    cheap chat thread and a heavy refactor thread have very different baselines.
+    A cache regression shows up exactly like this.
+    """
+    costs = [c for c in (entry.get("costs") or []) if c is not None]
+    if len(costs) < 5:
+        return None                      # not enough history to have a norm
+    last, prev = costs[-1], sorted(costs[:-1])
+    median = prev[len(prev) // 2]
+    if median <= 0 or last < 0.25:        # ignore noise on trivially cheap turns
+        return None
+    ratio = last / median
+    if ratio < 5:
+        return None
+    return {"last": round(last, 4), "median": round(median, 4), "ratio": round(ratio, 1)}
+
+
 def load_sessions() -> dict:
     status = bot_call("/status", {}, timeout=0.6)
     threads = status.get("threads", {})
@@ -117,6 +137,13 @@ def load_sessions() -> dict:
             "updated": entry.get("updated", 0),
             "files": len(entry.get("files", [])),
             "turn": turn_health(entry, live),
+            # A summary written before later turns no longer describes the
+            # thread. Entries predating summary_turns are unknown, not stale --
+            # assuming 0 would flag every existing thread at once.
+            "summary_stale": bool(entry.get("summary") and "summary_turns" in entry
+                                  and entry.get("turns", 0) > entry["summary_turns"]),
+            "cost_flag": cost_anomaly(entry),
+            "events": (entry.get("events") or [])[-8:],
             "running": st.get("running", False),
             "checked_out": st.get("checked_out", False),
             "terminal_live": st.get("terminal_live", False),
@@ -343,6 +370,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/titles":
+            answer = bot_call("/titles", payload, timeout=180)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/release":
             answer = bot_call("/release", payload, timeout=30)
             self._json(answer or {"ok": False, "error": "bot is offline"})
@@ -417,6 +447,29 @@ PAGE = r"""<!doctype html>
              border-radius: 6px; background: #2EB67D18;
              border-left: 2px solid #2EB67D; }
   .turnbar.bad { background: #D8517F1C; border-left-color: #D8517F; }
+  .badge.cost { background: #C08A1C22; color: var(--gold); border: 1px solid #C08A1C99; }
+  .card .untitled { color: var(--muted); font-style: italic; font-size: 12.5px; }
+  .pill { font-size: 10.5px; font-family: var(--mono); color: var(--gold);
+          border: 1px solid #C08A1C66; border-radius: 6px; padding: 1px 6px;
+          white-space: nowrap; }
+  #alertbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+              padding: 0 18px 10px; }
+  #alertbar:empty { display: none; }
+  .alert { font-size: 12px; font-weight: 650; padding: 3px 9px; border-radius: 6px; }
+  .alert.bad  { background: #D8517F26; color: #D8517F; border: 1px solid #D8517F99; }
+  .alert.warn { background: #C08A1C26; color: var(--gold); border: 1px solid #C08A1C99; }
+  .events { margin: 0 0 10px; }
+  .evsum { font-family: var(--mono); font-size: 11px; color: var(--muted); cursor: pointer; }
+  .ev { display: flex; gap: 8px; align-items: baseline; font-size: 11.5px;
+        padding: 3px 0 3px 12px; }
+  .ev .k { font-family: var(--mono); font-size: 10px; border-radius: 5px;
+           padding: 1px 6px; flex: none; }
+  .ev .k-recovered { background: #2EB67D22; color: #2EB67D; }
+  .ev .k-reaped, .ev .k-released, .ev .k-timeout, .ev .k-lost, .ev .k-error {
+           background: #D8517F22; color: #D8517F; }
+  .ev .k-interrupted { background: #C08A1C22; color: var(--gold); }
+  .ev .t { color: var(--muted); font-size: 10.5px; flex: none; }
+  .ev .d { color: var(--ink); opacity: .8; }
   .turnbar .what { color: var(--muted); font-family: var(--mono); font-size: 11px;
                    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                    max-width: 40%; }
@@ -570,8 +623,10 @@ PAGE = r"""<!doctype html>
   <h1>Silkworm sessions</h1>
   <span id="botdot" title="bot status"></span>
   <button class="ghost" style="margin-left:16px" onclick="toggleLearn()">🧠 Learnings</button>
+  <button class="ghost" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
 </header>
+<div id="alertbar"></div>
 <div id="searchresults"></div>
 <div class="layout">
   <nav id="list"></nav>
@@ -709,6 +764,7 @@ async function loadList() {
   const data = await (await fetch("/api/sessions")).json();
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
+  renderAlerts(data.sessions);
   const nav = document.getElementById("list");
   nav.innerHTML = "";
   for (const s of data.sessions) {
@@ -722,9 +778,11 @@ async function loadList() {
        : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
        : s.running ? '<span class="badge run">running</span>' : "") +
       (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
-    const label = s.title ? `<span class="title">${esc(s.title)}</span>` : `<span>${esc(s.key)}</span>`;
-    div.innerHTML = `<div class="key">${label}${badges}</div>
-      ${s.title ? `<div class="subkey">${esc(s.key)}</div>` : ""}
+    const label = s.title ? `<span class="title">${esc(s.title)}</span>`
+                          : `<span class="untitled">untitled</span>`;
+    div.innerHTML = `<div class="key">${label}${badges}
+        ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
+      <div class="subkey">${esc(s.key)}</div>
       ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
       <div class="meta"><span><b>${s.turns}</b> turns</span>
       <span><b>$${(s.cost||0).toFixed(2)}</b></span>
@@ -769,7 +827,18 @@ async function loadTranscript(scroll) {
   }
   h += `<div class="ctx"><span class="lbl">context</span>${
     s.summary ? esc(s.summary) : `<i>No summary yet.</i>`
-  } <button class="ghost" style="margin-left:6px" onclick="resummarize()">↻</button></div>`;
+  }${s.summary_stale ? ` <span class="pill">stale — newer turns since</span>` : ""
+  } <button class="ghost" style="margin-left:6px" title="regenerate summary"
+      onclick="resummarize()">↻</button>
+     <button class="ghost" title="rename this thread" onclick="retitle()">✎ name</button></div>`;
+  if (s.events && s.events.length) {
+    h += `<details class="events"><summary class="evsum">${s.events.length} thread event${
+      s.events.length === 1 ? "" : "s"}</summary>` +
+      s.events.slice().reverse().map(e =>
+        `<div class="ev"><span class="k k-${esc(e.kind)}">${esc(e.kind)}</span>
+         <span class="t">${age(e.at)}</span>
+         <span class="d">${esc(e.detail || "")}</span></div>`).join("") + `</details>`;
+  }
   if (data.error) {
     h += `<div class="empty">${esc(data.error)}</div>`;
   } else {
@@ -859,6 +928,47 @@ async function learnCall(payload) {
   return (await (await fetch("/api/learnings", {method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
+}
+function renderAlerts(sessions) {
+  const bar = document.getElementById("alertbar");
+  const stalled = sessions.filter(s => s.turn && s.turn.stalled);
+  const pricey = sessions.filter(s => s.cost_flag);
+  if (!stalled.length && !pricey.length) { bar.innerHTML = ""; return; }
+  const parts = [];
+  if (stalled.length) parts.push(
+    `<span class="alert bad">⚠ ${stalled.length} thread${stalled.length>1?"s":""} stalled</span>` +
+    stalled.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${
+      esc(s.title || s.key)} · ${dur(s.turn.age_s)}</button>`).join(""));
+  if (pricey.length) parts.push(
+    `<span class="alert warn">$ ${pricey.length} cost spike${pricey.length>1?"s":""}</span>` +
+    pricey.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${
+      esc(s.title || s.key)} · ${s.cost_flag.ratio}×</button>`).join(""));
+  bar.innerHTML = parts.join(" ");
+}
+function jumpTo(key) {
+  const card = [...document.querySelectorAll("#list .card")].find(
+    c => c.querySelector(".subkey") && c.querySelector(".subkey").textContent === key);
+  if (card) card.click();
+}
+async function retitle() {
+  if (!active) return;
+  const typed = prompt("Thread name (leave blank to generate one from its summary):",
+                       active.title || "");
+  if (typed === null) return;
+  toast(typed.trim() ? "Renaming…" : "Generating a name…");
+  const r = await (await fetch("/api/titles", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({key: active.key, title: typed.trim()})})).json();
+  toast(r.ok ? `Named “${r.title}”` : (r.error || "Could not name it"));
+  await loadList(); loadTranscript(false);
+}
+async function nameAllThreads() {
+  if (!confirm("Generate names for every untitled thread?")) return;
+  toast("Naming untitled threads…");
+  const r = await (await fetch("/api/titles", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: "{}"})).json();
+  toast(r.ok ? `Named ${r.titled}, skipped ${r.skipped}` : (r.error || "Failed"));
+  await loadList();
 }
 async function releaseThread() {
   if (!active) return;

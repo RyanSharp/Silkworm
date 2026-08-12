@@ -32,7 +32,12 @@ Claude Code session**.
 - **Status reactions** — ⏳ while a turn runs, ✅ when it lands, ‼️ if it fails,
   on both the thread parent and the message being answered.
 - **Context summaries** — each thread gets a 1–3 sentence "what is this about",
-  refreshed after every turn and shown in the visualizer.
+  refreshed after every turn and shown in the visualizer, with auto-generated
+  thread names (`silkworm titles`).
+- **Turn health** — the dashboard shows how long a turn has been running and
+  whether a `claude` process is actually behind it, flags stalled threads and
+  cost spikes at the top of the page, and can release a wedged thread in one
+  click.
 - **Restart recovery** — if the bot is restarted mid-turn, the next start
   recovers the reply from the session transcript and delivers it.
 - **Session hygiene** — stale thread sessions are swept after 30 days;
@@ -192,7 +197,12 @@ silkworm summarize            # only threads that don't have one yet
 silkworm summarize --force    # rebuild every summary
 ```
 
-The ↻ button on a thread regenerates just that one.
+The ↻ button on a thread regenerates just that one, and ✎ renames it (blank
+input generates a name from the summary). `silkworm titles` backfills names for
+every untitled thread.
+
+A summary written before later turns is marked **stale** in the UI, so you can
+tell a current description from one the summariser missed.
 
 ## Surviving a restart mid-turn
 
@@ -213,6 +223,20 @@ picked up, and since timestamps within a thread only move forward, anything at
 or behind that mark is a redelivery and is ignored — so a restart can't run the
 same message twice. The two work together: the watermark suppresses the
 duplicate run, recovery supplies the reply the interrupted run owed you.
+
+## When a turn goes wrong
+
+The dashboard is the place to notice it. Each thread reports how long its
+in-flight turn has been going and whether a `claude` process is really behind
+it, so the sidebar reads `running 3m` or `stalled 24h`, and a banner at the top
+of the page counts stalled threads and cost spikes (a turn costing far more than
+that thread's own median — how a prompt-cache regression shows up). **Release
+thread** kills the child, clears the marker, finalizes the frozen placeholder
+and drops the stale ⏳ — `!stop` can't, because a turn orphaned by a restart is
+no longer owned by the bot.
+
+Threads also keep a short event log — recovered, interrupted, timed out, reaped,
+released — so an interrupted thread doesn't look merely quiet.
 
 ## Moving a thread to the terminal
 

@@ -821,6 +821,28 @@ def handle_learnings(payload: dict) -> dict:
     return {"ok": True, "learnings": learnings.applicable(cwd) if cwd else learnings.all()}
 
 
+def handle_titles(payload: dict) -> dict:
+    """Route for /titles — name threads from their summaries (localhost-trusted)."""
+    key, manual = payload.get("key"), (payload.get("title") or "").strip()
+    if key and manual:                      # user typed one; no model needed
+        store.update(key, title=manual[:60])
+        return {"ok": True, "title": manual[:60]}
+    if not NAMING_MODEL:
+        return {"ok": False, "error": "NAMING_MODEL is empty (naming disabled)"}
+    try:
+        if key:
+            title = summaries.title_one(store, key, binary=CLAUDE_BIN,
+                                        model=NAMING_MODEL, env=claude_env(), force=True)
+            return {"ok": bool(title), "title": title,
+                    "error": "" if title else "no summary to name it from"}
+        return {"ok": True, **summaries.backfill_titles(
+            store, binary=CLAUDE_BIN, model=NAMING_MODEL, env=claude_env(),
+            force=bool(payload.get("force")))}
+    except Exception as e:
+        log.exception("titling failed")
+        return {"ok": False, "error": str(e)}
+
+
 def handle_release(payload: dict) -> dict:
     """Route for /release — force-free a wedged thread (localhost-trusted).
 
@@ -878,6 +900,7 @@ def handle_release(payload: dict) -> dict:
 
     recovery.clear_pending(store, key)
     RUNNING.pop(key, None)
+    store.add_event(key, "released", f"stuck turn killed ({len(pids)} process(es))")
     log.warning("released thread %s (killed %d process(es))", key, len(pids))
     return {"ok": True, "killed": len(pids)}
 
@@ -910,6 +933,7 @@ server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
 server.route("/summaries", handle_summaries)
 server.route("/release", handle_release)
+server.route("/titles", handle_titles)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -1091,9 +1115,14 @@ def handle_prompt(event: dict, say, client) -> None:
     except ClaudeStopped:
         progress.finalize(":octagonal_sign: Stopped.")
         reactions.cleared()
+    except ClaudeTimeout as e:
+        progress.finalize(f":warning: {e}")
+        reactions.failed()
+        store.add_event(key, "timeout", str(e))
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
         reactions.failed()
+        store.add_event(key, "error", str(e)[:160])
     except Exception:
         log.exception("unhandled error in thread %s", key)
         progress.finalize(":warning: Something went wrong — check the bot logs.")
@@ -1197,6 +1226,7 @@ def reap_runaways(max_age_s: float) -> int:
             continue
         log.warning("reaping runaway turn on %s (session=%s, running %.1fh)",
                     key, sid[:8], age / 3600)
+        store.add_event(key, "reaped", f"runaway turn killed after {age / 3600:.1f}h")
         for pid in pids:
             try:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)

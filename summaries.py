@@ -75,9 +75,59 @@ def summarize_one(store, key: str, *, binary: str, model: str, env: dict,
     if len(text) > 600:
         text = text[:597].rstrip() + "…"
 
-    store.update(key, summary=text, summary_ts=max_ts)
+    # summary_turns lets the UI tell a current summary from one that predates
+    # later turns (a failed or disabled summariser leaves it behind).
+    store.update(key, summary=text, summary_ts=max_ts,
+                 summary_turns=(entry.get("turns") or 0))
     log.info("summarized %s (%d chars)", key, len(text))
     return True
+
+
+TITLE_PROMPT = (
+    "Below is a one-paragraph description of a work session.\n\n"
+    "<description>\n{summary}\n</description>\n\n"
+    "Give it a title of 3-6 words for a sidebar list: concrete and specific to "
+    "this work, in title case, no quotes, no trailing punctuation, no preamble. "
+    "Reply with the title and nothing else."
+)
+
+
+def title_one(store, key: str, *, binary: str, model: str, env: dict,
+              force: bool = False) -> str:
+    """Name a thread from its summary. Cheaper and better grounded than
+    re-reading the transcript, and every thread already has a summary."""
+    entry = store.get(key)
+    if not entry or (entry.get("title") and not force):
+        return ""
+    summary = entry.get("summary")
+    if not summary:
+        return ""
+    try:
+        text = _run_model(binary, model, env, entry.get("cwd", ""),
+                          TITLE_PROMPT.format(summary=summary), timeout=60)
+    except Exception:
+        log.exception("title generation failed for %s", key)
+        return ""
+    title = " ".join(text.split()).strip('"\'').rstrip(".")[:60]
+    if not title:
+        return ""
+    store.update(key, title=title)
+    log.info("titled %s: %r", key, title)
+    return title
+
+
+def backfill_titles(store, *, binary: str, model: str, env: dict,
+                    force: bool = False) -> dict:
+    named = skipped = 0
+    for key, entry in store.all().items():
+        if entry.get("title") and not force:
+            skipped += 1
+            continue
+        if title_one(store, key, binary=binary, model=model, env=env, force=force):
+            named += 1
+        else:
+            skipped += 1
+    return {"titled": named, "skipped": skipped}
 
 
 def backfill(store, *, binary: str, model: str, env: dict, force: bool = False) -> dict:
