@@ -821,6 +821,67 @@ def handle_learnings(payload: dict) -> dict:
     return {"ok": True, "learnings": learnings.applicable(cwd) if cwd else learnings.all()}
 
 
+def handle_release(payload: dict) -> dict:
+    """Route for /release — force-free a wedged thread (localhost-trusted).
+
+    Automates the cleanup a stuck turn needs: kill the child (whether or not
+    this process still owns it), clear the pending marker, finalize the frozen
+    placeholder, and drop the stale hourglass. !stop can't do this, because a
+    turn orphaned by a restart isn't in RUNNING any more.
+    """
+    key = payload.get("key", "")
+    entry = store.get(key)
+    if not entry:
+        return {"ok": False, "error": "unknown thread"}
+
+    handle = RUNNING.get(key)
+    if handle:
+        try:
+            handle.stop()
+        except Exception:
+            log.exception("stopping owned turn failed for %s", key)
+
+    pending = entry.get("pending") or {}
+    sid = pending.get("session_id") or entry.get("session_id") or ""
+    pids = procs.session_pids(sid)
+    for pid in pids:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            pass
+    if pids:
+        time.sleep(4)
+        for pid in pids:
+            if _alive(pid):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+
+    channel, _, thread_ts = key.partition(":")
+    note = (":warning: _Turn released — it was killed after getting stuck. "
+            "The thread's history is intact; send your message again to continue._")
+    if pending.get("progress_ts"):
+        try:
+            app.client.chat_update(channel=channel, ts=pending["progress_ts"], text=note)
+        except Exception:
+            log.exception("finalizing placeholder failed for %s", key)
+    else:
+        try:
+            app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=note)
+        except Exception:
+            log.exception("posting release note failed for %s", key)
+    try:
+        ThreadReactions(app.client, channel, thread_ts, pending.get("msg_ts")).failed()
+    except Exception:
+        log.exception("clearing reactions failed for %s", key)
+
+    recovery.clear_pending(store, key)
+    RUNNING.pop(key, None)
+    log.warning("released thread %s (killed %d process(es))", key, len(pids))
+    return {"ok": True, "killed": len(pids)}
+
+
 def handle_summaries(payload: dict) -> dict:
     """Route for /summaries — regenerate thread summaries (localhost-trusted)."""
     if not SUMMARY_MODEL:
@@ -848,6 +909,7 @@ server.route("/web-message", handle_web_message)
 server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
 server.route("/summaries", handle_summaries)
+server.route("/release", handle_release)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":

@@ -13,14 +13,19 @@ import json
 import os
 import time
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+import procs
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_FILE = BASE_DIR / "sessions.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PORT = int(os.environ.get("SILKWORM_VIZ_PORT", "8790"))
+# Past twice the per-turn timeout, a turn is not slow -- it is stuck.
+STALL_AFTER_S = max(int(os.environ.get("CLAUDE_TIMEOUT", "900")) * 2, 3600)
 
 
 def _bot_port() -> str:
@@ -59,11 +64,43 @@ def raw_sessions() -> dict[str, dict]:
     return {k: ({"session_id": v} if isinstance(v, str) else v) for k, v in raw.items()}
 
 
+def turn_health(entry: dict, live: set) -> dict | None:
+    """How long this thread's in-flight turn has been going, and whether the
+    child is actually there.
+
+    A turn whose child has died, or that has run far past any plausible
+    duration, is stalled -- it will never finish on its own. Surfacing that is
+    the difference between noticing in a minute and noticing in a day.
+    """
+    pending = entry.get("pending")
+    if not pending:
+        return None
+    started = pending.get("started") or ""
+    try:
+        began = datetime.strptime(started, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - began).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    sid = pending.get("session_id") or entry.get("session_id") or ""
+    alive = sid in live
+    return {
+        "age_s": int(age),
+        "child_alive": alive,
+        # No child means it can never finish; past the bound it never will.
+        "stalled": (not alive) or age > STALL_AFTER_S,
+        "prompt": pending.get("prompt", ""),
+    }
+
+
 def load_sessions() -> dict:
     status = bot_call("/status", {}, timeout=0.6)
     threads = status.get("threads", {})
+    entries = raw_sessions()
+    live = procs.alive_sessions(
+        [(e.get("pending") or {}).get("session_id") or e.get("session_id")
+         for e in entries.values()])
     out = []
-    for key, entry in raw_sessions().items():
+    for key, entry in entries.items():
         channel, _, thread_ts = key.partition(":")
         sid = entry.get("session_id", "")
         cwd = entry.get("cwd", "")
@@ -79,6 +116,7 @@ def load_sessions() -> dict:
             "cost": entry.get("cost", 0.0),
             "updated": entry.get("updated", 0),
             "files": len(entry.get("files", [])),
+            "turn": turn_health(entry, live),
             "running": st.get("running", False),
             "checked_out": st.get("checked_out", False),
             "terminal_live": st.get("terminal_live", False),
@@ -305,6 +343,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/release":
+            answer = bot_call("/release", payload, timeout=30)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/summaries":
             # Generating a summary runs a model, so allow a generous timeout.
             answer = bot_call("/summaries", payload, timeout=180)
@@ -369,6 +410,16 @@ PAGE = r"""<!doctype html>
            flex: none; }
   .badge.run { background: #2EB67D22; color: #2EB67D; border: 1px solid #2EB67D66; }
   .badge.term { background: #C08A1C22; color: var(--gold); border: 1px solid #C08A1C66; }
+  .badge.stall { background: #D8517F26; color: #D8517F; border: 1px solid #D8517F99;
+                 font-weight: 650; }
+  .turnbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+             font-size: 12.5px; padding: 8px 11px; margin: 0 0 10px;
+             border-radius: 6px; background: #2EB67D18;
+             border-left: 2px solid #2EB67D; }
+  .turnbar.bad { background: #D8517F1C; border-left-color: #D8517F; }
+  .turnbar .what { color: var(--muted); font-family: var(--mono); font-size: 11px;
+                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                   max-width: 40%; }
   .card .meta { color: var(--muted); font-size: 12px; margin-top: 4px; display: flex;
                 gap: 10px; flex-wrap: wrap; }
   .card .meta b { color: var(--gold); font-weight: 600; }
@@ -559,6 +610,12 @@ const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','
 const fmtTok = n => n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(n);
 let active = null, showTable = false, statsCache = null;
 
+function dur(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m";
+  if (s < 86400) return Math.floor(s/3600) + "h" + (Math.floor(s%3600/60) || "") ;
+  return Math.floor(s/86400) + "d" + (Math.floor(s%86400/3600) || "");
+}
 function age(ts) {
   const d = (Date.now()/1000 - ts) / 86400;
   if (d < 1/24) return Math.max(1, Math.round(d*24*60)) + "m ago";
@@ -657,7 +714,13 @@ async function loadList() {
   for (const s of data.sessions) {
     const div = document.createElement("div");
     div.className = "card" + (active && active.key === s.key ? " active" : "");
-    const badges = (s.running ? '<span class="badge run">running</span>' : "") +
+    const t = s.turn;
+    const badges =
+      (t && t.stalled ? `<span class="badge stall" title="${t.child_alive
+            ? "running far past the timeout" : "no claude process — it cannot finish"}"
+         >stalled ${dur(t.age_s)}</span>`
+       : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
+       : s.running ? '<span class="badge run">running</span>' : "") +
       (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
     const label = s.title ? `<span class="title">${esc(s.title)}</span>` : `<span>${esc(s.key)}</span>`;
     div.innerHTML = `<div class="key">${label}${badges}</div>
@@ -696,6 +759,14 @@ async function loadTranscript(scroll) {
     <button class="ghost" onclick="const m=prompt('Model alias (opus / sonnet / haiku / fable, or reset):'); if(m) cmdSend('!model '+m)">Model…</button>
     <button class="ghost" onclick="if(confirm('Reset this thread\\'s session?')) cmdSend('!reset')">Reset</button>
   </div>`;
+  if (s.turn) {
+    const t = s.turn;
+    h += `<div class="turnbar${t.stalled ? " bad" : ""}">
+      <b>${t.stalled ? "⚠ Turn stalled" : "⏳ Turn running"} · ${dur(t.age_s)}</b>
+      <span>${t.child_alive ? "claude process alive" : "no claude process — cannot finish"}</span>
+      ${t.prompt ? `<span class="what">${esc(t.prompt)}</span>` : ""}
+      <button class="ghost" onclick="releaseThread()">Release thread</button></div>`;
+  }
   h += `<div class="ctx"><span class="lbl">context</span>${
     s.summary ? esc(s.summary) : `<i>No summary yet.</i>`
   } <button class="ghost" style="margin-left:6px" onclick="resummarize()">↻</button></div>`;
@@ -788,6 +859,18 @@ async function learnCall(payload) {
   return (await (await fetch("/api/learnings", {method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
+}
+async function releaseThread() {
+  if (!active) return;
+  if (!confirm("Kill this thread's stuck turn and release it?\n\n"
+             + "Its session history is kept — you can just send the message again.")) return;
+  toast("Releasing…");
+  const r = await (await fetch("/api/release", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({key: active.key})})).json();
+  if (r.ok) { toast(`Released (killed ${r.killed} process${r.killed === 1 ? "" : "es"})`); }
+  else toast(r.error || "Could not release");
+  await loadList(); loadTranscript(false);
 }
 async function resummarize() {
   if (!active) return;

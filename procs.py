@@ -38,3 +38,30 @@ def session_pids(session_id: str) -> list[int]:
 
 def session_alive(session_id: str) -> bool:
     return bool(session_pids(session_id))
+
+
+def alive_sessions(session_ids) -> set[str]:
+    """Which of these sessions have a live `claude` process — one ps call.
+
+    The dashboard asks about every thread on every poll; doing that one
+    session at a time would fork ps per thread per poll.
+    """
+    wanted = {s for s in session_ids if s}
+    if not wanted:
+        return set()
+    try:
+        out = subprocess.run(["ps", "-eww", "-o", "pid=,command="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return set()
+    me, live = os.getpid(), set()
+    for line in out.splitlines():
+        pid_s, _, cmd = line.strip().partition(" ")
+        if not pid_s.isdigit() or int(pid_s) == me:
+            continue
+        if os.path.basename(cmd.split(" ", 1)[0]) != "claude":
+            continue
+        for sid in wanted - live:
+            if sid in cmd:
+                live.add(sid)
+    return live
