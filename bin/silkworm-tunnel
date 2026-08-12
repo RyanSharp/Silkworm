@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# silkworm-tunnel — keep an SSH tunnel to the Silkworm dashboard open.
+#
+# Run this on the machine you BROWSE FROM (your laptop), not on the Mac mini
+# that runs Silkworm. It installs a launchd agent that holds an SSH tunnel to
+# the mini's dashboard port and re-dials whenever it drops — on wake from
+# sleep, on Wi-Fi changes, on reboot — so http://127.0.0.1:8790 just works.
+#
+#   ./silkworm-tunnel install [user@]host     # default: Ryans-Mini-2.local
+#   ./silkworm-tunnel status
+#   ./silkworm-tunnel uninstall
+#
+# The dashboard stays bound to loopback on the mini; nothing is exposed to the
+# LAN. The tunnel's far end lands on the mini's own 127.0.0.1.
+set -euo pipefail
+
+LABEL="com.silkworm.tunnel"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOGDIR="$HOME/Library/Logs/silkworm"
+PORT="${SILKWORM_VIZ_PORT:-8790}"
+DEFAULT_HOST="Ryans-Mini-2.local"
+
+Y=$'\033[33m'; G=$'\033[32m'; R=$'\033[31m'; N=$'\033[0m'
+say() { printf '%s🪱 silkworm-tunnel:%s %s\n' "$Y" "$N" "$1"; }
+ok()  { printf '  %s✔%s %s\n' "$G" "$N" "$1"; }
+bad() { printf '  %s✘%s %s\n' "$R" "$N" "$1"; }
+
+target() { printf '%s' "${1:-${SILKWORM_HOST:-$DEFAULT_HOST}}"; }
+
+check_ssh() {
+  local host="$1"
+  # BatchMode: fail instead of prompting. A launchd agent has no terminal to
+  # answer a password or passphrase prompt, so if this can't connect
+  # unattended, the agent would silently never come up.
+  if ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+         "$host" true 2>/dev/null; then
+    ok "key-based SSH to $host works without prompting"
+    return 0
+  fi
+  bad "cannot SSH to $host without a prompt"
+  cat <<EOF
+
+  Set up key auth first (one time):
+
+    ssh-keygen -t ed25519            # if you don't have a key yet
+    ssh-copy-id $host                # authorise it on the mini
+
+  If your key has a passphrase, store it so launchd can use it:
+
+    ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+
+  and add to ~/.ssh/config:
+
+    Host ${host%%.*}*
+      UseKeychain yes
+      AddKeysToAgent yes
+
+EOF
+  return 1
+}
+
+write_plist() {
+  local host="$1"
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string>
+    <string>-T</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-o</string><string>ServerAliveInterval=30</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-o</string><string>StrictHostKeyChecking=accept-new</string>
+    <string>-o</string><string>BatchMode=yes</string>
+    <string>-L</string><string>${PORT}:127.0.0.1:${PORT}</string>
+    <string>$host</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$LOGDIR/tunnel.log</string>
+  <key>StandardErrorPath</key><string>$LOGDIR/tunnel.err.log</string>
+</dict>
+</plist>
+EOF
+  ok "wrote $PLIST"
+}
+
+load_agent() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  ok "agent loaded (starts at login, re-dials on drop)"
+}
+
+wait_for_port() {
+  for _ in $(seq 1 15); do
+    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+case "${1:-install}" in
+  install)
+    host="$(target "${2:-}")"
+    say "installing tunnel to $host (dashboard port $PORT)"
+    check_ssh "$host" || exit 1
+    write_plist "$host"
+    load_agent
+    if wait_for_port; then
+      ok "tunnel up — open http://127.0.0.1:$PORT"
+    else
+      bad "port $PORT not listening yet — check $LOGDIR/tunnel.err.log"
+      exit 1
+    fi
+    ;;
+  status)
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+      ok "agent $LABEL is loaded"
+    else
+      bad "agent not loaded — run: $0 install"
+    fi
+    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+      ok "port $PORT is listening"
+      code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$PORT/" || true)
+      [ "$code" = "200" ] && ok "dashboard responding (HTTP 200)" \
+                          || bad "port open but dashboard returned '${code:-no response}'"
+    else
+      bad "port $PORT is not listening — see $LOGDIR/tunnel.err.log"
+    fi
+    ;;
+  uninstall)
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    rm -f "$PLIST"
+    ok "tunnel agent removed"
+    ;;
+  *)
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

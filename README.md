@@ -273,6 +273,30 @@ session has a Slack thread and shows in the visualizer from the moment it
 starts. Exit the terminal and the thread reclaims itself; reply in Slack to
 keep going. If the bot is down, the session starts untracked.
 
+## Reaching the dashboard from another machine
+
+The visualizer binds `127.0.0.1` only, and it should stay that way: it has no
+authentication, it can relay prompts into threads, and the bot trusts any
+localhost caller as the machine owner (bypassing the Slack allowlist). On a host
+running `--dangerously-skip-permissions`, exposing that port to a LAN hands
+arbitrary command execution to anything on the network.
+
+So tunnel instead. On the machine you browse *from*:
+
+```sh
+./bin/silkworm-tunnel install ryansharp@your-mini.local
+```
+
+That installs a launchd agent holding an SSH tunnel to the dashboard port, which
+re-dials on sleep, Wi-Fi changes and reboot, so `http://127.0.0.1:8790` keeps
+working without you re-running anything. `silkworm-tunnel status` checks it,
+`uninstall` removes it. It needs key-based SSH that works without prompting —
+the installer verifies that first and tells you how to fix it, because a launchd
+agent has no terminal to answer a passphrase prompt.
+
+For phone access, or from outside the network, Tailscale is a better fit than a
+tunnel: install it on both ends and the host gets a stable private address.
+
 ## Session visualizer
 
 ```sh
