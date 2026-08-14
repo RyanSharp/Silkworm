@@ -206,6 +206,55 @@ def test_watermark():
     check("corrupt watermark fails open", not handled("C:2", "1785644289.05"))
 
 
+# --- schema ------------------------------------------------------------------
+
+def test_schema():
+    import schema
+    print("\nsession record schema")
+    check("v1 bare string migrates", schema.migrate("abc")["session_id"] == "abc")
+    check("v0 dict gets stamped", schema.migrate({"session_id": "x"})["v"] == schema.VERSION)
+    cur = {"v": schema.VERSION, "future_field": 1}
+    check("current record is untouched", schema.migrate(cur) is cur)
+    check("unknown fields are kept", "future_field" in schema.migrate(cur))
+    check("summary_turns default is unknown, not 0", schema.default("summary_turns") is None)
+    a, b = schema.default("events"), schema.default("events")
+    a.append(1)
+    check("mutable defaults are not shared", b == [])
+    check("every schema field is documented",
+          all(isinstance(d, str) and d for _, d in schema.FIELDS.values()))
+
+    live = json.loads((BASE / "sessions.json").read_text()) if (BASE / "sessions.json").exists() else {}
+    if live:
+        tmp = Path(tempfile.mkdtemp()) / "s.json"
+        tmp.write_text(json.dumps(live))
+        out = SessionStore(tmp).all()
+        same = all(out[k].get(f) == v for k, e in live.items() for f, v in e.items())
+        check("real sessions.json round-trips with no field lost",
+              same and len(out) == len(live))
+
+
+# --- command redelivery -------------------------------------------------------
+
+def test_command_dedup():
+    src = (BASE / "bot.py").read_text()
+    print("\ncommands are guarded against redelivery")
+    block = src[src.index("if text.startswith(\"!\") and handle_command"):]
+    block = block[:block.index("if not text and not files")]
+    check("handled commands record the watermark", "last_msg_ts=msg_ts" in block)
+    check("only for threads that already exist", "store.get(key)" in block)
+
+
+# --- dashboard exposure -------------------------------------------------------
+
+def test_viz_bind_requires_token():
+    src = (BASE / "visualizer.py").read_text()
+    print("\ndashboard refuses to be exposed without auth")
+    check("non-loopback bind without a token is refused",
+          "if not LOOPBACK and not TOKEN:" in src and "raise SystemExit" in src)
+    check("token comparison is constant-time", "secrets.compare_digest" in src)
+    check("both GET and POST are gated", src.count("if not self._authed(url)") >= 2)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -225,7 +274,8 @@ def test_bounded_state():
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
-              test_dashboard_classifiers, test_watermark, test_bounded_state):
+              test_dashboard_classifiers, test_watermark, test_bounded_state,
+              test_schema, test_command_dedup, test_viz_bind_requires_token):
         try:
             t()
         except Exception as exc:

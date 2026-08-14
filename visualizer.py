@@ -18,12 +18,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import secrets
+
 import procs
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_FILE = BASE_DIR / "sessions.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PORT = int(os.environ.get("SILKWORM_VIZ_PORT", "8790"))
+# Loopback by default. The dashboard is not read-only -- it relays prompts into
+# threads, and the bot trusts any localhost caller as the machine owner -- so
+# binding it anywhere else requires a token (enforced at startup, below).
+BIND = os.environ.get("VIZ_BIND", "127.0.0.1").strip()
+TOKEN = os.environ.get("VIZ_TOKEN", "").strip()
+LOOPBACK = BIND in ("127.0.0.1", "::1", "localhost")
 # Past twice the per-turn timeout, a turn is not slow -- it is stuck.
 STALL_AFTER_S = max(int(os.environ.get("CLAUDE_TIMEOUT", "900")) * 2, 3600)
 
@@ -332,11 +340,41 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, data) -> None:
         self._send(200, json.dumps(data).encode(), "application/json")
 
+    def _authed(self, url) -> bool:
+        """Loopback needs no token; anything else must present one.
+
+        Accepts ?token= once and hands back a cookie, so a bookmarked URL
+        works without the secret sitting in the address bar afterwards.
+        """
+        if LOOPBACK:
+            return True
+        supplied = (self.headers.get("X-Silkworm-Token", "")
+                    or parse_qs(url.query).get("token", [""])[0]
+                    or self._cookie_token())
+        if secrets.compare_digest(supplied, TOKEN):
+            return True
+        self._send(401, b"unauthorized", "text/plain")
+        return False
+
+    def _cookie_token(self) -> str:
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "silkworm_token":
+                return value
+        return ""
+
     def do_GET(self):
         url = urlparse(self.path)
         qs = parse_qs(url.query)
+        if not self._authed(url):
+            return
         if url.path == "/":
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            cookie = {}
+            if not LOOPBACK and qs.get("token", [""])[0] == TOKEN:
+                cookie["Set-Cookie"] = (f"silkworm_token={TOKEN}; Path=/; "
+                                        "HttpOnly; SameSite=Strict; Max-Age=31536000")
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8", cookie)
         elif url.path == "/api/sessions":
             self._json(load_sessions())
         elif url.path == "/api/session":
@@ -359,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlparse(self.path)
+        if not self._authed(url):
+            return
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length)) if length else {}
@@ -1055,6 +1095,16 @@ setInterval(() => { if (active) loadTranscript(false); }, 4000);
 """
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Silkworm visualizer: http://127.0.0.1:{PORT} (bot bridge on :{BOT_PORT})")
+    if not LOOPBACK and not TOKEN:
+        # Failing closed: an unauthenticated bind beyond loopback would hand
+        # arbitrary command execution to anything that can reach the port.
+        raise SystemExit(
+            f"VIZ_BIND={BIND} exposes the dashboard beyond loopback, which needs\n"
+            "authentication. Set VIZ_TOKEN to a secret, e.g.\n\n"
+            "    VIZ_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')\n\n"
+            "then open http://<host>:%d/?token=$VIZ_TOKEN once." % PORT)
+    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    where = "127.0.0.1" if LOOPBACK else BIND
+    print(f"Silkworm visualizer: http://{where}:{PORT} (bot bridge on :{BOT_PORT})"
+          + ("" if LOOPBACK else "  [token required]"))
     server.serve_forever()

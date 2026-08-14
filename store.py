@@ -1,14 +1,19 @@
 """Persistent thread -> Claude session state.
 
-sessions.json maps "channel:thread_ts" to a dict:
-  {session_id, model, cwd, cost, turns, updated}
-Older versions stored a bare session-id string; those are migrated on load.
+sessions.json maps "channel:thread_ts" to one session record; every field of
+that record is declared in schema.py, which is also where its default and
+meaning live. Records are migrated forward on load.
 """
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
+
+import schema
+
+log = logging.getLogger("silkworm.store")
 
 
 class SessionStore:
@@ -19,9 +24,14 @@ class SessionStore:
         if path.exists():
             raw = json.loads(path.read_text())
             for key, val in raw.items():
-                if isinstance(val, str):  # v1 format
-                    val = {"session_id": val, "updated": time.time()}
-                self._data[key] = val
+                entry = schema.migrate(val)
+                entry.setdefault("updated", time.time())
+                unknown = schema.unknown_fields(entry)
+                if unknown:
+                    # Kept, not dropped: a newer Silkworm may have written them.
+                    log.warning("%s has fields not in schema v%d: %s",
+                                key, schema.VERSION, ", ".join(unknown))
+                self._data[key] = entry
 
     def _save(self) -> None:
         self._path.write_text(json.dumps(self._data, indent=2))
@@ -32,8 +42,12 @@ class SessionStore:
             return dict(entry) if entry else None
 
     def update(self, key: str, **fields) -> dict:
+        stray = [f for f in fields if f not in schema.FIELDS]
+        if stray:  # a typo'd field name would otherwise persist silently
+            log.warning("writing undeclared field(s) %s on %s — add them to schema.py",
+                        ", ".join(stray), key)
         with self._lock:
-            entry = self._data.setdefault(key, {})
+            entry = self._data.setdefault(key, {"v": schema.VERSION})
             entry.update(fields)
             entry["updated"] = time.time()
             self._save()

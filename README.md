@@ -297,6 +297,14 @@ agent has no terminal to answer a passphrase prompt.
 For phone access, or from outside the network, Tailscale is a better fit than a
 tunnel: install it on both ends and the host gets a stable private address.
 
+If you would rather bind the dashboard directly, it requires a token and
+refuses to start without one:
+
+```sh
+VIZ_BIND=0.0.0.0 VIZ_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
+# then open http://host:8790/?token=... once; it sets a cookie and remembers.
+```
+
 ## Session visualizer
 
 ```sh

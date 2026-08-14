@@ -976,6 +976,12 @@ def handle_prompt(event: dict, say, client) -> None:
     files = event.get("files") or []
 
     if text.startswith("!") and handle_command(text, key, say, thread_ts):
+        # Commands get the same redelivery guard as prompts: a restart-replayed
+        # !reset or !takeover would otherwise run a second time. Only for
+        # threads that already exist -- a command on an unknown thread has
+        # nothing to protect, and recording one would create an empty entry.
+        if not event.get("_web") and store.get(key):
+            store.update(key, last_msg_ts=msg_ts)
         return
     if not text and not files:
         say(text="Send me a prompt (or `!help`) and I'll spin up a Claude session for this thread.",
