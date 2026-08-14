@@ -223,6 +223,20 @@ def test_schema():
     check("every schema field is documented",
           all(isinstance(d, str) and d for _, d in schema.FIELDS.values()))
 
+    # migrate() edits in place, so a naive "did it change?" check compares an
+    # object with itself and never persists. Every entry here is a dict, which
+    # is what production looks like.
+    tmp2 = Path(tempfile.mkdtemp()) / "s.json"
+    tmp2.write_text(json.dumps({"C:1": {"session_id": "a"}, "C:2": {"session_id": "b"}}))
+    SessionStore(tmp2)
+    disk = json.loads(tmp2.read_text())
+    check("migration persists for dict-only stores",
+          all(v.get("v") == schema.VERSION for v in disk.values()))
+    mtime = tmp2.stat().st_mtime_ns
+    SessionStore(tmp2)
+    check("reloading an already-migrated store rewrites nothing",
+          tmp2.stat().st_mtime_ns == mtime)
+
     live = json.loads((BASE / "sessions.json").read_text()) if (BASE / "sessions.json").exists() else {}
     if live:
         tmp = Path(tempfile.mkdtemp()) / "s.json"

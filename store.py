@@ -23,15 +23,27 @@ class SessionStore:
         self._data: dict[str, dict] = {}
         if path.exists():
             raw = json.loads(path.read_text())
+            migrated = False
             for key, val in raw.items():
+                # Read the old version first: migrate() edits in place, so
+                # afterwards `val` is the migrated record, not the original.
+                had = val.get("v") if isinstance(val, dict) else None
                 entry = schema.migrate(val)
                 entry.setdefault("updated", time.time())
+                if had != entry.get("v"):
+                    migrated = True
                 unknown = schema.unknown_fields(entry)
                 if unknown:
                     # Kept, not dropped: a newer Silkworm may have written them.
                     log.warning("%s has fields not in schema v%d: %s",
                                 key, schema.VERSION, ", ".join(unknown))
                 self._data[key] = entry
+            if migrated:
+                # Write the migration through, so what's on disk matches what
+                # we're holding rather than waiting for an unrelated update.
+                self._save()
+                log.info("migrated %d session record(s) to schema v%d",
+                         len(raw), schema.VERSION)
 
     def _save(self) -> None:
         self._path.write_text(json.dumps(self._data, indent=2))
