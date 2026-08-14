@@ -1080,10 +1080,23 @@ def handle_prompt(event: dict, say, client) -> None:
                     # thread's history over one slow turn.
                     raise
                 except ClaudeError as e:
-                    if session_id is None:
+                    # Only a session that genuinely no longer exists justifies
+                    # starting over. Every other error -- a mid-turn API hiccup,
+                    # a tool failure, "Claude reported an error" -- says nothing
+                    # about whether the session is resumable, and starting fresh
+                    # silently discards the thread's entire history. If the
+                    # transcript is on disk, the session is fine: surface the
+                    # error and let the next message resume it.
+                    if session_id is None or harvester.find_transcript(session_id):
                         raise
-                    log.warning("resume failed for %s (%s); retrying with a fresh session", key, e)
-                    store.drop(key)
+                    log.warning("session %s for %s has no transcript on disk; "
+                                "starting a fresh session (%s)", session_id[:8], key, e)
+                    store.add_event(key, "session-lost",
+                                    f"transcript for {session_id[:8]} missing; started fresh")
+                    # Keep the entry (title, cost, summary, files) and remember
+                    # the old id rather than dropping everything on the floor.
+                    prev = (entry.get("previous_sessions") or []) + [session_id]
+                    store.update(key, session_id=None, previous_sessions=prev[-10:])
                     progress.update(":hourglass_flowing_sand: _Old session was gone — starting fresh…_")
                     result = run_turn(prompt, session_id=None, **kwargs)
 

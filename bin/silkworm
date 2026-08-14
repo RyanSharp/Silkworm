@@ -14,6 +14,7 @@
     silkworm restart                restart the services
     silkworm logs                   tail the bot log
     silkworm doctor                 check prerequisites
+    silkworm test                   run the regression tests
 
 Runs on macOS today (launchd LaunchAgents); Linux (systemd user units) planned —
 the ServiceManager below is the only platform-specific part. Stdlib only.
@@ -401,6 +402,10 @@ def main() -> None:
                   f"{r.get('skipped', 0)} skipped · {r.get('failed', 0)} failed")
         else:
             print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+    elif cmd == "test":
+        print(f"{WORM} running regression tests…")
+        py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+        sys.exit(subprocess.run([py, str(REPO / "tests" / "test_invariants.py")]).returncode)
     elif cmd == "titles":
         force = "--force" in args
         print(f"{WORM} naming threads{' (all)' if force else ' (untitled only)'}…")
