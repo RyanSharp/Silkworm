@@ -132,6 +132,23 @@ def test_recovery():
     check("mid-turn narration is not posted as the answer", "mid-turn narration" not in body)
     check("marker cleared after recovery", store.get("C:1").get("pending") is None)
 
+    # A rescued reply means the turn succeeded; without telling the caller, every
+    # restart would file a false failure into the "needs you" list.
+    outcomes = []
+    store.update("C:2", session_id="s", pending=dict(pend))
+    recovery.recover(store, finalize=lambda *a: None, reactions_for=lambda *a: RX(),
+                     say=lambda *a: None, wait_s=2,
+                     on_outcome=lambda k, ok: outcomes.append((k, ok)))
+    check("recovery reports a rescued reply as success", outcomes == [("C:2", True)])
+
+    tp.write_text("")            # nothing was produced
+    outcomes.clear()
+    store.update("C:3", session_id="s", pending=dict(pend))
+    recovery.recover(store, finalize=lambda *a: None, reactions_for=lambda *a: RX(),
+                     say=lambda *a: None, wait_s=2,
+                     on_outcome=lambda k, ok: outcomes.append((k, ok)))
+    check("recovery reports an empty turn as failure", outcomes == [("C:3", False)])
+
 
 # --- process lookup must not be fooled ---------------------------------------
 # pgrep could not see these processes at all; a naive substring match on ps
@@ -413,13 +430,18 @@ def test_task_runner_claim():
     # previous process. Gating on session liveness was wrong: a resumed session
     # is shared by every turn in its thread, so it is alive whenever a newer
     # turn runs, which would leave the orphan stuck in `running` forever.
+    # The sweep lives behind recovery, so tasks recovery resolved are already
+    # settled and only genuine orphans are marked failed.
     src = (BASE / "bot.py").read_text()
-    runner = src[src.index("def _task_runner("):]
-    runner = runner[:runner.index("def run_recovery")]
+    rec = src[src.index("def _recoverer("):]
+    rec = rec[:rec.index("def _sweeper")]
     check("startup closes out inline tasks orphaned by a restart",
-          "interrupted by a restart" in runner)
-    check("orphan sweep does not gate on session liveness",
-          "session_alive" not in runner)
+          "interrupted by a restart" in rec)
+    check("the sweep runs after recovery, not before",
+          rec.index("run_recovery()") < rec.index("interrupted by a restart"))
+    check("orphan sweep does not gate on session liveness", "session_alive" not in rec)
+    check("recovery resolves the task it rescued",
+          "recovered after a restart" in src)
 
 
 # --- bounded state ------------------------------------------------------------

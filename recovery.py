@@ -106,12 +106,15 @@ def _await_reply(session_id: str, since_iso: str, wait_s: int):
         time.sleep(POLL_S)
 
 
-def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dict:
+def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S,
+            on_outcome=None) -> dict:
     """Resolve every pending turn left behind by the previous process.
 
     `finalize(channel, thread_ts, ts, text)` edits the frozen placeholder
     message, `reactions_for(channel, thread_ts, msg_ts)` builds a
     ThreadReactions, and `say(channel, thread_ts, text)` posts a fresh message.
+    `on_outcome(key, recovered)` is told how each thread ended, so a caller can
+    resolve whatever else it tracks about that turn.
     """
     stats = {"recovered": 0, "interrupted": 0, "still_running": 0}
     for key, entry in store.all().items():
@@ -149,6 +152,8 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
                 rx.done()
                 store.add_event(key, "recovered", "reply rescued from the transcript")
                 stats["recovered"] += 1
+                if on_outcome:
+                    on_outcome(key, True)
             else:
                 msg = (":warning: _This turn was interrupted by a bot restart and "
                        "produced no reply. Send the message again to retry._")
@@ -159,6 +164,8 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S) -> dic
                 rx.failed()
                 store.add_event(key, "lost", "interrupted turn produced no reply")
                 stats["interrupted"] += 1
+                if on_outcome:
+                    on_outcome(key, False)
         except Exception:
             log.exception("recovery delivery failed for %s", key)
         finally:

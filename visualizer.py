@@ -410,6 +410,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/tasks":
+            answer = bot_call("/tasks", payload, timeout=15)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/titles":
             answer = bot_call("/titles", payload, timeout=180)
             self._json(answer or {"ok": False, "error": "bot is offline"})
@@ -621,6 +624,30 @@ PAGE = r"""<!doctype html>
            background: #1E0620; border: 1px solid var(--gold); color: var(--ink);
            border-radius: 8px; padding: 8px 16px; font-size: 13px; display: none; z-index: 30; }
 
+  #taskmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
+               display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; }
+  #taskmodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+                    width: min(860px, 100%); max-height: 80vh; overflow: auto; padding: 22px 24px; }
+  #taskmodal h2 { margin: 0 0 4px; font-size: 18px; }
+  #taskmodal .hint { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { background: none; border: 0; color: var(--muted); font: inherit; font-size: 12px;
+                padding: 3px 12px; cursor: pointer; }
+  .seg button.on { background: #C08A1C22; color: var(--gold); }
+  #taskbadge { margin-left: 6px; font-size: 10px; font-family: var(--mono);
+               background: #D8517F; color: #fff; border-radius: 8px; padding: 1px 6px; }
+  #taskbadge:empty { display: none; }
+  .task { display: flex; align-items: baseline; gap: 10px; padding: 9px 2px;
+          border-bottom: 1px solid var(--line); font-size: 13px; }
+  .task .st { font-family: var(--mono); font-size: 10px; border-radius: 5px;
+              padding: 1px 7px; flex: none; }
+  .st-proposed { background: #C08A1C22; color: var(--gold); }
+  .st-awaiting_approval, .st-needs_input { background: #2D9FD022; color: #2D9FD0; }
+  .st-failed { background: #D8517F22; color: #D8517F; }
+  .st-running { background: #2EB67D22; color: #2EB67D; }
+  .st-queued, .st-done, .st-cancelled, .st-blocked { background: #8881; color: var(--muted); }
+  .task .tt { flex: 1; }
+  .task .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
                 display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; }
   #learnmodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
@@ -662,7 +689,8 @@ PAGE = r"""<!doctype html>
   </svg>
   <h1>Silkworm sessions</h1>
   <span id="botdot" title="bot status"></span>
-  <button class="ghost" style="margin-left:16px" onclick="toggleLearn()">🧠 Learnings</button>
+  <button class="ghost" style="margin-left:16px" onclick="toggleTasks()">📋 Tasks<span id="taskbadge"></span></button>
+  <button class="ghost" onclick="toggleLearn()">🧠 Learnings</button>
   <button class="ghost" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
 </header>
@@ -683,6 +711,22 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="tip"></div>
 <div id="toast"></div>
+<div id="taskmodal" onclick="if(event.target.id==='taskmodal')toggleTasks()">
+  <div class="box">
+    <h2 style="display:flex;align-items:center;gap:12px">📋 Tasks
+      <span class="seg"><button id="tabneed" class="on" onclick="setTaskView('attention')">Needs you</button><button id="taball" onclick="setTaskView('all')">All</button></span></h2>
+    <div class="hint">Work Silkworm is managing. This opens on what needs you —
+      tasks proposed for triage, waiting on approval, asking a question, or failed.
+      Everything else is the system's business and stays out of the way.</div>
+    <div class="lform">
+      <input class="text" id="tgoal" placeholder="what should it do?"
+             onkeydown="if(event.key==='Enter')addTask()">
+      <input class="scope" id="tcwd" placeholder="working dir (blank = default)">
+      <button class="act" onclick="addTask()">Queue it</button>
+    </div>
+    <div id="tlist"></div>
+  </div>
+</div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
     <h2 style="display:flex;align-items:center;gap:12px">🧠 Learnings
@@ -805,6 +849,7 @@ async function loadList() {
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
   renderAlerts(data.sessions);
+  refreshTaskBadge();
   const nav = document.getElementById("list");
   nav.innerHTML = "";
   for (const s of data.sessions) {

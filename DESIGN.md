@@ -1,7 +1,8 @@
 # Task system — design
 
-Status: steps 1-2 built. Every Slack turn is a task, and a queue runner
-executes tasks with no live message. The dashboard UI is not built yet.
+Status: steps 1-3 built. Every Slack turn is a task, a queue runner executes
+tasks with no live message, and the dashboard opens on what needs you.
+Next: a reviewer role and one gate (step 4).
 
 ## What this is
 
@@ -95,17 +96,16 @@ graph to maintain.
 1. **Record + store + lifecycle** — no execution. *(built)*
 2. **Executor**: one `assistant` role reproducing today's Slack behaviour
    exactly. Nothing user-visible should change. *(built: every Slack turn is a
-   task, driven queued -> running -> done/failed/cancelled. Control is still
-   message-driven; a queue runner for tasks with no live message is next.)*
-   A queue runner executes tasks nobody is driving (`driver="queue"`), claiming
-   them atomically so a runner and a Slack turn can never both run one.
-   *(built)*
+   task, driven queued -> running -> done/failed/cancelled.)*
    A **queue runner** executes tasks nobody is driving — the ones created in
    the UI rather than by a Slack message. It claims work atomically, so a
    runner and a Slack turn can never both execute the same task, and runs
    serially: for one person, parallel agents multiply the reviewing, which is
    the actual bottleneck. *(built)*
-3. **"Needs me" view** in the dashboard, plus create-a-task.
+3. **"Needs me" view** in the dashboard, plus create-a-task. *(built: a 📋
+   Tasks panel opening on what needs you, with accept/dismiss/retry/cancel and
+   a header badge counting them. Recovery reports each thread's outcome so a
+   rescued reply closes its task as done rather than filing a false failure.)*
 4. **`reviewer` role** and one gate on implementor output.
 5. Ingestion adapters, worktree isolation, per-role tool scoping.
 

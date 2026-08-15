@@ -1394,16 +1394,6 @@ def _task_runner() -> None:
         moved = task_store.requeue_interrupted()
         if moved:
             log.info("requeued %d task(s) interrupted by a restart", moved)
-        # An inline task is driven by a Slack handler, which only exists inside
-        # a process. We are that process starting up, so any inline task still
-        # marked running was orphaned by the restart -- no exceptions, and
-        # notably not "is its session alive?": a long-lived session is shared by
-        # every turn in its thread, so it is alive whenever a *newer* turn is
-        # running and says nothing about this task. recovery.py still rescues
-        # the reply; this only stops the record claiming to be in progress.
-        for tid, rec in task_store.all().items():
-            if rec.get("state") == tasks.RUNNING and rec.get("driver") == "inline":
-                task_state(tid, tasks.FAILED, "interrupted by a restart")
     except Exception:
         log.exception("closing out interrupted tasks failed")
     while True:
@@ -1432,8 +1422,27 @@ def run_recovery() -> dict:
     def reactions_for(channel: str, thread_ts: str, msg_ts):
         return ThreadReactions(app.client, channel, thread_ts, msg_ts)
 
+    def on_outcome(key: str, recovered: bool) -> None:
+        # A rescued reply means the turn actually succeeded, so its task should
+        # say so. Without this every restart would file a false failure into
+        # the "needs you" list, which is the noise that kills the board.
+        tid = inline_task_for(key)
+        if tid:
+            task_state(tid, tasks.DONE if recovered else tasks.FAILED,
+                       "recovered after a restart" if recovered
+                       else "interrupted, produced no reply")
+
     return recovery.recover(store, finalize=finalize, reactions_for=reactions_for,
-                            say=say)
+                            say=say, on_outcome=on_outcome)
+
+
+def inline_task_for(key: str) -> str | None:
+    """The in-flight Slack-driven task for a thread, if there is one."""
+    for tid, rec in task_store.all().items():
+        if (rec.get("thread") == key and rec.get("state") == tasks.RUNNING
+                and rec.get("driver") == "inline"):
+            return tid
+    return None
 
 
 def _recoverer() -> None:
@@ -1441,6 +1450,17 @@ def _recoverer() -> None:
         run_recovery()
     except Exception:
         log.exception("startup recovery failed")
+    # Whatever recovery resolved is already settled; anything still marked
+    # running was driven by a handler in the previous process and nothing in
+    # this one will ever finish it. Deliberately not conditioned on session
+    # liveness: a resumed session is shared by every turn in its thread, so it
+    # is alive whenever a newer turn runs and says nothing about this task.
+    try:
+        for tid, rec in task_store.all().items():
+            if rec.get("state") == tasks.RUNNING and rec.get("driver") == "inline":
+                task_state(tid, tasks.FAILED, "interrupted by a restart")
+    except Exception:
+        log.exception("closing out orphaned inline tasks failed")
 
 
 def reap_runaways(max_age_s: float) -> int:
