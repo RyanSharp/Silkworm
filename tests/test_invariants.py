@@ -326,6 +326,47 @@ def test_task_lifecycle():
           TaskStore(st._path).get(t["id"])["state"] == T.DONE)
 
 
+# --- every turn is a task ------------------------------------------------------
+
+def test_turn_is_a_task():
+    src = (BASE / "bot.py").read_text()
+    print("\nturns are wired to the task lifecycle")
+    check("a prompt creates a task", "task_store.create(" in src)
+    check("task moves to running when Claude is invoked",
+          "task_state(task_id, tasks.RUNNING)" in src)
+    check("success records a result and completes",
+          "task_state(task_id, tasks.DONE)" in src and '"cost": result.cost_usd' in src)
+    check("stop cancels rather than fails", "tasks.CANCELLED, \"stopped by the user\"" in src)
+    # The OUTER handlers are the ones that end a turn; the inner ClaudeError
+    # handler retries and must not mark anything failed.
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "handle_prompt")
+    outer = [h for t in fn.body if isinstance(t, ast.Try) for h in t.handlers]
+    def marks_failed(exc_name):
+        for h in outer:
+            if exc_name not in ast.dump(h.type or ast.Constant(None)):
+                continue
+            # ast.dump renders tasks.FAILED as an Attribute, never that literal
+            # string, so match the node rather than the text.
+            for node in ast.walk(ast.Module(body=h.body, type_ignores=[])):
+                if isinstance(node, ast.Attribute) and node.attr == "FAILED":
+                    return True
+        return False
+    check("ClaudeTimeout marks the task failed", marks_failed("ClaudeTimeout"))
+    check("ClaudeError marks the task failed", marks_failed("ClaudeError"))
+
+    # A lifecycle complaint must never cost the user their reply, so the helper
+    # must contain no raise at all (string matching here trips on "raised").
+    helper = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "task_state")
+    check("a refused transition is swallowed, not raised",
+          not [n for n in ast.walk(helper) if isinstance(n, ast.Raise)])
+    check("the refusal is caught explicitly",
+          any(isinstance(h.type, ast.Attribute) and h.type.attr == "InvalidTransition"
+              for n in ast.walk(helper) if isinstance(n, ast.Try) for h in n.handlers))
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -347,7 +388,7 @@ if __name__ == "__main__":
               test_timeout_is_distinct, test_recovery, test_procs,
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
-              test_task_lifecycle):
+              test_task_lifecycle, test_turn_is_a_task):
         try:
             t()
         except Exception as exc:

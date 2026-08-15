@@ -94,7 +94,9 @@ graph to maintain.
 
 1. **Record + store + lifecycle** — no execution. *(built)*
 2. **Executor**: one `assistant` role reproducing today's Slack behaviour
-   exactly. Nothing user-visible should change.
+   exactly. Nothing user-visible should change. *(built: every Slack turn is a
+   task, driven queued -> running -> done/failed/cancelled. Control is still
+   message-driven; a queue runner for tasks with no live message is next.)*
 3. **"Needs me" view** in the dashboard, plus create-a-task.
 4. **`reviewer` role** and one gate on implementor output.
 5. Ingestion adapters, worktree isolation, per-role tool scoping.

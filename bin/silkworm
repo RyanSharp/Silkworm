@@ -6,6 +6,7 @@
     silkworm harvest                run the learning harvester now
     silkworm summarize [--force]    (re)generate thread context summaries
     silkworm titles [--force]       name threads from their summaries
+    silkworm tasks [state]          list tasks (default: what needs you)
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -402,6 +403,20 @@ def main() -> None:
                   f"{r.get('skipped', 0)} skipped · {r.get('failed', 0)} failed")
         else:
             print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+    elif cmd == "tasks":
+        state = args[1] if len(args) > 1 else ""
+        r = bot_call("/tasks", {"action": "list", "state": state} if state
+                     else {"action": "attention"}, timeout=10)
+        if not r.get("ok"):
+            print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+        else:
+            items = r["tasks"]
+            print(f"{WORM} {state or 'needs you'} — {len(items)} task(s)")
+            for t in items:
+                print(f"  {t['state']:18} {t['id']}  {t['title'][:52]}")
+            counts = r.get("counts") or {}
+            if counts:
+                print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
     elif cmd == "test":
         print(f"{WORM} running regression tests…")
         py = str(VENV_PY) if VENV_PY.exists() else sys.executable

@@ -30,6 +30,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import harvester
 import learnings_git
+import repos
+import tasks
 import procs
 import recovery
 import summaries
@@ -111,6 +113,7 @@ ARTIFACTS_ROOT.mkdir(exist_ok=True)
 
 # --- Shared state -----------------------------------------------------------
 store = SessionStore(BASE_DIR / "sessions.json")
+task_store = tasks.TaskStore(BASE_DIR / "tasks.json")
 # LEARNINGS_FILE can point at a file inside a git repo to share across machines.
 LEARNINGS_FILE = Path(os.environ.get("LEARNINGS_FILE", BASE_DIR / "learnings.json")).expanduser()
 LEARNINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -337,6 +340,24 @@ def name_thread(key: str, prompt: str, reply: str) -> None:
             log.info("named thread %s: %r", key, title)
     except Exception:
         log.exception("naming failed for %s", key)
+
+
+def task_state(task_id: str | None, state: str, detail: str = "") -> None:
+    """Move a task's state without ever breaking the turn it describes.
+
+    The task record is bookkeeping around the reply; a lifecycle complaint must
+    never cost the user their answer, so a refused transition is logged loudly
+    and swallowed rather than raised.
+    """
+    if not task_id:
+        return
+    try:
+        task_store.transition(task_id, state, detail)
+    except tasks.InvalidTransition:
+        log.warning("task %s could not move to %s (bug in the executor's state handling)",
+                    task_id, state)
+    except Exception:
+        log.exception("task %s state update to %s failed", task_id, state)
 
 
 def refresh_summary(key: str) -> None:
@@ -843,6 +864,42 @@ def handle_titles(payload: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def handle_tasks(payload: dict) -> dict:
+    """Route for /tasks — read and triage tasks (localhost-trusted)."""
+    action = payload.get("action", "list")
+    if action == "list":
+        state = payload.get("state")
+        items = (task_store.by_state(state) if state
+                 else sorted(task_store.all().values(),
+                             key=lambda t: -(t.get("created") or 0)))
+        return {"ok": True, "tasks": items[:200], "counts": task_store.counts()}
+    if action == "attention":
+        return {"ok": True, "tasks": task_store.needs_attention(),
+                "counts": task_store.counts()}
+    if action == "create":
+        try:
+            t = task_store.create(payload.get("goal", ""),
+                                  role=payload.get("role", "assistant"),
+                                  source=payload.get("source", "ui"),
+                                  state=payload.get("state", tasks.QUEUED),
+                                  thread=payload.get("thread", ""),
+                                  scope=payload.get("scope") or {})
+            return {"ok": True, "task": t}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+    if action in ("accept", "dismiss", "retry", "cancel"):
+        target = {"accept": tasks.QUEUED, "retry": tasks.QUEUED,
+                  "dismiss": tasks.CANCELLED, "cancel": tasks.CANCELLED}[action]
+        try:
+            return {"ok": True, "task": task_store.transition(
+                payload.get("id", ""), target, f"{action} via {payload.get('by', 'ui')}")}
+        except tasks.InvalidTransition as e:
+            return {"ok": False, "error": f"not allowed: {e}"}
+        except KeyError:
+            return {"ok": False, "error": "unknown task"}
+    return {"ok": False, "error": f"unknown action {action!r}"}
+
+
 def handle_release(payload: dict) -> dict:
     """Route for /release — force-free a wedged thread (localhost-trusted).
 
@@ -934,6 +991,7 @@ server.route("/learnings", handle_learnings)
 server.route("/summaries", handle_summaries)
 server.route("/release", handle_release)
 server.route("/titles", handle_titles)
+server.route("/tasks", handle_tasks)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -1035,6 +1093,18 @@ def handle_prompt(event: dict, say, client) -> None:
     if learn_block:
         system_note += "\n\n" + learn_block
 
+    # Every prompt is a task now. Created before the lock, so a message
+    # waiting its turn is visibly queued rather than invisible.
+    task = task_store.create(
+        text or "(attached files)",
+        role="assistant",
+        source="ui" if event.get("_web") else "slack",
+        source_ref=msg_ts,
+        thread=key,
+        scope={"cwd": str(cwd), "repo": repos.identity(str(cwd))},
+    )
+    task_id = task["id"]
+
     progress = ProgressMessage(client, channel, thread_ts)
     reactions = ThreadReactions(client, channel, thread_ts,
                                 None if event.get("_web") else msg_ts)
@@ -1053,6 +1123,7 @@ def handle_prompt(event: dict, say, client) -> None:
             recovery.mark_pending(store, key, msg_ts=reactions.msg,
                                   progress_ts=progress.ts,
                                   session_id=session_id, prompt=text)
+            task_state(task_id, tasks.RUNNING)
             if not event.get("_web"):  # web prompts have a synthetic ts
                 store.update(key, last_msg_ts=msg_ts)
 
@@ -1129,23 +1200,32 @@ def handle_prompt(event: dict, say, client) -> None:
         if uploaded:
             log.info("uploaded %d file(s) from outbox for %s", uploaded, key)
         reactions.done()
+        task_store.update(task_id, session_id=result.session_id,
+                          result={"text": result.text[:4000],
+                                  "cost": result.cost_usd,
+                                  "files_uploaded": uploaded})
+        task_state(task_id, tasks.DONE)
         refresh_summary(key)
 
     except ClaudeStopped:
         progress.finalize(":octagonal_sign: Stopped.")
         reactions.cleared()
+        task_state(task_id, tasks.CANCELLED, "stopped by the user")
     except ClaudeTimeout as e:
         progress.finalize(f":warning: {e}")
         reactions.failed()
         store.add_event(key, "timeout", str(e))
+        task_state(task_id, tasks.FAILED, str(e)[:160])
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
         reactions.failed()
         store.add_event(key, "error", str(e)[:160])
+        task_state(task_id, tasks.FAILED, str(e)[:160])
     except Exception:
         log.exception("unhandled error in thread %s", key)
         progress.finalize(":warning: Something went wrong — check the bot logs.")
         reactions.failed()
+        task_state(task_id, tasks.FAILED, "unhandled error")
     finally:
         RUNNING.pop(key, None)
         recovery.clear_pending(store, key)
