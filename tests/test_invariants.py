@@ -269,6 +269,63 @@ def test_viz_bind_requires_token():
     check("both GET and POST are gated", src.count("if not self._authed(url)") >= 2)
 
 
+# --- task lifecycle -----------------------------------------------------------
+
+def test_task_lifecycle():
+    import tasks as T
+    from tasks import TaskStore, InvalidTransition
+    print("\ntask lifecycle")
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+
+    def refuses(tid, to):
+        try:
+            st.transition(tid, to)
+            return False
+        except InvalidTransition:
+            return True
+
+    t = st.create("do a thing", source="slack")
+    check("new task starts queued", t["state"] == T.QUEUED)
+    check("record has every declared field", set(t) == set(T.FIELDS))
+    check("ingested task can start proposed",
+          st.create("x", state=T.PROPOSED)["state"] == T.PROPOSED)
+
+    st.transition(t["id"], T.RUNNING)
+    st.transition(t["id"], T.AWAITING_APPROVAL, "merge?")
+    st.transition(t["id"], T.RUNNING, "approved")
+    st.transition(t["id"], T.DONE)
+    check("approval round trip reaches done", st.get(t["id"])["state"] == T.DONE)
+    check("terminal state is terminal", refuses(t["id"], T.RUNNING))
+    check("a task cannot finish without running", refuses(st.create("y")["id"], T.DONE))
+    check("triage cannot be skipped",
+          refuses(st.create("z", state=T.PROPOSED)["id"], T.RUNNING))
+
+    f = st.create("flaky")
+    st.transition(f["id"], T.RUNNING)
+    st.transition(f["id"], T.FAILED)
+    st.transition(f["id"], T.QUEUED, "retry")
+    st.transition(f["id"], T.RUNNING)
+    check("failed tasks can be retried", st.get(f["id"])["state"] == T.RUNNING)
+    check("attempts counted per run", st.get(f["id"])["attempts"] == 2)
+    st.transition(f["id"], T.RUNNING)
+    check("repeat transition is a no-op", st.get(f["id"])["attempts"] == 2)
+
+    need = st.needs_attention()
+    check("only actionable states demand attention",
+          all(x["state"] in T.NEEDS_ATTENTION for x in need))
+    check("running/queued/done never demand attention",
+          not any(x["state"] in (T.QUEUED, T.RUNNING, T.DONE) for x in need))
+
+    try:
+        st.update(t["id"], state=T.RUNNING)
+        check("update() cannot change state", False)
+    except ValueError:
+        check("update() cannot change state", True)
+
+    check("tasks survive a reload",
+          TaskStore(st._path).get(t["id"])["state"] == T.DONE)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -289,7 +346,8 @@ if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
               test_dashboard_classifiers, test_watermark, test_bounded_state,
-              test_schema, test_command_dedup, test_viz_bind_requires_token):
+              test_schema, test_command_dedup, test_viz_bind_requires_token,
+              test_task_lifecycle):
         try:
             t()
         except Exception as exc:
