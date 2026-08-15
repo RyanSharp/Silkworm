@@ -66,6 +66,11 @@ class InvalidTransition(Exception):
 
 FIELDS: dict[str, tuple] = {
     "id":          (None,  "tsk_… identifier"),
+    # Who is responsible for running this. "inline" means a live handler (a
+    # Slack turn) already owns it and the queue runner must keep its hands off;
+    # "queue" means nobody is driving it and the runner may claim it. Defaults
+    # to inline so a task never starts executing merely by existing.
+    "driver":      ("inline", "inline | queue — who executes this"),
     "v":           (0,     "schema version of this record"),
     "title":       ("",    "short human label"),
     "goal":        ("",    "what the task should achieve; the prompt"),
@@ -207,6 +212,46 @@ class TaskStore:
     def next_queued(self) -> dict | None:
         pending = self.by_state(QUEUED)
         return pending[0] if pending else None
+
+    def claim(self) -> dict | None:
+        """Take the oldest queued task the runner is allowed to execute.
+
+        The claim (queued -> running) happens under the same lock that selects
+        it, so two runners -- or a runner and a restart -- can never both pick
+        up the same task. Tasks with driver="inline" are owned by a live Slack
+        turn and are never claimed here.
+        """
+        with self._lock:
+            candidates = [r for r in self._data.values()
+                          if r.get("state") == QUEUED and r.get("driver") == "queue"]
+            if not candidates:
+                return None
+            rec = min(candidates, key=lambda r: r.get("created", 0))
+            rec["state"] = RUNNING
+            rec["attempts"] = (rec.get("attempts") or 0) + 1
+            rec["updated"] = time.time()
+            events = rec.setdefault("events", [])
+            events.append({"at": time.time(), "kind": RUNNING, "detail": "claimed by the runner"})
+            del events[:-50]
+            self._save()
+            log.info("task %s claimed by the runner", rec["id"])
+            return dict(rec)
+
+    def requeue_interrupted(self) -> int:
+        """Return tasks left mid-run by a restart to the queue.
+
+        A queue task in `running` with nobody running it cannot make progress,
+        so it is recorded as interrupted and put back. Inline tasks are left
+        alone: recovery.py already rescues their reply from the transcript.
+        """
+        moved = 0
+        for tid, rec in list(self._data.items()):
+            if rec.get("state") != RUNNING or rec.get("driver") != "queue":
+                continue
+            self.transition(tid, FAILED, "interrupted by a restart")
+            self.transition(tid, QUEUED, "requeued after a restart")
+            moved += 1
+        return moved
 
     def counts(self) -> dict[str, int]:
         with self._lock:

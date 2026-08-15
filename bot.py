@@ -882,8 +882,11 @@ def handle_tasks(payload: dict) -> dict:
                                   role=payload.get("role", "assistant"),
                                   source=payload.get("source", "ui"),
                                   state=payload.get("state", tasks.QUEUED),
+                                  # Nobody is holding a live message for these,
+                                  # so the runner is what will execute them.
+                                  driver=payload.get("driver", "queue"),
                                   thread=payload.get("thread", ""),
-                                  scope=payload.get("scope") or {})
+                                  scope=payload.get("scope") or {"cwd": str(CLAUDE_CWD)})
             return {"ok": True, "task": t}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
@@ -1272,6 +1275,148 @@ def reconcile_checkouts() -> None:
             log.info("released stale pre-boot checkout %s", key)
 
 
+TASK_POLL_S = 10
+
+
+def home_channel() -> str:
+    """Where a task with no thread of its own should report."""
+    if SILKWORM_HOME_CHANNEL:
+        return SILKWORM_HOME_CHANNEL
+    dms = [k for k, v in sorted(store.all().items(), key=lambda kv: -kv[1].get("updated", 0))
+           if k.startswith("D")]
+    return dms[0].split(":", 1)[0] if dms else ""
+
+
+def task_thread(task: dict) -> tuple[str, str]:
+    """The Slack thread a task narrates into, creating one if it has none.
+
+    A task created in the dashboard has nowhere to talk, so it gets an anchor
+    message — the same trick terminal-started sessions use — and from then on
+    it behaves like any other thread.
+    """
+    if task.get("thread") and ":" in task["thread"]:
+        channel, _, thread_ts = task["thread"].partition(":")
+        return channel, thread_ts
+    channel = home_channel()
+    if not channel:
+        return "", ""
+    resp = app.client.chat_postMessage(
+        channel=channel,
+        text=f":clipboard: *Task* — {task.get('title') or task['id']}\n"
+             f"_{task['id']} · queued from {task.get('source', 'ui')}_")
+    thread_ts = resp["ts"]
+    task_store.update(task["id"], thread=f"{channel}:{thread_ts}")
+    return channel, thread_ts
+
+
+def execute_task(task: dict) -> None:
+    """Run one claimed task. Already in `running` — the claim did that."""
+    tid = task["id"]
+    scope = task.get("scope") or {}
+    cwd = Path(scope.get("cwd") or CLAUDE_CWD)
+    channel, thread_ts = task_thread(task)
+    if not channel:
+        log.error("task %s has nowhere to report (set SILKWORM_HOME_CHANNEL)", tid)
+        task_state(tid, tasks.FAILED, "no Slack channel to report into")
+        return
+
+    key = f"{channel}:{thread_ts}"
+    progress = ProgressMessage(app.client, channel, thread_ts)
+    outbox = OUTBOX_ROOT / key.replace(":", "__")
+    system_note = (
+        "You are completing a task; report the outcome concisely. "
+        f"If you create a file the user should receive, copy it into {outbox}."
+    )
+    learn_block = render_block(learnings.applicable(str(cwd)))
+    if learn_block:
+        system_note += "\n\n" + learn_block
+
+    lock = _thread_lock(key)
+    try:
+        with lock:
+            entry = store.get(key) or {}
+            session_id = task.get("session_id") or entry.get("session_id")
+            recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
+                                  session_id=session_id, prompt=task.get("goal", ""))
+            outbox.mkdir(parents=True, exist_ok=True)
+            try:
+                result = run_turn(
+                    task.get("goal", ""), session_id=session_id,
+                    binary=CLAUDE_BIN, cwd=cwd, permission_args=permission_args(),
+                    model=entry.get("model") or CLAUDE_MODEL,
+                    append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
+                    env=claude_env(), timeout=CLAUDE_TIMEOUT,
+                    on_init=lambda sid: task_store.update(tid, session_id=sid),
+                    on_activity=lambda n, i: progress.update(
+                        f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
+                    on_start=lambda h: RUNNING.__setitem__(key, h),
+                )
+                store.update(key, session_id=result.session_id, cwd=str(cwd))
+                store.add_cost(key, result.cost_usd)
+                uploaded = upload_outbox(app.client, outbox, channel, thread_ts, key)
+            finally:
+                shutil.rmtree(outbox, ignore_errors=True)
+
+        total = (store.get(key) or {}).get("cost", 0.0)
+        parts = chunk(to_mrkdwn(result.text))
+        parts[-1] += (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
+                      f"${result.cost_usd:.4f} · thread total ${total:.2f}_")
+        progress.finalize(parts[0])
+        for part in parts[1:]:
+            app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
+        task_store.update(tid, session_id=result.session_id,
+                          result={"text": result.text[:4000], "cost": result.cost_usd,
+                                  "files_uploaded": uploaded})
+        task_state(tid, tasks.DONE)
+        refresh_summary(key)
+    except ClaudeStopped:
+        progress.finalize(":octagonal_sign: Stopped.")
+        task_state(tid, tasks.CANCELLED, "stopped by the user")
+    except ClaudeError as e:
+        progress.finalize(f":warning: {e}")
+        task_state(tid, tasks.FAILED, str(e)[:160])
+    except Exception as e:
+        log.exception("task %s failed", tid)
+        progress.finalize(":warning: Task failed — check the bot logs.")
+        task_state(tid, tasks.FAILED, str(e)[:160])
+    finally:
+        RUNNING.pop(key, None)
+        recovery.clear_pending(store, key)
+
+
+def _task_runner() -> None:
+    """Execute tasks nobody else is driving, one at a time.
+
+    Serial on purpose: for a single person, parallel agents multiply the
+    reviewing, which is the actual bottleneck.
+    """
+    try:
+        moved = task_store.requeue_interrupted()
+        if moved:
+            log.info("requeued %d task(s) interrupted by a restart", moved)
+        # Inline tasks are owned by a Slack handler that died with the previous
+        # process, so nothing will ever finish them. recovery.py still rescues
+        # the reply from the transcript; this just stops the record claiming to
+        # be running. A task whose child is genuinely still alive is left be --
+        # that one is mid-flight and recovery is waiting on it.
+        for tid, rec in task_store.all().items():
+            if rec.get("state") != tasks.RUNNING or rec.get("driver") != "inline":
+                continue
+            if not procs.session_alive(rec.get("session_id") or ""):
+                task_state(tid, tasks.FAILED, "interrupted by a restart")
+    except Exception:
+        log.exception("closing out interrupted tasks failed")
+    while True:
+        try:
+            task = task_store.claim()
+            if task:
+                execute_task(task)
+                continue           # drain without waiting
+        except Exception:
+            log.exception("task runner iteration failed")
+        time.sleep(TASK_POLL_S)
+
+
 def run_recovery() -> dict:
     """Finish turns the previous process was running when it went away."""
     def finalize(channel: str, thread_ts: str, ts: str, text: str) -> None:
@@ -1382,6 +1527,7 @@ if __name__ == "__main__":
     threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+    threading.Thread(target=_task_runner, daemon=True, name="task-runner").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

@@ -1,7 +1,7 @@
 # Task system — design
 
-Status: agreed, partially built. `tasks.py` implements the record, store and
-lifecycle. Execution and UI are not wired yet.
+Status: steps 1-2 built. Every Slack turn is a task, and a queue runner
+executes tasks with no live message. The dashboard UI is not built yet.
 
 ## What this is
 
@@ -97,6 +97,9 @@ graph to maintain.
    exactly. Nothing user-visible should change. *(built: every Slack turn is a
    task, driven queued -> running -> done/failed/cancelled. Control is still
    message-driven; a queue runner for tasks with no live message is next.)*
+   A queue runner executes tasks nobody is driving (`driver="queue"`), claiming
+   them atomically so a runner and a Slack turn can never both run one.
+   *(built)*
 3. **"Needs me" view** in the dashboard, plus create-a-task.
 4. **`reviewer` role** and one gate on implementor output.
 5. Ingestion adapters, worktree isolation, per-role tool scoping.

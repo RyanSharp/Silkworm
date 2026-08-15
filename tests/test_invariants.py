@@ -367,6 +367,55 @@ def test_turn_is_a_task():
               for n in ast.walk(helper) if isinstance(n, ast.Try) for h in n.handlers))
 
 
+# --- queue runner -------------------------------------------------------------
+
+def test_task_runner_claim():
+    import tasks as T
+    from tasks import TaskStore
+    import threading as th
+    print("\nqueue runner claim semantics")
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+
+    inline = st.create("a slack turn")
+    check("tasks default to inline (never auto-run merely by existing)",
+          inline["driver"] == "inline")
+    check("runner ignores inline tasks", st.claim() is None)
+
+    for i in range(20):
+        st.create(f"q{i}", driver="queue")
+    got = []
+    def worker():
+        while True:
+            t = st.claim()
+            if not t:
+                return
+            got.append(t["id"])
+    ths = [th.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    check("every queued task claimed exactly once",
+          len(got) == 20 and len(set(got)) == 20)
+
+    moved = st.requeue_interrupted()
+    check("interrupted queue tasks are requeued", moved == 20)
+    check("inline tasks are not requeued (recovery handles their reply)",
+          st.get(inline["id"])["state"] == T.QUEUED and st.get(inline["id"])["driver"] == "inline")
+    trail = [e["kind"] for e in st.get(got[0])["events"]]
+    check("the interruption is recorded, not hidden",
+          "failed" in trail and trail[-1] == "queued")
+
+    st2 = TaskStore(Path(tempfile.mkdtemp()) / "t2.json")
+    first = st2.create("first", driver="queue")
+    st2.create("second", driver="queue")
+    check("claims are oldest-first", st2.claim()["id"] == first["id"])
+
+    src = (BASE / "bot.py").read_text()
+    check("runner closes out inline tasks orphaned by a restart",
+          "interrupted by a restart" in src and "procs.session_alive" in src)
+    check("a still-live inline task is left alone",
+          "if not procs.session_alive(rec.get(\"session_id\") or \"\"):" in src)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -388,7 +437,7 @@ if __name__ == "__main__":
               test_timeout_is_distinct, test_recovery, test_procs,
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
-              test_task_lifecycle, test_turn_is_a_task):
+              test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim):
         try:
             t()
         except Exception as exc:
