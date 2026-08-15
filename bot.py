@@ -1394,15 +1394,15 @@ def _task_runner() -> None:
         moved = task_store.requeue_interrupted()
         if moved:
             log.info("requeued %d task(s) interrupted by a restart", moved)
-        # Inline tasks are owned by a Slack handler that died with the previous
-        # process, so nothing will ever finish them. recovery.py still rescues
-        # the reply from the transcript; this just stops the record claiming to
-        # be running. A task whose child is genuinely still alive is left be --
-        # that one is mid-flight and recovery is waiting on it.
+        # An inline task is driven by a Slack handler, which only exists inside
+        # a process. We are that process starting up, so any inline task still
+        # marked running was orphaned by the restart -- no exceptions, and
+        # notably not "is its session alive?": a long-lived session is shared by
+        # every turn in its thread, so it is alive whenever a *newer* turn is
+        # running and says nothing about this task. recovery.py still rescues
+        # the reply; this only stops the record claiming to be in progress.
         for tid, rec in task_store.all().items():
-            if rec.get("state") != tasks.RUNNING or rec.get("driver") != "inline":
-                continue
-            if not procs.session_alive(rec.get("session_id") or ""):
+            if rec.get("state") == tasks.RUNNING and rec.get("driver") == "inline":
                 task_state(tid, tasks.FAILED, "interrupted by a restart")
     except Exception:
         log.exception("closing out interrupted tasks failed")

@@ -100,6 +100,11 @@ graph to maintain.
    A queue runner executes tasks nobody is driving (`driver="queue"`), claiming
    them atomically so a runner and a Slack turn can never both run one.
    *(built)*
+   A **queue runner** executes tasks nobody is driving — the ones created in
+   the UI rather than by a Slack message. It claims work atomically, so a
+   runner and a Slack turn can never both execute the same task, and runs
+   serially: for one person, parallel agents multiply the reviewing, which is
+   the actual bottleneck. *(built)*
 3. **"Needs me" view** in the dashboard, plus create-a-task.
 4. **`reviewer` role** and one gate on implementor output.
 5. Ingestion adapters, worktree isolation, per-role tool scoping.

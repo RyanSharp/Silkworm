@@ -409,11 +409,17 @@ def test_task_runner_claim():
     st2.create("second", driver="queue")
     check("claims are oldest-first", st2.claim()["id"] == first["id"])
 
+    # At startup no inline task can still be owned -- its handler lived in the
+    # previous process. Gating on session liveness was wrong: a resumed session
+    # is shared by every turn in its thread, so it is alive whenever a newer
+    # turn runs, which would leave the orphan stuck in `running` forever.
     src = (BASE / "bot.py").read_text()
-    check("runner closes out inline tasks orphaned by a restart",
-          "interrupted by a restart" in src and "procs.session_alive" in src)
-    check("a still-live inline task is left alone",
-          "if not procs.session_alive(rec.get(\"session_id\") or \"\"):" in src)
+    runner = src[src.index("def _task_runner("):]
+    runner = runner[:runner.index("def run_recovery")]
+    check("startup closes out inline tasks orphaned by a restart",
+          "interrupted by a restart" in runner)
+    check("orphan sweep does not gate on session liveness",
+          "session_alive" not in runner)
 
 
 # --- bounded state ------------------------------------------------------------
