@@ -444,6 +444,54 @@ def test_task_runner_claim():
           "recovered after a restart" in src)
 
 
+# --- the review gate ----------------------------------------------------------
+
+def test_review_gate():
+    import roles
+    import tasks as T
+    print("\nreview gate")
+
+    check("slack behaviour is untouched by roles", not roles.needs_review("assistant"))
+    check("implementor output is gated", roles.needs_review("implementor"))
+    check("a review is not itself reviewed", not roles.needs_review("reviewer"))
+    check("reviewer starts a fresh session", roles.is_fresh("reviewer"))
+    check("assistant resumes as before", not roles.is_fresh("assistant"))
+
+    default = ["--dangerously-skip-permissions"]
+    rp = roles.permission_args("reviewer", default)
+    check("reviewer never gets full autonomy", "--dangerously-skip-permissions" not in rp)
+    check("reviewer is read-only",
+          "Edit" not in roles.REVIEWER_TOOLS and "Write" not in roles.REVIEWER_TOOLS)
+    check("other roles keep the default args",
+          roles.permission_args("implementor", default) == default)
+
+    v = roles.parse_verdict('```json\n{"ok": true, "summary": "fine", "findings": []}\n```')
+    check("a clean verdict parses", v["ok"] and v["parsed"])
+    v = roles.parse_verdict('```json\n{"ok": false, "summary": "b", "findings": ["x"]}\n```')
+    check("findings parse", not v["ok"] and v["findings"] == ["x"])
+    v = roles.parse_verdict("Looks fine to me!")
+    check("an unreadable verdict fails closed", not v["ok"] and not v["parsed"])
+    v = roles.parse_verdict('```json\n{oops\n```')
+    check("malformed json fails closed", not v["ok"] and not v["parsed"])
+    v = roles.parse_verdict('```json\n{"ok":true,"findings":[]}\n```\n'
+                            '```json\n{"ok":false,"summary":"no","findings":["x"]}\n```')
+    check("the last verdict wins", not v["ok"])
+
+    check("a blocked task can be resolved by its review",
+          T.can(T.BLOCKED, T.DONE) and T.can(T.BLOCKED, T.AWAITING_APPROVAL))
+
+    src = (BASE / "bot.py").read_text()
+    gate = src[src.index("def resolve_review("):src.index("def _task_runner(")]
+    check("passing review completes the parent", "tasks.DONE if verdict" in gate)
+    check("a flagged review asks the user", "tasks.AWAITING_APPROVAL" in gate)
+    check("the implementor waits rather than self-certifying", "tasks.BLOCKED" in gate)
+    exe = src[src.index("def execute_task("):src.index("def resolve_review(")]
+    check("a fresh role does not resume the thread's session",
+          "None if fresh else" in exe)
+    check("a fresh role does not repoint the thread's session",
+          "if not fresh:" in exe)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -465,7 +513,8 @@ if __name__ == "__main__":
               test_timeout_is_distinct, test_recovery, test_procs,
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
-              test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim):
+              test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
+              test_review_gate):
         try:
             t()
         except Exception as exc:

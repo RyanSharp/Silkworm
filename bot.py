@@ -31,6 +31,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import harvester
 import learnings_git
 import repos
+import roles
 import tasks
 import procs
 import recovery
@@ -1312,6 +1313,8 @@ def task_thread(task: dict) -> tuple[str, str]:
 def execute_task(task: dict) -> None:
     """Run one claimed task. Already in `running` — the claim did that."""
     tid = task["id"]
+    role_name = task.get("role") or "assistant"
+    fresh = roles.is_fresh(role_name)
     scope = task.get("scope") or {}
     cwd = Path(scope.get("cwd") or CLAUDE_CWD)
     channel, thread_ts = task_thread(task)
@@ -1327,6 +1330,9 @@ def execute_task(task: dict) -> None:
         "You are completing a task; report the outcome concisely. "
         f"If you create a file the user should receive, copy it into {outbox}."
     )
+    role_system = roles.system_prompt(role_name)
+    if role_system:
+        system_note += "\n\n" + role_system
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
@@ -1335,14 +1341,17 @@ def execute_task(task: dict) -> None:
     try:
         with lock:
             entry = store.get(key) or {}
-            session_id = task.get("session_id") or entry.get("session_id")
+            # A fresh role starts its own session; resuming the thread's would
+            # hand the reviewer the very conversation it is meant to audit.
+            session_id = None if fresh else (task.get("session_id") or entry.get("session_id"))
             recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
                                   session_id=session_id, prompt=task.get("goal", ""))
             outbox.mkdir(parents=True, exist_ok=True)
             try:
                 result = run_turn(
                     task.get("goal", ""), session_id=session_id,
-                    binary=CLAUDE_BIN, cwd=cwd, permission_args=permission_args(),
+                    binary=CLAUDE_BIN, cwd=cwd,
+                    permission_args=roles.permission_args(role_name, permission_args()),
                     model=entry.get("model") or CLAUDE_MODEL,
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
                     env=claude_env(), timeout=CLAUDE_TIMEOUT,
@@ -1351,7 +1360,10 @@ def execute_task(task: dict) -> None:
                         f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
                     on_start=lambda h: RUNNING.__setitem__(key, h),
                 )
-                store.update(key, session_id=result.session_id, cwd=str(cwd))
+                # A fresh run must not repoint the thread at its throwaway
+                # session, or the next Slack message resumes the review.
+                if not fresh:
+                    store.update(key, session_id=result.session_id, cwd=str(cwd))
                 store.add_cost(key, result.cost_usd)
                 uploaded = upload_outbox(app.client, outbox, channel, thread_ts, key)
             finally:
@@ -1367,7 +1379,8 @@ def execute_task(task: dict) -> None:
         task_store.update(tid, session_id=result.session_id,
                           result={"text": result.text[:4000], "cost": result.cost_usd,
                                   "files_uploaded": uploaded})
-        task_state(tid, tasks.DONE)
+        if not resolve_review(task, role_name, result.text, channel, thread_ts):
+            task_state(tid, tasks.DONE)
         refresh_summary(key)
     except ClaudeStopped:
         progress.finalize(":octagonal_sign: Stopped.")
@@ -1382,6 +1395,48 @@ def execute_task(task: dict) -> None:
     finally:
         RUNNING.pop(key, None)
         recovery.clear_pending(store, key)
+
+
+def resolve_review(task: dict, role_name: str, text: str,
+                   channel: str, thread_ts: str) -> bool:
+    """Apply the review gate. Returns True if the task's fate is already settled.
+
+    An implementor does not finish on its own say-so: its output goes to a
+    reviewer with fresh context, and the task waits. The reviewer's verdict
+    then either completes it silently or puts it in front of the user with
+    specific findings — which is the whole point, spending tokens so that only
+    flagged work costs attention.
+    """
+    tid = task["id"]
+    if roles.needs_review(role_name) and not task.get("blocked_on"):
+        child = task_store.create(
+            roles.review_goal(task, text), role="reviewer", driver="queue",
+            source="review", source_ref=tid, parent=tid,
+            root=task.get("root") or tid, thread=f"{channel}:{thread_ts}",
+            scope=task.get("scope") or {})
+        task_store.update(tid, blocked_on=[child["id"]])
+        task_state(tid, tasks.BLOCKED, f"awaiting review {child['id']}")
+        return True
+
+    parent_id = task.get("parent")
+    if role_name != "reviewer" or not parent_id:
+        return False
+    verdict = roles.parse_verdict(text)
+    note = (":white_check_mark: *Review passed* — " if verdict["ok"]
+            else ":mag: *Review flagged this* — ") + (verdict["summary"] or "")
+    if verdict["findings"]:
+        note += "\n" + "\n".join(f"• {f}" for f in verdict["findings"])
+    try:
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=note)
+    except Exception:
+        log.exception("posting the review verdict failed")
+    parent = task_store.get(parent_id)
+    if parent:
+        task_store.update(parent_id, result={**(parent.get("result") or {}),
+                                             "review": verdict})
+        task_state(parent_id, tasks.DONE if verdict["ok"] else tasks.AWAITING_APPROVAL,
+                   verdict["summary"][:160])
+    return False
 
 
 def _task_runner() -> None:

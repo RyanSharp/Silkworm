@@ -1,8 +1,8 @@
 # Task system — design
 
-Status: steps 1-3 built. Every Slack turn is a task, a queue runner executes
-tasks with no live message, and the dashboard opens on what needs you.
-Next: a reviewer role and one gate (step 4).
+Status: steps 1-4 built. Every Slack turn is a task, a queue runner executes
+tasks with no live message, the dashboard opens on what needs you, and implementor work is
+gated behind an independent review. Next: ingestion adapters (step 5).
 
 ## What this is
 
@@ -106,7 +106,11 @@ graph to maintain.
    Tasks panel opening on what needs you, with accept/dismiss/retry/cancel and
    a header badge counting them. Recovery reports each thread's outcome so a
    rescued reply closes its task as done rather than filing a false failure.)*
-4. **`reviewer` role** and one gate on implementor output.
+4. **`reviewer` role** and one gate on implementor output. *(built: an
+   implementor cannot complete on its own say-so — its result goes to a
+   reviewer with a fresh session and read-only tools, and the task waits in
+   `blocked`. A passing verdict completes it silently; a flagged one lands in
+   `awaiting_approval` with the findings. An unreadable verdict fails closed.)*
 5. Ingestion adapters, worktree isolation, per-role tool scoping.
 
 Steps 1–3 are what make it a management system; 4–5 are what make it an agent

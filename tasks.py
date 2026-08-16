@@ -51,7 +51,9 @@ TRANSITIONS: dict[str, tuple] = {
     RUNNING:           (DONE, FAILED, AWAITING_APPROVAL, NEEDS_INPUT, BLOCKED, CANCELLED),
     AWAITING_APPROVAL: (RUNNING, CANCELLED, FAILED),
     NEEDS_INPUT:       (RUNNING, CANCELLED, FAILED),
-    BLOCKED:           (QUEUED, CANCELLED, FAILED),
+    # DONE/AWAITING_APPROVAL: a task blocked on its review is resolved by the
+    # reviewer's verdict, not by going round the queue again.
+    BLOCKED:           (QUEUED, DONE, AWAITING_APPROVAL, CANCELLED, FAILED),
     FAILED:            (QUEUED, CANCELLED),        # retry
     DONE:              (),
     CANCELLED:         (),
