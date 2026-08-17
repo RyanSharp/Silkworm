@@ -237,6 +237,8 @@ def test_schema():
     a, b = schema.default("events"), schema.default("events")
     a.append(1)
     check("mutable defaults are not shared", b == [])
+    check("a session records what it is for", "kind" in schema.FIELDS)
+    check("sessions default to being a conversation", schema.default("kind") == "thread")
     check("every schema field is documented",
           all(isinstance(d, str) and d for _, d in schema.FIELDS.values()))
 
@@ -397,6 +399,10 @@ def test_task_runner_claim():
     check("tasks default to inline (never auto-run merely by existing)",
           inline["driver"] == "inline")
     check("runner ignores inline tasks", st.claim() is None)
+    src0 = (BASE / "bot.py").read_text()
+    anchor = src0[src0.index("def task_thread("):src0.index("def execute_task(")]
+    check("an anchor thread is labelled a task run, not left untitled",
+          'kind="task"' in anchor and 'title=f"Task: ' in anchor)
 
     for i in range(20):
         st.create(f"q{i}", driver="queue")
@@ -482,6 +488,8 @@ def test_review_gate():
 
     src = (BASE / "bot.py").read_text()
     gate = src[src.index("def resolve_review("):src.index("def _task_runner(")]
+    check("a review task is titled readably, not by its prompt",
+          'title=f"Review: ' in gate)
     check("passing review completes the parent", "tasks.DONE if verdict" in gate)
     check("a flagged review asks the user", "tasks.AWAITING_APPROVAL" in gate)
     check("the implementor waits rather than self-certifying", "tasks.BLOCKED" in gate)

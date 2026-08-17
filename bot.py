@@ -1306,7 +1306,12 @@ def task_thread(task: dict) -> tuple[str, str]:
         text=f":clipboard: *Task* — {task.get('title') or task['id']}\n"
              f"_{task['id']} · queued from {task.get('source', 'ui')}_")
     thread_ts = resp["ts"]
-    task_store.update(task["id"], thread=f"{channel}:{thread_ts}")
+    key = f"{channel}:{thread_ts}"
+    task_store.update(task["id"], thread=key)
+    # Label it so the dashboard doesn't list a task run as an untitled
+    # conversation sitting alongside real ones.
+    store.update(key, kind="task",
+                 title=f"Task: {(task.get('title') or task['id'])[:52]}")
     return channel, thread_ts
 
 
@@ -1411,6 +1416,9 @@ def resolve_review(task: dict, role_name: str, text: str,
     if roles.needs_review(role_name) and not task.get("blocked_on"):
         child = task_store.create(
             roles.review_goal(task, text), role="reviewer", driver="queue",
+            # Without an explicit title it would be the review prompt's first
+            # line ("Goal that was given:"), which reads as nonsense in a list.
+            title=f"Review: {(task.get('title') or tid)[:46]}",
             source="review", source_ref=tid, parent=tid,
             root=task.get("root") or tid, thread=f"{channel}:{thread_ts}",
             scope=task.get("scope") or {})

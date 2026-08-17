@@ -136,6 +136,7 @@ def load_sessions() -> dict:
         out.append({
             "key": key,
             "title": entry.get("title") or "",
+            "kind": entry.get("kind") or "thread",
             "summary": entry.get("summary") or "",
             "session_id": sid,
             "model": entry.get("model"),
@@ -490,6 +491,7 @@ PAGE = r"""<!doctype html>
              border-radius: 6px; background: #2EB67D18;
              border-left: 2px solid #2EB67D; }
   .turnbar.bad { background: #D8517F1C; border-left-color: #D8517F; }
+  .badge.kind { background: #8881; color: var(--muted); border: 1px solid var(--line); }
   .badge.cost { background: #C08A1C22; color: var(--gold); border: 1px solid #C08A1C99; }
   .card .untitled { color: var(--muted); font-style: italic; font-size: 12.5px; }
   .pill { font-size: 10.5px; font-family: var(--mono); color: var(--gold);
@@ -865,7 +867,8 @@ async function loadList() {
       (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
     const label = s.title ? `<span class="title">${esc(s.title)}</span>`
                           : `<span class="untitled">untitled</span>`;
-    div.innerHTML = `<div class="key">${label}${badges}
+    const kindTag = s.kind === "task" ? `<span class="badge kind">task run</span>` : "";
+    div.innerHTML = `<div class="key">${label}${kindTag}${badges}
         ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
       <div class="subkey">${esc(s.key)}</div>
       ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}

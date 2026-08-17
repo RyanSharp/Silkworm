@@ -26,6 +26,9 @@ FIELDS: dict[str, tuple] = {
     "cwd":               ("",    "directory the session runs in"),
     "model":             (None,  "per-thread model override, or None for the default"),
     "title":             ("",    "short name shown in the dashboard"),
+    # "thread" is a conversation you had; "task" is an anchor the queue runner
+    # created to give a UI task somewhere to report. They are not peers.
+    "kind":              ("thread", "thread | task — what this session is for"),
     "summary":           ("",    "1-3 sentence description of the conversation"),
     "summary_ts":        ("",    "transcript timestamp the summary was written from"),
     "summary_turns":     (None,  "turn count when summarised; None = unknown, not 0"),
