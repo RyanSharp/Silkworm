@@ -238,6 +238,24 @@ no longer owned by the bot.
 Threads also keep a short event log — recovered, interrupted, timed out, reaped,
 released — so an interrupted thread doesn't look merely quiet.
 
+## Watching your inbox
+
+Silkworm can watch Gmail and **propose** tasks for mail that looks like it
+needs you — a question, a deadline, a bill, an account problem. Set
+`GMAIL_USER` and `GMAIL_APP_PASSWORD` in `.env` (an
+[app password](https://myaccount.google.com/apppasswords), not your account
+password) and it polls every `GMAIL_POLL_MIN` minutes. `silkworm email` runs a
+pass on demand.
+
+It is **read-only**: the mailbox is opened readonly and bodies are fetched with
+`BODY.PEEK`, so nothing is ever marked read, moved or deleted. Only sender,
+subject, date and a ~400 character snippet go to the triage model; full bodies
+stay on the machine.
+
+Everything it finds arrives as **`proposed`**, never queued, so a mediocre
+triage costs you an accept/dismiss rather than unwanted work. Triage fails
+closed — unreadable output flags nothing rather than everything.
+
 ## Moving a thread to the terminal
 
 Every thread is a normal Claude Code session, so it works both ways: send

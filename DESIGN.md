@@ -112,6 +112,13 @@ graph to maintain.
    `blocked`. A passing verdict completes it silently; a flagged one lands in
    `awaiting_approval` with the findings. An unreadable verdict fails closed.)*
 5. Ingestion adapters, worktree isolation, per-role tool scoping.
+   *(email: built. Gmail over IMAP with an app password — the API needs a
+   Cloud project and a browser consent flow, awkward on a headless host.
+   Read-only by construction: readonly select and BODY.PEEK, so watching the
+   inbox never changes what the user sees. A cheap model triages
+   sender/subject/snippet only — full bodies never leave the machine — and
+   everything it flags lands `proposed`, so a wrong guess costs two clicks
+   rather than flooding the list. Off unless credentials are set.)*
 
 Steps 1–3 are what make it a management system; 4–5 are what make it an agent
 system. In that order, because a queue nobody looks at is worse than no queue.

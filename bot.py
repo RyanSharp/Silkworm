@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import email_ingest
 import harvester
 import learnings_git
 import repos
@@ -59,6 +60,15 @@ NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "haiku")  # empty string disables
 HARVEST_MODEL = os.environ.get("HARVEST_MODEL", "sonnet")
 HARVEST_INTERVAL_H = float(os.environ.get("HARVEST_INTERVAL_H", "6"))  # 0 disables auto-harvest
+
+# --- Gmail watching (off unless credentials are present) ---
+GMAIL_USER = os.environ.get("GMAIL_USER", "").strip()
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+GMAIL_HOST = os.environ.get("GMAIL_HOST", "imap.gmail.com").strip()
+GMAIL_MAILBOX = os.environ.get("GMAIL_MAILBOX", "INBOX").strip()
+GMAIL_POLL_MIN = float(os.environ.get("GMAIL_POLL_MIN", "15"))
+GMAIL_MAX_PER_RUN = int(os.environ.get("GMAIL_MAX_PER_RUN", "25"))
+EMAIL_STATE_FILE = BASE_DIR / "email_state.json"
 
 # skip  = --dangerously-skip-permissions (full autonomy)
 # slack = gated: every non-trivial tool call posts Approve/Deny buttons
@@ -877,6 +887,12 @@ def handle_tasks(payload: dict) -> dict:
     if action == "attention":
         return {"ok": True, "tasks": task_store.needs_attention(),
                 "counts": task_store.counts()}
+    if action == "ingest-email":
+        try:
+            return run_email_ingest()
+        except Exception as e:
+            log.exception("manual email ingest failed")
+            return {"ok": False, "error": str(e)}
     if action == "create":
         try:
             t = task_store.create(payload.get("goal", ""),
@@ -1447,6 +1463,36 @@ def resolve_review(task: dict, role_name: str, text: str,
     return False
 
 
+def run_email_ingest() -> dict:
+    """One Gmail pass. Off unless both credentials are set."""
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD):
+        return {"ok": False, "error": "GMAIL_USER / GMAIL_APP_PASSWORD not set"}
+    try:
+        state = json.loads(EMAIL_STATE_FILE.read_text()) if EMAIL_STATE_FILE.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    result = email_ingest.ingest(
+        task_store, state, host=GMAIL_HOST, user=GMAIL_USER,
+        password=GMAIL_APP_PASSWORD, mailbox=GMAIL_MAILBOX,
+        limit=GMAIL_MAX_PER_RUN, binary=CLAUDE_BIN,
+        model=NAMING_MODEL or "haiku", env=claude_env(), cwd=str(CLAUDE_CWD))
+    EMAIL_STATE_FILE.write_text(json.dumps(state, indent=2))
+    return {"ok": True, **result}
+
+
+def _email_watcher() -> None:
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD):
+        log.info("gmail watching disabled (no GMAIL_USER / GMAIL_APP_PASSWORD)")
+        return
+    time.sleep(90)      # let the bot settle before reaching outside
+    while True:
+        try:
+            run_email_ingest()
+        except Exception:
+            log.exception("gmail ingest failed")
+        time.sleep(max(GMAIL_POLL_MIN, 5) * 60)
+
+
 def _task_runner() -> None:
     """Execute tasks nobody else is driving, one at a time.
 
@@ -1611,6 +1657,7 @@ if __name__ == "__main__":
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     threading.Thread(target=_task_runner, daemon=True, name="task-runner").start()
+    threading.Thread(target=_email_watcher, daemon=True, name="email").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

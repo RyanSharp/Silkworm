@@ -500,6 +500,63 @@ def test_review_gate():
           "if not fresh:" in exe)
 
 
+# --- gmail ingestion ----------------------------------------------------------
+
+def test_email_ingest():
+    import types
+    import email_ingest as E
+    from tasks import TaskStore
+    print("\ngmail ingestion")
+
+    src = (BASE / "email_ingest.py").read_text()
+    check("mailbox is opened read-only", "readonly=True" in src)
+    check("bodies are fetched with PEEK, never marking mail read", "BODY.PEEK" in src)
+    check("flags are never written", "STORE" not in src)
+
+    mail = [
+        {"uid": 11, "id": "m1", "from": "Landlord", "subject": "Rent due Friday",
+         "date": "", "snippet": "Confirm payment by Friday."},
+        {"uid": 12, "id": "m2", "from": "Deals", "subject": "50% OFF",
+         "date": "", "snippet": "Shop now"},
+    ]
+    def stub(out):
+        E.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: types.SimpleNamespace(stdout=out))
+
+    for name, out in (("no json array", "message 1 matters"),
+                      ("malformed json", "[{oops}]"),
+                      ("hallucinated id", '[{"id":"nope","title":"x"}]')):
+        stub(out)
+        check(f"triage fails closed on {name}",
+              E.triage(mail, binary="c", model="m", env={}) == [])
+
+    stub('[{"id":"m1","title":"Confirm rent","why":"deadline"}]')
+    flagged = E.triage(mail, binary="c", model="m", env={})
+    check("only flagged mail survives triage",
+          len(flagged) == 1 and flagged[0]["id"] == "m1")
+
+    store = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    fetch = lambda h, u, p, mb, since, lim: (            # noqa: E731
+        [m for m in mail if m["uid"] > since][:lim],
+        max([m["uid"] for m in mail] + [since]))
+    state = {}
+    r = E.ingest(store, state, host="h", user="u", password="p", fetch=fetch)
+    t = store.get(r["tasks"][0])
+    check("ingested mail lands as proposed, never queued", t["state"] == "proposed")
+    check("the message is referenced, not forked",
+          t["source"] == "email" and t["source_ref"] == "m1")
+
+    r2 = E.ingest(store, state, host="h", user="u", password="p", fetch=fetch)
+    check("a second pass proposes nothing", r2["proposed"] == 0)
+    state["uid"] = 0
+    r3 = E.ingest(store, state, host="h", user="u", password="p", fetch=fetch)
+    check("a reset watermark still does not re-propose", r3["proposed"] == 0)
+
+    bot = (BASE / "bot.py").read_text()
+    check("watching is off unless credentials are set",
+          'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -522,7 +579,7 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate):
+              test_review_gate, test_email_ingest):
         try:
             t()
         except Exception as exc:

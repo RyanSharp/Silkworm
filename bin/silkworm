@@ -7,6 +7,7 @@
     silkworm summarize [--force]    (re)generate thread context summaries
     silkworm titles [--force]       name threads from their summaries
     silkworm tasks [state]          list tasks (default: what needs you)
+    silkworm email                  scan Gmail now and propose tasks
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -417,6 +418,14 @@ def main() -> None:
             counts = r.get("counts") or {}
             if counts:
                 print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    elif cmd == "email":
+        print(f"{WORM} scanning Gmail…")
+        r = bot_call("/tasks", {"action": "ingest-email"}, timeout=600)
+        if r.get("ok"):
+            print(f"  {G}✔{N} {r.get('scanned', 0)} new message(s) · "
+                  f"{r.get('proposed', 0)} proposed for triage")
+        else:
+            print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
     elif cmd == "test":
         print(f"{WORM} running regression tests…")
         py = str(VENV_PY) if VENV_PY.exists() else sys.executable
