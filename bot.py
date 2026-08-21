@@ -117,11 +117,16 @@ SILKWORM_HOME_CHANNEL = os.environ.get("SILKWORM_HOME_CHANNEL", "").strip()
 
 OUTBOX_ROOT = BASE_DIR / "outbox"
 ARTIFACTS_ROOT = BASE_DIR / "artifacts"
+# Uploads live here, not in the thread's working directory. A thread's cwd is
+# usually a git repo, and writing screenshots into it leaves untracked noise in
+# `git status` that is one careless `git add -A` from being committed.
+UPLOADS_ROOT = BASE_DIR / "uploads"
 HOOK_PATH = BASE_DIR / "approval_hook.py"
 
 CLAUDE_CWD.mkdir(parents=True, exist_ok=True)
 OUTBOX_ROOT.mkdir(exist_ok=True)
 ARTIFACTS_ROOT.mkdir(exist_ok=True)
+UPLOADS_ROOT.mkdir(exist_ok=True)
 
 # --- Shared state -----------------------------------------------------------
 store = SessionStore(BASE_DIR / "sessions.json")
@@ -1186,7 +1191,7 @@ def handle_prompt(event: dict, say, client) -> None:
         if ctx:
             prompt = ctx + "The user now says: " + prompt
     if files:
-        saved = download_attachments(files, cwd / "slack-uploads", key)
+        saved = download_attachments(files, UPLOADS_ROOT / key.replace(":", "__"), key)
         if saved:
             by_name = {Path(f.get("name") or "").name: f for f in files}
             lines, any_image = [], False

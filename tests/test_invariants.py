@@ -778,6 +778,15 @@ def test_file_uploads_are_handled():
 
     check("images are pointed out as viewable, not just listed",
           "use Read to look at it" in src)
+    # A thread's cwd is usually a git repo; writing uploads there leaves
+    # untracked noise a stray `git add -A` would commit.
+    check("uploads are not written into the thread's working directory",
+          'cwd / "slack-uploads"' not in src)
+    check("uploads live under Silkworm, beside outbox and artifacts",
+          'UPLOADS_ROOT = BASE_DIR / "uploads"' in src
+          and "UPLOADS_ROOT / key.replace" in src)
+    check("uploads are gitignored",
+          "uploads/" in (BASE / ".gitignore").read_text())
     check("the download uses the bot token",
           'Authorization": f"Bearer {token}' in src)
 
