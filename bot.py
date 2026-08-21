@@ -392,7 +392,12 @@ def task_state(task_id: str | None, state: str, detail: str = "") -> None:
     if not task_id:
         return
     try:
-        task_store.transition(task_id, state, detail)
+        task = task_store.transition(task_id, state, detail)
+        if state == tasks.DONE:
+            # This thread just produced an answer, so any earlier failed turn
+            # on it has been overtaken by events.
+            task_store.supersede_failed(task.get("thread", ""),
+                                        task.get("created") or time.time())
     except tasks.InvalidTransition:
         log.warning("task %s could not move to %s (bug in the executor's state handling)",
                     task_id, state)

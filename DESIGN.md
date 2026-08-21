@@ -53,6 +53,13 @@ classified, parked in `blocked` with a `retry_at`, and requeued automatically
 after a handful of attempts. Real failures still stop and ask. Filing "the API
 was busy" under "needs you" is exactly how a board stops being trusted.
 
+A failed turn also has no way to notice that its thread recovered without it.
+When a task completes, earlier **failed conversational turns on the same
+thread** are superseded: if the conversation carried on and produced answers,
+you either re-asked or moved on, so the old failure is not an open action item.
+Restricted to conversational turns — a queued task that failed is work that did
+not happen, and an unrelated success elsewhere says nothing about it.
+
 `proposed` exists specifically to gate auto-ingestion. Tasks the user creates
 start at `queued`; ingested ones start at `proposed`, so turning on a new source
 can never flood the actionable list.

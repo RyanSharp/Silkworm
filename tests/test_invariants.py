@@ -679,6 +679,70 @@ def test_transient_retry():
     check("the runner promotes due retries", "due_retries(time.time())" in bot)
 
 
+# --- failures overtaken by events -----------------------------------------------
+# Four stale failures sat on the board while their threads had long since
+# carried on and produced answers.
+
+def test_supersede_stale_failures():
+    import tasks as T
+    from tasks import TaskStore
+    print("\nstale failures are superseded")
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+
+    old = st.create("msg", thread="C:1", driver="inline")
+    st.transition(old["id"], T.RUNNING)
+    st.transition(old["id"], T.FAILED, "Claude reported an error.")
+    time.sleep(0.01)
+    new = st.create("msg", thread="C:1", driver="inline")
+    st.transition(new["id"], T.RUNNING)
+    st.transition(new["id"], T.DONE)
+
+    gone = st.supersede_failed("C:1", new["created"])
+    check("a later answer clears an earlier failure on that thread",
+          gone == [old["id"]] and st.get(old["id"])["state"] == T.CANCELLED)
+    check("the reason is recorded, not silently dropped",
+          st.get(old["id"])["events"][-1]["detail"].startswith("superseded"))
+
+    other = st.create("msg", thread="C:2", driver="inline")
+    st.transition(other["id"], T.RUNNING)
+    st.transition(other["id"], T.FAILED, "boom")
+    st.supersede_failed("C:1", time.time())
+    check("a failure on another thread is untouched",
+          st.get(other["id"])["state"] == T.FAILED)
+
+    newer = st.create("msg", thread="C:1", driver="inline")
+    st.transition(newer["id"], T.RUNNING)
+    st.transition(newer["id"], T.FAILED, "boom")
+    st.supersede_failed("C:1", new["created"])
+    check("a failure newer than the success survives",
+          st.get(newer["id"])["state"] == T.FAILED)
+
+    q = st.create("real work", thread="C:3", driver="queue")
+    st.transition(q["id"], T.RUNNING)
+    st.transition(q["id"], T.FAILED, "boom")
+    time.sleep(0.01)
+    d = st.create("other", thread="C:3", driver="queue")
+    st.transition(d["id"], T.RUNNING)
+    st.transition(d["id"], T.DONE)
+    check("queued work is never superseded",
+          st.supersede_failed("C:3", d["created"]) == []
+          and st.get(q["id"])["state"] == T.FAILED,
+          "a queued failure is work that did not happen")
+
+    prop = st.create("ingested", thread="C:1", driver="inline", state=T.PROPOSED)
+    appr = st.create("gated", thread="C:1", driver="inline")
+    st.transition(appr["id"], T.RUNNING)
+    st.transition(appr["id"], T.AWAITING_APPROVAL)
+    st.supersede_failed("C:1", time.time())
+    check("proposed and awaiting_approval are never superseded",
+          st.get(prop["id"])["state"] == T.PROPOSED
+          and st.get(appr["id"])["state"] == T.AWAITING_APPROVAL,
+          "those are deliberate asks, not failures")
+
+    bot = (BASE / "bot.py").read_text()
+    check("completing a task triggers the sweep", "supersede_failed(" in bot)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -702,7 +766,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_projects,
-              test_transient_retry):
+              test_transient_retry, test_supersede_stale_failures):
         try:
             t()
         except Exception as exc:

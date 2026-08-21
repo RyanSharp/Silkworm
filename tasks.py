@@ -266,6 +266,37 @@ class TaskStore:
             moved += 1
         return moved
 
+    def supersede_failed(self, thread: str, before: float) -> list[str]:
+        """Cancel failed conversational turns on `thread` older than `before`.
+
+        A Slack thread is a conversation. If it carried on and produced
+        answers, an earlier failed turn is history -- you either re-asked or
+        moved on -- so it is not an open action item, and leaving it on the
+        board is how the board stops being read.
+
+        Restricted to conversational (inline) tasks on purpose. A queued task
+        that failed is real work that did not happen, and an unrelated success
+        somewhere else says nothing about whether it still needs doing.
+        """
+        if not thread:
+            return []
+        superseded = []
+        with self._lock:
+            for tid, rec in self._data.items():
+                if (rec.get("state") == FAILED and rec.get("thread") == thread
+                        and rec.get("driver") == "inline"
+                        and (rec.get("created") or 0) < before):
+                    superseded.append(tid)
+        for tid in superseded:
+            try:
+                self.transition(tid, CANCELLED,
+                                "superseded by a later successful turn on this thread")
+            except InvalidTransition:
+                superseded.remove(tid)
+        if superseded:
+            log.info("superseded %d stale failure(s) on %s", len(superseded), thread)
+        return superseded
+
     def due_retries(self, now: float) -> list[str]:
         """Ids of blocked tasks whose retry time has arrived."""
         with self._lock:
