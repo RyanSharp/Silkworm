@@ -67,6 +67,25 @@ Silkworm owns the state of the work. For an item owned elsewhere (a GitHub
 issue), the task carries a `source_ref` pointing at it and sync is **one-way
 outward**; the external item is never treated as a second state machine.
 
+## Projects
+
+A **project** is what a task belongs to; **scope** is where it may act. They
+are separate on purpose: two projects can share a repo, one project can span
+several, and plenty of projects ("plan the Asia trip") have no repo at all.
+Grouping by `cwd` would work for the first case and fall apart on the last.
+
+Projects are created on first use, never set up in advance — a system that
+makes you define a project before filing anything is one you stop using. A
+project may carry a default scope that its tasks inherit, so "work on the
+trader" lands in the right directory without repeating it.
+
+Project is a **lens, not a new default**: the dashboard still opens on what
+needs you across everything, with a filter to narrow. A per-project inbox that
+you must visit N times to see your work would undo the rule above.
+
+Binding a Slack thread with `!project <name>` makes every task from that thread
+inherit it.
+
 ## Record
 
 See `tasks.py` for the authoritative field list, in the same style as

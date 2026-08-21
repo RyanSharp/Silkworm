@@ -79,6 +79,9 @@ FIELDS: dict[str, tuple] = {
     "state":       (QUEUED, "lifecycle state; see STATES"),
     "role":        ("assistant", "role template this runs as"),
     "source":      ("ui",  "where it came from: ui | slack | github | email | …"),
+    # What body of work this belongs to. Distinct from scope: scope is where it
+    # may act, project is what it is part of. Plenty of projects have no repo.
+    "project":     ("",    "project slug, or empty for unfiled"),
     "source_ref":  ("",    "identifier in the originating system, if any"),
     "scope":       (dict,  "{repo, cwd, branch, worktree, paths} — where it may act"),
     "thread":      ("",    "Slack thread key for narration, if any"),
@@ -206,6 +209,11 @@ class TaskStore:
         with self._lock:
             out = [dict(v) for v in self._data.values() if v.get("state") in states]
         return sorted(out, key=lambda t: t.get("created", 0))
+
+    def by_project(self, slug: str) -> list[dict]:
+        with self._lock:
+            out = [dict(v) for v in self._data.values() if (v.get("project") or "") == slug]
+        return sorted(out, key=lambda t: -t.get("created", 0))
 
     def needs_attention(self) -> list[dict]:
         """The default view: only what the user has to act on."""

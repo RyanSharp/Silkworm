@@ -411,6 +411,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/projects":
+            answer = bot_call("/projects", payload, timeout=10)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/tasks":
             answer = bot_call("/tasks", payload, timeout=15)
             self._json(answer or {"ok": False, "error": "bot is offline"})
@@ -650,6 +653,9 @@ PAGE = r"""<!doctype html>
   .st-queued, .st-done, .st-cancelled, .st-blocked { background: #8881; color: var(--muted); }
   .task .tt { flex: 1; }
   .task .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .task .proj { color: var(--gold); }
+  #tproj { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+           border-radius: 8px; font: inherit; font-size: 12px; padding: 3px 8px; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
                 display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; }
   #learnmodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
@@ -716,13 +722,15 @@ PAGE = r"""<!doctype html>
 <div id="taskmodal" onclick="if(event.target.id==='taskmodal')toggleTasks()">
   <div class="box">
     <h2 style="display:flex;align-items:center;gap:12px">📋 Tasks
-      <span class="seg"><button id="tabneed" class="on" onclick="setTaskView('attention')">Needs you</button><button id="taball" onclick="setTaskView('all')">All</button></span></h2>
+      <span class="seg"><button id="tabneed" class="on" onclick="setTaskView('attention')">Needs you</button><button id="taball" onclick="setTaskView('all')">All</button></span>
+      <select id="tproj" onchange="renderTasks()" title="filter by project"></select></h2>
     <div class="hint">Work Silkworm is managing. This opens on what needs you —
       tasks proposed for triage, waiting on approval, asking a question, or failed.
       Everything else is the system's business and stays out of the way.</div>
     <div class="lform">
       <input class="text" id="tgoal" placeholder="what should it do?"
              onkeydown="if(event.key==='Enter')addTask()">
+      <input class="scope" id="tnewproj" placeholder="project (optional)">
       <input class="scope" id="tcwd" placeholder="working dir (blank = default)">
       <button class="act" onclick="addTask()">Queue it</button>
     </div>

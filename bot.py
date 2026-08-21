@@ -35,6 +35,7 @@ import repos
 import roles
 import tasks
 import procs
+import projects
 import recovery
 import summaries
 from approvals import ApprovalManager, describe_tool
@@ -125,6 +126,7 @@ ARTIFACTS_ROOT.mkdir(exist_ok=True)
 # --- Shared state -----------------------------------------------------------
 store = SessionStore(BASE_DIR / "sessions.json")
 task_store = tasks.TaskStore(BASE_DIR / "tasks.json")
+project_store = projects.ProjectStore(BASE_DIR / "projects.json")
 # LEARNINGS_FILE can point at a file inside a git repo to share across machines.
 LEARNINGS_FILE = Path(os.environ.get("LEARNINGS_FILE", BASE_DIR / "learnings.json")).expanduser()
 LEARNINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -582,7 +584,8 @@ HELP = """*Commands* (send inside a thread):
 • `!stats` — this thread's session info (model, turns, cost)
 • `!sessions` — list all active thread sessions
 • `!help` — this message
-Attach files to a message and Claude can read them; files Claude produces get uploaded back here."""
+Attach files to a message and Claude can read them; files Claude produces get uploaded back here.`!project <name>` — file this thread's tasks under a project
+"""
 
 
 def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
@@ -590,6 +593,30 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
     lower = cmd.lower()
     if lower in ("!help", "!commands"):
         say(text=HELP, thread_ts=thread_ts)
+    elif lower.startswith("!project"):
+        arg = cmd[len("!project"):].strip()
+        entry = store.get(key) or {}
+        if not arg:
+            current = entry.get("project") or ""
+            listing = ", ".join(f"`{p['slug']}`" for p in project_store.all(False)) or "none yet"
+            say(text=(f"This thread files tasks under `{current}`." if current
+                      else "This thread isn't filed under a project.")
+                     + f"\nProjects: {listing}\n"
+                       "`!project <name>` to file it here, `!project none` to unfile.",
+                thread_ts=thread_ts)
+        elif arg.lower() in ("none", "off", "clear"):
+            store.update(key, project="")
+            say(text="Unfiled — new tasks from this thread won't belong to a project.",
+                thread_ts=thread_ts)
+        else:
+            # Created on first use: needing to define a project before filing
+            # anything is how a task system stops getting used.
+            proj = project_store.ensure(
+                arg, scope={"cwd": entry.get("cwd")} if entry.get("cwd") else {})
+            store.update(key, project=proj["slug"])
+            say(text=f":card_index_dividers: Filed under *{proj['title']}* "
+                     f"(`{proj['slug']}`). Tasks from this thread inherit it.",
+                thread_ts=thread_ts)
     elif lower in ("!reset", "!new"):
         store.drop(key)
         say(text="Session cleared — the next message in this thread starts fresh.", thread_ts=thread_ts)
@@ -878,14 +905,17 @@ def handle_titles(payload: dict) -> dict:
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
+    project = payload.get("project") or ""
+    def _filter(items):
+        return [t for t in items if not project or (t.get("project") or "") == project]
     if action == "list":
         state = payload.get("state")
         items = (task_store.by_state(state) if state
                  else sorted(task_store.all().values(),
                              key=lambda t: -(t.get("created") or 0)))
-        return {"ok": True, "tasks": items[:200], "counts": task_store.counts()}
+        return {"ok": True, "tasks": _filter(items)[:200], "counts": task_store.counts()}
     if action == "attention":
-        return {"ok": True, "tasks": task_store.needs_attention(),
+        return {"ok": True, "tasks": _filter(task_store.needs_attention()),
                 "counts": task_store.counts()}
     if action == "ingest-email":
         try:
@@ -895,15 +925,23 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": False, "error": str(e)}
     if action == "create":
         try:
+            proj = (payload.get("project") or "").strip()
+            if proj:
+                proj = project_store.ensure(proj)["slug"]
+            # A project's default scope saves repeating the directory on
+            # every task filed under it.
+            scope = payload.get("scope") or project_store.scope_for(proj) \
+                or {"cwd": str(CLAUDE_CWD)}
             t = task_store.create(payload.get("goal", ""),
                                   role=payload.get("role", "assistant"),
+                                  project=proj,
                                   source=payload.get("source", "ui"),
                                   state=payload.get("state", tasks.QUEUED),
                                   # Nobody is holding a live message for these,
                                   # so the runner is what will execute them.
                                   driver=payload.get("driver", "queue"),
                                   thread=payload.get("thread", ""),
-                                  scope=payload.get("scope") or {"cwd": str(CLAUDE_CWD)})
+                                  scope=scope)
             return {"ok": True, "task": t}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
@@ -917,6 +955,26 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": False, "error": f"not allowed: {e}"}
         except KeyError:
             return {"ok": False, "error": "unknown task"}
+    return {"ok": False, "error": f"unknown action {action!r}"}
+
+
+def handle_projects(payload: dict) -> dict:
+    """Route for /projects — list, create and archive (localhost-trusted)."""
+    action = payload.get("action", "list")
+    if action == "list":
+        return {"ok": True, "projects": projects.summarise(
+            project_store.all(include_archived=bool(payload.get("archived"))),
+            list(task_store.all().values()), tasks.NEEDS_ATTENTION)}
+    if action == "ensure":
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "a project needs a name"}
+        scope = payload.get("scope")
+        return {"ok": True, "project": project_store.ensure(
+            name, **({"scope": scope} if scope else {}))}
+    if action in ("archive", "unarchive"):
+        ok = project_store.set_archived(payload.get("slug", ""), action == "archive")
+        return {"ok": ok, "error": "" if ok else "unknown project"}
     return {"ok": False, "error": f"unknown action {action!r}"}
 
 
@@ -1012,6 +1070,7 @@ server.route("/summaries", handle_summaries)
 server.route("/release", handle_release)
 server.route("/titles", handle_titles)
 server.route("/tasks", handle_tasks)
+server.route("/projects", handle_projects)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -1121,6 +1180,8 @@ def handle_prompt(event: dict, say, client) -> None:
         source="ui" if event.get("_web") else "slack",
         source_ref=msg_ts,
         thread=key,
+        # Bound once with !project, inherited by every turn after.
+        project=(store.get(key) or {}).get("project", ""),
         scope={"cwd": str(cwd), "repo": repos.identity(str(cwd))},
     )
     task_id = task["id"]

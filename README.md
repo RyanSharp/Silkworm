@@ -238,6 +238,28 @@ no longer owned by the bot.
 Threads also keep a short event log — recovered, interrupted, timed out, reaped,
 released — so an interrupted thread doesn't look merely quiet.
 
+## Projects
+
+Tasks can be filed under a **project** — "Asia Trip", "Trader", whatever the
+body of work is. Projects are created the first time you name one; there is no
+setup step.
+
+```
+!project Asia Trip     # in a Slack thread: its tasks are filed here from now on
+!project none          # unfile
+!project               # what this thread is filed under, and what exists
+```
+
+A project is **what a task belongs to**; `scope` is **where it may act**. They
+are separate deliberately — two projects can share a repo, one project can span
+several, and plenty ("plan the trip") have no repo at all. A project may carry a
+default scope that its tasks inherit, so work on a codebase lands in the right
+directory without repeating it.
+
+In the dashboard the Tasks panel gets a project filter, with the count of what
+needs you per project. It remains a **lens, not a new default**: the panel still
+opens on what needs you across everything.
+
 ## Watching your inbox
 
 Silkworm can watch Gmail and **propose** tasks for mail that looks like it

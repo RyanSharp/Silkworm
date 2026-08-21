@@ -557,6 +557,63 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+# --- projects -----------------------------------------------------------------
+
+def test_projects():
+    import projects
+    import tasks as T
+    from projects import ProjectStore
+    from tasks import TaskStore
+    print("\nprojects")
+
+    check("Asia Trip slugifies", projects.slugify("Asia Trip") == "asia-trip")
+    check("an empty name still yields a slug", projects.slugify("") == "untitled")
+
+    ps = ProjectStore(Path(tempfile.mkdtemp()) / "p.json")
+    a = ps.ensure("Asia Trip")
+    check("created on first use, no setup step", a["slug"] == "asia-trip")
+    ps.ensure("asia-trip")
+    check("the same project by name or slug is not duplicated", len(ps.all()) == 1)
+
+    ps.ensure("Trader", scope={"cwd": "/w/trader"})
+    check("a project may carry a default scope",
+          ps.scope_for("trader")["cwd"] == "/w/trader")
+    check("a project without a repo has no scope, and that is fine",
+          ps.scope_for("asia-trip") == {})
+    check("project is separate from scope in the task record",
+          "project" in T.FIELDS and "scope" in T.FIELDS)
+
+    ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ts.create("book flights", project="asia-trip", state=T.PROPOSED)
+    ts.create("hotel", project="asia-trip")
+    ts.create("reconnect", project="trader")
+    ts.create("unfiled")
+    check("tasks filter by project", len(ts.by_project("asia-trip")) == 2)
+    check("unfiled tasks belong to no project", len(ts.by_project("")) == 1)
+
+    rows = projects.summarise(ps.all(), list(ts.all().values()), T.NEEDS_ATTENTION)
+    top = rows[0]
+    check("projects sort by what needs you first",
+          top["slug"] == "asia-trip" and top["needs"] == 1)
+    check("counts distinguish open from total",
+          top["open"] == 2 and top["total"] == 2)
+
+    ts.create("stray", project="ghost")
+    rows = projects.summarise(ps.all(), list(ts.all().values()), T.NEEDS_ATTENTION)
+    check("a project filed against but never registered still appears",
+          any(r["slug"] == "ghost" for r in rows))
+
+    ps.set_archived("trader", True)
+    check("archiving hides it from pickers",
+          not any(p["slug"] == "trader" for p in ps.all(include_archived=False)))
+    check("archiving keeps its tasks", len(ts.by_project("trader")) == 1)
+
+    bot = (BASE / "bot.py").read_text()
+    check("a thread's project is inherited by its tasks",
+          'project=(store.get(key) or {}).get("project", "")' in bot)
+    check("!project files a thread", 'elif lower.startswith("!project")' in bot)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -579,7 +636,7 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_email_ingest):
+              test_review_gate, test_email_ingest, test_projects):
         try:
             t()
         except Exception as exc:

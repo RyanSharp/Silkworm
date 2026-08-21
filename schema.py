@@ -29,6 +29,9 @@ FIELDS: dict[str, tuple] = {
     # "thread" is a conversation you had; "task" is an anchor the queue runner
     # created to give a UI task somewhere to report. They are not peers.
     "kind":              ("thread", "thread | task — what this session is for"),
+    # Bind a thread to a project and its tasks inherit it, so you say it once
+    # rather than on every message.
+    "project":           ("",    "project slug this thread's tasks belong to"),
     "summary":           ("",    "1-3 sentence description of the conversation"),
     "summary_ts":        ("",    "transcript timestamp the summary was written from"),
     "summary_turns":     (None,  "turn count when summarised; None = unknown, not 0"),
