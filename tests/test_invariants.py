@@ -614,6 +614,71 @@ def test_projects():
     check("!project files a thread", 'elif lower.startswith("!project")' in bot)
 
 
+# --- transient failures are waited out, not escalated --------------------------
+# Quota exhaustion and API overload filled the "needs you" list with things no
+# person could act on, which is how a board stops being trusted.
+
+def test_transient_retry():
+    import retry as R
+    import tasks as T
+    from tasks import TaskStore
+    from datetime import datetime
+    print("\ntransient failures")
+    now = datetime(2026, 8, 20, 15, 0).timestamp()
+
+    for text in ("You've hit your session limit · resets 7pm",
+                 "Claude usage limit reached", "rate_limit_error",
+                 "rate limit exceeded"):
+        check(f"quota: {text[:34]}", R.classify(text) == R.QUOTA)
+    check("529 is transient", R.classify("API Error: 529 Overloaded") == R.OVERLOADED)
+    check("a dropped connection is transient",
+          R.classify("API Error: Connection closed mid-response.") == R.NETWORK)
+    for text in ("Claude reported an error.", "bash: command not found",
+                 "Claude timed out after 900s.", ""):
+        check(f"real failure stays a failure: {text[:28] or '(empty)'}",
+              R.classify(text) is None)
+
+    check("a stated reset time is honoured",
+          datetime.fromtimestamp(R.reset_at("resets 7pm", now)).hour == 19)
+    check("a reset time already past waits for tomorrow",
+          R.reset_at("resets 9am", now) > now)
+    check("no time given is not a parse", R.reset_at("no time here", now) is None)
+
+    kind, when = R.retry_at("session limit · resets 7pm", 1, now)
+    check("quota waits for the reset", datetime.fromtimestamp(when).hour == 19)
+    _, when = R.retry_at("usage limit reached", 1, now)
+    check("quota with no stated time waits a while", 25 <= (when - now) / 60 <= 35)
+    first = R.retry_at("529 Overloaded", 1, now)[1] - now
+    later = R.retry_at("529 Overloaded", 3, now)[1] - now
+    check("overload backs off progressively", later > first)
+    check("backoff is capped", R.retry_at("529 Overloaded", 4, now)[1] - now <= R.BACKOFF_CAP_S)
+    check("auto-retry gives up eventually",
+          R.retry_at("529 Overloaded", R.MAX_AUTO_RETRIES, now) is None)
+    check("a real error is never auto-retried",
+          R.retry_at("Claude reported an error.", 1, now) is None)
+
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    due = st.create("due"); st.transition(due["id"], T.RUNNING)
+    st.update(due["id"], retry_at=time.time() - 5, driver="queue")
+    st.transition(due["id"], T.BLOCKED, "quota")
+    soon = st.create("soon"); st.transition(soon["id"], T.RUNNING)
+    st.update(soon["id"], retry_at=time.time() + 3600)
+    st.transition(soon["id"], T.BLOCKED, "quota")
+    check("only tasks whose time has come are requeued",
+          st.due_retries(time.time()) == [due["id"]])
+    check("a waiting task never appears in 'needs you'",
+          T.BLOCKED not in T.NEEDS_ATTENTION)
+    st.transition(due["id"], T.QUEUED, "retry time reached")
+    check("a requeued task is handed to the runner",
+          st.get(due["id"])["driver"] == "queue",
+          "whatever was driving it is gone by the time it retries")
+
+    bot = (BASE / "bot.py").read_text()
+    check("failure paths try parking before escalating",
+          bot.count("if not fail_or_retry(") >= 3)
+    check("the runner promotes due retries", "due_retries(time.time())" in bot)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -636,7 +701,8 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_email_ingest, test_projects):
+              test_review_gate, test_email_ingest, test_projects,
+              test_transient_retry):
         try:
             t()
         except Exception as exc:

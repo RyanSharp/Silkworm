@@ -46,6 +46,13 @@ reduces attention spent, not work produced.
 Everything else (`queued`, `running`, `blocked`, `done`, `cancelled`) is the
 system's business and is not surfaced by default.
 
+A turn that dies on **quota exhaustion or API overload** is not a failure a
+person can act on — there is nothing to fix, only a time to wait. Those are
+classified, parked in `blocked` with a `retry_at`, and requeued automatically
+(at the stated reset time for quota, on a capped backoff otherwise), giving up
+after a handful of attempts. Real failures still stop and ask. Filing "the API
+was busy" under "needs you" is exactly how a board stops being trusted.
+
 `proposed` exists specifically to gate auto-ingestion. Tasks the user creates
 start at `queued`; ingested ones start at `proposed`, so turning on a new source
 can never flood the actionable list.

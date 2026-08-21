@@ -355,6 +355,33 @@ def name_thread(key: str, prompt: str, reply: str) -> None:
         log.exception("naming failed for %s", key)
 
 
+def fail_or_retry(task_id: str | None, error: str) -> bool:
+    """Park a transient failure for a later retry instead of asking for help.
+
+    Returns True if it was parked. Quota exhaustion and API overload are not
+    failures a person can do anything about, so surfacing them would just
+    train you to ignore the list.
+    """
+    if not task_id:
+        return False
+    task = task_store.get(task_id) or {}
+    plan = retry.retry_at(error, task.get("attempts") or 0)
+    if not plan:
+        return False
+    kind, when = plan
+    try:
+        task_store.update(task_id, retry_at=when,
+                          # Hand it to the runner: whatever was driving it (a
+                          # Slack handler) is gone by the time it retries.
+                          driver="queue")
+        task_store.transition(task_id, tasks.BLOCKED, retry.describe(kind, when))
+    except Exception:
+        log.exception("could not park %s for retry", task_id)
+        return False
+    log.info("task %s parked: %s", task_id, retry.describe(kind, when))
+    return True
+
+
 def task_state(task_id: str | None, state: str, detail: str = "") -> None:
     """Move a task's state without ever breaking the turn it describes.
 
@@ -1296,12 +1323,14 @@ def handle_prompt(event: dict, say, client) -> None:
         progress.finalize(f":warning: {e}")
         reactions.failed()
         store.add_event(key, "timeout", str(e))
-        task_state(task_id, tasks.FAILED, str(e)[:160])
+        if not fail_or_retry(task_id, str(e)):
+            task_state(task_id, tasks.FAILED, str(e)[:160])
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
         reactions.failed()
         store.add_event(key, "error", str(e)[:160])
-        task_state(task_id, tasks.FAILED, str(e)[:160])
+        if not fail_or_retry(task_id, str(e)):
+            task_state(task_id, tasks.FAILED, str(e)[:160])
     except Exception:
         log.exception("unhandled error in thread %s", key)
         progress.finalize(":warning: Something went wrong — check the bot logs.")
@@ -1469,7 +1498,8 @@ def execute_task(task: dict) -> None:
         task_state(tid, tasks.CANCELLED, "stopped by the user")
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
-        task_state(tid, tasks.FAILED, str(e)[:160])
+        if not fail_or_retry(tid, str(e)):
+            task_state(tid, tasks.FAILED, str(e)[:160])
     except Exception as e:
         log.exception("task %s failed", tid)
         progress.finalize(":warning: Task failed — check the bot logs.")
@@ -1568,6 +1598,8 @@ def _task_runner() -> None:
         log.exception("closing out interrupted tasks failed")
     while True:
         try:
+            for tid in task_store.due_retries(time.time()):
+                task_state(tid, tasks.QUEUED, "retry time reached")
             task = task_store.claim()
             if task:
                 execute_task(task)

@@ -93,6 +93,9 @@ FIELDS: dict[str, tuple] = {
     "result":      (None,  "{text, artifacts, cost} once finished"),
     "events":      (list,  "state changes and notable occurrences, capped at 50"),
     "attempts":    (0,     "how many times execution has been tried"),
+    # Set when a turn died on something transient (quota, overload). The task
+    # waits in `blocked` until this passes, rather than asking for help.
+    "retry_at":    (None,  "unix time to requeue this automatically"),
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }
@@ -262,6 +265,13 @@ class TaskStore:
             self.transition(tid, QUEUED, "requeued after a restart")
             moved += 1
         return moved
+
+    def due_retries(self, now: float) -> list[str]:
+        """Ids of blocked tasks whose retry time has arrived."""
+        with self._lock:
+            return [tid for tid, r in self._data.items()
+                    if r.get("state") == BLOCKED and r.get("retry_at")
+                    and r["retry_at"] <= now]
 
     def counts(self) -> dict[str, int]:
         with self._lock:
