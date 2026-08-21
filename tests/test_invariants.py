@@ -743,6 +743,45 @@ def test_supersede_stale_failures():
     check("completing a task triggers the sweep", "supersede_failed(" in bot)
 
 
+# --- file uploads reach the handler -------------------------------------------
+# Slack delivers an upload as a message with subtype "file_share". Dropping
+# every subtyped message silently discarded every screenshot ever sent.
+
+def test_file_uploads_are_handled():
+    print("\nfile uploads")
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+              and n.name == "should_handle")
+    subs = next(n for n in tree.body if isinstance(n, ast.Assign)
+                and getattr(n.targets[0], "id", "") == "HANDLED_SUBTYPES")
+    ns = {"BOT_USER_ID": "UBOT"}
+    exec(compile(ast.Module(body=[subs, fn], type_ignores=[]), "<x>", "exec"), ns)
+    should = ns["should_handle"]
+
+    upload = {"channel_type": "im", "user": "U1", "subtype": "file_share",
+              "files": [{"name": "shot.png"}], "text": "what is wrong here?"}
+    check("a screenshot upload is handled", should(upload) is True)
+    check("an upload with no caption is handled",
+          should({**upload, "text": ""}) is True)
+    check("a plain DM is still handled",
+          should({"channel_type": "im", "user": "U1", "text": "hi"}) is True)
+    for subtype in ("message_changed", "message_deleted", "channel_join"):
+        check(f"{subtype} is still ignored",
+              should({"channel_type": "im", "user": "U1", "subtype": subtype}) is False)
+    check("our own messages are ignored",
+          should({"channel_type": "im", "user": "UBOT", "text": "hi"}) is False)
+    check("other bots are ignored",
+          should({"channel_type": "im", "bot_id": "B1", "text": "hi"}) is False)
+    check("non-DM channels are ignored",
+          should({"channel_type": "channel", "user": "U1", "text": "hi"}) is False)
+
+    check("images are pointed out as viewable, not just listed",
+          "use Read to look at it" in src)
+    check("the download uses the bot token",
+          'Authorization": f"Bearer {token}' in src)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -766,7 +805,8 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_projects,
-              test_transient_retry, test_supersede_stale_failures):
+              test_transient_retry, test_supersede_stale_failures,
+              test_file_uploads_are_handled):
         try:
             t()
         except Exception as exc:

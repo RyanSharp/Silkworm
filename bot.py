@@ -1188,8 +1188,23 @@ def handle_prompt(event: dict, say, client) -> None:
     if files:
         saved = download_attachments(files, cwd / "slack-uploads", key)
         if saved:
-            listing = "\n".join(f"- {p}" for p in saved)
-            prompt += f"\n\n[The user attached file(s), saved locally at:\n{listing}]"
+            by_name = {Path(f.get("name") or "").name: f for f in files}
+            lines, any_image = [], False
+            for path in saved:
+                meta = by_name.get(path.name.split("-", 1)[-1], {})
+                mime = meta.get("mimetype") or ""
+                size = meta.get("size")
+                note = f" ({mime}{f', {size // 1024} KB' if size else ''})" if mime else ""
+                if mime.startswith("image/"):
+                    any_image = True
+                    note += " — an image; use Read to look at it"
+                lines.append(f"- {path}{note}")
+            listing = "\n".join(lines)
+            prompt += (f"\n\n[The user attached {len(saved)} file(s), saved locally:\n"
+                       f"{listing}\n"
+                       + ("Read the image before answering — the user is showing you "
+                          "something, not describing it." if any_image else
+                          "Read them if they are relevant to the request.") + "]")
 
     # Stable per-thread outbox path: this string ends up in --append-system-prompt,
     # and prompt caching is a byte-exact prefix match — a path that changes every
@@ -1351,13 +1366,28 @@ def on_mention(event, say, client):
     handle_prompt(event, say, client)
 
 
+#: Subtypes that are still a person talking to us. A file upload arrives as a
+#: message with subtype "file_share" -- dropping every subtype silently threw
+#: away every screenshot before it reached the attachment handling.
+HANDLED_SUBTYPES = {"file_share"}
+
+
+def should_handle(event: dict) -> bool:
+    """Whether an incoming message event is a DM from a human we should answer."""
+    if event.get("channel_type") != "im":
+        return False
+    if event.get("bot_id") or event.get("user") == BOT_USER_ID:
+        return False
+    subtype = event.get("subtype")
+    if subtype and subtype not in HANDLED_SUBTYPES:
+        return False          # joins, edits, deletions, channel noise
+    return True
+
+
 @app.event("message")
 def on_message(event, say, client):
-    if event.get("channel_type") != "im":
-        return
-    if event.get("subtype") or event.get("bot_id") or event.get("user") == BOT_USER_ID:
-        return
-    handle_prompt(event, say, client)
+    if should_handle(event):
+        handle_prompt(event, say, client)
 
 
 # --- Housekeeping -----------------------------------------------------------------

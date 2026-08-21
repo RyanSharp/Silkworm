@@ -20,9 +20,9 @@ Claude Code session**.
 - **Cost footer** — each reply ends with `⏱ 42s · $0.0312 · thread total $0.45`.
 - **Per-thread models** — `!model haiku` inside a thread switches just that thread.
 - **Interrupt** — `!stop` kills the running turn in that thread.
-- **Files both ways** — attach files to a message and Claude gets them on disk;
-  files Claude produces (it's told about a per-turn outbox) are uploaded back
-  into the thread.
+- **Files both ways** — attach files (screenshots included) and Claude gets
+  them on disk, told which are images so it looks at them; files Claude
+  produces are uploaded back into the thread.
 - **Thread context** — @-mention the bot inside an existing conversation thread
   and it reads the prior messages first, so "summarize this thread" works.
 - **Approval buttons** — optional `CLAUDE_APPROVAL_MODE=slack` gates tool calls
