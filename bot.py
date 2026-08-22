@@ -982,8 +982,29 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": True, "task": t}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
-    if action in ("accept", "dismiss", "retry", "cancel"):
+    if action == "rework":
+        # Send flagged work back with the reviewer's findings attached, so the
+        # rerun addresses them rather than repeating the same thing.
+        tid = payload.get("id", "")
+        task = task_store.get(tid)
+        if not task:
+            return {"ok": False, "error": "unknown task"}
+        review = (task.get("result") or {}).get("review") or {}
+        notes = payload.get("notes") or ""
+        addendum = "\n\n".join(filter(None, [
+            "A review flagged this. Address the findings, then say what changed.",
+            "\n".join(f"- {f}" for f in review.get("findings") or []),
+            f"Also: {notes}" if notes else ""]))
+        try:
+            task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
+                              driver="queue")
+            return {"ok": True, "task": task_store.transition(
+                tid, tasks.QUEUED, "sent back for rework")}
+        except tasks.InvalidTransition as e:
+            return {"ok": False, "error": f"not allowed: {e}"}
+    if action in ("accept", "approve", "dismiss", "retry", "cancel"):
         target = {"accept": tasks.QUEUED, "retry": tasks.QUEUED,
+                  "approve": tasks.DONE,
                   "dismiss": tasks.CANCELLED, "cancel": tasks.CANCELLED}[action]
         try:
             return {"ok": True, "task": task_store.transition(

@@ -485,6 +485,20 @@ def test_review_gate():
 
     check("a blocked task can be resolved by its review",
           T.can(T.BLOCKED, T.DONE) and T.can(T.BLOCKED, T.AWAITING_APPROVAL))
+    # A state that asks a question needs a way to answer it, or the task is
+    # stuck on the board with no button that does anything.
+    check("approving a flagged task completes it", T.can(T.AWAITING_APPROVAL, T.DONE))
+    check("a flagged task can be sent back", T.can(T.AWAITING_APPROVAL, T.QUEUED))
+    check("a task needing input can resume", T.can(T.NEEDS_INPUT, T.QUEUED))
+    import re as _re
+    vz = (BASE / "visualizer.py").read_text()
+    js = _re.search(r"<script>(.*?)</script>", vz, _re.S).group(1)
+    for state in ("proposed", "awaiting_approval", "needs_input", "failed"):
+        check(f"the UI offers an action for {state}",
+              f'=== "{state}"' in js,
+              "a state that needs the user must have a button")
+    check("the reviewer's findings are shown before you approve",
+          "function review(t)" in js and "Review flagged" in js)
 
     src = (BASE / "bot.py").read_text()
     gate = src[src.index("def resolve_review("):src.index("def _task_runner(")]

@@ -654,6 +654,10 @@ PAGE = r"""<!doctype html>
   .task .tt { flex: 1; }
   .task .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
   .task .proj { color: var(--gold); }
+  .task .rev { margin-top: 6px; font-size: 11.5px; line-height: 1.45; color: var(--ink);
+               background: #D8517F14; border-left: 2px solid #D8517F;
+               border-radius: 0 5px 5px 0; padding: 6px 9px; }
+  .task .rev ul { margin: 4px 0 0; padding-left: 16px; }
   #tproj { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
            border-radius: 8px; font: inherit; font-size: 12px; padding: 3px 8px; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
@@ -1141,10 +1145,25 @@ async function taskAction(id, action) {
   renderTasks();
   refreshTaskBadge();
 }
+function review(t) {
+  // Show why it is waiting, so approving is an informed click rather than a leap.
+  const rv = (t.result || {}).review;
+  if (!rv) return "";
+  const items = (rv.findings || []).map(f => `<li>${esc(f)}</li>`).join("");
+  return `<div class="rev"><b>${rv.ok ? "Review passed" : "Review flagged"}</b>
+    ${esc(rv.summary || "")}${items ? `<ul>${items}</ul>` : ""}</div>`;
+}
 function taskButtons(t) {
   const b = [];
   if (t.state === "proposed") {
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','accept')">Accept</button>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+  } else if (t.state === "awaiting_approval") {
+    b.push(`<button class="act" onclick="taskAction('${t.id}','approve')">Approve</button>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','rework')">Send back</button>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+  } else if (t.state === "needs_input") {
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','rework')">Answer &amp; resume</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "failed") {
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','retry')">Retry</button>`);
@@ -1174,7 +1193,7 @@ async function renderTasks() {
       <span class="tt">${esc(t.title)}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
-          age(t.created)}</div></span>
+          age(t.created)}</div>${review(t)}</span>
       ${taskButtons(t)}</div>`).join("");
 }
 function updateTaskBadge(counts) {
