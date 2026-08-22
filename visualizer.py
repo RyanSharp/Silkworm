@@ -1140,11 +1140,13 @@ async function addTask() {
   } else toast(r.error || "Could not create it");
 }
 async function sendBack(id, needsAnswer) {
+  // Ask before returning work, so the rerun knows why. Cancelling the prompt
+  // abandons the whole action -- "never mind" is not the same as "no notes".
   const notes = prompt(needsAnswer
     ? "Your answer (it resumes with this):"
     : "Anything to add? The reviewer's findings are included automatically.\n"
       + "Leave blank to send back with just those.", "");
-  if (notes === null) return;            // cancelled, not "no notes"
+  if (notes === null) return;
   await taskAction(id, "rework", notes);
 }
 async function taskAction(id, action, notes) {
