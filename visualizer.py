@@ -1139,8 +1139,16 @@ async function addTask() {
     renderTasks();
   } else toast(r.error || "Could not create it");
 }
-async function taskAction(id, action) {
-  const r = await taskCall({action, id});
+async function sendBack(id, needsAnswer) {
+  const notes = prompt(needsAnswer
+    ? "Your answer (it resumes with this):"
+    : "Anything to add? The reviewer's findings are included automatically.\n"
+      + "Leave blank to send back with just those.", "");
+  if (notes === null) return;            // cancelled, not "no notes"
+  await taskAction(id, "rework", notes);
+}
+async function taskAction(id, action, notes) {
+  const r = await taskCall(notes ? {action, id, notes, by: "you"} : {action, id});
   toast(r.ok ? `Task ${action}ed` : (r.error || "Not allowed"));
   renderTasks();
   refreshTaskBadge();
@@ -1160,10 +1168,10 @@ function taskButtons(t) {
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "awaiting_approval") {
     b.push(`<button class="act" onclick="taskAction('${t.id}','approve')">Approve</button>`);
-    b.push(`<button class="ghost" onclick="taskAction('${t.id}','rework')">Send back</button>`);
+    b.push(`<button class="ghost" onclick="sendBack('${t.id}',false)">Send back…</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "needs_input") {
-    b.push(`<button class="ghost" onclick="taskAction('${t.id}','rework')">Answer &amp; resume</button>`);
+    b.push(`<button class="ghost" onclick="sendBack('${t.id}',true)">Answer…</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "failed") {
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','retry')">Retry</button>`);

@@ -990,11 +990,20 @@ def handle_tasks(payload: dict) -> dict:
         if not task:
             return {"ok": False, "error": "unknown task"}
         review = (task.get("result") or {}).get("review") or {}
-        notes = payload.get("notes") or ""
-        addendum = "\n\n".join(filter(None, [
-            "A review flagged this. Address the findings, then say what changed.",
-            "\n".join(f"- {f}" for f in review.get("findings") or []),
-            f"Also: {notes}" if notes else ""]))
+        findings = review.get("findings") or []
+        notes = (payload.get("notes") or "").strip()
+        parts = []
+        if findings:
+            parts.append("A review flagged this. Address the findings, then say "
+                         "what changed.")
+            parts.append("\n".join(f"- {f}" for f in findings))
+        if notes:
+            # The user's own words carry more weight than the reviewer's, so
+            # they go last and are labelled as coming from a person.
+            parts.append(f"From {payload.get('by', 'the user')}:\n{notes}")
+        if not parts:
+            parts.append("Sent back for another pass.")
+        addendum = "\n\n".join(parts)
         try:
             task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
                               driver="queue")

@@ -500,6 +500,19 @@ def test_review_gate():
     check("the reviewer's findings are shown before you approve",
           "function review(t)" in js and "Review flagged" in js)
 
+    # Sending work back is worth little if you cannot say why.
+    check("send back asks for your own notes", "function sendBack(" in js)
+    check("cancelling the prompt does not send it back", "notes === null" in js)
+    bot = (BASE / "bot.py").read_text()
+    rework = bot[bot.index('if action == "rework":'):bot.index('if action in ("accept"')]
+    check("the original goal is kept, not replaced",
+          "task.get('goal', '')" in rework)
+    check("reviewer findings are appended for the rerun", "findings" in rework)
+    check("your notes are appended too", 'payload.get("notes")' in rework)
+    check("your notes are attributed to you, not the reviewer",
+          "From {payload.get('by'" in rework)
+    check("a rework is handed to the runner", 'driver="queue"' in rework)
+
     src = (BASE / "bot.py").read_text()
     gate = src[src.index("def resolve_review("):src.index("def _task_runner(")]
     check("a review task is titled readably, not by its prompt",
