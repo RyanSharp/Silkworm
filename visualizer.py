@@ -1087,6 +1087,105 @@ async function resummarize() {
   if (r.ok) { toast("Summary updated"); await loadList(); loadTranscript(false); }
   else toast(r.error || "Could not summarize");
 }
+let taskView = "attention";
+
+async function taskCall(payload) {
+  return (await (await fetch("/api/tasks", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)})).json());
+}
+function toggleTasks() {
+  const m = document.getElementById("taskmodal");
+  const open = m.style.display !== "flex";
+  m.style.display = open ? "flex" : "none";
+  if (open) renderProjects().then(renderTasks);
+}
+function setTaskView(v) {
+  taskView = v;
+  document.getElementById("tabneed").className = v === "attention" ? "on" : "";
+  document.getElementById("taball").className = v === "all" ? "on" : "";
+  renderTasks();
+}
+async function renderProjects() {
+  const sel = document.getElementById("tproj");
+  const keep = sel.value;
+  const r = await (await fetch("/api/projects", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "list"})})).json();
+  const rows = (r.projects || []).filter(p => !p.archived);
+  sel.innerHTML = `<option value="">all projects</option>` + rows.map(p =>
+    `<option value="${esc(p.slug)}">${esc(p.title)}${
+      p.needs ? ` (${p.needs})` : p.open ? ` · ${p.open}` : ""}</option>`).join("");
+  sel.value = keep;
+}
+async function addTask() {
+  const goal = document.getElementById("tgoal").value.trim();
+  if (!goal) return;
+  const cwd = document.getElementById("tcwd").value.trim();
+  // an explicit project wins; otherwise inherit whatever is being filtered on
+  const proj = document.getElementById("tnewproj").value.trim()
+            || document.getElementById("tproj").value;
+  const r = await taskCall({action: "create", goal, project: proj || undefined,
+                            scope: cwd ? {cwd} : undefined});
+  if (r.ok) {
+    document.getElementById("tgoal").value = "";
+    document.getElementById("tnewproj").value = "";
+    toast("Task queued");
+    await renderProjects();
+    renderTasks();
+  } else toast(r.error || "Could not create it");
+}
+async function taskAction(id, action) {
+  const r = await taskCall({action, id});
+  toast(r.ok ? `Task ${action}ed` : (r.error || "Not allowed"));
+  renderTasks();
+  refreshTaskBadge();
+}
+function taskButtons(t) {
+  const b = [];
+  if (t.state === "proposed") {
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','accept')">Accept</button>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+  } else if (t.state === "failed") {
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','retry')">Retry</button>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+  } else if (t.state === "queued" || t.state === "blocked") {
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','cancel')">Cancel</button>`);
+  }
+  // close the panel on the way, or the thread opens behind it
+  if (t.thread) b.push(`<button class="ghost" onclick="toggleTasks();jumpTo('${t.thread}')">Thread</button>`);
+  return b.join("");
+}
+async function renderTasks() {
+  const list = document.getElementById("tlist");
+  const project = document.getElementById("tproj").value;
+  const r = await taskCall({action: taskView === "attention" ? "attention" : "list",
+                            project: project || undefined});
+  if (!r.ok) { list.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  updateTaskBadge(r.counts);
+  if (!r.tasks.length) {
+    list.innerHTML = taskView === "attention"
+      ? `<div class="hint">Nothing needs you. 🎉</div>`
+      : `<div class="hint">No tasks yet — queue one above.</div>`;
+    return;
+  }
+  list.innerHTML = r.tasks.map(t => `<div class="task">
+      <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
+      <span class="tt">${esc(t.title)}
+        <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
+          esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
+          age(t.created)}</div></span>
+      ${taskButtons(t)}</div>`).join("");
+}
+function updateTaskBadge(counts) {
+  const need = ["proposed", "awaiting_approval", "needs_input", "failed"]
+    .reduce((n, k) => n + ((counts || {})[k] || 0), 0);
+  document.getElementById("taskbadge").textContent = need ? String(need) : "";
+}
+async function refreshTaskBadge() {
+  const r = await taskCall({action: "list"});
+  if (r.ok) updateTaskBadge(r.counts);
+}
 function toggleLearn() {
   const m = document.getElementById("learnmodal");
   const open = m.style.display !== "flex";

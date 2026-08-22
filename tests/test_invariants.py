@@ -791,6 +791,41 @@ def test_file_uploads_are_handled():
           'Authorization": f"Bearer {token}' in src)
 
 
+# --- the dashboard's own javascript --------------------------------------------
+# An edit anchored on text that did not exist silently inserted nothing, so the
+# tasks panel shipped as markup calling functions that were never defined.
+# loadList() called one of them, threw, and the whole page rendered empty --
+# while node --check passed, because an undefined call is a runtime error.
+
+def test_dashboard_js_is_whole():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\ndashboard javascript")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    defined = set(re.findall(r"(?:async\s+)?function\s+([A-Za-z_]\w*)", js))
+
+    for name in ("loadList", "loadStats", "loadTranscript", "renderAlerts", "jumpTo",
+                 "taskCall", "toggleTasks", "setTaskView", "renderProjects", "addTask",
+                 "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
+                 "refreshTaskBadge", "releaseThread", "retitle", "nameAllThreads",
+                 "resummarize", "toggleLearn", "renderLearnings"):
+        check(f"{name}() is defined", name in defined)
+
+    # Anything wired to an onclick must exist, or the click is a dead button.
+    handlers = set(re.findall(r'onclick="([a-zA-Z_]\w*)\(', js))
+    keywords = {"if", "for", "while", "return", "switch", "confirm", "prompt", "alert"}
+    missing = sorted(h for h in handlers if h not in defined and h not in keywords)
+    check("every onclick handler is defined", not missing, f"missing: {missing}")
+
+    # Every element the script looks up must be in the markup it ships with.
+    looked_up = set(re.findall(r'getElementById\("([^"]+)"\)', js))
+    present = set(re.findall(r'id="([^"]+)"', V.PAGE))
+    absent = sorted(looked_up - present)
+    check("every element the script reads exists in the page", not absent,
+          f"absent: {absent}")
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -815,7 +850,7 @@ if __name__ == "__main__":
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_projects,
               test_transient_retry, test_supersede_stale_failures,
-              test_file_uploads_are_handled):
+              test_file_uploads_are_handled, test_dashboard_js_is_whole):
         try:
             t()
         except Exception as exc:
