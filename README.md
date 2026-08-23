@@ -270,16 +270,16 @@ In the dashboard the Tasks panel gets a project filter, with the count of what
 needs you per project. It remains a **lens, not a new default**: the panel still
 opens on what needs you across everything.
 
-**Each project keeps a brief** — a short standing note of what has been decided
-— injected into every task filed under it, so a fresh session doesn't start
-cold. It writes itself: after each task completes, a cheap model *rewrites* the
-brief (never appends) from what just happened, keeping it a living paragraph
-rather than a growing log. `!brief` reads it, `!brief <text>` sets it,
-`!brief clear` empties it.
+**Each project keeps a brief.** A project without a repo gets a directory under
+`~/workspace/projects/<slug>/` — where its files live anyway — containing a
+`CLAUDE.md`. Tasks filed under the project run there, so Claude Code loads it
+automatically; there is no injection step. It writes itself: after each task, a
+cheap model *rewrites* it (never appends) from what happened, so it stays a
+living paragraph rather than a growing log. `!brief` reads or sets it, and it is
+an ordinary file you can edit or put in git.
 
-This matters most for projects with no repo. Learnings scope by git remote, so
-a codebase accumulates knowledge automatically — "plan the Asia trip" has no
-remote and would otherwise re-ask what was already settled every time.
+Repo-backed projects are left alone — they already have learnings and a
+`CLAUDE.md` of your own.
 
 ## Watching your inbox
 

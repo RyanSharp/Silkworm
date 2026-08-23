@@ -7,6 +7,11 @@ repo, one project can span several, and plenty of projects ("plan the Asia
 trip") have no repo at all. Grouping tasks by cwd would quietly work for the
 first case and fall apart on the last.
 
+A project without a repo gets a directory of its own, holding both its files
+and a CLAUDE.md that Claude Code loads by itself -- so the brief needs no
+injection machinery at all. A repo-backed project already has a home and a
+CLAUDE.md that belongs to you; we never write there, and learnings cover it.
+
 Projects are created on first use rather than set up in advance. A task system
 that requires you to define a project before you can file anything is a task
 system you stop using. A project may carry a default scope, which tasks filed
@@ -29,6 +34,11 @@ VERSION = 1
 #: costs more than it saves.
 BRIEF_CHARS = 1500
 
+#: Where a project with no repo of its own lives. It needs somewhere for its
+#: files regardless -- itineraries, notes, screenshots -- and that directory is
+#: also where its CLAUDE.md goes.
+PROJECT_ROOT = Path.home() / "workspace" / "projects"
+
 FIELDS: dict[str, tuple] = {
     "slug":     (None,  "stable identifier, e.g. asia-trip"),
     "v":        (0,     "schema version of this record"),
@@ -37,7 +47,8 @@ FIELDS: dict[str, tuple] = {
     # What has been decided about this project, injected into every task filed
     # under it. Rewritten rather than appended, so it stays a short living
     # brief instead of an ever-growing log that taxes every prompt.
-    "brief":    ("",    "durable facts and decisions; injected as context"),
+    # The brief itself lives in the project's CLAUDE.md, which Claude Code
+    # loads on its own; only the timestamp is tracked here.
     "brief_at": (0.0,   "unix time the brief was last rewritten"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
@@ -111,32 +122,66 @@ class ProjectStore:
                    if include_archived or not r.get("archived")]
         return sorted(out, key=lambda r: r.get("title", "").lower())
 
+    def home(self, slug: str, create: bool = False) -> Path | None:
+        """The project's own directory, for projects that have no repo.
+
+        A repo-backed project already has a home and a CLAUDE.md of its own,
+        which belongs to you -- we never write there.
+        """
+        rec = self.get(slug or "")
+        if not rec:
+            return None
+        if (rec.get("scope") or {}).get("repo"):
+            return None
+        path = Path((rec.get("scope") or {}).get("cwd") or (PROJECT_ROOT / slug))
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+            if not (rec.get("scope") or {}).get("cwd"):
+                self.ensure(rec["title"], scope={**(rec.get("scope") or {}),
+                                                 "cwd": str(path)})
+        return path
+
+    def brief_path(self, slug: str, create: bool = False) -> Path | None:
+        home = self.home(slug, create=create)
+        return (home / "CLAUDE.md") if home else None
+
     def set_brief(self, slug: str, text: str) -> dict | None:
+        """Write the brief to the project's CLAUDE.md.
+
+        Claude Code loads CLAUDE.md from the working directory by itself, so
+        the file *is* the injection -- nothing needs to put it in a prompt.
+        """
+        rec = self.get(slug or "")
+        if not rec:
+            return None
+        path = self.brief_path(slug, create=True)
+        if not path:
+            log.info("project %s is repo-backed; its CLAUDE.md is yours, not ours", slug)
+            return rec
+        body = (text or "").strip()
+        if body:
+            path.write_text(f"# {rec['title']}\n\n{body}\n")
+        elif path.exists():
+            path.unlink()
         with self._lock:
-            rec = self._data.get(slug)
-            if not rec:
-                return None
-            rec["brief"] = (text or "").strip()[:BRIEF_CHARS]
-            rec["brief_at"] = time.time()
-            rec["updated"] = time.time()
+            r = self._data.get(slug)
+            r["brief_at"] = time.time()
+            r["updated"] = time.time()
             self._save()
-            return dict(rec)
+            return dict(r)
 
     def brief_for(self, slug: str) -> str:
-        return (self.get(slug or "") or {}).get("brief", "")
+        path = self.brief_path(slug)
+        if not path or not path.exists():
+            return ""
+        text = path.read_text()
+        # strip the title heading we write, so reading it back round-trips
+        return re.sub(r"\A#\s+.*\n+", "", text).strip()
 
     def scope_for(self, slug: str) -> dict:
         """The default scope a task filed under this project inherits."""
         rec = self.get(slug or "")
         return dict((rec or {}).get("scope") or {})
-
-
-def context_block(brief: str, title: str = "") -> str:
-    """The brief as it appears in a task's system prompt."""
-    if not (brief or "").strip():
-        return ""          # never spend tokens, or churn the cache, on nothing
-    head = f"What you already know about {title}:" if title else "Project context:"
-    return f"{head}\n{brief.strip()}"
 
 
 BRIEF_PROMPT = """Keep a short standing brief for a project, for whoever picks \

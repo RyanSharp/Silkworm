@@ -636,24 +636,47 @@ def test_projects():
     check("archiving keeps its tasks", len(ts.by_project("trader")) == 1)
 
     # A project with no repo gets no learnings (those scope by git remote), so
-    # without a brief every task under it starts cold and re-asks what was
-    # already decided.
+    # its context lives in a CLAUDE.md that Claude Code loads by itself -- no
+    # injection machinery of ours.
+    import tempfile as _tf
+    projects.PROJECT_ROOT = Path(_tf.mkdtemp())
+    ps.ensure("Asia Trip")
     ps.set_brief("asia-trip", "Kyoto over Osaka. April.")
-    check("a brief round-trips", ps.brief_for("asia-trip") == "Kyoto over Osaka. April.")
-    check("a brief is capped", len(ps.set_brief("asia-trip", "x" * 9000)["brief"])
-          <= projects.BRIEF_CHARS)
-    ps.set_brief("asia-trip", "Kyoto over Osaka. April.")
-    check("an empty brief injects nothing", projects.context_block("") == "",
-          "never spend tokens, or churn the prompt cache, on nothing")
-    check("a brief injects with the project's name",
-          "Asia Trip" in projects.context_block("x", "Asia Trip"))
-    check("clearing a brief empties it", ps.set_brief("asia-trip", "")["brief"] == "")
+    path = ps.brief_path("asia-trip")
+    check("the brief is a CLAUDE.md in the project's own directory",
+          path is not None and path.name == "CLAUDE.md" and path.exists())
+    check("it reads back without the heading we add",
+          ps.brief_for("asia-trip") == "Kyoto over Osaka. April.")
+    check("the project's directory becomes its scope",
+          ps.scope_for("asia-trip").get("cwd") == str(path.parent),
+          "running there is what makes CLAUDE.md load")
+    ps.set_brief("asia-trip", "")
+    check("clearing removes the file rather than leaving an empty one",
+          not path.exists())
+
+    ps.ensure("Trader", scope={"cwd": "/w/trader", "repo": "github.com/x/trader"})
+    check("a repo-backed project has no Silkworm-owned home",
+          ps.home("trader") is None,
+          "its CLAUDE.md belongs to the user; learnings cover it")
+    before = ps.get("trader")
+    ps.set_brief("trader", "we should not write this")
+    check("writing a brief to a repo-backed project is a no-op",
+          ps.get("trader").get("scope") == before.get("scope"))
+
+    check("no prompt-injection machinery remains",
+          not hasattr(projects, "context_block"),
+          "CLAUDE.md is the injection")
 
     bot = (BASE / "bot.py").read_text()
-    check("a queued task is given its project's brief",
-          'project_context(task.get("project", ""))' in bot)
-    check("a Slack thread filed under a project gets it too",
-          'thread_brief = project_context(' in bot)
+    check("the bot no longer injects project context by hand",
+          "project_context(" not in bot,
+          "Claude Code loads CLAUDE.md from the working directory itself")
+    check("a project task is given its project's directory to run in",
+          "project_store.home(proj, create=True)" in bot)
+    check("filing a thread under a repo-less project moves it into that directory",
+          'store.update(key, project=proj["slug"],' in bot
+          and '"cwd": str(home)' in bot,
+          "its CLAUDE.md only loads if the thread runs there")
     check("the brief is rewritten, not appended",
           "do not append" in (BASE / "projects.py").read_text())
     check("completing a task folds the outcome back in",

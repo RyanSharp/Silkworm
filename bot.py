@@ -410,14 +410,6 @@ def task_state(task_id: str | None, state: str, detail: str = "") -> None:
         log.exception("task %s state update to %s failed", task_id, state)
 
 
-def project_context(slug: str) -> str:
-    """The project's standing brief, ready to append to a system prompt."""
-    if not slug:
-        return ""
-    rec = project_store.get(slug) or {}
-    return projects.context_block(rec.get("brief", ""), rec.get("title", ""))
-
-
 def refresh_brief(slug: str, event: str) -> None:
     """Rewrite a project's brief in the background after something happened.
 
@@ -705,7 +697,11 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             # anything is how a task system stops getting used.
             proj = project_store.ensure(
                 arg, scope={"cwd": entry.get("cwd")} if entry.get("cwd") else {})
-            store.update(key, project=proj["slug"])
+            # A repo-less project keeps its context in its own CLAUDE.md, which
+            # only loads if the thread actually runs there.
+            home = project_store.home(proj["slug"], create=True)
+            store.update(key, project=proj["slug"],
+                         **({"cwd": str(home)} if home else {}))
             say(text=f":card_index_dividers: Filed under *{proj['title']}* "
                      f"(`{proj['slug']}`). Tasks from this thread inherit it.",
                 thread_ts=thread_ts)
@@ -1020,6 +1016,9 @@ def handle_tasks(payload: dict) -> dict:
             proj = (payload.get("project") or "").strip()
             if proj:
                 proj = project_store.ensure(proj)["slug"]
+                # Give a repo-less project a home; running there is what makes
+                # its CLAUDE.md load, with no injection on our part.
+                project_store.home(proj, create=True)
             # A project's default scope saves repeating the directory on
             # every task filed under it.
             scope = payload.get("scope") or project_store.scope_for(proj) \
@@ -1315,9 +1314,6 @@ def handle_prompt(event: dict, say, client) -> None:
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
-    thread_brief = project_context((store.get(key) or {}).get("project", ""))
-    if thread_brief:
-        system_note += "\n\n" + thread_brief
 
     # Every prompt is a task now. Created before the lock, so a message
     # waiting its turn is visibly queued rather than invisible.
@@ -1579,10 +1575,6 @@ def execute_task(task: dict) -> None:
     role_system = roles.system_prompt(role_name)
     if role_system:
         system_note += "\n\n" + role_system
-    # What the project already knows, so a fresh session doesn't start cold.
-    brief = project_context(task.get("project", ""))
-    if brief:
-        system_note += "\n\n" + brief
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block

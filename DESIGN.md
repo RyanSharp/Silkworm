@@ -107,18 +107,23 @@ other's history. Independent sessions are also what makes a task a reviewable
 unit.
 
 Accumulated knowledge is carried as **context, not conversation**. A repo-backed
-project already gets learnings, scoped by git remote. A project without a repo
-got nothing — so every task under "plan the Asia trip" started cold and re-asked
-what was already settled. Each project now carries a short **brief** that is
-injected into every task filed under it, and rewritten (never appended) after a
-task completes, so it stays a living document rather than a log that taxes every
-prompt. `!brief` reads or sets it by hand.
+project already gets learnings, scoped by git remote, and has a CLAUDE.md of its
+own that belongs to you — Silkworm never writes there.
 
-**Mechanically** it is `--append-system-prompt`: the brief, the role's system
-text and the applicable learnings are concatenated into one system note handed
-to `claude` at launch. That text is part of the cached prefix, so it is built
-the same way every time and an empty brief contributes nothing at all rather
-than an empty heading.
+A project *without* a repo gets a directory of its own under
+`~/workspace/projects/<slug>/`, which it needs anyway for its files, holding a
+**CLAUDE.md** that Claude Code loads by itself. Tasks filed under the project
+run in that directory, so the context arrives with no injection machinery at
+all: no prompt assembly, no size accounting, no cache churn to reason about.
+Binding a Slack thread with `!project` moves that thread into the directory for
+the same reason.
+
+The file still maintains itself: after a task completes, a cheap model rewrites
+it from what happened. That is the one thing a hand-written CLAUDE.md doesn't
+do, and the only reason any of this is Silkworm's business. Everything else —
+storage, editing, git history, loading — is left to tools that already do it.
+
+`!brief` reads or sets it; it is an ordinary file you can also just edit.
 
 ## Record
 
