@@ -635,7 +635,29 @@ def test_projects():
           not any(p["slug"] == "trader" for p in ps.all(include_archived=False)))
     check("archiving keeps its tasks", len(ts.by_project("trader")) == 1)
 
+    # A project with no repo gets no learnings (those scope by git remote), so
+    # without a brief every task under it starts cold and re-asks what was
+    # already decided.
+    ps.set_brief("asia-trip", "Kyoto over Osaka. April.")
+    check("a brief round-trips", ps.brief_for("asia-trip") == "Kyoto over Osaka. April.")
+    check("a brief is capped", len(ps.set_brief("asia-trip", "x" * 9000)["brief"])
+          <= projects.BRIEF_CHARS)
+    ps.set_brief("asia-trip", "Kyoto over Osaka. April.")
+    check("an empty brief injects nothing", projects.context_block("") == "",
+          "never spend tokens, or churn the prompt cache, on nothing")
+    check("a brief injects with the project's name",
+          "Asia Trip" in projects.context_block("x", "Asia Trip"))
+    check("clearing a brief empties it", ps.set_brief("asia-trip", "")["brief"] == "")
+
     bot = (BASE / "bot.py").read_text()
+    check("a queued task is given its project's brief",
+          'project_context(task.get("project", ""))' in bot)
+    check("a Slack thread filed under a project gets it too",
+          'thread_brief = project_context(' in bot)
+    check("the brief is rewritten, not appended",
+          "do not append" in (BASE / "projects.py").read_text())
+    check("completing a task folds the outcome back in",
+          "refresh_brief(task.get(" in bot)
     check("a thread's project is inherited by its tasks",
           'project=(store.get(key) or {}).get("project", "")' in bot)
     check("!project files a thread", 'elif lower.startswith("!project")' in bot)

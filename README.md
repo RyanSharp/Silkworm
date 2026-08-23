@@ -256,6 +256,16 @@ several, and plenty ("plan the trip") have no repo at all. A project may carry a
 default scope that its tasks inherit, so work on a codebase lands in the right
 directory without repeating it.
 
+Each project carries a short **brief** — what's been decided, constraints,
+preferences — injected into every task filed under it. Tasks get their own
+sessions, so without this each one would start cold; the brief is how a project
+remembers without tasks sharing a conversation. It rewrites itself as tasks
+complete, and `!brief` reads or sets it by hand.
+
+This matters most for projects with no repo: a codebase project already
+accumulates **learnings** scoped by git remote, but "plan the Asia trip" has no
+remote to scope to.
+
 In the dashboard the Tasks panel gets a project filter, with the count of what
 needs you per project. It remains a **lens, not a new default**: the panel still
 opens on what needs you across everything.

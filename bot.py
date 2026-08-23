@@ -410,6 +410,42 @@ def task_state(task_id: str | None, state: str, detail: str = "") -> None:
         log.exception("task %s state update to %s failed", task_id, state)
 
 
+def project_context(slug: str) -> str:
+    """The project's standing brief, ready to append to a system prompt."""
+    if not slug:
+        return ""
+    rec = project_store.get(slug) or {}
+    return projects.context_block(rec.get("brief", ""), rec.get("title", ""))
+
+
+def refresh_brief(slug: str, event: str) -> None:
+    """Rewrite a project's brief in the background after something happened.
+
+    Rewritten rather than appended: a brief rides on every prompt for the
+    project, so it has to stay a short living document rather than a log.
+    """
+    if not slug or not SUMMARY_MODEL or not event.strip():
+        return
+
+    def run():
+        try:
+            rec = project_store.get(slug) or {}
+            prompt = projects.BRIEF_PROMPT.format(
+                brief=rec.get("brief") or "(nothing yet)", event=event[:3000])
+            proc = subprocess.run(
+                [CLAUDE_BIN, "-p", "--model", SUMMARY_MODEL, "--output-format", "text"],
+                input=prompt, capture_output=True, text=True, timeout=120,
+                cwd=str(CLAUDE_CWD), env=claude_env())
+            text = " ".join(proc.stdout.split())
+            if text:
+                project_store.set_brief(slug, text)
+                log.info("brief updated for project %s (%d chars)", slug, len(text))
+        except Exception:
+            log.exception("brief update failed for %s", slug)
+
+    threading.Thread(target=run, daemon=True, name="brief").start()
+
+
 def refresh_summary(key: str) -> None:
     """Re-summarize a thread in the background after a turn completes."""
     if not SUMMARY_MODEL:
@@ -630,6 +666,25 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
     lower = cmd.lower()
     if lower in ("!help", "!commands"):
         say(text=HELP, thread_ts=thread_ts)
+    elif lower.startswith("!brief"):
+        arg = cmd[len("!brief"):].strip()
+        slug = (store.get(key) or {}).get("project", "")
+        if not slug:
+            say(text="This thread isn't filed under a project — `!project <name>` first.",
+                thread_ts=thread_ts)
+        elif not arg:
+            brief = project_store.brief_for(slug)
+            say(text=(f":card_index_dividers: *{slug}* brief:\n{brief}" if brief
+                      else f"No brief for *{slug}* yet. It writes itself as tasks "
+                           "complete, or set one with `!brief <text>`."),
+                thread_ts=thread_ts)
+        elif arg.lower() in ("clear", "none"):
+            project_store.set_brief(slug, "")
+            say(text=f"Brief cleared for *{slug}*.", thread_ts=thread_ts)
+        else:
+            project_store.set_brief(slug, arg)
+            say(text=f":card_index_dividers: Brief set for *{slug}*. "
+                     "Tasks filed here will start with it.", thread_ts=thread_ts)
     elif lower.startswith("!project"):
         arg = cmd[len("!project"):].strip()
         entry = store.get(key) or {}
@@ -1039,6 +1094,13 @@ def handle_projects(payload: dict) -> dict:
         scope = payload.get("scope")
         return {"ok": True, "project": project_store.ensure(
             name, **({"scope": scope} if scope else {}))}
+    if action == "brief":
+        slug = payload.get("slug", "")
+        if "brief" in payload:
+            rec = project_store.set_brief(slug, payload.get("brief") or "")
+            return {"ok": bool(rec), "project": rec,
+                    "error": "" if rec else "unknown project"}
+        return {"ok": True, "brief": project_store.brief_for(slug)}
     if action in ("archive", "unarchive"):
         ok = project_store.set_archived(payload.get("slug", ""), action == "archive")
         return {"ok": ok, "error": "" if ok else "unknown project"}
@@ -1253,6 +1315,9 @@ def handle_prompt(event: dict, say, client) -> None:
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
+    thread_brief = project_context((store.get(key) or {}).get("project", ""))
+    if thread_brief:
+        system_note += "\n\n" + thread_brief
 
     # Every prompt is a task now. Created before the lock, so a message
     # waiting its turn is visibly queued rather than invisible.
@@ -1514,6 +1579,10 @@ def execute_task(task: dict) -> None:
     role_system = roles.system_prompt(role_name)
     if role_system:
         system_note += "\n\n" + role_system
+    # What the project already knows, so a fresh session doesn't start cold.
+    brief = project_context(task.get("project", ""))
+    if brief:
+        system_note += "\n\n" + brief
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
@@ -1563,6 +1632,9 @@ def execute_task(task: dict) -> None:
         if not resolve_review(task, role_name, result.text, channel, thread_ts):
             task_state(tid, tasks.DONE)
         refresh_summary(key)
+        refresh_brief(task.get("project", ""),
+                      f"Task: {task.get('goal', '')[:500]}\n\n"
+                      f"Outcome: {result.text[:1500]}")
     except ClaudeStopped:
         progress.finalize(":octagonal_sign: Stopped.")
         task_state(tid, tasks.CANCELLED, "stopped by the user")

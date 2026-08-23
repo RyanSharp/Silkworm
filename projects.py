@@ -25,11 +25,20 @@ log = logging.getLogger("silkworm.projects")
 
 VERSION = 1
 
+#: A brief is context on every prompt, so it has to stay small. Past this it
+#: costs more than it saves.
+BRIEF_CHARS = 1500
+
 FIELDS: dict[str, tuple] = {
     "slug":     (None,  "stable identifier, e.g. asia-trip"),
     "v":        (0,     "schema version of this record"),
     "title":    ("",    "human name, e.g. Asia Trip"),
     "scope":    (dict,  "default {cwd, repo} tasks inherit when unset"),
+    # What has been decided about this project, injected into every task filed
+    # under it. Rewritten rather than appended, so it stays a short living
+    # brief instead of an ever-growing log that taxes every prompt.
+    "brief":    ("",    "durable facts and decisions; injected as context"),
+    "brief_at": (0.0,   "unix time the brief was last rewritten"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),
@@ -102,10 +111,48 @@ class ProjectStore:
                    if include_archived or not r.get("archived")]
         return sorted(out, key=lambda r: r.get("title", "").lower())
 
+    def set_brief(self, slug: str, text: str) -> dict | None:
+        with self._lock:
+            rec = self._data.get(slug)
+            if not rec:
+                return None
+            rec["brief"] = (text or "").strip()[:BRIEF_CHARS]
+            rec["brief_at"] = time.time()
+            rec["updated"] = time.time()
+            self._save()
+            return dict(rec)
+
+    def brief_for(self, slug: str) -> str:
+        return (self.get(slug or "") or {}).get("brief", "")
+
     def scope_for(self, slug: str) -> dict:
         """The default scope a task filed under this project inherits."""
         rec = self.get(slug or "")
         return dict((rec or {}).get("scope") or {})
+
+
+def context_block(brief: str, title: str = "") -> str:
+    """The brief as it appears in a task's system prompt."""
+    if not (brief or "").strip():
+        return ""          # never spend tokens, or churn the cache, on nothing
+    head = f"What you already know about {title}:" if title else "Project context:"
+    return f"{head}\n{brief.strip()}"
+
+
+BRIEF_PROMPT = """Keep a short standing brief for a project, for whoever picks \
+up the next piece of work on it.
+
+Current brief (rewrite it; do not append):
+{brief}
+
+What just happened:
+{event}
+
+Return the updated brief and nothing else. Keep only durable things: decisions \
+made, constraints, preferences, names and facts that will still matter next \
+week. Drop anything transient, anything already obvious from the task itself, \
+and anything superseded by what just happened. Aim for under 150 words. If \
+nothing durable changed, return the current brief unchanged."""
 
 
 def summarise(projects: list[dict], tasks: list[dict],
