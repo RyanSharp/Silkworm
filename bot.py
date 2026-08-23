@@ -421,9 +421,12 @@ def refresh_brief(slug: str, event: str) -> None:
 
     def run():
         try:
-            rec = project_store.get(slug) or {}
+            # Read from the file, not the record: the brief moved to
+            # CLAUDE.md, and reading a field that no longer exists would make
+            # every rewrite start from scratch and discard what was learned.
+            current = project_store.brief_for(slug)
             prompt = projects.BRIEF_PROMPT.format(
-                brief=rec.get("brief") or "(nothing yet)", event=event[:3000])
+                brief=current or "(nothing yet)", event=event[:3000])
             proc = subprocess.run(
                 [CLAUDE_BIN, "-p", "--model", SUMMARY_MODEL, "--output-format", "text"],
                 input=prompt, capture_output=True, text=True, timeout=120,
@@ -1424,6 +1427,10 @@ def handle_prompt(event: dict, say, client) -> None:
         if uploaded:
             log.info("uploaded %d file(s) from outbox for %s", uploaded, key)
         reactions.done()
+        # A conversation in a project-bound thread is where most decisions get
+        # made; without this the brief only ever learns from queued tasks.
+        refresh_brief((store.get(key) or {}).get("project", ""),
+                      f"Asked: {text[:500]}\n\nAnswered: {result.text[:1500]}")
         task_store.update(task_id, session_id=result.session_id,
                           result={"text": result.text[:4000],
                                   "cost": result.cost_usd,

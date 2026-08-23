@@ -663,6 +663,20 @@ def test_projects():
     check("writing a brief to a repo-backed project is a no-op",
           ps.get("trader").get("scope") == before.get("scope"))
 
+    # The brief moved from a record field to a file; a reader left pointing at
+    # the old field silently made every rewrite start from scratch, discarding
+    # everything learned so far.
+    bot_src = (BASE / "bot.py").read_text()
+    rb = bot_src[bot_src.index("def refresh_brief("):bot_src.index("def refresh_summary(")]
+    check("the rewrite reads the brief from where it now lives",
+          "project_store.brief_for(slug)" in rb)
+    check("the rewrite does not read the removed record field",
+          'rec.get("brief")' not in rb,
+          "that always returns None and throws away the existing brief")
+    check("a conversation in a project-bound thread updates the brief too",
+          bot_src.count("refresh_brief(") >= 3,
+          "definition plus both trigger sites")
+
     check("no prompt-injection machinery remains",
           not hasattr(projects, "context_block"),
           "CLAUDE.md is the injection")
