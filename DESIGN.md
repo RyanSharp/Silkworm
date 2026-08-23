@@ -100,15 +100,6 @@ you must visit N times to see your work would undo the rule above.
 Binding a Slack thread with `!project <name>` makes every task from that thread
 inherit it.
 
-Sessions are keyed to the **thread**, never to the project: each task gets its
-own, so tasks stay independent, reviewable units and one does not pay for
-another's history. Accumulated knowledge is carried by **context injection**
-instead — learnings scoped by repo, and a per-project **brief** injected into
-every task filed under it. The brief is *rewritten* after each task rather than
-appended, since it rides on every prompt for that project; a log would become a
-tax. Projects with no repo get no learnings, so the brief is the only thing
-keeping them from starting cold each time.
-
 **Sessions are keyed to threads, not projects.** Each task gets its own session,
 deliberately: a shared per-project session would accumulate useful context but
 grow without bound, and unrelated tasks would pay for and be confused by each
@@ -122,6 +113,12 @@ what was already settled. Each project now carries a short **brief** that is
 injected into every task filed under it, and rewritten (never appended) after a
 task completes, so it stays a living document rather than a log that taxes every
 prompt. `!brief` reads or sets it by hand.
+
+**Mechanically** it is `--append-system-prompt`: the brief, the role's system
+text and the applicable learnings are concatenated into one system note handed
+to `claude` at launch. That text is part of the cached prefix, so it is built
+the same way every time and an empty brief contributes nothing at all rather
+than an empty heading.
 
 ## Record
 
