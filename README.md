@@ -270,6 +270,17 @@ In the dashboard the Tasks panel gets a project filter, with the count of what
 needs you per project. It remains a **lens, not a new default**: the panel still
 opens on what needs you across everything.
 
+**Each project keeps a brief** — a short standing note of what has been decided
+— injected into every task filed under it, so a fresh session doesn't start
+cold. It writes itself: after each task completes, a cheap model *rewrites* the
+brief (never appends) from what just happened, keeping it a living paragraph
+rather than a growing log. `!brief` reads it, `!brief <text>` sets it,
+`!brief clear` empties it.
+
+This matters most for projects with no repo. Learnings scope by git remote, so
+a codebase accumulates knowledge automatically — "plan the Asia trip" has no
+remote and would otherwise re-ask what was already settled every time.
+
 ## Watching your inbox
 
 Silkworm can watch Gmail and **propose** tasks for mail that looks like it
