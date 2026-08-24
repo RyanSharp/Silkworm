@@ -37,6 +37,7 @@ import tasks
 import procs
 import projects
 import recovery
+import retry
 import summaries
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, ClaudeTimeout, run_turn

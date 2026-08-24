@@ -585,6 +585,36 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+# --- a module used but never imported ----------------------------------------
+# `retry` was used in fail_or_retry and never imported, so every transient
+# failure raised NameError instead of being requeued. Its own tests passed:
+# they exercised retry.py directly and checked bot.py as *text*, which cannot
+# tell a used name from an imported one.
+
+def test_modules_are_imported():
+    print("\nevery module a file uses is imported")
+    siblings = {p.stem for p in BASE.glob("*.py")}
+    for path in sorted(BASE.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        imported, bound = set(), set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                imported |= {(a.asname or a.name).split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom):
+                imported |= {a.asname or a.name for a in n.names}
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(n.name)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                bound.add(n.id)
+            elif isinstance(n, ast.arg):
+                bound.add(n.arg)
+        used = {n.value.id for n in ast.walk(tree)
+                if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+        missing = sorted((used & siblings) - imported - bound - {path.stem})
+        check(f"{path.name} imports every sibling module it uses", not missing,
+              f"uses but never imports: {', '.join(missing)}")
+
+
 # --- labelled mail is a fact about a project, not a task ---------------------
 # A booking confirmation needs nothing from you. Putting it on the board would
 # mean clicking to dismiss something true; it belongs in the project's files.
@@ -1033,7 +1063,8 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_email_ingest, test_mail_facts, test_projects,
+              test_review_gate, test_email_ingest, test_modules_are_imported,
+              test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):
         try:
