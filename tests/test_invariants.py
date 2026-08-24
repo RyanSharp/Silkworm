@@ -585,6 +585,29 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+# --- a missing cwd must not be reported as a missing binary -------------------
+# Popen raises FileNotFoundError for either. Blaming the binary unconditionally
+# sent a real diagnosis looking for a PATH problem that did not exist.
+
+def test_missing_cwd_is_named():
+    import claude_runner
+    print("\na vanished working directory says so")
+    gone = Path(tempfile.mkdtemp()) / "deleted"
+    try:
+        claude_runner.run_turn("hi", cwd=str(gone), binary=sys.executable,
+                               permission_args=[])
+        check("a missing cwd raises", False, "no error at all")
+    except ClaudeError as e:
+        check("a missing cwd names the directory, not the binary",
+              str(gone) in str(e) and "on PATH" not in str(e), str(e))
+    try:
+        claude_runner.run_turn("hi", cwd=str(BASE),
+                               binary="definitely-not-claude", permission_args=[])
+        check("a missing binary raises", False, "no error at all")
+    except ClaudeError as e:
+        check("a missing binary still says so", "on PATH" in str(e), str(e))
+
+
 # --- a module used but never imported ----------------------------------------
 # `retry` was used in fail_or_retry and never imported, so every transient
 # failure raised NameError instead of being requeued. Its own tests passed:
@@ -1064,6 +1087,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
+              test_missing_cwd_is_named,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):

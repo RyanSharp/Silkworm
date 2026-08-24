@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 log = logging.getLogger("silkworm.runner")
 
@@ -118,6 +119,12 @@ def run_turn(
             start_new_session=True,  # own process group so stop/timeout kills children too
         )
     except FileNotFoundError:
+        # Popen raises the same error whether the binary or the cwd is missing.
+        # Blaming the binary unconditionally sends you looking for a PATH
+        # problem when the real cause is a working directory that no longer
+        # exists -- which is the likelier one for a task filed days ago.
+        if cwd and not Path(cwd).is_dir():
+            raise ClaudeError(f"working directory no longer exists: {cwd}")
         raise ClaudeError(f"`{binary}` not found — is Claude Code installed and on PATH?")
 
     handle = RunHandle(proc)
