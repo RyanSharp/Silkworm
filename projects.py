@@ -39,6 +39,17 @@ BRIEF_CHARS = 1500
 #: also where its CLAUDE.md goes.
 PROJECT_ROOT = Path.home() / "workspace" / "projects"
 
+#: Where facts drawn from mail accumulate. Deliberately *not* CLAUDE.md: that
+#: file is capped and rewritten wholesale after every task, so an itinerary put
+#: there would be summarised away within a turn or two. This one only ever
+#: grows, and CLAUDE.md points at it.
+LOGISTICS = "logistics.md"
+
+#: Appended to CLAUDE.md structurally rather than written by the model, so a
+#: brief rewrite cannot drop the pointer and strand the file.
+POINTER = f"Confirmations, bookings and dates are in `./{LOGISTICS}` -- read it "\
+          "before answering anything about schedule, travel or reservations."
+
 FIELDS: dict[str, tuple] = {
     "slug":     (None,  "stable identifier, e.g. asia-trip"),
     "v":        (0,     "schema version of this record"),
@@ -50,6 +61,9 @@ FIELDS: dict[str, tuple] = {
     # The brief itself lives in the project's CLAUDE.md, which Claude Code
     # loads on its own; only the timestamp is tracked here.
     "brief_at": (0.0,   "unix time the brief was last rewritten"),
+    # The Gmail label whose mail belongs to this project. Empty means "use the
+    # title", so a label you already keep needs no configuration at all.
+    "mail_label": ("",  "gmail label to draw facts from; blank = the title"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),
@@ -159,8 +173,12 @@ class ProjectStore:
             log.info("project %s is repo-backed; its CLAUDE.md is yours, not ours", slug)
             return rec
         body = (text or "").strip()
-        if body:
-            path.write_text(f"# {rec['title']}\n\n{body}\n")
+        # The pointer is structural, not part of the brief the model rewrites,
+        # so it survives every rewrite -- including one that returns nothing.
+        tail = f"\n{POINTER}\n" if (path.parent / LOGISTICS).exists() else ""
+        if body or tail:
+            head = f"# {rec['title']}\n\n"
+            path.write_text(f"{head}{body}\n{tail}" if body else f"{head}{tail.lstrip()}")
         elif path.exists():
             path.unlink()
         with self._lock:
@@ -175,8 +193,66 @@ class ProjectStore:
         if not path or not path.exists():
             return ""
         text = path.read_text()
-        # strip the title heading we write, so reading it back round-trips
-        return re.sub(r"\A#\s+.*\n+", "", text).strip()
+        # strip the title heading and the structural pointer we write, so
+        # reading it back round-trips and a rewrite never sees its own scaffold
+        text = re.sub(r"\A#\s+.*\n+", "", text)
+        return text.replace(POINTER, "").strip()
+
+    def logistics_path(self, slug: str, create: bool = False) -> Path | None:
+        home = self.home(slug, create=create)
+        return (home / LOGISTICS) if home else None
+
+    def add_fact(self, slug: str, heading: str, body: str, source: str = "") -> Path | None:
+        """Append a dated entry to the project's logistics file.
+
+        Append-only on purpose. Unlike the brief, these are facts with no
+        shelf life -- a flight number does not get summarised, and a past trip
+        is history rather than clutter.
+        """
+        path = self.logistics_path(slug, create=True)
+        if not path:
+            return None
+        new = not path.exists()
+        with self._lock:
+            with path.open("a") as fh:
+                if new:
+                    rec = self._data.get(slug) or {}
+                    fh.write(f"# {rec.get('title', slug)} -- logistics\n\n"
+                             "Facts drawn from mail. Append-only.\n")
+                fh.write(f"\n## {heading}\n")
+                if source:
+                    fh.write(f"*{source}*\n")
+                fh.write(f"\n{body.strip()}\n")
+        if new:
+            # first entry: make sure CLAUDE.md starts pointing here
+            self.set_brief(slug, self.brief_for(slug))
+        return path
+
+    def label_for(self, slug: str) -> str:
+        """The Gmail label this project draws facts from.
+
+        Defaults to the project's title, because a label named after the
+        project is what you would already have. Set `mail_label` to point at a
+        differently-named one.
+        """
+        rec = self.get(slug or "")
+        if not rec or rec.get("archived"):
+            return ""
+        return (rec.get("mail_label") or rec.get("title") or "").strip()
+
+    def mail_targets(self) -> list[tuple[str, str, Path]]:
+        """(slug, label, directory) for every project mail can be filed into.
+
+        Only projects with a directory of our own qualify: a repo-backed
+        project's files belong to you, and we do not write there.
+        """
+        out = []
+        for rec in self.all(include_archived=False):
+            label = self.label_for(rec["slug"])
+            home = self.home(rec["slug"])
+            if label and home:
+                out.append((rec["slug"], label, home))
+        return out
 
     def scope_for(self, slug: str) -> dict:
         """The default scope a task filed under this project inherits."""

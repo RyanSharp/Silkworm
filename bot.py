@@ -69,6 +69,10 @@ GMAIL_HOST = os.environ.get("GMAIL_HOST", "imap.gmail.com").strip()
 GMAIL_MAILBOX = os.environ.get("GMAIL_MAILBOX", "INBOX").strip()
 GMAIL_POLL_MIN = float(os.environ.get("GMAIL_POLL_MIN", "15"))
 GMAIL_MAX_PER_RUN = int(os.environ.get("GMAIL_MAX_PER_RUN", "25"))
+# Inbox triage proposes tasks from mail that looks like it wants a person. Off
+# by default: you already read your inbox, so re-surfacing it mostly duplicates
+# work you do anyway. Label-driven fact filing is the half that earns its keep.
+GMAIL_TRIAGE = os.environ.get("GMAIL_TRIAGE", "").strip().lower() in ("1", "true", "yes")
 EMAIL_STATE_FILE = BASE_DIR / "email_state.json"
 
 # skip  = --dangerously-skip-permissions (full autonomy)
@@ -695,6 +699,24 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             store.update(key, project="")
             say(text="Unfiled — new tasks from this thread won't belong to a project.",
                 thread_ts=thread_ts)
+        elif arg.lower() == "mail" or arg.lower().startswith("mail "):
+            # The Gmail label whose mail belongs here. Defaults to the project's
+            # title, so this is only needed when the label is named differently.
+            slug = entry.get("project") or ""
+            label = arg[4:].strip()
+            if not slug:
+                say(text="File this thread under a project first: `!project <name>`.",
+                    thread_ts=thread_ts)
+            elif label:
+                project_store.ensure(slug, mail_label="" if label.lower() in
+                                     ("none", "off", "clear") else label)
+                say(text=f":inbox_tray: Mail labelled *{project_store.label_for(slug)}* "
+                         "files its bookings and confirmations here.",
+                    thread_ts=thread_ts)
+            else:
+                say(text=f"Drawing facts from the Gmail label "
+                         f"*{project_store.label_for(slug) or '(none)'}*.",
+                    thread_ts=thread_ts)
         else:
             # Created on first use: needing to define a project before filing
             # anything is how a task system stops getting used.
@@ -1696,20 +1718,31 @@ def resolve_review(task: dict, role_name: str, text: str,
 
 
 def run_email_ingest() -> dict:
-    """One Gmail pass. Off unless both credentials are set."""
+    """One Gmail pass. Off unless both credentials are set.
+
+    Two halves, and they produce different things. Labelled mail is filed into
+    the matching project as *facts* -- a booking is not an action item, and
+    putting it on the board would mean clicking to dismiss something true.
+    Inbox triage, which proposes tasks, is opt-in.
+    """
     if not (GMAIL_USER and GMAIL_APP_PASSWORD):
         return {"ok": False, "error": "GMAIL_USER / GMAIL_APP_PASSWORD not set"}
     try:
         state = json.loads(EMAIL_STATE_FILE.read_text()) if EMAIL_STATE_FILE.exists() else {}
     except (OSError, json.JSONDecodeError):
         state = {}
-    result = email_ingest.ingest(
-        task_store, state, host=GMAIL_HOST, user=GMAIL_USER,
-        password=GMAIL_APP_PASSWORD, mailbox=GMAIL_MAILBOX,
-        limit=GMAIL_MAX_PER_RUN, binary=CLAUDE_BIN,
-        model=NAMING_MODEL or "haiku", env=claude_env(), cwd=str(CLAUDE_CWD))
+    common = dict(host=GMAIL_HOST, user=GMAIL_USER, password=GMAIL_APP_PASSWORD,
+                  limit=GMAIL_MAX_PER_RUN, binary=CLAUDE_BIN,
+                  model=NAMING_MODEL or "haiku", env=claude_env(),
+                  cwd=str(CLAUDE_CWD))
+    facts = email_ingest.ingest_facts(
+        project_store, state.setdefault("labels", {}), **common)
+    triaged = {}
+    if GMAIL_TRIAGE:
+        triaged = email_ingest.ingest(
+            task_store, state, mailbox=GMAIL_MAILBOX, **common)
     EMAIL_STATE_FILE.write_text(json.dumps(state, indent=2))
-    return {"ok": True, **result}
+    return {"ok": True, **facts, "triaged": triaged}
 
 
 def _email_watcher() -> None:

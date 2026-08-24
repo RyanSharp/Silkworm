@@ -81,6 +81,17 @@ Silkworm owns the state of the work. For an item owned elsewhere (a GitHub
 issue), the task carries a `source_ref` pointing at it and sync is **one-way
 outward**; the external item is never treated as a second state machine.
 
+**Not every input is a task.** A booking confirmation asks nothing of you; it
+is something a project should *know*. Routing it to the board would mean
+clicking to dismiss a fact, which is how a board stops reaching empty. So mail
+has two outputs and they go to different places: labelled mail becomes **facts
+in the project's files**, and only the opt-in inbox triage produces tasks.
+
+That distinction is what makes email worth having at all. As a task source it
+largely duplicates reading your own inbox — you already do that, with better
+tools. As a fact source it does something you would not do by hand:
+consolidating logistics into a project the agents can see.
+
 ## Projects
 
 A **project** is what a task belongs to; **scope** is where it may act. They
@@ -124,6 +135,11 @@ do, and the only reason any of this is Silkworm's business. Everything else —
 storage, editing, git history, loading — is left to tools that already do it.
 
 `!brief` reads or sets it; it is an ordinary file you can also just edit.
+
+Alongside it, `logistics.md` holds facts drawn from mail. It is append-only and
+never rewritten: a flight number has no shelf life, and a past trip is history
+rather than clutter. Keeping it out of CLAUDE.md is what stops the brief's cap
+and its wholesale rewrite from eating an itinerary.
 
 ## Record
 
@@ -172,11 +188,21 @@ graph to maintain.
 5. Ingestion adapters, worktree isolation, per-role tool scoping.
    *(email: built. Gmail over IMAP with an app password — the API needs a
    Cloud project and a browser consent flow, awkward on a headless host.
-   Read-only by construction: readonly select and BODY.PEEK, so watching the
-   inbox never changes what the user sees. A cheap model triages
-   sender/subject/snippet only — full bodies never leave the machine — and
-   everything it flags lands `proposed`, so a wrong guess costs two clicks
-   rather than flooding the list. Off unless credentials are set.)*
+   Read-only by construction: readonly select and BODY.PEEK, so watching mail
+   never changes what the user sees. Off unless credentials are set.*
+
+   *A Gmail label matching a project's name is the trigger **and** the project
+   assignment in one gesture the user already makes, which is why there is no
+   junk-filtering problem to solve: no classifier, no sender memory, no
+   Primary-vs-Updates judgement. Labelled mail is read for durable facts and
+   appended to the project's `logistics.md`, with attachments saved beside it.
+   Deliberately append-only and separate from CLAUDE.md, which is capped and
+   rewritten wholesale after every task — an itinerary put there would be
+   summarised away within a turn. CLAUDE.md carries a structural pointer to it
+   that a rewrite cannot drop.*
+
+   *Inbox triage — a cheap model over sender/subject/snippet, everything it
+   flags landing `proposed` — still exists but is opt-in behind `GMAIL_TRIAGE`.)*
 
 Steps 1–3 are what make it a management system; 4–5 are what make it an agent
 system. In that order, because a queue nobody looks at is worse than no queue.

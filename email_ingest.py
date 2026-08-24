@@ -27,6 +27,36 @@ log = logging.getLogger("silkworm.email")
 SNIPPET_CHARS = 400
 DEFAULT_MAILBOX = "INBOX"
 
+#: Extraction needs more of the message than triage does -- a confirmation
+#: buries the flight number below the pleasantries -- but still not all of it.
+FACT_CHARS = 3000
+
+#: Attachments worth keeping (boarding passes, tickets, itineraries). Anything
+#: larger is almost certainly not a document you want in a project directory.
+ATTACH_MAX = 5 * 1024 * 1024
+ATTACH_DIR = "attachments"
+
+EXTRACT_PROMPT = """Below is an email filed under a project. Pull out only \
+durable facts: flights, trains, hotels, reservations, tickets, appointments, \
+confirmation numbers, addresses, times, costs actually committed to.
+
+You are writing a reference note someone will read weeks later to answer \
+"what is booked and when". Nothing else belongs in it -- no marketing, no \
+"thanks for choosing us", no instructions the sender gives everyone, no \
+speculation about what the reader should do.
+
+Email:
+{item}
+
+Reply with only a json object:
+{{"skip": false, "date": "YYYY-MM-DD", "title": "<short, e.g. Flight AC123 \
+YYZ-NRT>", "body": "- fact\\n- fact"}}
+
+`date` is the date the thing *happens*, not the date of the email; use the \
+email's date only if there is no other. Use \
+{{"skip": true}} -- and nothing else -- if this holds no durable fact, which \
+is the common case for ordinary correspondence."""
+
 TRIAGE_PROMPT = """You are triaging a person's inbox. Below are unread messages.
 
 Flag only mail that genuinely needs *them* specifically to do or decide \
@@ -54,7 +84,7 @@ def _decode(value: str) -> str:
         return value or ""
 
 
-def _snippet(msg) -> str:
+def _snippet(msg, limit: int = SNIPPET_CHARS) -> str:
     """First readable text of a message, trimmed."""
     try:
         if msg.is_multipart():
@@ -71,7 +101,7 @@ def _snippet(msg) -> str:
         text = ""
     text = re.sub(r"https?://\S+", "[link]", text)      # links add noise, not signal
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:SNIPPET_CHARS]
+    return text[:limit]
 
 
 def imap_fetch(host: str, user: str, password: str, mailbox: str,
@@ -113,6 +143,159 @@ def imap_fetch(host: str, user: str, password: str, mailbox: str,
         except Exception:
             pass
     return items, high
+
+
+def _mbox(name: str) -> str:
+    """Quote a mailbox name for IMAP. Gmail labels contain spaces; imaplib
+    does not quote them for you, and an unquoted one selects nothing."""
+    return '"%s"' % name.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _safe_name(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip()).strip("-.")
+    return name[:80] or "attachment"
+
+
+def _attachments(msg) -> list[tuple[str, bytes]]:
+    """Named file parts of a message, small ones only."""
+    out = []
+    if not msg.is_multipart():
+        return out
+    for part in msg.walk():
+        filename = part.get_filename()
+        if not filename or part.get_content_maintype() == "multipart":
+            continue
+        try:
+            data = part.get_payload(decode=True) or b""
+        except Exception:
+            continue
+        if 0 < len(data) <= ATTACH_MAX:
+            out.append((_safe_name(_decode(filename)), data))
+    return out
+
+
+def fetch_label(host: str, user: str, password: str, label: str,
+                since_uid: int, limit: int) -> tuple[list[dict], int]:
+    """Messages carrying a Gmail label, read or unread, without touching them.
+
+    Unread-only would be wrong here: you label mail you have already opened,
+    and that is exactly the mail worth filing.
+    """
+    items: list[dict] = []
+    high = since_uid
+    conn = imaplib.IMAP4_SSL(host)
+    try:
+        conn.login(user, password)
+        typ, _ = conn.select(_mbox(label), readonly=True)
+        if typ != "OK":
+            log.warning("no such gmail label: %s", label)
+            return [], since_uid
+        criteria = f"(UID {since_uid + 1}:*)" if since_uid else "(ALL)"
+        typ, data = conn.uid("SEARCH", None, criteria)
+        if typ != "OK":
+            return [], since_uid
+        uids = sorted(u for u in (int(x) for x in (data[0] or b"").split())
+                      if u > since_uid)
+        for uid in uids[-limit:]:
+            typ, raw = conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
+            if typ != "OK" or not raw or not isinstance(raw[0], tuple):
+                continue
+            msg = email.message_from_bytes(raw[0][1])
+            items.append({
+                "uid": uid,
+                "id": msg.get("Message-ID", f"uid-{uid}").strip("<>"),
+                "from": _decode(msg.get("From", "")),
+                "subject": _decode(msg.get("Subject", "(no subject)")),
+                "date": msg.get("Date", ""),
+                "snippet": _snippet(msg, FACT_CHARS),
+                "attachments": _attachments(msg),
+            })
+        for u in uids:
+            high = max(high, u)          # advance past mail we skipped, too
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    return items, high
+
+
+def extract(item: dict, *, binary: str, model: str, env: dict,
+            cwd: str = "") -> dict | None:
+    """Pull durable facts out of one message, or None if it holds none.
+
+    Fails closed the same way triage does: an unreadable answer files nothing,
+    because a garbled entry in a reference file is worse than a missing one.
+    """
+    prompt = EXTRACT_PROMPT.format(item=(
+        f"from: {item['from']}\nsubject: {item['subject']}\n"
+        f"date: {item['date']}\n\n{item['snippet']}"))
+    try:
+        proc = subprocess.run(
+            [binary, "-p", "--model", model, "--output-format", "text"],
+            input=prompt, capture_output=True, text=True, timeout=180,
+            cwd=cwd or None, env=env)
+        text = proc.stdout
+    except Exception:
+        log.exception("fact extraction failed")
+        return None
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        log.warning("extractor returned no json object; filing nothing")
+        return None
+    try:
+        v = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        log.warning("extractor json did not parse; filing nothing")
+        return None
+    if not isinstance(v, dict) or v.get("skip") or not str(v.get("body", "")).strip():
+        return None
+    return {"date": str(v.get("date", ""))[:10],
+            "title": str(v.get("title") or item["subject"])[:80],
+            "body": str(v["body"])[:2000]}
+
+
+def ingest_facts(project_store, state, *, host, user, password, limit=25,
+                 binary="claude", model="haiku", env=None, cwd="",
+                 fetch=fetch_label) -> dict:
+    """One pass over every project's Gmail label, filing facts, not tasks.
+
+    A labelled confirmation is not something you have to act on -- it is
+    something the project should know. It belongs in the project's files, and
+    putting it on the board would mean clicking to dismiss a fact.
+    """
+    filed, scanned = [], 0
+    for slug, label, home in project_store.mail_targets():
+        per = state.setdefault(label, {})
+        since = int(per.get("uid", 0) or 0)
+        seen = set(per.get("seen") or [])
+        try:
+            items, high = fetch(host, user, password, label, since, limit)
+        except Exception:
+            log.exception("gmail label %s failed", label)
+            continue
+        fresh = [it for it in items if it["id"] not in seen]
+        scanned += len(fresh)
+        for it in fresh:
+            fact = extract(it, binary=binary, model=model, env=env or {}, cwd=cwd)
+            if not fact:
+                continue
+            body = fact["body"]
+            for name, data in it.get("attachments") or []:
+                # Sanitised again here, not only on the way in: a filename
+                # arrives from outside, and this one becomes a real path.
+                path = home / ATTACH_DIR / f"{it['uid']}-{_safe_name(name)}"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                body += f"\n- Attachment: `{ATTACH_DIR}/{path.name}`"
+            heading = " -- ".join(x for x in (fact["date"], fact["title"]) if x)
+            project_store.add_fact(slug, heading, body,
+                                   source=f"from {it['from']}, {it['date']}")
+            filed.append({"project": slug, "title": fact["title"]})
+        per["uid"] = max(since, high)
+        per["seen"] = (list(seen) + [it["id"] for it in fresh])[-500:]
+    log.info("mail facts: %d scanned, %d filed", scanned, len(filed))
+    return {"scanned": scanned, "filed": len(filed), "facts": filed}
 
 
 def _render(items: list[dict]) -> str:

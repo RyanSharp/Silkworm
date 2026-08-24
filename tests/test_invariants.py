@@ -575,6 +575,7 @@ def test_email_ingest():
 
     r2 = E.ingest(store, state, host="h", user="u", password="p", fetch=fetch)
     check("a second pass proposes nothing", r2["proposed"] == 0)
+
     state["uid"] = 0
     r3 = E.ingest(store, state, host="h", user="u", password="p", fetch=fetch)
     check("a reset watermark still does not re-propose", r3["proposed"] == 0)
@@ -582,6 +583,104 @@ def test_email_ingest():
     bot = (BASE / "bot.py").read_text()
     check("watching is off unless credentials are set",
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
+
+
+# --- labelled mail is a fact about a project, not a task ---------------------
+# A booking confirmation needs nothing from you. Putting it on the board would
+# mean clicking to dismiss something true; it belongs in the project's files.
+
+def test_mail_facts():
+    import types
+    import email_ingest as E
+    import projects
+    print("\nlabelled mail becomes project facts")
+
+    src = (BASE / "email_ingest.py").read_text()
+    check("labelled mail is read whether or not it is unread",
+          "(ALL)" in src and "UNSEEN" not in src[src.index("def fetch_label"):],
+          "you label mail you have already opened")
+    check("label mailboxes are quoted for IMAP", "_mbox(label)" in src,
+          "an unquoted 'Asia Trip' selects nothing")
+    check("labelled mail still never marks anything read",
+          "readonly=True" in src[src.index("def fetch_label"):])
+
+    root = Path(tempfile.mkdtemp())
+    projects.PROJECT_ROOT = root
+    ps = projects.ProjectStore(root / "p.json")
+    ps.ensure("Asia Trip")
+    ps.ensure("Trader", scope={"cwd": "/w/trader", "repo": "github.com/x/trader"})
+    ps.ensure("Old Trip"); ps.set_archived("old-trip", True)
+
+    check("a project's label defaults to its title, needing no setup",
+          ps.label_for("asia-trip") == "Asia Trip")
+    ps.ensure("Asia Trip", mail_label="Travel/Asia")
+    check("a differently-named label can be pointed at",
+          ps.label_for("asia-trip") == "Travel/Asia")
+    targets = {s for s, _, _ in ps.mail_targets()}
+    check("repo-backed projects are not mail targets", "trader" not in targets,
+          "their files are the user's; we do not write there")
+    check("archived projects are not mail targets", "old-trip" not in targets)
+
+    mail = [{"uid": 7, "id": "f1", "from": "Air Canada", "subject": "Your itinerary",
+             "date": "Tue, 3 Feb 2026", "snippet": "AC123 YYZ-NRT ...",
+             "attachments": [("boarding pass.pdf", b"%PDF-1.4 stub")]},
+            {"uid": 8, "id": "f2", "from": "Mum", "subject": "have fun!",
+             "date": "", "snippet": "so excited for you", "attachments": []}]
+    fetch = lambda h, u, p, label, since, lim: (         # noqa: E731
+        [m for m in mail if m["uid"] > since][:lim],
+        max([m["uid"] for m in mail] + [since]))
+
+    def stub(out):
+        E.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: types.SimpleNamespace(stdout=out))
+
+    for name, out in (("no json object", "seems like a flight"),
+                      ("malformed json", "{oops}"),
+                      ("no body", '{"skip": false, "title": "x", "body": ""}')):
+        stub(out)
+        check(f"extraction fails closed on {name}",
+              E.extract(mail[0], binary="c", model="m", env={}) is None,
+              "a garbled entry in a reference file is worse than a missing one")
+
+    stub('{"skip": true}')
+    check("ordinary correspondence files nothing",
+          E.extract(mail[1], binary="c", model="m", env={}) is None)
+
+    stub('{"skip": false, "date": "2026-04-14", "title": "Flight AC123 YYZ-NRT",'
+         ' "body": "- Depart 09:15\\n- Confirmation XR4K2P"}')
+    state = {}
+    r = E.ingest_facts(ps, state, host="h", user="u", password="p", fetch=fetch)
+    check("facts are filed against the labelled project",
+          r["filed"] == 2 and all(f["project"] == "asia-trip" for f in r["facts"]))
+
+    log = (ps.home("asia-trip") / projects.LOGISTICS).read_text()
+    check("the fact lands in logistics.md, not the brief",
+          "Confirmation XR4K2P" in log)
+    check("it is dated by when it happens", "## 2026-04-14" in log)
+    check("the source is recorded", "Air Canada" in log)
+    att = ps.home("asia-trip") / E.ATTACH_DIR / "7-boarding-pass.pdf"
+    check("attachments are saved into the project", att.exists())
+    check("and referenced from the entry", "7-boarding-pass.pdf" in log)
+
+    brief = (ps.home("asia-trip") / "CLAUDE.md").read_text()
+    check("CLAUDE.md points at the logistics file", projects.POINTER in brief)
+    ps.set_brief("asia-trip", "Kyoto over Osaka.")
+    brief = (ps.home("asia-trip") / "CLAUDE.md").read_text()
+    check("a brief rewrite cannot lose the pointer",
+          projects.POINTER in brief and "Kyoto over Osaka." in brief,
+          "the brief is rewritten wholesale after every task")
+    check("the pointer is not fed back into the next rewrite",
+          projects.POINTER not in ps.brief_for("asia-trip"))
+
+    r2 = E.ingest_facts(ps, state, host="h", user="u", password="p", fetch=fetch)
+    check("a second pass files nothing twice", r2["filed"] == 0)
+
+    bot = (BASE / "bot.py").read_text()
+    check("labelled mail files facts, never tasks",
+          "ingest_facts(\n            project_store" in bot
+          or "ingest_facts(" in bot and "task_store, state, mailbox=" in bot)
+    check("inbox triage is opt-in", 'os.environ.get("GMAIL_TRIAGE"' in bot,
+          "you already read your inbox; re-surfacing it duplicates your own work")
 
 
 # --- projects -----------------------------------------------------------------
@@ -934,7 +1033,7 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_email_ingest, test_projects,
+              test_review_gate, test_email_ingest, test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):
         try:

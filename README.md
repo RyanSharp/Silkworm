@@ -281,23 +281,47 @@ an ordinary file you can edit or put in git.
 Repo-backed projects are left alone — they already have learnings and a
 `CLAUDE.md` of your own.
 
-## Watching your inbox
+## Mail
 
-Silkworm can watch Gmail and **propose** tasks for mail that looks like it
-needs you — a question, a deadline, a bill, an account problem. Set
-`GMAIL_USER` and `GMAIL_APP_PASSWORD` in `.env` (an
+Set `GMAIL_USER` and `GMAIL_APP_PASSWORD` in `.env` (an
 [app password](https://myaccount.google.com/apppasswords), not your account
-password) and it polls every `GMAIL_POLL_MIN` minutes. `silkworm email` runs a
-pass on demand.
+password) and Silkworm polls every `GMAIL_POLL_MIN` minutes. `silkworm email`
+runs a pass on demand.
 
-It is **read-only**: the mailbox is opened readonly and bodies are fetched with
-`BODY.PEEK`, so nothing is ever marked read, moved or deleted. Only sender,
-subject, date and a ~400 character snippet go to the triage model; full bodies
-stay on the machine.
+It is **read-only**: mailboxes are opened readonly and bodies fetched with
+`BODY.PEEK`, so nothing is ever marked read, moved or deleted.
 
-Everything it finds arrives as **`proposed`**, never queued, so a mediocre
-triage costs you an accept/dismiss rather than unwanted work. Triage fails
-closed — unreadable output flags nothing rather than everything.
+### Labelled mail becomes project facts
+
+Label a message in Gmail with the name of one of your projects and Silkworm
+reads it for **durable facts** — flights, hotels, reservations, tickets,
+appointments, confirmation numbers — and appends them to that project's
+`logistics.md`, saving any attachments alongside. The project's `CLAUDE.md`
+points at the file, so a task working on that project has it available without
+carrying an itinerary in every prompt.
+
+The label does two jobs at once: it says *look at this* and it says *this
+belongs to that project*. There is no classifier to tune and no guessing about
+which project a message is for, which is why there is no junk problem — you
+only see what you labelled.
+
+    !project asia-trip        file this thread under a project
+    !project mail Travel/Asia  draw from a differently-named label
+
+The label defaults to the project's title, so a label you already keep needs no
+setup. Only projects with a Silkworm-owned directory take part; a repo-backed
+project's files are yours. Extraction fails closed, and ordinary correspondence
+files nothing — a booking is never turned into a task, because a confirmed
+flight asks nothing of you.
+
+### Inbox triage (opt-in)
+
+`GMAIL_TRIAGE=1` additionally watches `GMAIL_MAILBOX` and **proposes** tasks for
+mail that looks like it needs you. Off by default: you already read your inbox,
+so re-surfacing it mostly duplicates work you do anyway. Only sender, subject,
+date and a ~400 character snippet go to the model. Everything it finds arrives
+as **`proposed`**, never queued, so a mediocre guess costs an accept/dismiss
+rather than unwanted work.
 
 ## Moving a thread to the terminal
 
