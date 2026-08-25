@@ -194,6 +194,10 @@ def test_recovery():
     recovery._claude_alive = lambda sid: True   # still running -> early continue
     recovery.recover(store, finalize=lambda *a: None, reactions_for=lambda *a: RX(),
                      say=lambda *a: None, wait_s=0)
+    src_r = (BASE / "recovery.py").read_text()
+    check("a sweep does not warn about a healthy turn in progress",
+          "if wait_s:" in src_r and "log.debug" in src_r,
+          "it visits every marker every two minutes; warnings would bury real ones")
     check("a still-running thread releases its claim too",
           "C:6" not in recovery._inflight,
           "a leaked claim locks that thread out of every future pass")

@@ -150,8 +150,9 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S,
             channel, _, thread_ts = key.partition(":")
             sid = pending.get("session_id") or entry.get("session_id") or ""
             started = pending.get("started", "")
-            log.info("recovering interrupted turn on %s (session=%s)", key, sid[:8] or "?")
-
+            # Logged only once something is actually resolved: the periodic
+            # sweep visits every pending marker, and announcing each visit
+            # would bury the passes that did something.
             try:
                 text = _await_reply(sid, started, wait_s)
             except Exception:
@@ -161,10 +162,16 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S,
                 # Genuinely mid-turn after a long wait: the ⏳ is accurate, so leave
                 # the marker in place for the next start rather than guessing. No
                 # event -- nothing happened to it, and it would repeat every restart.
-                log.warning("gave up waiting on %s — turn still running, left pending", key)
+                # Only a wait that actually elapsed is worth a warning; a sweep
+                # (wait_s=0) merely observed a healthy turn still in progress.
+                if wait_s:
+                    log.warning("gave up waiting on %s — turn still running, left pending", key)
+                else:
+                    log.debug("%s still running, left pending", key)
                 stats["still_running"] += 1
                 continue
 
+            log.info("recovering interrupted turn on %s (session=%s)", key, sid[:8] or "?")
             rx = reactions_for(channel, thread_ts, pending.get("msg_ts"))
             note = ("_:leftwards_arrow_with_hook: Recovered after a restart — "
                     "this reply was produced but never delivered._")
