@@ -585,6 +585,78 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+# --- a running bot is not a connected bot -------------------------------------
+# On 2026-08-24 the socket-mode link broke at 22:26 and spun in a reconnect loop
+# for seventeen hours. The process never exited, so launchd's KeepAlive saw a
+# healthy service and `silkworm status` reported the bot reachable the whole
+# time -- it probes the local HTTP server, which was genuinely fine.
+
+def test_slack_health():
+    import slack_health as H
+    print("\nslack link health")
+
+    h = H.Health(window=10, min_fraction=0.5)
+    for i in range(9):
+        check_none = h.sample(False, i)
+    check("a partial window cannot condemn the link", check_none is None,
+          "startup is not an outage")
+    check("and the link is not called unhealthy yet", h.healthy())
+
+    # The real failure mode: a session really is established every few seconds,
+    # so an occasional sample honestly reports "connected".
+    h = H.Health(window=10, min_fraction=0.5)
+    flapping = [False, False, False, False, True, False, False, False, False, False]
+    actions = [h.sample(c, i) for i, c in enumerate(flapping)]
+    check("a flapping link is judged down despite connecting sometimes",
+          actions[-1] == H.REPAIR, f"got {actions[-1]}")
+    check("one lucky sample would have said connected", any(flapping))
+
+    # Escalation: repair first, restart only if the new connection is bad too.
+    for i, c in enumerate(flapping):
+        action = h.sample(c, 100 + i)
+    check("a second bad window escalates to a restart", action == H.RESTART)
+
+    h = H.Health(window=10, min_fraction=0.5)
+    for i, c in enumerate(flapping):
+        h.sample(c, i)                       # -> REPAIR, window cleared
+    for i in range(10):
+        action = h.sample(True, 100 + i)
+    check("a recovered link is not restarted", action is None)
+    # The window rolls rather than resetting, so the verdict lands part-way
+    # through the next bad stretch -- sooner than waiting out a fresh window.
+    again = [h.sample(c, 200 + i) for i, c in enumerate(flapping)]
+    check("and a good window forgives the earlier repair",
+          H.REPAIR in again and H.RESTART not in again,
+          f"otherwise one blip arms a restart forever; got {again}")
+
+    h = H.Health(window=10, min_fraction=0.5)
+    for i in range(10):
+        action = h.sample(True, i)
+    check("a healthy link asks for nothing", action is None)
+    check("a healthy link reports fully connected", h.fraction() == 1.0)
+    check("status names how long it has been down",
+          H.Health().status(0.0)["down_for"] == 0.0)
+
+    bot = (BASE / "bot.py").read_text()
+    check("the handler is kept, not fired and forgotten",
+          "slack_handler = SocketModeHandler(" in bot,
+          "nothing could check a connection nobody held a reference to")
+    check("a restart verdict actually exits so KeepAlive can act",
+          "os._exit(1)" in bot[bot.index("def _slack_watchdog"):])
+    check("/status reports the link, not just the HTTP server",
+          '"slack": slack.status(' in bot)
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("silkworm status checks the link too", '"connected to slack"' in cli,
+          "it reported the bot reachable throughout the outage")
+    viz = (BASE / "visualizer.py").read_text()
+    check("the dashboard passes the link to its alert bar",
+          "renderAlerts(data.sessions, data.slack)" in viz,
+          "during an outage the dashboard is the thing still working")
+    check("and only alerts on a full sampling window",
+          "slack.ready && !slack.connected" in viz,
+          "a bot that just started is not a bot that is down")
+
+
 # --- a missing cwd must not be reported as a missing binary -------------------
 # Popen raises FileNotFoundError for either. Blaming the binary unconditionally
 # sent a real diagnosis looking for a PATH problem that did not exist.
@@ -1087,7 +1159,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named,
+              test_missing_cwd_is_named, test_slack_health,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):

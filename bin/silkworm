@@ -240,6 +240,13 @@ def do_status() -> None:
     bot = bot_call("/status", {}, timeout=2)
     check(f"bot reachable on :{bot_port()}", bool(bot.get("online")),
           "silkworm logs may say why")
+    # A reachable bot is not a connected one: the local server answered fine
+    # through a seventeen-hour Slack outage.
+    link = bot.get("slack") or {}
+    if bot.get("online"):
+        down = link.get("down_for") or 0
+        check("connected to slack", bool(link.get("connected")),
+              f"down for {int(down // 60)}m — it should self-restart; silkworm logs")
     check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
     check("session hooks installed", hooks_installed())
     threads = bot.get("threads", {})

@@ -219,3 +219,33 @@ system. In that order, because a queue nobody looks at is worse than no queue.
   for — while adding a second persistence layer that does not know about the
   session transcripts recovery already reads. Worth stealing as patterns:
   explicit state schema, checkpoint per step, interrupt/resume, dynamic fan-out.
+
+## Liveness is not connectivity
+
+The bot is a process *and* a socket, and only the process was ever watched.
+launchd's `KeepAlive` restarts what exits; the local HTTP server answers
+whether or not Slack can reach us. On 2026-08-24 the socket-mode link broke at
+22:26, slack_sdk reconnected, each fresh session broke immediately, and the
+loop ran for seventeen hours. Every health signal in the system said fine. The
+only symptom was silence, and a person eventually restarted it by hand.
+
+So the link is now sampled directly (`slack_health.py`). Sampling once is not
+enough — in that loop a session really is established every few seconds, so a
+well-timed sample honestly reports "connected". Health is a **fraction over a
+five minute window**: a link up two percent of the time is down.
+
+The remedy is deliberately blunt. Repairing slack_sdk's internal state from
+outside is guesswork, and a restart is what actually worked when a person did
+it; turns interrupted by one are already rescued by `recovery.py`. A bad window
+asks for a reconnect, and a second bad window after that exits so `KeepAlive`
+brings the process back with a clean client. The repair runs in its own thread,
+because a `connect()` that blocks must not stall the sampler whose job is to
+escalate when the repair does not take.
+
+Both `silkworm status` and the dashboard now report the link separately from
+the server, since "reachable" was true throughout the outage.
+
+**Known limit:** this catches a link that visibly drops, not a half-open socket
+that stays `is_connected()` while delivering nothing. A second signal (age of
+the last received event) would catch that, but on an idle workspace it is
+indistinguishable from quiet, so it is not worth the false alarms yet.

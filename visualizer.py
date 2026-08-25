@@ -161,7 +161,10 @@ def load_sessions() -> dict:
             "has_transcript": find_transcript(sid) is not None,
         })
     out.sort(key=lambda s: -s["updated"])
-    return {"bot_online": bool(status.get("online")), "sessions": out}
+    # bot_online only says the local server answered; it stayed true through a
+    # seventeen-hour Slack outage. The link is a separate fact.
+    return {"bot_online": bool(status.get("online")), "sessions": out,
+            "slack": status.get("slack") or {}}
 
 
 def find_transcript(session_id: str) -> Path | None:
@@ -862,7 +865,7 @@ async function loadList() {
   const data = await (await fetch("/api/sessions")).json();
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
-  renderAlerts(data.sessions);
+  renderAlerts(data.sessions, data.slack);
   refreshTaskBadge();
   const nav = document.getElementById("list");
   nav.innerHTML = "";
@@ -1029,12 +1032,16 @@ async function learnCall(payload) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
 }
-function renderAlerts(sessions) {
+function renderAlerts(sessions, slack) {
   const bar = document.getElementById("alertbar");
   const stalled = sessions.filter(s => s.turn && s.turn.stalled);
   const pricey = sessions.filter(s => s.cost_flag);
-  if (!stalled.length && !pricey.length) { bar.innerHTML = ""; return; }
+  // Only trust a full sampling window; a bot that just started is not down.
+  const down = slack && slack.ready && !slack.connected;
+  if (!stalled.length && !pricey.length && !down) { bar.innerHTML = ""; return; }
   const parts = [];
+  if (down) parts.push(`<span class="alert bad">⚠ not connected to Slack${
+    slack.down_for ? " · " + dur(slack.down_for) : ""} — restarting itself</span>`);
   if (stalled.length) parts.push(
     `<span class="alert bad">⚠ ${stalled.length} thread${stalled.length>1?"s":""} stalled</span>` +
     stalled.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${

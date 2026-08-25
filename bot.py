@@ -33,6 +33,7 @@ import harvester
 import learnings_git
 import repos
 import roles
+import slack_health
 import tasks
 import procs
 import projects
@@ -137,6 +138,9 @@ UPLOADS_ROOT.mkdir(exist_ok=True)
 store = SessionStore(BASE_DIR / "sessions.json")
 task_store = tasks.TaskStore(BASE_DIR / "tasks.json")
 project_store = projects.ProjectStore(BASE_DIR / "projects.json")
+# Created here, not beside its watchdog: /status reads it and the local server
+# starts long before the watchdog thread does.
+slack = slack_health.Health()
 # LEARNINGS_FILE can point at a file inside a git repo to share across machines.
 LEARNINGS_FILE = Path(os.environ.get("LEARNINGS_FILE", BASE_DIR / "learnings.json")).expanduser()
 LEARNINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -871,7 +875,10 @@ def handle_status(payload: dict) -> dict:
             "checked_out": bool(entry.get("checked_out")),
             "terminal_live": bool(entry.get("terminal_live")),
         }
-    return {"online": True, "threads": threads}
+    # "online" only ever meant "this HTTP server answered", which stayed true
+    # through a seventeen-hour Slack outage. Report the link separately.
+    return {"online": True, "threads": threads,
+            "slack": slack.status(time.time())}
 
 
 def handle_web_message(payload: dict) -> dict:
@@ -1759,6 +1766,43 @@ def _email_watcher() -> None:
         time.sleep(max(GMAIL_POLL_MIN, 5) * 60)
 
 
+# --- is Slack actually connected? ---------------------------------------------
+
+def _slack_repair(client) -> None:
+    try:
+        client.disconnect()
+        client.connect()
+    except Exception:
+        log.exception("slack reconnect failed")
+
+
+def _slack_watchdog(handler) -> None:
+    """Restart the process when the socket-mode link stays down.
+
+    The process staying alive is not evidence that Slack can reach it: a
+    websocket that breaks and re-breaks leaves a running bot nobody can talk
+    to, which launchd's KeepAlive cannot see and the local HTTP server does not
+    reflect. Interrupted turns are rescued by recovery.py on the way back up,
+    so exiting is cheaper than the silence it replaces.
+    """
+    client = handler.client
+    while True:
+        time.sleep(slack_health.INTERVAL_S)
+        try:
+            action = slack.sample(bool(client.is_connected()), time.time())
+        except Exception:
+            log.exception("slack health check failed")
+            continue
+        if action == slack_health.REPAIR:
+            # In its own thread: connect() can block, and a blocked repair must
+            # not stall the sampler whose job is to escalate when it does not
+            # take. That would reproduce the unbounded wait being fixed here.
+            threading.Thread(target=_slack_repair, args=(client,), daemon=True,
+                             name="slack-repair").start()
+        elif action == slack_health.RESTART:
+            os._exit(1)          # KeepAlive brings us back with a clean client
+
+
 def _task_runner() -> None:
     """Execute tasks nobody else is driving, one at a time.
 
@@ -1930,4 +1974,7 @@ if __name__ == "__main__":
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))
-    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+    slack_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+    threading.Thread(target=_slack_watchdog, args=(slack_handler,),
+                     daemon=True, name="slack-health").start()
+    slack_handler.start()
