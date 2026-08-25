@@ -249,3 +249,30 @@ the server, since "reachable" was true throughout the outage.
 that stays `is_connected()` while delivering nothing. A second signal (age of
 the last received event) would catch that, but on an idle workspace it is
 indistinguishable from quiet, so it is not worth the false alarms yet.
+
+## Coming back is more than reconnecting
+
+Socket Mode does not queue. A message sent while the link is down is not
+redelivered when it returns — it is gone, and nothing records that it existed.
+The 2026-08-24 outage swallowed five messages that way; four were noticed and
+re-typed by hand, one was never answered.
+
+So on startup, and after any reconnect, each known thread is re-read from the
+Web API — which has the history the socket does not — and anything past the
+thread's `last_msg_ts` goes through the ordinary prompt path. Replay needs no
+new idempotency: that path already refuses anything at or behind the
+watermark. Bounded on purpose — a thread with no watermark is skipped, because
+"everything ever said" is not a backlog, and messages older than a few days
+have been re-asked or stopped mattering.
+
+Recovery also had to stop being a single startup pass. A turn still running
+when that pass fired was left pending by design — only a finished child gives
+a trustworthy reply — but nothing ever came back for it, so restarting during
+a long turn silently swallowed the answer. It now keeps sweeping, with
+`wait_s=0` so it only collects children that have already exited, skipping
+turns this process is running: their marker belongs to a live handler, and
+posting it here would deliver the reply twice.
+
+That sweep can rescue a turn a restart already recorded as failed, so
+`failed → done` is now a legal transition. Leaving a delivered answer filed
+under "needs you" is the noise that stops the board being trusted.

@@ -149,6 +149,40 @@ def test_recovery():
                      on_outcome=lambda k, ok: outcomes.append((k, ok)))
     check("recovery reports an empty turn as failure", outcomes == [("C:3", False)])
 
+    # A turn this process is running has a live handler that will clear its own
+    # marker; sweeping it here would post the reply a second time.
+    tp.write_text("\n".join([entry("2026-08-01T12:01:00.000Z", "FINAL REPLY")]) + "\n")
+    calls = []
+    store.update("C:4", session_id="s", pending=dict(pend))
+    st = recovery.recover(store, finalize=lambda *a: calls.append(a[3]),
+                          reactions_for=lambda *a: RX(), say=lambda *a: None,
+                          wait_s=0, skip={"C:4"})
+    import tasks as _T
+    check("a late rescue can correct a failure it already recorded",
+          _T.DONE in _T.TRANSITIONS[_T.FAILED],
+          "a restart marks the turn failed; the sweep then delivers its reply")
+    check("a failed task can still be retried or dropped",
+          _T.QUEUED in _T.TRANSITIONS[_T.FAILED] and _T.CANCELLED in _T.TRANSITIONS[_T.FAILED])
+    check("done is still terminal", _T.TRANSITIONS[_T.DONE] == ())
+    check("a turn this process is running is never swept",
+          not calls and st["recovered"] == 0)
+    check("and its marker is left for its own handler",
+          bool(store.get("C:4").get("pending")))
+
+    # The startup pass leaves a still-running turn pending on purpose, so
+    # something must come back for it -- otherwise restarting during a long
+    # turn swallows the answer, which is exactly what happened.
+    src = (BASE / "bot.py").read_text()
+    rec = src[src.index("def _recoverer"):src.index("def reap_runaways")]
+    check("recovery keeps sweeping after the startup pass", "while True:" in rec,
+          "one shot leaves a long turn's reply undelivered forever")
+    check("the sweep never waits on a live child", "wait_s=0" in rec,
+          "only a finished child gives a trustworthy reply")
+    check("the sweep skips this process's own turns", "skip=set(RUNNING)" in rec)
+    check("the orphaned-task closeout stays one-shot",
+          rec.index("interrupted by a restart") < rec.index("while True:"),
+          "running it on a loop would fail live turns")
+
 
 # --- process lookup must not be fooled ---------------------------------------
 # pgrep could not see these processes at all; a naive substring match on ps
@@ -583,6 +617,88 @@ def test_email_ingest():
     bot = (BASE / "bot.py").read_text()
     check("watching is off unless credentials are set",
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
+
+
+# --- messages sent while the link was down --------------------------------------
+# Socket Mode does not queue. During the 2026-08-24 outage five messages were
+# sent and none were delivered; four were noticed and re-typed by hand, and
+# "is this working?" was never answered at all.
+
+def test_backfill():
+    import backfill as B
+    print("\nreplaying messages Slack never delivered")
+
+    # Timestamps sit inside the age window, as a real outage's would; the ~17
+    # hour gap on 2026-08-24 is well within it.
+    now = 1_787_700_000.0
+    mark = now - 17 * 3600
+    at = lambda offset: f"{mark + offset:.6f}"          # noqa: E731
+    entries = {"C:100": {"last_msg_ts": at(0)}, "C:200": {}}
+    msgs = {
+        ("C", "100"): [
+            {"ts": at(0), "user": "U1", "text": "already answered"},
+            {"ts": at(50), "user": "U1", "text": "is this working?"},
+            {"ts": at(60), "user": "BOT", "text": "my own reply"},
+            {"ts": at(70), "bot_id": "B1", "text": "another app"},
+            {"ts": at(80), "user": "U1", "subtype": "channel_join", "text": "joined"},
+            {"ts": at(90), "user": "U1", "subtype": "file_share", "text": "screenshot",
+             "files": [{"id": "F1"}]},
+        ],
+        ("C", "200"): [{"ts": at(50), "user": "U1", "text": "no watermark here"}],
+    }
+    got = B.missed(entries, replies=lambda c, t: msgs[(c, t)], bot_user_id="BOT",
+                   handled_subtypes={"file_share"}, now=now)
+    texts = [e["text"] for e in got]
+    check("a message past the watermark is replayed", "is this working?" in texts,
+          "the one that was never answered")
+    check("a message at the watermark is not", "already answered" not in texts)
+    check("our own reply is not replayed", "my own reply" not in texts)
+    check("another app's message is not", "another app" not in texts)
+    check("channel noise is not", "joined" not in texts)
+    check("an upload is", "screenshot" in texts)
+    check("its files come with it", got[-1]["files"] == [{"id": "F1"}])
+    check("a thread with no watermark is skipped", "no watermark here" not in texts,
+          "everything ever said is not a backlog")
+    check("replayed oldest first",
+          [e["ts"] for e in got] == [at(50), at(90)])
+    check("the event looks like a real DM",
+          got[0]["channel"] == "C" and got[0]["thread_ts"] == "100"
+          and got[0]["channel_type"] == "im")
+    check("the 17 hour outage is inside the replay window",
+          17 * 3600 < B.MAX_AGE_S)
+
+    old = {"C:1": {"last_msg_ts": str(now - 7200)}}
+    stale = {("C", "1"): [{"ts": str(now - B.MAX_AGE_S - 1), "user": "U1", "text": "last week"}]}
+    check("a message older than the window is left alone",
+          B.missed(old, replies=lambda c, t: stale[(c, t)], bot_user_id="B",
+                   handled_subtypes=set(), now=now) == [],
+          "it was re-asked or stopped mattering")
+
+    many = {("C", "1"): [{"ts": str(now - 60 + i), "user": "U1", "text": f"m{i}"}
+                         for i in range(9)]}
+    capped = B.missed(old, replies=lambda c, t: many[(c, t)], bot_user_id="B",
+                      handled_subtypes=set(), now=now, max_per_thread=3)
+    check("a chatty gap is capped", len(capped) == 3)
+    check("and the newest are kept", [e["text"] for e in capped] == ["m6", "m7", "m8"])
+    src = (BASE / "backfill.py").read_text()
+    check("a dropped message is logged, not silently forgotten",
+          "log.warning" in src and "skipping" in src)
+
+    check("a thread Slack cannot return is skipped, not fatal",
+          B.missed(old, replies=lambda c, t: (_ for _ in ()).throw(RuntimeError("nope")),
+                   bot_user_id="B", handled_subtypes=set(), now=now) == [])
+
+    bot = (BASE / "bot.py").read_text()
+    check("backfill goes through the ordinary prompt path",
+          "handle_prompt(event, say, app.client)" in
+          bot[bot.index("def run_backfill"):bot.index("def _backfiller")],
+          "which already refuses redeliveries")
+    check("replayed events are not marked _web",
+          '"_web"' not in bot[bot.index("def run_backfill"):bot.index("def _backfiller")],
+          "_web skips the redelivery guard this relies on")
+    check("a reconnect also backfills",
+          "run_backfill()" in bot[bot.index("def _slack_repair"):bot.index("def _slack_watchdog")],
+          "the socket does not queue during the gap either")
 
 
 # --- a running bot is not a connected bot -------------------------------------
@@ -1159,7 +1275,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health,
+              test_missing_cwd_is_named, test_slack_health, test_backfill,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):

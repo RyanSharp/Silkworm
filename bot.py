@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import backfill
 import email_ingest
 import harvester
 import learnings_git
@@ -1774,6 +1775,13 @@ def _slack_repair(client) -> None:
         client.connect()
     except Exception:
         log.exception("slack reconnect failed")
+        return
+    # Whatever arrived during the gap was never delivered; the socket does not
+    # queue. Reconnecting is only half of coming back.
+    try:
+        run_backfill()
+    except Exception:
+        log.exception("backfill after reconnect failed")
 
 
 def _slack_watchdog(handler) -> None:
@@ -1803,6 +1811,47 @@ def _slack_watchdog(handler) -> None:
             os._exit(1)          # KeepAlive brings us back with a clean client
 
 
+def run_backfill() -> dict:
+    """Replay messages Slack could not deliver while we were disconnected.
+
+    Socket Mode does not queue: a message sent while the link is down is gone,
+    and nothing records that it existed. The Web API still has the thread, so
+    read it back and hand anything past the watermark to the ordinary path,
+    which already refuses redeliveries.
+    """
+    def replies(channel, thread_ts):
+        r = app.client.conversations_replies(channel=channel, ts=thread_ts, limit=100)
+        return r.get("messages", [])
+
+    events = backfill.missed(store.all(), replies=replies,
+                             bot_user_id=BOT_USER_ID,
+                             handled_subtypes=HANDLED_SUBTYPES)
+    for event in events:
+        key = f"{event['channel']}:{event['thread_ts']}"
+        log.info("backfilling missed message %s on %s", event["ts"], key)
+
+        def say(text, thread_ts=event["thread_ts"], **kwargs):
+            app.client.chat_postMessage(channel=event["channel"],
+                                        thread_ts=thread_ts, text=text, **kwargs)
+        try:
+            handle_prompt(event, say, app.client)
+        except Exception:
+            log.exception("backfill failed for %s", key)
+    if events:
+        log.info("backfill: replayed %d missed message(s)", len(events))
+    return {"ok": True, "replayed": len(events)}
+
+
+def _backfiller() -> None:
+    # After recovery, so a turn that was already in flight finishes delivering
+    # before anything new is replayed into the same thread.
+    time.sleep(20)
+    try:
+        run_backfill()
+    except Exception:
+        log.exception("backfill pass failed")
+
+
 def _task_runner() -> None:
     """Execute tasks nobody else is driving, one at a time.
 
@@ -1828,8 +1877,18 @@ def _task_runner() -> None:
         time.sleep(TASK_POLL_S)
 
 
-def run_recovery() -> dict:
-    """Finish turns the previous process was running when it went away."""
+#: How often to re-check for orphaned turns after the startup pass.
+RECOVERY_SWEEP_S = 120
+
+
+def run_recovery(wait_s: int | None = None, skip=None) -> dict:
+    """Finish turns no live handler is driving any more.
+
+    Runs at startup and then periodically. The startup pass alone is not
+    enough: a turn still running when it fires is left pending, and nothing
+    later would ever deliver its reply -- so restarting during a long turn
+    silently swallowed the answer.
+    """
     def finalize(channel: str, thread_ts: str, ts: str, text: str) -> None:
         parts = chunk(to_mrkdwn(text))
         app.client.chat_update(channel=channel, ts=ts, text=parts[0])
@@ -1853,8 +1912,9 @@ def run_recovery() -> dict:
                        "recovered after a restart" if recovered
                        else "interrupted, produced no reply")
 
+    kwargs = {} if wait_s is None else {"wait_s": wait_s}
     return recovery.recover(store, finalize=finalize, reactions_for=reactions_for,
-                            say=say, on_outcome=on_outcome)
+                            say=say, on_outcome=on_outcome, skip=skip, **kwargs)
 
 
 def inline_task_for(key: str) -> str | None:
@@ -1882,6 +1942,21 @@ def _recoverer() -> None:
                 task_state(tid, tasks.FAILED, "interrupted by a restart")
     except Exception:
         log.exception("closing out orphaned inline tasks failed")
+
+    # Keep sweeping. A turn that was still running during the startup pass is
+    # left pending by design -- only a finished child gives a trustworthy
+    # reply -- and without this nothing would ever come back for it. wait_s=0
+    # so the sweep only ever collects children that have already exited, and
+    # turns this process is running are skipped: their marker belongs to a live
+    # handler and posting it here would deliver the reply twice.
+    while True:
+        time.sleep(RECOVERY_SWEEP_S)
+        try:
+            stats = run_recovery(wait_s=0, skip=set(RUNNING))
+            if stats.get("recovered") or stats.get("interrupted"):
+                log.info("recovery sweep: %s", stats)
+        except Exception:
+            log.exception("recovery sweep failed")
 
 
 def reap_runaways(max_age_s: float) -> int:
@@ -1968,6 +2043,7 @@ if __name__ == "__main__":
     threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+    threading.Thread(target=_backfiller, daemon=True, name="backfill").start()
     threading.Thread(target=_task_runner, daemon=True, name="task-runner").start()
     threading.Thread(target=_email_watcher, daemon=True, name="email").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()

@@ -56,7 +56,11 @@ TRANSITIONS: dict[str, tuple] = {
     # DONE/AWAITING_APPROVAL: a task blocked on its review is resolved by the
     # reviewer's verdict, not by going round the queue again.
     BLOCKED:           (QUEUED, DONE, AWAITING_APPROVAL, CANCELLED, FAILED),
-    FAILED:            (QUEUED, CANCELLED),        # retry
+    # DONE because recovery can arrive after the failure was recorded: a
+    # restart marks an in-flight turn failed, and a later sweep finds the
+    # child finished and delivers its reply. Refusing that leaves a false
+    # failure on the board, which is the noise that stops it being trusted.
+    FAILED:            (QUEUED, CANCELLED, DONE),   # retry, or a late rescue
     DONE:              (),
     CANCELLED:         (),
 }

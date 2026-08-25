@@ -107,19 +107,21 @@ def _await_reply(session_id: str, since_iso: str, wait_s: int):
 
 
 def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S,
-            on_outcome=None) -> dict:
+            on_outcome=None, skip=None) -> dict:
     """Resolve every pending turn left behind by the previous process.
 
     `finalize(channel, thread_ts, ts, text)` edits the frozen placeholder
     message, `reactions_for(channel, thread_ts, msg_ts)` builds a
     ThreadReactions, and `say(channel, thread_ts, text)` posts a fresh message.
     `on_outcome(key, recovered)` is told how each thread ended, so a caller can
-    resolve whatever else it tracks about that turn.
+    resolve whatever else it tracks about that turn. `skip` is the set of keys
+    this process is itself running: their pending markers belong to a live
+    handler that will clear them, and touching one would post the reply twice.
     """
     stats = {"recovered": 0, "interrupted": 0, "still_running": 0}
     for key, entry in store.all().items():
         pending = entry.get("pending")
-        if not pending:
+        if not pending or key in (skip or ()):
             continue
         channel, _, thread_ts = key.partition(":")
         sid = pending.get("session_id") or entry.get("session_id") or ""
