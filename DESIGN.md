@@ -268,10 +268,17 @@ have been re-asked or stopped mattering.
 Recovery also had to stop being a single startup pass. A turn still running
 when that pass fired was left pending by design — only a finished child gives
 a trustworthy reply — but nothing ever came back for it, so restarting during
-a long turn silently swallowed the answer. It now keeps sweeping, with
-`wait_s=0` so it only collects children that have already exited, skipping
+a long turn silently swallowed the answer. A sweep now runs every two minutes
+with `wait_s=0`, collecting only children that have already exited and skipping
 turns this process is running: their marker belongs to a live handler, and
 posting it here would deliver the reply twice.
+
+The sweep is a **separate thread, not a tail on the startup pass**. That pass
+waits up to an hour on a live child, so a sweep queued behind it would not
+engage until the outage it exists to shorten was already over. Running the two
+concurrently is safe because recovery **claims a thread** before resolving it —
+released in a `finally`, including the still-running path, since a leaked claim
+would lock that thread out of every later pass.
 
 That sweep can rescue a turn a restart already recorded as failed, so
 `failed → done` is now a legal transition. Leaving a delivered answer filed

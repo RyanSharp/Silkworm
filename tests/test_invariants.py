@@ -172,16 +172,48 @@ def test_recovery():
     # The startup pass leaves a still-running turn pending on purpose, so
     # something must come back for it -- otherwise restarting during a long
     # turn swallows the answer, which is exactly what happened.
+    # Two passes really can meet: the startup pass waits up to an hour on a
+    # live child while the sweep runs alongside it. Both would post the reply.
+    # A fresh store: earlier cases deliberately leave markers behind, and this
+    # asserts that *nothing* was delivered.
+    store = tmp_store()
+    calls = []
+    store.update("C:5", session_id="s", pending=dict(pend))
+    recovery._claim("C:5")                      # pretend a pass already has it
+    st = recovery.recover(store, finalize=lambda *a: calls.append(a[3]),
+                          reactions_for=lambda *a: RX(), say=lambda *a: None, wait_s=0)
+    check("a thread another pass is resolving is left alone",
+          not calls and st["recovered"] == 0)
+    recovery._release("C:5")
+    st = recovery.recover(store, finalize=lambda *a: calls.append(a[3]),
+                          reactions_for=lambda *a: RX(), say=lambda *a: None, wait_s=0)
+    check("and is picked up once that pass releases it", st["recovered"] == 1)
+    check("the claim is released after a pass", "C:5" not in recovery._inflight)
+
+    store.update("C:6", session_id="s", pending=dict(pend))
+    recovery._claude_alive = lambda sid: True   # still running -> early continue
+    recovery.recover(store, finalize=lambda *a: None, reactions_for=lambda *a: RX(),
+                     say=lambda *a: None, wait_s=0)
+    check("a still-running thread releases its claim too",
+          "C:6" not in recovery._inflight,
+          "a leaked claim locks that thread out of every future pass")
+    recovery._claude_alive = lambda sid: False
+
     src = (BASE / "bot.py").read_text()
-    rec = src[src.index("def _recoverer"):src.index("def reap_runaways")]
-    check("recovery keeps sweeping after the startup pass", "while True:" in rec,
-          "one shot leaves a long turn's reply undelivered forever")
-    check("the sweep never waits on a live child", "wait_s=0" in rec,
+    sweep = src[src.index("def _recovery_sweeper"):]
+    sweep = sweep[:sweep.index("\ndef ", 1)]
+    check("the sweep is its own thread, not a tail on the startup pass",
+          "def _recovery_sweeper" in src and
+          'name="rsweep"' in src,
+          "the startup pass waits up to an hour; a sweep behind it never engages")
+    check("the sweep never waits on a live child", "wait_s=0" in sweep,
           "only a finished child gives a trustworthy reply")
-    check("the sweep skips this process's own turns", "skip=set(RUNNING)" in rec)
-    check("the orphaned-task closeout stays one-shot",
-          rec.index("interrupted by a restart") < rec.index("while True:"),
+    check("the sweep skips this process's own turns", "skip=set(RUNNING)" in sweep)
+    rec = src[src.index("def _recoverer"):]
+    rec = rec[:rec.index("\ndef ", 1)]          # _recoverer alone, not its neighbours
+    check("the orphaned-task closeout stays one-shot", "while True:" not in rec,
           "running it on a loop would fail live turns")
+    check("and still runs at startup", "interrupted by a restart" in rec)
 
 
 # --- process lookup must not be fooled ---------------------------------------

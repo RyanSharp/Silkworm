@@ -1943,12 +1943,20 @@ def _recoverer() -> None:
     except Exception:
         log.exception("closing out orphaned inline tasks failed")
 
-    # Keep sweeping. A turn that was still running during the startup pass is
-    # left pending by design -- only a finished child gives a trustworthy
-    # reply -- and without this nothing would ever come back for it. wait_s=0
-    # so the sweep only ever collects children that have already exited, and
-    # turns this process is running are skipped: their marker belongs to a live
-    # handler and posting it here would deliver the reply twice.
+
+def _recovery_sweeper() -> None:
+    """Collect orphaned turns as their children finish, for as long as we run.
+
+    Its own thread, not a tail on the startup pass: that pass waits up to an
+    hour on a live child, and a sweep sitting behind it would not engage until
+    the very outage it exists to shorten was over. Running alongside is safe
+    because recovery claims a thread before resolving it, so the two passes
+    cannot both deliver the same reply.
+
+    wait_s=0 collects only children that have already exited. Turns this
+    process is running are skipped outright: their marker belongs to a live
+    handler that will clear it.
+    """
     while True:
         time.sleep(RECOVERY_SWEEP_S)
         try:
@@ -2041,6 +2049,7 @@ if __name__ == "__main__":
     reconcile_checkouts()
     # Background: an orphaned turn may still be writing, so this waits on it.
     threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
+    threading.Thread(target=_recovery_sweeper, daemon=True, name="rsweep").start()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     threading.Thread(target=_backfiller, daemon=True, name="backfill").start()

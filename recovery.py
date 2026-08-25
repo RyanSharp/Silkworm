@@ -15,6 +15,7 @@ instead. Either way the thread ends in a truthful state rather than a stuck one.
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -88,6 +89,26 @@ def final_reply(path, since_iso: str) -> str:
     return latest
 
 
+#: Keys a recovery pass is currently resolving. The startup pass can wait up to
+#: an hour on a live child while the periodic sweep runs alongside it, so two
+#: passes really can meet on one thread -- and both would post the same reply.
+_inflight: set[str] = set()
+_inflight_lock = threading.Lock()
+
+
+def _claim(key: str) -> bool:
+    with _inflight_lock:
+        if key in _inflight:
+            return False
+        _inflight.add(key)
+        return True
+
+
+def _release(key: str) -> None:
+    with _inflight_lock:
+        _inflight.discard(key)
+
+
 def _await_reply(session_id: str, since_iso: str, wait_s: int):
     """Wait for the orphaned child to finish, then read its reply.
 
@@ -123,55 +144,62 @@ def recover(store, *, finalize, reactions_for, say, wait_s: int = WAIT_S,
         pending = entry.get("pending")
         if not pending or key in (skip or ()):
             continue
-        channel, _, thread_ts = key.partition(":")
-        sid = pending.get("session_id") or entry.get("session_id") or ""
-        started = pending.get("started", "")
-        log.info("recovering interrupted turn on %s (session=%s)", key, sid[:8] or "?")
-
+        if not _claim(key):
+            continue          # another pass is already resolving this thread
         try:
-            text = _await_reply(sid, started, wait_s)
-        except Exception:
-            log.exception("recovery read failed for %s", key)
-            text = ""
-        if text is STILL_RUNNING:
-            # Genuinely mid-turn after a long wait: the ⏳ is accurate, so leave
-            # the marker in place for the next start rather than guessing. No
-            # event -- nothing happened to it, and it would repeat every restart.
-            log.warning("gave up waiting on %s — turn still running, left pending", key)
-            stats["still_running"] += 1
-            continue
+            channel, _, thread_ts = key.partition(":")
+            sid = pending.get("session_id") or entry.get("session_id") or ""
+            started = pending.get("started", "")
+            log.info("recovering interrupted turn on %s (session=%s)", key, sid[:8] or "?")
 
-        rx = reactions_for(channel, thread_ts, pending.get("msg_ts"))
-        note = ("_:leftwards_arrow_with_hook: Recovered after a restart — "
-                "this reply was produced but never delivered._")
-        try:
-            if text:
-                body = f"{note}\n\n{text}"
-                if pending.get("progress_ts"):
-                    finalize(channel, thread_ts, pending["progress_ts"], body)
+            try:
+                text = _await_reply(sid, started, wait_s)
+            except Exception:
+                log.exception("recovery read failed for %s", key)
+                text = ""
+            if text is STILL_RUNNING:
+                # Genuinely mid-turn after a long wait: the ⏳ is accurate, so leave
+                # the marker in place for the next start rather than guessing. No
+                # event -- nothing happened to it, and it would repeat every restart.
+                log.warning("gave up waiting on %s — turn still running, left pending", key)
+                stats["still_running"] += 1
+                continue
+
+            rx = reactions_for(channel, thread_ts, pending.get("msg_ts"))
+            note = ("_:leftwards_arrow_with_hook: Recovered after a restart — "
+                    "this reply was produced but never delivered._")
+            try:
+                if text:
+                    body = f"{note}\n\n{text}"
+                    if pending.get("progress_ts"):
+                        finalize(channel, thread_ts, pending["progress_ts"], body)
+                    else:
+                        say(channel, thread_ts, body)
+                    rx.done()
+                    store.add_event(key, "recovered", "reply rescued from the transcript")
+                    stats["recovered"] += 1
+                    if on_outcome:
+                        on_outcome(key, True)
                 else:
-                    say(channel, thread_ts, body)
-                rx.done()
-                store.add_event(key, "recovered", "reply rescued from the transcript")
-                stats["recovered"] += 1
-                if on_outcome:
-                    on_outcome(key, True)
-            else:
-                msg = (":warning: _This turn was interrupted by a bot restart and "
-                       "produced no reply. Send the message again to retry._")
-                if pending.get("progress_ts"):
-                    finalize(channel, thread_ts, pending["progress_ts"], msg)
-                else:
-                    say(channel, thread_ts, msg)
-                rx.failed()
-                store.add_event(key, "lost", "interrupted turn produced no reply")
-                stats["interrupted"] += 1
-                if on_outcome:
-                    on_outcome(key, False)
-        except Exception:
-            log.exception("recovery delivery failed for %s", key)
+                    msg = (":warning: _This turn was interrupted by a bot restart and "
+                           "produced no reply. Send the message again to retry._")
+                    if pending.get("progress_ts"):
+                        finalize(channel, thread_ts, pending["progress_ts"], msg)
+                    else:
+                        say(channel, thread_ts, msg)
+                    rx.failed()
+                    store.add_event(key, "lost", "interrupted turn produced no reply")
+                    stats["interrupted"] += 1
+                    if on_outcome:
+                        on_outcome(key, False)
+            except Exception:
+                log.exception("recovery delivery failed for %s", key)
+            finally:
+                clear_pending(store, key)
         finally:
-            clear_pending(store, key)
+            # Always, including the still-running path: a leaked claim
+            # would lock that thread out of every future pass.
+            _release(key)
 
     if any(stats.values()):
         log.info("recovery: %d recovered, %d interrupted, %d still running",
