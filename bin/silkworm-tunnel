@@ -6,7 +6,7 @@
 # the mini's dashboard port and re-dials whenever it drops — on wake from
 # sleep, on Wi-Fi changes, on reboot — so http://127.0.0.1:8790 just works.
 #
-#   ./silkworm-tunnel install [user@]host     # default: Ryans-Mini-2.local
+#   ./silkworm-tunnel install [user@]host     # default: Ryans-Mac-mini-2.local
 #   ./silkworm-tunnel status
 #   ./silkworm-tunnel uninstall
 #
