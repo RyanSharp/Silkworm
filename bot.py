@@ -2015,8 +2015,18 @@ def _recoverer() -> None:
     # is alive whenever a newer turn runs and says nothing about this task.
     try:
         for tid, rec in task_store.all().items():
-            if rec.get("state") == tasks.RUNNING and rec.get("driver") == "inline":
+            if rec.get("driver") != "inline":
+                continue
+            if rec.get("state") == tasks.RUNNING:
                 task_state(tid, tasks.FAILED, "interrupted by a restart")
+            elif rec.get("state") == tasks.QUEUED:
+                # Never started, and an inline task waits on a handler that
+                # died with the previous process -- so it would sit queued
+                # forever. Cancelled rather than failed: nothing was attempted,
+                # and if its message really went unanswered the backfill pass
+                # replays it from the watermark, which a turn that never
+                # started never advanced.
+                task_state(tid, tasks.CANCELLED, "never started; its handler is gone")
     except Exception:
         log.exception("closing out orphaned inline tasks failed")
 

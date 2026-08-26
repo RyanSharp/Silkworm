@@ -218,6 +218,11 @@ def test_recovery():
     rec = rec[:rec.index("\ndef ", 1)]          # _recoverer alone, not its neighbours
     check("the orphaned-task closeout stays one-shot", "while True:" not in rec,
           "running it on a loop would fail live turns")
+    check("a queued inline task is closed out too, not left forever",
+          "never started; its handler is gone" in rec,
+          "inline means a handler drives it, and that handler is gone")
+    check("and cancelled rather than failed, since nothing was attempted",
+          rec.index("tasks.CANCELLED") > rec.index("tasks.QUEUED"))
     check("and still runs at startup", "interrupted by a restart" in rec)
 
 
