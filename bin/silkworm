@@ -9,6 +9,7 @@
     silkworm tasks [state]          list tasks (default: what needs you)
     silkworm email                  scan Gmail now and propose tasks
     silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
+    silkworm watching               scheduled wake-ups and when they fire
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -450,6 +451,20 @@ def main() -> None:
             counts = r.get("counts") or {}
             if counts:
                 print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    elif cmd == "watching":
+        r = bot_call("/tasks", {"action": "watching"})
+        rows = r.get("watching") or []
+        print(f"{WORM} watching — {len(rows)} scheduled wake-up(s)")
+        for w in rows:
+            when = ("due now" if w["in_s"] <= 0 else
+                    f"in {w['in_s']}s" if w["in_s"] < 90 else
+                    f"in {round(w['in_s'] / 60)}m" if w["in_s"] < 5400 else
+                    f"in {w['in_s'] / 3600:.1f}h")
+            print(f"  {when:>9}  {w['id']}  {w['goal'][:64]}")
+            print(f"             thread {w['thread']} · "
+                  f"check {w['depth']} of {w['depth'] + w['remaining']}")
+        if not rows:
+            print("  nothing scheduled")
     elif cmd == "defer":
         do_defer(args[1:])          # args[0] is the subcommand itself
     elif cmd == "email":

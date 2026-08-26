@@ -341,6 +341,18 @@ Chains cap at 24 wake-ups, and delays run from 30s to 24h. If a check reports
 nothing but fails to schedule the next one, the watch surfaces in `needs_input`
 rather than quietly ending.
 
+Because a silent watch is indistinguishable from a forgotten one, you can ask
+what it is actually waiting on:
+
+```sh
+silkworm watching
+#      in 8m  tsk_6733ab6f4d  check whether /tmp/job-done exists
+#              thread D0BH336V73L:1787708667.829329 · check 1 of 24
+```
+
+Only scheduled wake-ups — a quota-blocked retry is the system waiting on
+itself, not a promise made to you.
+
 ## Moving a thread to the terminal
 
 Every thread is a normal Claude Code session, so it works both ways: send

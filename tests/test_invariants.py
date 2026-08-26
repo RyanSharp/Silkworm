@@ -736,6 +736,23 @@ def test_defer():
           "only a scheduled check keeps the promise to report back")
 
     bot = (BASE / "bot.py").read_text()
+    # You cannot trust a watch you cannot see. `blocked` also holds quota
+    # retries, which are the system waiting on itself rather than a promise
+    # made to you, so the view has to tell them apart.
+    watch = bot[bot.index('if action == "watching"'):bot.index('if action == "ingest-email"')]
+    check("the watching view exists", 'return {"ok": True, "watching"' in watch)
+    check("it lists only scheduled wake-ups, not every blocked task",
+          'r.get("source") != "defer"' in watch,
+          "a quota retry is not a promise made to you")
+    check("it says when each one fires", '"in_s"' in watch)
+    check("and how much of the chain is left", '"remaining"' in watch)
+    check("soonest first", 'sorted(out, key=lambda w: w["in_s"])' in watch)
+    cli_src = (BASE / "bin" / "silkworm").read_text()
+    check("the CLI exposes it", 'cmd == "watching"' in cli_src)
+    check("and it is documented in the usage text",
+          "silkworm watching" in cli_src.split("def ")[0],
+          "an undiscoverable view is one you never use")
+
     check("the turn is told which thread it may schedule against",
           'env["SILKWORM_THREAD"] = key' in bot)
     check("and how deep its chain already is",

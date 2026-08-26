@@ -1058,6 +1058,21 @@ def handle_tasks(payload: dict) -> dict:
     if action == "attention":
         return {"ok": True, "tasks": _filter(task_store.needs_attention()),
                 "counts": task_store.counts()}
+    if action == "watching":
+        # Scheduled wake-ups specifically, not everything parked in `blocked`:
+        # a quota-blocked retry is the system waiting on itself, while a watch
+        # is a promise made to you, and only one of those is worth checking on.
+        now = time.time()
+        out = []
+        for tid, r in task_store.all().items():
+            if r.get("state") != tasks.BLOCKED or r.get("source") != "defer":
+                continue
+            out.append({"id": tid, "goal": r.get("goal", ""),
+                        "thread": r.get("thread", ""),
+                        "in_s": round((r.get("retry_at") or now) - now),
+                        "depth": r.get("defers") or 0,
+                        "remaining": defer.MAX_DEFERS - (r.get("defers") or 0)})
+        return {"ok": True, "watching": sorted(out, key=lambda w: w["in_s"])}
     if action == "ingest-email":
         try:
             return run_email_ingest()
