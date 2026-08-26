@@ -323,6 +323,24 @@ date and a ~400 character snippet go to the model. Everything it finds arrives
 as **`proposed`**, never queued, so a mediocre guess costs an accept/dismiss
 rather than unwanted work.
 
+## Watching something over time
+
+Ask for "keep an eye on the deploy and tell me when it's done" and Silkworm
+does not sit in a turn waiting — that would hit the 15 minute cap, lock the
+thread meanwhile, and die on the next restart. It finishes the turn and
+schedules a later one on the same conversation:
+
+    silkworm defer 10m "check whether the deploy finished"
+
+The wake-up waits as a `blocked` task with a `retry_at`, costing nothing and
+surviving restarts, then resumes the thread with its context intact. If there
+is nothing to report it re-schedules and stays **silent** — no message at all.
+When something has actually happened, it says so.
+
+Chains cap at 24 wake-ups, and delays run from 30s to 24h. If a check reports
+nothing but fails to schedule the next one, the watch surfaces in `needs_input`
+rather than quietly ending.
+
 ## Moving a thread to the terminal
 
 Every thread is a normal Claude Code session, so it works both ways: send

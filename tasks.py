@@ -102,6 +102,10 @@ FIELDS: dict[str, tuple] = {
     # Set when a turn died on something transient (quota, overload). The task
     # waits in `blocked` until this passes, rather than asking for help.
     "retry_at":    (None,  "unix time to requeue this automatically"),
+    # How many times this chain of scheduled wake-ups has already fired.
+    # Capped, so a model that keeps misjudging "is it done yet" cannot
+    # poll at your expense forever.
+    "defers":      (0,     "depth of the scheduled wake-up chain"),
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }
@@ -309,6 +313,13 @@ class TaskStore:
             return [tid for tid, r in self._data.items()
                     if r.get("state") == BLOCKED and r.get("retry_at")
                     and r["retry_at"] <= now]
+
+    def has_pending_wakeup(self, thread: str) -> bool:
+        """Whether a scheduled wake-up is still waiting on this thread."""
+        with self._lock:
+            return any(r.get("state") == BLOCKED and r.get("source") == "defer"
+                       and r.get("thread") == thread and r.get("retry_at")
+                       for r in self._data.values())
 
     def counts(self) -> dict[str, int]:
         with self._lock:

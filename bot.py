@@ -29,6 +29,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import backfill
+import defer
 import email_ingest
 import harvester
 import learnings_git
@@ -60,6 +61,8 @@ CLAUDE_CWD = Path(os.environ.get("CLAUDE_CWD", BASE_DIR / "workspace"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "900"))
+#: Absolute, because a turn's PATH is not ours to assume.
+SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "haiku")  # empty string disables
 HARVEST_MODEL = os.environ.get("HARVEST_MODEL", "sonnet")
@@ -268,6 +271,16 @@ class ProgressMessage:
             log.exception("failed to finalize progress message")
             self.ts = None
 
+    def delete(self) -> None:
+        """Remove the placeholder entirely, for a turn with nothing to say."""
+        if not self.ts:
+            return
+        try:
+            self.client.chat_delete(channel=self.channel, ts=self.ts)
+        except Exception:
+            log.exception("failed to delete progress message")
+        self.ts = None
+
 
 WORKING, DONE, FAILED = "hourglass", "white_check_mark", "bangbang"
 
@@ -341,9 +354,15 @@ def permission_args() -> list[str]:
     return ["--permission-mode", CLAUDE_PERMISSION_MODE]
 
 
-def claude_env() -> dict:
+def claude_env(key: str = "", defers: int = 0) -> dict:
     env = dict(os.environ)
     env["SILKWORM_BOT"] = "1"  # lets the global session_hook ignore our own runs
+    # So a turn can schedule a wake-up against its own thread rather than
+    # holding itself open until whatever it is watching finishes.
+    env["SILKWORM_PORT"] = str(APPROVAL_PORT)
+    if key:
+        env["SILKWORM_THREAD"] = key
+    env["SILKWORM_DEFERS"] = str(defers or 0)
     if CLAUDE_APPROVAL_MODE == "slack":
         env["SLACK_BOT_APPROVAL_PORT"] = str(APPROVAL_PORT)
         env["SLACK_BOT_APPROVAL_TIMEOUT"] = str(APPROVAL_TIMEOUT)
@@ -1222,6 +1241,40 @@ def handle_summaries(payload: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def handle_defer(payload: dict) -> dict:
+    """Route for /defer — schedule a later turn on a thread.
+
+    Deliberately a plain `blocked` task with a `retry_at`: the queue runner
+    already requeues those when their time comes, so a wake-up costs nothing
+    while it waits and survives a restart because it is a durable record
+    rather than a sleeping process.
+    """
+    key = (payload.get("key") or "").strip()
+    goal = (payload.get("goal") or "").strip()
+    if not re.fullmatch(r"[A-Z0-9]+:[0-9.]+", key):
+        return {"ok": False, "error": "no thread to schedule against"}
+    if not goal:
+        return {"ok": False, "error": "say what to check when it wakes"}
+    try:
+        delay = defer.parse_delay(payload.get("delay", ""))
+        depth = defer.next_depth(payload.get("depth"))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    entry = store.get(key) or {}
+    when = time.time() + delay
+    task = task_store.create(
+        goal, title=goal[:70], state=tasks.BLOCKED, driver="queue",
+        source="defer", thread=key, project=entry.get("project") or "",
+        scope={"cwd": entry.get("cwd") or str(CLAUDE_CWD)},
+        retry_at=when, defers=depth,
+    )
+    log.info("scheduled wake-up %s on %s in %.0fs (depth %d)",
+             task["id"], key, delay, depth)
+    return {"ok": True, "id": task["id"], "at": when, "in_s": round(delay),
+            "depth": depth, "remaining": defer.MAX_DEFERS - depth}
+
+
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
@@ -1233,6 +1286,7 @@ server.route("/release", handle_release)
 server.route("/titles", handle_titles)
 server.route("/tasks", handle_tasks)
 server.route("/projects", handle_projects)
+server.route("/defer", handle_defer)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -1345,6 +1399,7 @@ def handle_prompt(event: dict, say, client) -> None:
         f"If you create a file the user should receive, copy it into {outbox} "
         "and it will be uploaded to the Slack thread automatically."
     )
+    system_note += "\n\n" + defer.HOW_TO.format(bin=SILKWORM_BIN)
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
@@ -1400,7 +1455,8 @@ def handle_prompt(event: dict, say, client) -> None:
             kwargs = dict(
                 binary=CLAUDE_BIN, cwd=cwd, permission_args=permission_args(),
                 model=model, append_system_prompt=system_note,
-                extra_args=CLAUDE_EXTRA_ARGS, env=claude_env(), timeout=CLAUDE_TIMEOUT,
+                extra_args=CLAUDE_EXTRA_ARGS, env=claude_env(key),
+                timeout=CLAUDE_TIMEOUT,
                 on_init=on_init, on_activity=on_activity, on_start=on_start,
             )
             # The outbox dir is shared by every turn in this thread, so its
@@ -1610,6 +1666,10 @@ def execute_task(task: dict) -> None:
         "You are completing a task; report the outcome concisely. "
         f"If you create a file the user should receive, copy it into {outbox}."
     )
+    if task.get("source") == "defer":
+        system_note += "\n\n" + defer.WAKE_NOTE
+    else:
+        system_note += "\n\n" + defer.HOW_TO.format(bin=SILKWORM_BIN)
     role_system = roles.system_prompt(role_name)
     if role_system:
         system_note += "\n\n" + role_system
@@ -1634,7 +1694,8 @@ def execute_task(task: dict) -> None:
                     permission_args=roles.permission_args(role_name, permission_args()),
                     model=entry.get("model") or CLAUDE_MODEL,
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
-                    env=claude_env(), timeout=CLAUDE_TIMEOUT,
+                    env=claude_env(key, task.get("defers") or 0),
+                    timeout=CLAUDE_TIMEOUT,
                     on_init=lambda sid: task_store.update(tid, session_id=sid),
                     on_activity=lambda n, i: progress.update(
                         f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
@@ -1648,6 +1709,22 @@ def execute_task(task: dict) -> None:
                 uploaded = upload_outbox(app.client, outbox, channel, thread_ts, key)
             finally:
                 shutil.rmtree(outbox, ignore_errors=True)
+
+        if task.get("source") == "defer" and result.text.strip() == defer.QUIET:
+            # The check ran and found nothing worth interrupting for. Say
+            # nothing: a watch that narrates every poll is worse than no watch.
+            # But only if it actually scheduled the next one -- "nothing yet"
+            # with no successor is a watch that quietly stopped watching, which
+            # is the exact silence this whole mechanism exists to prevent.
+            task_store.update(tid, session_id=result.session_id,
+                              result={"text": defer.QUIET, "cost": result.cost_usd})
+            if task_store.has_pending_wakeup(key):
+                progress.delete()
+                task_state(tid, tasks.DONE, "nothing to report yet")
+            else:
+                progress.finalize(defer.STOPPED)
+                task_state(tid, tasks.NEEDS_INPUT, "watch ended without scheduling")
+            return
 
         total = (store.get(key) or {}).get("cost", 0.0)
         parts = chunk(to_mrkdwn(result.text))

@@ -8,6 +8,7 @@
     silkworm titles [--force]       name threads from their summaries
     silkworm tasks [state]          list tasks (default: what needs you)
     silkworm email                  scan Gmail now and propose tasks
+    silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -256,6 +257,30 @@ def do_status() -> None:
         print(f"    {len(threads)} threads · {running} running · {out} checked out to terminal")
 
 
+def do_defer(argv) -> None:
+    """Schedule a later turn on the thread this run belongs to.
+
+    Meant to be called by Claude from inside a turn, not typed by hand: the
+    thread comes from the environment the bot set up for that run.
+    """
+    import os
+    key = os.environ.get("SILKWORM_THREAD", "")
+    depth = os.environ.get("SILKWORM_DEFERS", "0")
+    if not key:
+        print("no thread — `defer` only works from inside a Silkworm turn")
+        raise SystemExit(1)
+    if len(argv) < 2:
+        print('usage: silkworm defer <delay> "<what to check when you wake>"')
+        raise SystemExit(2)
+    delay, goal = argv[0], " ".join(argv[1:])
+    r = bot_call("/defer", {"key": key, "delay": delay, "goal": goal, "depth": depth})
+    if not r.get("ok"):
+        print(f"could not schedule: {r.get('error') or 'the bot did not answer'}")
+        raise SystemExit(1)
+    print(f"scheduled: waking in {r['in_s']}s to \"{goal[:60]}\" "
+          f"({r['remaining']} wake-ups left in this chain)")
+
+
 def do_setup() -> None:
     print(f"{WORM} setting up in {REPO}")
     if not check("claude CLI on PATH", shutil.which("claude") is not None,
@@ -425,6 +450,8 @@ def main() -> None:
             counts = r.get("counts") or {}
             if counts:
                 print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    elif cmd == "defer":
+        do_defer(args[1:])          # args[0] is the subcommand itself
     elif cmd == "email":
         print(f"{WORM} scanning Gmail…")
         r = bot_call("/tasks", {"action": "ingest-email"}, timeout=600)

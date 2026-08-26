@@ -9,6 +9,7 @@ run without Slack, without a bot, and without spending anything.
 
 import ast
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -653,6 +654,124 @@ def test_email_ingest():
     bot = (BASE / "bot.py").read_text()
     check("watching is off unless credentials are set",
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
+
+
+# --- "get back to me when it's done" --------------------------------------------
+# A turn is request/response: one prompt in, one reply out, and the session is
+# dormant either side of it. Held open, a watch hits the 15 minute cap, holds
+# its thread's lock meanwhile, and dies on restart. Ended, whatever it
+# backgrounded reports to nobody. Both ways the instruction was simply lost.
+
+def test_defer():
+    import defer as D
+    from tasks import TaskStore
+    import tasks as T
+    print("\nscheduling a later turn instead of holding one open")
+
+    check("plain seconds", D.parse_delay("90") == 90)
+    check("units", (D.parse_delay("10m"), D.parse_delay("2h"), D.parse_delay("1d"))
+          == (600, 7200, 86400))
+    for bad, why in (("bogus", "unreadable"), ("1s", "below the floor"),
+                     ("48h", "above the ceiling"), ("", "empty")):
+        try:
+            D.parse_delay(bad)
+            check(f"{why} delay is refused", False, f"{bad!r} was accepted")
+        except ValueError:
+            check(f"{why} delay is refused", True)
+    check("the floor keeps a wake-up from being a busy-loop", D.MIN_DELAY_S >= 30)
+
+    check("a chain counts up", D.next_depth(0) == 1 and D.next_depth(3) == 4)
+    check("a missing depth starts at one", D.next_depth(None) == 1)
+    try:
+        D.next_depth(D.MAX_DEFERS)
+        check("a chain cannot poll forever", False, "the cap was not enforced")
+    except ValueError as e:
+        check("a chain cannot poll forever", "report what you know" in str(e),
+              "otherwise a model that misjudges 'is it done' bills you all night")
+
+    # The wake-up itself is an ordinary blocked task with a retry_at, which the
+    # queue runner already knows how to requeue.
+    ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    now = time.time()
+    t = ts.create("check the deploy", state=T.BLOCKED, driver="queue",
+                  source="defer", thread="C:1", retry_at=now + 600, defers=1)
+    check("a wake-up waits in blocked, costing nothing", t["state"] == T.BLOCKED)
+    check("and is invisible until it fires", T.BLOCKED not in T.NEEDS_ATTENTION,
+          "a pending watch is not something you have to act on")
+    check("not yet due", ts.due_retries(now) == [])
+    check("due when its time comes", ts.due_retries(now + 601) == [t["id"]])
+    check("it carries its thread, so it can speak there", t["thread"] == "C:1")
+    check("the chain depth survives the wait", t["defers"] == 1)
+
+    # "nothing yet" with no successor is a watch that stopped watching.
+    ts2 = TaskStore(Path(tempfile.mkdtemp()) / "t2.json")
+    check("no wake-up pending on an unknown thread",
+          not ts2.has_pending_wakeup("C:9"))
+    ts2.create("check again", state=T.BLOCKED, driver="queue", source="defer",
+               thread="C:9", retry_at=now + 300)
+    check("a scheduled wake-up is visible to its predecessor",
+          ts2.has_pending_wakeup("C:9"))
+    check("a wake-up on another thread does not count",
+          not ts2.has_pending_wakeup("C:8"))
+    ts3 = TaskStore(Path(tempfile.mkdtemp()) / "t3.json")
+    ts3.create("ordinary queued work", state=T.BLOCKED, driver="queue",
+               thread="C:9", retry_at=now + 300)
+    check("a blocked task that is not a wake-up does not count",
+          not ts3.has_pending_wakeup("C:9"),
+          "only a scheduled check keeps the promise to report back")
+
+    bot = (BASE / "bot.py").read_text()
+    check("the turn is told which thread it may schedule against",
+          'env["SILKWORM_THREAD"] = key' in bot)
+    check("and how deep its chain already is",
+          'env["SILKWORM_DEFERS"]' in bot)
+    ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
+    check("a wake-up resumes the same conversation",
+          "defer.WAKE_NOTE" in ex and "roles.is_fresh" in bot,
+          "the note it left itself is useless without the context")
+    check("a wake-up with nothing to say deletes its own placeholder",
+          "progress.delete()" in ex and "defer.QUIET" in ex,
+          "a watch that narrates every poll is worse than no watch")
+    check("and still closes out as done",
+          "nothing to report yet" in ex)
+    check("but only when it actually scheduled the next check",
+          "has_pending_wakeup(key)" in ex and "defer.STOPPED" in ex,
+          "silently ending the watch is the failure this exists to prevent")
+    check("a stopped watch asks for you instead of vanishing",
+          "tasks.NEEDS_INPUT" in ex)
+    check("ProgressMessage can actually delete", "def delete(self)" in bot
+          and "chat_delete" in bot)
+    check("ordinary turns are told how to schedule", "defer.HOW_TO" in bot)
+
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("the CLI refuses to run outside a turn",
+          'SILKWORM_THREAD' in cli and "only works from inside a Silkworm turn" in cli,
+          "there would be no thread to wake")
+    check("the bot exposes the route", 'server.route("/defer", handle_defer)' in bot)
+
+    # Driven for real, not grepped: the first version passed argv straight
+    # through, so the subcommand itself was read as the delay and every call
+    # died with "could not read a delay from 'defer'".
+    env = {**os.environ, "SILKWORM_THREAD": "C:1", "SILKWORM_DEFERS": "0"}
+    cli = str(BASE / "bin" / "silkworm")
+    r = subprocess.run([sys.executable, cli, "defer", "10m"],
+                       capture_output=True, text=True, env=env, timeout=30)
+    check("a missing goal is a usage error", r.returncode == 2,
+          f"exit {r.returncode}: {(r.stdout + r.stderr).strip()[:120]}")
+    check("the delay is not read as the subcommand",
+          "could not read a delay" not in (r.stdout + r.stderr))
+    r = subprocess.run([sys.executable, cli, "defer"],
+                       capture_output=True, text=True, env=env, timeout=30)
+    check("no arguments at all is a usage error", r.returncode == 2)
+    r = subprocess.run([sys.executable, cli, "defer", "10m", "x"],
+                       capture_output=True, text=True,
+                       env={k: v for k, v in os.environ.items()
+                            if k not in ("SILKWORM_THREAD",)}, timeout=30)
+    check("outside a turn it refuses rather than guessing a thread",
+          r.returncode == 1 and "inside a Silkworm turn" in r.stdout + r.stderr)
+    check("an absolute path is handed to the model, not a bare name",
+          "SILKWORM_BIN = str(Path(__file__).resolve().parent" in bot,
+          "a turn's PATH is not ours to assume")
 
 
 # --- messages sent while the link was down --------------------------------------
@@ -1311,7 +1430,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):

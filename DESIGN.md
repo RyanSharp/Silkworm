@@ -283,3 +283,36 @@ would lock that thread out of every later pass.
 That sweep can rescue a turn a restart already recorded as failed, so
 `failed → done` is now a legal transition. Leaving a delivered answer filed
 under "needs you" is the noise that stops the board being trusted.
+
+## "Get back to me when it's done"
+
+A turn is request/response — one prompt in, one reply out — and the session is
+dormant either side of it. "Monitor this and tell me when it finishes" is not
+that shape, and had two ways to be lost, both reachable:
+
+- **Hold the turn open.** It fights everything: the 15 minute cap kills it, the
+  runaway reaper kills what survives, the thread lock means you cannot talk to
+  that thread meanwhile, and a restart orphans it.
+- **End the turn and background the work.** The answer arrives somewhere nobody
+  is listening — nothing outside a turn was wired to speak.
+
+The fix is not a longer timeout. It is to **stop holding the turn open**:
+finish now, and schedule a short turn for later on the same session.
+
+    silkworm defer 10m "check whether the deploy finished"
+
+That is an ordinary task in `blocked` with a `retry_at`, which the queue runner
+already requeues when its time arrives. So a watch costs nothing while it
+waits, survives restarts because it is a durable record rather than a sleeping
+process, and resumes the thread with its context intact — the note it left
+itself is read by a session that remembers writing it.
+
+**Silence is the point.** A wake-up with nothing to report replies with a
+sentinel and its placeholder is deleted, so the thread stays quiet until there
+is news; a watch that narrates every poll is worse than no watch. But "nothing
+yet" with *no successor scheduled* is a watch that quietly stopped watching —
+the exact silence this exists to prevent — so that lands in `needs_input`
+instead of vanishing.
+
+Chains are capped at 24 wake-ups. A model that keeps misjudging "is it finished
+yet" would otherwise poll at your expense indefinitely.
