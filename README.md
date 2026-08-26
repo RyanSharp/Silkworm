@@ -409,6 +409,30 @@ working without you re-running anything. `silkworm-tunnel status` checks it,
 the installer verifies that first and tells you how to fix it, because a launchd
 agent has no terminal to answer a passphrase prompt.
 
+**The host is resolved on every dial, not fixed at install time.** A DHCP lease
+change used to break the tunnel permanently and silently, because the plist
+baked one address into the ssh command line. The agent now runs a small dialer
+that tries, in order: the host you installed with, the mDNS `.local` name,
+whatever answered last time, and finally an ARP lookup by hardware address.
+
+### If the host's address keeps moving
+
+A DHCP reservation on your router is the real fix, but there is a trap on
+macOS: **Private Wi-Fi Address** means the router never sees the machine's
+hardware MAC, only a randomised one — so a reservation made against the address
+`networksetup` reports will silently never match. Check which is actually in
+use before reserving anything:
+
+```sh
+networksetup -listallhardwareports | grep -A2 Wi-Fi   # hardware MAC
+ifconfig en1 | grep ether                             # what the network sees
+```
+
+If they differ, either turn Private Wi-Fi Address off for that network (System
+Settings → Wi-Fi → Details) and reserve against the hardware MAC, or reserve
+against the randomised one and accept that it may rotate. For an always-on
+host, Ethernet sidesteps the whole thing — no randomisation, stable MAC.
+
 For phone access, or from outside the network, Tailscale is a better fit than a
 tunnel: install it on both ends and the host gets a stable private address.
 
