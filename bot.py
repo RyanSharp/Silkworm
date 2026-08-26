@@ -2003,32 +2003,42 @@ def inline_task_for(key: str) -> str | None:
     return None
 
 
+def close_out_orphans() -> None:
+    """Settle inline tasks no handler in this process will ever drive.
+
+    An inline task is driven by the Slack handler that created it, and that
+    handler died with the previous process. Runs *before* recovery rather than
+    after: the startup pass can wait an hour on a live child, and these records
+    would claim work was in flight the whole time.
+
+    Anything recovery is about to resolve is left alone. A thread with a
+    pending marker may still deliver its reply, and marking it failed first
+    would put a false failure on the board for exactly as long as the wait --
+    which is the noise that stops the board being read.
+    """
+    pending = {k for k, e in store.all().items() if e.get("pending")}
+    for tid, rec in task_store.all().items():
+        if rec.get("driver") != "inline" or rec.get("thread") in pending:
+            continue
+        if rec.get("state") == tasks.RUNNING:
+            task_state(tid, tasks.FAILED, "interrupted by a restart")
+        elif rec.get("state") == tasks.QUEUED:
+            # Never started, so it would sit queued forever. Cancelled rather
+            # than failed: nothing was attempted, and if its message really
+            # went unanswered the backfill replays it from the watermark, which
+            # a turn that never started never advanced.
+            task_state(tid, tasks.CANCELLED, "never started; its handler is gone")
+
+
 def _recoverer() -> None:
+    try:
+        close_out_orphans()
+    except Exception:
+        log.exception("closing out orphaned inline tasks failed")
     try:
         run_recovery()
     except Exception:
         log.exception("startup recovery failed")
-    # Whatever recovery resolved is already settled; anything still marked
-    # running was driven by a handler in the previous process and nothing in
-    # this one will ever finish it. Deliberately not conditioned on session
-    # liveness: a resumed session is shared by every turn in its thread, so it
-    # is alive whenever a newer turn runs and says nothing about this task.
-    try:
-        for tid, rec in task_store.all().items():
-            if rec.get("driver") != "inline":
-                continue
-            if rec.get("state") == tasks.RUNNING:
-                task_state(tid, tasks.FAILED, "interrupted by a restart")
-            elif rec.get("state") == tasks.QUEUED:
-                # Never started, and an inline task waits on a handler that
-                # died with the previous process -- so it would sit queued
-                # forever. Cancelled rather than failed: nothing was attempted,
-                # and if its message really went unanswered the backfill pass
-                # replays it from the watermark, which a turn that never
-                # started never advanced.
-                task_state(tid, tasks.CANCELLED, "never started; its handler is gone")
-    except Exception:
-        log.exception("closing out orphaned inline tasks failed")
 
 
 def _recovery_sweeper() -> None:
