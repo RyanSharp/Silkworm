@@ -218,12 +218,17 @@ def test_recovery():
     rec = rec[:rec.index("\ndef ", 1)]          # _recoverer alone, not its neighbours
     check("the orphaned-task closeout stays one-shot", "while True:" not in rec,
           "running it on a loop would fail live turns")
+    check("and still runs at startup", "close_out_orphans()" in rec)
+    check("before recovery, which can wait an hour on a live child",
+          rec.index("close_out_orphans()") < rec.index("run_recovery()"),
+          "otherwise those records claim work is in flight for that whole hour")
+
+    co = src[src.index("def close_out_orphans"):src.index("def _recoverer")]
     check("a queued inline task is closed out too, not left forever",
-          "never started; its handler is gone" in rec,
+          "never started; its handler is gone" in co,
           "inline means a handler drives it, and that handler is gone")
     check("and cancelled rather than failed, since nothing was attempted",
-          rec.index("tasks.CANCELLED") > rec.index("tasks.QUEUED"))
-    check("and still runs at startup", "interrupted by a restart" in rec)
+          co.index("tasks.CANCELLED") > co.index("tasks.QUEUED"))
 
 
 # --- process lookup must not be fooled ---------------------------------------
@@ -512,18 +517,23 @@ def test_task_runner_claim():
     # previous process. Gating on session liveness was wrong: a resumed session
     # is shared by every turn in its thread, so it is alive whenever a newer
     # turn runs, which would leave the orphan stuck in `running` forever.
-    # The sweep lives behind recovery, so tasks recovery resolved are already
-    # settled and only genuine orphans are marked failed.
     src = (BASE / "bot.py").read_text()
-    rec = src[src.index("def _recoverer("):]
-    rec = rec[:rec.index("def _sweeper")]
+    co = src[src.index("def close_out_orphans"):src.index("def _recoverer")]
     check("startup closes out inline tasks orphaned by a restart",
-          "interrupted by a restart" in rec)
-    check("the sweep runs after recovery, not before",
-          rec.index("run_recovery()") < rec.index("interrupted by a restart"))
-    check("orphan sweep does not gate on session liveness", "session_alive" not in rec)
+          "interrupted by a restart" in co)
+    check("the closeout does not gate on session liveness", "session_alive" not in co)
     check("recovery resolves the task it rescued",
           "recovered after a restart" in src)
+    # This used to be guaranteed by ordering -- the closeout ran *after*
+    # recovery, so anything rescued was already settled. That cost an hour of
+    # records claiming work was in flight, because the startup pass waits that
+    # long on a live child. The guarantee is now explicit instead of positional:
+    # threads recovery still owns are skipped by name.
+    check("a thread recovery may still resolve is never marked failed",
+          'rec.get("thread") in pending' in co,
+          "a false failure that lasts the whole wait is what stops the board being read")
+    check("and the marker it keys on is the one recovery writes",
+          'e.get("pending")' in co)
 
 
 # --- the review gate ----------------------------------------------------------
