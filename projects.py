@@ -148,6 +148,13 @@ class ProjectStore:
         if (rec.get("scope") or {}).get("repo"):
             return None
         path = Path((rec.get("scope") or {}).get("cwd") or (PROJECT_ROOT / slug))
+        # Ask the filesystem, not the record. `!project` sets cwd from the
+        # thread and leaves `repo` empty, so a project pointed at a real
+        # checkout looked repo-less -- and set_brief would have replaced a
+        # hand-written CLAUDE.md with a 150-word generated one. A directory
+        # that is itself a repo is yours, however the record was filled in.
+        if (path / ".git").exists():
+            return None
         if create:
             path.mkdir(parents=True, exist_ok=True)
             if not (rec.get("scope") or {}).get("cwd"):

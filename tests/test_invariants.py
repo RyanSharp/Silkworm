@@ -1261,6 +1261,23 @@ def test_projects():
     check("a repo-backed project has no Silkworm-owned home",
           ps.home("trader") is None,
           "its CLAUDE.md belongs to the user; learnings cover it")
+
+    # `!project` sets cwd from the thread and leaves `repo` empty, so the record
+    # alone said "repo-less" for a real checkout -- and set_brief would have
+    # replaced a hand-written CLAUDE.md with a 150-word generated one.
+    real = Path(_tf.mkdtemp()) / "checkout"
+    (real / ".git").mkdir(parents=True)
+    (real / "CLAUDE.md").write_text("# Hand written\n\nDo not clobber me.\n")
+    ps.ensure("Odin", scope={"cwd": str(real)})          # note: no repo field
+    check("a directory that is itself a repo is never ours to write",
+          ps.home("odin") is None,
+          "the filesystem is the authority, not a field !project never sets")
+    ps.set_brief("odin", "a generated brief")
+    check("so set_brief leaves a real CLAUDE.md alone",
+          (real / "CLAUDE.md").read_text().startswith("# Hand written"),
+          "overwriting 289 lines of guide with a paragraph is not recoverable")
+    check("and records nothing as having been written",
+          (ps.get("odin") or {}).get("brief_at") == 0.0)
     before = ps.get("trader")
     ps.set_brief("trader", "we should not write this")
     check("writing a brief to a repo-backed project is a no-op",
