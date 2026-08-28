@@ -2181,6 +2181,10 @@ if __name__ == "__main__":
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))
+    # Logged because "is the new limit actually in effect" is otherwise only
+    # answerable by reading .env and trusting that the service was restarted.
+    log.info("turn limits: cap=%s idle=%ds",
+             f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none", CLAUDE_IDLE_TIMEOUT)
     slack_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     threading.Thread(target=_slack_watchdog, args=(slack_handler,),
                      daemon=True, name="slack-health").start()
