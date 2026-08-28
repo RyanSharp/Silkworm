@@ -671,6 +671,92 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+def _repo_guard_impl():
+    """Loaded from bot.py without importing it (bot.py needs Slack tokens)."""
+    import ast, types, contextlib, threading, logging
+    from pathlib import Path as _P
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    want = {"_repo_lock", "repo_guard"}
+    nodes = [n for n in tree.body
+             if isinstance(n, ast.FunctionDef) and n.name in want]
+    wanted = ("_repo_locks", "_repo_locks_guard")
+    def names(n):
+        if isinstance(n, ast.Assign):
+            return [getattr(t, "id", "") for t in n.targets]
+        if isinstance(n, ast.AnnAssign):      # `_repo_locks: dict[...] = {}`
+            return [getattr(n.target, "id", "")]
+        return []
+    assigns = [n for n in tree.body if any(x in wanted for x in names(n))]
+    mod = types.ModuleType("guard")
+    mod.__dict__.update(contextlib=contextlib, threading=threading, Path=_P,
+                        log=logging.getLogger("test"))
+    exec(compile(ast.Module(body=assigns + nodes, type_ignores=[]), "<guard>", "exec"),
+         mod.__dict__)
+    return mod
+
+
+def test_repo_guard():
+    import threading, time as _t
+    G = _repo_guard_impl()
+    print("\nturns sharing a checkout are serialised")
+
+    plain = Path(tempfile.mkdtemp())                 # not a repo
+    repo = Path(tempfile.mkdtemp()); (repo / ".git").mkdir()
+
+    check("a directory that is not a checkout is not locked",
+          G._repo_lock(str(plain)) is None,
+          "the shared scratch dir holds unrelated projects; locking it "
+          "would queue every thread behind every other")
+    check("a checkout gets a lock", G._repo_lock(str(repo)) is not None)
+    check("the same checkout gets the same lock",
+          G._repo_lock(str(repo)) is G._repo_lock(str(repo) + "/"),
+          "resolved path, so two spellings do not both get in")
+
+    order, started = [], threading.Event()
+
+    def hold():
+        with G.repo_guard(str(repo)):
+            started.set()
+            order.append("a-in")
+            _t.sleep(0.6)
+            order.append("a-out")
+
+    def contend():
+        started.wait(2)
+        with G.repo_guard(str(repo)):
+            order.append("b-in")
+
+    ta, tb = threading.Thread(target=hold), threading.Thread(target=contend)
+    ta.start(); tb.start(); ta.join(5); tb.join(5)
+    check("a second turn waits for the first to finish",
+          order == ["a-in", "a-out", "b-in"], f"got {order}")
+
+    # Non-repo directories must stay concurrent, or normal use grinds.
+    order2, started2 = [], threading.Event()
+
+    def hold2():
+        with G.repo_guard(str(plain)):
+            started2.set(); _t.sleep(0.6); order2.append("a-out")
+
+    def free2():
+        started2.wait(2)
+        with G.repo_guard(str(plain)):
+            order2.append("b-in")
+
+    t1, t2 = threading.Thread(target=hold2), threading.Thread(target=free2)
+    t1.start(); t2.start(); t1.join(5); t2.join(5)
+    check("turns in a non-checkout directory still run concurrently",
+          order2 == ["b-in", "a-out"], f"got {order2}")
+
+    bot = (BASE / "bot.py").read_text()
+    check("both call sites take it", bot.count("repo_guard(cwd, progress)") == 2,
+          "a Slack turn and a queued task are exactly the pair that collide")
+    for site in ("with lock, repo_guard(cwd, progress):",):
+        check("taken inside the thread lock, so the order cannot deadlock",
+              site in bot)
+
+
 # --- a turn may run as long as it is still working -------------------------------
 # The 900s wall clock killed three real turns in three days -- a strategy
 # backtest and two game-dev iterations -- because elapsed time cannot tell
@@ -1555,7 +1641,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard,
               test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,

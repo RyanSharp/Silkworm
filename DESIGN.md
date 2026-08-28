@@ -316,3 +316,32 @@ instead of vanishing.
 
 Chains are capped at 24 wake-ups. A model that keeps misjudging "is it finished
 yet" would otherwise poll at your expense indefinitely.
+
+## Two agents in one checkout
+
+Thread locks are keyed by thread, which was fine while a thread was the only
+way to start work. Filing a task under a project broke that: the task opens a
+*new* thread pointed at the project's directory, so a queued task and an
+ordinary conversation about the same repo run at once. Two agents in one
+working tree do not merely race on files — one running `git checkout` moves
+the ground under the other.
+
+So a turn also holds its **checkout** for its duration. Only real repo roots
+are serialised: the shared scratch directory holds a dozen unrelated projects,
+and locking that would queue every thread behind every other for nothing. The
+guard is taken inside the thread lock at both call sites, so the ordering is
+consistent and cannot deadlock, and a turn that has to wait says so in its
+progress message rather than appearing hung.
+
+This trades throughput for safety, which is the right way round here: waiting
+is visible and recoverable, and a half-applied edit from two agents is not.
+Worktree isolation (`scope.worktree`, still a no-op) is the way to get the
+parallelism back later.
+
+**A project pointed at a real checkout is never ours to write.** `!project`
+sets a project's cwd from the thread it was run in and leaves `repo` empty, so
+keying "is this ours" on that field alone let a project pointed at a working
+repo look repo-less — and the brief rewriter would have replaced a
+hand-written CLAUDE.md with a generated paragraph. The check asks the
+filesystem: a directory containing `.git` is yours, however the record was
+filled in.

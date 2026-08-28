@@ -7,6 +7,7 @@ bootstrap, Slack approval buttons, per-channel working dirs, session hygiene,
 and a user allowlist.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -169,6 +170,59 @@ _channels_cache: dict[str, str] = {}
 def _thread_lock(key: str) -> threading.Lock:
     with _thread_locks_guard:
         return _thread_locks.setdefault(key, threading.Lock())
+
+
+#: Serialises turns that share a git working tree, keyed by resolved path.
+_repo_locks: dict[str, threading.Lock] = {}
+_repo_locks_guard = threading.Lock()
+
+
+def _repo_lock(cwd):          # -> threading.Lock | None
+    # Unannotated on purpose: threading.Lock is a factory function, not a
+    # class, so `threading.Lock | None` raises TypeError at import on 3.12.
+    """The lock for a checkout, or None if this directory is not one.
+
+    Only actual repo roots are serialised. The shared scratch directory holds
+    a dozen unrelated projects, and locking that would queue every thread
+    behind every other for no benefit.
+    """
+    try:
+        path = Path(cwd).resolve()
+    except Exception:
+        return None
+    if not (path / ".git").exists():
+        return None
+    with _repo_locks_guard:
+        return _repo_locks.setdefault(str(path), threading.Lock())
+
+
+@contextlib.contextmanager
+def repo_guard(cwd, progress=None):
+    """Hold a checkout for the duration of a turn.
+
+    Thread locks are keyed by thread, so nothing stopped two sessions editing
+    one working tree at once -- and filing a task under a project opens a
+    *new* thread in that project's directory, which makes the collision the
+    normal case rather than a corner. Two agents in one checkout do not merely
+    race on files: one running `git checkout` moves the ground under the other.
+
+    Taken inside the thread lock at both call sites, so the ordering is
+    consistent and cannot deadlock.
+    """
+    lock = _repo_lock(cwd)
+    if lock is None:
+        yield
+        return
+    if not lock.acquire(blocking=False):
+        log.info("waiting on another turn already working in %s", cwd)
+        if progress:
+            progress.update(":hourglass_flowing_sand: _Waiting for another thread "
+                            "working in the same checkout…_")
+        lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _dedup(channel: str, ts: str) -> bool:
@@ -1449,7 +1503,7 @@ def handle_prompt(event: dict, say, client) -> None:
         progress.update(":hourglass_flowing_sand: _Queued behind an earlier message in this thread…_")
 
     try:
-        with lock:
+        with lock, repo_guard(cwd, progress):
             entry = store.get(key) or {}
             session_id = entry.get("session_id")
             log.info("thread=%s session=%s cwd=%s prompt=%r", key, session_id or "NEW", cwd, text[:120])
@@ -1701,7 +1755,7 @@ def execute_task(task: dict) -> None:
 
     lock = _thread_lock(key)
     try:
-        with lock:
+        with lock, repo_guard(cwd, progress):
             entry = store.get(key) or {}
             # A fresh role starts its own session; resuming the thread's would
             # hand the reviewer the very conversation it is meant to audit.
