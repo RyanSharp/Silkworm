@@ -671,6 +671,82 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+# --- a turn may run as long as it is still working -------------------------------
+# The 900s wall clock killed three real turns in three days -- a strategy
+# backtest and two game-dev iterations -- because elapsed time cannot tell
+# progress from a wedge. Only silence can.
+
+def test_turn_deadline_is_idleness():
+    import claude_runner as CR
+    print("\nturns end on silence, not on the clock")
+
+    # A stand-in for the real binary: it must be executable and ignore the
+    # flags run_turn always passes (-p, --output-format ...), so parameters
+    # come through the environment instead of argv.
+    fake = Path(tempfile.mkdtemp()) / "fakeclaude"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'exec "$PYBIN" -c \'\n'
+        "import json, os, sys, time\n"
+        "sys.stdin.read()\n"
+        "chatty = float(os.environ[\"CHATTY\"]); quiet = float(os.environ[\"QUIET\"])\n"
+        "end = time.time() + chatty\n"
+        "while time.time() < end:\n"
+        "    print(json.dumps({\"type\": \"system\", \"subtype\": \"init\",\n"
+        "                      \"session_id\": \"fake-session\"}), flush=True)\n"
+        "    time.sleep(0.2)\n"
+        "time.sleep(quiet)\n"
+        "print(json.dumps({\"type\": \"result\", \"result\": \"done\",\n"
+        "                  \"session_id\": \"fake-session\"}), flush=True)\n"
+        "'\n")
+    fake.chmod(0o755)
+
+    def run(chatty, quiet, **kw):
+        env = {**os.environ, "PYBIN": sys.executable,
+               "CHATTY": str(chatty), "QUIET": str(quiet)}
+        return CR.run_turn("go", binary=str(fake), cwd=str(BASE),
+                           permission_args=[], env=env, **kw)
+
+    # Busy for far longer than the idle limit: must survive.
+    t0 = time.time()
+    r = run(6, 0, timeout=0, idle_timeout=3)
+    busy = time.time() - t0
+    check("a turn that keeps working outlives the idle limit",
+          r.text == "done" and busy > 5,
+          f"ran {busy:.1f}s under a 3s idle limit")
+
+    # Quiet for longer than the idle limit: must die, and say why.
+    try:
+        run(0.5, 30, timeout=0, idle_timeout=3)
+        check("a silent turn is stopped", False, "it was allowed to hang")
+    except CR.ClaudeTimeout as e:
+        check("a silent turn is stopped", True)
+        check("and the error names silence, not elapsed time",
+              "no output" in str(e) and "as long as it likes" in str(e), str(e)[:90])
+
+    # The absolute cap still exists for anyone who wants one.
+    try:
+        run(30, 0, timeout=3, idle_timeout=0)
+        check("an explicit absolute cap still applies", False, "it ran past the cap")
+    except CR.ClaudeTimeout as e:
+        check("an explicit absolute cap still applies", "timed out after 3s" in str(e),
+              str(e)[:80])
+
+    check("a timeout is still not treated as a dead session",
+          issubclass(CR.ClaudeTimeout, CR.ClaudeError))
+
+    src = (BASE / "claude_runner.py").read_text()
+    check("any output counts as alive, even lines we cannot parse",
+          src.index("last_seen[0] = time.monotonic()") < src.index("line = line.strip()"),
+          "the question is whether the process is doing anything")
+    bot = (BASE / "bot.py").read_text()
+    check("turns run uncapped by default",
+          'os.environ.get("CLAUDE_TIMEOUT", "0")' in bot)
+    check("the reaper is keyed off the idle limit, not the absolute cap",
+          "max(CLAUDE_IDLE_TIMEOUT * 2, CLAUDE_TIMEOUT * 2, 3600)" in bot,
+          "deriving a bound from a cap of 0 would reap orphans mid-work")
+
+
 # --- "get back to me when it's done" --------------------------------------------
 # A turn is request/response: one prompt in, one reply out, and the session is
 # dormant either side of it. Held open, a watch hits the 15 minute cap, holds
@@ -1463,6 +1539,7 @@ if __name__ == "__main__":
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer,
+              test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_dashboard_js_is_whole):

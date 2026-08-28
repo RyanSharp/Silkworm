@@ -96,7 +96,8 @@ def run_turn(
     append_system_prompt: str | None = None,
     extra_args: list[str] = (),
     env: dict | None = None,
-    timeout: int = 900,
+    timeout: int = 0,          # absolute cap; 0 = none, let it run
+    idle_timeout: int = 1800,  # kill only after this long with no output at all
     on_init=None,      # fn(session_id)
     on_activity=None,  # fn(tool_name, tool_input)
     on_start=None,     # fn(RunHandle)
@@ -131,15 +132,34 @@ def run_turn(
     if on_start:
         on_start(handle)
 
+    # A wall-clock cap cannot tell work from a wedge: it kills a legitimate
+    # two-hour refactor exactly as readily as a hung process. What distinguishes
+    # them is whether anything is still coming out. So the deadline is on
+    # *silence*, and the absolute cap is optional and off by default.
     timed_out = threading.Event()
+    idle_killed = threading.Event()
+    finished = threading.Event()
+    last_seen = [time.monotonic()]
 
-    def _kill_on_timeout():
-        timed_out.set()
-        handle.stop()
+    def _watch():
+        started = time.monotonic()
+        # Check often enough that a short idle limit is honoured promptly, but
+        # never faster than is useful for a half-hour one.
+        tick = max(1.0, min(15.0, (idle_timeout or 60) / 4))
+        while not finished.wait(tick):
+            now = time.monotonic()
+            if idle_timeout and now - last_seen[0] > idle_timeout:
+                idle_killed.set()
+                timed_out.set()
+                handle.stop()
+                return
+            if timeout and now - started > timeout:
+                timed_out.set()
+                handle.stop()
+                return
 
-    timer = threading.Timer(timeout, _kill_on_timeout)
-    timer.start()
-    timed_out.clear()
+    watchdog = threading.Thread(target=_watch, daemon=True, name="turn-watchdog")
+    watchdog.start()
 
     result = TurnResult()
     saw_result = False
@@ -148,6 +168,10 @@ def run_turn(
         proc.stdin.close()
 
         for line in proc.stdout:
+            # Any output at all counts as being alive -- including lines we do
+            # not parse. The question is whether the process is doing anything,
+            # not whether it said something we understand.
+            last_seen[0] = time.monotonic()
             line = line.strip()
             if not line:
                 continue
@@ -180,8 +204,8 @@ def run_turn(
         stderr = proc.stderr.read()
         proc.wait()
     finally:
-        timer.cancel()
-        # Cancelling the timer removes the child's only deadline, so if we are
+        finished.set()
+        # Stopping the watchdog removes the child's only deadline, so if we are
         # leaving while it is still alive (any error path out of the read loop)
         # it would run forever with nobody reading it. Never abandon a child.
         if proc.poll() is None:
@@ -194,6 +218,11 @@ def run_turn(
             pass
 
     if handle.stopped:
+        if idle_killed.is_set():
+            raise ClaudeTimeout(
+                f"Claude produced no output for {idle_timeout}s and was stopped. "
+                "A turn may run as long as it likes while it is still working; "
+                "this one had gone quiet.")
         if timed_out.is_set():
             raise ClaudeTimeout(f"Claude timed out after {timeout}s.")
         raise ClaudeStopped("Stopped by user.")

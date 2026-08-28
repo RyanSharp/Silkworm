@@ -125,8 +125,30 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `CLAUDE_MODEL` | CLI default | Default model (per-thread override with `!model`) |
 | `CLAUDE_APPROVAL_MODE` | `skip` | `skip` = full autonomy, `slack` = approval buttons, `gated` = plain permission mode |
 | `APPROVAL_AUTO_ALLOW` | read-only tools | Tools that never need approval in `slack` mode |
-| `CLAUDE_TIMEOUT` | `900` | Per-turn timeout (seconds) |
+| `CLAUDE_TIMEOUT` | `0` | Absolute per-turn cap in seconds; `0` = none |
+| `CLAUDE_IDLE_TIMEOUT` | `1800` | Stop a turn after this long with **no output at all** |
 | `SESSION_MAX_AGE_DAYS` | `30` | Forget idle thread sessions after this long |
+
+## How long a turn may run
+
+**As long as it is still working.** A turn used to be capped at 900 seconds,
+which killed real work — a strategy backtest, a long refactor — because elapsed
+time cannot distinguish progress from a wedge.
+
+What ends a turn now is **silence**. Anything arriving on the process's output
+resets the clock, including lines Silkworm does not parse; the question is
+whether the process is doing anything, not whether it said something legible.
+Only after `CLAUDE_IDLE_TIMEOUT` (default 30 minutes) with nothing at all is the
+turn stopped, and the error says so rather than blaming the clock.
+
+The limit is generous on purpose: a single tool call is legitimately quiet while
+it runs, though Claude Code caps Bash at 10 minutes, so half an hour of total
+silence means something is genuinely stuck. Set `CLAUDE_TIMEOUT` if you also
+want a hard ceiling; it is off by default.
+
+Some backstop is necessary rather than optional. A turn holds its thread's lock,
+so a wedged one that never dies makes that thread unusable forever — which is
+exactly the failure that once left a child running for 24 hours.
 
 ## How approval mode works
 

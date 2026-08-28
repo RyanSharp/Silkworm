@@ -60,7 +60,14 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_CWD = Path(os.environ.get("CLAUDE_CWD", BASE_DIR / "workspace"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "900"))
+# A turn may run as long as it is still working. The old 900s wall clock cut
+# off real work -- a strategy backtest, a long refactor -- because elapsed
+# time cannot tell progress from a wedge. 0 means no absolute cap.
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "0"))
+# What actually ends a turn: silence. Generous, because a single tool call
+# is legitimately quiet while it runs (Claude Code caps Bash at 10 minutes),
+# so this only fires on a process that has genuinely stopped doing anything.
+CLAUDE_IDLE_TIMEOUT = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800"))
 #: Absolute, because a turn's PATH is not ours to assume.
 SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
@@ -1471,7 +1478,7 @@ def handle_prompt(event: dict, say, client) -> None:
                 binary=CLAUDE_BIN, cwd=cwd, permission_args=permission_args(),
                 model=model, append_system_prompt=system_note,
                 extra_args=CLAUDE_EXTRA_ARGS, env=claude_env(key),
-                timeout=CLAUDE_TIMEOUT,
+                timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                 on_init=on_init, on_activity=on_activity, on_start=on_start,
             )
             # The outbox dir is shared by every turn in this thread, so its
@@ -1710,7 +1717,7 @@ def execute_task(task: dict) -> None:
                     model=entry.get("model") or CLAUDE_MODEL,
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
                     env=claude_env(key, task.get("defers") or 0),
-                    timeout=CLAUDE_TIMEOUT,
+                    timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                     on_init=lambda sid: task_store.update(tid, session_id=sid),
                     on_activity=lambda n, i: progress.update(
                         f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
@@ -2125,7 +2132,10 @@ def reap_runaways(max_age_s: float) -> int:
 
 def _watchdog() -> None:
     # Generous: a legitimate long turn must never be mistaken for a runaway.
-    bound = max(CLAUDE_TIMEOUT * 2, 3600)
+    # Keyed off the idle limit rather than the absolute cap, which is now
+    # normally 0 -- deriving a bound from that would have made it a flat hour
+    # and started reaping orphaned children in the middle of real work.
+    bound = max(CLAUDE_IDLE_TIMEOUT * 2, CLAUDE_TIMEOUT * 2, 3600)
     while True:
         time.sleep(300)
         try:
