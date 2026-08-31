@@ -29,6 +29,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import uuid
 from pathlib import Path
@@ -251,11 +252,71 @@ def do_status() -> None:
               f"down for {int(down // 60)}m — it should self-restart; silkworm logs")
     check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
     check("session hooks installed", hooks_installed())
+
+    # A stale credential kills every turn and says nothing until you notice the
+    # failures, so it gets checked rather than discovered.
+    st = creds_state()
+    if st["mode"] == "token":
+        ok("auth: long-lived token (immune to Keychain/file drift)")
+    elif st["mode"] == "oauth":
+        h = st["refresh_expires_in_h"]
+        check(f"claude credentials valid ({h/24:.1f}d left on the refresh token)",
+              h > 24, "run: claude setup-token — see the auth note in the README")
+    else:
+        check("claude credentials readable", False,
+              f"{CREDS} is {st['mode']}")
+    if st["mode"] != "token":
+        check("only one credential store in play", not keychain_item_present(),
+              "a Keychain copy ages out separately and breaks headless turns")
     threads = bot.get("threads", {})
     if threads:
         running = sum(1 for t in threads.values() if t.get("running"))
         out = sum(1 for t in threads.values() if t.get("checked_out"))
         print(f"    {len(threads)} threads · {running} running · {out} checked out to terminal")
+
+
+CREDS = Path.home() / ".claude" / ".credentials.json"
+
+
+def env_has(name: str) -> bool:
+    """Whether .env sets a variable, without reading its value."""
+    try:
+        for line in (REPO / ".env").read_text().splitlines():
+            if line.strip().startswith(f"{name}="):
+                return True
+    except OSError:
+        pass
+    return bool(os.environ.get(name))
+
+
+def keychain_item_present() -> bool:
+    """The second credential store. Its existence is the bug, not its contents.
+
+    Claude Code keeps OAuth creds in the login Keychain when it can reach it and
+    in a file when it cannot. An interactive login only refreshes the file, so a
+    Keychain copy ages out unnoticed and every headless turn starts failing --
+    which is exactly what happened on 2026-08-30.
+    """
+    return subprocess.run(
+        ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+        capture_output=True).returncode == 0
+
+
+def creds_state() -> dict:
+    """Freshness of the credentials headless turns run on.
+
+    Returns times and booleans only -- never a token. This is printed.
+    """
+    if env_has("CLAUDE_CODE_OAUTH_TOKEN"):
+        return {"mode": "token"}
+    if not CREDS.exists():
+        return {"mode": "missing"}
+    try:
+        o = json.loads(CREDS.read_text()).get("claudeAiOauth") or {}
+        exp = float(o.get("refreshTokenExpiresAt", 0)) / 1000
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"mode": "unreadable"}
+    return {"mode": "oauth", "refresh_expires_in_h": (exp - time.time()) / 3600}
 
 
 def do_defer(argv) -> None:

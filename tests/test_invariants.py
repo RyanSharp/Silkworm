@@ -696,6 +696,57 @@ def _repo_guard_impl():
     return mod
 
 
+# --- a stale credential must be visible before it kills every turn ---------------
+# On 2026-08-30 Claude Code's two credential stores drifted: interactive logins
+# only refreshed the file, the Keychain copy aged out, and every headless turn
+# failed with "OAuth session expired". Nothing reported it -- it was found by
+# noticing the failures.
+
+def test_credentials_check():
+    import importlib.machinery, importlib.util, json as _j, time as _t
+    print("\ncredential freshness is checked, not discovered")
+
+    loader = importlib.machinery.SourceFileLoader("sw", str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("sw", loader)
+    sw = importlib.util.module_from_spec(spec)
+    loader.exec_module(sw)                      # safe: main() is __main__-guarded
+
+    tmp = Path(tempfile.mkdtemp())
+    sw.CREDS = tmp / "missing.json"
+    sw.env_has = lambda name: False
+    check("a missing credentials file is reported, not ignored",
+          sw.creds_state()["mode"] == "missing")
+
+    bad = tmp / "bad.json"; bad.write_text("{not json")
+    sw.CREDS = bad
+    check("an unreadable one is reported too", sw.creds_state()["mode"] == "unreadable")
+
+    good = tmp / "good.json"
+    good.write_text(_j.dumps({"claudeAiOauth": {
+        "refreshTokenExpiresAt": (_t.time() + 3 * 86400) * 1000,
+        "accessToken": "sk-must-not-be-printed"}}))
+    sw.CREDS = good
+    st = sw.creds_state()
+    check("a healthy one reports days remaining",
+          st["mode"] == "oauth" and 71 < st["refresh_expires_in_h"] < 73, str(st))
+    check("and never returns the token itself",
+          not any("must-not-be-printed" in str(v) for v in st.values()),
+          "this value gets printed to a terminal")
+
+    sw.env_has = lambda name: name == "CLAUDE_CODE_OAUTH_TOKEN"
+    check("a long-lived token short-circuits the whole question",
+          sw.creds_state()["mode"] == "token",
+          "it bypasses both stores, so drift cannot happen")
+
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("status warns before expiry, not after", "h > 24" in cli,
+          "a credential that dies overnight takes every turn with it")
+    check("status flags the second store existing at all",
+          "only one credential store in play" in cli,
+          "the Keychain copy is what drifted")
+    check("the fix is named in the failure message", "claude setup-token" in cli)
+
+
 def test_repo_guard():
     import threading, time as _t
     G = _repo_guard_impl()
@@ -1642,6 +1693,7 @@ if __name__ == "__main__":
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard,
+              test_credentials_check,
               test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,

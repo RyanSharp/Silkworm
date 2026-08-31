@@ -129,6 +129,36 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `CLAUDE_IDLE_TIMEOUT` | `1800` | Stop a turn after this long with **no output at all** |
 | `SESSION_MAX_AGE_DAYS` | `30` | Forget idle thread sessions after this long |
 
+## Authentication for headless turns
+
+Claude Code keeps OAuth credentials in **two** places — the login Keychain when
+a process can reach it, and `~/.claude/.credentials.json` when it cannot — and
+nothing keeps them in step. An interactive login refreshes only the file, so a
+Keychain copy ages out unnoticed and then every headless turn fails with
+`OAuth session expired and could not be refreshed`, while `claude` in your
+terminal keeps working. That happened on 2026-08-30.
+
+`silkworm status` now reports how long the refresh token has left and warns
+below a day, and flags a Keychain copy existing at all, since its existence is
+what allows the drift.
+
+The durable fix bypasses both stores:
+
+```sh
+claude setup-token                 # interactive; needs a browser
+read -rs TOKEN && printf '\nCLAUDE_CODE_OAUTH_TOKEN=%s\n' "$TOKEN" >> .env && unset TOKEN
+silkworm restart
+```
+
+It goes in `.env`, not the plist: `.env` is gitignored, is already loaded into
+the environment the bot hands each turn, and this repo keeps secrets out of
+service definitions. `read -rs` keeps the token off your screen and out of
+shell history.
+
+Note that a shell test will not reproduce this class of bug — a terminal and a
+launchd agent differ precisely in whether they can reach the Keychain. Trust
+whether real turns are succeeding, or test from a throwaway launchd job.
+
 ## How long a turn may run
 
 **As long as it is still working.** A turn used to be capped at 900 seconds,
