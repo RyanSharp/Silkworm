@@ -256,18 +256,23 @@ def do_status() -> None:
     # A stale credential kills every turn and says nothing until you notice the
     # failures, so it gets checked rather than discovered.
     st = creds_state()
+    where = ", ".join(st.get("stores") or []) or "nowhere"
     if st["mode"] == "token":
         ok("auth: long-lived token (immune to Keychain/file drift)")
     elif st["mode"] == "oauth":
         h = st["hours_left"]
-        check(f"claude credentials valid ({h/24:.1f}d left on the refresh token)",
+        check(f"claude credentials valid ({h/24:.1f}d left, from the {st['source']})",
               h > 24, "run: claude setup-token — see the auth note in the README")
     else:
         check("claude credentials readable", False,
-              f"credentials are {st['mode']}")
+              f"credentials are {st['mode']} (stores: {where})")
     if st["mode"] != "token":
-        check("only one credential store in play", not keychain_item_present(),
-              "a Keychain copy ages out separately and breaks headless turns")
+        # Two is the dangerous number, not one. Which single store is in use has
+        # already changed under us once, and that is fine; both at once is not.
+        check(f"credentials live in exactly one place ({where})",
+              len(st.get("stores") or []) == 1,
+              "two copies drift, and which one a process uses depends on whether "
+              "it can reach the Keychain")
     threads = bot.get("threads", {})
     if threads:
         running = sum(1 for t in threads.values() if t.get("running"))

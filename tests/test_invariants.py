@@ -712,9 +712,30 @@ def test_credentials_check():
     check("a long-lived token short-circuits the question",
           C.state(has_token=True)["mode"] == "token",
           "it bypasses both stores, so neither drift nor expiry applies")
+    # Which single store holds the credentials has already changed under us: on
+    # 2026-08-31 they moved from the file into the Keychain, and a check that
+    # only knew about the file called that "missing" while every turn succeeded.
+    real_stores = C.stores
+    C.stores = lambda path=None: []
     check("a missing file is reported, not ignored",
           C.state(path=tmp / "nope.json")["mode"] == "missing")
+    C.stores = lambda path=None: ["keychain"]
+    C._keychain_read = lambda: {"claudeAiOauth": {
+        "refreshTokenExpiresAt": (_t.time() + 40 * 3600) * 1000}}
+    st = C.state(path=tmp / "nope.json")
+    check("credentials only in the Keychain are found, not called missing",
+          st["mode"] == "oauth" and st["source"] == "keychain",
+          f"got {st.get('mode')} — this said 'every turn will fail' while they were succeeding")
+    check("and that is not itself a problem worth warning about",
+          C.warning(st) == "", "one store is fine; two is the bug")
+    C.stores = lambda path=None: ["file", "keychain"]
+    both = C.warning({"mode": "oauth", "stores": ["file", "keychain"], "hours_left": 999})
+    check("two stores at once does warn, whatever their expiry",
+          "two places" in both,
+          "that pairing is exactly what broke every headless turn on 2026-08-30")
+    C.stores = real_stores
     bad = tmp / "bad.json"; bad.write_text("{not json")
+    C.stores = lambda path=None: ["file"]
     check("an unreadable one too", C.state(path=bad)["mode"] == "unreadable")
 
     def creds(hours):
@@ -724,6 +745,7 @@ def test_credentials_check():
             "accessToken": "sk-must-not-be-printed"}}))
         return f
 
+    C.stores = lambda path=None: ["file"]
     healthy = C.state(path=creds(72))
     check("a healthy credential reports hours remaining",
           healthy["mode"] == "oauth" and 71 < healthy["hours_left"] < 73)
