@@ -345,3 +345,28 @@ repo look repo-less — and the brief rewriter would have replaced a
 hand-written CLAUDE.md with a generated paragraph. The check asks the
 filesystem: a directory containing `.git` is yours, however the record was
 filled in.
+
+## Credentials die on a schedule
+
+Claude Code keeps OAuth credentials in the login Keychain when a process can
+reach one and in `~/.claude/.credentials.json` when it cannot, and nothing keeps
+the two in step. An interactive login refreshes only the file, so a Keychain
+copy ages out unnoticed and every headless turn fails while `claude` in a
+terminal keeps working. That is a hard failure to diagnose from the symptom.
+
+Worse, the refresh token's expiry is **fixed** — it does not roll forward when
+the access token is refreshed (observed unchanged across a day and several
+refreshes). So this is a scheduled outage, not a risk, and **a restart cannot
+fix it**: the expired token is on disk and restarting re-reads the same file.
+That matters because restarting is the first thing anyone tries.
+
+So the bot warns a day ahead in Slack, once per credential rather than hourly,
+re-arming when a new one appears, and `silkworm status` reports the time
+remaining. Both read one module, because two copies of a credential parser is
+one too many. Neither ever returns the token: a check that leaks the credential
+it is checking would be a worse bug than the one it catches.
+
+A configured `CLAUDE_CODE_OAUTH_TOKEN` silences all of it, since it bypasses
+both stores. Note that an *invalid* one overrides the working credentials file
+rather than falling back to it — so a bad token is worse than none, and worth
+verifying against a real turn rather than a shell test.

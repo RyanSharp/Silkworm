@@ -30,6 +30,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import backfill
+import credentials
 import defer
 import email_ingest
 import harvester
@@ -2005,6 +2006,38 @@ def _backfiller() -> None:
         log.exception("backfill pass failed")
 
 
+#: Remembers which expiry we have already warned about, so a new credential
+#: re-arms the warning and an old one does not nag hourly.
+_warned_expiry = [0.0]
+
+
+def _credential_watcher() -> None:
+    """Say something before the credentials die, not after.
+
+    A restart cannot fix an expired token -- it is on disk, and restarting
+    re-reads the same file -- so the only useful moment is beforehand. The
+    refresh token's expiry does not roll forward when the access token is
+    refreshed, which makes it a scheduled outage rather than a risk.
+    """
+    time.sleep(120)          # let the bot settle before it talks
+    while True:
+        try:
+            st = credentials.state(has_token=bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")))
+            msg = credentials.warning(st)
+            expiry = st.get("expires_at", 0.0)
+            if msg and expiry != _warned_expiry[0]:
+                channel = home_channel()
+                if channel:
+                    app.client.chat_postMessage(channel=channel, text=msg)
+                    _warned_expiry[0] = expiry
+                    log.warning("credential warning posted: %s", st.get("mode"))
+            elif not msg:
+                _warned_expiry[0] = 0.0      # healthy again; re-arm
+        except Exception:
+            log.exception("credential check failed")
+        time.sleep(3600)
+
+
 def _task_runner() -> None:
     """Execute tasks nobody else is driving, one at a time.
 
@@ -2231,6 +2264,7 @@ if __name__ == "__main__":
     threading.Thread(target=_backfiller, daemon=True, name="backfill").start()
     threading.Thread(target=_task_runner, daemon=True, name="task-runner").start()
     threading.Thread(target=_email_watcher, daemon=True, name="email").start()
+    threading.Thread(target=_credential_watcher, daemon=True, name="creds").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

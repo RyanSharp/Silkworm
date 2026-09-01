@@ -259,12 +259,12 @@ def do_status() -> None:
     if st["mode"] == "token":
         ok("auth: long-lived token (immune to Keychain/file drift)")
     elif st["mode"] == "oauth":
-        h = st["refresh_expires_in_h"]
+        h = st["hours_left"]
         check(f"claude credentials valid ({h/24:.1f}d left on the refresh token)",
               h > 24, "run: claude setup-token — see the auth note in the README")
     else:
         check("claude credentials readable", False,
-              f"{CREDS} is {st['mode']}")
+              f"credentials are {st['mode']}")
     if st["mode"] != "token":
         check("only one credential store in play", not keychain_item_present(),
               "a Keychain copy ages out separately and breaks headless turns")
@@ -275,7 +275,8 @@ def do_status() -> None:
         print(f"    {len(threads)} threads · {running} running · {out} checked out to terminal")
 
 
-CREDS = Path.home() / ".claude" / ".credentials.json"
+sys.path.insert(0, str(REPO))
+import credentials                                   # noqa: E402
 
 
 def env_has(name: str) -> bool:
@@ -289,34 +290,12 @@ def env_has(name: str) -> bool:
     return bool(os.environ.get(name))
 
 
-def keychain_item_present() -> bool:
-    """The second credential store. Its existence is the bug, not its contents.
-
-    Claude Code keeps OAuth creds in the login Keychain when it can reach it and
-    in a file when it cannot. An interactive login only refreshes the file, so a
-    Keychain copy ages out unnoticed and every headless turn starts failing --
-    which is exactly what happened on 2026-08-30.
-    """
-    return subprocess.run(
-        ["security", "find-generic-password", "-s", "Claude Code-credentials"],
-        capture_output=True).returncode == 0
-
-
 def creds_state() -> dict:
-    """Freshness of the credentials headless turns run on.
+    return credentials.state(has_token=env_has("CLAUDE_CODE_OAUTH_TOKEN"))
 
-    Returns times and booleans only -- never a token. This is printed.
-    """
-    if env_has("CLAUDE_CODE_OAUTH_TOKEN"):
-        return {"mode": "token"}
-    if not CREDS.exists():
-        return {"mode": "missing"}
-    try:
-        o = json.loads(CREDS.read_text()).get("claudeAiOauth") or {}
-        exp = float(o.get("refreshTokenExpiresAt", 0)) / 1000
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {"mode": "unreadable"}
-    return {"mode": "oauth", "refresh_expires_in_h": (exp - time.time()) / 3600}
+
+def keychain_item_present() -> bool:
+    return credentials.keychain_item_present()
 
 
 def do_defer(argv) -> None:

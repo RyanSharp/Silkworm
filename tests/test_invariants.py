@@ -697,54 +697,67 @@ def _repo_guard_impl():
 
 
 # --- a stale credential must be visible before it kills every turn ---------------
-# On 2026-08-30 Claude Code's two credential stores drifted: interactive logins
-# only refreshed the file, the Keychain copy aged out, and every headless turn
-# failed with "OAuth session expired". Nothing reported it -- it was found by
-# noticing the failures.
+# On 2026-08-30 Claude Code's two credential stores drifted and every headless
+# turn failed with "OAuth session expired" while `claude` in a terminal worked.
+# Nothing reported it; it was found by noticing failed tasks. The refresh
+# token's expiry does not roll forward on refresh, so this is a scheduled
+# outage, and a restart cannot fix it -- the dead token is on disk.
 
 def test_credentials_check():
-    import importlib.machinery, importlib.util, json as _j, time as _t
-    print("\ncredential freshness is checked, not discovered")
-
-    loader = importlib.machinery.SourceFileLoader("sw", str(BASE / "bin" / "silkworm"))
-    spec = importlib.util.spec_from_loader("sw", loader)
-    sw = importlib.util.module_from_spec(spec)
-    loader.exec_module(sw)                      # safe: main() is __main__-guarded
+    import credentials as C
+    import json as _j, time as _t
+    print("\ncredential expiry is announced, not discovered")
 
     tmp = Path(tempfile.mkdtemp())
-    sw.CREDS = tmp / "missing.json"
-    sw.env_has = lambda name: False
-    check("a missing credentials file is reported, not ignored",
-          sw.creds_state()["mode"] == "missing")
-
+    check("a long-lived token short-circuits the question",
+          C.state(has_token=True)["mode"] == "token",
+          "it bypasses both stores, so neither drift nor expiry applies")
+    check("a missing file is reported, not ignored",
+          C.state(path=tmp / "nope.json")["mode"] == "missing")
     bad = tmp / "bad.json"; bad.write_text("{not json")
-    sw.CREDS = bad
-    check("an unreadable one is reported too", sw.creds_state()["mode"] == "unreadable")
+    check("an unreadable one too", C.state(path=bad)["mode"] == "unreadable")
 
-    good = tmp / "good.json"
-    good.write_text(_j.dumps({"claudeAiOauth": {
-        "refreshTokenExpiresAt": (_t.time() + 3 * 86400) * 1000,
-        "accessToken": "sk-must-not-be-printed"}}))
-    sw.CREDS = good
-    st = sw.creds_state()
-    check("a healthy one reports days remaining",
-          st["mode"] == "oauth" and 71 < st["refresh_expires_in_h"] < 73, str(st))
+    def creds(hours):
+        f = tmp / f"c{hours}.json"
+        f.write_text(_j.dumps({"claudeAiOauth": {
+            "refreshTokenExpiresAt": (_t.time() + hours * 3600) * 1000,
+            "accessToken": "sk-must-not-be-printed"}}))
+        return f
+
+    healthy = C.state(path=creds(72))
+    check("a healthy credential reports hours remaining",
+          healthy["mode"] == "oauth" and 71 < healthy["hours_left"] < 73)
     check("and never returns the token itself",
-          not any("must-not-be-printed" in str(v) for v in st.values()),
-          "this value gets printed to a terminal")
+          not any("must-not-be-printed" in str(v) for v in healthy.values()),
+          "this is printed to a terminal and posted to Slack")
+    check("a healthy credential says nothing", C.warning(healthy) == "")
 
-    sw.env_has = lambda name: name == "CLAUDE_CODE_OAUTH_TOKEN"
-    check("a long-lived token short-circuits the whole question",
-          sw.creds_state()["mode"] == "token",
-          "it bypasses both stores, so drift cannot happen")
+    soon = C.warning(C.state(path=creds(5)))
+    check("one about to expire warns", soon.startswith(":key:"))
+    check("the warning says a restart will not help",
+          "restarting will not help" in soon,
+          "that is the first thing anyone tries, and it re-reads the same file")
+    check("and names the actual fix", "claude setup-token" in soon)
+    check("an already-expired one still warns",
+          "have expired" in C.warning(C.state(path=creds(-2))))
+    check("a missing file warns too", C.warning({"mode": "missing"}).startswith(":key:"))
+
+    bot = (BASE / "bot.py").read_text()
+    w = bot[bot.index("def _credential_watcher"):bot.index("def _task_runner")]
+    check("the bot warns on its own, without being asked",
+          'name="creds"' in bot and "chat_postMessage" in w)
+    check("it warns once per credential, not hourly",
+          "_warned_expiry" in w and 'expiry != _warned_expiry[0]' in w,
+          "a nag every hour is a nag you filter out")
+    check("a replaced credential re-arms the warning",
+          "_warned_expiry[0] = 0.0" in w)
+    check("a configured token silences it entirely",
+          'os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")' in w)
 
     cli = (BASE / "bin" / "silkworm").read_text()
-    check("status warns before expiry, not after", "h > 24" in cli,
-          "a credential that dies overnight takes every turn with it")
-    check("status flags the second store existing at all",
-          "only one credential store in play" in cli,
-          "the Keychain copy is what drifted")
-    check("the fix is named in the failure message", "claude setup-token" in cli)
+    check("the CLI shares the module rather than copying it",
+          "import credentials" in cli and "def state(" not in cli,
+          "two copies of a credential parser is one too many")
 
 
 def test_repo_guard():
