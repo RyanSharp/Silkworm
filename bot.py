@@ -959,8 +959,13 @@ def handle_status(payload: dict) -> dict:
         }
     # "online" only ever meant "this HTTP server answered", which stayed true
     # through a seventeen-hour Slack outage. Report the link separately.
+    # Reports what *this process* resolved, not what .env says now. Editing
+    # .env without restarting is the normal case, and a check that reads the
+    # file would call that fixed while the running bot still had the old value.
+    auth = credentials.state(has_token=bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")))
+    auth.pop("expires_at", None)
     return {"online": True, "threads": threads,
-            "slack": slack.status(time.time())}
+            "slack": slack.status(time.time()), "auth": auth}
 
 
 def handle_web_message(payload: dict) -> dict:

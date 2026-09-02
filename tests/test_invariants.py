@@ -781,6 +781,28 @@ def test_credentials_check():
           "import credentials" in cli and "def state(" not in cli,
           "two copies of a credential parser is one too many")
 
+    # The token branch of `silkworm status` had never executed until a token was
+    # actually configured, and it called ok() -- which does not exist; only
+    # check(label, ok, hint) does. Driven for real rather than grepped.
+    env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-fake"}
+    r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "status"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    blob = r.stdout + r.stderr
+    check("status survives token mode", "Traceback" not in blob,
+          blob.strip().splitlines()[-1] if blob.strip() else "no output")
+    check("and says so", "long-lived token" in blob, blob[-160:])
+
+    # Editing .env without restarting is the normal case; the running bot and
+    # the file disagree until then, and that gap is the thing worth reporting.
+    check("status compares the running bot against .env",
+          'bot.get("auth")' in cli and "running bot matches .env" in cli,
+          "reading the file alone would call a stale bot fixed")
+    bot_src = (BASE / "bot.py").read_text()
+    check("the bot reports the auth it actually resolved",
+          '"auth": auth' in bot_src and "credentials.state(has_token=" in bot_src)
+    check("and never ships an expiry timestamp it does not need",
+          'auth.pop("expires_at", None)' in bot_src)
+
 
 def test_repo_guard():
     import threading, time as _t

@@ -255,10 +255,17 @@ def do_status() -> None:
 
     # A stale credential kills every turn and says nothing until you notice the
     # failures, so it gets checked rather than discovered.
-    st = creds_state()
+    # What the bot resolved beats what .env currently says: editing .env without
+    # restarting leaves the two disagreeing, and that gap is worth surfacing
+    # rather than papering over.
+    st = bot.get("auth") or creds_state()
+    on_disk = creds_state()
+    if bot.get("online") and on_disk["mode"] != st["mode"]:
+        check("running bot matches .env", False,
+              f"bot is using {st['mode']}, .env says {on_disk['mode']} — run: silkworm restart")
     where = ", ".join(st.get("stores") or []) or "nowhere"
     if st["mode"] == "token":
-        ok("auth: long-lived token (immune to Keychain/file drift)")
+        check("auth: long-lived token (immune to Keychain/file drift)", True)
     elif st["mode"] == "oauth":
         h = st["hours_left"]
         check(f"claude credentials valid ({h/24:.1f}d left, from the {st['source']})",
