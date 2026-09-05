@@ -335,8 +335,29 @@ progress message rather than appearing hung.
 
 This trades throughput for safety, which is the right way round here: waiting
 is visible and recoverable, and a half-applied edit from two agents is not.
-Worktree isolation (`scope.worktree`, still a no-op) is the way to get the
-parallelism back later.
+
+**A queued task no longer competes for it at all.** It gets its own `git`
+worktree — a second working tree over the same object store, on its own branch
+— so it cannot leave your checkout dirty or on another branch, and it does not
+queue behind a conversation about the same repo. The isolation matters more
+than the parallelism: a task running in the tree you edit can disturb work you
+have not committed, and no amount of serialising fixes that.
+
+Only *queued* work is isolated. A worktree cannot see uncommitted changes in
+your main tree, so "fix the thing I'm working on" would find nothing there —
+which makes isolation right for self-contained work and wrong for iterating
+with you. Conversations stay in the main checkout, still serialised.
+
+The task's commits land on `silkworm/<task-id>`, which outlives the worktree
+and is named in the reply. Nothing destroys work: a worktree with uncommitted
+changes is left on disk and reported rather than removed, on failure as much as
+on success. A sweep removes ones no live task owns, since a restart orphans
+whatever was running and an orphaned worktree is invisible — it costs disk and
+clutters `git worktree list` while looking like nothing at all.
+
+Opening pull requests is deliberately not part of this. A branch you can look at
+is useful immediately; pushing one outward is a decision worth making
+separately.
 
 **A project pointed at a real checkout is never ours to write.** `!project`
 sets a project's cwd from the thread it was run in and leaves `repo` empty, so

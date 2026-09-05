@@ -44,6 +44,7 @@ import projects
 import recovery
 import retry
 import summaries
+import worktrees
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, ClaudeTimeout, run_turn
 from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
@@ -1743,6 +1744,20 @@ def execute_task(task: dict) -> None:
 
     key = f"{channel}:{thread_ts}"
     progress = ProgressMessage(app.client, channel, thread_ts)
+
+    # A queued task in a repository gets its own checkout. It cannot then leave
+    # your working tree dirty or on another branch, and it no longer queues
+    # behind a conversation about the same repo. Only queued work: a worktree
+    # cannot see uncommitted changes in your main tree, so a conversation about
+    # what you are editing right now must stay where you are editing it.
+    worktree = None
+    if task.get("driver") == "queue" and worktrees.is_repo(cwd):
+        progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
+        worktree = worktrees.create(cwd, tid)
+        if worktree:
+            cwd = worktree
+            task_store.update(tid, scope={**scope, "worktree": str(worktree)})
+
     outbox = OUTBOX_ROOT / key.replace(":", "__")
     system_note = (
         "You are completing a task; report the outcome concisely. "
@@ -1808,8 +1823,17 @@ def execute_task(task: dict) -> None:
                 task_state(tid, tasks.NEEDS_INPUT, "watch ended without scheduling")
             return
 
+        wt_note = ""
+        if worktree:
+            removed, note = worktrees.release(worktree)
+            worktree = None                      # released; finally need not repeat it
+            if note:
+                wt_note = (f"\n\n_:deciduous_tree: Worked in an isolated checkout — {note}._"
+                           if removed else
+                           f"\n\n_:deciduous_tree: Isolated checkout {note}._")
+
         total = (store.get(key) or {}).get("cost", 0.0)
-        parts = chunk(to_mrkdwn(result.text))
+        parts = chunk(to_mrkdwn(result.text + wt_note))
         parts[-1] += (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
                       f"${result.cost_usd:.4f} · thread total ${total:.2f}_")
         progress.finalize(parts[0])
@@ -1836,6 +1860,13 @@ def execute_task(task: dict) -> None:
         progress.finalize(":warning: Task failed — check the bot logs.")
         task_state(tid, tasks.FAILED, str(e)[:160])
     finally:
+        if worktree:
+            # Any path out of the turn that did not release it. release() keeps
+            # a dirty tree, so a failed task's partial work survives.
+            try:
+                worktrees.release(worktree)
+            except Exception:
+                log.exception("could not release worktree %s", worktree)
         RUNNING.pop(key, None)
         recovery.clear_pending(store, key)
 
@@ -2155,6 +2186,26 @@ def _recoverer() -> None:
         log.exception("startup recovery failed")
 
 
+def _worktree_sweeper() -> None:
+    """Remove isolated checkouts no live task owns.
+
+    A restart orphans whatever was running, and an orphaned worktree is
+    invisible: it costs disk and clutters `git worktree list` while looking
+    like nothing at all. Dirty ones are always kept -- unfinished work is
+    still work, and it is reported rather than tidied away.
+    """
+    while True:
+        try:
+            live = {tid for tid, r in task_store.all().items()
+                    if r.get("state") == tasks.RUNNING}
+            n = worktrees.sweep(keep=live)
+            if n:
+                log.info("swept %d orphaned worktree(s)", n)
+        except Exception:
+            log.exception("worktree sweep failed")
+        time.sleep(1800)
+
+
 def _recovery_sweeper() -> None:
     """Collect orphaned turns as their children finish, for as long as we run.
 
@@ -2264,6 +2315,7 @@ if __name__ == "__main__":
     # Background: an orphaned turn may still be writing, so this waits on it.
     threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
     threading.Thread(target=_recovery_sweeper, daemon=True, name="rsweep").start()
+    threading.Thread(target=_worktree_sweeper, daemon=True, name="wtsweep").start()
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     threading.Thread(target=_backfiller, daemon=True, name="backfill").start()

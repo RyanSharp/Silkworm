@@ -375,6 +375,23 @@ date and a ~400 character snippet go to the model. Everything it finds arrives
 as **`proposed`**, never queued, so a mediocre guess costs an accept/dismiss
 rather than unwanted work.
 
+## Isolated checkouts for queued work
+
+A task filed against a repo-backed project runs in **its own `git` worktree**,
+not your checkout — its own files, its own branch, sharing history. So it can
+never leave your working tree dirty or on another branch, and it doesn't queue
+behind a conversation about the same repo.
+
+Its commits land on `silkworm/<task-id>`, which survives for you to review; the
+reply names the branch and how many commits it made. A worktree holding
+uncommitted changes is left on disk and reported rather than removed, so
+unfinished work is never tidied away — and ones orphaned by a restart are swept
+periodically.
+
+Conversations are deliberately *not* isolated: a worktree can't see uncommitted
+changes in your main tree, so "fix what I'm working on" needs to run where you
+are actually working.
+
 ## Watching something over time
 
 Ask for "keep an eye on the deploy and tell me when it's done" and Silkworm

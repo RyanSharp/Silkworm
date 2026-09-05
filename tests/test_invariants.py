@@ -696,6 +696,81 @@ def _repo_guard_impl():
     return mod
 
 
+# --- a queued task must not work in your checkout --------------------------------
+# Turns sharing a repo were serialised, which was right but blunt: a queued task
+# also ran in the tree you edit, so it could leave it dirty or on another
+# branch. A worktree gives it somewhere private and decouples the two.
+
+def test_worktrees():
+    import worktrees as W
+    print("\nqueued tasks get their own checkout")
+
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "worktrees"
+    repo = root / "repo"; repo.mkdir()
+    def git(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                            capture_output=True, text=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("hello\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    check("a non-repo gets no worktree", W.create(root, "tsk_x", fetch=False) is None,
+          "the shared scratch directory is not a checkout")
+
+    wt = W.create(repo, "tsk_abc", fetch=False)
+    check("a repo-backed task gets one", wt is not None and wt.exists())
+    check("on its own branch", W.branch_of(wt) == "silkworm/tsk_abc")
+    check("it lives outside the repository", repo not in wt.parents,
+          "inside, a task would scan or commit it by accident")
+    check("your checkout is untouched",
+          sorted(x.name for x in repo.iterdir() if x.name != ".git") == ["a.txt"])
+
+    (wt / "b.txt").write_text("task work\n")
+    git(wt, "add", "-A"); git(wt, "commit", "-qm", "work")
+    check("your checkout is still untouched after the task commits",
+          sorted(x.name for x in repo.iterdir() if x.name != ".git") == ["a.txt"],
+          "this is the whole point, not a side effect")
+
+    check("commits are counted without being told the base",
+          W.commits_on(wt) == 1,
+          "origin/HEAD is unset in many repos, and rev-list against a ref that "
+          "does not exist fails silently into 'the task did nothing'")
+
+    removed, note = W.release(wt)
+    check("a finished task's worktree is removed", removed and not wt.exists())
+    check("and the commit count is reported, not guessed",
+          "1 commit" in note, f"got {note!r} — origin/HEAD is unset in many repos")
+    check("the branch survives for review",
+          bool(git(repo, "branch", "--list", "silkworm/tsk_abc").stdout.strip()))
+
+    dirty = W.create(repo, "tsk_dirty", fetch=False)
+    (dirty / "wip.txt").write_text("half done\n")
+    removed, note = W.release(dirty)
+    check("uncommitted work is never discarded",
+          not removed and dirty.exists() and "uncommitted" in note,
+          "a task's unfinished work is still work")
+
+    orphan = W.create(repo, "tsk_orphan", fetch=False)
+    swept = W.sweep(keep=set())
+    check("orphans left by a restart are swept", swept == 1 and not orphan.exists())
+    check("but never a dirty one", dirty.exists(),
+          "sweeping is tidying, not deleting someone's work")
+    live = W.create(repo, "tsk_live", fetch=False)
+    W.sweep(keep={"tsk_live"})
+    check("a running task's worktree is left alone", live.exists())
+
+    bot = (BASE / "bot.py").read_text()
+    ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
+    check("only queued work is isolated",
+          'task.get("driver") == "queue" and worktrees.is_repo(cwd)' in ex,
+          "a conversation must stay where your uncommitted edits are")
+    check("a failed task still releases its checkout",
+          "could not release worktree" in ex, "otherwise every failure leaks one")
+    check("the branch is named in the reply", "isolated checkout" in ex.lower())
+    check("orphans are swept periodically", 'name="wtsweep"' in bot)
+
+
 # --- a stale credential must be visible before it kills every turn ---------------
 # On 2026-08-30 Claude Code's two credential stores drifted and every headless
 # turn failed with "OAuth session expired" while `claude` in a terminal worked.
@@ -1750,6 +1825,7 @@ if __name__ == "__main__":
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard,
+              test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,
