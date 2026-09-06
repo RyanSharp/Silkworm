@@ -9,6 +9,7 @@
     silkworm tasks [state]          list tasks (default: what needs you)
     silkworm email                  scan Gmail now and propose tasks
     silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
+    silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
@@ -310,6 +311,35 @@ def keychain_item_present() -> bool:
     return credentials.keychain_item_present()
 
 
+def do_file_task(argv) -> None:
+    """File a task from inside a turn, for work just scoped with the user."""
+    key = os.environ.get("SILKWORM_THREAD", "")
+    if not key:
+        print("no thread — `task` only works from inside a Silkworm turn")
+        raise SystemExit(1)
+    project, role, goal = "", "", []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--project" and i + 1 < len(argv):
+            project = argv[i + 1]; i += 2
+        elif argv[i] == "--role" and i + 1 < len(argv):
+            role = argv[i + 1]; i += 2
+        else:
+            goal.append(argv[i]); i += 1
+    goal = " ".join(goal).strip()
+    if not goal:
+        print('usage: silkworm task [--project <slug>] [--role implementor|assistant] "<goal>"')
+        raise SystemExit(2)
+    r = bot_call("/file-task", {"key": key, "goal": goal,
+                                "project": project, "role": role or "implementor"})
+    if not r.get("ok"):
+        print(f"not filed: {r.get('error') or 'the bot did not answer'}")
+        raise SystemExit(1)
+    print(f"filed {r['id']} as {r['role']}"
+          + (f" under {r['project']}" if r.get("project") else "")
+          + f" in {r.get('cwd') or '?'} ({r['remaining']} more allowed this turn)")
+
+
 def do_defer(argv) -> None:
     """Schedule a later turn on the thread this run belongs to.
 
@@ -517,6 +547,8 @@ def main() -> None:
                   f"check {w['depth']} of {w['depth'] + w['remaining']}")
         if not rows:
             print("  nothing scheduled")
+    elif cmd == "task":
+        do_file_task(args[1:])   # args[0] is the subcommand
     elif cmd == "defer":
         do_defer(args[1:])          # args[0] is the subcommand itself
     elif cmd == "email":

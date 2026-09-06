@@ -696,6 +696,58 @@ def _repo_guard_impl():
     return mod
 
 
+# --- a scoping conversation must be able to emit work ----------------------------
+# Of 143 recent tasks, 130 were live conversation and 3 were made in the
+# dashboard. Not a preference for chat: a conversation could not *emit*
+# anything, so scoping ended with a plan in a thread and no way to act on it.
+
+def test_scoping():
+    import scoping as S
+    print("\nscoped work can be filed from a conversation")
+
+    check("a goal too short to act on is refused",
+          "at least" in S.validate("do it"))
+    check("a workable goal passes",
+          S.validate("Add an appearance preference to Settings") == "")
+    check("an enormous goal is refused, not truncated",
+          "split it" in S.validate("x" * (S.MAX_GOAL_CHARS + 1)))
+    check("a turn cannot file without limit",
+          "limit for one turn" in S.validate("Add an appearance preference",
+                                             filed_already=S.MAX_PER_TURN),
+          "every task costs a session, or two once reviewed")
+    check("the cap leaves room for a real plan", 3 <= S.MAX_PER_TURN <= 20)
+
+    bot = (BASE / "bot.py").read_text()
+    h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
+    check("filed work is queued, not proposed", "state=tasks.QUEUED" in h,
+          "you scoped it with the user, who is who the proposed gate asks")
+    check("it defaults to implementor, so output gets reviewed",
+          'payload.get("role") or "implementor"' in h)
+    check("a reviewer cannot be filed", 'role == "reviewer"' in h,
+          "reviewing a review would never terminate")
+    check("it runs on the queue, not inline", 'driver="queue"' in h,
+          "nobody is holding a live message for it")
+    check("project and scope are inherited from the thread",
+          'entry.get("project")' in h and "project_store.scope_for" in h,
+          "a bound conversation should not restate where its work belongs")
+    check("the per-turn budget resets each turn",
+          "_filed_this_turn.pop(key, None)" in bot,
+          "otherwise the cap becomes per-process and blocks later scoping")
+    check("the model is told the capability exists", "scoping.HOW_TO" in bot)
+
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("the CLI refuses outside a turn",
+          "only works from inside a Silkworm turn" in cli)
+    env = {**os.environ, "SILKWORM_THREAD": "C1:1.0"}
+    r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "task"],
+                       capture_output=True, text=True, env=env, timeout=30)
+    check("a missing goal is a usage error", r.returncode == 2,
+          (r.stdout + r.stderr).strip()[:120])
+    check("the subcommand is not read as the goal",
+          "silkworm task" not in r.stdout.split("usage:")[-1].split('"')[0]
+          or "--project" in r.stdout)
+
+
 # --- a queued task must not work in your checkout --------------------------------
 # Turns sharing a repo were serialised, which was right but blunt: a queued task
 # also ran in the tree you edit, so it could leave it dirty or on another
@@ -1824,7 +1876,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,

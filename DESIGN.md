@@ -391,3 +391,33 @@ A configured `CLAUDE_CODE_OAUTH_TOKEN` silences all of it, since it bypasses
 both stores. Note that an *invalid* one overrides the working credentials file
 rather than falling back to it — so a bad token is worse than none, and worth
 verifying against a real turn rather than a shell test.
+
+## Scoping conversations into work
+
+The board stayed empty and the reason was measurable: of 143 recent tasks, 130
+arrived as live Slack conversation and 3 were created in the dashboard. Roles
+told the same story — `implementor` and `reviewer` had each run exactly once,
+both in a test. Everything real was a person waiting on an answer.
+
+That is not a preference for chat. A conversation could not **emit** anything,
+so scoping a piece of work ended with a plan in a thread and no way to act on
+it short of retyping each piece into a form. The gap was the last step, not the
+interface.
+
+So a turn can file tasks. The plan you just agreed becomes the queue, in the
+place you were already talking, and the pieces run unattended in their own
+worktrees with a reviewer between them and "done". Everything downstream
+already existed: the queue runner, the review gate, isolated checkouts, project
+scope. Only the way in was missing.
+
+Filed at `queued` rather than `proposed`: you scoped these with the model, so
+they are already reviewed by the person the `proposed` gate exists to ask. They
+default to `implementor`, because unattended work should not complete on its own
+say-so. A `reviewer` cannot be filed — reviewing a review would not terminate.
+
+Capped per turn, since a plan that loses count becomes fifty sessions, and each
+task costs one, or two once reviewed.
+
+**The natural follow-on is a concurrent queue runner.** It still runs one task
+at a time, which was correct while everything shared a checkout and is not once
+work is isolated — a five-task plan is currently ten sequential sessions.

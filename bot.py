@@ -37,6 +37,7 @@ import harvester
 import learnings_git
 import repos
 import roles
+import scoping
 import slack_health
 import tasks
 import procs
@@ -1358,6 +1359,51 @@ def handle_defer(payload: dict) -> dict:
             "depth": depth, "remaining": defer.MAX_DEFERS - depth}
 
 
+#: Filed per turn, so a plan that loses count cannot become fifty sessions.
+_filed_this_turn: dict = {}
+
+
+def handle_file_task(payload: dict) -> dict:
+    """Route for /file-task — a turn filing work it just scoped with the user.
+
+    Separate from the dashboard's create: this one resolves the project and
+    scope from the thread it was called in, so a conversation already bound to
+    a project does not have to restate where its work belongs.
+    """
+    key = (payload.get("key") or "").strip()
+    goal = (payload.get("goal") or "").strip()
+    if not re.fullmatch(r"[A-Z0-9]+:[0-9.]+", key):
+        return {"ok": False, "error": "no thread to file against"}
+
+    entry = store.get(key) or {}
+    proj = (payload.get("project") or entry.get("project") or "").strip()
+    if proj:
+        proj = project_store.ensure(proj)["slug"]
+        project_store.home(proj, create=True)
+
+    err = scoping.validate(goal, _filed_this_turn.get(key, 0))
+    if err:
+        return {"ok": False, "error": err}
+
+    role = payload.get("role") or "implementor"
+    if role not in roles.ROLES or role == "reviewer":
+        return {"ok": False, "error": f"unknown role {role!r}"}
+
+    scope = project_store.scope_for(proj) or {"cwd": entry.get("cwd") or str(CLAUDE_CWD)}
+    task = task_store.create(
+        goal, title=goal[:70], role=role, project=proj,
+        # queued, not proposed: it was scoped with the user, who is the person
+        # the proposed gate exists to ask.
+        state=tasks.QUEUED, driver="queue", source="scoped",
+        scope=scope,
+    )
+    _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
+    log.info("filed task %s from %s (project=%s role=%s)", task["id"], key, proj or "-", role)
+    return {"ok": True, "id": task["id"], "project": proj,
+            "role": role, "cwd": scope.get("cwd", ""),
+            "remaining": scoping.MAX_PER_TURN - _filed_this_turn[key]}
+
+
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
@@ -1370,6 +1416,7 @@ server.route("/titles", handle_titles)
 server.route("/tasks", handle_tasks)
 server.route("/projects", handle_projects)
 server.route("/defer", handle_defer)
+server.route("/file-task", handle_file_task)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":
@@ -1483,6 +1530,8 @@ def handle_prompt(event: dict, say, client) -> None:
         "and it will be uploaded to the Slack thread automatically."
     )
     system_note += "\n\n" + defer.HOW_TO.format(bin=SILKWORM_BIN)
+    system_note += "\n\n" + scoping.HOW_TO.format(bin=SILKWORM_BIN,
+                                                   max=scoping.MAX_PER_TURN)
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
@@ -1519,6 +1568,7 @@ def handle_prompt(event: dict, say, client) -> None:
             recovery.mark_pending(store, key, msg_ts=reactions.msg,
                                   progress_ts=progress.ts,
                                   session_id=session_id, prompt=text)
+            _filed_this_turn.pop(key, None)   # a fresh budget for this turn
             task_state(task_id, tasks.RUNNING)
             if not event.get("_web"):  # web prompts have a synthetic ts
                 store.update(key, last_msg_ts=msg_ts)
