@@ -224,11 +224,19 @@ def test_recovery():
           "otherwise those records claim work is in flight for that whole hour")
 
     co = src[src.index("def close_out_orphans"):src.index("def _recoverer")]
-    check("a queued inline task is closed out too, not left forever",
-          "never started; its handler is gone" in co,
-          "inline means a handler drives it, and that handler is gone")
-    check("and cancelled rather than failed, since nothing was attempted",
-          co.index("tasks.CANCELLED") > co.index("tasks.QUEUED"))
+    # Cancelling these and trusting the backfill lost real messages. The
+    # backfill keys on one high-water mark, but messages are not handled in
+    # arrival order: one that queued behind another and died in a restart is
+    # invisible the moment any later message has run.
+    check("a queued inline task is handed to the runner, not dropped",
+          'task_store.update(tid, driver="queue")' in co,
+          "its handler is gone but the work is still wanted")
+    check("and is not cancelled any more",
+          "never started; its handler is gone" not in co,
+          "that silently lost messages when you were three deep in a thread")
+    check("nothing has to be recovered from Slack for it",
+          "backfill" in co.lower(),
+          "the record already holds the goal, thread and project")
 
 
 # --- process lookup must not be fooled ---------------------------------------

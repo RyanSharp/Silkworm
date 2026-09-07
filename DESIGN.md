@@ -484,3 +484,34 @@ default, but the trader sits on a research branch eighteen commits ahead of
 main, and branching there off main would quietly discard all of it and build on
 the wrong baseline — three times over, once tasks run in parallel. `!project
 base <branch>` sets it.
+
+## One worker, on purpose
+
+Parallel execution is supported and defaults to **off** (`TASK_WORKERS=1`). An
+agent can work indefinitely, so a single worker burns the queue down over time
+without anything ever needing to be merged against anything else. The
+parallelism bought speed nobody was waiting on, at the cost of conflicts
+somebody would have been. Raise it when waiting for a result is the thing that
+actually costs you.
+
+The isolation work stands regardless: a queued task still gets its own worktree
+off its project's base branch, because that is what stops it disturbing the
+checkout you work in, which has nothing to do with concurrency.
+
+## Messages lost three deep in a thread
+
+A message that arrived while an earlier turn was running queued behind it on
+the thread lock. If a restart landed in between, the task was cancelled and the
+message was never answered.
+
+The intended safety net was the backfill, and it did not hold. The backfill
+keys on a single high-water mark, and **messages are not handled in arrival
+order** — one that queued behind another is invisible the moment any later
+message has run, because the watermark has already passed it. Three real
+messages were lost this way before it was noticed; two others survived only
+because nothing newer had run yet.
+
+So the queued task is no longer cancelled: its `driver` flips to `queue` and
+the runner picks it up. The record already holds the goal, thread, project and
+scope, so nothing has to be reconstructed from Slack at all, and no ordering
+assumption is involved.

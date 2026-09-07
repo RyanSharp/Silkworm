@@ -72,10 +72,13 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "0"))
 # is legitimately quiet while it runs (Claude Code caps Bash at 10 minutes),
 # so this only fires on a process that has genuinely stopped doing anything.
 CLAUDE_IDLE_TIMEOUT = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800"))
-# How many queued tasks run at once. Worktrees make this safe -- each gets its
-# own checkout -- but every worker is a live Claude session, so this is a quota
+# How many queued tasks run at once. One by default: an agent can work
+# indefinitely, so a single worker burns the queue down over time, and nothing
+# has to be merged against anything else -- the parallelism was buying speed
+# nobody was waiting on, at the cost of conflicts somebody would be. Worktrees
+# make raising it safe; each worker is a live Claude session, so it is a quota
 # decision as much as a concurrency one.
-TASK_WORKERS = int(os.environ.get("TASK_WORKERS", "3"))
+TASK_WORKERS = int(os.environ.get("TASK_WORKERS", "1"))
 #: Absolute, because a turn's PATH is not ours to assume.
 SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
@@ -2356,11 +2359,18 @@ def close_out_orphans() -> None:
         if rec.get("state") == tasks.RUNNING:
             task_state(tid, tasks.FAILED, "interrupted by a restart")
         elif rec.get("state") == tasks.QUEUED:
-            # Never started, so it would sit queued forever. Cancelled rather
-            # than failed: nothing was attempted, and if its message really
-            # went unanswered the backfill replays it from the watermark, which
-            # a turn that never started never advanced.
-            task_state(tid, tasks.CANCELLED, "never started; its handler is gone")
+            # Never started, and its handler is gone -- but the work is still
+            # wanted, so hand it to the queue runner rather than dropping it.
+            #
+            # Cancelling it and trusting the backfill was wrong. The backfill
+            # keys on a single high-water mark, and messages are not processed
+            # in arrival order: one that queued behind another, then died in a
+            # restart, is invisible the moment any later message has run. That
+            # silently lost real messages -- exactly the "3 deep and some go
+            # missing" symptom. The record already holds the goal, thread and
+            # project, so nothing needs to be recovered from Slack at all.
+            task_store.update(tid, driver="queue")
+            log.info("task %s handed to the runner (its Slack handler is gone)", tid)
 
 
 def _recoverer() -> None:
