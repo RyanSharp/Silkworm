@@ -529,9 +529,17 @@ def test_task_runner_claim():
     # records claiming work was in flight, because the startup pass waits that
     # long on a live child. The guarantee is now explicit instead of positional:
     # threads recovery still owns are skipped by name.
-    check("a thread recovery may still resolve is never marked failed",
-          'rec.get("thread") in pending' in co,
+    check("the live turn recovery will resolve is never marked failed",
+          'rec.get("source_ref") == live[thread]' in co,
           "a false failure that lasts the whole wait is what stops the board being read")
+    # Skipping the whole *thread* left a task running for sixteen hours: the
+    # conversation carried on, so a marker was always present, and it belonged
+    # to a newer turn every time.
+    check("but an older task on that same thread still gets closed out",
+          'rec.get("thread") in pending' not in co,
+          "a busy thread always has a pending marker, so this never fired")
+    check("the marker is matched by message, which is what identifies a turn",
+          '(e.get("pending") or {}).get("msg_ts")' in co)
     check("and the marker it keys on is the one recovery writes",
           'e.get("pending")' in co)
 

@@ -2291,15 +2291,21 @@ def close_out_orphans() -> None:
     after: the startup pass can wait an hour on a live child, and these records
     would claim work was in flight the whole time.
 
-    Anything recovery is about to resolve is left alone. A thread with a
-    pending marker may still deliver its reply, and marking it failed first
-    would put a false failure on the board for exactly as long as the wait --
-    which is the noise that stops the board being read.
+    Anything recovery is about to resolve is left alone -- but only the one
+    turn it is about to resolve. Skipping every task on a thread that has a
+    pending marker left a task stuck in `running` for sixteen hours: the
+    conversation carried on, so the thread always had a marker, and the marker
+    belonged to a newer turn each time. The marker names the live turn by its
+    message, so match on that instead of on the thread.
     """
-    pending = {k for k, e in store.all().items() if e.get("pending")}
+    live = {k: (e.get("pending") or {}).get("msg_ts")
+            for k, e in store.all().items() if e.get("pending")}
     for tid, rec in task_store.all().items():
-        if rec.get("driver") != "inline" or rec.get("thread") in pending:
+        if rec.get("driver") != "inline":
             continue
+        thread = rec.get("thread")
+        if thread in live and rec.get("source_ref") == live[thread]:
+            continue                    # this is the turn recovery will finish
         if rec.get("state") == tasks.RUNNING:
             task_state(tid, tasks.FAILED, "interrupted by a restart")
         elif rec.get("state") == tasks.QUEUED:
