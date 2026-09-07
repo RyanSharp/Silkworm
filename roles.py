@@ -22,6 +22,14 @@ log = logging.getLogger("silkworm.roles")
 # Tools a reviewer may use: read the tree, read history, run nothing else.
 REVIEWER_TOOLS = "Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git status:*)"
 
+# An ideator reads the same way, and may file proposals -- nothing else. It
+# runs unattended at night, so it must not be able to change anything: every
+# suggestion has to survive you before it becomes work.
+# {bin} is filled in at run time with the absolute path. These are prefix
+# patterns, not globs -- a leading "*" matches nothing, which silently left the
+# first ideator able to think but not to file.
+IDEATOR_TOOLS = REVIEWER_TOOLS + " Bash(git ls-files:*) Bash({bin} task:*)"
+
 REVIEWER_SYSTEM = (
     "You are reviewing work another agent just completed. You did not do it and "
     "have no stake in it. Read the actual state of the repository rather than "
@@ -35,6 +43,23 @@ REVIEWER_SYSTEM = (
     "```\n"
     "ok=false only for something you would want a person to look at. An empty "
     "findings list with ok=true means it is genuinely fine."
+)
+
+IDEATOR_SYSTEM = (
+    "You are reviewing a project on your own, out of hours, looking for work "
+    "worth doing. Nobody is waiting on this and nothing you say ships "
+    "directly: your proposals go to a list a person accepts or dismisses in "
+    "the morning.\n\n"
+    "Read the project properly first -- its code, its recent history, its "
+    "CLAUDE.md, its tests. Then propose specific work that would make it "
+    "better. Ground every proposal in something you actually saw: a real gap, "
+    "a real inconsistency, a real risk. Prefer a few concrete proposals to "
+    "many vague ones.\n\n"
+    "Do not propose work merely to have proposed something. Returning nothing "
+    "is a perfectly good outcome on a night when the project is in good "
+    "shape, and is far better than manufacturing busywork that costs a person "
+    "a decision.\n\n"
+    "Say briefly what you looked at and what you filed."
 )
 
 IMPLEMENTOR_SYSTEM = (
@@ -53,6 +78,14 @@ ROLES: dict[str, dict] = {
         "system": IMPLEMENTOR_SYSTEM,
         "review": True,          # its output goes to a reviewer before completing
         "restricted": False,
+        "model": None,
+    },
+    "ideator": {
+        "system": IDEATOR_SYSTEM,
+        "review": False,         # it proposes; acceptance is the gate
+        "restricted": True,      # read-only, enforced by the permission args
+        "fresh": True,           # a nightly look should not inherit yesterday's
+        "tools": IDEATOR_TOOLS,
         "model": None,
     },
     "reviewer": {
@@ -81,10 +114,12 @@ def is_fresh(name: str) -> bool:
     return bool(get(name).get("fresh"))
 
 
-def permission_args(name: str, default_args: list[str]) -> list[str]:
+def permission_args(name: str, default_args: list[str], bin: str = "") -> list[str]:
     """Run args for this role. A restricted role never gets full autonomy."""
-    if get(name).get("restricted"):
-        return ["--allowedTools", REVIEWER_TOOLS]
+    role = get(name)
+    if role.get("restricted"):
+        tools = (role.get("tools") or REVIEWER_TOOLS).replace("{bin}", bin)
+        return ["--allowedTools", tools]
     return list(default_args)
 
 

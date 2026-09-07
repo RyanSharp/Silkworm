@@ -696,6 +696,62 @@ def _repo_guard_impl():
     return mod
 
 
+# --- a project can be reviewed while you sleep -----------------------------------
+# A nightly look that proposes work, which you accept or dismiss in the morning.
+# The `proposed` state existed for exactly this and had never once been used.
+
+def test_ideation():
+    import projects, roles, datetime as dt
+    print("\nnightly review proposes, and can do nothing else")
+
+    for text, want in (("2am", "02:00"), ("02:00", "02:00"), ("2:30pm", "14:30"),
+                       ("12am", "00:00"), ("12pm", "12:00")):
+        check(f"{text} reads as {want}", projects.parse_at(text) == want)
+    for bad in ("25:00", "nonsense", "", "13pm"):
+        try:
+            projects.parse_at(bad)
+            check(f"{bad!r} is refused", False, "it was accepted")
+        except ValueError:
+            check(f"{bad!r} is refused", True)
+
+    recs = [{"slug": "trader", "ideate_at": "02:00", "ideate_on": "", "archived": False},
+            {"slug": "saga", "ideate_at": "02:00", "ideate_on": "2026-09-06", "archived": False},
+            {"slug": "odin", "ideate_at": "", "ideate_on": "", "archived": False},
+            {"slug": "old", "ideate_at": "02:00", "ideate_on": "", "archived": True}]
+    due = projects.due_for_ideation(recs, dt.datetime(2026, 9, 6, 3, 0))
+    check("only a project whose time has passed and has not run is due", due == ["trader"],
+          f"got {due}")
+    check("nothing is due before its time",
+          projects.due_for_ideation(recs, dt.datetime(2026, 9, 6, 1, 0)) == [])
+    check("a late start still runs the pass",
+          projects.due_for_ideation(recs, dt.datetime(2026, 9, 6, 23, 0)) == ["trader"],
+          "a bot asleep at 02:00 should not silently skip the night")
+
+    check("the ideator is read-only", roles.get("ideator")["restricted"],
+          "it runs unattended; nothing it thinks should ship on its own")
+    check("and starts fresh each night", roles.get("ideator")["fresh"])
+    tools = roles.permission_args("ideator", ["--dangerously-skip-permissions"],
+                                  bin="/x/silkworm")[1]
+    check("it may file proposals", "Bash(/x/silkworm task:*)" in tools)
+    check("the path is absolute, not a glob", "*silkworm" not in tools,
+          "these are prefix patterns; a leading * matched nothing and silently "
+          "left the first ideator able to think but not to file")
+    check("it may not edit, run tests, or push",
+          "Edit" not in tools and "Write" not in tools and "Bash(git push" not in tools)
+
+    bot = (BASE / "bot.py").read_text()
+    h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
+    check("a proposal waits rather than running", "tasks.PROPOSED if propose" in h)
+    check("and an ideator cannot file more ideators",
+          'role in ("reviewer", "ideator")' in h)
+    ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
+    check("a read-only role gets no worktree",
+          'not roles.get(role_name).get("restricted")' in ex,
+          "it cannot write, so the worktree only leaves an empty branch behind")
+    check("the scheduler records the date it ran", "ideate_on=" in bot,
+          "or a restart in the small hours would run it twice")
+
+
 # --- a scoping conversation must be able to emit work ----------------------------
 # Of 143 recent tasks, 130 were live conversation and 3 were made in the
 # dashboard. Not a preference for chat: a conversation could not *emit*
@@ -719,12 +775,16 @@ def test_scoping():
 
     bot = (BASE / "bot.py").read_text()
     h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
-    check("filed work is queued, not proposed", "state=tasks.QUEUED" in h,
-          "you scoped it with the user, who is who the proposed gate asks")
+    check("work scoped with you is queued, not proposed",
+          "tasks.PROPOSED if propose else tasks.QUEUED" in h,
+          "you scoped it with the user, who is who the proposed gate asks — "
+          "only an unattended proposal has to wait")
     check("it defaults to implementor, so output gets reviewed",
           'payload.get("role") or "implementor"' in h)
-    check("a reviewer cannot be filed", 'role == "reviewer"' in h,
-          "reviewing a review would never terminate")
+    check("neither a reviewer nor an ideator can be filed as work",
+          'role in ("reviewer", "ideator")' in h,
+          "reviewing a review would not terminate, and an ideator that could "
+          "file ideators would propose its way into a loop")
     check("it runs on the queue, not inline", 'driver="queue"' in h,
           "nobody is holding a live message for it")
     check("project and scope are inherited from the thread",
@@ -1824,6 +1884,83 @@ def test_file_uploads_are_handled():
 # loadList() called one of them, threw, and the whole page rendered empty --
 # while node --check passed, because an undefined call is a runtime error.
 
+# --- the thread list is two different things wearing one name --------------------
+# Conversations you return to, and the one-off threads a task narrates into.
+# Ten of the latter buries the former, and there was no way to say which.
+
+def test_thread_kind_filter():
+    import re, json as _j, subprocess as _sp, tempfile as _tf
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthreads can be told apart")
+
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    # Drive the real functions rather than assert on their source: a filter that
+    # renders but does not filter looks identical from the outside.
+    # The stub has to come *before* the script: it wires listeners and timers
+    # at load, so a prelude appended afterwards never runs.
+    prelude = """
+const _els = {};
+function _el(id) {
+  return _els[id] || (_els[id] = {innerHTML: "", value: "", style: {},
+    classList: {add(){}, remove(){}, toggle(){}}, appendChild(){}, addEventListener(){}});
+}
+globalThis.document = {getElementById: _el, addEventListener(){},
+  createElement: () => _el("_new"), querySelectorAll: () => [], body: _el("body")};
+globalThis.window = globalThis;
+globalThis.fetch = async () => ({json: async () => ({sessions: [], tasks: []}),
+                                 text: async () => ""});
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.localStorage = {getItem: () => null, setItem(){}};
+// The page kicks off its own polling on load, which our stub fetch cannot
+// satisfy. That is not what is under test; the filter is driven synchronously
+// below and has already reported by the time any of it settles.
+process.on("unhandledRejection", () => {});
+"""
+    # Drive the real functions rather than assert on their source: a filter that
+    # renders but does not filter looks identical from the outside.
+    drive = """
+loadList = function () {};        // setKind calls it; not under test here
+const _bar = _el("kindfilter");
+const S = [{key: "a", kind: "thread"}, {key: "b", kind: "task"},
+           {key: "c", kind: "task"}, {key: "d"}];
+renderKindFilter(S);
+const out = {bar: _bar.innerHTML, allVisible: S.filter(matchesKind).length};
+setKind("task");
+out.taskOnly = S.filter(matchesKind).map(s => s.key);
+setKind("thread");
+out.threadOnly = S.filter(matchesKind).map(s => s.key);
+setKind("all");
+out.backToAll = S.filter(matchesKind).length;
+_bar.innerHTML = "";
+renderKindFilter([{key: "x", kind: "thread"}]);
+out.singleKindBar = _bar.innerHTML;
+console.log(JSON.stringify(out));
+"""
+    harness = prelude + js + drive
+    f = Path(_tf.mkdtemp()) / "h.js"
+    f.write_text(harness)
+    r = _sp.run(["node", str(f)], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        check("the filter runs in a browser-like context", False,
+              (r.stderr or "").strip().splitlines()[-1] if r.stderr else "no output")
+        return
+    out = _j.loads(r.stdout.strip().splitlines()[-1])
+
+    check("every kind present gets a button",
+          "Conversations" in out["bar"] and "Task runs" in out["bar"])
+    check("with its count, so the split is visible at a glance",
+          "<b>2</b>" in out["bar"] and "<b>4</b>" in out["bar"])
+    check("nothing is hidden by default", out["allVisible"] == 4)
+    check("task runs can be isolated", out["taskOnly"] == ["b", "c"])
+    check("conversations can be isolated", out["threadOnly"] == ["a", "d"],
+          "a thread with no kind set is a conversation, not an unknown")
+    check("and All comes back", out["backToAll"] == 4)
+    check("one kind shows no filter at all", out["singleKindBar"] == "",
+          "a single-option filter is noise, not a choice")
+
+
 def test_dashboard_js_is_whole():
     import re
     sys.argv = ["x"]
@@ -1832,7 +1969,8 @@ def test_dashboard_js_is_whole():
     js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
     defined = set(re.findall(r"(?:async\s+)?function\s+([A-Za-z_]\w*)", js))
 
-    for name in ("loadList", "loadStats", "loadTranscript", "renderAlerts", "jumpTo",
+    for name in ("renderKindFilter", "setKind", "matchesKind",
+                 "loadList", "loadStats", "loadTranscript", "renderAlerts", "jumpTo",
                  "taskCall", "toggleTasks", "setTaskView", "renderProjects", "addTask",
                  "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
                  "refreshTaskBadge", "releaseThread", "retitle", "nameAllThreads",
@@ -1876,13 +2014,14 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
-              test_file_uploads_are_handled, test_dashboard_js_is_whole):
+              test_file_uploads_are_handled, test_thread_kind_filter,
+              test_dashboard_js_is_whole):
         try:
             t()
         except Exception as exc:

@@ -498,6 +498,13 @@ PAGE = r"""<!doctype html>
              border-left: 2px solid #2EB67D; }
   .turnbar.bad { background: #D8517F1C; border-left-color: #D8517F; }
   .badge.kind { background: #8881; color: var(--muted); border: 1px solid var(--line); }
+  .listcol { display: flex; flex-direction: column; min-width: 0; }
+  #kindfilter { display: flex; gap: 4px; padding: 6px 8px 2px; flex-wrap: wrap; }
+  #kindfilter button { font-size: 11px; font-family: var(--mono); cursor: pointer;
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 8px; }
+  #kindfilter button:hover { color: var(--fg); }
+  #kindfilter button.on { background: #8882; color: var(--fg); border-color: #888a; }
   .badge.cost { background: #C08A1C22; color: var(--gold); border: 1px solid #C08A1C99; }
   .card .untitled { color: var(--muted); font-style: italic; font-size: 12.5px; }
   .pill { font-size: 10.5px; font-family: var(--mono); color: var(--gold);
@@ -712,7 +719,10 @@ PAGE = r"""<!doctype html>
 <div id="alertbar"></div>
 <div id="searchresults"></div>
 <div class="layout">
-  <nav id="list"></nav>
+  <div class="listcol">
+    <div id="kindfilter"></div>
+    <nav id="list"></nav>
+  </div>
   <main>
     <div id="content">
       <div id="dash"></div>
@@ -861,15 +871,50 @@ function renderDash() {
 }
 
 // --- session list ---
+// Threads are two quite different things wearing one list: conversations you
+// return to, and the one-off threads a task narrates into. Ten of the latter
+// buries the former. Only kinds actually present get a button, so this stays a
+// way to narrow what is there rather than a menu of empty categories.
+let threadKind = "all";
+
+const KIND_LABEL = {thread: "Conversations", task: "Task runs"};
+
+function matchesKind(s) {
+  return threadKind === "all" || (s.kind || "thread") === threadKind;
+}
+
+function setKind(k) {
+  threadKind = k;
+  loadList();
+}
+
+function renderKindFilter(sessions) {
+  const bar = document.getElementById("kindfilter");
+  const counts = {};
+  for (const s of sessions) {
+    const k = s.kind || "thread";
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const kinds = Object.keys(counts).sort();
+  // One kind is not a choice; showing a filter with a single option is noise.
+  if (kinds.length < 2) { bar.innerHTML = ""; return; }
+  const btn = (k, label, n) =>
+    `<button class="${threadKind === k ? "on" : ""}" onclick="setKind('${k}')">` +
+    `${label} <b>${n}</b></button>`;
+  bar.innerHTML = btn("all", "All", sessions.length) +
+    kinds.map(k => btn(k, KIND_LABEL[k] || k, counts[k])).join("");
+}
+
 async function loadList() {
   const data = await (await fetch("/api/sessions")).json();
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
   renderAlerts(data.sessions, data.slack);
   refreshTaskBadge();
+  renderKindFilter(data.sessions);
   const nav = document.getElementById("list");
   nav.innerHTML = "";
-  for (const s of data.sessions) {
+  for (const s of data.sessions.filter(matchesKind)) {
     const div = document.createElement("div");
     div.className = "card" + (active && active.key === s.key ? " active" : "");
     const t = s.turn;

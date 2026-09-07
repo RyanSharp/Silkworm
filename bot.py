@@ -788,6 +788,33 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             store.update(key, project="")
             say(text="Unfiled — new tasks from this thread won't belong to a project.",
                 thread_ts=thread_ts)
+        elif arg.lower().startswith("ideate"):
+            slug = entry.get("project") or ""
+            when = arg[6:].strip()
+            if not slug:
+                say(text="File this thread under a project first: `!project <name>`.",
+                    thread_ts=thread_ts)
+            elif not when:
+                cur = (project_store.get(slug) or {}).get("ideate_at") or ""
+                say(text=(f"*{slug}* is reviewed nightly at *{cur}*." if cur
+                          else f"*{slug}* has no nightly review. "
+                               "`!project ideate 02:00` to add one."),
+                    thread_ts=thread_ts)
+            elif when.lower() in ("off", "none", "stop", "clear"):
+                project_store.ensure(slug, ideate_at="")
+                say(text=f":crescent_moon: Nightly review off for *{slug}*.",
+                    thread_ts=thread_ts)
+            else:
+                try:
+                    at = projects.parse_at(when)
+                except ValueError as e:
+                    say(text=f":warning: {e}", thread_ts=thread_ts)
+                else:
+                    project_store.ensure(slug, ideate_at=at)
+                    say(text=f":crescent_moon: *{slug}* will be reviewed nightly at "
+                             f"*{at}*, and anything it finds lands in "
+                             "*proposed* for you to accept or dismiss.",
+                        thread_ts=thread_ts)
         elif arg.lower() == "mail" or arg.lower().startswith("mail "):
             # The Gmail label whose mail belongs here. Defaults to the project's
             # title, so this is only needed when the label is named differently.
@@ -1386,20 +1413,27 @@ def handle_file_task(payload: dict) -> dict:
         return {"ok": False, "error": err}
 
     role = payload.get("role") or "implementor"
-    if role not in roles.ROLES or role == "reviewer":
+    if role not in roles.ROLES or role in ("reviewer", "ideator"):
         return {"ok": False, "error": f"unknown role {role!r}"}
+
+    # A proposal is not work yet. Nothing ran it past you, so it waits in
+    # `proposed` until you accept it -- which is the whole point of a job that
+    # thinks about your projects while you are asleep.
+    propose = bool(payload.get("propose"))
+    state = tasks.PROPOSED if propose else tasks.QUEUED
 
     scope = project_store.scope_for(proj) or {"cwd": entry.get("cwd") or str(CLAUDE_CWD)}
     task = task_store.create(
         goal, title=goal[:70], role=role, project=proj,
-        # queued, not proposed: it was scoped with the user, who is the person
-        # the proposed gate exists to ask.
-        state=tasks.QUEUED, driver="queue", source="scoped",
+        # Work scoped with you is queued: it was already reviewed by the person
+        # the proposed gate exists to ask. A proposal nobody has seen is not.
+        state=state, driver="queue",
+        source="ideation" if propose else "scoped",
         scope=scope,
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
     log.info("filed task %s from %s (project=%s role=%s)", task["id"], key, proj or "-", role)
-    return {"ok": True, "id": task["id"], "project": proj,
+    return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
             "remaining": scoping.MAX_PER_TURN - _filed_this_turn[key]}
 
@@ -1801,7 +1835,11 @@ def execute_task(task: dict) -> None:
     # cannot see uncommitted changes in your main tree, so a conversation about
     # what you are editing right now must stay where you are editing it.
     worktree = None
-    if task.get("driver") == "queue" and worktrees.is_repo(cwd):
+    # A read-only role has nothing to isolate: it cannot write, so a worktree
+    # buys nothing and leaves an empty branch behind every run -- one per
+    # project per night once ideation is scheduled.
+    if (task.get("driver") == "queue" and worktrees.is_repo(cwd)
+            and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
         worktree = worktrees.create(cwd, tid)
         if worktree:
@@ -1838,7 +1876,8 @@ def execute_task(task: dict) -> None:
                 result = run_turn(
                     task.get("goal", ""), session_id=session_id,
                     binary=CLAUDE_BIN, cwd=cwd,
-                    permission_args=roles.permission_args(role_name, permission_args()),
+                    permission_args=roles.permission_args(role_name, permission_args(),
+                                                        bin=SILKWORM_BIN),
                     model=entry.get("model") or CLAUDE_MODEL,
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
                     env=claude_env(key, task.get("defers") or 0),
@@ -2124,6 +2163,52 @@ def _credential_watcher() -> None:
         time.sleep(3600)
 
 
+def run_ideation(slug: str) -> dict:
+    """File the nightly look at one project as a task the runner will pick up.
+
+    A task rather than a direct run, so it queues behind whatever else is
+    happening, survives a restart, and shows up in the record like any other
+    work. The ideator role is read-only: it can propose, and nothing else.
+    """
+    rec = project_store.get(slug) or {}
+    scope = project_store.scope_for(slug) or {"cwd": str(CLAUDE_CWD)}
+    goal = (
+        f"Look over the {rec.get('title') or slug} project and propose work "
+        "worth doing.\n\n"
+        "Read what is actually there before suggesting anything: the code, "
+        "recent commits, the tests, CLAUDE.md. Then file each proposal with\n"
+        f"    {SILKWORM_BIN} task --propose --project {slug} \"<goal>\"\n"
+        f"at most {scoping.MAX_PROPOSALS} of them, fewer if fewer are "
+        "warranted, and none at all if the project is in good shape. Each goal "
+        "must stand alone: whoever picks it up will not have read this.\n\n"
+        "Then say what you looked at and what you filed."
+    )
+    task = task_store.create(goal, title=f"Nightly review: {rec.get('title') or slug}",
+                             role="ideator", project=slug, state=tasks.QUEUED,
+                             driver="queue", source="ideation", scope=scope)
+    project_store.ensure(slug, ideate_on=datetime.now().strftime("%Y-%m-%d"))
+    log.info("filed nightly ideation %s for %s", task["id"], slug)
+    return {"ok": True, "id": task["id"]}
+
+
+def _ideation_scheduler() -> None:
+    """Fire each project's nightly look when its time comes round.
+
+    Checked against the wall clock rather than slept precisely to, so a bot
+    restarted at 02:00 still runs the pass when it comes back, and one that
+    already ran today does not run twice.
+    """
+    time.sleep(180)
+    while True:
+        try:
+            for slug in projects.due_for_ideation(
+                    project_store.all(include_archived=False), datetime.now()):
+                run_ideation(slug)
+        except Exception:
+            log.exception("ideation scheduler failed")
+        time.sleep(300)
+
+
 def _task_runner() -> None:
     """Execute tasks nobody else is driving, one at a time.
 
@@ -2372,6 +2457,7 @@ if __name__ == "__main__":
     threading.Thread(target=_task_runner, daemon=True, name="task-runner").start()
     threading.Thread(target=_email_watcher, daemon=True, name="email").start()
     threading.Thread(target=_credential_watcher, daemon=True, name="creds").start()
+    threading.Thread(target=_ideation_scheduler, daemon=True, name="ideate").start()
     threading.Thread(target=_harvester, daemon=True, name="harvester").start()
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

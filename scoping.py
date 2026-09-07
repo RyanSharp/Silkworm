@@ -21,6 +21,9 @@ import re
 #: stopped counting -- and every task costs a session, or two with review.
 MAX_PER_TURN = 10
 
+#: A night that finds ten things has not prioritised. Fewer, better.
+MAX_PROPOSALS = 5
+
 #: Long enough to act on without the implementor guessing what you meant.
 MIN_GOAL_CHARS = 15
 MAX_GOAL_CHARS = 4000

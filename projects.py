@@ -64,6 +64,11 @@ FIELDS: dict[str, tuple] = {
     # The Gmail label whose mail belongs to this project. Empty means "use the
     # title", so a label you already keep needs no configuration at all.
     "mail_label": ("",  "gmail label to draw facts from; blank = the title"),
+    # Out-of-hours ideation. "HH:MM" local time, or "" for off. `ideate_on` is
+    # the last date it ran, so a restart cannot make it run twice in a night
+    # and a missed night is simply skipped rather than fired late.
+    "ideate_at": ("",   "local HH:MM to look for improvements, or off"),
+    "ideate_on": ("",   "YYYY-MM-DD it last ran"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),
@@ -266,6 +271,40 @@ class ProjectStore:
         rec = self.get(slug or "")
         return dict((rec or {}).get("scope") or {})
 
+
+def parse_at(text: str) -> str:
+    """Normalise "2am", "02:00", "14:30" to "HH:MM". Raises ValueError."""
+    t = (text or "").strip().lower().replace(".", ":")
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
+    if not m:
+        raise ValueError(f"could not read a time from {text!r} (try 02:00 or 2am)")
+    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if ampm:
+        if not 1 <= hour <= 12:
+            raise ValueError("a 12-hour time needs an hour between 1 and 12")
+        hour = (hour % 12) + (12 if ampm == "pm" else 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"{text!r} is not a time of day")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def due_for_ideation(records, now) -> list:
+    """Slugs whose scheduled time has passed today and that have not run.
+
+    Compares against the wall clock rather than tracking a timer, so a bot
+    that was asleep or restarted at 02:00 still runs the pass when it comes
+    back -- and one that already ran today does not run again.
+    """
+    today = now.strftime("%Y-%m-%d")
+    hhmm = now.strftime("%H:%M")
+    due = []
+    for rec in records:
+        at = (rec.get("ideate_at") or "").strip()
+        if not at or rec.get("archived") or rec.get("ideate_on") == today:
+            continue
+        if hhmm >= at:
+            due.append(rec["slug"])
+    return due
 
 BRIEF_PROMPT = """Keep a short standing brief for a project, for whoever picks \
 up the next piece of work on it.

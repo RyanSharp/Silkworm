@@ -151,9 +151,13 @@ def release(worktree) -> tuple[bool, str]:
             return False, f"could not be removed: `{path}`"
     else:
         shutil.rmtree(path, ignore_errors=True)
-    note = f"branch `{branch}` ({made} commit{'s' if made != 1 else ''})" if made \
-        else f"branch `{branch}` (no commits)"
-    return True, note
+    if made:
+        return True, f"branch `{branch}` ({made} commit{'s' if made != 1 else ''})"
+    # A branch with nothing on it is not work, it is litter. Left alone they
+    # accumulate one per run and make `git branch` useless.
+    if repo and branch.startswith(BRANCH_PREFIX):
+        _git(repo, "branch", "-D", branch)
+    return True, ""
 
 
 def sweep(keep: set) -> int:

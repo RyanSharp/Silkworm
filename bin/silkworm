@@ -317,10 +317,12 @@ def do_file_task(argv) -> None:
     if not key:
         print("no thread — `task` only works from inside a Silkworm turn")
         raise SystemExit(1)
-    project, role, goal = "", "", []
+    project, role, goal, propose = "", "", [], False
     i = 0
     while i < len(argv):
-        if argv[i] == "--project" and i + 1 < len(argv):
+        if argv[i] == "--propose":
+            propose = True; i += 1
+        elif argv[i] == "--project" and i + 1 < len(argv):
             project = argv[i + 1]; i += 2
         elif argv[i] == "--role" and i + 1 < len(argv):
             role = argv[i + 1]; i += 2
@@ -328,14 +330,15 @@ def do_file_task(argv) -> None:
             goal.append(argv[i]); i += 1
     goal = " ".join(goal).strip()
     if not goal:
-        print('usage: silkworm task [--project <slug>] [--role implementor|assistant] "<goal>"')
+        print('usage: silkworm task [--propose] [--project <slug>] '
+              '[--role implementor|assistant] "<goal>"')
         raise SystemExit(2)
-    r = bot_call("/file-task", {"key": key, "goal": goal,
+    r = bot_call("/file-task", {"key": key, "goal": goal, "propose": propose,
                                 "project": project, "role": role or "implementor"})
     if not r.get("ok"):
         print(f"not filed: {r.get('error') or 'the bot did not answer'}")
         raise SystemExit(1)
-    print(f"filed {r['id']} as {r['role']}"
+    print(f"filed {r['id']} ({r.get('state', 'queued')}) as {r['role']}"
           + (f" under {r['project']}" if r.get("project") else "")
           + f" in {r.get('cwd') or '?'} ({r['remaining']} more allowed this turn)")
 
