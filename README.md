@@ -128,6 +128,7 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `CLAUDE_TIMEOUT` | `0` | Absolute per-turn cap in seconds; `0` = none |
 | `CLAUDE_IDLE_TIMEOUT` | `1800` | Stop a turn after this long with **no output at all** |
 | `SESSION_MAX_AGE_DAYS` | `30` | Forget idle thread sessions after this long |
+| `TASK_WORKERS` | `3` | How many queued tasks run at once (each is a Claude session) |
 
 ## Authentication for headless turns
 

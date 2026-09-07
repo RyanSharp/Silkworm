@@ -608,7 +608,7 @@ def test_review_gate():
     check("a rework is handed to the runner", 'driver="queue"' in rework)
 
     src = (BASE / "bot.py").read_text()
-    gate = src[src.index("def resolve_review("):src.index("def _task_runner(")]
+    gate = src[src.index("def resolve_review("):src.index("def _task_scheduler(")]
     check("a review task is titled readably, not by its prompt",
           'title=f"Review: ' in gate)
     check("passing review completes the parent", "tasks.DONE if verdict" in gate)
@@ -702,6 +702,84 @@ def _repo_guard_impl():
     exec(compile(ast.Module(body=assigns + nodes, type_ignores=[]), "<guard>", "exec"),
          mod.__dict__)
     return mod
+
+
+# --- tasks run in parallel, and each gets its own checkout -----------------------
+# Three concurrent tasks: one got a worktree and two silently fell back to
+# sharing the main checkout, losing both isolation and the parallelism. The
+# branch survived each failure, so the retry could never work.
+
+def test_parallel_tasks():
+    import worktrees as W
+    print("\nparallel workers, one checkout each")
+
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "wts"
+    repo = root / "repo"; repo.mkdir()
+    def git(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                            capture_output=True, text=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-q", "-b", "research")
+    (repo / "r.txt").write_text("research\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "research work")
+    git(repo, "checkout", "-q", "main")
+
+    # A project is not always working on main.
+    d = W.create(repo, "tsk_d", fetch=False)
+    check("the default base is the default branch",
+          not (d / "r.txt").exists())
+    r = W.create(repo, "tsk_r", fetch=False, base="research")
+    check("a project can name the branch its work builds on",
+          (r / "r.txt").exists(),
+          "branching the trader off main would drop 18 commits of research")
+    m = W.create(repo, "tsk_m", fetch=False, base="no-such-branch")
+    check("an unknown base falls back rather than failing the task",
+          m is not None and not (m / "r.txt").exists())
+
+    # The bug: `worktree add -b` makes the branch first and the tree second, so
+    # a failure at the second step leaves the branch behind and every retry
+    # then dies on "a branch named X already exists".
+    src = (BASE / "worktrees.py").read_text()
+    create = src[src.index("def create("):src.index("def main_repo")]
+    check("a failed creation deletes the branch it made",
+          create.count('"branch", "-D", branch') == 2,
+          "otherwise the retry fails forever, and a stale branch blocks the next run")
+    check("creation is serialised per repository",
+          "with _repo_create_lock(repo):" in create,
+          "concurrent `worktree add` on one repo makes all but one fail")
+    check("the fetch happens inside that lock too",
+          create.index("_repo_create_lock") < create.index("base_ref("),
+          "concurrent fetches contend on the same refs")
+    check("the real error is logged, not the progress line",
+          '(r.stderr or "").strip()[-300:]' in create,
+          'git writes "Preparing worktree..." to stderr, which hid the cause')
+
+    # Six at once, which is what surfaced it.
+    import threading
+    out = {}
+    def go(n): out[n] = W.create(repo, f"tsk_c{n}", fetch=False)
+    ts = [threading.Thread(target=go, args=(i,)) for i in range(6)]
+    [t.start() for t in ts]; [t.join(90) for t in ts]
+    check("six concurrent creations all succeed",
+          sum(1 for v in out.values() if v) == 6,
+          f"got {sum(1 for v in out.values() if v)}/6")
+    check("and each is a distinct checkout",
+          len({str(v) for v in out.values() if v}) == 6)
+
+    bot = (BASE / "bot.py").read_text()
+    check("workers are separate from the scheduler",
+          "def _task_worker" in bot and "def _task_scheduler" in bot,
+          "blocked -> queued is a transition; racing workers would have all "
+          "but one refused")
+    check("how many run at once is configurable",
+          'os.environ.get("TASK_WORKERS"' in bot)
+    check("the count is logged at startup, like the other limits",
+          "task workers: %d" in bot)
+    check("a task's base branch reaches the worktree",
+          'base=scope.get("branch")' in bot)
 
 
 # --- a project can be reviewed while you sleep -----------------------------------
@@ -960,7 +1038,7 @@ def test_credentials_check():
     check("a missing file warns too", C.warning({"mode": "missing"}).startswith(":key:"))
 
     bot = (BASE / "bot.py").read_text()
-    w = bot[bot.index("def _credential_watcher"):bot.index("def _task_runner")]
+    w = bot[bot.index("def _credential_watcher"):bot.index("def _task_scheduler")]
     check("the bot warns on its own, without being asked",
           'name="creds"' in bot and "chat_postMessage" in w)
     check("it warns once per credential, not hourly",
@@ -2022,7 +2100,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_parallel_tasks,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,

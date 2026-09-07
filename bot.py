@@ -72,6 +72,10 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "0"))
 # is legitimately quiet while it runs (Claude Code caps Bash at 10 minutes),
 # so this only fires on a process that has genuinely stopped doing anything.
 CLAUDE_IDLE_TIMEOUT = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800"))
+# How many queued tasks run at once. Worktrees make this safe -- each gets its
+# own checkout -- but every worker is a live Claude session, so this is a quota
+# decision as much as a concurrency one.
+TASK_WORKERS = int(os.environ.get("TASK_WORKERS", "3"))
 #: Absolute, because a turn's PATH is not ours to assume.
 SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
@@ -815,6 +819,29 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                              f"*{at}*, and anything it finds lands in "
                              "*proposed* for you to accept or dismiss.",
                         thread_ts=thread_ts)
+        elif arg.lower() == "base" or arg.lower().startswith("base "):
+            # Which branch this project's tasks build on. Fresh main unless a
+            # project says otherwise -- the trader's research branch is
+            # eighteen commits ahead of main, and building on main there would
+            # silently discard all of it.
+            slug = entry.get("project") or ""
+            want = arg[4:].strip()
+            if not slug:
+                say(text="File this thread under a project first: `!project <name>`.",
+                    thread_ts=thread_ts)
+            elif not want:
+                cur = (project_store.scope_for(slug) or {}).get("branch") or ""
+                say(text=(f"*{slug}* branches from *{cur}*." if cur
+                          else f"*{slug}* branches from the default branch."),
+                    thread_ts=thread_ts)
+            else:
+                sc = project_store.scope_for(slug)
+                sc["branch"] = "" if want.lower() in ("none", "default", "clear") else want
+                project_store.ensure(slug, scope=sc)
+                say(text=(f":herb: *{slug}* tasks now branch from *{sc['branch']}*."
+                          if sc["branch"] else
+                          f":herb: *{slug}* tasks branch from the default branch again."),
+                    thread_ts=thread_ts)
         elif arg.lower() == "mail" or arg.lower().startswith("mail "):
             # The Gmail label whose mail belongs here. Defaults to the project's
             # title, so this is only needed when the label is named differently.
@@ -1841,7 +1868,7 @@ def execute_task(task: dict) -> None:
     if (task.get("driver") == "queue" and worktrees.is_repo(cwd)
             and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
-        worktree = worktrees.create(cwd, tid)
+        worktree = worktrees.create(cwd, tid, base=scope.get("branch") or "")
         if worktree:
             cwd = worktree
             task_store.update(tid, scope={**scope, "worktree": str(worktree)})
@@ -2209,11 +2236,12 @@ def _ideation_scheduler() -> None:
         time.sleep(300)
 
 
-def _task_runner() -> None:
-    """Execute tasks nobody else is driving, one at a time.
+def _task_scheduler() -> None:
+    """Requeue what a restart interrupted, then keep due retries moving.
 
-    Serial on purpose: for a single person, parallel agents multiply the
-    reviewing, which is the actual bottleneck.
+    Deliberately one thread rather than one per worker: `blocked -> queued` is
+    a state transition, and several workers racing to make the same one would
+    have all but the first refused, filling the log with noise about nothing.
     """
     try:
         moved = task_store.requeue_interrupted()
@@ -2225,12 +2253,31 @@ def _task_runner() -> None:
         try:
             for tid in task_store.due_retries(time.time()):
                 task_state(tid, tasks.QUEUED, "retry time reached")
+        except Exception:
+            log.exception("task scheduler iteration failed")
+        time.sleep(TASK_POLL_S)
+
+
+def _task_worker(n: int) -> None:
+    """Claim and run queued work, alongside the other workers.
+
+    Safe to run several of these because the pieces underneath were built for
+    it: `claim` selects and transitions under one lock, so no two workers get
+    the same task, and every queued task works in its own git worktree, so no
+    two of them share a checkout.
+
+    A task waiting on its reviewer does not hold a worker -- the review is
+    enqueued as its own task and the implementor parks in `blocked` -- so
+    workers cannot all end up waiting on each other.
+    """
+    while True:
+        try:
             task = task_store.claim()
             if task:
                 execute_task(task)
                 continue           # drain without waiting
         except Exception:
-            log.exception("task runner iteration failed")
+            log.exception("task worker %d failed", n)
         time.sleep(TASK_POLL_S)
 
 
@@ -2460,7 +2507,10 @@ if __name__ == "__main__":
     threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
     threading.Thread(target=_backfiller, daemon=True, name="backfill").start()
-    threading.Thread(target=_task_runner, daemon=True, name="task-runner").start()
+    threading.Thread(target=_task_scheduler, daemon=True, name="tsched").start()
+    for _i in range(max(1, TASK_WORKERS)):
+        threading.Thread(target=_task_worker, args=(_i,), daemon=True,
+                         name=f"task{_i}").start()
     threading.Thread(target=_email_watcher, daemon=True, name="email").start()
     threading.Thread(target=_credential_watcher, daemon=True, name="creds").start()
     threading.Thread(target=_ideation_scheduler, daemon=True, name="ideate").start()
@@ -2470,8 +2520,9 @@ if __name__ == "__main__":
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))
     # Logged because "is the new limit actually in effect" is otherwise only
     # answerable by reading .env and trusting that the service was restarted.
-    log.info("turn limits: cap=%s idle=%ds",
-             f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none", CLAUDE_IDLE_TIMEOUT)
+    log.info("turn limits: cap=%s idle=%ds · task workers: %d",
+             f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none",
+             CLAUDE_IDLE_TIMEOUT, TASK_WORKERS)
     slack_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     threading.Thread(target=_slack_watchdog, args=(slack_handler,),
                      daemon=True, name="slack-health").start()

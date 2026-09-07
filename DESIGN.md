@@ -453,3 +453,34 @@ evaluates against, and that differs by project: a trading system has real ground
 truth and is also where a self-directed loop would overfit hardest, while an app
 has no objective signal at all and would generate plausible nonsense. Define the
 signal per project before trusting the loop, not after.
+
+## Running tasks in parallel
+
+The queue runner took one task at a time. That was correct while everything
+shared a checkout and stopped being correct once queued work was isolated, so
+it is now a scheduler thread plus `TASK_WORKERS` workers (three by default).
+
+The pieces underneath were already built for it: `claim` selects and
+transitions under one lock, so no two workers get the same task, and a task
+waiting on its reviewer parks in `blocked` rather than holding a worker — the
+review is enqueued as its own task — so workers cannot end up waiting on each
+other. The scheduler is separate because `blocked -> queued` is a transition,
+and racing workers would have all but the first refused.
+
+**Worktree creation had to be serialised even though the tasks are not.** Three
+concurrent tasks produced one worktree and two silent fallbacks to the shared
+checkout, losing isolation and parallelism at once. `git worktree add` holds a
+repository lock, and so does the fetch that resolves the base, so creation
+takes a per-repository lock — a second or two each, against tasks that run for
+minutes.
+
+The failure also left a trap: `worktree add -b` creates the branch first and
+the working tree second, so a failure at the second step leaves the branch
+behind, and every retry afterwards dies on "a branch named X already exists".
+The branch is now cleared before retrying and after giving up.
+
+**A project can name the branch its work builds on.** Fresh main is still the
+default, but the trader sits on a research branch eighteen commits ahead of
+main, and branching there off main would quietly discard all of it and build on
+the wrong baseline — three times over, once tasks run in parallel. `!project
+base <branch>` sets it.

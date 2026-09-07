@@ -22,6 +22,8 @@ disk and reported rather than removed.
 import logging
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger("silkworm.worktrees")
@@ -47,18 +49,28 @@ def is_repo(path) -> bool:
         return False
 
 
-def base_ref(repo, fetch: bool = True) -> str:
-    """What to branch from: the freshest default branch we can name.
+def base_ref(repo, fetch: bool = True, prefer: str = "") -> str:
+    """What to branch from: `prefer` if it exists, else the default branch.
 
-    Fetch is best-effort -- being offline should mean branching from a slightly
-    stale main, not failing to start the task at all.
+    A project is not always working on main. The trader sits on a research
+    branch eighteen commits ahead of it, and branching off main there would
+    quietly drop all of that and build on the wrong baseline -- so a project
+    can name its own base. Fresh main stays the default, per the usual rule
+    about not stacking branches.
+
+    Fetch is best-effort: being offline should mean branching from a slightly
+    stale base, not failing to start the task at all.
     """
     if fetch:
         try:
             _git(repo, "fetch", "--quiet", "origin", timeout=60)
         except Exception:
             log.info("fetch failed for %s; branching from what is local", repo)
-    for ref in ("origin/HEAD", "origin/main", "origin/master", "main", "master"):
+    candidates = []
+    if prefer:
+        candidates += [f"origin/{prefer}", prefer]
+    candidates += ["origin/HEAD", "origin/main", "origin/master", "main", "master"]
+    for ref in candidates:
         if _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0:
             return ref
     return "HEAD"
@@ -68,7 +80,21 @@ def path_for(repo, task_id: str) -> Path:
     return ROOT / f"{Path(repo).name}{SEP}{task_id}"
 
 
-def create(repo, task_id: str, fetch: bool = True) -> Path | None:
+#: `git worktree add` takes a repository-level lock while it writes refs, so
+#: two workers starting at once make one of them fail. Creation is a second or
+#: two; serialising just that costs nothing and keeps the tasks themselves
+#: parallel. Observed directly: three concurrent tasks, two failed to get a
+#: worktree and silently fell back to sharing the main checkout.
+_create_locks: dict = {}
+_create_guard = threading.Lock()
+
+
+def _repo_create_lock(repo):
+    with _create_guard:
+        return _create_locks.setdefault(str(Path(repo).resolve()), threading.Lock())
+
+
+def create(repo, task_id: str, fetch: bool = True, base: str = "") -> Path | None:
     """A fresh worktree for this task, or None if one could not be made.
 
     Returning None is a soft failure on purpose: the caller falls back to the
@@ -81,12 +107,29 @@ def create(repo, task_id: str, fetch: bool = True) -> Path | None:
     if path.exists():
         return path
     ROOT.mkdir(parents=True, exist_ok=True)
-    base = base_ref(repo, fetch)
     branch = f"{BRANCH_PREFIX}{task_id}"
-    r = _git(repo, "worktree", "add", "-b", branch, str(path), base)
+    with _repo_create_lock(repo):
+        base = base_ref(repo, fetch, prefer=base)
+        r = _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        if r.returncode != 0:
+            # `worktree add -b` creates the branch first and the working tree
+            # second, so a failure at the second step leaves the branch behind
+            # -- and a naive retry then fails forever with "a branch named X
+            # already exists". Clear it before trying again.
+            time.sleep(1.5)
+            _git(repo, "worktree", "prune")
+            _git(repo, "branch", "-D", branch)
+            r = _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        if r.returncode != 0:
+            # Still failed: do not leave a half-made branch lying around for a
+            # later run to trip over.
+            _git(repo, "branch", "-D", branch)
     if r.returncode != 0:
+        # Tail, not head: git puts "Preparing worktree..." progress on stderr,
+        # so logging the first 300 characters captured that and hid the actual
+        # error underneath it.
         log.warning("could not create a worktree for %s: %s",
-                    repo, (r.stderr or "").strip()[:300])
+                    repo, (r.stderr or "").strip()[-300:])
         return None
     log.info("worktree %s on %s (from %s)", path, branch, base)
     return path
