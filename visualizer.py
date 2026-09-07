@@ -23,6 +23,13 @@ import secrets
 import procs
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+#: Read once: it is a kilobyte and never changes while the server runs.
+try:
+    FAVICON = (BASE_DIR / "assets" / "favicon.svg").read_bytes()
+except OSError:
+    FAVICON = b""
 SESSIONS_FILE = BASE_DIR / "sessions.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PORT = int(os.environ.get("SILKWORM_VIZ_PORT", "8790"))
@@ -380,6 +387,14 @@ class Handler(BaseHTTPRequestHandler):
                 cookie["Set-Cookie"] = (f"silkworm_token={TOKEN}; Path=/; "
                                         "HttpOnly; SameSite=Strict; Max-Age=31536000")
             self._send(200, PAGE.encode(), "text/html; charset=utf-8", cookie)
+        elif url.path in ("/favicon.svg", "/favicon.ico"):
+            # Both paths: the link tag asks for the svg, but browsers request
+            # /favicon.ico on their own and a 404 for it is noise in the log.
+            if FAVICON:
+                self._send(200, FAVICON, "image/svg+xml",
+                           {"Cache-Control": "public, max-age=86400"})
+            else:
+                self._send(404, b"no icon", "text/plain")
         elif url.path == "/api/sessions":
             self._json(load_sessions())
         elif url.path == "/api/session":
@@ -446,6 +461,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Silkworm — Sessions</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   :root {
     --bg: #2C0E2E; --panel: #3A1440; --line: #57265B; --line2: #4A1F50;

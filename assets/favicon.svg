@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Deliberately not logo.svg. A favicon is read at 16px, where five body
+       segments, a dashed thread and a face collapse into one lump. Same palette
+       and same idea, drawn with as few shapes as still say "worm on a thread".
+       Verified by rendering at 16 and 32 and looking at it. -->
+  <defs>
+    <radialGradient id="bg" cx="0.35" cy="0.25" r="1.1">
+      <stop offset="0" stop-color="#5C2160"/>
+      <stop offset="1" stop-color="#3D1140"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+
+  <!-- one solid thread, thick enough to survive downscaling -->
+  <path d="M96,166 C 214,108 336,134 412,206"
+        fill="none" stroke="#ECB22E" stroke-width="40" stroke-linecap="round"/>
+
+  <!-- a body and a head: two shapes read as a worm, five read as a smudge -->
+  <g stroke="#3D1140" stroke-width="12">
+    <circle cx="166" cy="366" r="78" fill="#EFE2CC"/>
+    <circle cx="302" cy="336" r="114" fill="#F6EEDF"/>
+  </g>
+
+  <!-- eyes big enough to still be two dots when the mark is 16px across -->
+  <circle cx="276" cy="316" r="24" fill="#331233"/>
+  <circle cx="348" cy="320" r="24" fill="#331233"/>
+</svg>

@@ -790,6 +790,32 @@ def test_parallel_tasks():
           'base=scope.get("branch")' in bot)
 
 
+# --- the dashboard has an icon ---------------------------------------------------
+# Drawn separately from logo.svg on purpose: a favicon is read at 16px, where
+# the logo's five body segments, dashed thread and face collapse into a smudge.
+
+def test_favicon():
+    print("\nfavicon")
+    icon = BASE / "assets" / "favicon.svg"
+    check("there is a favicon", icon.exists())
+    body = icon.read_text() if icon.exists() else ""
+    check("it is square, so browsers do not letterbox it",
+          'viewBox="0 0 512 512"' in body)
+    check("it is small enough to serve from memory", len(body) < 4000,
+          f"{len(body)} bytes")
+    check("it is simpler than the logo",
+          body.count("<circle") < (BASE / "assets" / "logo.svg").read_text().count("<circle"),
+          "detail that vanishes at 16px is detail that muddies it")
+
+    viz = (BASE / "visualizer.py").read_text()
+    check("the page asks for it", 'rel="icon"' in viz)
+    check("it is served", '"/favicon.svg", "/favicon.ico"' in viz,
+          "browsers request /favicon.ico unprompted; a 404 for it is log noise")
+    check("with an image content type", '"image/svg+xml"' in viz)
+    check("and read once rather than per request", "FAVICON = (BASE_DIR" in viz)
+    check("a missing file does not break the dashboard", "FAVICON = b\"\"" in viz)
+
+
 # --- old threads can be put away -------------------------------------------------
 # 37 threads, 13 of them one-off task runs, ten untouched for a fortnight. The
 # ask was "delete, or at a minimum hide" -- and deleting is the wrong half of
@@ -2164,7 +2190,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_parallel_tasks,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_parallel_tasks,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,
