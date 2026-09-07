@@ -43,6 +43,10 @@ FIELDS: dict[str, tuple] = {
     "updated":           (0.0,   "unix time of the last write"),
     "last_msg_ts":       (None,  "newest Slack ts picked up; guards against redelivery"),
     "pending":           (None,  "in-flight turn marker, or None -- see recovery.py"),
+    # Hidden rather than deleted. Dropping a record destroys its title,
+    # summary, cost history and file list along with the session id, and a
+    # thread you are done looking at is not a thread you want erased.
+    "hidden":            (False, "kept, but out of the dashboard's default list"),
     "checked_out":       (False, "handed to a terminal session"),
     "terminal_live":     (False, "that terminal session is currently running"),
 }

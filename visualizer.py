@@ -135,6 +135,7 @@ def load_sessions() -> dict:
         st = threads.get(key, {})
         out.append({
             "key": key,
+            "hidden": bool(entry.get("hidden")),
             "title": entry.get("title") or "",
             "kind": entry.get("kind") or "thread",
             "summary": entry.get("summary") or "",
@@ -423,6 +424,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/titles":
             answer = bot_call("/titles", payload, timeout=180)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/hide":
+            answer = bot_call("/hide", payload, timeout=10)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/release":
             answer = bot_call("/release", payload, timeout=30)
             self._json(answer or {"ok": False, "error": "bot is offline"})
@@ -505,6 +509,9 @@ PAGE = r"""<!doctype html>
     border-radius: 6px; padding: 2px 8px; }
   #kindfilter button:hover { color: var(--fg); }
   #kindfilter button.on { background: #8882; color: var(--fg); border-color: #888a; }
+  .hidebtn { float: right; background: transparent; border: 0; cursor: pointer;
+    color: var(--muted); font-size: 13px; line-height: 1; padding: 0 2px; }
+  .hidebtn:hover { color: var(--fg); }
   .badge.cost { background: #C08A1C22; color: var(--gold); border: 1px solid #C08A1C99; }
   .card .untitled { color: var(--muted); font-style: italic; font-size: 12.5px; }
   .pill { font-size: 10.5px; font-family: var(--mono); color: var(--gold);
@@ -879,8 +886,32 @@ let threadKind = "all";
 
 const KIND_LABEL = {thread: "Conversations", task: "Task runs"};
 
+// Hidden threads are kept, just not listed. "I am done looking at this" is a
+// different thing from "erase what it cost me", and the record holds the
+// title, summary, cost history and file list.
+let showHidden = false;
+
 function matchesKind(s) {
+  if (!showHidden && s.hidden) return false;
   return threadKind === "all" || (s.kind || "thread") === threadKind;
+}
+
+async function hideThread(key, hidden, ev) {
+  if (ev) ev.stopPropagation();          // the card itself opens the thread
+  await fetch("/api/hide", {method: "POST", headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({action: hidden ? "hide" : "unhide", key})});
+  loadList();
+}
+
+function toggleHidden() { showHidden = !showHidden; loadList(); }
+
+async function hideOldTaskRuns() {
+  // Task runs are one-offs and are what actually piles up; a quiet
+  // conversation may still be one you come back to, so it is left alone.
+  const r = await (await fetch("/api/hide", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "bulk", days: 14, kinds: ["task"]})})).json();
+  if (r.ok) loadList();
 }
 
 function setKind(k) {
@@ -896,13 +927,24 @@ function renderKindFilter(sessions) {
     counts[k] = (counts[k] || 0) + 1;
   }
   const kinds = Object.keys(counts).sort();
-  // One kind is not a choice; showing a filter with a single option is noise.
-  if (kinds.length < 2) { bar.innerHTML = ""; return; }
   const btn = (k, label, n) =>
     `<button class="${threadKind === k ? "on" : ""}" onclick="setKind('${k}')">` +
     `${label} <b>${n}</b></button>`;
-  bar.innerHTML = btn("all", "All", sessions.length) +
+  // One kind is not a choice, but the hidden controls still belong here.
+  const kindBtns = kinds.length < 2 ? "" :
+    btn("all", "All", sessions.length) +
     kinds.map(k => btn(k, KIND_LABEL[k] || k, counts[k])).join("");
+  const nHidden = sessions.filter(s => s.hidden).length;
+  const oldRuns = sessions.filter(
+    s => !s.hidden && (s.kind || "thread") === "task"
+         && (Date.now() / 1000 - s.updated) > 14 * 86400).length;
+  bar.innerHTML = kindBtns +
+    (nHidden ? `<button class="${showHidden ? "on" : ""}" onclick="toggleHidden()"
+                  title="hidden threads are kept, not deleted"
+                >hidden <b>${nHidden}</b></button>` : "") +
+    (oldRuns ? `<button onclick="hideOldTaskRuns()"
+                  title="hide task runs untouched for 14 days"
+                >tidy <b>${oldRuns}</b></button>` : "");
 }
 
 async function loadList() {
@@ -928,7 +970,10 @@ async function loadList() {
     const label = s.title ? `<span class="title">${esc(s.title)}</span>`
                           : `<span class="untitled">untitled</span>`;
     const kindTag = s.kind === "task" ? `<span class="badge kind">task run</span>` : "";
-    div.innerHTML = `<div class="key">${label}${kindTag}${badges}
+    const hideBtn = `<button class="hidebtn" title="${s.hidden ? "show again" : "hide"}"
+        onclick="hideThread('${s.key}', ${s.hidden ? "false" : "true"}, event)"
+      >${s.hidden ? "\u21ba" : "\u00d7"}</button>`;
+    div.innerHTML = `<div class="key">${label}${kindTag}${badges}${hideBtn}
         ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
       <div class="subkey">${esc(s.key)}</div>
       ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}

@@ -790,6 +790,62 @@ def test_parallel_tasks():
           'base=scope.get("branch")' in bot)
 
 
+# --- old threads can be put away -------------------------------------------------
+# 37 threads, 13 of them one-off task runs, ten untouched for a fortnight. The
+# ask was "delete, or at a minimum hide" -- and deleting is the wrong half of
+# that, because dropping a record destroys its title, summary, cost history and
+# file list along with the session id.
+
+def test_hiding_threads():
+    print("\nthreads can be hidden, and are never deleted to do it")
+    import schema
+    check("hidden is part of the record", "hidden" in schema.FIELDS)
+    check("and defaults to visible", schema.default("hidden") is False)
+
+    st = tmp_store()
+    st.update("C:1", title="a conversation", kind="thread")
+    st.update("C:2", title="a task run", kind="task")
+    st.update("C:3", title="an old conversation", kind="thread")
+    st.update("C:4", title="a running task run", kind="task",
+              pending={"session_id": "s"})
+    # update() stamps `updated` itself, so age has to be set behind it.
+    old_ts = time.time() - 30 * 86400
+    for k in ("C:2", "C:3", "C:4"):
+        st._data[k]["updated"] = old_ts
+
+    check("hiding one works", st.set_hidden("C:1", True) and st.get("C:1").get("hidden"))
+    check("nothing is discarded by hiding",
+          st.get("C:1")["title"] == "a conversation",
+          "the title, summary, cost and files all have to survive it")
+    check("unhiding works", st.set_hidden("C:1", False)
+          and not st.get("C:1").get("hidden"))
+    check("hiding an unknown thread is refused", not st.set_hidden("C:nope", True))
+
+    hidden = st.hide_older_than(14, kinds=("task",))
+    check("a bulk tidy hides old task runs", hidden == ["C:2"], f"got {hidden}")
+    check("and leaves an old conversation alone",
+          not st.get("C:3").get("hidden"),
+          "a quiet conversation may still be one you come back to")
+    check("and never hides a thread with a turn in flight",
+          not st.get("C:4").get("hidden"))
+    check("hiding does not count as activity",
+          st.get("C:2")["updated"] < time.time() - 14 * 86400,
+          "or a hidden thread would look freshly used")
+
+    viz = (BASE / "visualizer.py").read_text()
+    check("the list filters hidden out by default",
+          "if (!showHidden && s.hidden) return false;" in viz)
+    check("hidden threads stay reachable", "function toggleHidden" in viz,
+          "put away is not thrown away")
+    check("the hide control does not open the thread it hides",
+          "ev.stopPropagation()" in viz)
+    check("the payload says which are hidden", '"hidden": bool(entry.get("hidden"))' in viz)
+    bot = (BASE / "bot.py").read_text()
+    check("the bot exposes it", 'server.route("/hide", handle_hide)' in bot)
+    check("and never deletes to satisfy it",
+          "store.drop" not in bot[bot.index("def handle_hide"):bot.index("server = LocalServer")])
+
+
 # --- a project can be reviewed while you sleep -----------------------------------
 # A nightly look that proposes work, which you accept or dismiss in the morning.
 # The `proposed` state existed for exactly this and had never once been used.
@@ -2108,7 +2164,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_parallel_tasks,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_parallel_tasks,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,

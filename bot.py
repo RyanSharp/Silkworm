@@ -1468,6 +1468,28 @@ def handle_file_task(payload: dict) -> dict:
             "remaining": scoping.MAX_PER_TURN - _filed_this_turn[key]}
 
 
+def handle_hide(payload: dict) -> dict:
+    """Route for /hide — take a thread out of the dashboard's default list.
+
+    Hidden, never deleted: dropping a record destroys its title, summary, cost
+    history and file list along with the session, and "I am done looking at
+    this" is not "erase what it cost me".
+    """
+    action = payload.get("action", "hide")
+    if action == "bulk":
+        days = float(payload.get("days") or 30)
+        kinds = tuple(payload.get("kinds") or ())
+        keys = store.hide_older_than(days, kinds=kinds)
+        log.info("hid %d thread(s) untouched for %sd%s", len(keys), days,
+                 f" (kinds={','.join(kinds)})" if kinds else "")
+        return {"ok": True, "hidden": len(keys), "keys": keys}
+    key = payload.get("key", "")
+    if not store.get(key):
+        return {"ok": False, "error": "unknown thread"}
+    ok = store.set_hidden(key, action != "unhide")
+    return {"ok": ok, "key": key, "hidden": action != "unhide"}
+
+
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
@@ -1481,6 +1503,7 @@ server.route("/tasks", handle_tasks)
 server.route("/projects", handle_projects)
 server.route("/defer", handle_defer)
 server.route("/file-task", handle_file_task)
+server.route("/hide", handle_hide)
 
 approvals: ApprovalManager | None = None
 if CLAUDE_APPROVAL_MODE == "slack":

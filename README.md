@@ -376,6 +376,17 @@ date and a ~400 character snippet go to the model. Everything it finds arrives
 as **`proposed`**, never queued, so a mediocre guess costs an accept/dismiss
 rather than unwanted work.
 
+## Tidying the thread list
+
+Threads accumulate, especially the one-off threads task runs narrate into. Each
+card in the dashboard has a **×** to hide it, a `hidden` button brings them
+back, and **tidy** hides task runs untouched for a fortnight in one go.
+
+Hidden, never deleted: the record keeps its title, summary, cost history and
+files, so putting a thread away costs you nothing and is one click from undone.
+The bulk tidy leaves conversations alone — a quiet one may still be one you come
+back to — and never touches a thread with a turn in flight.
+
 ## Nightly review
 
 Point it at a project and it will look the project over out of hours:

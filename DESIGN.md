@@ -515,3 +515,20 @@ So the queued task is no longer cancelled: its `driver` flips to `queue` and
 the runner picks it up. The record already holds the goal, thread, project and
 scope, so nothing has to be reconstructed from Slack at all, and no ordering
 assumption is involved.
+
+## Putting threads away
+
+The list grows and never shrinks: 37 threads, 13 of them one-off task runs, ten
+untouched for a fortnight. The ask was "delete old threads, or at a minimum
+hide them" — and **delete is the wrong half**. Dropping a record destroys its
+title, summary, cost history and file list along with the session id, and "I am
+done looking at this" is not "erase what it cost me".
+
+So threads are hidden, never deleted. A hidden thread keeps everything and is
+one click from coming back. The bulk tidy only touches **task runs**, because
+those are one-offs that pile up, while a quiet conversation may still be one
+you return to — and it skips anything with a turn in flight. Hiding does not
+stamp `updated`, or a thread you put away would look freshly used.
+
+This sits alongside the kind filter rather than replacing it: filtering answers
+"show me only conversations", hiding answers "I am finished with this one".

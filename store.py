@@ -118,6 +118,36 @@ class SessionStore:
                     return key
             return None
 
+    def set_hidden(self, key: str, hidden: bool) -> bool:
+        """Hide or unhide one thread. Nothing is discarded either way."""
+        with self._lock:
+            rec = self._data.get(key)
+            if rec is None:
+                return False
+            rec["hidden"] = bool(hidden)
+            rec["updated"] = rec.get("updated", 0.0)   # hiding is not activity
+            self._save()
+            return True
+
+    def hide_older_than(self, days: float, kinds=()) -> list[str]:
+        """Hide threads untouched for `days`. Returns the keys hidden.
+
+        `kinds` narrows it -- task-run threads are one-offs that pile up, while
+        a quiet conversation may still be one you return to.
+        """
+        cutoff = time.time() - days * 86400
+        with self._lock:
+            keys = [k for k, v in self._data.items()
+                    if not v.get("hidden")
+                    and v.get("updated", 0) < cutoff
+                    and not v.get("pending")
+                    and (not kinds or (v.get("kind") or "thread") in kinds)]
+            for k in keys:
+                self._data[k]["hidden"] = True
+            if keys:
+                self._save()
+            return keys
+
     def sweep(self, max_age_days: float) -> int:
         cutoff = time.time() - max_age_days * 86400
         with self._lock:
