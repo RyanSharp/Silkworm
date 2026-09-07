@@ -375,6 +375,24 @@ date and a ~400 character snippet go to the model. Everything it finds arrives
 as **`proposed`**, never queued, so a mediocre guess costs an accept/dismiss
 rather than unwanted work.
 
+## Nightly review
+
+Point it at a project and it will look the project over out of hours:
+
+    !project ideate 02:00      # or 2am; `!project ideate off` to stop
+
+Each night it reads the code, history and tests, and files what it finds as
+**proposed** tasks — on your board, waiting. Accept the ones worth doing and
+they queue like any other work, running in their own checkouts with a reviewer
+before they can complete. Dismiss the rest.
+
+The reviewer is read-only by enforcement, not instruction: it can read and file
+proposals, and cannot edit, commit or push. It's told that finding nothing is a
+good outcome, and capped at five proposals — a pass that must produce something
+produces busywork, and busywork costs you a decision.
+
+It never acts on its own findings. Acceptance is always a person.
+
 ## Isolated checkouts for queued work
 
 A task filed against a repo-backed project runs in **its own `git` worktree**,

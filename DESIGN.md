@@ -421,3 +421,35 @@ task costs one, or two once reviewed.
 **The natural follow-on is a concurrent queue runner.** It still runs one task
 at a time, which was correct while everything shared a checkout and is not once
 work is isolated — a five-task plan is currently ten sequential sessions.
+
+## Out-of-hours ideation
+
+A project can be looked over on a schedule — `!project ideate 02:00` — and
+whatever the pass finds is filed as **`proposed`**: on the board, waiting, not
+running. You accept the ones worth doing in the morning and they queue like any
+other work. That is the whole loop, and every part of it except the schedule
+already existed. `proposed` in particular was built for exactly this and had
+never once been used.
+
+The ideator is **read-only**, enforced rather than requested: it runs unattended
+in the middle of the night, so it can read the tree and history and file
+proposals, and nothing else. It gets a fresh session each time — a nightly look
+should not inherit last night's conclusions — and no worktree, because a role
+that cannot write has nothing to isolate and would only leave an empty branch
+behind every run.
+
+It is told that **finding nothing is a good outcome.** A pass that must produce
+something produces busywork, and busywork costs the scarcest thing here: a
+decision. Capped at five proposals for the same reason — a night that finds ten
+things has not prioritised.
+
+Scheduling is checked against the wall clock rather than slept precisely to, so
+a bot restarted at 02:00 still runs the pass when it returns, and one that has
+already run today does not run twice.
+
+**What this deliberately does not do** is act on its own findings. Acceptance is
+a person, every time. An improvement loop is only as good as the signal it
+evaluates against, and that differs by project: a trading system has real ground
+truth and is also where a self-directed loop would overfit hardest, while an app
+has no objective signal at all and would generate plausible nonsense. Define the
+signal per project before trusting the loop, not after.
