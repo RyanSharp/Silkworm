@@ -389,7 +389,9 @@ back to — and never touches a thread with a turn in flight.
 
 ## Nightly review
 
-Point it at a project and it will look the project over out of hours:
+Point it at a project and it will look the project over out of hours. From the
+dashboard, the 🌙 strip in the 📋 Tasks panel lists every project and what it is
+scheduled for — click one to set a time or turn it off. Or from Slack:
 
     !project ideate 02:00      # or 2am; `!project ideate off` to stop
 

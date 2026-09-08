@@ -1287,6 +1287,21 @@ def handle_projects(payload: dict) -> dict:
         scope = payload.get("scope")
         return {"ok": True, "project": project_store.ensure(
             name, **({"scope": scope} if scope else {}))}
+    if action == "ideate":
+        # Nightly review, set from the dashboard rather than only from Slack.
+        # Validated here rather than in the page: "2am" should work, and a
+        # typo should be refused with a reason rather than silently stored.
+        slug = (payload.get("slug") or "").strip()
+        if not project_store.get(slug):
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        want = (payload.get("at") or "").strip()
+        if want.lower() in ("", "off", "none", "clear"):
+            return {"ok": True, "project": project_store.ensure(slug, ideate_at="")}
+        try:
+            at = projects.parse_at(want)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "project": project_store.ensure(slug, ideate_at=at)}
     if action == "brief":
         slug = payload.get("slug", "")
         if "brief" in payload:

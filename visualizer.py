@@ -525,6 +525,15 @@ PAGE = r"""<!doctype html>
     border-radius: 6px; padding: 2px 8px; }
   #kindfilter button:hover { color: var(--fg); }
   #kindfilter button.on { background: #8882; color: var(--fg); border-color: #888a; }
+  #nightly { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    padding: 4px 0 10px; }
+  #nightly .nlabel { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  #nightly button { font-size: 11px; font-family: var(--mono); cursor: pointer;
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 8px; }
+  #nightly button:hover { color: var(--fg); }
+  #nightly button.on { background: #C08A1C22; color: var(--gold);
+    border-color: #C08A1C99; }
   .hidebtn { float: right; background: transparent; border: 0; cursor: pointer;
     color: var(--muted); font-size: 13px; line-height: 1; padding: 0 2px; }
   .hidebtn:hover { color: var(--fg); }
@@ -767,6 +776,7 @@ PAGE = r"""<!doctype html>
     <div class="hint">Work Silkworm is managing. This opens on what needs you —
       tasks proposed for triage, waiting on approval, asking a question, or failed.
       Everything else is the system's business and stays out of the way.</div>
+    <div id="nightly"></div>
     <div class="lform">
       <input class="text" id="tgoal" placeholder="what should it do?"
              onkeydown="if(event.key==='Enter')addTask()">
@@ -1223,6 +1233,40 @@ function setTaskView(v) {
   document.getElementById("taball").className = v === "all" ? "on" : "";
   renderTasks();
 }
+// Kept so the schedule prompt can show what a project is currently set to
+// rather than making you remember it.
+let projectRows = [];
+
+async function setIdeate(slug) {
+  const cur = (projectRows.find(p => p.slug === slug) || {}).ideate_at || "";
+  const at = prompt(
+    `Nightly review for ${slug}\n\nTime of day (02:00, or 2am), or "off" to stop:`,
+    cur || "02:00");
+  if (at === null) return;                       // cancelled is not "off"
+  const r = await (await fetch("/api/projects", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "ideate", slug, at})})).json();
+  if (!r.ok) { toast(r.error || "could not set that"); return; }
+  const now = (r.project || {}).ideate_at;
+  toast(now ? `${slug}: nightly review at ${now}` : `${slug}: nightly review off`);
+  renderProjects();
+}
+
+function renderNightly(rows) {
+  const el = document.getElementById("nightly");
+  if (!el) return;
+  if (!rows.length) { el.innerHTML = ""; return; }
+  const on = rows.filter(p => p.ideate_at).length;
+  el.innerHTML =
+    `<span class="nlabel">🌙 nightly review${on ? "" : " — none scheduled"}</span>` +
+    rows.map(p =>
+      `<button class="${p.ideate_at ? "on" : ""}" onclick="setIdeate('${esc(p.slug)}')"
+         title="${p.ideate_at
+           ? `reads the project at ${p.ideate_at} and files proposals for you to accept`
+           : "off — click to schedule a nightly look"}"
+       >${esc(p.title)}${p.ideate_at ? ` <b>${p.ideate_at}</b>` : ""}</button>`).join("");
+}
+
 async function renderProjects() {
   const sel = document.getElementById("tproj");
   const keep = sel.value;
@@ -1230,6 +1274,8 @@ async function renderProjects() {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({action: "list"})})).json();
   const rows = (r.projects || []).filter(p => !p.archived);
+  projectRows = rows;
+  renderNightly(rows);
   sel.innerHTML = `<option value="">all projects</option>` + rows.map(p =>
     `<option value="${esc(p.slug)}">${esc(p.title)}${
       p.needs ? ` (${p.needs})` : p.open ? ` · ${p.open}` : ""}</option>`).join("");

@@ -915,7 +915,28 @@ def test_ideation():
     check("it may not edit, run tests, or push",
           "Edit" not in tools and "Write" not in tools and "Bash(git push" not in tools)
 
+    # Schedulable from the dashboard as well as Slack, and validated in the
+    # bot either way -- "2am" should work, and a typo should come back with a
+    # reason rather than being stored as a time that never fires.
     bot = (BASE / "bot.py").read_text()
+    pr = bot[bot.index('if action == "ideate"'):bot.index('if action == "brief"')]
+    check("the dashboard can schedule a nightly review", "project_store.ensure(slug, ideate_at=" in pr)
+    check("an unknown project is refused", "unknown project" in pr)
+    check("a bad time is refused with a reason", "projects.parse_at(want)" in pr
+          and "except ValueError as e" in pr,
+          "storing an unparseable time would just never fire")
+    check("off is spelled several plausible ways",
+          '("", "off", "none", "clear")' in pr)
+
+    viz = (BASE / "visualizer.py").read_text()
+    check("the panel shows which projects are scheduled", "function renderNightly" in viz)
+    check("and says so when none are", "none scheduled" in viz,
+          "the answer to 'what runs overnight' should be visible, not remembered")
+    check("cancelling the prompt is not the same as turning it off",
+          "if (at === null) return;" in viz)
+    check("it shows the current time rather than making you recall it",
+          "cur || \"02:00\"" in viz)
+
     h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
     check("a proposal waits rather than running", "tasks.PROPOSED if propose" in h)
     check("and an ideator cannot file more ideators",
