@@ -35,6 +35,7 @@ import credentials
 import defer
 import email_ingest
 import harvester
+import jsonstore
 import learnings_git
 import repos
 import roles
@@ -2504,10 +2505,8 @@ def run_email_ingest() -> dict:
     """
     if not (GMAIL_USER and GMAIL_APP_PASSWORD):
         return {"ok": False, "error": "GMAIL_USER / GMAIL_APP_PASSWORD not set"}
-    try:
-        state = json.loads(EMAIL_STATE_FILE.read_text()) if EMAIL_STATE_FILE.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        state = {}
+    # Non-strict: a watermark, so the worst case is re-reading some mail.
+    state = jsonstore.load(EMAIL_STATE_FILE, default={}, strict=False) or {}
     common = dict(host=GMAIL_HOST, user=GMAIL_USER, password=GMAIL_APP_PASSWORD,
                   limit=GMAIL_MAX_PER_RUN, binary=CLAUDE_BIN,
                   model=NAMING_MODEL or "haiku", env=claude_env(),
@@ -2518,7 +2517,7 @@ def run_email_ingest() -> dict:
     if GMAIL_TRIAGE:
         triaged = email_ingest.ingest(
             task_store, state, mailbox=GMAIL_MAILBOX, **common)
-    EMAIL_STATE_FILE.write_text(json.dumps(state, indent=2))
+    jsonstore.save(EMAIL_STATE_FILE, state)
     return {"ok": True, **facts, "triaged": triaged}
 
 

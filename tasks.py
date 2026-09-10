@@ -11,12 +11,13 @@ a default and a meaning, so a reader never has to guess whether a missing value
 means "old record" or "nothing happened".
 """
 
-import json
 import logging
 import threading
 import time
 import uuid
 from pathlib import Path
+
+import jsonstore
 
 log = logging.getLogger("silkworm.tasks")
 
@@ -207,27 +208,26 @@ class TaskStore:
         self._path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
-        if path.exists():
-            for tid, rec in json.loads(path.read_text()).items():
-                # Isolation used to be inferred from `driver`. Records written
-                # before it became a field of its own keep the answer that rule
-                # gave them -- read here, at load, before restart recovery
-                # rewrites any driver it would have been inferred from.
-                #
-                # Except where that rule was the bug: a conversation, or a
-                # conversation's scheduled wake-up, already handed to the
-                # runner by an earlier restart reads as driver="queue" and
-                # must not inherit an isolation it was never meant to have.
-                # `source` says what the work is, and nothing rewrites it.
-                rec.setdefault("isolate", rec.get("driver") == "queue"
-                               and rec.get("source") not in CONVERSATIONAL)
-                # Fill in anything a newer field list added, without clobbering.
-                for name in FIELDS:
-                    rec.setdefault(name, default(name))
-                self._data[tid] = rec
+        for tid, rec in (jsonstore.load(path, default={}) or {}).items():
+            # Isolation used to be inferred from `driver`. Records written
+            # before it became a field of its own keep the answer that rule
+            # gave them -- read here, at load, before restart recovery
+            # rewrites any driver it would have been inferred from.
+            #
+            # Except where that rule was the bug: a conversation, or a
+            # conversation's scheduled wake-up, already handed to the
+            # runner by an earlier restart reads as driver="queue" and
+            # must not inherit an isolation it was never meant to have.
+            # `source` says what the work is, and nothing rewrites it.
+            rec.setdefault("isolate", rec.get("driver") == "queue"
+                           and rec.get("source") not in CONVERSATIONAL)
+            # Fill in anything a newer field list added, without clobbering.
+            for name in FIELDS:
+                rec.setdefault(name, default(name))
+            self._data[tid] = rec
 
     def _save(self) -> None:
-        self._path.write_text(json.dumps(self._data, indent=2))
+        jsonstore.save(self._path, self._data)
 
     def create(self, goal: str, **fields) -> dict:
         task = make(goal, **fields)

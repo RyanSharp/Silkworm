@@ -19,12 +19,13 @@ under it inherit when they don't specify their own -- so "work on the trader"
 lands in the right directory without repeating it every time.
 """
 
-import json
 import logging
 import re
 import threading
 import time
 from pathlib import Path
+
+import jsonstore
 
 log = logging.getLogger("silkworm.projects")
 
@@ -101,14 +102,13 @@ class ProjectStore:
         self._path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
-        if path.exists():
-            for slug, rec in json.loads(path.read_text()).items():
-                for f in FIELDS:
-                    rec.setdefault(f, default(f))
-                self._data[slug] = rec
+        for slug, rec in (jsonstore.load(path, default={}) or {}).items():
+            for f in FIELDS:
+                rec.setdefault(f, default(f))
+            self._data[slug] = rec
 
     def _save(self) -> None:
-        self._path.write_text(json.dumps(self._data, indent=2))
+        jsonstore.save(self._path, self._data)
 
     def get(self, slug: str) -> dict | None:
         with self._lock:

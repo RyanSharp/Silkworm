@@ -5,12 +5,12 @@ that record is declared in schema.py, which is also where its default and
 meaning live. Records are migrated forward on load.
 """
 
-import json
 import logging
 import threading
 import time
 from pathlib import Path
 
+import jsonstore
 import schema
 
 log = logging.getLogger("silkworm.store")
@@ -21,8 +21,8 @@ class SessionStore:
         self._path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
-        if path.exists():
-            raw = json.loads(path.read_text())
+        raw = jsonstore.load(path, default={})
+        if raw:
             migrated = False
             for key, val in raw.items():
                 # Read the old version first: migrate() edits in place, so
@@ -46,7 +46,7 @@ class SessionStore:
                          len(raw), schema.VERSION)
 
     def _save(self) -> None:
-        self._path.write_text(json.dumps(self._data, indent=2))
+        jsonstore.save(self._path, self._data)
 
     def get(self, key: str) -> dict | None:
         with self._lock:

@@ -14,6 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import jsonstore
 import repos
 
 log = logging.getLogger("silkworm.harvester")
@@ -115,12 +116,9 @@ def _extract(binary: str, model: str, env: dict, existing: list[str], convo: str
 def harvest(store, learnings, *, binary: str, model: str, env: dict,
             state_path: Path) -> dict:
     """One harvest pass over all tracked sessions. Returns a summary dict."""
-    state = {}
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            state = {}
+    # Non-strict: this file is a watermark, not records. If it is somehow
+    # unreadable the cost is re-scanning sessions, not losing anything.
+    state = jsonstore.load(state_path, default={}, strict=False) or {}
     sessions_state = state.setdefault("sessions", {})
 
     added, scanned = 0, 0
@@ -159,6 +157,6 @@ def harvest(store, learnings, *, binary: str, model: str, env: dict,
         sessions_state[sid + "@mtime"] = path.stat().st_mtime
 
     state["last_run"] = time.time()
-    state_path.write_text(json.dumps(state, indent=2))
+    jsonstore.save(state_path, state)
     log.info("harvest: %d sessions scanned, %d learnings added", scanned, added)
     return {"scanned": scanned, "added": added, "last_run": state["last_run"]}

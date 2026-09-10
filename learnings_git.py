@@ -100,5 +100,8 @@ def init(learnings_file: Path, remote: str = "") -> dict:
         learnings_file.write_text("[]\n")
     gi = repo / ".gitignore"
     if not gi.exists():
-        gi.write_text("harvest_state.json\n")
+        # The .prev/.corrupt/.tmp sidecars jsonstore.py keeps beside
+        # learnings.json are local recovery copies, not shared state.
+        gi.write_text("harvest_state.json\n"
+                      "*.json.prev\n*.json.corrupt\n*.json*.tmp.*\n")
     return {"ok": True, "dir": str(repo)}

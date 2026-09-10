@@ -3463,6 +3463,203 @@ def test_task_retention():
           and 0 < env.index("TASK_COMPACT_AFTER_DAYS") - env.index("SESSION_MAX_AGE_DAYS") < 600)
 
 
+# --- state files survive being killed mid-save --------------------------------
+# Every store used to save with write_text(), which truncates the file and then
+# writes it. A restart landing in that window left a half-written tasks.json,
+# and the load path parsed it outside any try -- so the bot could not start at
+# all, with 400+ task records and every thread's history on the floor.
+
+def test_atomic_persistence():
+    import threading as _th
+    import jsonstore
+    import projects as _projects
+    import tasks as _tasks
+    from learnings import LearningStore
+
+    print("\nstate files survive being killed mid-save")
+    d = Path(tempfile.mkdtemp())
+
+    # No store may go back to truncate-then-write. Checked on the parse tree,
+    # not the text, so a comment mentioning write_text doesn't pass for one.
+    offenders, saves = [], 0
+    def writes_in_place(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("write_text", "write_bytes"))
+    for mod in ("store.py", "tasks.py", "projects.py", "learnings.py",
+                "harvester.py", "bot.py"):
+        tree = ast.parse((BASE / mod).read_text())
+        for node in ast.walk(tree):
+            # The store file itself, whatever the surrounding function is
+            # called. (Other files here -- a project's CLAUDE.md -- are fine.)
+            if (writes_in_place(node) and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_path"):
+                offenders.append(f"{mod}:{node.lineno}")
+            if isinstance(node, ast.FunctionDef) and node.name == "_save":
+                saves += 1
+                offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
+                              if writes_in_place(n)]
+    check("every store's _save was found to check", saves == 4, f"found {saves}")
+    check("no store writes its file in place", not offenders, f"at {offenders}")
+
+    # A save leaves either the whole old file or the whole new one.
+    path = d / "tasks.json"
+    store = _tasks.TaskStore(path)
+    ids = [store.create(f"task {i}")["id"] for i in range(20)]
+    before = path.read_text()
+    boom = jsonstore._scratch(path)
+
+    real_replace = os.replace
+    def die_before_replace(src, dst):        # a kill after the temp file is written
+        if str(src).startswith(str(path) + ".tmp"):
+            raise KeyboardInterrupt("killed mid-save")
+        return real_replace(src, dst)
+    os.replace = die_before_replace
+    try:
+        store.create("the one that gets killed")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.replace = real_replace
+    check("a kill mid-save leaves the previous file whole",
+          path.read_text() == before and json.loads(path.read_text()))
+    litter = sorted(f.name for f in d.iterdir() if ".tmp." in f.name)
+    check("and leaves no half-written temp file behind", not litter, f"{litter}")
+    check("the half-written copy never reached the store", not boom.exists())
+
+    # Truncate the primary the way a SIGKILL mid-write would, then come back up.
+    store.create("written after the near miss")
+    live = json.loads(path.read_text())
+    path.write_text(json.dumps(live)[: len(json.dumps(live)) // 2])
+    try:
+        reopened = _tasks.TaskStore(path)
+        raised = None
+    except Exception as exc:                 # noqa: BLE001 - reporting it is the test
+        reopened, raised = None, exc
+    check("a truncated tasks.json still comes up", raised is None, f"raised {raised!r}")
+    if reopened is not None:
+        check("holding its records", all(reopened.get(t) for t in ids),
+              f"{len(reopened.all())} of {len(ids) + 1} records")
+        check("not silently empty", len(reopened.all()) >= len(ids))
+    check("the unreadable copy is kept", jsonstore.corrupt_path(path).exists())
+    check("and the primary is readable again", json.loads(path.read_text()))
+
+    # The same for sessions, projects and learnings: same failure, same fix.
+    sp = d / "sessions.json"
+    sessions = SessionStore(sp)
+    sessions.update("C:1", session_id="abc")
+    sessions.update("C:2", session_id="def")
+    sp.write_text(sp.read_text()[:40])
+    check("a truncated sessions.json keeps its threads",
+          SessionStore(sp).get("C:1")["session_id"] == "abc")
+
+    pp = d / "projects.json"
+    ps = _projects.ProjectStore(pp)
+    ps.ensure("Saga"); ps.ensure("Cadence")
+    pp.write_text(pp.read_text()[:40])
+    check("a truncated projects.json keeps its projects",
+          _projects.ProjectStore(pp).get("saga") is not None)
+
+    lp = d / "learnings.json"
+    ls = LearningStore(lp)
+    ls.add("do", "commit before a long build")
+    ls.add("avoid", "never stash across worktrees")
+    lp.write_text(lp.read_text()[:30])
+    check("a truncated learnings.json keeps its learnings",
+          len(LearningStore(lp).all()) == 2)
+
+    # The backup tracks the last finished save, not the one before it, so
+    # recovering costs at most the single write that was interrupted.
+    check("the backup is the last completed save, not a stale one",
+          json.loads(jsonstore.backup_path(sp).read_text()).keys() == {"C:1", "C:2"})
+    # And it is a file of its own. A hard link would share an inode with the
+    # primary, so truncating one would truncate both -- no backup at all.
+    check("the backup is a separate file, not a link to the primary",
+          jsonstore.backup_path(sp).stat().st_ino != sp.stat().st_ino)
+
+    # Losing both copies must be loud. Starting empty here is the failure mode
+    # that makes the loss invisible: an empty store looks like a fresh install.
+    bp = d / "both.json"
+    jsonstore.save(bp, {"a": 1}); jsonstore.save(bp, {"a": 2})
+    bp.write_text("{trunc")
+    jsonstore.backup_path(bp).write_text("{also trunc")
+    try:
+        jsonstore.load(bp, default={})
+        raised = None
+    except jsonstore.CorruptStore as exc:
+        raised = exc
+    check("both copies unreadable raises rather than starting empty",
+          isinstance(raised, jsonstore.CorruptStore))
+    check("and says where the wreckage is", raised and "both.json.corrupt" in str(raised))
+
+    # Not being able to read a file is not the same as the file being bad: a
+    # permission or a momentarily exhausted fd table would otherwise get a
+    # perfectly good store renamed out from under the next process to try.
+    unread = d / "unread.json"
+    jsonstore.save(unread, {"records": "here"})
+    real_read = Path.read_text
+    def cannot_read(self, *a, **kw):
+        if self.name.startswith("unread.json"):
+            raise OSError(24, "Too many open files")
+        return real_read(self, *a, **kw)
+    Path.read_text = cannot_read
+    try:
+        jsonstore.load(unread)
+        raised = None
+    except Exception as exc:                     # noqa: BLE001
+        raised = exc
+    finally:
+        Path.read_text = real_read
+    check("an unreadable-but-fine file still raises rather than starting empty",
+          isinstance(raised, jsonstore.CorruptStore))
+    check("and is left where it is, not renamed to .corrupt",
+          unread.exists() and not jsonstore.corrupt_path(unread).exists())
+    check("so the next attempt just works",
+          jsonstore.load(unread) == {"records": "here"})
+
+    # A watermark is not records: re-scanning is cheaper than refusing to start.
+    wm = d / "watermark.json"
+    wm.write_text("{trunc")
+    check("a watermark falls back to empty instead",
+          jsonstore.load(wm, default={"x": 1}, strict=False) == {"x": 1})
+
+    # Readers only ever see whole files, even while writers are hammering.
+    hot = d / "hot.json"
+    hs = _tasks.TaskStore(hot)
+    hs.create("seed")
+    stop, bad, reads = _th.Event(), [], []
+    def writer(n):
+        for i in range(40):
+            hs.create(f"w{n}-{i}")
+    def reader():
+        while not stop.is_set():
+            try:
+                reads.append(len(json.loads(hot.read_text())))
+            except Exception as exc:         # noqa: BLE001
+                bad.append(repr(exc))
+    r = _th.Thread(target=reader, daemon=True); r.start()
+    ws = [_th.Thread(target=writer, args=(n,)) for n in range(4)]
+    [w.start() for w in ws]; [w.join() for w in ws]
+    stop.set(); r.join(timeout=5)
+    check("concurrent readers never see a partial file", not bad, f"{bad[:2]}")
+    check("the reader actually read during the writes", len(reads) > 1)
+    check("every write landed", len(hs.all()) == 161)
+
+    # Finally, for real: a separate process opening a half-written store.
+    boot = d / "boot.json"
+    _tasks.TaskStore(boot).create("survive me")
+    ts = _tasks.TaskStore(boot); ts.create("and me")
+    boot.write_text(boot.read_text()[:70])
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r); import tasks;"
+         "print(len(tasks.TaskStore(__import__('pathlib').Path(%r)).all()))"
+         % (str(BASE), str(boot))],
+        capture_output=True, text=True)
+    check("a fresh process comes up on a truncated store",
+          proc.returncode == 0 and proc.stdout.strip() == "2",
+          f"rc={proc.returncode} out={proc.stdout.strip()!r} err={proc.stderr.strip()[-300:]}")
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -3828,7 +4025,8 @@ if __name__ == "__main__":
               test_file_uploads_are_handled, test_thread_kind_filter,
               test_unmerged_branches,
               test_dashboard_js_is_whole,
-              test_discarding_a_branch_keeps_it, test_task_retention):
+              test_discarding_a_branch_keeps_it, test_task_retention,
+              test_atomic_persistence):
         try:
             t()
         except Exception as exc:

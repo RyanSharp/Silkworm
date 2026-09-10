@@ -13,12 +13,12 @@ Stored as a JSON array in learnings.json; thread-safe; read by the bot, the
 harvester, and the visualizer.
 """
 
-import json
 import threading
 import time
 import uuid
 from pathlib import Path
 
+import jsonstore
 import repos
 
 TYPES = ("do", "avoid", "note")
@@ -33,15 +33,10 @@ class LearningStore:
     def __init__(self, path: Path):
         self._path = path
         self._lock = threading.Lock()
-        self._data: list[dict] = []
-        if path.exists():
-            try:
-                self._data = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
-                self._data = []
+        self._data: list[dict] = jsonstore.load(path, default=[]) or []
 
     def _save(self) -> None:
-        self._path.write_text(json.dumps(self._data, indent=2))
+        jsonstore.save(self._path, self._data)
 
     def add(self, ltype: str, text: str, scope: str = "", *,
             origin: str = "manual", source: str = "", enabled: bool = True) -> dict:

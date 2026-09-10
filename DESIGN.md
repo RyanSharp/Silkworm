@@ -702,3 +702,29 @@ default. Only when the recorded path is actually missing, so a thread
 deliberately pointed somewhere unusual is left alone. The bug is fixed, but a
 directory can always be moved or deleted by hand, and a conversation that can
 never run again is a bad way to find that out.
+
+## State that survives being killed
+
+Every store wrote itself with `path.write_text(json.dumps(...))`, which
+truncates the file and then fills it back in. `tasks.json` is over a megabyte
+and is rewritten on every create, update, transition and claim, from several
+threads at once, so that window was open a lot — and a `silkworm restart`, a
+crash or a reboot landing inside it leaves a half-written file. Neither
+`TaskStore` nor `SessionStore` parsed defensively on the way back in, so the
+result was not a degraded bot but no bot: construction raised, startup failed,
+and the fix was hand-editing JSON with 400+ task records and every thread's
+session id, title, summary and cost history at stake.
+
+`jsonstore.py` makes the write atomic — temp file in the same directory, flush,
+`os.replace` — so a reader sees the whole old file or the whole new one, never a
+prefix. Each finished save is written a second time to `<name>.prev`. That is a
+copy rather than a hard link on purpose: a link shares an inode, so whatever
+truncated the primary would truncate the backup too, which is the one case it
+exists for.
+
+On load, an unreadable primary falls back to `.prev`, says in the log which copy
+it used, and keeps the wreckage at `.corrupt`. What it will not do is start
+empty. An empty store is indistinguishable from a fresh install — that is
+exactly how losing everything becomes invisible — so when both copies are gone
+it raises and says so. Watermarks (harvest state, mail state) opt out of that:
+they hold no records, and the cost of starting over is a rescan.
