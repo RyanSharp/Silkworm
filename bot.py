@@ -2240,17 +2240,14 @@ def run_ideation(slug: str) -> dict:
     """
     rec = project_store.get(slug) or {}
     scope = project_store.scope_for(slug) or {"cwd": str(CLAUDE_CWD)}
-    goal = (
-        f"Look over the {rec.get('title') or slug} project and propose work "
-        "worth doing.\n\n"
-        "Read what is actually there before suggesting anything: the code, "
-        "recent commits, the tests, CLAUDE.md. Then file each proposal with\n"
-        f"    {SILKWORM_BIN} task --propose --project {slug} \"<goal>\"\n"
-        f"at most {scoping.MAX_PROPOSALS} of them, fewer if fewer are "
-        "warranted, and none at all if the project is in good shape. Each goal "
-        "must stand alone: whoever picks it up will not have read this.\n\n"
-        "Then say what you looked at and what you filed."
-    )
+    # Told nothing, a fresh session re-derives last night's ideas and files them
+    # again -- correctly, since a real gap is still there tomorrow. So it is
+    # told: here is what is already open, and here is what you already said no
+    # to. Otherwise every night costs the user the same dismissals.
+    open_names, dismissed = scoping.already_filed(
+        task_store.by_project(slug), time.time())
+    goal = scoping.ideation_goal(slug, rec.get("title") or slug, SILKWORM_BIN,
+                                 open_names, dismissed)
     task = task_store.create(goal, title=f"Nightly review: {rec.get('title') or slug}",
                              role="ideator", project=slug, state=tasks.QUEUED,
                              driver="queue", source="ideation", scope=scope)

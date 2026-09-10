@@ -928,6 +928,78 @@ def test_ideation():
     check("off is spelled several plausible ways",
           '("", "off", "none", "clear")' in pr)
 
+    # A fresh session every night with no memory of last night re-derives the
+    # same gaps and files them again -- and every duplicate costs a dismissal,
+    # until a board of things you already said no to stops being read. So the
+    # goal has to carry what is already open.
+    import tasks, scoping as S
+    ts = tasks.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    keep = ts.create("Add a test for the retry path", title="Add a test for the retry path",
+                     project="silkworm", state=tasks.PROPOSED, source="ideation")
+    running = ts.create("Split visualizer.py", title="Split visualizer.py",
+                        project="silkworm", state=tasks.QUEUED, source="ideation")
+    ts.transition(running["id"], tasks.RUNNING)
+    shipped = ts.create("Give the dashboard a favicon", title="Give the dashboard a favicon",
+                        project="silkworm", state=tasks.QUEUED, source="ideation")
+    ts.transition(shipped["id"], tasks.RUNNING)
+    ts.transition(shipped["id"], tasks.DONE)
+    said_no = ts.create("Rewrite it all in Rust", title="Rewrite it all in Rust",
+                        project="silkworm", state=tasks.PROPOSED, source="ideation")
+    ts.transition(said_no["id"], tasks.CANCELLED, "dismissed")
+    nightly = ts.create("Look over the silkworm project", title="Nightly review: Silkworm",
+                        project="silkworm", role="ideator", state=tasks.QUEUED,
+                        source="ideation")
+    elsewhere = ts.create("Fix the Saga webhook", title="Fix the Saga webhook",
+                          project="saga", state=tasks.PROPOSED, source="ideation")
+
+    open_names, dismissed = S.already_filed(ts.by_project("silkworm"), time.time())
+    goal = S.ideation_goal("silkworm", "Silkworm", "/x/silkworm", open_names, dismissed)
+
+    check("the goal names a proposal still waiting to be triaged",
+          "Add a test for the retry path" in goal,
+          "without it the ideator refiles the same idea every night")
+    check("and work already accepted and under way", "Split visualizer.py" in goal)
+    check("and tells it not to file them again",
+          "do not file any of these again" in goal)
+    check("finished work is not listed", "Give the dashboard a favicon" not in goal,
+          "shipping something is not a reason never to touch that area again")
+    check("the nightly review task is not listed as an idea",
+          "Nightly review" not in goal)
+    check("another project's board is not listed", "Fix the Saga webhook" not in goal,
+          f"{elsewhere['id']} belongs to saga")
+    check("a dismissed proposal is remembered", "Rewrite it all in Rust" in goal
+          and "do not bring them back" in goal,
+          "an idea the user rejected must not come back looking fresh")
+    check("filing nothing is named as an acceptable night",
+          "file nothing and say so" in goal)
+
+    # update() always stamps `updated`, so age the record directly.
+    old = dict(ts.get(said_no["id"]),
+               updated=time.time() - (S.DISMISSAL_MEMORY_DAYS + 1) * 86400)
+    _, stale = S.already_filed([old], time.time())
+    check("but a dismissal is forgotten eventually", stale == [],
+          f"'not now' is not 'never'; got {stale}")
+
+    bare = S.ideation_goal("silkworm", "Silkworm", "/x/silkworm", [], [])
+    check("a project with an empty board gets no listing",
+          "do not file any of these again" not in bare and "--propose" in bare)
+    check("both goals still say how to file",
+          "/x/silkworm task --propose --project silkworm" in goal)
+
+    long_name = ts.create("x" * 500, title="y" * 500, project="silkworm",
+                          state=tasks.PROPOSED, source="ideation")
+    names, _ = S.already_filed(ts.by_project("silkworm"), time.time())
+    check("a listed name is truncated, not sent whole",
+          max(len(n) for n in names) <= S.MAX_NAME_CHARS,
+          f"{long_name['id']} would otherwise put 500 chars in every night's prompt")
+
+    ideation = bot[bot.index("def run_ideation"):bot.index("def _ideation_scheduler")]
+    check("the nightly goal is built from the project's own board",
+          "scoping.already_filed(" in ideation and "task_store.by_project(slug)" in ideation)
+    check("and the ideator is not told to read the board itself",
+          "scoping.ideation_goal(" in ideation,
+          "it is read-only over the repo; the tasks live in Silkworm")
+
     viz = (BASE / "visualizer.py").read_text()
     check("the panel shows which projects are scheduled", "function renderNightly" in viz)
     check("and says so when none are", "none scheduled" in viz,
