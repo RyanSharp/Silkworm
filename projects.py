@@ -64,6 +64,10 @@ FIELDS: dict[str, tuple] = {
     # The Gmail label whose mail belongs to this project. Empty means "use the
     # title", so a label you already keep needs no configuration at all.
     "mail_label": ("",  "gmail label to draw facts from; blank = the title"),
+    # How this project proves its own work. Unset means unverified, which is
+    # different from failing: work is never auto-merged without one, because
+    # silence is not confidence.
+    "test_cmd": ("",    "command that verifies this project, e.g. ./bin/silkworm test"),
     # Out-of-hours ideation. "HH:MM" local time, or "" for off. `ideate_on` is
     # the last date it ran, so a restart cannot make it run twice in a night
     # and a missed night is simply skipped rather than fired late.

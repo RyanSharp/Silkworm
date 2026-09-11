@@ -45,6 +45,7 @@ import projects
 import recovery
 import retry
 import summaries
+import verify
 import worktrees
 from approvals import ApprovalManager, describe_tool
 from claude_runner import ClaudeError, ClaudeStopped, ClaudeTimeout, run_turn
@@ -822,6 +823,28 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                              f"*{at}*, and anything it finds lands in "
                              "*proposed* for you to accept or dismiss.",
                         thread_ts=thread_ts)
+        elif arg.lower() == "test" or arg.lower().startswith("test "):
+            # How this project proves its own work, for the verifier to run.
+            slug = entry.get("project") or ""
+            want = arg[4:].strip()
+            if not slug:
+                say(text="File this thread under a project first: `!project <name>`.",
+                    thread_ts=thread_ts)
+            elif not want:
+                cur = (project_store.get(slug) or {}).get("test_cmd") or ""
+                say(text=(f"*{slug}* verifies with `{cur}`." if cur
+                          else f"*{slug}* has no test command, so its work is never "
+                               "verified and never auto-merged."),
+                    thread_ts=thread_ts)
+            elif want.lower() in ("none", "off", "clear"):
+                project_store.ensure(slug, test_cmd="")
+                say(text=f":grey_question: *{slug}* will no longer be verified.",
+                    thread_ts=thread_ts)
+            else:
+                project_store.ensure(slug, test_cmd=want)
+                say(text=f":test_tube: *{slug}* verifies with `{want}`. Work that "
+                         "fails it goes back to be fixed rather than to you.",
+                    thread_ts=thread_ts)
         elif arg.lower() == "base" or arg.lower().startswith("base "):
             # Which branch this project's tasks build on. Fresh main unless a
             # project says otherwise -- the trader's research branch is
@@ -1287,6 +1310,17 @@ def handle_projects(payload: dict) -> dict:
         scope = payload.get("scope")
         return {"ok": True, "project": project_store.ensure(
             name, **({"scope": scope} if scope else {}))}
+    if action == "test-cmd":
+        # How a project proves its own work. Set here as well as from Slack so
+        # the dashboard can configure it; empty means unverified, which blocks
+        # auto-merge rather than being treated as a pass.
+        slug = (payload.get("slug") or "").strip()
+        if not project_store.get(slug):
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        cmd = (payload.get("cmd") or "").strip()
+        if cmd.lower() in ("off", "none", "clear"):
+            cmd = ""
+        return {"ok": True, "project": project_store.ensure(slug, test_cmd=cmd)}
     if action == "ideate":
         # Nightly review, set from the dashboard rather than only from Slack.
         # Validated here rather than in the page: "2am" should work, and a
@@ -1999,6 +2033,23 @@ def execute_task(task: dict) -> None:
         task_store.update(tid, session_id=result.session_id,
                           result={"text": result.text[:4000], "cost": result.cost_usd,
                                   "files_uploaded": uploaded})
+        # Verify before reviewing: a reviewer session spent on work that does
+        # not pass its own tests is a session wasted, and the test result is
+        # the stronger signal anyway.
+        settled = False
+        if roles.needs_review(role_name) and not task.get("blocked_on"):
+            checked = verify_work(task, cwd)
+            if checked["ran"]:
+                parts[-1] += "\n" + verify.summary(checked)
+                task_store.update(tid, verified=bool(checked["ok"]))
+                if not checked["ok"]:
+                    progress.finalize(parts[0])
+                    for part in parts[1:]:
+                        app.client.chat_postMessage(channel=channel,
+                                                    thread_ts=thread_ts, text=part)
+                    settled = send_back_for_tests(task, checked, channel, thread_ts)
+        if settled:
+            return
         if not resolve_review(task, role_name, result.text, channel, thread_ts):
             task_state(tid, tasks.DONE)
         refresh_summary(key)
@@ -2026,6 +2077,58 @@ def execute_task(task: dict) -> None:
                 log.exception("could not release worktree %s", worktree)
         RUNNING.pop(key, None)
         recovery.clear_pending(store, key)
+
+
+#: How many times work may be sent back for failing its own tests before it
+#: stops and asks. A change that cannot pass after this many goes is not one
+#: more attempt away from passing.
+MAX_VERIFY_ATTEMPTS = int(os.environ.get("MAX_VERIFY_ATTEMPTS", "2"))
+
+
+def verify_work(task: dict, cwd) -> dict:
+    """Run the project's own tests against this task's checkout.
+
+    Evidence, not judgement: a subprocess and an exit code, with no model in
+    between that could report a suite as green when it was not. Returns the
+    raw result; `ran=False` means there was nothing to run, which callers must
+    not confuse with failing.
+    """
+    proj = project_store.get(task.get("project") or "") or {}
+    cmd = (proj.get("test_cmd") or "").strip()
+    if not cmd:
+        return {"ran": False, "ok": False, "code": None,
+                "output": "no test command is configured for this project"}
+    log.info("verifying %s with %r in %s", task["id"], cmd, cwd)
+    return verify.run(cmd, cwd)
+
+
+def send_back_for_tests(task: dict, result: dict, channel: str, thread_ts: str) -> bool:
+    """Requeue failing work with the failure attached. True if it was sent back.
+
+    The implementor gets the actual output rather than "it failed", and the
+    attempt is counted -- a change that cannot pass after a couple of goes is
+    not one more away from passing, and should cost a person's attention
+    instead of another session.
+    """
+    tid = task["id"]
+    tried = int(task.get("verify_attempts") or 0) + 1
+    task_store.update(tid, verify_attempts=tried)
+    if tried > MAX_VERIFY_ATTEMPTS:
+        app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":x: *Tests still fail after {tried} attempts.* Leaving it for you.\n"
+                 f"```\n{result.get('output', '')[-1200:]}\n```")
+        task_state(tid, tasks.AWAITING_APPROVAL,
+                   f"tests still failing after {tried} attempts")
+        return True
+    app.client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=f":arrows_counterclockwise: *Tests fail — sending it back* "
+             f"(attempt {tried} of {MAX_VERIFY_ATTEMPTS}).")
+    task_store.update(tid, goal=(task.get("goal", "") + "\n\n"
+                                 + verify.rework_note(result)))
+    task_state(tid, tasks.QUEUED, f"tests failed; sent back (attempt {tried})")
+    return True
 
 
 def resolve_review(task: dict, role_name: str, text: str,

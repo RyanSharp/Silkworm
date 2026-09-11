@@ -48,7 +48,12 @@ TERMINAL = (DONE, CANCELLED)
 TRANSITIONS: dict[str, tuple] = {
     PROPOSED:          (QUEUED, CANCELLED),
     QUEUED:            (RUNNING, BLOCKED, CANCELLED),
-    RUNNING:           (DONE, FAILED, AWAITING_APPROVAL, NEEDS_INPUT, BLOCKED, CANCELLED),
+    # QUEUED because work can be sent back to be redone: it ran, failed the
+    # project's own tests, and goes round again with the failure attached.
+    # Without it the send-back is refused and swallowed, and the task sits in
+    #  for ever -- which is exactly what happened the first time.
+    RUNNING:           (DONE, FAILED, AWAITING_APPROVAL, NEEDS_INPUT, BLOCKED,
+                        CANCELLED, QUEUED),
     # DONE: you looked and it's fine. QUEUED: send it back to be reworked.
     # Without those two, a task could enter this state and have no way out.
     AWAITING_APPROVAL: (RUNNING, QUEUED, DONE, CANCELLED, FAILED),
@@ -106,6 +111,10 @@ FIELDS: dict[str, tuple] = {
     # Capped, so a model that keeps misjudging "is it done yet" cannot
     # poll at your expense forever.
     "defers":      (0,     "depth of the scheduled wake-up chain"),
+    # Evidence from the project's own tests, kept so the record says whether
+    # work was proven rather than merely believed.
+    "verified":        (None,  "True/False from the test command, None = not run"),
+    "verify_attempts": (0,     "times it was sent back for failing tests"),
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }

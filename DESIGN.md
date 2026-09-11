@@ -532,3 +532,32 @@ stamp `updated`, or a thread you put away would look freshly used.
 
 This sits alongside the kind filter rather than replacing it: filtering answers
 "show me only conversations", hiding answers "I am finished with this one".
+
+## Verifying work, as distinct from reviewing it
+
+The reviewer is read-only and cannot run anything, so it verifies code by
+reading it. One real review said so outright: *"could not run `./bin/silkworm
+test` here, so the '567 passed' claim is unverified."* Merging on that would be
+merging on an opinion.
+
+So verification is separate, and **deliberately not an agent**. Running a test
+command and reading an exit code needs no model, and a model in the loop could
+report a suite as green when it was not — which is the one thing this exists to
+make impossible. The reviewer stays a judgement; this is evidence.
+
+A project declares how it proves itself (`!project test ./bin/silkworm test`).
+**Unset means unverified, which is not the same as failing**: `ran=False` is
+kept distinct from `ok=False` throughout, so a project with no suite is never
+treated as having passed one, and never auto-merged.
+
+Tests run **before** the review gate — a reviewer session spent on work that
+does not pass its own tests is a session wasted, and the test result is the
+stronger signal anyway. Failing work goes back to the implementor with the
+actual output attached, and the attempt is counted: after a couple of goes it
+stops and asks, because a change that cannot pass is not one more session away
+from passing.
+
+`running → queued` had to become a legal transition for that. It was not, so
+the first live run had the send-back refused and swallowed — by design, since a
+lifecycle complaint must never cost a reply — and the task sat in `running` for
+ever. Caught by running it rather than by reading it.

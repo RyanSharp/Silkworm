@@ -872,6 +872,78 @@ def test_hiding_threads():
           "store.drop" not in bot[bot.index("def handle_hide"):bot.index("server = LocalServer")])
 
 
+# --- work is proven, not believed ------------------------------------------------
+# The reviewer is read-only and cannot run anything, and said so in a real
+# review: "could not run ./bin/silkworm test here, so the '567 passed' claim is
+# unverified." Merging on that would be merging on an opinion.
+
+def test_verification():
+    import verify as V
+    print("\nwork is verified by running the tests, not by asking")
+
+    check("a passing command passes", V.run("true", "/tmp")["ok"])
+    r = V.run("false", "/tmp")
+    check("a failing command fails", r["ran"] and not r["ok"] and r["code"] == 1)
+    check("output is captured for the failure message",
+          "hello" in V.run("sh -c 'echo hello; exit 1'", "/tmp")["output"])
+
+    none = V.run("", "/tmp")
+    check("no command means it did not run", none["ran"] is False,
+          "which is not the same as failing")
+    missing = V.run("no-such-binary-xyz", "/tmp")
+    check("an unrunnable command did not run either", missing["ran"] is False,
+          "a missing binary is a configuration problem, not a failing test")
+    check("and says which", "could not run" in missing["output"])
+    slow = V.run("sleep 5", "/tmp", timeout=1)
+    check("a suite that never finishes fails rather than hanging",
+          slow["ran"] and not slow["ok"] and "did not finish" in slow["output"])
+
+    check("a run that did not happen is never reported as passing",
+          not none["ok"] and not missing["ok"])
+    check("its summary says unverified, not failed",
+          "Not verified" in V.summary(none), V.summary(none))
+    check("a real failure says failed", ":x:" in V.summary(r))
+    check("the rework note carries the actual output",
+          "Output tail" in V.rework_note(r))
+    check("and tells it not to bend the tests to fit",
+          "rather than adjusting the tests" in V.rework_note(r))
+
+    src = (BASE / "verify.py").read_text()
+    check("verification is a subprocess, not an agent",
+          "claude" not in src.lower() and "subprocess.run" in src,
+          "a model in the loop could report a suite green that was not")
+
+    bot = (BASE / "bot.py").read_text()
+    ex = bot[bot.index("def execute_task"):bot.index("MAX_VERIFY_ATTEMPTS")]
+    check("tests run before the reviewer is spent",
+          ex.index("verify_work(task, cwd)") < ex.index("resolve_review("),
+          "reviewing work that fails its own tests wastes a session")
+    check("an unrun suite does not send work back",
+          'if checked["ran"]:' in ex,
+          "a project with no test command must not be treated as failing")
+    sb = bot[bot.index("def send_back_for_tests"):bot.index("def resolve_review")]
+    check("a failure goes back with the output attached",
+          "verify.rework_note(result)" in sb)
+    check("attempts are counted", "verify_attempts" in sb)
+    check("and it stops asking after a few",
+          "tasks.AWAITING_APPROVAL" in sb,
+          "work that cannot pass is not one more session away from passing")
+
+    import tasks as T
+    # The first live run wedged here: send-back does running -> queued, which
+    # was not a legal move, so task_state refused it and swallowed the refusal
+    # by design. The task sat in `running` for ever.
+    check("work can be sent back to be redone",
+          T.QUEUED in T.TRANSITIONS[T.RUNNING],
+          "without it the send-back is refused and the task never moves again")
+    check("a refused transition is at least logged",
+          "could not move to" in (BASE / "bot.py").read_text(),
+          "it is swallowed so a reply is never lost, so the log is the only trace")
+    check("the record says whether work was proven", "verified" in T.FIELDS)
+    check("with None meaning not run, not False",
+          T.default("verified") is None)
+
+
 # --- a project can be reviewed while you sleep -----------------------------------
 # A nightly look that proposes work, which you accept or dismiss in the morning.
 # The `proposed` state existed for exactly this and had never once been used.
@@ -2211,7 +2283,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_parallel_tasks,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_parallel_tasks,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,
