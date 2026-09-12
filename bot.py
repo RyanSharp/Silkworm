@@ -1277,8 +1277,13 @@ def handle_tasks(payload: dict) -> dict:
             parts.append("Sent back for another pass.")
         addendum = "\n\n".join(parts)
         try:
+            # Clear the previous cycle's review and verdict. Both the review
+            # gate and verification are guarded by `not blocked_on`, so leaving
+            # the old reviewer's id there made a reworked task skip both and go
+            # straight to done -- unproven and unreviewed, which is the exact
+            # opposite of what sending it back is for.
             task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
-                              driver="queue")
+                              driver="queue", blocked_on=[], verified=None)
             return {"ok": True, "task": task_store.transition(
                 tid, tasks.QUEUED, "sent back for rework")}
         except tasks.InvalidTransition as e:
@@ -2025,8 +2030,20 @@ def execute_task(task: dict) -> None:
                 task_state(tid, tasks.NEEDS_INPUT, "watch ended without scheduling")
             return
 
+        # Verify before the checkout is released: it is the only place the work
+        # exists. Running afterwards pointed at a deleted directory, which
+        # verify.run reported as "could not run" -- correctly -- and the caller
+        # read as "nothing to verify". Every task passed unverified, silently.
+        checked = None
+        if roles.needs_review(role_name) and not task.get("blocked_on"):
+            checked = verify_work(task, cwd)
+            if checked["ran"]:
+                task_store.update(tid, verified=bool(checked["ok"]))
+
         wt_note = ""
-        if worktree:
+        if worktree and (checked is None or checked.get("ok") or not checked["ran"]):
+            # A failure keeps its checkout: the next attempt reattaches the
+            # branch anyway, but leaving it makes the failure inspectable.
             removed, note = worktrees.release(worktree)
             worktree = None                      # released; finally need not repeat it
             if note:
@@ -2035,7 +2052,8 @@ def execute_task(task: dict) -> None:
                            f"\n\n_:deciduous_tree: Isolated checkout {note}._")
 
         total = (store.get(key) or {}).get("cost", 0.0)
-        parts = chunk(to_mrkdwn(result.text + wt_note))
+        verdict = ("\n\n" + verify.summary(checked)) if checked else ""
+        parts = chunk(to_mrkdwn(result.text + wt_note + verdict))
         parts[-1] += (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
                       f"${result.cost_usd:.4f} · thread total ${total:.2f}_")
         progress.finalize(parts[0])
@@ -2044,23 +2062,9 @@ def execute_task(task: dict) -> None:
         task_store.update(tid, session_id=result.session_id,
                           result={"text": result.text[:4000], "cost": result.cost_usd,
                                   "files_uploaded": uploaded})
-        # Verify before reviewing: a reviewer session spent on work that does
-        # not pass its own tests is a session wasted, and the test result is
-        # the stronger signal anyway.
-        settled = False
-        if roles.needs_review(role_name) and not task.get("blocked_on"):
-            checked = verify_work(task, cwd)
-            if checked["ran"]:
-                parts[-1] += "\n" + verify.summary(checked)
-                task_store.update(tid, verified=bool(checked["ok"]))
-                if not checked["ok"]:
-                    progress.finalize(parts[0])
-                    for part in parts[1:]:
-                        app.client.chat_postMessage(channel=channel,
-                                                    thread_ts=thread_ts, text=part)
-                    settled = send_back_for_tests(task, checked, channel, thread_ts)
-        if settled:
-            return
+        if checked and not checked["ok"] and checked["ran"]:
+            if send_back_for_tests(task, checked, channel, thread_ts):
+                return
         if not resolve_review(task, role_name, result.text, channel, thread_ts):
             task_state(tid, tasks.DONE)
         refresh_summary(key)

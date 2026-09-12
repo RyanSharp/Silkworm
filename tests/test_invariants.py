@@ -918,6 +918,18 @@ def test_verification():
     check("tests run before the reviewer is spent",
           ex.index("verify_work(task, cwd)") < ex.index("resolve_review("),
           "reviewing work that fails its own tests wastes a session")
+    # Verification ran *after* the worktree was released, so it pointed at a
+    # deleted directory. verify.run reported "could not run", the caller read
+    # that as "nothing to verify", and every task passed unverified in silence.
+    check("and before the checkout they ran in is released",
+          ex.index("verify_work(task, cwd)") < ex.index("worktrees.release(worktree)"),
+          "afterwards there is nothing left to test")
+    rw = bot[bot.index('if action == "rework"'):bot.index('if action in ("accept"')]
+    check("sending work back clears the previous review",
+          "blocked_on=[]" in rw,
+          "both the gate and verification are guarded by `not blocked_on`, so a "
+          "stale id made a reworked task skip both and go straight to done")
+    check("and clears the stale verdict with it", "verified=None" in rw)
     check("an unrun suite does not send work back",
           'if checked["ran"]:' in ex,
           "a project with no test command must not be treated as failing")
