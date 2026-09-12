@@ -65,7 +65,11 @@ def land(worktree, repo, branch: str, base: str, run_tests) -> dict:
     # `git rebase ''` -- "fatal: invalid upstream" -- which refused every
     # landing on every project that had not set one, which is most of them.
     base = worktrees.base_ref(repo, fetch=False, prefer=base)
-    base_name = base.split("/")[-1] if base else "main"
+    # `origin/HEAD` is a symbolic ref: splitting it on "/" gives "HEAD", not
+    # the branch it points at, so the checkout-is-on-the-base check compared
+    # "main" against "HEAD" and refused. Resolve it to the real name first.
+    resolved = _git(repo, "rev-parse", "--abbrev-ref", base).stdout.strip()
+    base_name = (resolved or base).split("/")[-1] or "main"
     on = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if on != base_name:
         return _fail("base-branch",
