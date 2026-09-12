@@ -995,6 +995,15 @@ def test_landing():
     a = branch("a", 2)
     b = branch("b", 3)
 
+    # Most projects never name a base. Passing the empty string straight to
+    # `git rebase` gave "fatal: invalid upstream ''" and refused every landing
+    # -- the first real one failed exactly there.
+    z = branch("z", 5)
+    check("an unnamed base resolves to the default branch",
+          M.land(z, repo, "z", "", tests)["landed"],
+          "scope.branch is None for most projects")
+    g(repo, "reset", "--hard", "HEAD~1")
+
     check("a proven branch lands", M.land(a, repo, "a", "main", tests)["landed"])
     check("history stays linear",
           len(g(repo, "log", "--oneline").stdout.strip().splitlines()) == 2,

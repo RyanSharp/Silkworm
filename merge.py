@@ -26,6 +26,8 @@ missing test command all stop the landing and hand it back with a reason.
 import logging
 import subprocess
 
+import worktrees
+
 log = logging.getLogger("silkworm.merge")
 
 
@@ -58,6 +60,11 @@ def land(worktree, repo, branch: str, base: str, run_tests) -> dict:
         return _fail("base-dirty",
                      "the checkout has uncommitted changes, so nothing was merged")
 
+    # A project that has not named a base gets the default branch resolved the
+    # same way a worktree does. Passing the empty string through meant
+    # `git rebase ''` -- "fatal: invalid upstream" -- which refused every
+    # landing on every project that had not set one, which is most of them.
+    base = worktrees.base_ref(repo, fetch=False, prefer=base)
     base_name = base.split("/")[-1] if base else "main"
     on = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if on != base_name:
