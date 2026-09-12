@@ -21,7 +21,9 @@ import re
 #: stopped counting -- and every task costs a session, or two with review.
 MAX_PER_TURN = 10
 
-#: A night that finds ten things has not prioritised. Fewer, better.
+#: A night that finds ten things has not prioritised. Fewer, better. Enforced
+#: rather than asked for: the ideator runs unattended, so a run that miscounts
+#: would spend the one thing the whole gate protects -- a decision per proposal.
 MAX_PROPOSALS = 5
 
 #: Long enough to act on without the implementor guessing what you meant.
@@ -29,7 +31,17 @@ MIN_GOAL_CHARS = 15
 MAX_GOAL_CHARS = 4000
 
 
-def validate(goal: str, filed_already: int = 0) -> str:
+def limit_for(propose: bool = False) -> int:
+    """How many tasks one turn may file, given what it is filing.
+
+    A proposal costs you an accept or a dismiss whether or not it was worth
+    making, so an unattended pass gets the smaller budget; work you scoped in
+    conversation is already agreed and gets the full one.
+    """
+    return MAX_PROPOSALS if propose else MAX_PER_TURN
+
+
+def validate(goal: str, filed_already: int = 0, propose: bool = False) -> str:
     """Returns an error message, or '' if this task may be filed."""
     goal = (goal or "").strip()
     if len(goal) < MIN_GOAL_CHARS:
@@ -37,8 +49,12 @@ def validate(goal: str, filed_already: int = 0) -> str:
                 "whoever picks it up has only this to go on")
     if len(goal) > MAX_GOAL_CHARS:
         return f"that goal is over {MAX_GOAL_CHARS} characters; split it"
-    if filed_already >= MAX_PER_TURN:
-        return (f"{MAX_PER_TURN} tasks is the limit for one turn — file the "
+    limit = limit_for(propose)
+    if filed_already >= limit:
+        if propose:
+            return (f"{limit} proposals is the limit for one pass — file the "
+                    "ones most worth doing, not every one you found")
+        return (f"{limit} tasks is the limit for one turn — file the "
                 "next slice after these have run")
     return ""
 

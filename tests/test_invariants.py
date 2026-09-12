@@ -1185,6 +1185,26 @@ def test_scoping():
           "every task costs a session, or two once reviewed")
     check("the cap leaves room for a real plan", 3 <= S.MAX_PER_TURN <= 20)
 
+    # The five-proposal cap used to exist only as a sentence in the ideator's
+    # prompt: a run that miscounted filed ten, and every extra one costs the
+    # decision the proposed gate exists to protect.
+    check("a proposal run is cut off at five",
+          "limit for one pass" in S.validate("Add an appearance preference",
+                                             filed_already=S.MAX_PROPOSALS,
+                                             propose=True),
+          "the sixth proposal must be refused, not asked for politely")
+    check("the fifth proposal still goes through",
+          S.validate("Add an appearance preference",
+                     filed_already=S.MAX_PROPOSALS - 1, propose=True) == "")
+    check("a scoping conversation keeps the larger budget",
+          S.validate("Add an appearance preference",
+                     filed_already=S.MAX_PROPOSALS) == "",
+          "work agreed with you is not rationed like an unattended pass")
+    check("proposals are the scarcer of the two budgets",
+          S.MAX_PROPOSALS < S.MAX_PER_TURN
+          and S.limit_for(True) == S.MAX_PROPOSALS
+          and S.limit_for(False) == S.MAX_PER_TURN)
+
     bot = (BASE / "bot.py").read_text()
     h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
     check("work scoped with you is queued, not proposed",
@@ -1206,6 +1226,27 @@ def test_scoping():
           "_filed_this_turn.pop(key, None)" in bot,
           "otherwise the cap becomes per-process and blocks later scoping")
     check("the model is told the capability exists", "scoping.HOW_TO" in bot)
+
+    fn = next(n for n in ast.walk(ast.parse(bot))
+              if isinstance(n, ast.FunctionDef) and n.name == "handle_file_task")
+    validates = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr == "validate"]
+    kw = {k.arg: k.value for c in validates for k in c.keywords}
+    check("the filing path tells the validator what it is filing",
+          len(validates) == 1 and isinstance(kw.get("propose"), ast.Name)
+          and kw["propose"].id == "propose",
+          "otherwise the proposal cap is only a sentence in a prompt")
+    decided = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "propose" for t in n.targets)]
+    check("and knows which it is before it validates",
+          bool(decided) and bool(validates) and max(decided) < validates[0].lineno)
+    limits = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Attribute) and n.func.attr == "limit_for"]
+    check("the budget reported back is the one enforced",
+          len(limits) == 1
+          and [a.id for a in limits[0].args if isinstance(a, ast.Name)] == ["propose"]
+          and "MAX_PER_TURN" not in h,
+          "a proposal run told '9 more allowed' would go on filing")
 
     cli = (BASE / "bin" / "silkworm").read_text()
     check("the CLI refuses outside a turn",

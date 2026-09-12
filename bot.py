@@ -1503,19 +1503,20 @@ def handle_file_task(payload: dict) -> dict:
         proj = project_store.ensure(proj)["slug"]
         project_store.home(proj, create=True)
 
-    err = scoping.validate(goal, _filed_this_turn.get(key, 0))
+    # A proposal is not work yet. Nothing ran it past you, so it waits in
+    # `proposed` until you accept it -- which is the whole point of a job that
+    # thinks about your projects while you are asleep. It also files against
+    # the smaller budget, because each one costs you a decision.
+    propose = bool(payload.get("propose"))
+    state = tasks.PROPOSED if propose else tasks.QUEUED
+
+    err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose)
     if err:
         return {"ok": False, "error": err}
 
     role = payload.get("role") or "implementor"
     if role not in roles.ROLES or role in ("reviewer", "ideator"):
         return {"ok": False, "error": f"unknown role {role!r}"}
-
-    # A proposal is not work yet. Nothing ran it past you, so it waits in
-    # `proposed` until you accept it -- which is the whole point of a job that
-    # thinks about your projects while you are asleep.
-    propose = bool(payload.get("propose"))
-    state = tasks.PROPOSED if propose else tasks.QUEUED
 
     scope = project_store.scope_for(proj) or {"cwd": entry.get("cwd") or str(CLAUDE_CWD)}
     task = task_store.create(
@@ -1530,7 +1531,7 @@ def handle_file_task(payload: dict) -> dict:
     log.info("filed task %s from %s (project=%s role=%s)", task["id"], key, proj or "-", role)
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
-            "remaining": scoping.MAX_PER_TURN - _filed_this_turn[key]}
+            "remaining": scoping.limit_for(propose) - _filed_this_turn[key]}
 
 
 def handle_hide(payload: dict) -> dict:
