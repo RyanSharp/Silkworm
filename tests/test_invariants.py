@@ -1004,6 +1004,7 @@ def test_landing():
           "scope.branch is None for most projects")
     g(repo, "reset", "--hard", "HEAD~1")
 
+
     check("a proven branch lands", M.land(a, repo, "a", "main", tests)["landed"])
     check("history stays linear",
           len(g(repo, "log", "--oneline").stdout.strip().splitlines()) == 2,
@@ -1050,6 +1051,24 @@ def test_landing():
           not r["landed"] and r["stage"] == "tests-after-merge")
     check("and the base is exactly where it was",
           g(repo, "rev-parse", "HEAD").stdout.strip() == before)
+
+    # And with a real remote, where the resolved base is the symbolic ref
+    # `origin/HEAD`: splitting that on "/" yields "HEAD", not the branch it
+    # points at, so the checkout-is-on-the-base guard compared main against
+    # HEAD and refused. A repo with no remote never exercises this.
+    origin = root / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], capture_output=True)
+    g(repo, "remote", "add", "origin", str(origin))
+    g(repo, "push", "-q", "-u", "origin", "main")
+    g(repo, "remote", "set-head", "origin", "main")
+    check("origin/HEAD is resolved to its branch, not the word HEAD",
+          g(repo, "rev-parse", "--abbrev-ref", "origin/HEAD").stdout.strip() == "origin/main",
+          "this is what the guard has to cope with")
+    y = branch("y", 6)
+    r = M.land(y, repo, "y", "", tests)
+    check("a landing works against a repo with a remote",
+          r["landed"], f"refused at {r.get('stage')}: {str(r.get('detail'))[:70]}")
+    g(repo, "remote", "remove", "origin")
 
     bot = (BASE / "bot.py").read_text()
     li = bot[bot.index("def land_if_ready"):bot.index("def run_email_ingest")]

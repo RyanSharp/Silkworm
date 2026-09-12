@@ -68,8 +68,7 @@ def land(worktree, repo, branch: str, base: str, run_tests) -> dict:
     # `origin/HEAD` is a symbolic ref: splitting it on "/" gives "HEAD", not
     # the branch it points at, so the checkout-is-on-the-base check compared
     # "main" against "HEAD" and refused. Resolve it to the real name first.
-    resolved = _git(repo, "rev-parse", "--abbrev-ref", base).stdout.strip()
-    base_name = (resolved or base).split("/")[-1] or "main"
+    base_name = base.split("/")[-1] if base else "main"
     on = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if on != base_name:
         return _fail("base-branch",
