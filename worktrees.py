@@ -135,6 +135,31 @@ def create(repo, task_id: str, fetch: bool = True, base: str = "") -> Path | Non
     return path
 
 
+def attach(repo, task_id: str, branch: str) -> Path | None:
+    """A checkout of an existing branch, for work that has already been done.
+
+    Landing happens after the review, by which time the task's own worktree is
+    long released -- but its branch survives. Reattaching the branch rather
+    than creating one is what lets the work be rebased and retested later.
+    """
+    repo = Path(repo)
+    if not is_repo(repo):
+        return None
+    if _git(repo, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
+        return None
+    path = ROOT / f"{repo.name}{SEP}land{SEP}{task_id}"
+    if path.exists():
+        return path
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with _repo_create_lock(repo):
+        r = _git(repo, "worktree", "add", str(path), branch)
+    if r.returncode != 0:
+        log.warning("could not attach %s for landing: %s",
+                    branch, (r.stderr or "").strip()[-300:])
+        return None
+    return path
+
+
 def main_repo(worktree) -> Path | None:
     """The checkout a worktree belongs to."""
     r = _git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")

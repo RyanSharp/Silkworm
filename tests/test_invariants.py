@@ -944,6 +944,109 @@ def test_verification():
           T.default("verified") is None)
 
 
+# --- landing work without a person -----------------------------------------------
+# Eight branches accumulated off one base and none were merged. Two of them
+# turned out to implement the same fix independently, each passing alone.
+
+def test_landing():
+    import merge as M, verify as V, worktrees as W
+    import threading
+    print("\nwork lands only once it has been shown to work")
+
+    root = Path(tempfile.mkdtemp())
+    repo = root / "repo"; repo.mkdir()
+    def g(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                          capture_output=True, text=True)
+    g(repo, "init", "-q", "-b", "main")
+    g(repo, "config", "user.email", "t@t"); g(repo, "config", "user.name", "t")
+    # Plain text, not Python: a two-line module lets git auto-resolve a
+    # whole-file rewrite, and identical-length edits let a stale .pyc answer
+    # for the new source. Both hid what this is trying to measure.
+    (repo / "v.txt").write_text("1\n")
+    (repo / "expect.txt").write_text("1\n")
+    g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+    CMD = "sh -c 'test \"$(cat v.txt)\" = \"$(cat expect.txt)\"'"
+    tests = lambda cwd: V.run(CMD, cwd)                # noqa: E731
+
+    def branch(name, value):
+        wt = root / name
+        g(repo, "worktree", "add", "-q", "-b", name, str(wt), "main")
+        (wt / "v.txt").write_text(f"{value}\n")
+        (wt / "expect.txt").write_text(f"{value}\n")
+        g(wt, "add", "-A")
+        g(wt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name)
+        return wt
+
+    # Both cut from the same base *before* either lands -- which is the actual
+    # situation, and the reason an earlier version of this test proved nothing:
+    # a branch created after the first landing has nothing to conflict with.
+    a = branch("a", 2)
+    b = branch("b", 3)
+
+    check("a proven branch lands", M.land(a, repo, "a", "main", tests)["landed"])
+    check("history stays linear",
+          len(g(repo, "log", "--oneline").stdout.strip().splitlines()) == 2,
+          "fast-forward only, so no merge commit resolves anything unreviewed")
+
+    check("the second branch passes on its own", tests(b)["ok"])
+    r = M.land(b, repo, "b", "main", tests)
+    check("but is refused once the base has moved under it",
+          not r["landed"] and r["stage"] == "rebase",
+          f"got {r['stage']} — two agents fixing the same thing must not both land")
+
+    # Running the suite litters the checkout it tested; that must not block the
+    # next landing, which is what counting untracked files did.
+    # A file inside it: git does not track empty directories, so mkdir alone
+    # left this assertion testing nothing at all.
+    (repo / "__pycache__").mkdir(exist_ok=True)
+    (repo / "__pycache__" / "stale.pyc").write_bytes(b"\x00")
+    c = branch("c", 2)
+    (c / "note.txt").write_text("harmless\n")
+    g(c, "add", "-A"); g(c, "-c", "user.email=t@t", "-c", "user.name=t",
+                         "commit", "-qm", "note")
+    check("build droppings do not block the next landing",
+          M.land(c, repo, "c", "main", tests)["landed"],
+          "the first landing's own test run left artefacts behind")
+
+    # Uncommitted work in the base is someone's edit and must stop it.
+    (repo / "v.txt").write_text("99\n")
+    d = branch("d", 2)
+    r = M.land(d, repo, "d", "main", tests)
+    check("uncommitted work in the base stops a landing",
+          not r["landed"] and r["stage"] == "base-dirty")
+    g(repo, "checkout", "--", "v.txt")
+
+    # And the safety net: passes in the worktree, breaks the base.
+    before = g(repo, "rev-parse", "HEAD").stdout.strip()
+    e = branch("e", 2)
+    (e / "x.txt").write_text("x\n")
+    g(e, "add", "-A"); g(e, "-c", "user.email=t@t", "-c", "user.name=t",
+                         "commit", "-qm", "x")
+    r = M.land(e, repo, "e", "main",
+               lambda cwd: {"ran": True, "ok": str(cwd).endswith("/e"),
+                            "code": 1, "output": "broke the base"})
+    check("a merge that breaks the base is reverted",
+          not r["landed"] and r["stage"] == "tests-after-merge")
+    check("and the base is exactly where it was",
+          g(repo, "rev-parse", "HEAD").stdout.strip() == before)
+
+    bot = (BASE / "bot.py").read_text()
+    li = bot[bot.index("def land_if_ready"):bot.index("def run_email_ingest")]
+    check("a project must opt in", 'proj.get("auto_merge")' in li)
+    check("and must be able to prove itself", 'proj.get("test_cmd")' in li,
+          "landing on a project with no suite is merging on a guess")
+    check("unverified work never lands", 'task.get("verified")' in li)
+    check("landing takes the checkout guard",
+          "with repo_guard(cwd):" in li,
+          "it writes to the tree conversations share")
+    check("the branch is reattached, since its worktree is long gone",
+          "worktrees.attach(" in li)
+    check("and the temporary checkout is always released",
+          "finally:" in li and "worktrees.release(here)" in li)
+    import projects as P
+    check("auto-merge is off by default", P.default("auto_merge") is False)
+
+
 # --- a project can be reviewed while you sleep -----------------------------------
 # A nightly look that proposes work, which you accept or dismiss in the morning.
 # The `proposed` state existed for exactly this and had never once been used.
@@ -2283,7 +2386,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_parallel_tasks,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_parallel_tasks,
               test_worktrees,
               test_credentials_check,
               test_turn_deadline_is_idleness,

@@ -44,6 +44,7 @@ import procs
 import projects
 import recovery
 import retry
+import merge
 import summaries
 import verify
 import worktrees
@@ -1321,6 +1322,16 @@ def handle_projects(payload: dict) -> dict:
         if cmd.lower() in ("off", "none", "clear"):
             cmd = ""
         return {"ok": True, "project": project_store.ensure(slug, test_cmd=cmd)}
+    if action == "auto-merge":
+        slug = (payload.get("slug") or "").strip()
+        rec = project_store.get(slug)
+        if not rec:
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        on = bool(payload.get("on"))
+        if on and not (rec.get("test_cmd") or "").strip():
+            return {"ok": False,
+                    "error": "set a test command first — nothing may land unproven"}
+        return {"ok": True, "project": project_store.ensure(slug, auto_merge=on)}
     if action == "ideate":
         # Nightly review, set from the dashboard rather than only from Slack.
         # Validated here rather than in the page: "2am" should work, and a
@@ -2171,9 +2182,66 @@ def resolve_review(task: dict, role_name: str, text: str,
     if parent:
         task_store.update(parent_id, result={**(parent.get("result") or {}),
                                              "review": verdict})
+        if verdict["ok"]:
+            # Land before completing: if the landing refuses, that is worth
+            # knowing in the same breath as the verdict rather than later.
+            try:
+                landed = land_if_ready(parent, channel, thread_ts)
+            except Exception:
+                log.exception("landing %s failed", parent_id)
+                landed = ":hand: _Landing errored — see the bot log._"
+            if landed:
+                try:
+                    app.client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                                text=landed)
+                except Exception:
+                    log.exception("posting the landing result failed")
         task_state(parent_id, tasks.DONE if verdict["ok"] else tasks.AWAITING_APPROVAL,
                    verdict["summary"][:160])
     return False
+
+
+def land_if_ready(task: dict, channel: str, thread_ts: str) -> str:
+    """Land a task's branch if the project allows it and the work earned it.
+
+    Everything here is a refusal by default. A project must opt in, must be
+    able to prove itself, and the work must already have passed both its own
+    tests and an independent review. Anything short of that leaves the branch
+    where it is and says why.
+    """
+    proj = project_store.get(task.get("project") or "") or {}
+    scope = task.get("scope") or {}
+    worktree, cwd = scope.get("worktree"), scope.get("cwd")
+    branch = f"{worktrees.BRANCH_PREFIX}{task['id']}"
+    if not proj.get("auto_merge"):
+        return ""
+    if not (proj.get("test_cmd") or "").strip():
+        return ":hand: _Not landed: this project has no test command, so nothing proved it._"
+    if not task.get("verified"):
+        return ":hand: _Not landed: the change was never verified._"
+    if not cwd:
+        return ":hand: _Not landed: it has no checkout to land from._"
+
+    # The task's own worktree was released when its turn ended, so reattach the
+    # branch. Rebasing and retesting need somewhere to happen that is not the
+    # checkout being merged into.
+    here = worktrees.attach(cwd, task["id"], branch)
+    if not here:
+        return f":hand: _Not landed: could not check out `{branch}`._"
+
+    def run_tests(where):
+        return verify.run(proj["test_cmd"], where)
+
+    try:
+        # Landing touches the shared checkout, so take the guard a turn takes.
+        with repo_guard(cwd):
+            result = merge.land(here, cwd, branch, scope.get("branch") or "", run_tests)
+    finally:
+        worktrees.release(here)
+    if result["landed"]:
+        task_store.update(task["id"], result={**(task.get("result") or {}),
+                                              "landed": result.get("head")})
+    return merge.summary(result, branch)
 
 
 def run_email_ingest() -> dict:

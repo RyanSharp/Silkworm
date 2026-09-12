@@ -68,6 +68,9 @@ FIELDS: dict[str, tuple] = {
     # different from failing: work is never auto-merged without one, because
     # silence is not confidence.
     "test_cmd": ("",    "command that verifies this project, e.g. ./bin/silkworm test"),
+    # Off by default, and refused outright without a test command: landing work
+    # unattended on a project that cannot prove itself is merging on a guess.
+    "auto_merge": (False, "land reviewed, verified work on the base branch"),
     # Out-of-hours ideation. "HH:MM" local time, or "" for off. `ideate_on` is
     # the last date it ran, so a restart cannot make it run twice in a night
     # and a missed night is simply skipped rather than fired late.

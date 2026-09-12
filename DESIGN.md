@@ -561,3 +561,37 @@ from passing.
 the first live run had the send-back refused and swallowed — by design, since a
 lifecycle complaint must never cost a reply — and the task sat in `running` for
 ever. Caught by running it rather than by reading it.
+
+## Landing work without a person
+
+Eight branches accumulated off one base and none were merged; two of them
+turned out to implement the same fix independently, each passing alone. So
+landing is opt-in per project, and every step is evidence rather than
+judgement:
+
+    rebase  → retest → fast-forward → retest → revert if that broke it
+
+**Rebase first**, because "it passed on my branch" says nothing about today's
+base. **Retest after the rebase**, because that is the only thing that could
+have caught the two-agents-same-fix case — each passed alone. **Fast-forward
+only**, so history stays linear and the merge itself cannot introduce a
+resolution nobody reviewed. **Retest on the base**, because a fast-forward can
+still break a repository whose tests depend on files outside the diff. **Revert
+if it does**: a broken base is far worse than an unlanded branch.
+
+It refuses rather than guesses. A project that has not opted in, has no test
+command, has unverified work, has uncommitted edits in the base, or whose
+branch will not rebase cleanly — all stop, leave the branch alone, and say
+which. Landing takes the same checkout guard a turn does, since it writes to
+the tree conversations share.
+
+**Only tracked changes count as "dirty".** Running a suite leaves artefacts in
+the very checkout it tested, so counting untracked files meant the first
+landing succeeded and every one after it refused. Untracked files are safe
+regardless: git refuses a fast-forward that would overwrite one.
+
+Three fixture bugs while testing this, each of which made a test prove nothing:
+a two-line Python module let git auto-resolve a whole-file rewrite; identical-
+length edits let a stale `.pyc` answer for new source; and a branch created
+*after* the first landing has nothing left to conflict with. The mutations now
+confirm each assertion fails without its fix.
