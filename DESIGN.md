@@ -597,3 +597,23 @@ a two-line Python module let git auto-resolve a whole-file rewrite; identical-
 length edits let a stale `.pyc` answer for new source; and a branch created
 *after* the first landing has nothing left to conflict with. The mutations now
 confirm each assertion fails without its fix.
+
+## A turn's directory is not the thread's
+
+A turn that ran in a worktree wrote that path back as the *thread's* working
+directory. The worktree is released when the turn ends, so every later message
+in that thread failed with "working directory no longer exists" — permanently,
+and with nothing connecting the failure to the task that caused it. Twenty-four
+threads were carrying dead paths before anyone noticed, because most were task
+anchors nobody had replied to yet.
+
+So the two are now distinct: `cwd` is where *this turn* runs and may be a
+worktree; `home_cwd` is where the *thread* lives and is only ever the project's
+own directory.
+
+A thread whose directory has gone is also repointed at startup — at its
+project's directory, else the repository its worktree came from, else the
+default. Only when the recorded path is actually missing, so a thread
+deliberately pointed somewhere unusual is left alone. The bug is fixed, but a
+directory can always be moved or deleted by hand, and a conversation that can
+never run again is a bad way to find that out.

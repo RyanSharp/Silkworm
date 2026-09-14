@@ -1954,6 +1954,12 @@ def execute_task(task: dict) -> None:
     # cannot see uncommitted changes in your main tree, so a conversation about
     # what you are editing right now must stay where you are editing it.
     worktree = None
+    # Where the *thread* lives, as distinct from where this turn runs. A turn
+    # in a worktree must never leave that path behind as the thread's home: the
+    # worktree is released when the turn ends, so every later message in that
+    # thread fails with "working directory no longer exists" -- permanently,
+    # and with no obvious connection to the task that caused it.
+    home_cwd = cwd
     # A read-only role has nothing to isolate: it cannot write, so a worktree
     # buys nothing and leaves an empty branch behind every run -- one per
     # project per night once ideation is scheduled.
@@ -2009,7 +2015,8 @@ def execute_task(task: dict) -> None:
                 # A fresh run must not repoint the thread at its throwaway
                 # session, or the next Slack message resumes the review.
                 if not fresh:
-                    store.update(key, session_id=result.session_id, cwd=str(cwd))
+                    store.update(key, session_id=result.session_id,
+                                 cwd=str(home_cwd))
                 store.add_cost(key, result.cost_usd)
                 uploaded = upload_outbox(app.client, outbox, channel, thread_ts, key)
             finally:
@@ -2547,6 +2554,42 @@ def inline_task_for(key: str) -> str | None:
     return None
 
 
+def repair_thread_cwds() -> int:
+    """Repoint threads whose working directory has gone away.
+
+    A turn that ran in a worktree used to leave that path as the thread's home,
+    and a released worktree then broke every later message in it -- permanently,
+    with nothing connecting the failure to the task that caused it. That bug is
+    fixed, but 24 threads were already carrying dead paths, and a directory can
+    always be moved or deleted by hand.
+
+    Prefers the project's own directory, then the repository the worktree came
+    from, then the default. Only ever runs when the recorded path is gone, so a
+    thread deliberately pointed somewhere unusual is left alone.
+    """
+    fixed = 0
+    for key, entry in store.all().items():
+        cwd = entry.get("cwd")
+        if not cwd or Path(cwd).is_dir():
+            continue
+        target = ""
+        scoped = project_store.scope_for(entry.get("project") or "")
+        if scoped.get("cwd") and Path(scoped["cwd"]).is_dir():
+            target = scoped["cwd"]
+        elif Path(cwd).parent == worktrees.ROOT:
+            # ".../<repo>--<task>" or ".../<repo>--land--<task>"
+            repo = Path(cwd).name.split(worktrees.SEP, 1)[0]
+            guess = Path.home() / "workspace" / repo
+            if guess.is_dir():
+                target = str(guess)
+        if not target:
+            target = str(CLAUDE_CWD)
+        store.update(key, cwd=target)
+        log.info("thread %s pointed at a missing %s; now %s", key, cwd, target)
+        fixed += 1
+    return fixed
+
+
 def close_out_orphans() -> None:
     """Settle inline tasks no handler in this process will ever drive.
 
@@ -2588,6 +2631,12 @@ def close_out_orphans() -> None:
 
 
 def _recoverer() -> None:
+    try:
+        n = repair_thread_cwds()
+        if n:
+            log.info("repointed %d thread(s) whose directory had gone", n)
+    except Exception:
+        log.exception("repairing thread working directories failed")
     try:
         close_out_orphans()
     except Exception:

@@ -1327,6 +1327,16 @@ def test_worktrees():
 
     bot = (BASE / "bot.py").read_text()
     ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
+    # A turn running in a worktree wrote that path back as the *thread's* cwd.
+    # The worktree is released when the turn ends, so every later message in
+    # that thread failed with "working directory no longer exists" -- for good,
+    # and with nothing pointing at the task that caused it. Two real trader
+    # conversations broke this way.
+    check("a turn never leaves its worktree as the thread's home",
+          "cwd=str(home_cwd)" in ex and "home_cwd = cwd" in ex,
+          "the worktree outlives nothing; the thread outlives everything")
+    check("and the run still happens in the worktree", "cwd = worktree" in ex)
+
     check("only queued work is isolated",
           'task.get("driver") == "queue" and worktrees.is_repo(cwd)' in ex,
           "a conversation must stay where your uncommitted edits are")
