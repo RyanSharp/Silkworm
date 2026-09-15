@@ -100,16 +100,14 @@ def existing(repo) -> dict:
     return out
 
 
-def merged_into(repo, base: str) -> set:
-    """Branch names already contained in `base`. One call, not one per branch."""
-    r = _git(repo, "branch", "--merged", base, "--format=%(refname:short)")
-    if r.returncode != 0:
-        return set()
-    return {b.strip() for b in r.stdout.splitlines() if b.strip()}
-
-
 def ahead(repo, base: str, branch: str) -> int:
-    """Commits on `branch` that `base` does not have."""
+    """Commits on `branch` that `base` does not have.
+
+    This is the whole merge test. A branch already contained in the base has
+    nothing ahead of it, so asking `git branch --merged` as well was a second
+    way to compute the same answer -- and a second way no test could tell
+    apart from the first, which is how it survived unnoticed.
+    """
     r = _git(repo, "rev-list", "--count", f"{base}..{branch}")
     try:
         return int(r.stdout.strip())
@@ -120,10 +118,10 @@ def ahead(repo, base: str, branch: str) -> int:
 def survey(records) -> list:
     """One row per stopped task whose branch still holds unmerged commits.
 
-    Grouped by (repo, preferred base) so the two expensive questions -- which
-    branches exist, and which are already in the base -- are asked once per
-    group rather than once per task. A project on a research branch and one on
-    main are different groups, since "merged" means a different thing in each.
+    Grouped by (repo, preferred base): the list of branches costs one call per
+    group rather than one per task, and the base is resolved once. A project on
+    a research branch and one on main are different groups, since "merged"
+    means a different thing in each.
 
     Rows are newest-first: the useful list is "what did last night leave?".
     """
@@ -145,15 +143,13 @@ def survey(records) -> list:
         if not present:
             continue
         base = worktrees.base_ref(repo, fetch=False, prefer=pref)
-        done = merged_into(repo, base)
         shown = base_name(repo, base)
         for name, rec in present.items():
-            if name in done:
-                continue
             count = ahead(repo, base, name)
             if not count:
-                # Not an ancestor, but nothing on it either: the branch is
-                # behind the base, not ahead of it. Nothing to land.
+                # Everything on it is already in the base -- it was merged, by
+                # us or by hand -- or it never held anything. Either way there
+                # is nothing to land and nothing to say.
                 continue
             rows.append({
                 "id": rec.get("id") or "",
