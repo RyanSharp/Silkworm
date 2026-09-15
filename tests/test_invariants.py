@@ -43,6 +43,25 @@ def tmp_store():
     return SessionStore(Path(tempfile.mkdtemp()) / "s.json")
 
 
+def bot_functions(*names, **globals_):
+    """Lift named functions out of bot.py and run them against fakes.
+
+    Importing bot.py needs a Slack token and would open the live tasks.json, so
+    most checks here read it as text. Compiling just the functions under test
+    into a namespace we control buys the real thing instead: the code actually
+    runs, against a scratch store, and a mistake in it fails rather than merely
+    reading differently.
+    """
+    tree = ast.parse((BASE / "bot.py").read_text())
+    wanted = [n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name in names]
+    missing = set(names) - {n.name for n in wanted}
+    assert not missing, f"bot.py has no {', '.join(sorted(missing))}"
+    ns = {"log": logging.getLogger("test"), "time": time, **globals_}
+    exec(compile(ast.Module(body=wanted, type_ignores=[]), "bot.py", "exec"), ns)
+    return ns
+
+
 # --- a transient error must never discard a thread's history ------------------
 # A mid-turn API hiccup ("Connection closed mid-response") once wiped four
 # threads: the retry path dropped the session entry and started fresh.
@@ -1523,13 +1542,37 @@ def test_worktrees():
           "a task's unfinished work is still work")
 
     orphan = W.create(repo, "tsk_orphan", fetch=False)
-    swept = W.sweep(keep=set())
+    check("a worktree is not swept the moment it appears",
+          W.sweep(keep=set()) == 0 and orphan.exists(),
+          "the sweep runs on a guess; an hour of patience costs a little disk, "
+          "and guessing wrong costs somebody's uncommitted afternoon")
+    swept = W.sweep(keep=set(), min_age_s=0)
     check("orphans left by a restart are swept", swept == 1 and not orphan.exists())
     check("but never a dirty one", dirty.exists(),
           "sweeping is tidying, not deleting someone's work")
     live = W.create(repo, "tsk_live", fetch=False)
-    W.sweep(keep={"tsk_live"})
+    W.sweep(keep={"tsk_live"}, min_age_s=0)
     check("a running task's worktree is left alone", live.exists())
+
+    # An agent that has just committed and is running a long test suite has a
+    # clean tree for minutes at a time -- so the dirty check does not save it,
+    # and losing the branch as well as the checkout loses the work outright.
+    committed = W.create(repo, "tsk_swept", fetch=False)
+    (committed / "c.txt").write_text("real work\n")
+    git(committed, "add", "-A"); git(committed, "commit", "-qm", "real work")
+    empty = W.create(repo, "tsk_empty", fetch=False)
+    W.sweep(keep=set(), min_age_s=0)
+    check("the sweep never deletes a branch it is only guessing about",
+          bool(git(repo, "branch", "--list", "silkworm/tsk_swept").stdout.strip()),
+          "the checkout is recoverable from the branch; the branch is not "
+          "recoverable from anything")
+    check("not even an apparently empty one",
+          bool(git(repo, "branch", "--list", "silkworm/tsk_empty").stdout.strip()),
+          "`git branch -D` is unrecoverable, and the sweep parsed a directory name")
+    W.release(W.create(repo, "tsk_tidy", fetch=False))
+    check("but the task's own executor still tidies its empty branch away",
+          not git(repo, "branch", "--list", "silkworm/tsk_tidy").stdout.strip(),
+          "release() knows the run is over; the sweep only thinks it might be")
 
     bot = (BASE / "bot.py").read_text()
     ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
@@ -1550,6 +1593,177 @@ def test_worktrees():
           "could not release worktree" in ex, "otherwise every failure leaks one")
     check("the branch is named in the reply", "isolated checkout" in ex.lower())
     check("orphans are swept periodically", 'name="wtsweep"' in bot)
+
+
+# --- cancelling must stop the work, not just relabel it --------------------------
+# A Saga implementor was cancelled 71 seconds after the runner claimed it. The
+# record said cancelled; the agent carried on working and spending in a
+# checkout that nothing now owned, and the next sweep deleted that checkout --
+# branch and all -- out from under it. It lost its first pass of the work.
+
+class FakeHandle:
+    """Stands in for a RunHandle, and remembers when it was stopped."""
+
+    def __init__(self, on_stop=None):
+        self.stopped = 0
+        self._on_stop = on_stop
+
+    def stop(self):
+        self.stopped += 1
+        if self._on_stop:
+            self._on_stop()
+
+
+def test_cancel_stops_the_child():
+    import tasks as T
+    from tasks import TaskStore
+    print("\ncancelling a running task stops it")
+
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    running_tasks = {}
+    ns = bot_functions("stop_task", "handle_tasks", "live_worktree_tasks",
+                       tasks=T, task_store=st, RUNNING_TASKS=running_tasks)
+    tasks_route, stop_task = ns["handle_tasks"], ns["stop_task"]
+
+    def running_task(**fields):
+        t = st.create("do a thing", driver="queue", **fields)
+        st.transition(t["id"], T.RUNNING)
+        return t["id"]
+
+    # What the record said at the moment the child was told to stop. If the
+    # transition happens first, the agent is working on a task the board has
+    # already written off -- which is the whole bug.
+    seen = []
+    tid = running_task()
+    running_tasks[tid] = FakeHandle(lambda: seen.append(st.get(tid)["state"]))
+    r = tasks_route({"action": "cancel", "id": tid})
+
+    check("cancelling a running task kills its child",
+          running_tasks[tid].stopped == 1,
+          "the record said cancelled while the agent kept working and spending")
+    check("it is stopped before it is written off", seen == [T.RUNNING],
+          f"stopped while the record said {seen}")
+    check("and the task ends up cancelled", r["ok"] and st.get(tid)["state"] == T.CANCELLED)
+    check("the reply says the work was stopped", r.get("note") == "stopped")
+    check("the event log records it too",
+          "stopped" in st.get(tid)["events"][-1]["detail"],
+          "otherwise nothing distinguishes a real stop from a relabelling")
+
+    dis = running_task()
+    running_tasks[dis] = FakeHandle()
+    tasks_route({"action": "dismiss", "id": dis})
+    check("dismiss is the same door and stops it too",
+          running_tasks[dis].stopped == 1 and st.get(dis)["state"] == T.CANCELLED,
+          "the dashboard offers both, and they differ only in wording")
+
+    orphan = running_task()
+    r = tasks_route({"action": "cancel", "id": orphan})
+    check("a running task with no child of ours can still be cancelled",
+          r["ok"] and st.get(orphan)["state"] == T.CANCELLED,
+          "a restart leaves records running with nobody running them; refusing "
+          "would make those uncancellable")
+    check("and the reply is honest that nothing was stopped",
+          "orphaned" in (r.get("note") or ""), r.get("note"))
+
+    q = st.create("not started", driver="queue")
+    r = tasks_route({"action": "cancel", "id": q["id"]})
+    check("cancelling queued work stops nothing and says nothing",
+          r["ok"] and not r.get("note") and st.get(q["id"])["state"] == T.CANCELLED)
+    check("stopping a task that is not running is a no-op",
+          stop_task("tsk_nothing") is False)
+
+    # The registry the whole mechanism reads from. RUNNING is keyed by thread,
+    # which cannot answer "is *this task* still going".
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    for fname in ("handle_prompt", "execute_task"):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fname)
+        body = ast.dump(fn)
+        check(f"{fname} registers its child by task id", "RUNNING_TASKS" in body)
+        final = [x for t in ast.walk(fn) if isinstance(t, ast.Try) for x in t.finalbody]
+        check(f"{fname} lets it go in finally",
+              "RUNNING_TASKS" in ast.dump(ast.Module(body=final, type_ignores=[])),
+              "a handle left behind would keep a finished task's checkout forever")
+
+
+# --- a checkout must outlive its task leaving RUNNING ----------------------------
+# The sweeper kept only `running` tasks, so a task became sweepable the instant
+# anything happened to it -- a cancel, a failure, a review gate -- while its
+# checkout was still the only place its work existed.
+
+def test_worktree_survives_leaving_running():
+    import tasks as T
+    import worktrees as W
+    from tasks import TaskStore
+    print("\na checkout outlives its task leaving running")
+
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    running_tasks = {}
+    keep = bot_functions("live_worktree_tasks", tasks=T, task_store=st,
+                         RUNNING_TASKS=running_tasks)["live_worktree_tasks"]
+
+    def task_in(state):
+        t = st.create("work", driver="queue")
+        for step in {T.RUNNING: [T.RUNNING],
+                     T.FAILED: [T.RUNNING, T.FAILED],
+                     T.AWAITING_APPROVAL: [T.RUNNING, T.AWAITING_APPROVAL],
+                     T.BLOCKED: [T.RUNNING, T.BLOCKED],
+                     T.NEEDS_INPUT: [T.RUNNING, T.NEEDS_INPUT],
+                     T.DONE: [T.RUNNING, T.DONE],
+                     T.CANCELLED: [T.CANCELLED],
+                     T.QUEUED: []}[state]:
+            st.transition(t["id"], step)
+        return t["id"]
+
+    held = {state: task_in(state) for state in T.STATES if state != T.PROPOSED}
+    kept = keep()
+    for state, tid in held.items():
+        if state in T.TERMINAL:
+            check(f"a {state} task's checkout is litter", tid not in kept)
+        else:
+            check(f"a {state} task keeps its checkout", tid in kept,
+                  "its work may exist nowhere else")
+
+    # The cancel window: the record goes terminal at once, the child takes a
+    # few seconds to die, and the executor releases the checkout on its way
+    # out. Until it does, the live handle is what holds the sweep off.
+    dying = held[T.CANCELLED]
+    running_tasks[dying] = FakeHandle()
+    check("a child still in there keeps its checkout even once written off",
+          dying in keep(),
+          "otherwise the sweep races the agent it just told to stop")
+
+    # End to end, against real git.
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "worktrees"
+    repo = root / "repo"; repo.mkdir()
+    def git(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                            capture_output=True, text=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("base\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    trees = {state: W.create(repo, tid, fetch=False) for state, tid in held.items()}
+    # Committed, and mid-test-run: a clean tree, which is exactly when the
+    # dirty check saves nothing.
+    for state in (T.CANCELLED, T.FAILED, T.AWAITING_APPROVAL):
+        (trees[state] / "work.txt").write_text("hours of it\n")
+        git(trees[state], "add", "-A"); git(trees[state], "commit", "-qm", "work")
+    W.sweep(keep=keep(), min_age_s=0)
+
+    check("a cancelled task still being stopped keeps its work",
+          trees[T.CANCELLED].exists(),
+          "this is the failure exactly: cancelled, swept, work gone")
+    check("a failed task keeps its checkout to be looked at",
+          trees[T.FAILED].exists())
+    check("work waiting on its review keeps its checkout",
+          trees[T.AWAITING_APPROVAL].exists(),
+          "the review gate is not the end of the task")
+    check("and a finished one is still tidied away",
+          not trees[T.DONE].exists(),
+          "the sweep must still do its job, or orphans pile up invisibly")
 
 
 # --- a stale credential must be visible before it kills every turn ---------------
@@ -3343,7 +3557,8 @@ if __name__ == "__main__":
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_review_followups, test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_parallel_tasks,
-              test_worktrees,
+              test_worktrees, test_cancel_stops_the_child,
+              test_worktree_survives_leaving_running,
               test_credentials_check,
               test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,

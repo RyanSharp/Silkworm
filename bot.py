@@ -177,6 +177,12 @@ learnings = LearningStore(LEARNINGS_FILE)
 _thread_locks: dict[str, threading.Lock] = {}
 _thread_locks_guard = threading.Lock()
 RUNNING: dict[str, object] = {}          # thread key -> RunHandle
+#: task id -> RunHandle, for the same children keyed the way the board sees
+#: them. RUNNING alone cannot answer "is *this task* still going", and that is
+#: the question both cancelling and the worktree sweep need answered: a cancel
+#: that only rewrites the record leaves an agent working in a checkout nobody
+#: is protecting any more, which has already cost a task its first pass.
+RUNNING_TASKS: dict[str, object] = {}
 ACTIVE_SESSIONS: dict[str, tuple[str, str]] = {}  # session_id -> (channel, thread_ts)
 _seen_events: OrderedDict[str, None] = OrderedDict()
 _users_cache: dict[str, str] = {}
@@ -496,6 +502,25 @@ def fail_or_retry(task_id: str | None, error: str) -> bool:
         log.exception("could not park %s for retry", task_id)
         return False
     log.info("task %s parked: %s", task_id, retry.describe(kind, when))
+    return True
+
+
+def stop_task(task_id: str) -> bool:
+    """Kill the child a task is running, if this process is running one.
+
+    What `!stop` does, reachable by task id rather than by thread. False means
+    there was nothing of ours to stop -- the task finished, or it was orphaned
+    by a restart and its child (if any) belongs to reap_runaways now.
+    """
+    handle = RUNNING_TASKS.get(task_id)
+    if not handle:
+        return False
+    try:
+        handle.stop()
+    except Exception:
+        log.exception("could not stop the child running task %s", task_id)
+        return False
+    log.info("stopped the child running task %s", task_id)
     return True
 
 
@@ -1310,9 +1335,22 @@ def handle_tasks(payload: dict) -> dict:
         target = {"accept": tasks.QUEUED, "retry": tasks.QUEUED,
                   "approve": tasks.DONE,
                   "dismiss": tasks.CANCELLED, "cancel": tasks.CANCELLED}[action]
+        tid = payload.get("id", "")
+        # Cancelling a running task has to stop it, not just relabel it. It
+        # used to do only the latter: the record said cancelled while the agent
+        # carried on working and spending, in an isolated checkout that -- no
+        # longer being owned by anything running -- the sweeper was then free
+        # to delete underneath it. That happened, and took a task's first pass
+        # of uncommitted work with it.
+        note = ""
+        current = (task_store.get(tid) or {}).get("state")
+        if target == tasks.CANCELLED and current == tasks.RUNNING:
+            note = ("stopped" if stop_task(tid) else
+                    "no live child here — it was orphaned by a restart")
         try:
-            return {"ok": True, "task": task_store.transition(
-                payload.get("id", ""), target, f"{action} via {payload.get('by', 'ui')}")}
+            return {"ok": True, "note": note, "task": task_store.transition(
+                tid, target, f"{action} via {payload.get('by', 'ui')}"
+                + (f" ({note})" if note else ""))}
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
         except KeyError:
@@ -1798,6 +1836,7 @@ def handle_prompt(event: dict, say, client) -> None:
 
             def on_start(handle) -> None:
                 RUNNING[key] = handle
+                RUNNING_TASKS[task_id] = handle
 
             kwargs = dict(
                 binary=CLAUDE_BIN, cwd=cwd, permission_args=permission_args(),
@@ -1895,6 +1934,7 @@ def handle_prompt(event: dict, say, client) -> None:
         task_state(task_id, tasks.FAILED, "unhandled error")
     finally:
         RUNNING.pop(key, None)
+        RUNNING_TASKS.pop(task_id, None)
         recovery.clear_pending(store, key)
 
 
@@ -2096,7 +2136,8 @@ def execute_task(task: dict) -> None:
                     on_init=lambda sid: task_store.update(tid, session_id=sid),
                     on_activity=lambda n, i: progress.update(
                         f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
-                    on_start=lambda h: RUNNING.__setitem__(key, h),
+                    on_start=lambda h: (RUNNING.__setitem__(key, h),
+                                       RUNNING_TASKS.__setitem__(tid, h)),
                 )
                 # A fresh run must not repoint the thread at its throwaway
                 # session, or the next Slack message resumes the review.
@@ -2187,6 +2228,7 @@ def execute_task(task: dict) -> None:
             except Exception:
                 log.exception("could not release worktree %s", worktree)
         RUNNING.pop(key, None)
+        RUNNING_TASKS.pop(tid, None)
         recovery.clear_pending(store, key)
 
 
@@ -2817,6 +2859,25 @@ def _recoverer() -> None:
         log.exception("startup recovery failed")
 
 
+def live_worktree_tasks() -> set:
+    """Task ids whose isolated checkout must survive this sweep.
+
+    Not just `running`. A task leaves that state the moment anything happens to
+    it -- a cancel, a failure, a review gate -- while its checkout may still be
+    the only place its work exists, and the child may still be in it. Keeping
+    only `running` meant a cancel handed the very next sweep a live worktree to
+    tidy away; a task that had just committed and was running its tests looked
+    clean for minutes at a time, so the dirty check saved nothing.
+
+    So: anything with a child of ours in it, plus anything that has not reached
+    a terminal state. A finished or cancelled task has had its checkout
+    released the ordinary way, and one still on disk for it really is litter.
+    """
+    return ({tid for tid, r in task_store.all().items()
+             if r.get("state") not in tasks.TERMINAL}
+            | set(RUNNING_TASKS))
+
+
 def _worktree_sweeper() -> None:
     """Remove isolated checkouts no live task owns.
 
@@ -2824,12 +2885,16 @@ def _worktree_sweeper() -> None:
     invisible: it costs disk and clutters `git worktree list` while looking
     like nothing at all. Dirty ones are always kept -- unfinished work is
     still work, and it is reported rather than tidied away.
+
+    What is left to sweep, once live_worktree_tasks() has had its say, is
+    checkouts belonging to tasks that are finished or that no longer exist at
+    all. A restart-orphaned one is requeued rather than swept, and the next
+    attempt picks the same checkout back up -- which is the better outcome
+    anyway, since the work is already in it.
     """
     while True:
         try:
-            live = {tid for tid, r in task_store.all().items()
-                    if r.get("state") == tasks.RUNNING}
-            n = worktrees.sweep(keep=live)
+            n = worktrees.sweep(keep=live_worktree_tasks())
             if n:
                 log.info("swept %d orphaned worktree(s)", n)
         except Exception:

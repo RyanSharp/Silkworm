@@ -202,11 +202,15 @@ def commits_on(worktree, base: str = "") -> int:
         return 0
 
 
-def release(worktree) -> tuple[bool, str]:
+def release(worktree, delete_empty_branch: bool = True) -> tuple[bool, str]:
     """Tidy up after a task. Returns (removed, note for the reply).
 
     Uncommitted changes are never discarded -- the worktree is left where it is
     and named, because a task's unfinished work is still work.
+
+    `delete_empty_branch` is what the caller knows about whose branch this is.
+    The task's own executor knows the run is over and may tidy an empty branch
+    away; the sweeper is guessing from a directory name and must not.
     """
     path = Path(worktree)
     if not path.exists():
@@ -227,21 +231,53 @@ def release(worktree) -> tuple[bool, str]:
     if made:
         return True, f"branch `{branch}` ({made} commit{'s' if made != 1 else ''})"
     # A branch with nothing on it is not work, it is litter. Left alone they
-    # accumulate one per run and make `git branch` useless. discard checks that
+    # accumulate one per run and make `git branch` useless. Two separate
+    # things have to hold before one goes. The caller must be entitled to say
+    # so -- the task's own executor knows the run is over, while the sweeper is
+    # guessing from a directory name and must not. And discard checks that
     # claim against the refs rather than trusting the commit count above it:
     # `made` is counted from a base that has to be resolved, and a base that
     # resolves to nothing has read as "the task did nothing" before now.
-    if repo and branch.startswith(BRANCH_PREFIX):
+    if delete_empty_branch and repo and branch.startswith(BRANCH_PREFIX):
         discard.drop(repo, branch)
     return True, ""
 
 
-def sweep(keep: set) -> int:
+#: Nothing is swept until it has been sitting around this long. A genuinely
+#: orphaned worktree is never urgent -- it costs some disk until the next pass
+#: -- while a young one is very likely still being worked in. The sweep runs on
+#: a guess (a task id parsed out of a directory name), and an hour of patience
+#: is what stops that guess from costing anyone their afternoon.
+MIN_AGE_S = 3600
+
+
+def age_s(path) -> float:
+    """How long ago this worktree was made, by the most recent evidence.
+
+    Deliberately optimistic: whichever of the timestamps looks newest wins, so
+    a tree the filesystem is unsure about is treated as young and left alone.
+    """
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return 0.0
+    newest = max(st.st_mtime, st.st_ctime, getattr(st, "st_birthtime", 0))
+    return max(0.0, time.time() - newest)
+
+
+def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
     """Remove worktrees no live task owns. Never touches a dirty one.
 
     A restart orphans whatever was running, and an orphaned worktree is
     invisible: it costs disk and clutters `git worktree list` while looking
     like nothing at all.
+
+    Three things hold the sweep off, because it is guessing and the cost of
+    guessing wrong is somebody's uncommitted afternoon: `keep` (the caller
+    knows a task still owns this), a dirty tree, and youth. And it never
+    deletes the branch -- an agent that has just committed and is running a
+    long test suite has a clean tree for minutes at a time, which is exactly
+    when losing both the checkout and the branch costs the most.
     """
     if not ROOT.exists():
         return 0
@@ -252,10 +288,12 @@ def sweep(keep: set) -> int:
         task_id = path.name.split(SEP, 1)[1]
         if task_id in keep:
             continue
+        if age_s(path) < min_age_s:
+            continue
         if is_dirty(path):
             log.info("leaving orphaned worktree with uncommitted work: %s", path)
             continue
-        ok, _ = release(path)
+        ok, _ = release(path, delete_empty_branch=False)
         removed += int(ok)
         if ok:
             log.info("swept orphaned worktree %s", path)
