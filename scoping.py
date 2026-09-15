@@ -59,6 +59,13 @@ def validate(goal: str, filed_already: int = 0, propose: bool = False) -> str:
     return ""
 
 
+def _clip(title, width: int = 90) -> str:
+    """A title, marked when it has been cut, so a truncation is not read as
+    the whole of what the branch does."""
+    title = (title or "").strip()
+    return title if len(title) <= width else title[:width - 1].rstrip() + "…"
+
+
 def unmerged_note(rows, limit: int = 12) -> str:
     """Tell the nightly pass what is already fixed on a branch nobody merged.
 
@@ -78,7 +85,7 @@ def unmerged_note(rows, limit: int = 12) -> str:
     body = "\n".join(
         f"  - {r.get('branch') or '?'} ({r.get('commits') or 0} commit"
         f"{'s' if (r.get('commits') or 0) != 1 else ''}, off "
-        f"{r.get('base') or 'the base'}) — {(r.get('title') or '').strip()[:90]}"
+        f"{r.get('base') or 'the base'}) — {_clip(r.get('title'))}"
         for r in shown)
     more = (f"\n  …and {len(rows) - len(shown)} more"
             if len(rows) > len(shown) else "")

@@ -2497,6 +2497,21 @@ def test_unmerged_branches():
     check("a deleted branch is not reported", B.survey([finished("tsk_bbb")]) == [],
           "there is nothing left to land")
 
+    # The branch list exists to bound the cost: without it the survey would ask
+    # git about every finished task ever recorded, one subprocess each, behind
+    # a dashboard panel. Deleting the check leaves the answers right and the
+    # cost linear in the board, which no correctness assertion can see.
+    asked = []
+    real_ahead = B.ahead
+    B.ahead = lambda repo, base, branch: (asked.append(branch), real_ahead(repo, base, branch))[1]
+    try:
+        B.survey([finished(f"tsk_gone{i}") for i in range(40)])
+    finally:
+        B.ahead = real_ahead
+    check("branches that do not exist are never asked about individually",
+          asked == [],
+          f"one subprocess per finished task, forever: {len(asked)} of them")
+
     # Still-running work owns its branch; listing it would be noise every night.
     work("tsk_ccc", "c")
     for state in (T.RUNNING, T.QUEUED, T.BLOCKED, T.PROPOSED):

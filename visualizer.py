@@ -1410,8 +1410,8 @@ async function renderUnmerged() {
   if (!rows.length) { el.innerHTML = ""; return; }
   el.innerHTML = `<span class="nlabel">🌿 ${esc(r.summary || "")}</span>` +
     rows.map(b => {
-      const tip = `${esc(b.title)}\n${esc(b.id)} · ${esc(b.state)} · off ${
-        esc(b.base)} · ${esc(b.repo)}`;
+      const tip = `${esc(b.title)}\n${esc(b.head)} · ${esc(b.id)} · ${
+        esc(b.state)} · off ${esc(b.base)}\n${esc(b.repo)}`;
       const label = `${esc(b.branch.replace(/^silkworm\//, ""))} <b>${b.commits}</b>`;
       return b.thread
         ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(b.thread)}')">${label}</button>`

@@ -298,8 +298,15 @@ def do_status() -> None:
         # Asks git across every project, so it gets longer than a ping.
         unmerged = bot_call("/tasks", {"action": "unmerged"}, timeout=30)
         rows = unmerged.get("unmerged") or []
-        check("finished work is all merged", not rows,
-              f"{unmerged.get('summary') or 'some is not'} — land or drop them")
+        if not unmerged.get("ok"):
+            # "Could not ask" is not "nothing outstanding". A bot running older
+            # code does not know the action, and reporting that as all-clear
+            # would be the same silence this check exists to break.
+            check("finished work is all merged", False,
+                  f"could not ask: {unmerged.get('error') or 'no answer'}")
+        else:
+            check("finished work is all merged", not rows,
+                  f"{unmerged.get('summary') or 'some is not'} — land or drop them")
         for r in rows[:12]:
             print(f"      {r.get('branch', '')} "
                   f"({r.get('commits', 0)} on {r.get('base', '?')}) "
