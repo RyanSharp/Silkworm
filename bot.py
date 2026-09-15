@@ -2123,6 +2123,11 @@ def execute_task(task: dict) -> None:
             recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
                                   session_id=session_id, prompt=task.get("goal", ""))
             outbox.mkdir(parents=True, exist_ok=True)
+
+            def on_start(handle) -> None:
+                RUNNING[key] = handle
+                RUNNING_TASKS[tid] = handle
+
             try:
                 result = run_turn(
                     task.get("goal", ""), session_id=session_id,
@@ -2136,8 +2141,7 @@ def execute_task(task: dict) -> None:
                     on_init=lambda sid: task_store.update(tid, session_id=sid),
                     on_activity=lambda n, i: progress.update(
                         f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
-                    on_start=lambda h: (RUNNING.__setitem__(key, h),
-                                       RUNNING_TASKS.__setitem__(tid, h)),
+                    on_start=on_start,
                 )
                 # A fresh run must not repoint the thread at its throwaway
                 # session, or the next Slack message resumes the review.
