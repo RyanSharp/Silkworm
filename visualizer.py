@@ -1328,7 +1328,10 @@ async function sendBack(id, needsAnswer) {
 }
 async function taskAction(id, action, notes) {
   const r = await taskCall(notes ? {action, id, notes, by: "you"} : {action, id});
-  toast(r.ok ? `Task ${action}ed` : (r.error || "Not allowed"));
+  // Cancelling something that was running says whether the work was actually
+  // stopped, which is the only part of it you cannot see from the board.
+  toast(r.ok ? `Task ${action}ed${r.note ? ` — ${r.note}` : ""}`
+             : (r.error || "Not allowed"));
   renderTasks();
   refreshTaskBadge();
 }
