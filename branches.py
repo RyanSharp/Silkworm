@@ -47,9 +47,21 @@ log = logging.getLogger("silkworm.branches")
 IN_FLIGHT = (tasks.PROPOSED, tasks.QUEUED, tasks.RUNNING, tasks.BLOCKED)
 
 
+class _Failed:
+    """What a git call that could not even start looks like to a caller."""
+    returncode, stdout, stderr = 1, "", "git could not be run"
+
+
 def _git(cwd, *args, timeout: int = 30):
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, timeout=timeout)
+    """Never raises. One unreadable or wedged repository must cost that
+    repository's row, not the whole survey -- this runs behind a dashboard
+    panel and inside the nightly goal, and neither may fail on it."""
+    try:
+        return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("git %s in %s: %s", args[0] if args else "?", cwd, e)
+        return _Failed()
 
 
 def name_for(task: dict) -> str:
@@ -177,10 +189,6 @@ def base_name(repo, ref: str) -> str:
     r = _git(repo, "rev-parse", "--abbrev-ref", ref)
     resolved = r.stdout.strip() if r.returncode == 0 else ""
     return (resolved or ref).split("/")[-1] or ref
-
-
-def count(records) -> int:
-    return len(survey(records))
 
 
 def line(rows) -> str:

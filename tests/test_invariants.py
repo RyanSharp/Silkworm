@@ -2521,6 +2521,19 @@ def test_unmerged_branches():
           len(B.survey([finished("tsk_ccc", state=T.AWAITING_APPROVAL)])) == 1,
           "awaiting approval means the work is done and sitting there")
 
+    # One unreadable or wedged repository must cost that repository's row, not
+    # the whole survey: this runs behind a dashboard panel and inside the
+    # nightly goal, and neither may fail on it.
+    broken = finished("tsk_aaa")
+    broken["scope"] = {"cwd": str(repo)}
+    real_run = B.subprocess.run
+    B.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no git"))
+    try:
+        check("a repository git cannot be run against is skipped, not raised",
+              B.survey([broken]) == [])
+    finally:
+        B.subprocess.run = real_run
+
     # A project with no repository has no branches, and asking git about a
     # kitchen renovation should cost nothing rather than throwing.
     plain = T.make("plan the trip", state=T.QUEUED, scope={"cwd": str(root / "nope")})
