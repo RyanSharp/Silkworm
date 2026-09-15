@@ -11,6 +11,7 @@
     silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
     silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
+    silkworm discard <branch>...    delete task branches, keeping their tips
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -566,6 +567,25 @@ def main() -> None:
         print(f"{WORM} running regression tests…")
         py = str(VENV_PY) if VENV_PY.exists() else sys.executable
         sys.exit(subprocess.run([py, str(REPO / "tests" / "test_invariants.py")]).returncode)
+    elif cmd == "discard":
+        # The way to reset a backlog. Doing it with `git branch -D` is how
+        # fifteen commits ended up reachable from nothing on 2026-09-12, with a
+        # note claiming a reflog that had never held them.
+        sys.path.insert(0, str(REPO))
+        import discard as _discard
+        # args[0] is "discard" itself -- the classic off-by-one, which
+        # here would have tried to delete a branch called "discard".
+        branches = [a for a in args[1:] if not a.startswith("-")]
+        repo = Path.cwd()
+        if not branches:
+            print("usage: silkworm discard <branch>... "
+                  "(run from the repository they are in)")
+            sys.exit(2)
+        print(f"{WORM} discarding {len(branches)} branch(es) from {repo}…")
+        for line in _discard.reset(repo, branches):
+            print(f"  {G}·{N} {line}")
+        print(f"  recover any of them with: git checkout -b <branch> <tag>")
+
     elif cmd == "titles":
         force = "--force" in args
         print(f"{WORM} naming threads{' (all)' if force else ' (untitled only)'}…")

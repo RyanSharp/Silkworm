@@ -26,6 +26,8 @@ import threading
 import time
 from pathlib import Path
 
+import discard
+
 log = logging.getLogger("silkworm.worktrees")
 
 #: Outside any repository, so it is never scanned, committed or walked by a
@@ -118,12 +120,15 @@ def create(repo, task_id: str, fetch: bool = True, base: str = "") -> Path | Non
             # already exists". Clear it before trying again.
             time.sleep(1.5)
             _git(repo, "worktree", "prune")
-            _git(repo, "branch", "-D", branch)
+            # Through discard, because "the branch already exists" is one of
+            # the reasons this step fails -- and then the branch being cleared
+            # is not the half-made one, it is somebody's finished work.
+            discard.drop(repo, branch)
             r = _git(repo, "worktree", "add", "-b", branch, str(path), base)
         if r.returncode != 0:
             # Still failed: do not leave a half-made branch lying around for a
             # later run to trip over.
-            _git(repo, "branch", "-D", branch)
+            discard.drop(repo, branch)
     if r.returncode != 0:
         # Tail, not head: git puts "Preparing worktree..." progress on stderr,
         # so logging the first 300 characters captured that and hid the actual
@@ -222,9 +227,12 @@ def release(worktree) -> tuple[bool, str]:
     if made:
         return True, f"branch `{branch}` ({made} commit{'s' if made != 1 else ''})"
     # A branch with nothing on it is not work, it is litter. Left alone they
-    # accumulate one per run and make `git branch` useless.
+    # accumulate one per run and make `git branch` useless. discard checks that
+    # claim against the refs rather than trusting the commit count above it:
+    # `made` is counted from a base that has to be resolved, and a base that
+    # resolves to nothing has read as "the task did nothing" before now.
     if repo and branch.startswith(BRANCH_PREFIX):
-        _git(repo, "branch", "-D", branch)
+        discard.drop(repo, branch)
     return True, ""
 
 

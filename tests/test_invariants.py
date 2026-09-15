@@ -753,8 +753,12 @@ def test_parallel_tasks():
     src = (BASE / "worktrees.py").read_text()
     create = src[src.index("def create("):src.index("def main_repo")]
     check("a failed creation deletes the branch it made",
-          create.count('"branch", "-D", branch') == 2,
+          create.count("discard.drop(repo, branch)") == 2,
           "otherwise the retry fails forever, and a stale branch blocks the next run")
+    check("and goes through discard rather than `branch -D`",
+          '"branch", "-D"' not in create,
+          "one reason `worktree add -b` fails is that the branch already exists, "
+          "and then a bare -D deletes finished work")
     check("creation is serialised per repository",
           "with _repo_create_lock(repo):" in create,
           "concurrent `worktree add` on one repo makes all but one fail")
@@ -2470,6 +2474,171 @@ def test_bounded_state():
     check("turns and total still accumulate", e["turns"] == 60 and round(e["cost"], 2) == 6.0)
 
 
+# --- discarding a branch keeps what was on it --------------------------------
+# On 2026-09-12 fifteen branches were deleted when the backlog was reset, and
+# what was kept was a list of shas and a line promising "the reflog for ~90
+# days". Deleting a branch deletes its reflog, and the work had been done in
+# worktrees whose reflogs went with them, so fourteen of the fifteen were
+# reachable from no ref at all and auto-gc would have taken them from about
+# 2026-09-24. Three proposals on the board still say to read those diffs.
+
+
+def _repo_with_history():
+    """A real repository. These invariants are about refs, not about strings."""
+    d = Path(tempfile.mkdtemp())
+    run = lambda *a: subprocess.run(["git", *a], cwd=d, capture_output=True, text=True)
+    run("init", "-q", "-b", "main")
+    run("config", "user.email", "t@t"); run("config", "user.name", "t")
+    (d / "a.txt").write_text("1"); run("add", "-A"); run("commit", "-qm", "base")
+    return d, run
+
+
+def test_discarding_a_branch_keeps_it():
+    print("\ndiscarding a branch keeps what was on it")
+    import discard
+
+    d, run = _repo_with_history()
+    # The commit is made in a worktree and the worktree is then removed, which
+    # is how the real ones were made. It matters: doing it with `git checkout
+    # -b` here leaves the tip in this repository's own HEAD reflog, which keeps
+    # it alive through a prune all by itself -- so the test would pass with the
+    # tagging taken out and prove nothing. A worktree's reflog is deleted with
+    # the worktree, which is why fourteen of the fifteen were held by nothing.
+    wt = d / "wt"
+    run("worktree", "add", "-q", "-b", "feature", str(wt), "main")
+    (wt / "b.txt").write_text("work")
+    subprocess.run(["git", "add", "-A"], cwd=wt, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "real work"], cwd=wt, capture_output=True)
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt,
+                         capture_output=True, text=True).stdout.strip()
+    run("worktree", "remove", "--force", str(wt))
+    check("the fixture reproduces the real conditions: no reflog holds it",
+          sha not in run("reflog", "--all").stdout,
+          "otherwise the prune below proves nothing")
+
+    deleted, tag, _ = discard.drop(d, "feature")
+    check("the branch is gone", deleted and not discard.tip(d, "feature"))
+    check("its tip was tagged first", bool(tag) and tag.endswith(sha[:7]),
+          "a sha written in a file is not a ref, and only a ref survives gc")
+    # The actual failure being prevented, reproduced rather than argued about.
+    run("gc", "--prune=now", "--quiet")
+    check("and it survives git gc --prune=now",
+          run("cat-file", "-t", sha).stdout.strip() == "commit",
+          "this is exactly what would have happened to the 2026-09-12 branches")
+    check("the diff survives too, not just the commit object",
+          "b.txt" in run("show", "--stat", "--format=", sha).stdout)
+    check("recovery instruction in the tag actually works",
+          run("checkout", "-qb", "back", tag).returncode == 0
+          and run("rev-parse", "back").stdout.strip() == sha)
+
+    # A task that committed nothing points at the base, which main holds. Every
+    # run leaves one, and tagging them would bury the real rescues.
+    d, run = _repo_with_history()
+    run("branch", "silkworm/tsk_empty")
+    deleted, tag, _ = discard.drop(d, "silkworm/tsk_empty")
+    check("a branch holding nothing new is deleted without a tag",
+          deleted and tag == "",
+          "otherwise one tag per run makes `git tag -l discarded/*` useless")
+
+    # Four of the fifteen names appeared twice, with divergent tips: a task id
+    # re-ran and reused its branch. Name-only tags would have kept eight.
+    d, run = _repo_with_history()
+    tips = []
+    for n in ("first", "second"):
+        # Both on one date, which is the case that actually happened: a task
+        # re-ran the same day and its branch name came round again.
+        wt = d / f"wt-{n}"
+        run("worktree", "add", "-q", "-b", "silkworm/tsk_same", str(wt), "main")
+        (wt / f"{n}.txt").write_text(n)
+        subprocess.run(["git", "add", "-A"], cwd=wt, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", n], cwd=wt, capture_output=True)
+        tips.append(subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt,
+                                   capture_output=True, text=True).stdout.strip())
+        run("worktree", "remove", "--force", str(wt))
+        discard.drop(d, "silkworm/tsk_same", "2026-09-12")
+    run("gc", "--prune=now", "--quiet")
+    check("a reused branch name does not overwrite the earlier rescue",
+          all(run("cat-file", "-t", t).stdout.strip() == "commit" for t in tips),
+          "the tag name carries the sha, so two tips of one name both survive")
+    check("both are found under one namespace",
+          len([t for t in run("tag", "-l", "discarded/*").stdout.split() if t]) == 2)
+
+    # The ordering invariant. Tagging after the delete is a race with gc and
+    # with a crash; failing to tag has to mean not deleting.
+    d, run = _repo_with_history()
+    run("checkout", "-qb", "fragile")
+    (d / "c.txt").write_text("x"); run("add", "-A"); run("commit", "-qm", "precious")
+    run("checkout", "-q", "main")
+    real = discard.preserve
+    def explode(*a, **k):
+        raise RuntimeError("no tag for you")
+    discard.preserve = explode
+    try:
+        deleted, tag, note = discard.drop(d, "fragile")
+    finally:
+        discard.preserve = real
+    check("a branch whose tip cannot be tagged is not deleted",
+          not deleted and bool(discard.tip(d, "fragile")),
+          "deleting on a failed preserve is the original bug with extra steps")
+    check("and the reason is reported rather than swallowed", "no tag for you" in note)
+
+    # The note is the thing someone reads under pressure.
+    d, run = _repo_with_history()
+    run("checkout", "-qb", "silkworm/tsk_note")
+    (d / "n.txt").write_text("x"); run("add", "-A"); run("commit", "-qm", "noted")
+    run("checkout", "-q", "main")
+    discard.reset(d, ["silkworm/tsk_note"], "2026-09-30")
+    text = (d / ".discarded" / "2026-09-30-reset.txt").read_text()
+    check("the note points at the tag, not only at a sha",
+          "discarded/2026-09-30/silkworm/tsk_note-" in text)
+    check("the note does not promise the reflog",
+          "reflog for" not in text,
+          "that promise was false: a deleted branch takes its reflog with it")
+
+    # The CLI is the path a future reset is meant to take, so drive it rather
+    # than reading it. It shipped with argv[0] read as a branch name -- it
+    # reported "no branch discard" and would have deleted one called that.
+    d, run = _repo_with_history()
+    run("branch", "discard")
+    cli = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"),
+                          "discard", "silkworm/tsk_none"],
+                         cwd=d, capture_output=True, text=True)
+    check("the CLI does not read its own subcommand as a branch",
+          bool(discard.tip(d, "discard")) and "no branch discard" not in cli.stdout,
+          "argv includes the subcommand itself")
+    check("and asks for arguments rather than doing nothing quietly",
+          subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "discard"],
+                         cwd=d, capture_output=True, text=True).returncode == 2)
+
+    # What this task was actually for. The note is ignored by git and lives in
+    # the main checkout, so resolve that rather than BASE -- these tests
+    # usually run from a worktree, where BASE has no .discarded at all and the
+    # check would quietly never run.
+    common = subprocess.run(["git", "rev-parse", "--path-format=absolute",
+                             "--git-common-dir"], cwd=BASE,
+                            capture_output=True, text=True).stdout.strip()
+    main = Path(common).parent if common.endswith("/.git") else BASE
+    listed = main / ".discarded" / "2026-09-12-reset.txt"
+    if listed.exists():
+        text = listed.read_text()
+        rows = [ln.split() for ln in text.splitlines()
+                if ln.strip() and not ln.startswith("#")]
+        loose = [r[0] for r in rows if len(r) < 3]
+        check("the note names a tag for every commit, not just a sha",
+              not loose, f"no tag recorded for {', '.join(s[:8] for s in loose)}")
+        # Resolved against the repository, so a tag that was renamed or never
+        # made fails here rather than reading as fine because the text says so.
+        missing = [r[0] for r in rows if len(r) > 2 and r[2] not in
+                   subprocess.run(["git", "tag", "--contains", r[0]], cwd=BASE,
+                                  capture_output=True, text=True).stdout.split()]
+        check("every branch discarded on 2026-09-12 is reachable from a tag",
+              not missing and len(rows) >= 15,
+              f"{len(missing)} of {len(rows)} would be pruned")
+        check("and the note explains what actually protects them",
+              "That was wrong" in text and "Nothing but a ref keeps a commit" in text,
+              "the reflog line was the instruction someone would have followed")
+
+
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
@@ -2484,7 +2653,8 @@ if __name__ == "__main__":
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_thread_kind_filter,
-              test_dashboard_js_is_whole):
+              test_dashboard_js_is_whole,
+              test_discarding_a_branch_keeps_it):
         try:
             t()
         except Exception as exc:
