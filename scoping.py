@@ -59,6 +59,39 @@ def validate(goal: str, filed_already: int = 0, propose: bool = False) -> str:
     return ""
 
 
+def unmerged_note(rows, limit: int = 12) -> str:
+    """Tell the nightly pass what is already fixed on a branch nobody merged.
+
+    The ideator reads the base branch, which is the honest thing to read -- and
+    a gap fixed on an unmerged branch is still a gap there. So it re-derives it
+    and files it again, correctly, for as long as the branch sits unlanded.
+    That is not hypothetical: one fix was proposed on two different nights and
+    implemented twice, each time costing a session and a reviewer, because the
+    first branch never landed.
+
+    Empty when there is nothing to say, so a healthy project pays no tokens
+    for the paragraph.
+    """
+    if not rows:
+        return ""
+    shown = rows[:limit]
+    body = "\n".join(
+        f"  - {r.get('branch') or '?'} ({r.get('commits') or 0} commit"
+        f"{'s' if (r.get('commits') or 0) != 1 else ''}, off "
+        f"{r.get('base') or 'the base'}) — {(r.get('title') or '').strip()[:90]}"
+        for r in shown)
+    more = (f"\n  …and {len(rows) - len(shown)} more"
+            if len(rows) > len(shown) else "")
+    return ("Already done, and sitting on a branch that was never merged:\n\n"
+            f"{body}{more}\n\n"
+            "Those gaps are fixed on those branches and not on the base you "
+            "are reading, so the code will look like it still has them. Check "
+            "the branch before proposing anything it covers. If the only thing "
+            "wrong is that it has not been merged, say that in your reply — do "
+            "not file it as work, because implementing it again is exactly the "
+            "mistake this list exists to stop.")
+
+
 HOW_TO = """When the user asks you to scope, plan or break down a piece of \
 work, you can file the pieces as real tasks rather than only describing them:
 

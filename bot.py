@@ -30,6 +30,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import backfill
+import branches
 import credentials
 import defer
 import email_ingest
@@ -1223,6 +1224,14 @@ def handle_tasks(payload: dict) -> dict:
                         "depth": r.get("defers") or 0,
                         "remaining": defer.MAX_DEFERS - (r.get("defers") or 0)})
         return {"ok": True, "watching": sorted(out, key=lambda w: w["in_s"])}
+    if action == "unmerged":
+        # Finished work whose commits never reached the base. Its own action
+        # rather than part of `list`: the badge polls `list` every five
+        # seconds, and this asks git, so folding it in would run a survey
+        # twice a minute to answer a question that only changes when you
+        # merge something.
+        rows = branches.survey(_filter(list(task_store.all().values())))
+        return {"ok": True, "unmerged": rows, "summary": branches.line(rows)}
     if action == "ingest-email":
         try:
             return run_email_ingest()
@@ -1932,6 +1941,31 @@ def task_thread(task: dict) -> tuple[str, str]:
     return channel, thread_ts
 
 
+def record_branch(tid: str, worktree, scope: dict) -> None:
+    """Write down what this task left in git, before its checkout goes away.
+
+    The worktree is about to be released and it is the only thing that knows
+    which branch the work is on and what it was cut from. Afterwards the branch
+    is still there but nothing points at it: eight finished tasks each left a
+    commit nobody merged, and the board recorded eight plain `done`.
+
+    Never allowed to cost a reply. A failure here loses the note, not the work,
+    so it is logged and swallowed rather than raised into the turn.
+    """
+    try:
+        repo = worktrees.main_repo(worktree)
+        base = worktrees.base_ref(repo, fetch=False,
+                                  prefer=(scope or {}).get("branch") or "") if repo else ""
+        made = worktrees.commits_on(worktree, base)
+        branch = worktrees.branch_of(worktree)
+        if not made or not branch:
+            return                               # nothing to point anyone at
+        task_store.update(tid, branch=branch, commits=made,
+                          base=branches.base_name(repo, base) if repo else base)
+    except Exception:
+        log.exception("could not record the branch for %s", tid)
+
+
 def execute_task(task: dict) -> None:
     """Run one claimed task. Already in `running` — the claim did that."""
     tid = task["id"]
@@ -2052,6 +2086,7 @@ def execute_task(task: dict) -> None:
         if worktree and (checked is None or checked.get("ok") or not checked["ran"]):
             # A failure keeps its checkout: the next attempt reattaches the
             # branch anyway, but leaving it makes the failure inspectable.
+            record_branch(tid, worktree, scope)
             removed, note = worktrees.release(worktree)
             worktree = None                      # released; finally need not repeat it
             if note:
@@ -2095,6 +2130,7 @@ def execute_task(task: dict) -> None:
             # Any path out of the turn that did not release it. release() keeps
             # a dirty tree, so a failed task's partial work survives.
             try:
+                record_branch(tid, worktree, scope)
                 worktrees.release(worktree)
             except Exception:
                 log.exception("could not release worktree %s", worktree)
@@ -2509,6 +2545,13 @@ def run_ideation(slug: str) -> dict:
         "must stand alone: whoever picks it up will not have read this.\n\n"
         "Then say what you looked at and what you filed."
     )
+    # Told nothing about them, a fresh session reads the base, finds a gap that
+    # is already fixed on an unmerged branch, and files it again -- which is how
+    # one fix came to be implemented twice, at the cost of two sessions and two
+    # reviewers each time. So the goal carries the list.
+    note = scoping.unmerged_note(branches.survey(task_store.by_project(slug)))
+    if note:
+        goal += "\n\n" + note
     task = task_store.create(goal, title=f"Nightly review: {rec.get('title') or slug}",
                              role="ideator", project=slug, state=tasks.QUEUED,
                              driver="queue", source="ideation", scope=scope)

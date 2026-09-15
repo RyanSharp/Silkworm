@@ -360,6 +360,31 @@ Opening pull requests is deliberately not part of this. A branch you can look at
 is useful immediately; pushing one outward is a decision worth making
 separately.
 
+**But a branch you cannot see is not a branch you can look at.** For a while the
+only record that one existed was a line in a Slack reply, which scrolls away.
+Eight tasks finished, the board recorded eight `done`, and eight fixes sat on
+eight branches nobody merged — so none of those bugs were fixed in the bot that
+was actually running. Two of the eight were the same fix, implemented twice on
+different nights at the cost of a session and a reviewer each, because the first
+branch never landed and the gap was therefore still in the code for the next
+night's pass to find.
+
+So a task now records the branch it left and the base it was cut from, written
+down as its checkout closes because afterwards nothing knows. `branches.py`
+answers *what is finished and not in the base?*, and the answer is shown in the
+Tasks panel, counted by `silkworm status`, and put in front of the nightly
+ideator alongside its goal.
+
+Merge state is asked of git every time rather than stored. You can land a branch
+by hand, and a stored flag would go on saying unmerged for ever; a deleted
+branch is gone rather than outstanding. The survey is local — no fetch — because
+a dashboard panel must not wait on the network, and naming a branch someone else
+already merged is a much better failure than staying silent about one nobody
+did. It is its own request rather than part of the task list, since the badge
+polls that every five seconds.
+
+This is visibility, not automation: nothing in it merges, deletes or pushes.
+
 **A project pointed at a real checkout is never ours to write.** `!project`
 sets a project's cwd from the thread it was run in and leaves `repo` empty, so
 keying "is this ours" on that field alone let a project pointed at a working

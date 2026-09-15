@@ -102,6 +102,16 @@ FIELDS: dict[str, tuple] = {
     "root":        (None,  "top-level task this belongs to"),
     "blocked_on":  (list,  "task ids that must finish first"),
     "result":      (None,  "{text, artifacts, cost} once finished"),
+    # What the task left behind in git. The worktree is released when the turn
+    # ends and took the only trace of it with it -- the branch outlives the
+    # checkout, but nothing except one line in a Slack reply ever said so, and
+    # eight finished tasks went unmerged without the board knowing. Note this
+    # `branch` is the task's own; `scope["branch"]` is the base it builds on.
+    # Merge state is deliberately not stored: you can land a branch by hand,
+    # and a stale flag is worse than asking git. See branches.py.
+    "branch":      ("",    "branch this task's commits are on, if it made any"),
+    "base":        ("",    "the base it was cut from, as resolved at the time"),
+    "commits":     (0,     "commits it made, counted as its checkout closed"),
     "events":      (list,  "state changes and notable occurrences, capped at 50"),
     "attempts":    (0,     "how many times execution has been tried"),
     # Set when a turn died on something transient (quota, overload). The task

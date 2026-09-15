@@ -2431,6 +2431,155 @@ console.log(JSON.stringify(out));
           "a single-option filter is noise, not a choice")
 
 
+# --- finished work that never reached the base -------------------------------
+# Eight tasks completed, the board recorded eight `done`, and eight fixes sat on
+# eight branches nobody merged -- so none of those bugs were fixed in the bot
+# that was actually running. Two of the eight were the same fix, implemented
+# twice on different nights, because the first never landed and the gap was
+# still there for the next pass to find.
+
+def test_unmerged_branches():
+    import branches as B
+    import tasks as T
+    import worktrees as W
+    print("\nfinished work on unmerged branches is visible")
+
+    root = Path(tempfile.mkdtemp())
+    old_root = W.ROOT
+    W.ROOT = root / "worktrees"
+    repo = root / "repo"; repo.mkdir()
+
+    def git(cwd, *a):
+        return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, text=True)
+
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("hello\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    def finished(tid, state=T.DONE, **extra):
+        rec = T.make(f"do {tid}", state=T.QUEUED, scope={"cwd": str(repo)}, **extra)
+        rec["id"] = tid
+        rec["state"] = state
+        rec["title"] = f"work for {tid}"
+        return rec
+
+    def work(tid, text):
+        wt = W.create(repo, tid, fetch=False)
+        (Path(wt) / f"{tid}.txt").write_text(text)
+        git(wt, "add", "-A"); git(wt, "commit", "-qm", f"work {tid}")
+        return wt
+
+    # One task that did work and stopped. This is the whole scenario.
+    wt_a = work("tsk_aaa", "a")
+    W.release(wt_a)
+    rows = B.survey([finished("tsk_aaa")])
+    check("a finished task's branch is named", len(rows) == 1)
+    check("with its commit count", rows and rows[0]["commits"] == 1,
+          "\"it is on a branch\" without a size is not enough to decide on")
+    check("and the base it would go to", rows and rows[0]["base"] == "main")
+    check("the summary line counts them", "1 finished task" in B.line(rows))
+
+    # Merging it must make it disappear without anything telling us so: merge
+    # state is asked of git, never stored, because you can land a branch by hand.
+    git(repo, "merge", "--ff-only", "-q", "silkworm/tsk_aaa")
+    check("merging it by hand clears it, with no flag to update",
+          B.survey([finished("tsk_aaa")]) == [],
+          "a stored merge flag would still say unmerged")
+    check("and the summary goes quiet", B.line([]) == "")
+
+    # A branch that was deleted is not unmerged work, it is gone. The eight
+    # that prompted this were later discarded; the survey must not resurrect
+    # them as things to land.
+    wt_b = work("tsk_bbb", "b")
+    W.release(wt_b)
+    git(repo, "branch", "-D", "silkworm/tsk_bbb")
+    check("a deleted branch is not reported", B.survey([finished("tsk_bbb")]) == [],
+          "there is nothing left to land")
+
+    # Still-running work owns its branch; listing it would be noise every night.
+    work("tsk_ccc", "c")
+    for state in (T.RUNNING, T.QUEUED, T.BLOCKED, T.PROPOSED):
+        check(f"a task still in {state} is left alone",
+              B.survey([finished("tsk_ccc", state=state)]) == [])
+    check("but the same task, once stopped, is reported",
+          len(B.survey([finished("tsk_ccc", state=T.AWAITING_APPROVAL)])) == 1,
+          "awaiting approval means the work is done and sitting there")
+
+    # A project with no repository has no branches, and asking git about a
+    # kitchen renovation should cost nothing rather than throwing.
+    plain = T.make("plan the trip", state=T.QUEUED, scope={"cwd": str(root / "nope")})
+    plain["state"] = T.DONE
+    check("a project with no repo is skipped", B.survey([plain]) == [])
+
+    # The eight branches predate the field entirely, so the survey has to fall
+    # back to the convention or the feature is blind to exactly the case that
+    # caused it.
+    old = finished("tsk_ccc")
+    old.pop("branch", None)
+    check("a record written before the field still resolves its branch",
+          B.name_for(old) == "silkworm/tsk_ccc")
+    check("and a recorded branch wins over the convention",
+          B.name_for({"id": "tsk_x", "branch": "feature/thing"}) == "feature/thing")
+
+    # origin/HEAD is a symbolic ref: splitting it on "/" gives "HEAD" rather
+    # than the branch, which has already made one landing refuse itself.
+    git(repo, "remote", "add", "origin", str(repo))
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "remote", "set-head", "origin", "main")
+    check("a symbolic base ref reports the branch it points at",
+          B.base_name(repo, "origin/HEAD") == "main")
+
+    # The prompt block: an ideator told nothing re-derives a fix that already
+    # exists on a branch, which is how one got implemented twice.
+    import scoping as S
+    rows = B.survey([finished("tsk_ccc")])
+    note = S.unmerged_note(rows)
+    check("the nightly goal is told which branches already hold the fix",
+          "silkworm/tsk_ccc" in note and "1 commit" in note)
+    check("and told not to file it again",
+          "not file it as work" in note)
+    check("a project with nothing outstanding gets no paragraph",
+          S.unmerged_note([]) == "",
+          "a healthy project should not pay tokens for an empty list")
+
+    bot = (BASE / "bot.py").read_text()
+    ideate = bot[bot.index("def run_ideation"):bot.index("def _ideation_scheduler")]
+    check("the nightly pass actually carries the list",
+          "scoping.unmerged_note(branches.survey(" in ideate,
+          "the ideator re-derives what is fixed on a branch it was never shown")
+
+    # Recorded as the checkout closes, because afterwards nothing knows.
+    ex = bot[bot.index("def execute_task"):bot.index("MAX_VERIFY_ATTEMPTS")]
+    check("the branch is written down before the checkout is released",
+          ex.count("record_branch(tid, worktree, scope)") == 2
+          and ex.index("record_branch(tid, worktree, scope)")
+          < ex.index("worktrees.release(worktree)"),
+          "released first, there is nothing left to ask which branch it was")
+    # Behavioural rather than textual: the docstring says "raised", so grepping
+    # for the word proves nothing. Ask the tree.
+    fn = next(n for n in ast.walk(ast.parse(bot))
+              if isinstance(n, ast.FunctionDef) and n.name == "record_branch")
+    guarded = [n for n in fn.body if isinstance(n, ast.Try)]
+    check("and recording it can never cost the reply",
+          len(fn.body) == 2 and len(guarded) == 1
+          and any(h.type and getattr(h.type, "id", "") == "Exception"
+                  for h in guarded[0].handlers)
+          and not [n for n in ast.walk(fn) if isinstance(n, ast.Raise)],
+          "losing the note is survivable; losing the turn is not")
+
+    # The badge polls the task list every five seconds. A git survey folded
+    # into that would run twice a minute for an answer that changes when you
+    # merge something.
+    handler = bot[bot.index("def handle_tasks"):bot.index("def handle_projects")]
+    check("the survey is its own request, not part of the polled list",
+          'if action == "unmerged":' in handler
+          and "branches.survey" not in handler[:handler.index('if action == "unmerged":')],
+          "folding it into `list` would shell out to git every five seconds")
+
+    W.ROOT = old_root
+
+
 def test_dashboard_js_is_whole():
     import re
     sys.argv = ["x"]
@@ -2444,7 +2593,7 @@ def test_dashboard_js_is_whole():
                  "taskCall", "toggleTasks", "setTaskView", "renderProjects", "addTask",
                  "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
                  "refreshTaskBadge", "releaseThread", "retitle", "nameAllThreads",
-                 "resummarize", "toggleLearn", "renderLearnings"):
+                 "resummarize", "toggleLearn", "renderLearnings", "renderUnmerged"):
         check(f"{name}() is defined", name in defined)
 
     # Anything wired to an onclick must exist, or the click is a dead button.
@@ -2822,6 +2971,7 @@ if __name__ == "__main__":
               test_mail_facts, test_projects,
               test_transient_retry, test_supersede_stale_failures,
               test_file_uploads_are_handled, test_thread_kind_filter,
+              test_unmerged_branches,
               test_dashboard_js_is_whole,
               test_discarding_a_branch_keeps_it):
         try:

@@ -534,6 +534,15 @@ PAGE = r"""<!doctype html>
   #nightly button:hover { color: var(--fg); }
   #nightly button.on { background: #C08A1C22; color: var(--gold);
     border-color: #C08A1C99; }
+  #unmerged { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    padding: 0 0 10px; }
+  #unmerged .nlabel { font-size: 11px; color: var(--c-fresh); font-family: var(--mono); }
+  #unmerged .b { font-size: 11px; font-family: var(--mono); cursor: default;
+    background: #2D9FD01A; color: var(--ink); border: 1px solid #2D9FD077;
+    border-radius: 6px; padding: 2px 8px; }
+  #unmerged button.b { cursor: pointer; }
+  #unmerged button.b:hover { border-color: var(--c-fresh); }
+  #unmerged .b b { color: var(--c-fresh); }
   .hidebtn { float: right; background: transparent; border: 0; cursor: pointer;
     color: var(--muted); font-size: 13px; line-height: 1; padding: 0 2px; }
   .hidebtn:hover { color: var(--fg); }
@@ -781,8 +790,11 @@ PAGE = r"""<!doctype html>
       <select id="tproj" onchange="renderTasks()" title="filter by project"></select></h2>
     <div class="hint">Work Silkworm is managing. This opens on what needs you —
       tasks proposed for triage, waiting on approval, asking a question, or failed.
-      Everything else is the system's business and stays out of the way.</div>
+      Everything else is the system's business and stays out of the way.
+      A finished task's commits stay on its own branch, so any that never reached
+      the base are listed below — nothing here merges them.</div>
     <div id="nightly"></div>
+    <div id="unmerged"></div>
     <div class="lform">
       <input class="text" id="tgoal" placeholder="what should it do?"
              onkeydown="if(event.key==='Enter')addTask()">
@@ -1365,6 +1377,7 @@ function taskButtons(t) {
 async function renderTasks() {
   const list = document.getElementById("tlist");
   const project = document.getElementById("tproj").value;
+  renderUnmerged();
   const r = await taskCall({action: taskView === "attention" ? "attention" : "list",
                             project: project || undefined});
   if (!r.ok) { list.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
@@ -1382,6 +1395,28 @@ async function renderTasks() {
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
           age(t.created)}</div>${review(t)}</span>
       ${taskButtons(t)}</div>`).join("");
+}
+// Work that finished and never reached the base. Nothing in the dashboard
+// mentioned branches at all, so eight completed tasks left eight unmerged
+// commits and the board showed eight plain "done". Its own request rather than
+// part of the task list, because the badge polls that every five seconds and
+// this one asks git.
+async function renderUnmerged() {
+  const el = document.getElementById("unmerged");
+  if (!el) return;
+  const project = document.getElementById("tproj").value;
+  const r = await taskCall({action: "unmerged", project: project || undefined});
+  const rows = (r && r.unmerged) || [];
+  if (!rows.length) { el.innerHTML = ""; return; }
+  el.innerHTML = `<span class="nlabel">🌿 ${esc(r.summary || "")}</span>` +
+    rows.map(b => {
+      const tip = `${esc(b.title)}\n${esc(b.id)} · ${esc(b.state)} · off ${
+        esc(b.base)} · ${esc(b.repo)}`;
+      const label = `${esc(b.branch.replace(/^silkworm\//, ""))} <b>${b.commits}</b>`;
+      return b.thread
+        ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(b.thread)}')">${label}</button>`
+        : `<span class="b" title="${tip}">${label}</span>`;
+    }).join("");
 }
 function updateTaskBadge(counts) {
   const need = ["proposed", "awaiting_approval", "needs_input", "failed"]
