@@ -43,6 +43,17 @@ NEEDS_ATTENTION = (PROPOSED, AWAITING_APPROVAL, NEEDS_INPUT, FAILED)
 
 TERMINAL = (DONE, CANCELLED)
 
+#: The keys of `result` a compacted record keeps. Cost is the number the history
+#: is read for ("what has this project cost me"), and `review` is the record
+#: that the work was checked -- the dashboard shows it on every row, finished
+#: ones included, and it is bounded at a 300-char summary and 20 findings by
+#: roles.parse_verdict. `landed` is the commit the work reached the base branch
+#: as (db2a533); it is forty bytes, it is written nowhere else, and without it a
+#: task that landed is indistinguishable from one whose branch was discarded --
+#: the same mistake as losing the verdict. The reply text is the bulk, and once
+#: the work has landed nobody opens that again.
+RESULT_KEEPS = ("cost", "review", "landed")
+
 #: state -> states it may move to. Anything absent is rejected, so an executor
 #: bug shows up as a refused transition rather than a task in a nonsense state.
 TRANSITIONS: dict[str, tuple] = {
@@ -114,6 +125,10 @@ FIELDS: dict[str, tuple] = {
     "commits":     (0,     "commits it made, counted as its checkout closed"),
     "events":      (list,  "state changes and notable occurrences, capped at 50"),
     "attempts":    (0,     "how many times execution has been tried"),
+    # Set once the record has been through compact_older_than: the work landed
+    # long enough ago that the reply text and event log were dropped. The
+    # record itself stays, so a missing result never has to be guessed at.
+    "compacted":   (False, "bulky detail dropped; summary fields kept"),
     # Set when a turn died on something transient (quota, overload). The task
     # waits in `blocked` until this passes, rather than asking for help.
     "retry_at":    (None,  "unix time to requeue this automatically"),
@@ -325,6 +340,54 @@ class TaskStore:
         if superseded:
             log.info("superseded %d stale failure(s) on %s", len(superseded), thread)
         return superseded
+
+    def compact_older_than(self, days: float) -> list[str]:
+        """Strip the freight from finished records untouched for `days`.
+
+        tasks.json is rewritten whole on every create, update, transition and
+        claim, and every Slack turn adds a record, so it only ever grows. What
+        grows it is not the records themselves -- it is the reply text and the
+        event log hanging off work that landed weeks ago and is never opened
+        again.
+
+        Same decision as hiding threads rather than deleting them (cdbe005):
+        keep the record, lose the weight. Title, state, timestamps and cost
+        survive, so "what has this project had done to it" still reads back;
+        `result.text` and the events go.
+
+        Nothing in NEEDS_ATTENTION is compacted, however old. That is the list
+        the user actually works from, and a task that has been waiting on them
+        for a month is the last one whose detail should be thrown away.
+        """
+        cutoff = time.time() - days * 86400
+        with self._lock:
+            ids = []
+            for tid, rec in self._data.items():
+                if rec.get("state") in NEEDS_ATTENTION or rec.get("state") not in TERMINAL:
+                    continue
+                if rec.get("compacted") or (rec.get("updated") or 0) >= cutoff:
+                    continue
+                result = rec.get("result")
+                result = result if isinstance(result, dict) else {}
+                if not rec.get("events") and not result.get("text"):
+                    continue                      # nothing to drop; leave it be
+                ids.append(tid)
+            for tid in ids:
+                rec = self._data[tid]
+                result = rec.get("result")
+                if isinstance(result, dict):
+                    kept = {k: v for k, v in result.items() if k in RESULT_KEEPS}
+                    rec["result"] = kept or None
+                rec["events"] = []
+                rec["compacted"] = True
+                # `updated` is deliberately left alone: compacting is tidying,
+                # not activity, and a compacted task must not look freshly
+                # worked on -- nor drift back inside the retention window.
+            if ids:
+                self._save()
+        if ids:
+            log.info("compacted %d finished task(s) older than %sd", len(ids), days)
+        return ids
 
     def due_retries(self, now: float) -> list[str]:
         """Ids of blocked tasks whose retry time has arrived."""

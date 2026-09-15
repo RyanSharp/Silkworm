@@ -135,6 +135,9 @@ def _parse_channel_dirs(raw: str) -> dict[str, str]:
 CHANNEL_DIRS = _parse_channel_dirs(os.environ.get("CLAUDE_CHANNEL_DIRS", ""))
 
 SESSION_MAX_AGE_DAYS = float(os.environ.get("SESSION_MAX_AGE_DAYS", "30"))
+# Finished tasks are kept forever -- they are the project's history -- but
+# past this the reply text and event log are dropped from them.
+TASK_COMPACT_AFTER_DAYS = float(os.environ.get("TASK_COMPACT_AFTER_DAYS", "14"))
 SLACK_MSG_LIMIT = 3800
 
 # When a thread is checked out to the terminal (!terminal), a Slack message
@@ -2871,6 +2874,10 @@ def _sweeper() -> None:
         removed = store.sweep(SESSION_MAX_AGE_DAYS)
         if removed:
             log.info("swept %d stale session(s) older than %sd", removed, SESSION_MAX_AGE_DAYS)
+        try:
+            task_store.compact_older_than(TASK_COMPACT_AFTER_DAYS)
+        except Exception:
+            log.exception("compacting finished tasks failed")
         for orphan in OUTBOX_ROOT.iterdir():
             if orphan.is_dir() and orphan.stat().st_mtime < time.time() - 86400:
                 shutil.rmtree(orphan, ignore_errors=True)

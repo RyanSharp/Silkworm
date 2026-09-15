@@ -2638,6 +2638,157 @@ def test_dashboard_js_is_whole():
           f"absent: {absent}")
 
 
+# --- tasks.json only ever grew ---------------------------------------------------
+# 412 records in 1.1 MB after a fortnight, 367 of them done, and the whole file
+# re-serialised on every create, update, transition and claim -- because every
+# Slack turn files a task and nothing ever took one away. Sessions had already
+# settled this (cdbe005): put the record away, don't destroy it.
+
+def test_task_retention():
+    import tasks as T
+    from tasks import TaskStore
+    print("\nfinished tasks are compacted, not deleted")
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    check("compacted is part of the record", "compacted" in T.FIELDS)
+    check("and defaults to whole", T.default("compacted") is False)
+
+    def aged(state, days, **fields):
+        """A task parked in `state`, last touched `days` ago."""
+        t = st.create("do a thing", **fields)
+        st.transition(t["id"], T.RUNNING)
+        st.update(t["id"], result={"text": "x" * 4000, "cost": 0.42})
+        st.transition(t["id"], state, "finished")
+        # update()/transition() stamp `updated`, so age has to be set behind them.
+        st._data[t["id"]]["updated"] = time.time() - days * 86400
+        return t["id"]
+
+    old = aged(T.DONE, 30, title="landed a month ago", project="silkworm")
+    recent = aged(T.DONE, 1)
+    cancelled = aged(T.CANCELLED, 30)
+    # A task that went through the review gate. The dashboard renders the
+    # verdict on every row -- review(t) is called for all of them, and `list`
+    # returns finished tasks -- so compacting must not blank out "Review
+    # passed" on work whose review is the whole record that it was checked.
+    reviewed = aged(T.DONE, 30)
+    st.update(reviewed, result={**(st.get(reviewed)["result"] or {}),
+                                "review": {"ok": True, "summary": "looks right",
+                                           "findings": ["one nit"], "parsed": True},
+                                "landed": "abc1234"})
+    st._data[reviewed]["updated"] = time.time() - 30 * 86400
+
+    done = st.compact_older_than(14)
+    check("old finished tasks are compacted",
+          sorted(done) == sorted([old, cancelled, reviewed]), f"got {done}")
+
+    rec = st.get(old)
+    check("the record itself survives", rec is not None and rec["state"] == T.DONE)
+    check("and keeps what the history is read for",
+          rec["title"] == "landed a month ago" and rec["project"] == "silkworm"
+          and rec["created"] and rec["updated"] and rec["attempts"] == 1)
+    check("cost survives", (rec["result"] or {}).get("cost") == 0.42)
+    check("the reply text is dropped", not (rec["result"] or {}).get("text"))
+    check("the event log is dropped", rec["events"] == [])
+    check("and it says so", rec["compacted"] is True,
+          "or an empty result reads as work that produced nothing")
+    check("compacting does not count as activity",
+          rec["updated"] < time.time() - 14 * 86400,
+          "or a compacted task looks freshly worked on")
+    rv = (st.get(reviewed)["result"] or {}).get("review") or {}
+    check("the review verdict survives compaction",
+          rv.get("ok") is True and rv.get("summary") == "looks right"
+          and rv.get("findings") == ["one nit"],
+          "the dashboard shows it on finished rows too, and it is the record "
+          "that the work was checked at all")
+    check("but the reviewed task's own reply text still goes",
+          not (st.get(reviewed)["result"] or {}).get("text"))
+    check("the commit it landed as survives too",
+          (st.get(reviewed)["result"] or {}).get("landed") == "abc1234",
+          "nothing else records that the work reached the base branch, so "
+          "dropping it makes a landed task look like a discarded one")
+    viz = (BASE / "visualizer.py").read_text()
+    check("every task row asks for the verdict, not just the waiting ones",
+          "${review(t)}" in viz and "review" in T.RESULT_KEEPS,
+          "so anything review() reads has to survive compaction")
+    check("recent work is left whole",
+          len((st.get(recent)["result"] or {}).get("text") or "") == 4000)
+
+    # `compacted` is only worth carrying if it means something. A task that was
+    # cancelled before it ever ran is old, finished and empty, and it must come
+    # out of the sweep unbadged -- otherwise the flag reads as "we threw the
+    # detail away" on work that never had any, and an empty result stops being
+    # answerable either way.
+    barren = st.create("cancelled before it ran")
+    st.transition(barren["id"], T.CANCELLED, "never started")
+    st._data[barren["id"]]["updated"] = time.time() - 30 * 86400
+    st._data[barren["id"]]["events"] = []
+    check("a finished task that produced nothing is not compacted",
+          st.compact_older_than(14) == [] and st.get(barren["id"])["compacted"] is False,
+          "or `compacted` stops distinguishing dropped detail from no detail")
+    check("a second pass finds nothing to do", st.compact_older_than(14) == [])
+    check("compacted records still carry every field",
+          set(TaskStore(st._path).get(old)) == set(T.FIELDS))
+
+    # The point of the whole exercise.
+    ages = {}
+    for state in T.NEEDS_ATTENTION:
+        via = {T.PROPOSED: None, T.FAILED: T.FAILED,
+               T.AWAITING_APPROVAL: T.AWAITING_APPROVAL,
+               T.NEEDS_INPUT: T.NEEDS_INPUT}[state]
+        t = st.create("needs you", state=T.PROPOSED if via is None else T.QUEUED)
+        if via is not None:
+            st.transition(t["id"], T.RUNNING)
+            st.update(t["id"], result={"text": "y" * 4000, "cost": 1.0})
+            st.transition(t["id"], via)
+        else:
+            st.update(t["id"], result={"text": "y" * 4000, "cost": 1.0})
+        st._data[t["id"]]["updated"] = time.time() - 3650 * 86400
+        ages[state] = t["id"]
+
+    check("every attention state is covered", set(ages) == set(T.NEEDS_ATTENTION))
+    check("nothing needing attention is compacted, however old",
+          st.compact_older_than(14) == [],
+          "that is the list you work from -- ten years old or not")
+    for state, tid in ages.items():
+        r = st.get(tid)
+        check(f"{state} keeps its detail",
+              not r["compacted"] and len((r["result"] or {}).get("text") or "") == 4000
+              and (r["events"] or state == T.PROPOSED))
+
+    # Today NEEDS_ATTENTION and TERMINAL do not overlap, so the TERMINAL test
+    # alone would hold all of the above and the NEEDS_ATTENTION guard would be
+    # decoration -- passing without ever being consulted. It is there for the
+    # drift where they do overlap: `failed` is a plausible future terminal
+    # state, since a task that failed is finished. So make that the case and
+    # check the guard, not the coincidence, is what protects the list.
+    terminal = T.TERMINAL
+    try:
+        T.TERMINAL = tuple(terminal) + (T.FAILED,)
+        check("attention states are held by name, not by not being terminal",
+              st.compact_older_than(14) == []
+              and not st.get(ages[T.FAILED])["compacted"],
+              "if `failed` ever becomes terminal, this is the only thing left "
+              "standing between the board and a wiped failure")
+    finally:
+        T.TERMINAL = terminal
+
+    # And a live task is not finished either, however long it has been running.
+    running = st.create("still going", driver="queue")
+    st.transition(running["id"], T.RUNNING)
+    st.update(running["id"], result={"text": "z" * 4000})
+    st._data[running["id"]]["updated"] = time.time() - 100 * 86400
+    check("in-flight work is never compacted", st.compact_older_than(14) == [])
+
+    bot = (BASE / "bot.py").read_text()
+    check("the sweeper runs it", "task_store.compact_older_than(TASK_COMPACT_AFTER_DAYS)" in bot)
+    check("the window is configurable",
+          'os.environ.get("TASK_COMPACT_AFTER_DAYS"' in bot)
+    check("and never deletes a task to save space", "task_store.drop" not in bot)
+    env = (BASE / ".env.example").read_text()
+    check("documented next to the session window",
+          "TASK_COMPACT_AFTER_DAYS" in env
+          and 0 < env.index("TASK_COMPACT_AFTER_DAYS") - env.index("SESSION_MAX_AGE_DAYS") < 600)
+
+
 # --- bounded state ------------------------------------------------------------
 
 def test_bounded_state():
@@ -3001,7 +3152,7 @@ if __name__ == "__main__":
               test_file_uploads_are_handled, test_thread_kind_filter,
               test_unmerged_branches,
               test_dashboard_js_is_whole,
-              test_discarding_a_branch_keeps_it):
+              test_discarding_a_branch_keeps_it, test_task_retention):
         try:
             t()
         except Exception as exc:
