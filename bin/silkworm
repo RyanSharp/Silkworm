@@ -361,7 +361,12 @@ def do_file_task(argv) -> None:
               '[--role implementor|assistant] "<goal>"')
         raise SystemExit(2)
     r = bot_call("/file-task", {"key": key, "goal": goal, "propose": propose,
-                                "project": project, "role": role or "implementor"})
+                                "project": project, "role": role or "implementor",
+                                # What this run *is*, from the environment the
+                                # bot set up for it, not from anything the turn
+                                # chose. A read-only role's work waits for a
+                                # person whether or not it asked --propose.
+                                "caller_role": os.environ.get("SILKWORM_ROLE", "")})
     if not r.get("ok"):
         print(f"not filed: {r.get('error') or 'the bot did not answer'}")
         raise SystemExit(1)

@@ -464,6 +464,20 @@ should not inherit last night's conclusions — and no worktree, because a role
 that cannot write has nothing to isolate and would only leave an empty branch
 behind every run.
 
+Read-only has to cover what it *commissions*, not only what it touches. The
+allowlist that lets it file is a prefix, so it also permits filing without
+`--propose` — which landed a task in `queued`, as an implementor, for the runner
+to execute overnight with full write permissions. Where a filed task lands is
+therefore decided by the role that filed it rather than by a flag that role
+chose: whatever a restricted role files waits in `proposed`, and against the
+tighter cap, whatever it asked for.
+
+Read two ways, so neither is load-bearing alone. The bot puts the role in the
+run's environment alongside the thread it belongs to, which the CLI passes back
+— direct, but it travels through the caller. And the route checks the role of
+whatever task is *running* on that thread, which is the bot's own record and
+never leaves the process. Either one saying "restricted" holds the filing.
+
 It is told that **finding nothing is a good outcome.** A pass that must produce
 something produces busywork, and busywork costs the scarcest thing here: a
 decision. Capped at five proposals for the same reason — a night that finds ten

@@ -8,6 +8,8 @@ run without Slack, without a bot, and without spending anything.
 """
 
 import ast
+import contextlib
+import io
 import json
 import logging
 import os
@@ -1171,13 +1173,82 @@ def test_ideation():
           "or a restart in the small hours would run it twice")
 
 
+def _file_task_impl():
+    """Load handle_file_task out of bot.py without importing it.
+
+    bot.py needs Slack tokens to import, so the route is compiled on its own
+    against the real roles/scoping/tasks modules and a temporary task store.
+    Only the two session lookups are stubbed -- the decision under test, and
+    every rule it depends on, is the shipped code.
+    """
+    import types
+    import roles as R, scoping as S, tasks as T
+    from tasks import TaskStore
+
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn")
+    def named(n):
+        if isinstance(n, ast.FunctionDef):
+            return n.name
+        if isinstance(n, ast.AnnAssign):
+            return getattr(n.target, "id", "")
+        return ""
+    nodes = [n for n in tree.body if named(n) in want]
+    assert len(nodes) == len(want), \
+        f"expected all of {want}, found {[named(n) for n in nodes]}"
+
+    ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    # Naming a project writes: a record, and a home directory on disk. Recorded
+    # rather than stubbed away, so a filing that gets refused can be shown to
+    # have left nothing behind.
+    made: list = []
+    mod = types.ModuleType("filing")
+    mod.__dict__.update(
+        re=__import__("re"), roles=R, scoping=S, tasks=T, task_store=ts,
+        log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
+        store=types.SimpleNamespace(get=lambda k: {}),
+        project_store=types.SimpleNamespace(
+            ensure=lambda n, **kw: (made.append(n), {"slug": n})[1],
+            home=lambda n, create=False: made.append(n),
+            scope_for=lambda n: None),
+    )
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<filing>", "exec"),
+         mod.__dict__)
+    return mod.handle_file_task, mod._filed_this_turn, ts, made
+
+
+def _cli_file_task_impl():
+    """Load `silkworm task` out of the CLI without a bot to call.
+
+    bot_call is replaced with a recorder, so what the CLI would have sent is
+    inspectable; everything up to it -- the argument parsing and the read of
+    the environment the bot set up -- is the shipped code.
+    """
+    import types
+    src = (BASE / "bin" / "silkworm").read_text()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "do_file_task")
+    sent: list = []
+    def bot_call(path, payload, timeout=3):
+        sent.append((path, payload))
+        return {"ok": True, "id": "tsk_0", "state": "proposed",
+                "role": payload.get("role"), "project": payload.get("project"),
+                "cwd": "/tmp", "remaining": 4}
+    mod = types.ModuleType("cli")
+    mod.__dict__.update(os=os, bot_call=bot_call)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<cli>", "exec"),
+         mod.__dict__)
+    return mod.do_file_task, sent
+
+
 # --- a scoping conversation must be able to emit work ----------------------------
 # Of 143 recent tasks, 130 were live conversation and 3 were made in the
 # dashboard. Not a preference for chat: a conversation could not *emit*
 # anything, so scoping ended with a plan in a thread and no way to act on it.
 
 def test_scoping():
-    import scoping as S
+    import scoping as S, tasks as T
     print("\nscoped work can be filed from a conversation")
 
     check("a goal too short to act on is refused",
@@ -1254,6 +1325,134 @@ def test_scoping():
           and [a.id for a in limits[0].args if isinstance(a, ast.Name)] == ["propose"]
           and "MAX_PER_TURN" not in h,
           "a proposal run told '9 more allowed' would go on filing")
+
+    # Where a filed task lands is decided by who filed it, not by a flag the
+    # filer chose. The ideator's allowlist is `Bash({bin} task:*)` -- a prefix,
+    # so it permits an invocation with no --propose at all, and that filed
+    # straight to `queued` with role implementor. The queue runner then ran it
+    # overnight with full write permissions: read-only stopped the ideator
+    # editing the tree, and did not stop it commissioning an agent that would.
+    # Driven through the real route rather than read off the source, because
+    # the thing that broke was the behaviour, not the wording.
+    file_task, filed_this_turn, ts, projects_made = _file_task_impl()
+    store_of = ts.get
+    KEY = "C1:1785644289.000100"
+
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output",
+                   "caller_role": "ideator"})
+    rec = store_of(r["id"])
+    check("an ideator that omits --propose still lands in proposed",
+          r["ok"] and r["state"] == T.PROPOSED and rec["state"] == T.PROPOSED,
+          f"filed {r.get('state')} — the runner would have run this unattended")
+    check("and is recorded as the unattended pass it was",
+          rec["source"] == "ideation",
+          "queued-by-an-ideator read as work you scoped")
+    check("the tighter budget applies to it too",
+          r["remaining"] == S.MAX_PROPOSALS - 1,
+          f"told {r.get('remaining')} more of {S.MAX_PER_TURN}, not "
+          f"{S.MAX_PROPOSALS}")
+
+    filed_this_turn.clear()
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output",
+                   "caller_role": "reviewer"})
+    check("so does a reviewer, for the same reason",
+          r["ok"] and r["state"] == T.PROPOSED)
+
+    filed_this_turn.clear()
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output",
+                   "caller_role": "wat"})
+    check("an unrecognised caller does not buy full autonomy",
+          r["ok"] and r["state"] == T.PROPOSED,
+          "roles.get reads an unknown name as assistant, so a typo would queue")
+
+    filed_this_turn.clear()
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output",
+                   "caller_role": "assistant"})
+    check("work scoped with you in a conversation still queues",
+          r["ok"] and r["state"] == T.QUEUED and r["remaining"] == S.MAX_PER_TURN - 1,
+          "the person the proposed gate asks was in the room")
+
+    filed_this_turn.clear()
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output"})
+    check("and so does a person at a terminal, with no role at all",
+          r["ok"] and r["state"] == T.QUEUED)
+
+    # The environment reaches this route back through the CLI. The role of the
+    # task actually running on the thread does not: it is the bot's own record.
+    # Either one saying "restricted" is enough, so neither is load-bearing on
+    # its own -- here the caller claims nothing at all and is still held.
+    ts.create("Nightly review: saga", role="ideator", thread=KEY,
+              state=T.RUNNING, driver="queue")
+    filed_this_turn.clear()
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output"})
+    check("a caller that claims nothing is still read off the running task",
+          r["ok"] and r["state"] == T.PROPOSED,
+          "the thread has a running ideator on it")
+    filed_this_turn.clear()
+    r = file_task({"key": "C1:1785644289.000999",
+                   "goal": "Cache the résumé parser's output"})
+    check("and only on its own thread",
+          r["ok"] and r["state"] == T.QUEUED,
+          "someone else's nightly pass must not hold your filing")
+
+    filed_this_turn.clear()
+    filed = [n for n in range(9)
+             if file_task({"key": KEY, "caller_role": "ideator",
+                           "goal": f"Cache the résumé parser's output {n}"})["ok"]]
+    check("and an unattended run is refused at the sixth",
+          filed == list(range(S.MAX_PROPOSALS)),
+          f"it filed {len(filed)} without ever asking to propose")
+
+    # Naming a project creates its record and its home directory. That ran
+    # above the checks, so a filing the ideator was refused still left one
+    # behind -- a write, on behalf of the one role that may not write.
+    filed_this_turn.clear()
+    projects_made.clear()
+    r = file_task({"key": KEY, "goal": "too short", "project": "invented",
+                   "caller_role": "ideator"})
+    check("a refused filing creates no project",
+          not r["ok"] and projects_made == [],
+          f"made {projects_made} anyway")
+    r = file_task({"key": KEY, "goal": "Cache the résumé parser's output",
+                   "project": "invented", "caller_role": "ideator"})
+    check("and one that goes through still does",
+          r["ok"] and "invented" in projects_made)
+
+    # And the CLI half, driven rather than read: what the bot is told about
+    # the caller has to come from the environment the bot set up for the run,
+    # not from anything on the command line, or it is a flag again.
+    cli_file_task, sent = _cli_file_task_impl()
+    env_was = dict(os.environ)
+    try:
+        os.environ["SILKWORM_THREAD"] = KEY
+        os.environ["SILKWORM_ROLE"] = "ideator"
+        # It prints its confirmation for the model to read; here that would
+        # only interleave with the test output.
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli_file_task(["--project", "saga", "Cache the résumé parser's output"])
+    finally:
+        os.environ.clear(); os.environ.update(env_was)
+    check("the CLI reports the run's own role to the bot",
+          sent and sent[-1][1].get("caller_role") == "ideator",
+          f"sent {sent[-1][1] if sent else None}")
+    try:
+        os.environ["SILKWORM_THREAD"] = KEY
+        os.environ["SILKWORM_ROLE"] = "ideator"
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli_file_task(["--role", "assistant", "Cache the résumé parser's output"])
+    finally:
+        os.environ.clear(); os.environ.update(env_was)
+    check("and the command line cannot talk it down",
+          sent[-1][1].get("caller_role") == "ideator"
+          and sent[-1][1].get("role") == "assistant",
+          "--role names the role of the task being filed, not of the filer")
+
+    check("and the bot is what sets that, per run",
+          'env["SILKWORM_ROLE"] = role or "assistant"' in bot)
+    ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
+    check("a task's run is told the role it is running as",
+          "role=role_name" in ex,
+          "without it every task, ideator included, reports as assistant")
 
     cli = (BASE / "bin" / "silkworm").read_text()
     check("the CLI refuses outside a turn",

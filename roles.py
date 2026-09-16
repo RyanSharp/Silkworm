@@ -129,6 +129,16 @@ def is_fresh(name: str) -> bool:
     return bool(get(name).get("fresh"))
 
 
+def is_restricted(name: str) -> bool:
+    """True if this role runs without autonomy — read-only, on an allowlist.
+
+    Read by the filing path as well as the runner: a role that may not change
+    anything itself must not be able to commission work that changes things
+    for it, so whatever it files waits for a person rather than queueing.
+    """
+    return bool(get(name).get("restricted"))
+
+
 def permission_args(name: str, default_args: list[str], bin: str = "") -> list[str]:
     """Run args for this role. A restricted role never gets full autonomy."""
     role = get(name)

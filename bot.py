@@ -431,7 +431,7 @@ def permission_args() -> list[str]:
     return ["--permission-mode", CLAUDE_PERMISSION_MODE]
 
 
-def claude_env(key: str = "", defers: int = 0) -> dict:
+def claude_env(key: str = "", defers: int = 0, role: str = "") -> dict:
     env = dict(os.environ)
     env["SILKWORM_BOT"] = "1"  # lets the global session_hook ignore our own runs
     # So a turn can schedule a wake-up against its own thread rather than
@@ -440,6 +440,12 @@ def claude_env(key: str = "", defers: int = 0) -> dict:
     if key:
         env["SILKWORM_THREAD"] = key
     env["SILKWORM_DEFERS"] = str(defers or 0)
+    # Which role this run *is*, so the filing path can decide where its work
+    # lands rather than believing what it claims. Set here and nowhere else: a
+    # restricted role's allowlist is prefix-matched against the command as
+    # typed, so it has no way to put an assignment in front of the CLI and
+    # describe itself as something less supervised.
+    env["SILKWORM_ROLE"] = role or "assistant"
     if CLAUDE_APPROVAL_MODE == "slack":
         env["SLACK_BOT_APPROVAL_PORT"] = str(APPROVAL_PORT)
         env["SLACK_BOT_APPROVAL_TIMEOUT"] = str(APPROVAL_TIMEOUT)
@@ -1497,6 +1503,32 @@ def handle_defer(payload: dict) -> dict:
 _filed_this_turn: dict = {}
 
 
+def filed_by_restricted_role(caller_role: str, key: str) -> bool:
+    """Whether the run doing the filing is one that may not write.
+
+    Not "unattended": an implementor runs unattended too, and files onto the
+    queue, because it already has full autonomy directly. The question here is
+    only whether this run is on an allowlist.
+
+    Two independent reads, because either alone is a single point of failure.
+    The role the bot put in the run's own environment is the direct answer,
+    but it reaches this route back through the CLI; the role of whatever task
+    is running on the thread is the bot's own record, which nothing outside
+    the process touches. Either saying "restricted" is enough.
+
+    An unrecognised name counts as restricted too: roles.get() reads a name it
+    does not know as `assistant`, so a typo would otherwise be a way of buying
+    full autonomy. No name at all is a person at a terminal, who files
+    normally — being the person the proposed gate exists to ask.
+    """
+    if caller_role and (caller_role not in roles.ROLES
+                        or roles.is_restricted(caller_role)):
+        return True
+    return any(roles.is_restricted(t.get("role") or "")
+               for t in task_store.by_state(tasks.RUNNING)
+               if t.get("thread") == key)
+
+
 def handle_file_task(payload: dict) -> dict:
     """Route for /file-task — a turn filing work it just scoped with the user.
 
@@ -1509,17 +1541,22 @@ def handle_file_task(payload: dict) -> dict:
     if not re.fullmatch(r"[A-Z0-9]+:[0-9.]+", key):
         return {"ok": False, "error": "no thread to file against"}
 
-    entry = store.get(key) or {}
-    proj = (payload.get("project") or entry.get("project") or "").strip()
-    if proj:
-        proj = project_store.ensure(proj)["slug"]
-        project_store.home(proj, create=True)
-
     # A proposal is not work yet. Nothing ran it past you, so it waits in
     # `proposed` until you accept it -- which is the whole point of a job that
     # thinks about your projects while you are asleep. It also files against
     # the smaller budget, because each one costs you a decision.
-    propose = bool(payload.get("propose"))
+    #
+    # Which of the two it is comes from the role that is filing, not only from
+    # the flag it passed, because a flag is something a caller can leave off.
+    # The ideator's allowlist is `Bash({bin} task:*)` -- a prefix, so it
+    # permits an invocation with no --propose at all, and that filed straight
+    # to `queued` as an implementor for the runner to execute overnight with
+    # full write permissions. Read-only stops the ideator editing the tree; it
+    # does not stop it commissioning an agent that will. Acceptance is a
+    # person, every time, so a restricted role's work waits whatever it asked.
+    restricted = filed_by_restricted_role(
+        (payload.get("caller_role") or "").strip(), key)
+    propose = bool(payload.get("propose")) or restricted
     state = tasks.PROPOSED if propose else tasks.QUEUED
 
     err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose)
@@ -1529,6 +1566,16 @@ def handle_file_task(payload: dict) -> dict:
     role = payload.get("role") or "implementor"
     if role not in roles.ROLES or role in ("reviewer", "ideator"):
         return {"ok": False, "error": f"unknown role {role!r}"}
+
+    # Resolved only once the filing is going to happen. Naming a project
+    # creates its record and its home directory on disk, and doing that above
+    # the checks meant a refused filing still left one behind -- a write, done
+    # on behalf of a role whose whole point is that it cannot write.
+    entry = store.get(key) or {}
+    proj = (payload.get("project") or entry.get("project") or "").strip()
+    if proj:
+        proj = project_store.ensure(proj)["slug"]
+        project_store.home(proj, create=True)
 
     scope = project_store.scope_for(proj) or {"cwd": entry.get("cwd") or str(CLAUDE_CWD)}
     task = task_store.create(
@@ -1540,7 +1587,9 @@ def handle_file_task(payload: dict) -> dict:
         scope=scope,
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
-    log.info("filed task %s from %s (project=%s role=%s)", task["id"], key, proj or "-", role)
+    log.info("filed task %s from %s (project=%s role=%s state=%s%s)",
+             task["id"], key, proj or "-", role, state,
+             " restricted-caller" if restricted else "")
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
             "remaining": scoping.limit_for(propose) - _filed_this_turn[key]}
@@ -2042,7 +2091,7 @@ def execute_task(task: dict) -> None:
                                                         bin=SILKWORM_BIN),
                     model=entry.get("model") or CLAUDE_MODEL,
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
-                    env=claude_env(key, task.get("defers") or 0),
+                    env=claude_env(key, task.get("defers") or 0, role=role_name),
                     timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                     on_init=lambda sid: task_store.update(tid, session_id=sid),
                     on_activity=lambda n, i: progress.update(
