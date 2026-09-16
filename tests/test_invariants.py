@@ -9,11 +9,14 @@ run without Slack, without a bot, and without spending anything.
 
 import ast
 import json
+import logging
 import os
+import re as _re
 import subprocess
 import sys
 import tempfile
 import time
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2638,6 +2641,172 @@ def test_discarding_a_branch_keeps_it():
               "That was wrong" in text and "Nothing but a ref keeps a commit" in text,
               "the reflog line was the instruction someone would have followed")
 
+# --- a passing review must not swallow what it found --------------------------
+# Every ok=true verdict on the board carried findings, and three of them were
+# real defects. Routing on `ok` alone wrote them to a completed task, which is
+# the one place nobody looks.
+
+def test_review_followups():
+    import roles
+    import scoping
+    from tasks import TaskStore
+    import tasks as T
+    print("\nreview followups")
+
+    def verdict(**kw):
+        return roles.parse_verdict("```json\n" + json.dumps(kw) + "\n```")
+
+    v = verdict(ok=True, summary="fine", findings=["commits_ahead fails toward deletion"])
+    check("a passing verdict's findings are not discarded",
+          v["followups"] == ["commits_ahead fails toward deletion"],
+          "this is the bug: ok=true plus findings used to go nowhere")
+    check("and they do not become blocking", v["ok"] and v["findings"] == [])
+
+    v = verdict(ok=False, summary="no", findings=["broken"], followups=["later"])
+    check("a flagged verdict keeps its findings where they block",
+          not v["ok"] and v["findings"] == ["broken"] and v["followups"] == ["later"])
+
+    v = verdict(ok=True, summary="fine", findings=["a"], followups=["b"])
+    check("promoted findings join the declared followups",
+          v["followups"] == ["b", "a"])
+
+    v = verdict(ok=True, summary="fine", unverified=["could not run the suite"])
+    check("what the review could not check is not filed as work",
+          v["unverified"] == ["could not run the suite"] and not v["followups"],
+          "otherwise every completed task files a proposal and the board never empties")
+
+    v = verdict(ok=True, summary="fine", findings="a single string")
+    check("a string where a list belongs still survives",
+          v["followups"] == ["a single string"])
+    check("blank entries are dropped",
+          verdict(ok=True, summary="s", followups=["", "  ", "real"])["followups"] == ["real"])
+    check("a flood is bounded",
+          len(verdict(ok=True, summary="s", followups=[f"f{i}" for i in range(50)])
+              ["followups"]) == roles.MAX_ITEMS)
+    for key in ("findings", "followups", "unverified"):
+        check(f"an unreadable verdict still has {key}",
+              roles.parse_verdict("nothing here")[key] == [])
+
+    check("the reviewer is told where each list goes",
+          all(k in roles.REVIEWER_SYSTEM for k in
+              ("findings:", "followups:", "unverified:")))
+    check("and told that passing with findings will not bury them",
+          "discarded" in roles.REVIEWER_SYSTEM)
+
+    # --- filing ---------------------------------------------------------------
+    store = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    src = ast.parse((BASE / "bot.py").read_text())
+    fn = next(n for n in src.body if isinstance(n, ast.FunctionDef)
+              and n.name == "file_followups")
+    ns = {"task_store": store, "scoping": scoping, "tasks": T, "log": logging.getLogger("t"),
+          "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<x>", "exec"), ns)
+    file_followups = ns["file_followups"]
+
+    parent = store.create("do the thing", title="Do the thing", project="silkworm",
+                          scope={"cwd": "/repo", "worktree": "/tmp/wt-gone"})
+    ids = file_followups(parent, ["rev-list failure reads as zero commits ahead"])
+    check("a followup becomes a real task", len(ids) == 1)
+    child = store.get(ids[0])
+    check("it waits for a decision rather than running", child["state"] == T.PROPOSED,
+          "queued would run unreviewed work; done would hide it again")
+    check("which is a state the board surfaces", T.PROPOSED in T.NEEDS_ATTENTION)
+    check("it says where it came from",
+          child["source"] == "review" and child["source_ref"] == parent["id"])
+    check("it inherits the project so it is not unfiled",
+          child["project"] == "silkworm")
+    check("it does not inherit the released worktree",
+          "worktree" not in (child["scope"] or {}),
+          "that path is gone the moment the implementor's turn ends")
+    check("the finding itself is in the goal",
+          "rev-list failure reads as zero" in child["goal"])
+    check("and the rerun is told to confirm it is still true",
+          "still true" in child["goal"])
+    check("the title is readable in a list, not the whole finding",
+          child["title"].startswith("From review: ") and len(child["title"]) <= 70)
+
+    many = file_followups(parent, [f"finding number {i}" for i in range(20)])
+    check("filing is capped like any other unattended pass",
+          len(many) == scoping.limit_for(propose=True))
+    check("a followup that cannot be made into a valid goal is skipped, not filed",
+          file_followups(parent, ["x" * (scoping.MAX_GOAL_CHARS + 1)]) == [],
+          "better a lost note in the log than an unrunnable task on the board")
+
+    # --- routing --------------------------------------------------------------
+    bot = (BASE / "bot.py").read_text()
+    gate = bot[bot.index("def resolve_review("):bot.index("def land_if_ready(")]
+    check("followups are filed from the review gate", "file_followups(parent" in gate)
+    check("only once the verdict passes", 'verdict["ok"] and verdict["followups"]' in gate,
+          "a flagged task already puts the whole verdict in front of the user")
+    check("filing cannot cost the verdict", "log.exception(\"filing review followups"
+          in gate)
+    check("what was filed is recorded on the task", '"filed": filed' in gate)
+    check("and said in the thread", "accept or dismiss" in gate)
+
+    js = _re.search(r"<script>(.*?)</script>", (BASE / "visualizer.py").read_text(),
+                    _re.S).group(1)
+    rv = js[js.index("function review(t)"):js.index("function taskButtons(")]
+    for key in ("findings", "followups", "unverified", "filed"):
+        check(f"the dashboard shows the verdict's {key}", f"rv.{key}" in rv)
+
+    # --- the gate itself, driven rather than read -----------------------------
+    # The reported failure was end to end: a verdict came back ok with findings
+    # and the task went to done with nothing anywhere. Run that exact input.
+    gate_fn = next(n for n in src.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "resolve_review")
+    posted = []
+    gns = dict(ns)
+    gns.update({
+        "roles": roles, "task_store": store,
+        "app": types.SimpleNamespace(client=types.SimpleNamespace(
+            chat_postMessage=lambda **kw: posted.append(kw["text"]))),
+        "land_if_ready": lambda t, c, th: "",
+        "task_state": lambda tid, st, why="": store.transition(tid, st, why),
+    })
+    exec(compile(ast.Module(body=[gate_fn], type_ignores=[]), "<x>", "exec"), gns)
+    resolve = gns["resolve_review"]
+
+    work = store.create("do it", title="Do it", project="silkworm", role="implementor",
+                        scope={"cwd": "/repo"}, blocked_on=["rev1"])
+    store.transition(work["id"], T.BLOCKED, "awaiting review")
+    reviewer = store.create("review it", role="reviewer", parent=work["id"])
+    resolve(store.get(reviewer["id"]), "reviewer",
+            '```json\n{"ok": true, "summary": "fine", '
+            '"findings": ["the guard fails toward deletion when rev-list errors"], '
+            '"unverified": ["could not run the suite"]}\n```', "C1", "1.0")
+
+    done = store.get(work["id"])
+    check("a pass still completes the task silently", done["state"] == T.DONE)
+    review_rec = (done.get("result") or {}).get("review") or {}
+    check("its finding was filed, not written to a finished task",
+          len(review_rec.get("filed") or []) == 1,
+          "this is the end-to-end case that lost three real defects")
+    filed_task = store.get(((review_rec.get("filed") or [""]) + [""])[0]) or {}
+    check("and the filed task carries the finding",
+          "fails toward deletion" in filed_task.get("goal", ""))
+    check("and waits in a state the board surfaces",
+          filed_task.get("state") == T.PROPOSED)
+    check("what the review could not run was not filed as work anywhere",
+          all("could not run the suite" not in t.get("goal", "")
+              for t in gns["task_store"]._data.values()),
+          "otherwise every completed task files a proposal and the board never empties")
+    check("the thread was told", any("accept or dismiss" in m for m in posted))
+
+    before = len(gns["task_store"]._data)
+    flagged = store.create("do it too", title="Do it too", role="implementor",
+                           scope={"cwd": "/repo"}, blocked_on=["rev2"])
+    store.transition(flagged["id"], T.BLOCKED, "awaiting review")
+    rev2 = store.create("review it", role="reviewer", parent=flagged["id"])
+    resolve(store.get(rev2["id"]), "reviewer",
+            '```json\n{"ok": false, "summary": "no", "findings": ["it is wrong"], '
+            '"followups": ["and this too"]}\n```', "C1", "1.0")
+    check("a flagged task still asks the user",
+          store.get(flagged["id"])["state"] == T.AWAITING_APPROVAL)
+    check("and nothing is filed behind its back",
+          len(gns["task_store"]._data) == before + 2,
+          "the whole verdict is already in front of them")
+
+
 
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
@@ -2645,7 +2814,7 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_email_ingest, test_modules_are_imported,
+              test_review_gate, test_review_followups, test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_parallel_tasks,
               test_worktrees,
               test_credentials_check,

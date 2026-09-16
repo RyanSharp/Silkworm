@@ -184,7 +184,8 @@ graph to maintain.
    implementor cannot complete on its own say-so — its result goes to a
    reviewer with a fresh session and read-only tools, and the task waits in
    `blocked`. A passing verdict completes it silently; a flagged one lands in
-   `awaiting_approval` with the findings. An unreadable verdict fails closed.)*
+   `awaiting_approval` with the findings; anything the reviewer found that does
+   not block is filed as a proposal. An unreadable verdict fails closed.)*
 5. Ingestion adapters, worktree isolation, per-role tool scoping.
    *(email: built. Gmail over IMAP with an app password — the API needs a
    Cloud project and a browser consent flow, awkward on a headless host.
@@ -534,6 +535,43 @@ stamp `updated`, or a thread you put away would look freshly used.
 
 This sits alongside the kind filter rather than replacing it: filtering answers
 "show me only conversations", hiding answers "I am finished with this one".
+
+## What a review found but did not block on
+
+The gate routed on the verdict's `ok` flag alone: pass completes the task,
+fail asks the user. Everything the reviewer said on a passing verdict was
+written to the task record and never read again — and on the board, *every*
+passing verdict had findings. Three were real defects nobody has seen: a
+never-force-delete guard that fails toward deletion when `rev-list` errors, a
+store that overwrites a file it documents as left in place, an ideator path
+that escapes the proposal cap entirely.
+
+The obvious fix is wrong. Route every finding on a passing verdict to
+`awaiting_approval` and the board stops reaching empty within the week, because
+the most common finding by far is the reviewer noting it could not run the test
+suite. That is not a defect; it is a fact about the role. A view that is always
+full is a view nobody reads, and then the flagged work is lost too.
+
+So the verdict says what it wants done, and each answer has its own
+destination:
+
+| list | means | goes to |
+|---|---|---|
+| `findings` | wrong with *this* work | `ok=false` → `awaiting_approval` |
+| `followups` | real, but not this task's fault | filed as `proposed`, one each |
+| `unverified` | what the review could not check | recorded; never routed |
+
+`proposed` is the existing answer to "worth a decision, not worth interrupting
+for". It reaches the same view, it is capped like any other unattended pass,
+and a dismiss is one click — so a followup costs the same as an ideation
+proposal, which is the price already agreed for a machine noticing something.
+
+**A pass that still lists findings is a contradiction, and it is resolved by
+believing the findings.** They are promoted to followups rather than dropped,
+which is exactly the case that lost the three defects above, and which no
+prompt change alone would have fixed: the parser cannot assume a reviewer read
+its instructions. Filing is wrapped so that a failure there costs a log line,
+never the verdict.
 
 ## Verifying work, as distinct from reviewing it
 

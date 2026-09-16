@@ -38,11 +38,26 @@ REVIEWER_SYSTEM = (
     "missing, or unsafe? Ignore style preferences.\n\n"
     "Finish your reply with a fenced json block, and nothing after it:\n"
     "```json\n"
-    '{"ok": true|false, "summary": "one line", '
-    '"findings": ["specific problem", "..."]}\n'
+    '{"ok": true|false, "summary": "one line", "findings": ["..."], '
+    '"followups": ["..."], "unverified": ["..."]}\n'
     "```\n"
-    "ok=false only for something you would want a person to look at. An empty "
-    "findings list with ok=true means it is genuinely fine."
+    "The three lists go to three different places, so put each thing in the "
+    "one that matches what you want done about it:\n"
+    "- findings: something wrong with *this* work that a person must see "
+    "before it is called done. Anything here means ok=false, and it stops the "
+    "task and asks them.\n"
+    "- followups: something real you found that this task is not to blame for "
+    "and that should not block it -- a pre-existing gap, a defect outside the "
+    "goal, a fragility worth fixing later. Each one is filed as its own "
+    "proposal for the user to accept or dismiss, so write it as work someone "
+    "could pick up, and only raise the ones worth a decision.\n"
+    "- unverified: what you could not check yourself, such as a test suite "
+    "this role cannot run. Recorded against the task, never acted on. This is "
+    "not a finding and it is not a followup.\n\n"
+    "ok=true with an empty findings list means it is genuinely fine. Do not "
+    "pass the work and list a real defect in findings anyway: that is a "
+    "contradiction, and it is resolved by believing the defect -- it is "
+    "treated as a followup rather than discarded."
 )
 
 IDEATOR_SYSTEM = (
@@ -138,12 +153,38 @@ def review_goal(task: dict, result_text: str) -> str:
     )
 
 
+#: Per list, per verdict. A reviewer that returns thirty of anything has
+#: stopped reviewing and started transcribing.
+MAX_ITEMS = 20
+
+
+def _items(raw) -> list[str]:
+    """Normalise one of the verdict's lists: strings, trimmed, bounded."""
+    if isinstance(raw, str):             # a single string where a list belongs
+        raw = [raw]
+    out = []
+    for item in raw or []:
+        text = str(item).strip()[:300]
+        if text:
+            out.append(text)
+    return out[:MAX_ITEMS]
+
+
 def parse_verdict(text: str) -> dict:
     """Pull the verdict out of a reviewer's reply.
 
-    Fails closed: if no verdict can be read, the work is treated as needing a
-    person, never as approved. A reviewer that rambles must not silently pass
-    something through.
+    Fails closed twice over.
+
+    If no verdict can be read, the work is treated as needing a person, never
+    as approved: a reviewer that rambles must not silently pass something
+    through.
+
+    And if a verdict passes the work while still listing findings, those
+    findings are promoted to `followups` rather than believed away. Routing on
+    `ok` alone sent every finding on a passing verdict to a completed task
+    nobody opens again -- which is how three real defects sat unread. A pass
+    that still lists problems is a contradiction, and the problems are the half
+    of it worth keeping. They do not block the task; they get filed.
     """
     blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text or "", re.S)
     if not blocks:                       # tolerate a bare object
@@ -155,12 +196,21 @@ def parse_verdict(text: str) -> dict:
         except json.JSONDecodeError:
             continue
         if isinstance(v, dict) and "ok" in v:
+            ok = bool(v.get("ok"))
+            findings, followups = _items(v.get("findings")), _items(v.get("followups"))
+            if ok and findings:
+                log.info("verdict passed with %d finding(s); filing them as "
+                         "followups rather than dropping them", len(findings))
+                followups = (followups + findings)[:MAX_ITEMS]
+                findings = []
             return {
-                "ok": bool(v.get("ok")),
+                "ok": ok,
                 "summary": str(v.get("summary", ""))[:300],
-                "findings": [str(f)[:300] for f in (v.get("findings") or [])][:20],
+                "findings": findings,
+                "followups": followups,
+                "unverified": _items(v.get("unverified")),
                 "parsed": True,
             }
     log.warning("no verdict found in reviewer output; treating as needing review")
     return {"ok": False, "summary": "reviewer returned no readable verdict",
-            "findings": [], "parsed": False}
+            "findings": [], "followups": [], "unverified": [], "parsed": False}

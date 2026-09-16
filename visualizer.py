@@ -699,7 +699,13 @@ PAGE = r"""<!doctype html>
   .task .rev { margin-top: 6px; font-size: 11.5px; line-height: 1.45; color: var(--ink);
                background: #D8517F14; border-left: 2px solid #D8517F;
                border-radius: 0 5px 5px 0; padding: 6px 9px; }
+  /* A passed review is not a warning, so it does not wear the flagged colour --
+     but it still shows, because it can carry what the reviewer found anyway. */
+  .task .rev.ok { background: #2EB67D14; border-left-color: #2EB67D; }
   .task .rev ul { margin: 4px 0 0; padding-left: 16px; }
+  .task .rev .lbl { display: block; margin-top: 5px; color: var(--muted);
+                    font-size: 11px; }
+  .task .rev .filed { font-family: var(--mono); color: var(--muted); font-size: 11px; }
   #tproj { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
            border-radius: 8px; font: inherit; font-size: 12px; padding: 3px 8px; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
@@ -1316,11 +1322,23 @@ async function taskAction(id, action, notes) {
 }
 function review(t) {
   // Show why it is waiting, so approving is an informed click rather than a leap.
+  // A passed review is shown too: its findings used to be written to a done
+  // task and never read again, which is the whole reason followups exist.
   const rv = (t.result || {}).review;
   if (!rv) return "";
-  const items = (rv.findings || []).map(f => `<li>${esc(f)}</li>`).join("");
-  return `<div class="rev"><b>${rv.ok ? "Review passed" : "Review flagged"}</b>
-    ${esc(rv.summary || "")}${items ? `<ul>${items}</ul>` : ""}</div>`;
+  const list = (xs, label) => (xs || []).length
+    ? `${label ? `<span class="lbl">${label}</span>` : ""}`
+      + `<ul>${xs.map(f => `<li>${esc(f)}</li>`).join("")}</ul>`
+    : "";
+  const filed = (rv.filed || []).length
+    ? `<div class="filed">filed as ${(rv.filed || []).map(esc).join("  ")}</div>` : "";
+  const unver = (rv.unverified || []).length
+    ? `<span class="lbl">not checked by the review: ${
+        esc((rv.unverified || []).join("; "))}</span>` : "";
+  return `<div class="rev ${rv.ok ? "ok" : ""}">
+    <b>${rv.ok ? "Review passed" : "Review flagged"}</b> ${esc(rv.summary || "")}
+    ${list(rv.findings, "")}${list(rv.followups, "found alongside it:")}${filed}${unver}
+  </div>`;
 }
 function taskButtons(t) {
   const b = [];

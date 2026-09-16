@@ -2154,6 +2154,53 @@ def send_back_for_tests(task: dict, result: dict, channel: str, thread_ts: str) 
     return True
 
 
+def file_followups(task: dict, followups: list[str]) -> list[str]:
+    """File a passing review's non-blocking findings as proposals.
+
+    A review that passes the work completes it silently, and that rule is what
+    lets the board reach empty: the most common thing a reviewer says is that
+    it could not run the test suite, and stopping to ask about each of those
+    would make "what needs me?" permanently full and therefore ignored.
+
+    But silence must not also be how a real bug is lost. A reviewer that
+    noticed something on the way past had nowhere to put it: on a completed
+    task the finding is never read again. `proposed` is already the answer to
+    "worth a decision, not worth interrupting for" -- it reaches the same view,
+    and a dismiss is one click. So each followup becomes one.
+
+    Capped like any other unattended pass. A review that finds ten things has
+    not prioritised either, and every proposal costs a decision.
+    """
+    proj = task.get("project") or ""
+    # Not the parent's scope verbatim: it carries the worktree that turn ran
+    # in, which was released when the turn ended.
+    scope = project_store.scope_for(proj) or {
+        k: v for k, v in (task.get("scope") or {}).items() if k != "worktree"}
+    filed = []
+    for finding in followups[:scoping.limit_for(propose=True)]:
+        goal = (f"A review of {task['id']} ({task.get('title') or 'untitled'}) "
+                f"found this alongside that task, rather than in it:\n\n"
+                f"{finding}\n\n"
+                "Check it is still true before changing anything -- the review "
+                "read the tree as it was then, and main has moved since. If it "
+                "is not, say so and stop.")
+        err = scoping.validate(goal, propose=True)
+        if err:
+            log.warning("not filing a review followup on %s: %s", task["id"], err)
+            continue
+        try:
+            child = task_store.create(
+                goal, title=f"From review: {finding[:52]}", role="implementor",
+                project=proj, state=tasks.PROPOSED, driver="queue",
+                source="review", source_ref=task["id"],
+                root=task.get("root") or task["id"], scope=scope)
+        except ValueError:
+            log.exception("could not file a review followup on %s", task["id"])
+            continue
+        filed.append(child["id"])
+    return filed
+
+
 def resolve_review(task: dict, role_name: str, text: str,
                    channel: str, thread_ts: str) -> bool:
     """Apply the review gate. Returns True if the task's fate is already settled.
@@ -2163,6 +2210,13 @@ def resolve_review(task: dict, role_name: str, text: str,
     then either completes it silently or puts it in front of the user with
     specific findings — which is the whole point, spending tokens so that only
     flagged work costs attention.
+
+    That leaves a third thing a reviewer says, and it used to have nowhere to
+    go: a real problem that is not this task's fault. Routing on `ok` alone
+    meant it was written to a completed task and never read. It now gets its
+    own destination — `findings` stop the task, `followups` are filed as
+    proposals, and `unverified` is recorded and nothing else — so no finding
+    depends on the user opening a task that is already done.
     """
     tid = task["id"]
     if roles.needs_review(role_name) and not task.get("blocked_on"):
@@ -2182,15 +2236,36 @@ def resolve_review(task: dict, role_name: str, text: str,
     if role_name != "reviewer" or not parent_id:
         return False
     verdict = roles.parse_verdict(text)
+    parent = task_store.get(parent_id)
+
+    # A passing verdict completes the task silently. What it must not do is
+    # swallow whatever the reviewer found that it did not consider blocking:
+    # those go out as proposals, so they reach the same view by the route
+    # built for things worth a decision but not an interruption.
+    filed: list[str] = []
+    if parent and verdict["ok"] and verdict["followups"]:
+        try:
+            filed = file_followups(parent, verdict["followups"])
+        except Exception:
+            log.exception("filing review followups for %s failed", parent_id)
+    verdict = {**verdict, "filed": filed}
+
     note = (":white_check_mark: *Review passed* — " if verdict["ok"]
             else ":mag: *Review flagged this* — ") + (verdict["summary"] or "")
     if verdict["findings"]:
         note += "\n" + "\n".join(f"• {f}" for f in verdict["findings"])
+    if verdict["followups"]:
+        note += ("\n_Filed for you to accept or dismiss:_" if filed
+                 else "\n_Also noted, alongside the task:_")
+        note += "\n" + "\n".join(f"• {f}" for f in verdict["followups"])
+        if filed:
+            note += "\n" + "  ".join(f"`{i}`" for i in filed)
+    if verdict["unverified"]:
+        note += "\n_The review could not check:_ " + "; ".join(verdict["unverified"])
     try:
         app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=note)
     except Exception:
         log.exception("posting the review verdict failed")
-    parent = task_store.get(parent_id)
     if parent:
         task_store.update(parent_id, result={**(parent.get("result") or {}),
                                              "review": verdict})
