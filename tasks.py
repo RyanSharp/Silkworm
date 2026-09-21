@@ -95,6 +95,12 @@ FIELDS: dict[str, tuple] = {
     # "queue" means nobody is driving it and the runner may claim it. Defaults
     # to inline so a task never starts executing merely by existing.
     "driver":      ("inline", "inline | queue — who executes this"),
+    # Whether this work belongs in its own checkout. Decided when the record is
+    # made, and deliberately *not* derived from `driver`: a restart hands an
+    # orphaned conversational turn to the runner (close_out_orphans), and if
+    # isolation followed the driver, "fix what I'm working on" would come back
+    # in a worktree where your uncommitted edits do not exist.
+    "isolate":     (False, "run in its own checkout, away from your working tree"),
     "v":           (0,     "schema version of this record"),
     "title":       ("",    "short human label"),
     "goal":        ("",    "what the task should achieve; the prompt"),
@@ -172,6 +178,22 @@ def make(goal: str, **fields) -> dict:
     return task
 
 
+#: Sources whose work is a conversation with you, or a continuation of one.
+#: These run where you are working, never in a checkout of their own.
+CONVERSATIONAL = ("slack", "defer")
+
+
+def isolated(rec: dict) -> bool:
+    """Whether this task runs in its own checkout rather than yours.
+
+    Ask the record, never the driver. Who executes a task changes -- a Slack
+    turn orphaned by a restart is handed to the queue runner so its message is
+    not lost -- but what kind of work it is does not, and only that decides
+    where it may run.
+    """
+    return bool(rec.get("isolate"))
+
+
 def can(from_state: str, to_state: str) -> bool:
     return to_state in TRANSITIONS.get(from_state, ())
 
@@ -187,6 +209,18 @@ class TaskStore:
         self._data: dict[str, dict] = {}
         if path.exists():
             for tid, rec in json.loads(path.read_text()).items():
+                # Isolation used to be inferred from `driver`. Records written
+                # before it became a field of its own keep the answer that rule
+                # gave them -- read here, at load, before restart recovery
+                # rewrites any driver it would have been inferred from.
+                #
+                # Except where that rule was the bug: a conversation, or a
+                # conversation's scheduled wake-up, already handed to the
+                # runner by an earlier restart reads as driver="queue" and
+                # must not inherit an isolation it was never meant to have.
+                # `source` says what the work is, and nothing rewrites it.
+                rec.setdefault("isolate", rec.get("driver") == "queue"
+                               and rec.get("source") not in CONVERSATIONAL)
                 # Fill in anything a newer field list added, without clobbering.
                 for name in FIELDS:
                     rec.setdefault(name, default(name))

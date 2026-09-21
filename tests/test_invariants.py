@@ -1486,6 +1486,267 @@ def test_scoping():
           or "--project" in r.stdout)
 
 
+def _bot_func(name, **namespace):
+    """One function out of bot.py, loaded without importing it.
+
+    bot.py wants Slack tokens at import time, so the function is compiled on
+    its own into a namespace the caller supplies. Every free name it reads and
+    the caller did not supply becomes a MagicMock, so a big function can be
+    driven by handing it only the few things the behaviour under test turns
+    on -- and so a name the function stops using is not silently still stubbed.
+    """
+    import builtins
+    from unittest.mock import MagicMock
+    tree = ast.parse((BASE / "bot.py").read_text())
+    node = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+    bound = {a.arg for a in node.args.args}
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            bound.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bound.add(n.name)
+            bound.update(a.arg for a in n.args.args)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+    free = {n.id for n in ast.walk(node)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    mod = types.ModuleType(f"bot_{name}")
+    for free_name in free - bound - set(dir(builtins)):
+        mod.__dict__[free_name] = MagicMock(name=free_name)
+    mod.__dict__.update(namespace)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{name}>", "exec"),
+         mod.__dict__)
+    return mod.__dict__[name]
+
+
+def _close_out_orphans_impl(sess, task_store, task_state):
+    """close_out_orphans, loaded from bot.py without importing it."""
+    import logging
+    import tasks as T
+    return _bot_func("close_out_orphans", store=sess, task_store=task_store,
+                     tasks=T, task_state=task_state, log=logging.getLogger("test"))
+
+
+# --- a restart must not move a conversation into a worktree ----------------------
+# Two rules met badly. close_out_orphans sets driver="queue" on a Slack message
+# that was still queued when the process died, so the runner picks it up rather
+# than the message being lost. Isolation was then read off that same flag, so
+# "fix what I'm working on" came back in a fresh worktree off the base branch --
+# without the user's uncommitted edits -- and committed to silkworm/<task-id>.
+
+def test_isolation_is_not_a_scheduling_decision():
+    from tasks import TaskStore
+    import tasks as T
+    print("\na restart must not move a conversation into a worktree")
+
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    sess = tmp_store()
+    def task_state(tid, state, detail=""):
+        st.transition(tid, state, detail)
+
+    conv = st.create("fix what I'm working on", driver="inline", source="slack",
+                     thread="C1:1.0", source_ref="1.0", isolate=False,
+                     scope={"cwd": "/repo/yours"})["id"]
+    filed = st.create("add the missing test", driver="queue", source="ui",
+                      isolate=True, scope={"cwd": "/repo/yours"})["id"]
+    check("a conversation is not isolated", not T.isolated(st.get(conv)),
+          "a worktree cannot see the edits it is being asked about")
+    check("filed work is", T.isolated(st.get(filed)))
+
+    _close_out_orphans_impl(sess, st, task_state)()
+
+    rec = st.get(conv)
+    check("a message orphaned by a restart is still handed to the runner",
+          rec["driver"] == "queue", "otherwise the message is simply lost")
+    check("but it still runs in your checkout, not a worktree",
+          not T.isolated(rec),
+          "who runs it changed; what kind of work it is did not")
+    check("and its directory is untouched", rec["scope"]["cwd"] == "/repo/yours")
+    check("filed work is unaffected by the closeout", T.isolated(st.get(filed)))
+
+    # Records written before `isolate` existed keep the answer the old rule
+    # gave them -- read at load, before the closeout rewrites the driver they
+    # would have been inferred from.
+    old = Path(tempfile.mkdtemp()) / "legacy.json"
+    old.write_text(json.dumps({
+        "tsk_oldconv": {"id": "tsk_oldconv", "goal": "g", "state": "queued",
+                        "driver": "inline", "source": "slack", "thread": "C1:2.0",
+                        "source_ref": "2.0", "scope": {"cwd": "/repo/yours"}},
+        "tsk_oldfiled": {"id": "tsk_oldfiled", "goal": "g", "state": "queued",
+                         "driver": "queue", "source": "ui",
+                         "scope": {"cwd": "/repo/yours"}},
+        # One an earlier restart had already flipped: the driver no longer
+        # says what this is, and reading it is the bug being fixed.
+        "tsk_rescued": {"id": "tsk_rescued", "goal": "g", "state": "queued",
+                        "driver": "queue", "source": "slack", "thread": "C1:4.0",
+                        "scope": {"cwd": "/repo/yours"}},
+        "tsk_wakeup": {"id": "tsk_wakeup", "goal": "g", "state": "blocked",
+                       "driver": "queue", "source": "defer", "thread": "C1:5.0",
+                       "scope": {"cwd": "/repo/yours"}},
+    }))
+    legacy = TaskStore(old)
+    check("an existing filed task keeps its checkout",
+          T.isolated(legacy.get("tsk_oldfiled")))
+    check("a conversation a previous restart already rescued does not gain one",
+          not T.isolated(legacy.get("tsk_rescued")),
+          "its driver was rewritten before the field existed; its source was not")
+    check("nor does a scheduled wake-up", not T.isolated(legacy.get("tsk_wakeup")),
+          "it resumes the thread's own session, in the thread's own checkout")
+    _close_out_orphans_impl(tmp_store(), legacy, lambda *a, **k: None)()
+    check("an existing conversation does not gain one at upgrade",
+          legacy.get("tsk_oldconv")["driver"] == "queue"
+          and not T.isolated(legacy.get("tsk_oldconv")),
+          "the migration must read the driver before the closeout rewrites it")
+
+    # Parking a task for a transient failure rewrites the driver for the same
+    # reason the closeout does -- whoever was driving it is gone by the time it
+    # retries -- so it must not move the work either.
+    import retry as R, logging
+    parked = st.create("quota ran out mid-answer", driver="inline", source="slack",
+                       thread="C1:3.0", source_ref="3.0", isolate=False,
+                       state=T.RUNNING, scope={"cwd": "/repo/yours"})["id"]
+    _bot_func("fail_or_retry", task_store=st, retry=R, tasks=T,
+              log=logging.getLogger("test"),
+              task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+              )(parked, "Claude usage limit reached")
+    check("a conversation parked for a retry is handed to the runner too",
+          st.get(parked)["driver"] == "queue")
+    check("and it is still not isolated when it comes back",
+          not T.isolated(st.get(parked)),
+          "the same rewrite, the same conversation, the same working tree")
+
+    # And now the thing itself: run the rescued turn and see where it lands.
+    ran = _run_a_task(conv_record=st.get(conv))
+    check("a rescued conversation runs in the thread's own directory",
+          ran["cwd"] == ran["repo"],
+          f"ran in {ran['cwd']}, which is not where your uncommitted edits are")
+    check("it makes no checkout of its own", ran["worktrees"] == [],
+          "a worktree off the base branch holds none of your work")
+    check("and no throwaway branch to commit onto", ran["branches"] == [],
+          "commits would have landed on silkworm/<a task you never filed>")
+    check("nothing records one against it", "worktree" not in ran["scope"])
+    check("the thread's home is still yours", ran["home"] == ran["repo"])
+
+    # Not vacuous: the same harness, on work that did ask for a checkout.
+    filed_run = _run_a_task(conv_record=None)
+    check("filed work in the same repo does get its own checkout",
+          filed_run["cwd"] != filed_run["repo"] and filed_run["worktrees"],
+          "if nothing is ever isolated here, the check above proves nothing")
+    check("on a branch of its own", filed_run["branches"] != [])
+    check("and the thread's home is still not the checkout it used",
+          filed_run["home"] == filed_run["repo"],
+          "a released worktree left as a thread's cwd breaks it permanently")
+
+    # The decision is on the record. Asserted on the syntax rather than the
+    # text, so `driver` reappearing in an unrelated line nearby cannot pass.
+    ex = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "execute_task")
+    def makes_a_worktree(node):
+        return any(isinstance(c, ast.Attribute) and c.attr == "create"
+                   and getattr(c.value, "id", "") == "worktrees"
+                   for c in ast.walk(node))
+    branch = next(n for n in ast.walk(ex)
+                  if isinstance(n, ast.If) and makes_a_worktree(n))
+    check("isolation is read from the record, not from who is driving",
+          "attr='isolated'" in ast.dump(branch.test)
+          and "'driver'" not in ast.dump(branch.test),
+          "driver is a scheduling flag; a restart rewrites it")
+
+    # Every way a task comes into being answers it, rather than falling
+    # through to the default. The default has to be *something*, and whichever
+    # way it points it is right for half the callers by accident -- which is
+    # how one flag came to answer two questions in the first place.
+    for mod in ("bot.py", "email_ingest.py"):
+        for made in (c for c in ast.walk(ast.parse((BASE / mod).read_text()))
+                     if isinstance(c, ast.Call)
+                     and getattr(c.func, "attr", "") == "create"
+                     and getattr(c.func.value, "id", "") == "task_store"):
+            check(f"{mod}:{made.lineno} says where its task may run",
+                  any(k.arg == "isolate" for k in made.keywords),
+                  "a new way of filing work must not inherit the answer")
+
+    prompt = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "handle_prompt")
+    made = next(c for c in ast.walk(prompt) if isinstance(c, ast.Call)
+                and getattr(c.func, "attr", "") == "create"
+                and getattr(c.func.value, "id", "") == "task_store")
+    says = {k.arg: getattr(k.value, "value", None) for k in made.keywords}
+    check("a conversation records the decision when it is created",
+          says.get("isolate") is False,
+          "left to the default it would be right by luck, not by decision")
+
+
+def _run_a_task(conv_record):
+    """Drive execute_task over a real repo. Returns where the turn happened.
+
+    `conv_record` is the rescued conversation to run; None runs a filed task
+    instead, so the same harness shows both answers and neither check can pass
+    by the harness simply never isolating anything.
+    """
+    import shutil, threading, logging
+    import tasks as T, roles, worktrees as W
+    from tasks import TaskStore
+
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "wts"
+    repo = root / "repo"; repo.mkdir()
+    def git(*a): return subprocess.run(["git", *a], cwd=str(repo),
+                                       capture_output=True, text=True)
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (repo / "mine.txt").write_text("what I am working on\n")
+    git("add", "-A"); git("commit", "-qm", "base")
+
+    st = TaskStore(root / "t.json")
+    if conv_record:
+        # The record exactly as the closeout left it, pointed at this repo.
+        rec = st.create(conv_record["goal"], thread="C1:1.0",
+                        **{f: conv_record[f] for f in
+                           ("driver", "source", "source_ref", "isolate")},
+                        scope={"cwd": str(repo)})
+    else:
+        rec = st.create("add the missing test", driver="queue", source="ui",
+                        isolate=True, thread="C1:1.0",
+                        scope={"cwd": str(repo)})
+    st.transition(rec["id"], T.RUNNING, "claimed by the runner")
+    task = st.get(rec["id"])
+
+    sess = tmp_store()
+    seen = {}
+    def run_turn(goal, **kw):
+        # Snapshot while the turn is happening: execute_task releases its
+        # checkout before it returns, so looking afterwards finds nothing
+        # either way and would pass whatever the answer had been.
+        seen["cwd"] = Path(kw["cwd"])
+        seen["worktrees"] = sorted(d.name for d in W.ROOT.iterdir()) \
+            if W.ROOT.exists() else []
+        seen["branches"] = [b for b in git("branch", "--format=%(refname:short)")
+                            .stdout.split() if b != "main"]
+        return types.SimpleNamespace(text="done", cost_usd=0.0, duration_ms=1,
+                                     session_id="sess")
+    execute_task = _bot_func(
+        "execute_task", tasks=T, task_store=st, store=sess, roles=roles,
+        worktrees=W, Path=Path, run_turn=run_turn, shutil=shutil,
+        OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+        permission_args=lambda: [], log=logging.getLogger("test"),
+        task_thread=lambda t: ("C1", "1.0"),
+        task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+        _thread_lock=lambda key: threading.Lock(),
+        repo_guard=lambda *a, **k: contextlib.nullcontext(),
+        render_block=lambda _: "", chunk=lambda text: [text],
+        to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+        upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+        ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+    )
+    execute_task(task)
+
+    return {"cwd": seen.get("cwd"), "repo": repo,
+            "worktrees": seen.get("worktrees"), "branches": seen.get("branches"),
+            "scope": (st.get(rec["id"]) or {}).get("scope") or {},
+            "home": Path((sess.get("C1:1.0") or {}).get("cwd", ""))}
+
+
 # --- a queued task must not work in your checkout --------------------------------
 # Turns sharing a repo were serialised, which was right but blunt: a queued task
 # also ran in the tree you edit, so it could leave it dirty or on another
@@ -1586,8 +1847,8 @@ def test_worktrees():
           "the worktree outlives nothing; the thread outlives everything")
     check("and the run still happens in the worktree", "cwd = worktree" in ex)
 
-    check("only queued work is isolated",
-          'task.get("driver") == "queue" and worktrees.is_repo(cwd)' in ex,
+    check("only work that asked to be isolated is",
+          'tasks.isolated(task) and worktrees.is_repo(cwd)' in ex,
           "a conversation must stay where your uncommitted edits are")
     check("a failed task still releases its checkout",
           "could not release worktree" in ex, "otherwise every failure leaks one")
@@ -3559,6 +3820,7 @@ if __name__ == "__main__":
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_parallel_tasks,
               test_worktrees, test_cancel_stops_the_child,
               test_worktree_survives_leaving_running,
+              test_isolation_is_not_a_scheduling_decision,
               test_credentials_check,
               test_turn_deadline_is_idleness,
               test_mail_facts, test_projects,

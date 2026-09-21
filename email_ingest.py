@@ -366,6 +366,7 @@ def ingest(task_store, state, *, host, user, password, mailbox=DEFAULT_MAILBOX,
             title=f["title"],
             state="proposed",          # never straight to work; triage is a guess
             driver="queue",
+            isolate=True,              # filed work, not a conversation with you
             source="email",
             source_ref=f["id"],
         )

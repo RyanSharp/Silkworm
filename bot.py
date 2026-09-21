@@ -1292,6 +1292,10 @@ def handle_tasks(payload: dict) -> dict:
                                   # Nobody is holding a live message for these,
                                   # so the runner is what will execute them.
                                   driver=payload.get("driver", "queue"),
+                                  # Filed work stands on its own, so it runs in
+                                  # its own checkout rather than the tree you
+                                  # are editing.
+                                  isolate=True,
                                   thread=payload.get("thread", ""),
                                   scope=scope)
             return {"ok": True, "task": t}
@@ -1528,6 +1532,9 @@ def handle_defer(payload: dict) -> dict:
     task = task_store.create(
         goal, title=goal[:70], state=tasks.BLOCKED, driver="queue",
         source="defer", thread=key, project=entry.get("project") or "",
+        # The runner executes it, but it is the same conversation resuming the
+        # same session: it belongs in the thread's checkout, not a worktree.
+        isolate=False,
         scope={"cwd": entry.get("cwd") or str(CLAUDE_CWD)},
         retry_at=when, defers=depth,
     )
@@ -1622,6 +1629,9 @@ def handle_file_task(payload: dict) -> dict:
         # the proposed gate exists to ask. A proposal nobody has seen is not.
         state=state, driver="queue",
         source="ideation" if propose else "scoped",
+        # Filed work, not the conversation that scoped it: whoever runs it
+        # starts fresh, so it gets its own checkout.
+        isolate=True,
         scope=scope,
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
@@ -1798,6 +1808,11 @@ def handle_prompt(event: dict, say, client) -> None:
         thread=key,
         # Bound once with !project, inherited by every turn after.
         project=(store.get(key) or {}).get("project", ""),
+        # A conversation is never isolated -- it runs where your uncommitted
+        # edits are. Recorded rather than inferred, because a restart may hand
+        # this very task to the queue runner (close_out_orphans) so the message
+        # is not lost, and being run by the runner must not move where it runs.
+        isolate=False,
         scope={"cwd": str(cwd), "repo": repos.identity(str(cwd))},
     )
     task_id = task["id"]
@@ -2074,11 +2089,18 @@ def execute_task(task: dict) -> None:
     key = f"{channel}:{thread_ts}"
     progress = ProgressMessage(app.client, channel, thread_ts)
 
-    # A queued task in a repository gets its own checkout. It cannot then leave
-    # your working tree dirty or on another branch, and it no longer queues
-    # behind a conversation about the same repo. Only queued work: a worktree
-    # cannot see uncommitted changes in your main tree, so a conversation about
-    # what you are editing right now must stay where you are editing it.
+    # Self-contained work in a repository gets its own checkout. It cannot then
+    # leave your working tree dirty or on another branch, and it no longer
+    # queues behind a conversation about the same repo. Only self-contained
+    # work: a worktree cannot see uncommitted changes in your main tree, so a
+    # conversation about what you are editing right now must stay where you are
+    # editing it.
+    #
+    # That decision is on the record (`isolate`), taken when the task was made.
+    # It used to be read off `driver`, which close_out_orphans rewrites at
+    # startup so an orphaned Slack message is re-run rather than dropped -- and
+    # that quietly moved the conversation into a worktree the user's edits were
+    # not in, then committed to silkworm/<task-id> instead of their branch.
     worktree = None
     # Where the *thread* lives, as distinct from where this turn runs. A turn
     # in a worktree must never leave that path behind as the thread's home: the
@@ -2089,7 +2111,7 @@ def execute_task(task: dict) -> None:
     # A read-only role has nothing to isolate: it cannot write, so a worktree
     # buys nothing and leaves an empty branch behind every run -- one per
     # project per night once ideation is scheduled.
-    if (task.get("driver") == "queue" and worktrees.is_repo(cwd)
+    if (tasks.isolated(task) and worktrees.is_repo(cwd)
             and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
         worktree = worktrees.create(cwd, tid, base=scope.get("branch") or "")
@@ -2326,6 +2348,9 @@ def file_followups(task: dict, followups: list[str]) -> list[str]:
             child = task_store.create(
                 goal, title=f"From review: {finding[:52]}", role="implementor",
                 project=proj, state=tasks.PROPOSED, driver="queue",
+                # Filed work: whoever picks it up starts fresh, so it gets its
+                # own checkout rather than whatever tree you are mid-edit in.
+                isolate=True,
                 source="review", source_ref=task["id"],
                 root=task.get("root") or task["id"], scope=scope)
         except ValueError:
@@ -2356,6 +2381,10 @@ def resolve_review(task: dict, role_name: str, text: str,
     if roles.needs_review(role_name) and not task.get("blocked_on"):
         child = task_store.create(
             roles.review_goal(task, text), role="reviewer", driver="queue",
+            # Not isolated: the reviewer reads the commits the implementor
+            # left on its branch, and that branch lives in this checkout. A
+            # fresh worktree off the base branch would hold none of them.
+            isolate=False,
             # Without an explicit title it would be the review prompt's first
             # line ("Goal that was given:"), which reads as nonsense in a list.
             title=f"Review: {(task.get('title') or tid)[:46]}",
@@ -2652,7 +2681,11 @@ def run_ideation(slug: str) -> dict:
         goal += "\n\n" + note
     task = task_store.create(goal, title=f"Nightly review: {rec.get('title') or slug}",
                              role="ideator", project=slug, state=tasks.QUEUED,
-                             driver="queue", source="ideation", scope=scope)
+                             # Unattended work of its own, though the ideator
+                             # being read-only means it is denied a checkout
+                             # anyway -- one empty branch a night otherwise.
+                             driver="queue", source="ideation", isolate=True,
+                             scope=scope)
     project_store.ensure(slug, ideate_on=datetime.now().strftime("%Y-%m-%d"))
     log.info("filed nightly ideation %s for %s", task["id"], slug)
     return {"ok": True, "id": task["id"]}
@@ -2842,6 +2875,10 @@ def close_out_orphans() -> None:
             # silently lost real messages -- exactly the "3 deep and some go
             # missing" symptom. The record already holds the goal, thread and
             # project, so nothing needs to be recovered from Slack at all.
+            #
+            # Only *who* runs it changes. Where it runs is on the record
+            # (`isolate`), so this cannot move a conversation about your
+            # uncommitted edits into a worktree that does not have them.
             task_store.update(tid, driver="queue")
             log.info("task %s handed to the runner (its Slack handler is gone)", tid)
 

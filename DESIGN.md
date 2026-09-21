@@ -558,6 +558,14 @@ the runner picks it up. The record already holds the goal, thread, project and
 scope, so nothing has to be reconstructed from Slack at all, and no ordering
 assumption is involved.
 
+That flip then collided with worktrees, because **isolation was inferred from
+`driver` too**. A rescued Slack message re-ran in a fresh worktree off the base
+branch — the one place the user's uncommitted edits are not — and committed to
+`silkworm/<task-id>` rather than their branch. Two unrelated questions had been
+answered by one flag: *who runs this* and *where may it run*. They are separate
+fields now. `isolate` is decided when the record is made and never re-derived,
+so the closeout can change the driver without moving the work.
+
 ## Putting threads away
 
 The list grows and never shrinks: 37 threads, 13 of them one-off task runs, ten

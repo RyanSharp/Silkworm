@@ -13,7 +13,10 @@ your checkout is untouchable from it, and the two no longer serialise.
 Deliberately *not* used for conversations. A worktree cannot see uncommitted
 work in your main tree, so "fix the thing I'm working on" would find nothing
 there. Isolation is right for self-contained work and wrong for iterating with
-you, which is exactly the queued/interactive split.
+you -- so each task records that decision when it is made (`isolate` in
+tasks.py). It is not read off `driver`: a restart hands an orphaned Slack
+message to the queue runner so it is not lost, and being run by the runner must
+not change where it runs.
 
 Nothing here destroys work: a worktree holding uncommitted changes is left on
 disk and reported rather than removed.

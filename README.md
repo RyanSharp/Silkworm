@@ -424,7 +424,9 @@ periodically.
 
 Conversations are deliberately *not* isolated: a worktree can't see uncommitted
 changes in your main tree, so "fix what I'm working on" needs to run where you
-are actually working.
+are actually working. That's recorded on the task when it's created, not
+inferred from who happens to run it — a message orphaned by a restart is handed
+to the runner so it isn't lost, and it still runs in your checkout.
 
 ## Watching something over time
 
