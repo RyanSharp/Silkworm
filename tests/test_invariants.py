@@ -5723,7 +5723,7 @@ def test_unknown_role_fails_closed():
               "--dangerously-skip-permissions" not in args, f"got {args}")
         check(f"{bad!r} resolves to a read-only role", roles.get(bad).get("restricted"))
         check(f"{bad!r} cannot edit or write",
-              "Edit" not in args[1] and "Write" not in args[1])
+              "Edit" not in " ".join(args) and "Write" not in " ".join(args))
     check("a made-up name is not reported as known", not roles.known("reviewr"))
     check("the genuine default is untouched",
           roles.known("") and roles.known(None)
