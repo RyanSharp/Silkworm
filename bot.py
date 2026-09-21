@@ -229,8 +229,11 @@ def repo_guard(cwd, progress=None):
     normal case rather than a corner. Two agents in one checkout do not merely
     race on files: one running `git checkout` moves the ground under the other.
 
-    Taken inside the thread lock at both call sites, so the ordering is
-    consistent and cannot deadlock.
+    Taken inside the thread lock by the turns that use it, so the ordering is
+    consistent and cannot deadlock. A landing takes it with no thread lock at
+    all and holds it for two full suite runs, which is the point -- a live turn
+    in the same checkout waits rather than editing under a rebase -- and it
+    never goes on to want a thread lock, so there is still no cycle.
     """
     lock = _repo_lock(cwd)
     if lock is None:
@@ -1229,6 +1232,47 @@ def handle_titles(payload: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def approve_task(payload: dict) -> dict:
+    """Approve flagged work — and land it, where a passing review would have.
+
+    Approving is a person reading the reviewer's findings and deciding the work
+    is fine, which is at least as strong as a review that found nothing to say.
+    Mapping it to a bare transition made the one route through flagged work
+    also the only route that never tried to merge: tsk_5fb51199eb reached
+    `done` carrying four reviewed, test-passing commits that main did not have.
+
+    Only from `awaiting_approval`. The same button is legal from `blocked`,
+    where the task is still waiting on its review, and approving there must not
+    merge work nobody has read yet.
+
+    The task ends `done` whether or not the landing succeeds — approving is the
+    user closing the item, and refusing to close it would only put the same
+    task in front of them again. What happened to the branch is written to the
+    record instead, which is what the board reads.
+    """
+    tid = payload.get("id", "")
+    task = task_store.get(tid)
+    if not task:
+        return {"ok": False, "error": "unknown task"}
+    reviewed = task.get("state") == tasks.AWAITING_APPROVAL
+    try:
+        done = task_store.transition(
+            tid, tasks.DONE, f"approve via {payload.get('by', 'ui')}")
+    except tasks.InvalidTransition as e:
+        return {"ok": False, "error": f"not allowed: {e}"}
+    if reviewed:
+        # The task is already `done`; a failure to even begin the landing must
+        # not be reported as a refused approval. It used to propagate, and the
+        # dashboard renders any raised error as "Not allowed" -- so the user
+        # re-clicked, the state was no longer awaiting_approval, and no landing
+        # was ever attempted. That is the original silence, through new code.
+        try:
+            start_landing(tid)
+        except Exception:
+            log.exception("could not start the landing for %s", tid)
+    return {"ok": True, "task": task_store.get(tid) or done}
+
+
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
@@ -1336,9 +1380,10 @@ def handle_tasks(payload: dict) -> dict:
                 tid, tasks.QUEUED, "sent back for rework")}
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
-    if action in ("accept", "approve", "dismiss", "retry", "cancel"):
+    if action == "approve":
+        return approve_task(payload)
+    if action in ("accept", "dismiss", "retry", "cancel"):
         target = {"accept": tasks.QUEUED, "retry": tasks.QUEUED,
-                  "approve": tasks.DONE,
                   "dismiss": tasks.CANCELLED, "cancel": tasks.CANCELLED}[action]
         tid = payload.get("id", "")
         # Cancelling a running task has to stop it, not just relabel it. It
@@ -2433,52 +2478,91 @@ def resolve_review(task: dict, role_name: str, text: str,
     if parent:
         task_store.update(parent_id, result={**(parent.get("result") or {}),
                                              "review": verdict})
+        stranded = ""
         if verdict["ok"]:
             # Land before completing: if the landing refuses, that is worth
             # knowing in the same breath as the verdict rather than later.
-            try:
-                landed = land_if_ready(parent, channel, thread_ts)
-            except Exception:
-                log.exception("landing %s failed", parent_id)
-                landed = ":hand: _Landing errored — see the bot log._"
-            if landed:
-                try:
-                    app.client.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                                text=landed)
-                except Exception:
-                    log.exception("posting the landing result failed")
-        task_state(parent_id, tasks.DONE if verdict["ok"] else tasks.AWAITING_APPROVAL,
-                   verdict["summary"][:160])
+            outcome = land_and_record(parent_id, channel, thread_ts)
+            if merge.needs_a_person(outcome):
+                # Reviewed, proven, and still not on the base. Nobody has
+                # looked at why, and `done` would say there is nothing to
+                # look at -- which is how the same gap got implemented twice
+                # on two different nights, each time at the price of a
+                # session and a reviewer.
+                #
+                # A parent the user closed while its review was still running
+                # cannot be parked -- `done` is terminal, and task_state
+                # swallows the refusal rather than costing the reviewer its
+                # reply. The record still carries the refusal, which is what
+                # the board reads, so it does not become silent again.
+                stranded = f"review passed but the landing refused " \
+                           f"({outcome.get('stage')})"
+        if stranded:
+            task_state(parent_id, tasks.AWAITING_APPROVAL, stranded[:160])
+        else:
+            task_state(parent_id, tasks.DONE if verdict["ok"] else tasks.AWAITING_APPROVAL,
+                       verdict["summary"][:160])
     return False
 
 
-def land_if_ready(task: dict, channel: str, thread_ts: str) -> str:
+def landing_enabled(task: dict) -> bool:
+    """Has this task's project asked Silkworm to merge on its behalf?
+
+    Kept apart from the rest of the gate because it is the one refusal that is
+    not a problem: a project that never opted in was always going to end with a
+    branch, and saying so on every task would make the marker meaningless.
+    """
+    return bool((project_store.get(task.get("project") or "") or {}).get("auto_merge"))
+
+
+def land_if_ready(task: dict) -> dict:
     """Land a task's branch if the project allows it and the work earned it.
 
     Everything here is a refusal by default. A project must opt in, must be
     able to prove itself, and the work must already have passed both its own
     tests and an independent review. Anything short of that leaves the branch
     where it is and says why.
+
+    What comes back is a record rather than a sentence. It used to return the
+    Slack line directly, which meant the caller could print it and nothing
+    else: "not enabled", "never verified" and "the rebase conflicts" were one
+    string, so every one of them ended the task as plainly `done`. `eligible`
+    separates the two kinds -- False means it was never a candidate, True means
+    git was asked and said no, which is the case that needs a person.
     """
     proj = project_store.get(task.get("project") or "") or {}
     scope = task.get("scope") or {}
-    worktree, cwd = scope.get("worktree"), scope.get("cwd")
-    branch = f"{worktrees.BRANCH_PREFIX}{task['id']}"
-    if not proj.get("auto_merge"):
-        return ""
+    cwd = scope.get("cwd")
+    # The same answer the unmerged survey uses, which honours the branch the
+    # task actually recorded as its checkout closed rather than assuming the
+    # convention. Two ways of naming it would be two things to keep in step.
+    branch = branches.name_for(task)
+
+    def never(stage: str, detail: str = "") -> dict:
+        return {"eligible": False, "landed": False, "stage": stage,
+                "detail": detail, "branch": branch}
+
+    if not landing_enabled(task):
+        return never("not-enabled", "this project does not land its own work")
     if not (proj.get("test_cmd") or "").strip():
-        return ":hand: _Not landed: this project has no test command, so nothing proved it._"
+        return never("no-test-command",
+                     "this project has no test command, so nothing proved it")
+    # This is also what keeps `send_back_for_tests` honest. Work parked in
+    # awaiting_approval because its tests failed MAX_VERIFY_ATTEMPTS times is
+    # not verified, so approving it -- which means "stop trying", not "merge
+    # it" -- cannot reach a merge through here.
     if not task.get("verified"):
-        return ":hand: _Not landed: the change was never verified._"
+        return never("unverified", "the change was never verified")
     if not cwd:
-        return ":hand: _Not landed: it has no checkout to land from._"
+        return never("no-checkout", "it has no checkout to land from")
 
     # The task's own worktree was released when its turn ended, so reattach the
     # branch. Rebasing and retesting need somewhere to happen that is not the
     # checkout being merged into.
     here = worktrees.attach(cwd, task["id"], branch)
     if not here:
-        return f":hand: _Not landed: could not check out `{branch}`._"
+        return {"eligible": True, "landed": False, "stage": "attach",
+                "branch": branch, "detail": f"could not check out {branch}"}
 
     def run_tests(where):
         return verify.run(proj["test_cmd"], where)
@@ -2489,10 +2573,142 @@ def land_if_ready(task: dict, channel: str, thread_ts: str) -> str:
             result = merge.land(here, cwd, branch, scope.get("branch") or "", run_tests)
     finally:
         worktrees.release(here)
-    if result["landed"]:
-        task_store.update(task["id"], result={**(task.get("result") or {}),
-                                              "landed": result.get("head")})
-    return merge.summary(result, branch)
+    return {**result, "eligible": True, "branch": branch}
+
+
+def record_landing(task: dict, outcome: dict) -> None:
+    """Write what the landing did onto the record, so it outlives the message.
+
+    A Slack line scrolls away within the hour. Until this existed the only
+    durable trace was `result.landed`, written on success alone, so a refusal
+    left the record identical to a clean merge -- which is how five branches
+    carrying eleven commits sat behind tasks that read as finished.
+    """
+    if not outcome.get("eligible") and outcome.get("stage") == "not-enabled":
+        return                        # landing was never this project's model
+    # Re-read rather than trust the caller's copy: a landing runs for minutes,
+    # and merging its outcome into a dict fetched before it started would drop
+    # anything written in between -- the review verdict, most of all.
+    current = task_store.get(task["id"]) or task
+    keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base")
+    result = {**(current.get("result") or {}),
+              "landing": {k: outcome[k] for k in keep if k in outcome}}
+    if outcome.get("landed"):
+        result["landed"] = outcome.get("head")
+    task_store.update(task["id"], result=result)
+
+
+def land_and_record(task_id: str, channel: str = "", thread_ts: str = "") -> dict:
+    """Attempt a landing, record the outcome, and narrate it. Never raises."""
+    task = task_store.get(task_id) or {"id": task_id}
+    branch = branches.name_for(task)
+    try:
+        outcome = land_if_ready(task)
+    except Exception:
+        log.exception("landing %s failed", task_id)
+        outcome = {"eligible": True, "landed": False, "stage": "errored",
+                   "branch": branch, "detail": "the landing itself errored; "
+                                               "see the bot log"}
+    try:
+        record_landing(task, outcome)
+    except Exception:
+        log.exception("recording the landing of %s failed", task_id)
+    if channel and outcome.get("stage") != "not-enabled":
+        try:
+            app.client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                        text=merge.summary(outcome, branch))
+        except Exception:
+            log.exception("posting the landing result failed")
+    return outcome
+
+
+#: Landings under way in this process, so a second request for the same task
+#: cannot start one beside it. A landing is not idempotent: both attempts would
+#: be handed the same `land/<task-id>` checkout by worktrees.attach, and one
+#: releasing it while the other rebases inside it destroys the work in flight.
+_landing_now: set[str] = set()
+_landing_guard = threading.Lock()
+
+#: What a landing interrupted by a restart looks like on the record.
+LANDING_UNDERWAY = "in-progress"
+
+
+def start_landing(task_id: str) -> bool:
+    """Run a landing off the calling thread, marking it as under way first.
+
+    A landing rebases and runs the project's suite twice; the dashboard gives
+    its call fifteen seconds. So the request cannot wait for it -- but nor can
+    the record go quiet in the meantime, which is the whole failure being
+    fixed, so the in-progress marker goes down before the thread starts.
+    """
+    task = task_store.get(task_id)
+    if not task or not landing_enabled(task):
+        return False
+    with _landing_guard:
+        # Two Approve clicks land in two server threads, and both read the
+        # task's state before either writes it, so both believe they are the
+        # one approving it. Only one may go on to touch git.
+        if task_id in _landing_now:
+            log.info("a landing for %s is already under way", task_id)
+            return False
+        _landing_now.add(task_id)
+    record_landing(task, {"eligible": True, "landed": False,
+                          "stage": LANDING_UNDERWAY,
+                          "branch": branches.name_for(task),
+                          "detail": "landing under way"})
+
+    def run():
+        try:
+            channel, thread_ts = "", ""
+            # Deliberately not task_thread(): a task with nowhere to talk should
+            # not get an anchor message posted for it hours after it finished.
+            if task.get("thread") and ":" in task["thread"]:
+                channel, _, thread_ts = task["thread"].partition(":")
+            land_and_record(task_id, channel, thread_ts)
+        except Exception:
+            # land_and_record guards itself, so this is the thread dying before
+            # it gets there. Leaving the marker would say "landing…" for ever.
+            log.exception("the landing thread for %s died", task_id)
+            try:
+                record_landing(task_store.get(task_id) or task,
+                               {"eligible": True, "landed": False,
+                                "stage": "errored", "branch": branches.name_for(task),
+                                "detail": "the landing thread died; see the bot log"})
+            except Exception:
+                log.exception("could not record the death of %s's landing", task_id)
+        finally:
+            with _landing_guard:
+                _landing_now.discard(task_id)
+
+    threading.Thread(target=run, daemon=True, name=f"land-{task_id[:12]}").start()
+    return True
+
+
+def clear_interrupted_landings() -> list[str]:
+    """Rewrite landings a restart killed, so no row says "landing…" for ever.
+
+    The landing runs on a daemon thread, which a restart ends without
+    unwinding. The marker it left is durable and nothing else would ever
+    revisit it, so the board would animate a merge that stopped happening days
+    ago -- the same lie as silence, only moving. This is the task equivalent of
+    `requeue_interrupted`, and like it, it runs before anything else can.
+    """
+    stale = []
+    for tid, rec in task_store.all().items():
+        landing = ((rec.get("result") or {}).get("landing")) or {}
+        if landing.get("stage") != LANDING_UNDERWAY:
+            continue
+        try:
+            record_landing(rec, {**landing, "stage": "interrupted",
+                                 "detail": "the bot restarted while it was "
+                                           "landing; nothing was merged"})
+            stale.append(tid)
+        except Exception:
+            log.exception("could not clear the stale landing on %s", tid)
+    if stale:
+        log.info("cleared %d landing(s) a restart interrupted: %s",
+                 len(stale), ", ".join(stale))
+    return stale
 
 
 _email_lock = threading.Lock()
@@ -2730,6 +2946,13 @@ def _task_scheduler() -> None:
             log.info("requeued %d task(s) interrupted by a restart", moved)
     except Exception:
         log.exception("closing out interrupted tasks failed")
+    try:
+        # A landing runs on a daemon thread, which a restart ends mid-merge. Its
+        # marker is durable, so without this the board keeps saying "landing…"
+        # about something that stopped days ago.
+        clear_interrupted_landings()
+    except Exception:
+        log.exception("clearing interrupted landings failed")
     while True:
         try:
             for tid in task_store.due_retries(time.time()):

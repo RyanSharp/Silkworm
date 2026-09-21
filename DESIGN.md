@@ -183,9 +183,11 @@ graph to maintain.
 4. **`reviewer` role** and one gate on implementor output. *(built: an
    implementor cannot complete on its own say-so — its result goes to a
    reviewer with a fresh session and read-only tools, and the task waits in
-   `blocked`. A passing verdict completes it silently; a flagged one lands in
-   `awaiting_approval` with the findings; anything the reviewer found that does
-   not block is filed as a proposal. An unreadable verdict fails closed.)*
+   `blocked`. A passing verdict lands the work and completes it; a flagged one,
+   or one whose landing refused, goes to `awaiting_approval` — with the
+   findings, or with the stage the merge stopped at. Anything the reviewer
+   found that does not block is filed as a proposal. An unreadable verdict
+   fails closed.)*
 5. Ingestion adapters, worktree isolation, per-role tool scoping.
    *(email: built. Gmail over IMAP with an app password — the API needs a
    Cloud project and a browser consent flow, awkward on a headless host.
@@ -682,6 +684,48 @@ a two-line Python module let git auto-resolve a whole-file rewrite; identical-
 length edits let a stale `.pyc` answer for new source; and a branch created
 *after* the first landing has nothing left to conflict with. The mutations now
 confirm each assertion fails without its fix.
+
+### A refusal is a result, not a sentence
+
+The gate used to hand back the Slack line itself. A caller given a sentence can
+print it and nothing else, so "this project does not land its own work" and
+"the rebase conflicts and the branch is still sitting there" ended the task the
+same way — `done`, silently, with the commits nowhere near the base. Two routes
+reached that. A passing review completed the task regardless of what the
+landing said, and `result.landed` was written on success alone, so a refusal
+left a record indistinguishable from a clean merge. And `approve` — the one way
+through flagged work — was a bare transition that never tried to merge at all.
+
+So the gate returns a record. `eligible` splits the two kinds: false means the
+work was never a candidate, true means git was asked and said no, which is the
+only case that needs a person. `merge.needs_a_person` is where that lives, and
+everything downstream reads it rather than prose.
+
+- A refused landing **parks the task in `awaiting_approval`** instead of
+  completing it. A rebase conflict needs someone; `done` says it does not.
+- `result.landing` records the stage and the reason, and survives compaction
+  for the same reason `landed` does — throwing it away at a fortnight would
+  defer the silence rather than end it.
+- **Approving lands.** Reading a reviewer's findings and deciding the work is
+  fine is at least as strong as a review that found nothing, so it goes through
+  the same gate rather than round it. Only from `awaiting_approval`: the button
+  is legal from `blocked` too, where the review has not happened yet.
+- The existing guards carry the rest. Work parked by failing its own tests
+  `MAX_VERIFY_ATTEMPTS` times is not verified, so approving it means *stop
+  trying*, not *merge it*, and cannot reach git.
+
+Approving always completes the task, landed or not; refusing to close it would
+only put the same row back in front of the user. The landing runs on its own
+thread — it rebases and runs the suite twice, and the dashboard's call has
+fifteen seconds — with the marker written *before* the thread starts, so the
+record is never silent in between, and cleared at startup if a restart killed
+the thread mid-merge. Two approvals of one task cannot land beside each other:
+they would share one `land/<id>` checkout, and one releasing it while the other
+rebases inside it destroys the work in flight.
+
+This is the *why*; the unmerged-branch strip above the task list is the *what*,
+asked of git each time. They answer different questions and neither replaces
+the other.
 
 ## A turn's directory is not the thread's
 

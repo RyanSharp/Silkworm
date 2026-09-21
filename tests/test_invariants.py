@@ -711,6 +711,29 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
+def _bot_fns(names, ns):
+    """Compile named top-level functions out of bot.py into `ns`.
+
+    bot.py needs Slack tokens to import, so the pieces under test are lifted
+    out of it the way _repo_guard_impl does. Returns the names it found, so a
+    missing one fails a named check rather than raising.
+    """
+    tree = ast.parse((BASE / "bot.py").read_text())
+
+    def defines(n):
+        if isinstance(n, ast.FunctionDef):
+            return {n.name}
+        if isinstance(n, ast.Assign):
+            return {t.id for t in n.targets if isinstance(t, ast.Name)}
+        if isinstance(n, ast.AnnAssign):        # `_landing_now: set[str] = set()`
+            return {n.target.id} if isinstance(n.target, ast.Name) else set()
+        return set()
+
+    nodes = [n for n in tree.body if defines(n) & set(names)]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<bot>", "exec"), ns)
+    return {name for n in nodes for name in defines(n)}
+
+
 def _repo_guard_impl():
     """Loaded from bot.py without importing it (bot.py needs Slack tokens)."""
     import ast, types, contextlib, threading, logging
@@ -1099,8 +1122,13 @@ def test_landing():
     g(repo, "remote", "remove", "origin")
 
     bot = (BASE / "bot.py").read_text()
-    li = bot[bot.index("def land_if_ready"):bot.index("def run_email_ingest")]
-    check("a project must opt in", 'proj.get("auto_merge")' in li)
+    li = bot[bot.index("def landing_enabled"):bot.index("def run_email_ingest")]
+    check("the gate names the branch the way the survey does",
+          "branches.name_for(task)" in li and "BRANCH_PREFIX" not in li,
+          "two ways to name it are two things that can disagree")
+    check("a project must opt in, decided in one place",
+          li.count('"auto_merge"') == 1 and "if not landing_enabled(task):" in li,
+          "the gate and the board must not disagree about who lands its own work")
     check("and must be able to prove itself", 'proj.get("test_cmd")' in li,
           "landing on a project with no suite is merging on a guess")
     check("unverified work never lands", 'task.get("verified")' in li)
@@ -3294,7 +3322,8 @@ def test_dashboard_js_is_whole():
                  "loadList", "loadStats", "loadTranscript", "renderAlerts", "jumpTo",
                  "taskCall", "toggleTasks", "setTaskView", "renderProjects", "addTask",
                  "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
-                 "refreshTaskBadge", "releaseThread", "retitle", "nameAllThreads",
+                 "refreshTaskBadge", "landing", "releaseThread", "retitle",
+                 "nameAllThreads",
                  "resummarize", "toggleLearn", "renderLearnings", "renderUnmerged"):
         check(f"{name}() is defined", name in defined)
 
@@ -3310,6 +3339,330 @@ def test_dashboard_js_is_whole():
     absent = sorted(looked_up - present)
     check("every element the script reads exists in the page", not absent,
           f"absent: {absent}")
+
+    # A marker nothing renders is the same silence it was written to end.
+    row = re.search(r"async function renderTasks\(.*?^}", js, re.S | re.M).group(0)
+    check("the task row says when commits never landed", "${landing(t)}" in row,
+          "landing() exists but the board never calls it")
+
+
+
+
+# --- reviewed work must not read as done while it sits on a branch ------------
+# Five branches carrying eleven commits reached `done` with nothing on the
+# board to say so. Two of them were the same fix, proposed on two different
+# nights, because the first never landed and the gap was still there to find.
+
+def test_landing_is_visible():
+    import logging
+    import types
+    import merge as M
+    import tasks as T
+    import worktrees as W
+    print("\na task never reads as done while its commits sit on a branch")
+
+    LOG = logging.getLogger("test")
+
+    # The outcome has to distinguish "we never tried" from "git said no", or
+    # the caller can only print it -- which is what it used to do.
+    nap = getattr(M, "needs_a_person", None)
+    check("a refused landing is distinguishable from one never attempted",
+          bool(nap) and nap({"eligible": True, "landed": False, "stage": "rebase"})
+          and not nap({"eligible": False, "landed": False, "stage": "not-enabled"})
+          and not nap({"eligible": True, "landed": True, "stage": "done"}),
+          "merge.needs_a_person is missing; the outcome is still just a sentence")
+
+    # --- the gate itself ------------------------------------------------------
+    class Projects:
+        def __init__(self, rec):
+            self.rec = rec
+        def get(self, slug):
+            return dict(self.rec)
+
+    import branches as B
+    gate = {"project_store": Projects({"auto_merge": True, "test_cmd": "true"}),
+            "worktrees": W, "merge": M, "branches": B, "log": LOG}
+    _bot_fns({"land_if_ready", "landing_enabled"}, gate)
+    t = {"id": "tsk_guard", "project": "p", "scope": {"cwd": "/nowhere"}}
+
+    def land_if_ready(task):
+        """The gate's answer, or a stand-in for a version that has no answer."""
+        fn = gate.get("land_if_ready")
+        try:
+            return fn(task) if fn else "absent"
+        except TypeError:
+            return "it took a channel and returned a sentence"
+
+    # send_back_for_tests parks work here after MAX_VERIFY_ATTEMPTS failures.
+    # Approving that means "stop trying", not "merge it".
+    r = land_if_ready({**t, "verified": False})
+    check("work parked by failing tests is never merged by approving it",
+          isinstance(r, dict) and not r.get("eligible") and r.get("stage") == "unverified",
+          f"got {r!r}")
+    gate["project_store"] = Projects({"auto_merge": True, "test_cmd": ""})
+    r = land_if_ready({**t, "verified": True})
+    check("a project with no suite cannot land on a guess",
+          isinstance(r, dict) and not r.get("eligible")
+          and r.get("stage") == "no-test-command", f"got {r!r}")
+    gate["project_store"] = Projects({"auto_merge": False, "test_cmd": "true"})
+    r = land_if_ready({**t, "verified": True})
+    check("a project that never opted in is not a refusal anyone must chase",
+          isinstance(r, dict) and not r.get("eligible")
+          and r.get("stage") == "not-enabled", f"got {r!r}")
+
+    # --- the refusal has somewhere durable to live ----------------------------
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    rec_ns = {"task_store": store, "log": LOG}
+    _bot_fns({"record_landing"}, rec_ns)
+    record_landing = rec_ns.get("record_landing")
+
+    task = store.create("do the thing", project="p")
+    refused = {"eligible": True, "landed": False, "stage": "rebase",
+               "branch": "silkworm/" + task["id"],
+               "detail": "conflicts on tests/test_invariants.py"}
+    if record_landing:
+        record_landing(task, refused)
+    landing = ((store.get(task["id"]).get("result") or {}).get("landing")) or {}
+    check("a refusal is written to the record, not only posted to the thread",
+          landing.get("stage") == "rebase" and landing.get("landed") is False,
+          "result.landed is written on success only, so a refusal left no trace")
+    check("and it names the branch that is still waiting",
+          landing.get("branch") == "silkworm/" + task["id"])
+
+    # A landing runs for minutes. Folding its outcome into the copy of the
+    # record the caller took beforehand would drop whatever was written in
+    # between -- the review verdict sits right there.
+    stale = store.get(task["id"])
+    store.update(task["id"], result={**(stale.get("result") or {}),
+                                     "review": {"ok": True, "summary": "fine"}})
+    if record_landing:
+        record_landing(stale, {**refused, "stage": "attach"})
+    after = (store.get(task["id"]).get("result")) or {}
+    check("a landing outcome does not overwrite what was written beside it",
+          (after.get("review") or {}).get("ok") is True
+          and (after.get("landing") or {}).get("stage") == "attach",
+          f"got {after!r}")
+
+    quiet = store.create("do the thing", project="q")
+    if record_landing:
+        record_landing(quiet, {"eligible": False, "landed": False,
+                               "stage": "not-enabled", "detail": ""})
+    check("a project that does not land its own work gets no marker",
+          bool(record_landing)
+          and "landing" not in ((store.get(quiet["id"]).get("result")) or {}),
+          "every task on every other project would carry a false warning")
+
+    # --- approving flagged work goes through the same gate --------------------
+    started = []
+    app_ns = {"task_store": store, "tasks": T, "log": LOG,
+              "start_landing": lambda tid: bool(started.append(tid))}
+    _bot_fns({"approve_task"}, app_ns)
+    approve = app_ns.get("approve_task")
+
+    def parked(state, detail=""):
+        rec = store.create("implement it", project="p", role="implementor")
+        store.transition(rec["id"], T.RUNNING)
+        store.transition(rec["id"], state, detail)
+        store.update(rec["id"], verified=True)
+        return rec["id"]
+
+    reviewed = parked(T.AWAITING_APPROVAL, "a review flagged this")
+    if approve:
+        approve({"id": reviewed, "by": "you"})
+    check("approving flagged work goes through the landing gate",
+          bool(approve) and started == [reviewed],
+          "approve maps straight to done; four reviewed commits stayed on a branch")
+    check("and approving still completes the task",
+          bool(approve) and store.get(reviewed)["state"] == T.DONE)
+
+    started.clear()
+    blocked = parked(T.BLOCKED, "awaiting review")
+    if approve:
+        approve({"id": blocked})
+    check("approving a task still waiting on its review does not merge it",
+          not started, "that would land work nobody has read")
+
+    # --- and a review whose landing refused does not report success -----------
+    outcome = {}
+    posted = []
+    moves = []
+
+    def task_state(tid, state, detail=""):
+        try:
+            store.transition(tid, state, detail)
+        except T.InvalidTransition as e:
+            moves.append(str(e))
+
+    import roles
+    rev_ns = {"task_store": store, "tasks": T, "roles": roles, "merge": M,
+              "log": LOG, "task_state": task_state,
+              "app": types.SimpleNamespace(client=types.SimpleNamespace(
+                  chat_postMessage=lambda **kw: posted.append(kw))),
+              "land_and_record": lambda tid, ch, ts: outcome,
+              # What main calls. Kept so main reaches the state decision and
+              # this measures that decision rather than a NameError.
+              "land_if_ready": lambda *a, **k: ":hand: _Not landed (rebase)._"}
+    _bot_fns({"resolve_review"}, rev_ns)
+    resolve_review = rev_ns.get("resolve_review")
+    PASS = '```json\n{"ok": true, "summary": "fine", "findings": []}\n```'
+
+    def reviewed_as(result):
+        nonlocal outcome
+        outcome = result
+        pid = parked(T.BLOCKED, "awaiting review")
+        if resolve_review:
+            resolve_review({"id": "tsk_rev", "parent": pid}, "reviewer", PASS, "C", "1")
+        return store.get(pid)
+
+    stuck = reviewed_as({"eligible": True, "landed": False, "stage": "rebase",
+                         "detail": "conflicts", "branch": "silkworm/x"})
+    check("a passing review whose landing refused does not reach done",
+          stuck["state"] == T.AWAITING_APPROVAL,
+          f"state is {stuck['state']}; the commits are still only on the branch")
+    check("and the board is told why it is waiting",
+          "landing refused" in (stuck["events"][-1]["detail"] if stuck["events"] else ""),
+          "otherwise it looks like the reviewer flagged something")
+
+    done = reviewed_as({"eligible": True, "landed": True, "stage": "done",
+                        "head": "abc1234", "branch": "silkworm/y"})
+    check("a landing that succeeded still completes the task",
+          done["state"] == T.DONE, f"state is {done['state']}")
+    never = reviewed_as({"eligible": False, "landed": False,
+                         "stage": "not-enabled", "detail": ""})
+    check("and so does a project that never lands its own work",
+          never["state"] == T.DONE, f"state is {never['state']}")
+    check("no transition was refused along the way", not moves, f"refused: {moves}")
+
+    # --- a landing killed mid-merge must not animate for ever ----------------
+    # The landing runs on a daemon thread, which a restart ends without
+    # unwinding. Its marker is durable and nothing else revisits it, so the row
+    # would keep saying "landing…" about something that stopped days ago.
+    sweep_ns = {"task_store": store, "log": LOG}
+    _bot_fns({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY"},
+             sweep_ns)
+    sweep = sweep_ns.get("clear_interrupted_landings")
+    mid = store.create("do the thing", project="p")
+    store.update(mid["id"], result={"landing": {
+        "eligible": True, "landed": False, "stage": "in-progress",
+        "branch": "silkworm/" + mid["id"], "detail": "landing under way"}})
+    settled = store.create("do the thing", project="p")
+    store.update(settled["id"], result={"landing": {
+        "eligible": True, "landed": True, "stage": "done", "head": "abc1234"}})
+    cleared = sweep() if sweep else []
+    after_mid = ((store.get(mid["id"]).get("result") or {}).get("landing")) or {}
+    check("a landing a restart interrupted stops claiming to be under way",
+          bool(sweep) and cleared == [mid["id"]]
+          and after_mid.get("stage") == "interrupted",
+          f"got {cleared} / {after_mid.get('stage')!r}")
+    check("and says nothing was merged",
+          "nothing was merged" in (after_mid.get("detail") or ""))
+    sched = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
+                 if isinstance(n, ast.FunctionDef) and n.name == "_task_scheduler")
+    check("and the sweep runs at startup, beside the one for interrupted turns",
+          any(isinstance(c.func, ast.Name) and c.func.id == "clear_interrupted_landings"
+              for c in ast.walk(sched) if isinstance(c, ast.Call)),
+          "a sweep nothing calls leaves the marker exactly where it was")
+    check("a landing that already finished is left alone",
+          (((store.get(settled["id"]).get("result")) or {}).get("landing")
+           or {}).get("stage") == "done")
+
+    # --- and two approvals of one task cannot land beside each other ----------
+    # Both would be handed the same land/<id> checkout by worktrees.attach, and
+    # one releasing it while the other rebases inside it destroys the work.
+    import threading as _th
+    holding = _th.Event()
+    release = _th.Event()
+    threads_run = []
+    start_ns = {"task_store": store, "tasks": T, "branches": B, "log": LOG,
+                "threading": _th,
+                "landing_enabled": lambda task: True,
+                "land_and_record": lambda tid, c, t: (threads_run.append(tid),
+                                                      holding.set(),
+                                                      release.wait(5))}
+    _bot_fns({"start_landing", "record_landing", "LANDING_UNDERWAY",
+              "_landing_now", "_landing_guard"}, start_ns)
+    start_landing = start_ns.get("start_landing")
+    slow = store.create("do the thing", project="p")
+    first = start_landing(slow["id"]) if start_landing else False
+    holding.wait(5)
+    second = start_landing(slow["id"]) if start_landing else False
+    release.set()
+    check("only one landing per task may be in flight",
+          first is True and second is False and threads_run == [slow["id"]],
+          f"started {threads_run}")
+    check("and the record says one is under way while it is",
+          (((store.get(slow["id"]).get("result")) or {}).get("landing")
+           or {}).get("stage") == "in-progress")
+
+    # --- failing to even begin a landing is not a refused approval ------------
+    # The transition already happened. Raising here makes the dashboard toast
+    # "Not allowed" for work that is done, and the re-click finds a state that
+    # no longer qualifies -- so no landing is ever attempted. The old silence,
+    # reached through the new code.
+    boom = {"task_store": store, "tasks": T, "log": LOG,
+            "start_landing": lambda tid: (_ for _ in ()).throw(OSError("disk full"))}
+    _bot_fns({"approve_task"}, boom)
+    approve_boom = boom.get("approve_task")
+    unlucky = parked(T.AWAITING_APPROVAL, "a review flagged this")
+    try:
+        answer = approve_boom({"id": unlucky}) if approve_boom else {}
+    except Exception as e:
+        # Fail as a named check rather than taking the rest of the case with it.
+        answer = {"raised": repr(e)}
+    check("a landing that cannot start is not reported as a refused approval",
+          answer.get("ok") is True and store.get(unlucky)["state"] == T.DONE,
+          f"got {answer!r}")
+
+    # --- and the board actually renders each of those outcomes ---------------
+    # Reading the marker into the page is not the same as it saying anything.
+    # An earlier version returned "" for every refusal that never reached git,
+    # so approving unverified work showed "landing…" and then nothing at all.
+    import re as _re
+    sys.argv = ["x"]
+    import visualizer as _V
+    js = _re.search(r"<script>(.*?)</script>", _V.PAGE, _re.S).group(1)
+    fn = js[js.index("function landing(t)"):js.index("function taskButtons(")]
+    check("only a task with no landing record renders nothing",
+          "if (!l) return \"\";" in fn,
+          "an outcome written and then not shown is worse than not writing it")
+    check("and a refusal that never reached git still says so",
+          "if (!l.eligible)" in fn and fn.count("not landed") >= 2)
+
+    esc = _re.search(r"const esc = .*", js).group(0)
+    harness = (esc + "\n" + fn + "\n"
+               + "const out = JSON.parse(process.env.CASES).map(t => landing(t));\n"
+               + "process.stdout.write(JSON.stringify(out));\n")
+    cases = [{}, {"result": {"landing": {"eligible": True, "landed": True,
+                                         "head": "abc1234def"}}},
+             {"result": {"landing": {"eligible": True, "landed": False,
+                                     "stage": "in-progress"}}},
+             {"result": {"landing": {"eligible": True, "landed": False,
+                                     "stage": "rebase", "branch": "silkworm/tsk_1",
+                                     "detail": "conflicts"}}},
+             {"result": {"landing": {"eligible": False, "landed": False,
+                                     "stage": "unverified",
+                                     "detail": "the change was never verified"}}}]
+    try:
+        run = subprocess.run(["node", "-e", harness], capture_output=True,
+                             text=True, timeout=30,
+                             env={**os.environ, "CASES": json.dumps(cases)})
+        rendered = json.loads(run.stdout) if run.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        rendered = None                     # no node here; the checks above hold
+    if rendered is None:
+        print("    (node unavailable — landing() checked by contract only)")
+    else:
+        check("a task with no landing record renders nothing", rendered[0] == "")
+        check("a landing that succeeded shows the commit",
+              "abc1234" in rendered[1] and "not landed" not in rendered[1])
+        check("one under way says so", "landing" in rendered[2].lower()
+              and "not landed" not in rendered[2])
+        check("a refusal git made names the branch still waiting",
+              "silkworm/tsk_1" in rendered[3] and "waiting for you" in rendered[3]
+              and "conflicts" in rendered[3])
+        check("and one that never reached git still gives its reason",
+              "never verified" in rendered[4] and "not landed" in rendered[4],
+              "this rendered as nothing, so approving unverified work went quiet")
 
 
 # --- tasks.json only ever grew ---------------------------------------------------
@@ -3349,10 +3702,20 @@ def test_task_retention():
                                            "findings": ["one nit"], "parsed": True},
                                 "landed": "abc1234"})
     st._data[reviewed]["updated"] = time.time() - 30 * 86400
+    # And one whose landing refused. This is the marker that stops a finished
+    # task with unmerged commits reading as plainly done, so dropping it at a
+    # fortnight would defer that silence rather than end it.
+    stranded = aged(T.DONE, 30)
+    st.update(stranded, result={**(st.get(stranded)["result"] or {}),
+                                "landing": {"eligible": True, "landed": False,
+                                            "stage": "rebase",
+                                            "branch": "silkworm/tsk_old",
+                                            "detail": "conflicts"}})
+    st._data[stranded]["updated"] = time.time() - 30 * 86400
 
     done = st.compact_older_than(14)
     check("old finished tasks are compacted",
-          sorted(done) == sorted([old, cancelled, reviewed]), f"got {done}")
+          sorted(done) == sorted([old, cancelled, reviewed, stranded]), f"got {done}")
 
     rec = st.get(old)
     check("the record itself survives", rec is not None and rec["state"] == T.DONE)
@@ -3379,6 +3742,10 @@ def test_task_retention():
           (st.get(reviewed)["result"] or {}).get("landed") == "abc1234",
           "nothing else records that the work reached the base branch, so "
           "dropping it makes a landed task look like a discarded one")
+    landing = (st.get(stranded)["result"] or {}).get("landing") or {}
+    check("and so does a landing that refused",
+          landing.get("stage") == "rebase" and landing.get("branch") == "silkworm/tsk_old",
+          "losing it lets a task with unmerged commits go back to reading as done")
     viz = (BASE / "visualizer.py").read_text()
     check("every task row asks for the verdict, not just the waiting ones",
           "${review(t)}" in viz and "review" in T.RESULT_KEEPS,
@@ -4326,7 +4693,11 @@ def test_review_followups():
         "roles": roles, "task_store": store,
         "app": types.SimpleNamespace(client=types.SimpleNamespace(
             chat_postMessage=lambda **kw: posted.append(kw["text"]))),
-        "land_if_ready": lambda t, c, th: "",
+        # Landing has its own cases in test_landing_is_visible; here it must
+        # simply not stand between the verdict and where it routes.
+        "merge": __import__("merge"),
+        "land_and_record": lambda tid, c, th: {"eligible": True, "landed": True,
+                                               "stage": "done", "head": "abc1234"},
         "task_state": lambda tid, st, why="": store.transition(tid, st, why),
     })
     exec(compile(ast.Module(body=[gate_fn], type_ignores=[]), "<x>", "exec"), gns)
@@ -4492,7 +4863,8 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_review_followups, test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_parallel_tasks,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_landing_is_visible,
+              test_parallel_tasks,
               test_worktrees, test_cancel_stops_the_child,
               test_worktree_survives_leaving_running,
               test_isolation_is_not_a_scheduling_decision,

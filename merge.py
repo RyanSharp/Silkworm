@@ -113,10 +113,27 @@ def land(worktree, repo, branch: str, base: str, run_tests) -> dict:
             "before": before, "head": head, "detail": ""}
 
 
+def needs_a_person(outcome: dict) -> bool:
+    """True when a landing was actually tried against git and refused.
+
+    The distinction this draws is the whole point of the outcome being a record
+    rather than a sentence. "The project never asked us to merge" and "we
+    rebased, it conflicted, and the branch is still sitting there" both used to
+    arrive as a string the caller could only print, so both ended the task the
+    same way -- `done`, with eleven commits across five branches that no base
+    had. Only the second needs someone.
+    """
+    return bool(outcome.get("eligible")) and not outcome.get("landed")
+
+
 def summary(result: dict, branch: str) -> str:
     """One line for the thread."""
     if result.get("landed"):
         return (f":shipit: _Landed on *{result.get('base')}* "
                 f"(`{result.get('head', '')[:8]}`)._")
+    if not result.get("eligible", True):
+        # Never reached git, so there is no branch waiting and no output to
+        # quote -- just the reason it was never a candidate.
+        return f":hand: _Not landed: {result.get('detail') or result.get('stage')}._"
     return (f":hand: _Not landed ({result.get('stage')}). Branch `{branch}` is "
             f"waiting for you._\n```\n{result.get('detail', '')[-800:]}\n```")

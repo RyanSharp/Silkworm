@@ -717,6 +717,12 @@ PAGE = r"""<!doctype html>
   .task .rev .lbl { display: block; margin-top: 5px; color: var(--muted);
                     font-size: 11px; }
   .task .rev .filed { font-family: var(--mono); color: var(--muted); font-size: 11px; }
+  .task .land { margin-top: 6px; font-size: 11.5px; line-height: 1.45;
+                font-family: var(--mono); color: var(--muted); }
+  .task .land.bad { color: #D8517F; }
+  .task .land.ok { color: #2EB67D; }
+  .task .land .d { color: var(--muted); font-family: var(--mono); font-size: 10.5px;
+                   white-space: pre-wrap; margin-top: 3px; }
   #tproj { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
            border-radius: 8px; font: inherit; font-size: 12px; padding: 3px 8px; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
@@ -1357,6 +1363,25 @@ function review(t) {
     ${list(rv.findings, "")}${list(rv.followups, "found alongside it:")}${filed}${unver}
   </div>`;
 }
+function landing(t) {
+  // A task whose commits never reached the base must not read as plainly done.
+  // The record is only written for projects that land their own work -- the
+  // branch is the deliverable everywhere else, and a warning on every task
+  // would hide the one that means something -- so anything present here is
+  // worth showing, including the refusals that never reached git.
+  const l = (t.result || {}).landing;
+  if (!l) return "";
+  if (l.landed)
+    return `<div class="land ok">landed ${esc((l.head || "").slice(0, 8))}</div>`;
+  if (l.stage === "in-progress") return `<div class="land">landing…</div>`;
+  const d = l.detail ? `<div class="d">${esc(String(l.detail).slice(-300))}</div>` : "";
+  // Never a candidate (unverified, no suite) versus git asked and refused.
+  // Only the second leaves a branch for anyone to do something about.
+  if (!l.eligible)
+    return `<div class="land">not landed — ${esc(l.detail || l.stage || "?")}</div>`;
+  return `<div class="land bad">not landed (${esc(l.stage || "?")}) — ${
+    esc(l.branch || "the branch")} is waiting for you${d}</div>`;
+}
 function taskButtons(t) {
   const b = [];
   if (t.state === "proposed") {
@@ -1398,7 +1423,7 @@ async function renderTasks() {
       <span class="tt">${esc(t.title)}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
-          age(t.created)}</div>${review(t)}</span>
+          age(t.created)}</div>${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`).join("");
 }
 // Work that finished and never reached the base. Nothing in the dashboard

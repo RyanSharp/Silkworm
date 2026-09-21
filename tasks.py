@@ -51,9 +51,13 @@ TERMINAL = (DONE, CANCELLED)
 #: roles.parse_verdict. `landed` is the commit the work reached the base branch
 #: as (db2a533); it is forty bytes, it is written nowhere else, and without it a
 #: task that landed is indistinguishable from one whose branch was discarded --
-#: the same mistake as losing the verdict. The reply text is the bulk, and once
-#: the work has landed nobody opens that again.
-RESULT_KEEPS = ("cost", "review", "landed")
+#: the same mistake as losing the verdict. `landing` is the same argument for
+#: the case that did *not* land -- the stage the merge refused at and why. It is
+#: what stops a finished task with unmerged commits reading as plainly done, so
+#: throwing it away at fourteen days would only defer that silence rather than
+#: end it, and a refusal is worth keeping more than a success is. The reply text
+#: is the bulk, and once the work has landed nobody opens that again.
+RESULT_KEEPS = ("cost", "review", "landed", "landing")
 
 #: state -> states it may move to. Anything absent is rejected, so an executor
 #: bug shows up as a refused transition rather than a task in a nonsense state.
