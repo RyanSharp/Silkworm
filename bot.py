@@ -1324,6 +1324,12 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": False, "error": str(e)}
     if action == "create":
         try:
+            # Checked before the project is ensured, so a refused filing leaves
+            # nothing behind -- and checked here at all because this route used
+            # to pass whatever role string it was handed straight to the store.
+            role = payload.get("role", "assistant")
+            if not roles.known(role):
+                return {"ok": False, "error": f"unknown role {role!r}"}
             proj = (payload.get("project") or "").strip()
             if proj:
                 proj = project_store.ensure(proj)["slug"]
@@ -1335,7 +1341,7 @@ def handle_tasks(payload: dict) -> dict:
             scope = payload.get("scope") or project_store.scope_for(proj) \
                 or {"cwd": str(CLAUDE_CWD)}
             t = task_store.create(payload.get("goal", ""),
-                                  role=payload.get("role", "assistant"),
+                                  role=role,
                                   project=proj,
                                   source=payload.get("source", "ui"),
                                   state=payload.get("state", tasks.QUEUED),
@@ -2177,6 +2183,14 @@ def execute_task(task: dict) -> None:
     """Run one claimed task. Already in `running` — the claim did that."""
     tid = task["id"]
     role_name = task.get("role") or "assistant"
+    # A role we cannot recognise is not run. roles.get() now falls back to
+    # read-only rather than to the unrestricted assistant template, so this is
+    # belt and braces -- but a task whose permissions are a guess should stop
+    # and say so rather than quietly run under permissions nobody chose.
+    if not roles.known(role_name):
+        log.error("task %s names unknown role %r; refusing to run it", tid, role_name)
+        task_state(tid, tasks.FAILED, f"unknown role {role_name!r}")
+        return
     fresh = roles.is_fresh(role_name)
     scope = task.get("scope") or {}
     cwd = Path(scope.get("cwd") or CLAUDE_CWD)

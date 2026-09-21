@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 
 import jsonstore
+import roles
 
 log = logging.getLogger("silkworm.tasks")
 
@@ -180,6 +181,15 @@ def make(goal: str, **fields) -> dict:
         log.warning("ignoring undeclared task field(s): %s", ", ".join(stray))
     if task["state"] not in STATES:
         raise ValueError(f"unknown state {task['state']!r}")
+    # The role decides what the task is allowed to do when it runs, so an
+    # unrecognised one is refused here rather than persisted and discovered at
+    # execution time. Validated in the same place as the state, and for the
+    # same reason: a field that changes behaviour should never reach the store
+    # holding a value nothing understands.
+    if not task["role"]:
+        task["role"] = default("role")
+    if not roles.known(task["role"]):
+        raise ValueError(f"unknown role {task['role']!r}")
     return task
 
 

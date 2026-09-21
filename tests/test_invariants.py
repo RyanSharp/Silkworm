@@ -5679,6 +5679,105 @@ def test_review_followups():
           "the whole verdict is already in front of them")
 
 
+# --- an unrecognised role must not become an unrestricted one ------------------
+# roles.get() was ROLES.get(name, ROLES["assistant"]): a typo, a stray trailing
+# space, or a role name from another build resolved to `assistant`, which is
+# unrestricted, so a role meant to be read-only ran with
+# --dangerously-skip-permissions. And only one of the two places a task is
+# created ever checked the name, so the bad value could be stored in the first
+# place.
+
+def test_unknown_role_fails_closed():
+    import roles
+    import tasks as T
+    print("\nan unrecognised role fails closed")
+
+    # Half one: a name nothing understands never reaches the store.
+    for bad in ("reviewr", "reviewer ", "Reviewer", "admin", "root"):
+        try:
+            T.make("do a thing", role=bad)
+            check(f"{bad!r} is refused at creation", False, "it was accepted")
+        except ValueError:
+            check(f"{bad!r} is refused at creation", True)
+    for good in sorted(roles.ROLES):
+        check(f"{good!r} still builds", T.make("x", role=good)["role"] == good)
+    check("an absent role is still the default",
+          T.make("x")["role"] == "assistant"
+          and T.make("x", role="")["role"] == "assistant"
+          and T.make("x", role=None)["role"] == "assistant")
+
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    try:
+        store.create("x", role="reviewr")
+        check("the store refuses it too", False, "it was accepted")
+    except ValueError:
+        check("the store refuses it too", True)
+    check("and a refused task is not persisted", store.all() == {})
+
+    # Half two: even if one were stored, resolving it gives the *most*
+    # restricted template, not the least.
+    default = ["--dangerously-skip-permissions"]
+    for bad in ("reviewr", "reviewer ", "totally-made-up"):
+        args = roles.permission_args(bad, default)
+        check(f"{bad!r} never gets full autonomy",
+              "--dangerously-skip-permissions" not in args, f"got {args}")
+        check(f"{bad!r} resolves to a read-only role", roles.get(bad).get("restricted"))
+        check(f"{bad!r} cannot edit or write",
+              "Edit" not in args[1] and "Write" not in args[1])
+    check("a made-up name is not reported as known", not roles.known("reviewr"))
+    check("the genuine default is untouched",
+          roles.known("") and roles.known(None)
+          and roles.permission_args("assistant", default) == default
+          and roles.permission_args("", default) == default,
+          "failing closed must not change how a Slack turn runs")
+
+    # Both halves again, where they are wired in.
+    tree = ast.parse((BASE / "bot.py").read_text())
+
+    def fn(name):
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def lines_of(node, dotted):
+        """Line numbers of every `a.b(...)` call inside node."""
+        out = []
+        for c in ast.walk(node):
+            if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                    and isinstance(c.func.value, ast.Name)
+                    and f"{c.func.value.id}.{c.func.attr}" == dotted):
+                out.append(c.lineno)
+        return out
+
+    ex = fn("execute_task")
+    guard, runs = lines_of(ex, "roles.known"), lines_of(ex, "roles.permission_args")
+    check("the runner checks the role name before it builds any run args",
+          guard and runs and min(guard) < min(runs),
+          "permissions derived from a name nobody recognises are a guess")
+    guards = [n for n in ast.walk(ex) if isinstance(n, ast.If)
+              and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                      and c.func.attr == "known" for c in ast.walk(n.test))]
+    check("and refuses the task instead of running it anyway",
+          any(any(isinstance(b, ast.Return) for b in ast.walk(g))
+              and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                      and c.func.id == "task_state" for c in ast.walk(g))
+              for g in guards),
+          "it must stop and say so, not fall through")
+
+    branch = next(n for n in ast.walk(fn("handle_tasks"))
+                  if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                  and isinstance(n.test.left, ast.Name) and n.test.left.id == "action"
+                  and isinstance(n.test.comparators[0], ast.Constant)
+                  and n.test.comparators[0].value == "create")
+    checked = lines_of(branch, "roles.known")
+    check("the dashboard route validates the role before filing",
+          checked and lines_of(branch, "task_store.create")
+          and min(checked) < min(lines_of(branch, "task_store.create")),
+          "this route passed whatever string it was handed straight to the store")
+    check("and before a project is made as a side effect",
+          checked and lines_of(branch, "project_store.ensure")
+          and min(checked) < min(lines_of(branch, "project_store.ensure")),
+          "a refused filing should leave nothing behind")
+
 
 # --- everyone else who touches a state file -----------------------------------
 # The stores themselves go through jsonstore now, but two callers reach around
@@ -6107,7 +6206,9 @@ if __name__ == "__main__":
               test_dashboard_classifiers, test_watermark, test_bounded_state,
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_review_followups, test_email_ingest, test_modules_are_imported,
+              test_review_gate, test_review_followups,
+              test_unknown_role_fails_closed,
+              test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_landing_is_visible,
               test_parallel_tasks,
               test_worktrees, test_cancel_stops_the_child,

@@ -116,8 +116,35 @@ ROLES: dict[str, dict] = {
 }
 
 
+#: What an unrecognised role resolves to. A name that is not in ROLES -- a
+#: typo, a stray trailing space, a record written by an older or newer build --
+#: used to land on `assistant`, which is unrestricted. That made the one
+#: mechanism keeping the reviewer and the nightly ideator from changing
+#: anything fail in the permissive direction: the role meant to be read-only
+#: would have run with --dangerously-skip-permissions. It now falls back to the
+#: most restricted template there is instead of the least.
+UNKNOWN: dict = {
+    "system": "",
+    "review": False,
+    "restricted": True,      # read-only, enforced by the permission args
+    "fresh": True,           # nothing unrecognised inherits a session
+    "tools": REVIEWER_TOOLS,
+    "model": None,
+}
+
+
+def known(name: str) -> bool:
+    """Whether this is a role we recognise. Empty means the default one."""
+    return (name or "assistant") in ROLES
+
+
 def get(name: str) -> dict:
-    return ROLES.get(name or "assistant", ROLES["assistant"])
+    """The template for a role, failing closed on anything unrecognised."""
+    role = ROLES.get(name or "assistant")
+    if role is None:
+        log.error("unknown role %r: falling back to read-only permissions", name)
+        return UNKNOWN
+    return role
 
 
 def needs_review(name: str) -> bool:
