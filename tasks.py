@@ -45,6 +45,14 @@ NEEDS_ATTENTION = (PROPOSED, AWAITING_APPROVAL, NEEDS_INPUT, FAILED)
 
 TERMINAL = (DONE, CANCELLED)
 
+#: Who may be executing a task. `inline` means a live handler already owns it;
+#: `queue` means the runner may claim it. Checked like STATES, and for the same
+#: reason: this field decides whether anything ever picks the task up. A value
+#: nothing recognises is claimed by the runner (which wants "queue") and owned
+#: by no live handler either, so the task simply sits in `queued` for ever,
+#: looking filed and never running.
+DRIVERS = ("inline", "queue")
+
 #: The keys of `result` a compacted record keeps. Cost is the number the history
 #: is read for ("what has this project cost me"), and `review` is the record
 #: that the work was checked -- the dashboard shows it on every row, finished
@@ -181,6 +189,8 @@ def make(goal: str, **fields) -> dict:
         log.warning("ignoring undeclared task field(s): %s", ", ".join(stray))
     if task["state"] not in STATES:
         raise ValueError(f"unknown state {task['state']!r}")
+    if task["driver"] not in DRIVERS:
+        raise ValueError(f"unknown driver {task['driver']!r}")
     # The role decides what the task is allowed to do when it runs, so an
     # unrecognised one is refused here rather than persisted and discovered at
     # execution time. Validated in the same place as the state, and for the

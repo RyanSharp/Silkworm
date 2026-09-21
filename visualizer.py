@@ -807,6 +807,7 @@ PAGE = r"""<!doctype html>
     <div class="lform">
       <input class="text" id="tgoal" placeholder="what should it do?"
              onkeydown="if(event.key==='Enter')addTask()">
+      <select id="trole" title="how this runs"></select>
       <input class="scope" id="tnewproj" placeholder="project (optional)">
       <input class="scope" id="tcwd" placeholder="working dir (blank = default)">
       <button class="act" onclick="addTask()">Queue it</button>
@@ -1252,7 +1253,7 @@ function toggleTasks() {
   const m = document.getElementById("taskmodal");
   const open = m.style.display !== "flex";
   m.style.display = open ? "flex" : "none";
-  if (open) renderProjects().then(renderTasks);
+  if (open) { renderRoles(); renderProjects().then(renderTasks); }
 }
 function setTaskView(v) {
   taskView = v;
@@ -1308,6 +1309,17 @@ async function renderProjects() {
       p.needs ? ` (${p.needs})` : p.open ? ` · ${p.open}` : ""}</option>`).join("");
   sel.value = keep;
 }
+// The choices come from roles.FILEABLE, the same list the route that accepts
+// the filing checks against, so the form cannot offer something that will be
+// refused -- or quietly file a different kind of task than a conversation does.
+async function renderRoles() {
+  const sel = document.getElementById("trole");
+  if (sel.options.length) return;               // a fixed list; ask once
+  const r = await taskCall({action: "roles"});
+  sel.innerHTML = (r.roles || []).map(x =>
+    `<option value="${esc(x.name)}"${x.default ? " selected" : ""}
+     >${esc(x.name)} — ${esc(x.hint)}</option>`).join("");
+}
 async function addTask() {
   const goal = document.getElementById("tgoal").value.trim();
   if (!goal) return;
@@ -1315,7 +1327,11 @@ async function addTask() {
   // an explicit project wins; otherwise inherit whatever is being filtered on
   const proj = document.getElementById("tnewproj").value.trim()
             || document.getElementById("tproj").value;
+  // Left off if the list never loaded, so the route's own default applies
+  // rather than an empty string standing in for a choice.
+  const role = document.getElementById("trole").value;
   const r = await taskCall({action: "create", goal, project: proj || undefined,
+                            role: role || undefined,
                             scope: cwd ? {cwd} : undefined});
   if (r.ok) {
     document.getElementById("tgoal").value = "";

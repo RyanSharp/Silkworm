@@ -116,6 +116,40 @@ ROLES: dict[str, dict] = {
 }
 
 
+#: The roles a person may file a task as, and what each one means in the words
+#: the form offers them. `reviewer` and `ideator` are absent on purpose: the
+#: bot spawns those itself, and neither is work anyone asks for.
+#:
+#: This lives here rather than at either front door because the two doors
+#: disagreeing is exactly what it exists to stop. The dashboard filed
+#: `assistant`, whose review flag is False, so the same sentence typed into the
+#: box got no reviewer, no verification -- verify_work is behind the same flag
+#: -- and therefore nothing that could ever land, while typed into Slack it
+#: filed `implementor` and got the whole gate. Nothing said which you had got.
+FILEABLE: dict[str, str] = {
+    "implementor": "reviewed, verified, then landed",
+    "assistant":   "runs unreviewed, lands nothing",
+}
+
+#: What you get when you do not say. Matches handle_file_task: filing work is
+#: asking for work to be done, and work that is done gets checked.
+DEFAULT_FILED = "implementor"
+
+
+def validate_filed(name: str) -> str:
+    """Why a person may not file work as this role, or "" if they may.
+
+    Mirrors scoping.validate: an empty string means yes. An internal role is
+    refused for a different reason than a typo, and says so, because "unknown
+    role 'reviewer'" is a confusing thing to be told about a role that exists.
+    """
+    if name in FILEABLE:
+        return ""
+    if name in ROLES:
+        return f"{name!r} is internal; Silkworm spawns it itself"
+    return f"unknown role {name!r}"
+
+
 #: What an unrecognised role resolves to. A name that is not in ROLES -- a
 #: typo, a stray trailing space, a record written by an older or newer build --
 #: used to land on `assistant`, which is unrestricted. That made the one

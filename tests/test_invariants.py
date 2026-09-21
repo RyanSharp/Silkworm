@@ -1663,8 +1663,11 @@ def test_ideation():
 
     h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
     check("a proposal waits rather than running", "tasks.PROPOSED if propose" in h)
+    import roles as _R
     check("and an ideator cannot file more ideators",
-          'role in ("reviewer", "ideator")' in h)
+          "roles.validate_filed(role)" in h
+          and bool(_R.validate_filed("ideator"))
+          and bool(_R.validate_filed("reviewer")))
     ex = bot[bot.index("def execute_task"):bot.index("def resolve_review")]
     check("a read-only role gets no worktree",
           'not roles.get(role_name).get("restricted")' in ex,
@@ -1749,7 +1752,7 @@ def _cli_file_task_impl():
 # anything, so scoping ended with a plan in a thread and no way to act on it.
 
 def test_scoping():
-    import scoping as S, tasks as T
+    import roles as R, scoping as S, tasks as T
     print("\nscoped work can be filed from a conversation")
 
     check("a goal too short to act on is refused",
@@ -1791,9 +1794,11 @@ def test_scoping():
           "you scoped it with the user, who is who the proposed gate asks — "
           "only an unattended proposal has to wait")
     check("it defaults to implementor, so output gets reviewed",
-          'payload.get("role") or "implementor"' in h)
+          'payload.get("role") or roles.DEFAULT_FILED' in h
+          and R.DEFAULT_FILED == "implementor" and R.needs_review(R.DEFAULT_FILED))
     check("neither a reviewer nor an ideator can be filed as work",
-          'role in ("reviewer", "ideator")' in h,
+          "roles.validate_filed(role)" in h
+          and bool(R.validate_filed("reviewer")) and bool(R.validate_filed("ideator")),
           "reviewing a review would not terminate, and an ideator that could "
           "file ideators would propose its way into a loop")
     check("it runs on the queue, not inline", 'driver="queue"' in h,
@@ -5768,7 +5773,7 @@ def test_unknown_role_fails_closed():
                   and isinstance(n.test.left, ast.Name) and n.test.left.id == "action"
                   and isinstance(n.test.comparators[0], ast.Constant)
                   and n.test.comparators[0].value == "create")
-    checked = lines_of(branch, "roles.known")
+    checked = lines_of(branch, "roles.validate_filed")
     check("the dashboard route validates the role before filing",
           checked and lines_of(branch, "task_store.create")
           and min(checked) < min(lines_of(branch, "task_store.create")),
@@ -6200,6 +6205,158 @@ def test_thread_links_open_the_thread():
           out.stdout or out.stderr[:200])
 
 
+
+def _dashboard_create_impl():
+    """Load handle_tasks out of bot.py without importing it.
+
+    The same trick as _file_task_impl, and for the same reason: bot.py needs
+    Slack tokens to import, and the point is to drive the shipped route rather
+    than read its source. Only the two stores are stand-ins -- one real
+    TaskStore, and a project_store that records what it was asked to create so
+    a refused filing can be shown to have left nothing behind.
+    """
+    import types
+    import roles as R, tasks as T
+    from tasks import TaskStore
+
+    fn = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "handle_tasks")
+    ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    made: list = []
+    mod = types.ModuleType("dashboard")
+    mod.__dict__.update(
+        roles=R, tasks=T, task_store=ts, time=time,
+        log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
+        project_store=types.SimpleNamespace(
+            ensure=lambda n, **kw: (made.append(n), {"slug": n})[1],
+            home=lambda n, create=False: made.append(n),
+            scope_for=lambda n: None),
+    )
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<dashboard>", "exec"),
+         mod.__dict__)
+    return mod.handle_tasks, ts, made
+
+
+# --- both front doors must file the same kind of work -------------------------
+# Typing a goal into the dashboard and saying the same sentence in Slack are
+# both first-class ways to file work (DESIGN.md step 3), and they disagreed.
+# The form sent no role at all, handle_tasks defaulted to `assistant`, and
+# needs_review("assistant") is False -- so no reviewer was ever spawned,
+# verify_work never ran (it is behind the same flag), `verified` stayed None,
+# and land_if_ready then refused the work for never having been verified. The
+# task still got its own worktree and still ran with full permissions, so it
+# committed happily; the commits just sat on a branch nothing would ever
+# review, verify or land. Nothing in the form said which of the two you had
+# asked for.
+
+def test_front_doors_agree():
+    import re
+    import roles as R, tasks as T
+    print("\nfiling the same work either way gets the same task")
+
+    create, dash_store, projects_made = _dashboard_create_impl()
+    file_task, filed_this_turn, _conv_store, _made = _file_task_impl()
+    GOAL = "Cache the résumé parser's output"
+    KEY = "C1:1785644289.000100"
+
+    def dash(**kw):
+        return create({"action": "create", "goal": GOAL, **kw})
+
+    def conv(**kw):
+        filed_this_turn.clear()
+        return file_task({"key": KEY, "goal": GOAL, **kw})
+
+    a, b = dash(), conv()
+    check("the same goal filed either way gets the same role",
+          a["ok"] and b["ok"] and a["task"]["role"] == b["role"],
+          f"the dashboard filed {(a.get('task') or {}).get('role')!r} and a "
+          f"conversation filed {b.get('role')!r}")
+    check("and it is a role whose output is checked",
+          R.needs_review(a["task"]["role"]),
+          "work nobody reviews is never verified either, so it can never land")
+    check("saying so explicitly still works from either",
+          dash(role="assistant")["task"]["role"] == "assistant"
+          and conv(role="assistant")["role"] == "assistant",
+          "the default is a default, not the only answer")
+
+    # A name nothing recognises is refused, with a reason, at both doors --
+    # rather than resolving to the permissive template and running there.
+    for bad in ("implementer", "Implementor", "admin", "root"):
+        d, c = dash(role=bad), conv(role=bad)
+        check(f"the dashboard refuses {bad!r}",
+              not d["ok"] and bad in (d.get("error") or ""),
+              f"answered {d.get('error') or d}")
+        check(f"and so does a conversation",
+              not c["ok"] and bad in (c.get("error") or ""),
+              f"answered {c.get('error') or c}")
+    for internal in ("reviewer", "ideator"):
+        d = dash(role=internal)
+        check(f"{internal!r} cannot be filed as work", not d["ok"])
+        check("and is refused for existing, not for being unknown",
+              "internal" in (d.get("error") or "").lower(),
+              f"'{d.get('error')}' — it does exist; saying it does not is "
+              "a confusing thing to read")
+
+    # Refused before anything is written: naming a project creates a record
+    # and a directory on disk, and that used to run above the check.
+    projects_made.clear()
+    before = len(dash_store.all())
+    d = dash(role="admin", project="invented")
+    check("a refused filing stores nothing and makes no project",
+          not d["ok"] and projects_made == [] and len(dash_store.all()) == before,
+          f"made {projects_made}")
+
+    # driver decides whether the queue runner may ever claim the task. `state`
+    # was already checked by the factory; this was not, so a value nothing
+    # recognises filed a task no runner would take and no handler owned.
+    for bad in ("queued", "runner", "inline ", "Queue"):
+        d = dash(driver=bad)
+        check(f"a driver of {bad!r} is refused",
+              not d["ok"] and "driver" in (d.get("error") or ""),
+              f"answered {d.get('error') or d}")
+    check("both real drivers still file",
+          all(dash(driver=x)["ok"] for x in T.DRIVERS)
+          and set(T.DRIVERS) == {"inline", "queue"})
+    check("and filed work is driven by the queue unless told otherwise",
+          dash()["task"]["driver"] == "queue",
+          "nobody is holding a live message for it")
+    for bad, field in (("runner", "driver"), ("nonsense", "state")):
+        try:
+            T.make("x", **{field: bad})
+            check(f"the factory refuses a bad {field}", False, "it was accepted")
+        except ValueError as e:
+            check(f"the factory refuses a bad {field}", field in str(e), str(e))
+
+    # A filing starts queued or proposed. Every other state is a real state --
+    # so the factory passes it -- and means something that has not happened.
+    for bad in (T.RUNNING, T.DONE, T.BLOCKED, T.AWAITING_APPROVAL):
+        d = dash(state=bad)
+        check(f"a task cannot be filed straight into {bad!r}",
+              not d["ok"] and bad in (d.get("error") or ""),
+              f"answered {d.get('error') or d}")
+    check("queued and proposed both go through",
+          all(dash(state=st)["ok"] for st in (T.QUEUED, T.PROPOSED)))
+
+    # And the form itself, which is the half a person actually sees.
+    r = create({"action": "roles"})
+    check("the route publishes exactly what may be filed",
+          r["ok"] and [x["name"] for x in r["roles"]] == list(R.FILEABLE))
+    check("and which one you get by not choosing",
+          r["default"] == R.DEFAULT_FILED
+          and [x["name"] for x in r["roles"] if x["default"]] == [R.DEFAULT_FILED])
+    check("each choice says what it means",
+          all(x["hint"] for x in r["roles"]),
+          "'implementor' on its own does not tell you the work gets reviewed")
+
+    viz = (BASE / "visualizer.py").read_text()
+    js = re.search(r"<script>(.*?)</script>", viz, re.S).group(1)
+    check("the form offers the choice at all", 'id="trole"' in viz)
+    check("it asks the route what the choices are", 'action: "roles"' in js)
+    check("and sends back what was picked", "role: role || undefined" in js)
+    check("the page names no role of its own",
+          not any(name in js for name in R.FILEABLE),
+          "a second copy of the list is a second thing to drift")
+
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
@@ -6207,7 +6364,7 @@ if __name__ == "__main__":
               test_schema, test_command_dedup, test_viz_bind_requires_token,
               test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
               test_review_gate, test_review_followups,
-              test_unknown_role_fails_closed,
+              test_unknown_role_fails_closed, test_front_doors_agree,
               test_email_ingest, test_modules_are_imported,
               test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_landing_is_visible,
               test_parallel_tasks,

@@ -179,7 +179,12 @@ graph to maintain.
 3. **"Needs me" view** in the dashboard, plus create-a-task. *(built: a 📋
    Tasks panel opening on what needs you, with accept/dismiss/retry/cancel and
    a header badge counting them. Recovery reports each thread's outcome so a
-   rescued reply closes its task as done rather than filing a false failure.)*
+   rescued reply closes its task as done rather than filing a false failure.
+   The box files the same kind of task a conversation does: both doors read
+   `roles.FILEABLE`, so the same sentence typed in either place defaults to
+   `implementor` and gets the same review-and-verify gate. It used to default
+   to `assistant`, which needs no review — so dashboard work was never
+   reviewed, never verified, and could never land, and nothing said so.)*
 4. **`reviewer` role** and one gate on implementor output. *(built: an
    implementor cannot complete on its own say-so — its result goes to a
    reviewer with a fresh session and read-only tools, and the task waits in

@@ -1316,6 +1316,12 @@ def handle_tasks(payload: dict) -> dict:
         # merge something.
         rows = branches.survey(_filter(list(task_store.all().values())))
         return {"ok": True, "unmerged": rows, "summary": branches.line(rows)}
+    if action == "roles":
+        # What the form may offer, fetched rather than written into the page,
+        # so the choices and the rule that enforces them cannot drift apart.
+        return {"ok": True, "default": roles.DEFAULT_FILED,
+                "roles": [{"name": n, "hint": h, "default": n == roles.DEFAULT_FILED}
+                          for n, h in roles.FILEABLE.items()]}
     if action == "ingest-email":
         try:
             return run_email_ingest()
@@ -1324,12 +1330,27 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": False, "error": str(e)}
     if action == "create":
         try:
+            # The same default and the same choices as filing from a
+            # conversation (handle_file_task, via roles.FILEABLE). This route
+            # used to default to `assistant`, whose review flag is False, so
+            # the same sentence typed into the dashboard got no reviewer, no
+            # verification and nothing that could ever land -- on a branch, in
+            # its own worktree, with full permissions, and nothing saying so.
+            #
             # Checked before the project is ensured, so a refused filing leaves
-            # nothing behind -- and checked here at all because this route used
-            # to pass whatever role string it was handed straight to the store.
-            role = payload.get("role", "assistant")
-            if not roles.known(role):
-                return {"ok": False, "error": f"unknown role {role!r}"}
+            # nothing behind.
+            role = (payload.get("role") or roles.DEFAULT_FILED).strip()
+            err = roles.validate_filed(role)
+            if err:
+                return {"ok": False, "error": err}
+            # `make` checks the state is a real one; it cannot know that only
+            # two of them are somewhere a *filing* may start. Queued means the
+            # runner will take it, proposed means it waits for you to accept
+            # it. Filed as `running`, it would be running with nothing running
+            # it, and nothing would ever pick it up.
+            state = payload.get("state") or tasks.QUEUED
+            if state not in (tasks.QUEUED, tasks.PROPOSED):
+                return {"ok": False, "error": f"cannot file a task as {state!r}"}
             proj = (payload.get("project") or "").strip()
             if proj:
                 proj = project_store.ensure(proj)["slug"]
@@ -1344,10 +1365,13 @@ def handle_tasks(payload: dict) -> dict:
                                   role=role,
                                   project=proj,
                                   source=payload.get("source", "ui"),
-                                  state=payload.get("state", tasks.QUEUED),
+                                  state=state,
                                   # Nobody is holding a live message for these,
                                   # so the runner is what will execute them.
-                                  driver=payload.get("driver", "queue"),
+                                  # An unrecognised one is refused by `make`,
+                                  # which is what this route's ValueError
+                                  # handler turns into an answer.
+                                  driver=payload.get("driver") or "queue",
                                   # Filed work stands on its own, so it runs in
                                   # its own checkout rather than the tree you
                                   # are editing.
@@ -1705,9 +1729,10 @@ def handle_file_task(payload: dict) -> dict:
     if err:
         return {"ok": False, "error": err}
 
-    role = payload.get("role") or "implementor"
-    if role not in roles.ROLES or role in ("reviewer", "ideator"):
-        return {"ok": False, "error": f"unknown role {role!r}"}
+    role = (payload.get("role") or roles.DEFAULT_FILED).strip()
+    err = roles.validate_filed(role)
+    if err:
+        return {"ok": False, "error": err}
 
     # Resolved only once the filing is going to happen. Naming a project
     # creates its record and its home directory on disk, and doing that above
