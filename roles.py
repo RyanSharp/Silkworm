@@ -173,7 +173,20 @@ def known(name: str) -> bool:
 
 
 def get(name: str) -> dict:
-    """The template for a role, failing closed on anything unrecognised."""
+    """The template for a role, failing closed on anything unrecognised.
+
+    A fallback, rather than a KeyError, on purpose. Every caller that creates
+    a task now validates the name first -- tasks.make() refuses one it does
+    not know, as it refuses a bad state -- so the only names that can reach
+    here are records written before a role was renamed or removed, and the
+    right answer to one of those is to run it with nothing it can break, not
+    to crash the queue runner's loop over a record it cannot even read the
+    goal of. The refusal still happens, loudly and where it can say why:
+    execute_task checks known() before it builds any run args and fails the
+    task. What this guarantees is the weaker, load-bearing thing -- that no
+    path to a permission argument can pass through a name nobody recognises
+    and come out unrestricted.
+    """
     role = ROLES.get(name or "assistant")
     if role is None:
         log.error("unknown role %r: falling back to read-only permissions", name)

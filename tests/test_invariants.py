@@ -6313,7 +6313,7 @@ def test_front_doors_agree():
         d = dash(driver=bad)
         check(f"a driver of {bad!r} is refused",
               not d["ok"] and "driver" in (d.get("error") or ""),
-              f"answered {d.get('error') or d}")
+              f"filed it with driver={(d.get('task') or {}).get('driver')!r}")
     check("both real drivers still file",
           all(dash(driver=x)["ok"] for x in T.DRIVERS)
           and set(T.DRIVERS) == {"inline", "queue"})
@@ -6333,19 +6333,21 @@ def test_front_doors_agree():
         d = dash(state=bad)
         check(f"a task cannot be filed straight into {bad!r}",
               not d["ok"] and bad in (d.get("error") or ""),
-              f"answered {d.get('error') or d}")
+              f"filed it in {(d.get('task') or {}).get('state')!r}")
     check("queued and proposed both go through",
           all(dash(state=st)["ok"] for st in (T.QUEUED, T.PROPOSED)))
 
     # And the form itself, which is the half a person actually sees.
     r = create({"action": "roles"})
     check("the route publishes exactly what may be filed",
-          r["ok"] and [x["name"] for x in r["roles"]] == list(R.FILEABLE))
+          r.get("ok") and [x["name"] for x in r.get("roles") or []]
+                          == list(R.FILEABLE))
     check("and which one you get by not choosing",
-          r["default"] == R.DEFAULT_FILED
-          and [x["name"] for x in r["roles"] if x["default"]] == [R.DEFAULT_FILED])
+          r.get("default") == R.DEFAULT_FILED
+          and [x["name"] for x in r.get("roles") or [] if x.get("default")]
+              == [R.DEFAULT_FILED])
     check("each choice says what it means",
-          all(x["hint"] for x in r["roles"]),
+          all(x.get("hint") for x in r.get("roles") or []),
           "'implementor' on its own does not tell you the work gets reviewed")
 
     viz = (BASE / "visualizer.py").read_text()
