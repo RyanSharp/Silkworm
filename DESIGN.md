@@ -757,5 +757,17 @@ is a second process on the bot's live files, and renaming one out from under a
 running bot, which is holding the real records in memory and will save them
 over the top, would turn a recoverable situation into a lost one.
 
-The cost is small: on the live 2.5 MB `tasks.json` a save goes from 13.0 ms to
-14.6 ms, almost all of which is `json.dumps` either way.
+Two callers reach past the stores at their files, and an atomic save fixes
+neither. The CLI's `import` read `sessions.json` with a bare `json.loads`
+inside an `except OSError`, so the one error it did not catch was the one this
+module is about; it goes through `load(repair=False)` now, and stops rather
+than importing against an empty set, which would re-register sessions Silkworm
+already tracks. And `run_email_ingest` had two callers — the poll loop and the
+dashboard's button — and no lock, unlike its harvest twin: both read the mail
+watermark, marked their own messages seen and wrote it back, so the later save
+dropped the other's progress and that mail was proposed twice. `os.replace`
+makes a save whole; it cannot make a read-modify-write exclusive.
+
+The cost is small: measured on a copy of the live `tasks.json` (2.95 MB, 706
+records) a full save goes from 7.0 ms to 8.9 ms, of which about 1 ms is the
+second copy. Almost all of the rest is `json.dumps`, which it paid before.

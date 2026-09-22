@@ -3685,7 +3685,10 @@ def test_atomic_persistence():
     check("a read-only caller still recovers",
           attempt(jsonstore.load, theirs, repair=False) == {"owner": "the bot"})
     check("without moving the owner's file aside or rewriting it",
-          theirs.read_text() == "{half" and not jsonstore.corrupt_path(theirs).exists())
+          # attempt(): a reader that broke this rule has renamed the file away,
+          # so reading it raises -- which would take the rest of the case with it.
+          attempt(theirs.read_text) == "{half"
+          and not jsonstore.corrupt_path(theirs).exists())
     check("leaving the repair to whoever owns it",
           attempt(jsonstore.load, theirs) == {"owner": "the bot"}
           and jsonstore.corrupt_path(theirs).exists()
@@ -3779,6 +3782,19 @@ def test_atomic_persistence():
           not jsonstore.corrupt_path(flaky).exists())
     check("so once the fd table clears, the newer save is still there",
           attempt(jsonstore.load, flaky) == {"records": "newer, and perfectly good"})
+
+    # load() refuses before it ever gets there, so _set_aside's own version of
+    # that rule is never reached through it. Checked directly rather than left
+    # to be believed: it is the contract of the function that does the renaming,
+    # and the next caller to arrive at it is the one that would learn otherwise.
+    fine = d / "fine.json"
+    fine.write_text('{"records": "perfectly readable"}')
+    moved = jsonstore._set_aside(fine, OSError(13, "Permission denied"))
+    check("setting aside is refused outright for an error that is not the contents",
+          moved is False and fine.exists() and not jsonstore.corrupt_path(fine).exists())
+    moved = jsonstore._set_aside(fine, json.JSONDecodeError("bad", "{", 0))
+    check("and done for one that is", moved is True and not fine.exists()
+          and jsonstore.corrupt_path(fine).exists())
 
     # The refusal binds whoever writes. A read-only reader -- the dashboard on
     # the bot's live files -- cannot rewind anything, so it still gets the
