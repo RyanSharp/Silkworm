@@ -706,10 +706,12 @@ never run again is a bad way to find that out.
 ## State that survives being killed
 
 Every store wrote itself with `path.write_text(json.dumps(...))`, which
-truncates the file and then fills it back in. `tasks.json` is over a megabyte
-and is rewritten on every create, update, transition and claim, from several
-threads at once, so that window was open a lot — and a `silkworm restart`, a
-crash or a reboot landing inside it leaves a half-written file. Neither
+truncates the file and then fills it back in. `tasks.json` is 2.95 MB and is
+rewritten on every create, update, transition and claim, from several threads
+at once, so that window was open a lot: with a reader polling a copy of the
+real file while it was saved sixty times, 38 of 61 reads — 62% — came back
+mid-write. A `silkworm restart`, a crash or a reboot landing in there leaves
+the file itself that way. Neither
 `TaskStore` nor `SessionStore` parsed defensively on the way back in, so the
 result was not a degraded bot but no bot: construction raised, startup failed,
 and the fix was hand-editing JSON with 400+ task records and every thread's
