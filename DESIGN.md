@@ -178,7 +178,9 @@ graph to maintain.
    the actual bottleneck. *(built)*
 3. **"Needs me" view** in the dashboard, plus create-a-task. *(built: a 📋
    Tasks panel opening on what needs you, with accept/dismiss/retry/cancel and
-   a header badge counting them. Recovery reports each thread's outcome so a
+   a header badge counting them. A row opens onto the whole goal, and onto why
+   a failure failed, so Accept and Dismiss are not decided from a title that is
+   the first sixty characters of a two-thousand-word case. Recovery reports each thread's outcome so a
    rescued reply closes its task as done rather than filing a false failure.
    The box files the same kind of task a conversation does: both doors read
    `roles.FILEABLE`, so the same sentence typed in either place defaults to

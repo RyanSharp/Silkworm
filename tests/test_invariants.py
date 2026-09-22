@@ -4511,8 +4511,8 @@ def test_dashboard_js_is_whole():
                  "loadList", "loadStats", "loadTranscript", "renderAlerts", "jumpTo",
                  "taskCall", "toggleTasks", "setTaskView", "renderProjects", "addTask",
                  "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
-                 "refreshTaskBadge", "landing", "releaseThread", "retitle",
-                 "nameAllThreads",
+                 "refreshTaskBadge", "taskDetail", "lastEvent", "landing",
+                 "releaseThread", "retitle", "nameAllThreads",
                  "resummarize", "toggleLearn", "renderLearnings", "renderUnmerged"):
         check(f"{name}() is defined", name in defined)
 
@@ -5022,6 +5022,146 @@ def test_landing_is_visible():
         check("and one that never reached git still gives its reason",
               "never verified" in rendered[4] and "not landed" in rendered[4],
               "this rendered as nothing, so approving unverified work went quiet")
+
+
+# --- a task row has to say what it is ---------------------------------------------
+# Fifty-one proposals sat in the panel showing nothing but the goal's first line
+# cut at sixty characters, while the whole goal -- two or three thousand words of
+# evidence -- was already in the payload, fetched on every poll and thrown away.
+# Accept spends a session, Dismiss throws one away, and both were being decided
+# from a sentence fragment. The same held for a failure: Retry and Dismiss, with
+# the reason sitting unread in events[-1].detail.
+
+DASHBOARD_DRIVER = r"""
+// Runs the dashboard's own javascript against a stub DOM and a stub fetch, then
+// prints the task list exactly as the browser would build it. The point is to
+// drive the real renderTasks rather than to read its source: a row that should
+// show its goal has to actually show it.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const tasks = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+process.on("unhandledRejection", () => {});
+
+function el(id) {
+  return {id, innerHTML: "", textContent: "", value: "", title: "", className: "",
+          style: {}, disabled: false, dataset: {}, children: [],
+          classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+          appendChild() {}, removeChild() {}, remove() {}, addEventListener() {},
+          insertAdjacentHTML() {}, focus() {}, scrollIntoView() {},
+          querySelector() { return null; }, querySelectorAll() { return []; },
+          getBoundingClientRect() { return {top: 0, left: 0, width: 0, height: 0}; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+globalThis.document = {getElementById: byId, createElement: () => el("new"),
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: "", hash: "", href: ""},
+                     matchMedia: () => ({matches: false, addEventListener() {}})};
+globalThis.location = globalThis.window.location;
+globalThis.localStorage = {getItem: () => null, setItem() {}, removeItem() {}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.fetch = async (url, opts) => {
+  const body = opts && opts.body ? JSON.parse(opts.body) : {};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions: [], slack: {}};
+  else if (url.startsWith("/api/stats"))
+    out = {total_cost: 0, cache_rate: null, threads: 0, days: []};
+  else if (url.startsWith("/api/projects")) out = {ok: true, projects: []};
+  else if (url.startsWith("/api/tasks"))
+    out = (body.action === "list" || body.action === "attention")
+      ? {ok: true, tasks, counts: {}} : {ok: true};
+  return {json: async () => out, text: async () => ""};
+};
+
+(0, eval)(src + "\n;globalThis.__renderTasks = renderTasks;");
+(async () => {
+  await globalThis.__renderTasks();
+  process.stdout.write(byId("tlist").innerHTML);
+})();
+"""
+
+
+def test_task_row_shows_its_own_goal():
+    import re
+    import shutil
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\na task row carries its goal and its reason")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+
+    # A nightly proposal: the title is the first line, the case is 2,600
+    # characters below it, and the panel has to be able to show both.
+    goal = ("Auto-merge lands work on local main and never publishes it, so the next "
+            "branch rebases onto a stale base.\n\n"
+            + "merge.py:118 rebases onto origin/HEAD but fast-forwards the local "
+              "checkout, and nothing pushes. " * 24
+            + "\n\nDone: land() pushes, or says why it did not. <script>alert(1)</script>\n"
+              "FINAL LINE OF THE CASE")
+    assert len(goal) > 2000, "the fixture has to be long enough to be truncated"
+    deep = "RAN OUT OF ROOM IN THE TITLE"
+    goal = goal[:1400] + deep + goal[1400:]
+
+    rows = [
+        {"id": "tsk_proposed1", "state": "proposed", "title": goal.splitlines()[0][:60],
+         "goal": goal, "project": "silkworm", "source": "ideate", "attempts": 1,
+         "created": time.time() - 3600, "thread": "", "events": [], "result": {}},
+        {"id": "tsk_failed1", "state": "failed", "title": "Say whether a cancelled task stopped",
+         "goal": "Say whether a cancelled task stopped\n\nand more besides", "project": "",
+         "source": "ui", "attempts": 2, "created": time.time() - 7200, "thread": "",
+         "result": {},
+         "events": [{"at": 1, "kind": "running", "detail": "claimed by the runner"},
+                    {"at": 2, "kind": "failed",
+                     "detail": "claude exited 1: NO WORKTREE, BRANCH ALREADY EXISTS"}]},
+        # A goal that fits in its title has nothing behind it, and opening an
+        # empty disclosure is worse than no disclosure.
+        {"id": "tsk_short1", "state": "queued", "title": "Bump the favicon",
+         "goal": "Bump the favicon", "project": "", "source": "ui", "attempts": 1,
+         "created": time.time() - 60, "thread": "", "events": [], "result": {}},
+    ]
+
+    node = shutil.which("node")
+    if not node:
+        # Couldn't run is not the same as passed. Fall back to the weaker
+        # structural reading so the invariant is not simply unchecked here.
+        print("  … node not installed — cannot run the page's own javascript")
+        body = js[js.index("async function renderTasks"):]
+        check("the row is built from taskDetail(t), which reads t.goal",
+              "taskDetail(t)" in body and "t.goal" in js)
+        return
+
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "tasks.json").write_text(json.dumps(rows))
+    (d / "drive.js").write_text(DASHBOARD_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(d / "tasks.json")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the dashboard's javascript runs", False, p.stderr.strip()[-400:])
+        return
+    html = p.stdout
+
+    check("the proposal's full goal reaches the row",
+          deep in html and "FINAL LINE OF THE CASE" in html,
+          "the panel still shows only the truncated title")
+    check("a failed row says why it failed",
+          "NO WORKTREE, BRANCH ALREADY EXISTS" in html,
+          "Retry and Dismiss with no reason on offer")
+    check("the goal is escaped, not injected",
+          "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+          and "<script>alert(1)</script>" not in html)
+
+    # Scannable by default: fifty rows of three thousand characters is only a
+    # different way of being unreadable.
+    opened = _re.findall(r"<details[^>]*>", html)
+    check("every row opens shut", opened and not any("open" in o for o in opened),
+          f"found: {opened}")
+    # Scope this to the row itself: a window of characters would reach back
+    # into the proposal above it and find that row's disclosure instead.
+    short = next(r for r in html.split('<div class="task">') if "tsk_short1" in r)
+    check("a goal that fits its title gets no disclosure at all",
+          "<details" not in short, "an empty expander is worse than none")
 
 
 # --- tasks.json only ever grew ---------------------------------------------------

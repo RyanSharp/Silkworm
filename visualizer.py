@@ -708,7 +708,19 @@ PAGE = r"""<!doctype html>
   .task .tt { flex: 1; }
   .task .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
   .task .proj { color: var(--gold); }
-  .task .rev { margin-top: 6px; font-size: 11.5px; line-height: 1.45; color: var(--ink);
+  /* The disclosure holding the goal. Shut by default -- fifty proposals each
+     showing three thousand characters is only a different way of being
+     unreadable -- but one click away, because Accept and Dismiss both cost
+     real money and the title is a sentence fragment. */
+  .task .more > summary { cursor: pointer; list-style-position: outside; }
+  .task .more > summary::marker { color: var(--muted); }
+  .task .goal { margin: 7px 0 0; padding: 8px 10px; max-height: 360px; overflow-y: auto;
+                white-space: pre-wrap; word-break: break-word;
+                font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+                color: var(--ink); background: #8881; border-radius: 6px; }
+  /* Why it stopped wears the same treatment as a flagged review: both answer
+     "what happened here" for a row that is asking you to decide something. */
+  .task .rev, .task .why { margin-top: 6px; font-size: 11.5px; line-height: 1.45; color: var(--ink);
                background: #D8517F14; border-left: 2px solid #D8517F;
                border-radius: 0 5px 5px 0; padding: 6px 9px; }
   /* A passed review is not a warning, so it does not wear the flagged colour --
@@ -1400,6 +1412,28 @@ function review(t) {
     ${list(rv.findings, "")}${list(rv.followups, "found alongside it:")}${filed}${unver}
   </div>`;
 }
+function lastEvent(t) {
+  // Why a task stopped is already on the record -- transition() writes the
+  // reason into events -- the row just never showed it. Prefer the event that
+  // put it in the state it is in; fall back to whatever happened last.
+  const ev = t.events || [];
+  const e = ev.filter(x => x.kind === t.state).slice(-1)[0] || ev.slice(-1)[0];
+  return (e && e.detail) || "";
+}
+function taskDetail(t) {
+  // A title is the goal's first line cut at sixty characters. For a nightly
+  // proposal that is the opening clause of two thousand words of evidence --
+  // file names, line numbers, what done looks like -- and the row asks you to
+  // spend a session on it or throw it away. The payload already carries the
+  // whole thing, so show it rather than fetching it and dropping it.
+  const goal = (t.goal || "").trim();
+  const why = t.state === "failed" ? lastEvent(t) : "";
+  // A short goal is its own title; there is nothing behind it to open.
+  const body = goal && goal !== (t.title || "").trim()
+    ? `<pre class="goal">${esc(goal)}</pre>` : "";
+  if (!body && !why) return "";
+  return (why ? `<div class="why">${esc(why)}</div>` : "") + body;
+}
 function landing(t) {
   // A task whose commits never reached the base must not read as plainly done.
   // The record is only written for projects that land their own work -- the
@@ -1468,13 +1502,19 @@ async function renderTasks() {
       : `<div class="hint">No tasks yet — queue one above.</div>`;
     return;
   }
-  list.innerHTML = r.tasks.map(t => `<div class="task">
+  list.innerHTML = r.tasks.map(t => {
+    const more = taskDetail(t);
+    const title = more
+      ? `<details class="more"><summary>${esc(t.title)}</summary>${more}</details>`
+      : esc(t.title);
+    return `<div class="task">
       <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
-      <span class="tt">${esc(t.title)}
+      <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
           age(t.created)}</div>${review(t)}${landing(t)}</span>
-      ${taskButtons(t)}</div>`).join("");
+      ${taskButtons(t)}</div>`;
+  }).join("");
 }
 // Work that finished and never reached the base. Nothing in the dashboard
 // mentioned branches at all, so eight completed tasks left eight unmerged
