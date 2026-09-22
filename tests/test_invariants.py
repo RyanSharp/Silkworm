@@ -711,6 +711,8 @@ def test_review_sees_the_work():
     tid = impl["id"]
     st.transition(tid, T.RUNNING)
     wt = W.create(repo, tid, fetch=False)
+    st.update(tid, scope={**impl["scope"], "worktree": str(wt)})
+    impl = st.get(tid)
     (wt / "fix.py").write_text("def fixed(): return 1\n")
     git(wt, "add", "-A"); git(wt, "commit", "-qm", "the work")
     ns["record_branch"](tid, wt, impl["scope"])
@@ -829,9 +831,12 @@ def test_review_sees_the_work():
 
     # Nothing between the two turns holds a directory open: the branch is
     # durable, so a review that never runs leaks nothing.
+    check("the implementor's scope named a checkout that is now gone",
+          not Path(impl["scope"]["worktree"]).exists(),
+          "without this the next check passes whether or not anything strips it")
     check("the review's scope carries no released worktree",
           "worktree" not in (child.get("scope") or {}),
-          "it pointed at a directory that had already been removed")
+          "inherited verbatim, it points at a directory that no longer exists")
 
     src = (BASE / "bot.py").read_text()
     exe = src[src.index("def execute_task("):src.index("def verify_work(")]
@@ -855,8 +860,12 @@ def test_review_sees_the_work():
         isinstance(d.value, ast.UnaryOp) and isinstance(d.value.op, ast.Not)
         and getattr(d.value.operand, "id", "") == "borrowed" for d in dels),
         "release() deletes on a commit count that has read as zero before now")
+    # Anchored on the release itself, not on how it is called: a change to the
+    # arguments is a different fault, and this check should not claim it.
+    released, acted = (exe.find("worktrees.release(worktree"),
+                       exe.find("resolve_review("))
     check("the checkout goes before the verdict is acted on",
-          exe.index("delete_empty_branch=not borrowed") < exe.index("resolve_review("),
+          released != -1 and acted != -1 and released < acted,
           "the landing reattaches the same branch and git refuses a held one")
     check("the branch is read from the record, not the dict in hand",
           "(task_store.get(tid) or task).get(\"branch\")" in gate,
