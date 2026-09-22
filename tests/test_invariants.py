@@ -3808,13 +3808,19 @@ def test_atomic_persistence():
         if str(dst).endswith(jsonstore.CORRUPT_SUFFIX):
             raise OSError(1, "Operation not permitted")
         return real_replace(src, dst, *a, **kw)
+    said = io.StringIO()
+    listener = logging.StreamHandler(said)
+    jsonstore.log.addHandler(listener)
     os.replace = wont_rename
     try:
         got = attempt(jsonstore.load, stubborn)
     finally:
         os.replace = real_replace
+        jsonstore.log.removeHandler(listener)
     check("a recovery that cannot set the wreckage aside still returns the records",
           got == {"records": "recoverable"}, f"{got!r}")
+    check("and does not claim to have kept a copy it could not move",
+          jsonstore.CORRUPT_SUFFIX not in said.getvalue(), said.getvalue())
     check("and leaves the wreckage rather than writing over the only copy of it",
           stubborn.read_text() == "{half", stubborn.read_text()[:40])
     check("so the next boot recovers again instead of finding nothing",
