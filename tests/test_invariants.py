@@ -3691,6 +3691,22 @@ def test_atomic_persistence():
           and jsonstore.corrupt_path(theirs).exists()
           and reads(theirs) == {"owner": "the bot"})
 
+    # Recovering and then failing to tidy up must not cost the records: we are
+    # holding them, and a full disk is no reason to hand back nothing.
+    stuck = d / "stuck.json"
+    jsonstore.save(stuck, {"records": "recovered"})
+    stuck.write_text("{half")
+    real_write = jsonstore._write
+    def no_room(path, text):
+        raise OSError(28, "No space left on device")
+    jsonstore._write = no_room
+    try:
+        got = attempt(jsonstore.load, stuck)
+    finally:
+        jsonstore._write = real_write
+    check("a recovery that cannot write itself back still returns the records",
+          got == {"records": "recovered"}, f"{got!r}")
+
     # Losing both copies must be loud. Starting empty here is the failure mode
     # that makes the loss invisible: an empty store looks like a fresh install.
     bp = d / "both.json"

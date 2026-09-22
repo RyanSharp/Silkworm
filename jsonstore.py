@@ -160,8 +160,15 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
             if repair:
                 # Put the recovered contents back where they belong, so the
                 # next reader doesn't have to repeat this. No backup pass: it
-                # already holds exactly this.
-                save(path, data, keep_backup=False)
+                # already holds exactly this. Tidying up is not worth losing
+                # over: we are holding the records, and refusing to hand them
+                # back because the disk is full would be the loss this whole
+                # module exists to prevent.
+                try:
+                    save(path, data, keep_backup=False)
+                except OSError as exc:
+                    log.warning("recovered %s but could not write it back: %s",
+                                path.name, exc)
             return data
 
     if primary_error is None:
