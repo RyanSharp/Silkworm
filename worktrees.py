@@ -129,8 +129,15 @@ def _local_if_ahead(repo, ref: str) -> str:
     return name
 
 
-def path_for(repo, task_id: str) -> Path:
-    return ROOT / f"{Path(repo).name}{SEP}{task_id}"
+def path_for(repo, task_id: str, label: str = "") -> Path:
+    """Where a task's checkout goes. `label` says what it is for.
+
+    The task id is always last: the sweep reads it back out of the directory
+    name, so anything in front of it is decoration and anything behind it would
+    be mistaken for it.
+    """
+    name = Path(repo).name + SEP + (label + SEP if label else "") + task_id
+    return ROOT / name
 
 
 #: `git worktree add` takes a repository-level lock while it writes refs, so
@@ -191,19 +198,25 @@ def create(repo, task_id: str, fetch: bool = True, base: str = "") -> Path | Non
     return path
 
 
-def attach(repo, task_id: str, branch: str) -> Path | None:
+def attach(repo, task_id: str, branch: str, label: str = "land") -> Path | None:
     """A checkout of an existing branch, for work that has already been done.
 
     Landing happens after the review, by which time the task's own worktree is
     long released -- but its branch survives. Reattaching the branch rather
     than creating one is what lets the work be rebased and retested later.
+
+    The review needs exactly the same thing, and for a sharper reason: the work
+    it has to read was committed inside a worktree that no longer exists, so
+    without this it stands in the main checkout and reviews a tree the change
+    never reached. `label` is only so that `git worktree list` says which of
+    the two a directory is.
     """
     repo = Path(repo)
     if not is_repo(repo):
         return None
     if _git(repo, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
         return None
-    path = ROOT / f"{repo.name}{SEP}land{SEP}{task_id}"
+    path = path_for(repo, task_id, label)
     if path.exists():
         return path
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -232,6 +245,24 @@ def is_dirty(worktree) -> bool:
 
 def branch_of(worktree) -> str:
     r = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def fork_point(repo, branch: str, base: str = "") -> str:
+    """The commit `branch` was cut from, as a sha, or "" if it cannot be found.
+
+    A review needs a fixed point to diff against, and the base *branch* is not
+    quite one. The name has to resolve wherever the reviewer happens to be
+    standing, and `origin/HEAD` is unset in plenty of repositories -- while a
+    reviewer whose opening command errors is back to reading the summary it was
+    asked not to trust. A sha always resolves.
+
+    It is also the fork point rather than the base branch's tip, which matters
+    because the base moves while a task works: `main..HEAD` read from the main
+    checkout would credit this task with other people's commits.
+    """
+    ref = base_ref(repo, fetch=False, prefer=base)
+    r = _git(repo, "merge-base", ref, branch)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
@@ -336,7 +367,11 @@ def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
     for path in ROOT.iterdir():
         if not path.is_dir() or SEP not in path.name:
             continue
-        task_id = path.name.split(SEP, 1)[1]
+        # From the right. A labelled checkout is `<repo>--land--<id>` or
+        # `<repo>--review--<id>`, and splitting from the front read the task id
+        # as "land--<id>" -- which is in nobody's keep set, so a landing or a
+        # review in progress became sweepable the moment it was an hour old.
+        task_id = path.name.rsplit(SEP, 1)[1]
         if task_id in keep:
             continue
         if age_s(path) < min_age_s:

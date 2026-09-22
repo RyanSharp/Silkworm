@@ -671,6 +671,208 @@ def test_review_gate():
     check("a fresh role does not repoint the thread's session",
           "if not fresh:" in exe)
 
+# --- the review must stand in the tree that holds the work --------------------
+# Isolation and the review gate cancelled each other out. An isolated task
+# commits inside its own worktree and nowhere else; the gate created the
+# reviewer with the scope the *implementor* had been given, whose cwd is the
+# main checkout, and that worktree had already been released. So the
+# independent check read an unchanged tree and could only believe the summary
+# it was told not to trust -- and a passing verdict is what lands work.
+
+def test_review_sees_the_work():
+    import roles
+    import tasks as T
+    import worktrees as W
+    from tasks import TaskStore
+    print("\nthe review stands where the work is")
+
+    def git(cwd, *a):
+        return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, text=True)
+
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "worktrees"
+    repo = root / "repo"; repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("hello\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ns = bot_functions("record_branch", "review_branch", "resolve_review",
+                       roles=roles, tasks=T, task_store=st, worktrees=W,
+                       branches=__import__("branches"),
+                       task_state=lambda tid, state, detail="": st.transition(
+                           tid, state, detail))
+
+    # An implementor's turn, for real: its own checkout, a commit in it, the
+    # branch written down on the way out, and the checkout released.
+    impl = st.create("add a fix", role="implementor", driver="queue", isolate=True,
+                     project="p", scope={"cwd": str(repo)})
+    tid = impl["id"]
+    st.transition(tid, T.RUNNING)
+    wt = W.create(repo, tid, fetch=False)
+    (wt / "fix.py").write_text("def fixed(): return 1\n")
+    git(wt, "add", "-A"); git(wt, "commit", "-qm", "the work")
+    ns["record_branch"](tid, wt, impl["scope"])
+    W.release(wt)
+    check("the implementor's own checkout is gone by review time",
+          not wt.exists(), "which is why the reviewer cannot simply inherit it")
+
+    # The base branch moves on underneath, as it does in a real repository.
+    (repo / "unrelated.txt").write_text("someone else\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "unrelated")
+
+    # The real enqueue path.
+    settled = ns["resolve_review"](impl, "implementor", "I added fix.py", "C1", "1.0")
+    kids = [r for r in st.all().values() if r.get("parent") == tid]
+    check("the gate enqueues a review and the task waits",
+          settled and len(kids) == 1 and st.get(tid)["state"] == T.BLOCKED)
+    child = kids[0]
+
+    branch = ns["review_branch"](child)
+    check("the review knows which branch to stand on",
+          branch == f"{W.BRANCH_PREFIX}{tid}",
+          "read off what the implementor left, which is the only record of it")
+
+    # Now run the review's own turn through the real execute_task and look at
+    # the directory it is actually handed. Snapshotted while the turn is
+    # happening: the checkout is released before execute_task returns, so
+    # looking afterwards finds nothing either way and would pass regardless.
+    st.transition(child["id"], T.RUNNING, "claimed by the runner")
+    seen = {}
+
+    def run_turn(goal, **kw):
+        here = Path(kw["cwd"])
+        seen["cwd"] = here
+        seen["has_work"] = (here / "fix.py").exists()
+        seen["head"] = git(here, "log", "--format=%s", "-1").stdout.strip()
+        return types.SimpleNamespace(text='{"ok": true, "summary": "fine"}',
+                                     cost_usd=0.0, duration_ms=1, session_id="s")
+
+    import logging
+    import threading
+    _bot_func("execute_task", tasks=T, task_store=st, store=tmp_store(),
+              roles=roles, worktrees=W, Path=Path, run_turn=run_turn,
+              review_branch=ns["review_branch"],
+              record_branch=ns["record_branch"],
+              OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+              permission_args=lambda: [], log=logging.getLogger("test"),
+              task_thread=lambda t: ("C1", "1.0"),
+              task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+              _thread_lock=lambda key: threading.Lock(),
+              repo_guard=lambda *a, **k: contextlib.nullcontext(),
+              render_block=lambda _: "", chunk=lambda text: [text],
+              to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+              upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+              ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+              )(st.get(child["id"]))
+    where = seen.get("cwd")
+
+    # The point of the whole exercise.
+    check("the reviewer's working directory contains the implementor's commits",
+          bool(seen.get("has_work")) and seen.get("head") == "the work",
+          f"the review ran in {where}, where the change does not exist")
+    check("and it is not the main checkout",
+          where != repo and not (repo / "fix.py").exists(),
+          "a review sent there audits a tree the change never reached")
+    check("the prompt it was given names that same directory",
+          str(where) in child["goal"],
+          "resolve_review predicts the path before the checkout exists; the "
+          "two have to agree or the prompt names a directory nobody is in")
+    check("and the checkout is released when the review's turn ends",
+          not where.exists(),
+          "the landing reattaches this branch and git refuses a held one")
+    where = W.attach(repo, child.get("parent"), branch, label="review")
+
+    # A branch name alone still leaves it guessing what in the tree is new.
+    check("the prompt names the branch", branch in child["goal"])
+    base = W.fork_point(repo, branch)
+    check("the fork point is the commit the branch was cut from",
+          base == git(repo, "rev-parse", "HEAD~1").stdout.strip(),
+          "not the base branch's tip, which has moved since")
+    check("and the prompt hands it over", base in child["goal"])
+
+    # Every command offered has to be one this reviewer can actually run. A
+    # missing base once produced `git log the base commit..HEAD`, which errors.
+    prefixes = _re.findall(r"Bash\(([^)]*?):\*\)", roles.REVIEWER_TOOLS)
+
+    def runnable(text, cwd):
+        cmds = _re.findall(r"`(git [^`]*)`", text)
+        if len(cmds) < 2:
+            return False, "it offers no commands to start from"
+        for cmd in cmds:
+            if not any(cmd.startswith(p) for p in prefixes):
+                return False, f"{cmd!r} is not in the reviewer's allowlist"
+            r = subprocess.run(cmd.split(), cwd=str(cwd), capture_output=True, text=True)
+            if r.returncode != 0 or not r.stdout.strip():
+                return False, f"{cmd!r}: {(r.stderr or 'no output').strip()[:90]}"
+        return True, ""
+
+    ok, why = runnable(child["goal"], where)
+    check("every command it is given is allowed, runs, and shows the work", ok, why)
+    ok, why = runnable(roles.review_goal(child, "x", cwd=str(where),
+                                         branch=branch, base=""), where)
+    check("including when there is no fork point and it must fall back", ok, why)
+    check("a placeholder never reaches the reviewer as a revision",
+          "the base commit" not in roles.review_goal(child, "x", cwd=str(where),
+                                                     branch=branch, base=""))
+
+    # The branch under a review belongs to somebody else.
+    W.release(where, delete_empty_branch=False)
+    check("releasing the review's checkout leaves the branch alone",
+          git(repo, "rev-parse", "--verify", "--quiet", branch).returncode == 0,
+          "it is the only copy of the work, and the landing reattaches it")
+    landing = W.attach(repo, tid, branch)
+    check("and the landing can then have the branch", landing is not None,
+          "git refuses a branch already checked out in another worktree")
+    W.release(landing, delete_empty_branch=False)
+
+    # Nothing between the two turns holds a directory open: the branch is
+    # durable, so a review that never runs leaks nothing.
+    check("the review's scope carries no released worktree",
+          "worktree" not in (child.get("scope") or {}),
+          "it pointed at a directory that had already been removed")
+
+    src = (BASE / "bot.py").read_text()
+    exe = src[src.index("def execute_task("):src.index("def verify_work(")]
+    gate = src[src.index("def resolve_review("):src.index("def land_if_ready(")]
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "execute_task")
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", "") == "attach"]
+    check("execute_task checks out the branch under review",
+          len(calls) == 1 and any(k.arg == "label" for k in calls[0].keywords),
+          "without this the reviewer runs in whatever scope it inherited")
+    check("and it is the branch review_branch names, not one guessed from an id",
+          any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "review_branch"
+              for n in ast.walk(fn)))
+    check("what it borrows is never recorded as its own work",
+          "if not borrowed:" in exe and "record_branch" in exe,
+          "the implementor's commits would be filed against the review")
+    dels = [n for n in ast.walk(fn) if isinstance(n, ast.keyword)
+            and n.arg == "delete_empty_branch"]
+    check("and is never deleted as an empty branch", len(dels) == 2 and all(
+        isinstance(d.value, ast.UnaryOp) and isinstance(d.value.op, ast.Not)
+        and getattr(d.value.operand, "id", "") == "borrowed" for d in dels),
+        "release() deletes on a commit count that has read as zero before now")
+    check("the checkout goes before the verdict is acted on",
+          exe.index("delete_empty_branch=not borrowed") < exe.index("resolve_review("),
+          "the landing reattaches the same branch and git refuses a held one")
+    check("the branch is read from the record, not the dict in hand",
+          "(task_store.get(tid) or task).get(\"branch\")" in gate,
+          "record_branch wrote it to the store on the way out of the checkout; "
+          "the record this turn has been carrying predates that")
+
+    # A sweep that cannot read the id back out of the path deletes it anyway.
+    held = W.attach(repo, tid, branch, label="review")
+    W.sweep(keep={tid}, min_age_s=0)
+    check("a sweep keeps a checkout the waiting task still owns",
+          held.exists() and (held / "fix.py").exists(),
+          "the task id sits behind the label, so splitting from the front "
+          "read it as 'review--<id>' and matched nothing in the keep set")
+    W.sweep(keep=set(), min_age_s=0)
+    check("and takes it once nothing owns it", not held.exists())
+
 
 # --- gmail ingestion ----------------------------------------------------------
 
@@ -1060,7 +1262,7 @@ def test_verification():
     # deleted directory. verify.run reported "could not run", the caller read
     # that as "nothing to verify", and every task passed unverified in silence.
     check("and before the checkout they ran in is released",
-          ex.index("verify_work(task, cwd)") < ex.index("worktrees.release(worktree)"),
+          ex.index("verify_work(task, cwd)") < ex.index("worktrees.release(worktree,"),
           "afterwards there is nothing left to test")
     rw = bot[bot.index('if action == "rework"'):bot.index('if action in ("accept"')]
     check("sending work back clears the previous review",
@@ -2619,9 +2821,12 @@ def test_isolation_is_not_a_scheduling_decision():
     ex = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
               if isinstance(n, ast.FunctionDef) and n.name == "execute_task")
     def makes_a_worktree(node):
+        # Its own body, not the whole subtree: an enclosing `if` whose *else*
+        # creates the worktree would otherwise answer for this, and the test it
+        # is asked about would be the enclosing one's.
         return any(isinstance(c, ast.Attribute) and c.attr == "create"
                    and getattr(c.value, "id", "") == "worktrees"
-                   for c in ast.walk(node))
+                   for stmt in node.body for c in ast.walk(stmt))
     branch = next(n for n in ast.walk(ex)
                   if isinstance(n, ast.If) and makes_a_worktree(n))
     check("isolation is read from the record, not from who is driving",
@@ -2703,6 +2908,8 @@ def _run_a_task(conv_record):
                                      session_id="sess")
     execute_task = _bot_func(
         "execute_task", tasks=T, task_store=st, store=sess, roles=roles,
+        review_branch=bot_functions("review_branch",
+                                    task_store=st)["review_branch"],
         worktrees=W, Path=Path, run_turn=run_turn, shutil=shutil,
         OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
         permission_args=lambda: [], log=logging.getLogger("test"),
@@ -4473,7 +4680,7 @@ def test_unmerged_branches():
     check("the branch is written down before the checkout is released",
           ex.count("record_branch(tid, worktree, scope)") == 2
           and ex.index("record_branch(tid, worktree, scope)")
-          < ex.index("worktrees.release(worktree)"),
+          < ex.index("worktrees.release(worktree,"),
           "released first, there is nothing left to ask which branch it was")
     # Behavioural rather than textual: the docstring says "raised", so grepping
     # for the word proves nothing. Ask the tree.

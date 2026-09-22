@@ -365,6 +365,38 @@ on success. A sweep removes ones no live task owns, since a restart orphans
 whatever was running and an orphaned worktree is invisible — it costs disk and
 clutters `git worktree list` while looking like nothing at all.
 
+**The branch, not the tree, is what gets handed on.** Isolation and the review
+gate arrived separately and quietly cancelled each other out: the reviewer was
+created with the scope the *implementor* had been given, whose cwd is the main
+checkout, and by then the worktree holding the commits was released. So the
+independent check stood in an unchanged tree with nothing but a prose summary —
+exactly the self-certification it exists to prevent, and since the landing
+chain runs off a passing verdict, exactly what now authorises a merge with
+nobody watching.
+
+The fix is to reattach rather than to hold. A review gets its own checkout of
+`silkworm/<task-id>`, made when its turn starts, the same way the landing
+already reattaches that branch to rebase and retest. Keeping the implementor's
+worktree alive instead would have worked, but it means holding a directory
+across an unbounded queue wait and then releasing it on every way a review can
+end — finished, flagged, failed, killed by a restart, parked in `blocked`
+waiting out a quota limit. Reattaching holds nothing between turns: the branch
+is durable, so if the review never runs, nothing leaks. It also reviews
+precisely what would land, which a worktree carrying uncommitted scratch does
+not.
+
+The prompt then names the branch and the fork point, since a checkout on its
+own still leaves the reviewer guessing what in it is new. The fork point is a
+sha, not the base branch: the base moves while a task works, and a name has to
+resolve wherever the reviewer is standing. Where there is no fork point to give
+it, the prompt offers commands that need none — a reviewer whose opening
+command errors is back to reading the summary.
+
+The borrowed branch is somebody else's throughout. It is not recorded as the
+review's own work, it is never deleted as an empty branch, and it is released
+before the verdict is acted on, because the landing reattaches that same branch
+and `git` refuses one already checked out elsewhere.
+
 Opening pull requests is deliberately not part of this. A branch you can look at
 is useful immediately; pushing one outward is a decision worth making
 separately.

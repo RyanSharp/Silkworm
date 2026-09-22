@@ -2241,6 +2241,29 @@ def record_branch(tid: str, worktree, scope: dict) -> None:
         log.exception("could not record the branch for %s", tid)
 
 
+def review_branch(task: dict) -> str:
+    """The branch a review has to stand on, or "" if there is none.
+
+    An isolated implementor commits inside its own worktree, on
+    `silkworm/<task-id>`, and nowhere else — and that checkout is released when
+    its turn ends. So a review handed the scope the implementor *started* from
+    arrives in the main checkout, on the base branch, and audits a tree the
+    change never reached. It can then do nothing but believe the summary, which
+    is the self-certification the gate exists to prevent — and since the
+    landing chain runs off a passing review, that verdict is now one of the two
+    things that merge work with nobody watching.
+
+    Read off what the implementor actually left rather than assumed from the
+    task id: a task that ran in the shared checkout has no branch of its own,
+    and there is nothing to attach. record_branch writes it before the
+    implementor's checkout goes away, which is the last moment anything knows.
+    """
+    if task.get("role") != "reviewer":
+        return ""
+    parent = task_store.get(task.get("parent") or "") or {}
+    return parent.get("branch") or ""
+
+
 def execute_task(task: dict) -> None:
     """Run one claimed task. Already in `running` — the claim did that."""
     tid = task["id"]
@@ -2287,7 +2310,25 @@ def execute_task(task: dict) -> None:
     # A read-only role has nothing to isolate: it cannot write, so a worktree
     # buys nothing and leaves an empty branch behind every run -- one per
     # project per night once ideation is scheduled.
-    if (tasks.isolated(task) and worktrees.is_repo(cwd)
+    #
+    # A review does not branch, it borrows. The work it has to read is already
+    # committed on the implementor's branch, so it gets a checkout of *that*
+    # branch rather than a fresh one off the base — a fresh one would hold none
+    # of it. `borrowed` then marks the branch under this turn as somebody
+    # else's: not this task's work to record, and not this task's branch to
+    # tidy away. The checkout is keyed by the implementor's id, not the
+    # review's, so that it lives exactly as long as the work in it is
+    # unresolved: the sweep keeps what a non-terminal task owns, and the
+    # implementor stays blocked until the verdict lands.
+    borrowed = review_branch(task)
+    if borrowed and worktrees.is_repo(cwd):
+        progress.update(":deciduous_tree: _Checking out the work to review…_")
+        worktree = worktrees.attach(cwd, task.get("parent") or tid,
+                                    borrowed, label="review")
+        if worktree:
+            cwd = worktree
+            task_store.update(tid, scope={**scope, "worktree": str(worktree)})
+    elif (tasks.isolated(task) and worktrees.is_repo(cwd)
             and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
         worktree = worktrees.create(cwd, tid, base=scope.get("branch") or "")
@@ -2382,10 +2423,21 @@ def execute_task(task: dict) -> None:
         if worktree and (checked is None or checked.get("ok") or not checked["ran"]):
             # A failure keeps its checkout: the next attempt reattaches the
             # branch anyway, but leaving it makes the failure inspectable.
-            record_branch(tid, worktree, scope)
-            removed, note = worktrees.release(worktree)
+            #
+            # A borrowed branch is left strictly alone. Recording it would file
+            # the implementor's commits against the review, and letting go of
+            # it as an empty branch would discard the very work the review just
+            # read — release() only deletes a branch it believes has nothing on
+            # it, and "nothing on it" is a count against a base that has read
+            # as zero before now. It must also be gone before resolve_review
+            # below: a passing verdict lands, and the landing reattaches this
+            # same branch, which git refuses while another worktree holds it.
+            if not borrowed:
+                record_branch(tid, worktree, scope)
+            removed, note = worktrees.release(worktree,
+                                              delete_empty_branch=not borrowed)
             worktree = None                      # released; finally need not repeat it
-            if note:
+            if note and not borrowed:
                 wt_note = (f"\n\n_:deciduous_tree: Worked in an isolated checkout — {note}._"
                            if removed else
                            f"\n\n_:deciduous_tree: Isolated checkout {note}._")
@@ -2426,8 +2478,9 @@ def execute_task(task: dict) -> None:
             # Any path out of the turn that did not release it. release() keeps
             # a dirty tree, so a failed task's partial work survives.
             try:
-                record_branch(tid, worktree, scope)
-                worktrees.release(worktree)
+                if not borrowed:
+                    record_branch(tid, worktree, scope)
+                worktrees.release(worktree, delete_empty_branch=not borrowed)
             except Exception:
                 log.exception("could not release worktree %s", worktree)
         RUNNING.pop(key, None)
@@ -2565,18 +2618,39 @@ def resolve_review(task: dict, role_name: str, text: str,
     """
     tid = task["id"]
     if roles.needs_review(role_name) and not task.get("blocked_on"):
+        # Not the implementor's scope verbatim: it carries the worktree that
+        # turn ran in, which was released a few lines ago. What the review
+        # needs is the branch the work was left on — which it checks out for
+        # itself when its turn starts, since that may be hours from now and
+        # holding a directory open across a queue is how the last attempt at
+        # this ended up special-casing quota failures.
+        scope = {k: v for k, v in (task.get("scope") or {}).items()
+                 if k != "worktree"}
+        # From the store, not the dict in hand. record_branch wrote the branch
+        # moments ago, on the way out of the checkout — the only moment
+        # anything knew it — and the record this turn has been carrying since
+        # it was claimed predates that. Read the stale one and the prompt names
+        # no branch, which is the whole bug wearing a smaller hat.
+        branch = (task_store.get(tid) or task).get("branch") or ""
+        here = scope.get("cwd") or ""
+        where = str(worktrees.path_for(here, tid, "review")) if branch and here \
+            else here
         child = task_store.create(
-            roles.review_goal(task, text), role="reviewer", driver="queue",
-            # Not isolated: the reviewer reads the commits the implementor
-            # left on its branch, and that branch lives in this checkout. A
-            # fresh worktree off the base branch would hold none of them.
+            roles.review_goal(task, text, cwd=where, branch=branch,
+                              base=worktrees.fork_point(
+                                  here, branch, scope.get("branch") or "")
+                              if branch and here else ""),
+            role="reviewer", driver="queue",
+            # Not isolated in the ordinary sense: a fresh worktree off the base
+            # branch would hold none of the work. It gets a checkout of the
+            # implementor's own branch instead — see review_branch.
             isolate=False,
             # Without an explicit title it would be the review prompt's first
             # line ("Goal that was given:"), which reads as nonsense in a list.
             title=f"Review: {(task.get('title') or tid)[:46]}",
             source="review", source_ref=tid, parent=tid,
             root=task.get("root") or tid, thread=f"{channel}:{thread_ts}",
-            scope=task.get("scope") or {})
+            scope=scope)
         task_store.update(tid, blocked_on=[child["id"]])
         task_state(tid, tasks.BLOCKED, f"awaiting review {child['id']}")
         return True

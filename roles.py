@@ -226,15 +226,41 @@ def system_prompt(name: str) -> str:
     return get(name).get("system", "")
 
 
-def review_goal(task: dict, result_text: str) -> str:
-    """The prompt handed to a reviewer, with fresh context."""
+def review_goal(task: dict, result_text: str, cwd: str = "",
+                branch: str = "", base: str = "") -> str:
+    """The prompt handed to a reviewer, with fresh context.
+
+    `cwd`/`branch`/`base` say where the work actually is. An isolated task
+    commits inside its own worktree, on its own branch, and nowhere else. A
+    reviewer not told so stands in the main checkout, finds it unchanged, and
+    has nothing left to go on but the summary it was explicitly asked not to
+    trust -- which is the self-certification the gate exists to prevent.
+
+    Every command offered here has to be one that runs. A missing base filled
+    in with a placeholder would hand over `git log the base commit..HEAD`,
+    which errors, and a reviewer whose opening commands fail is back to the
+    summary again. So the base-relative form is offered only when there is a
+    base to offer, and the fallback needs none.
+    """
     scope = task.get("scope") or {}
-    return (
-        f"Goal that was given:\n{task.get('goal', '')}\n\n"
-        f"Working directory: {scope.get('cwd', '?')}\n\n"
-        f"What the implementor reported:\n{result_text[:4000]}\n\n"
-        "Verify it against the repository itself."
-    )
+    where = cwd or scope.get("cwd", "?")
+    parts = [f"Goal that was given:\n{task.get('goal', '')}",
+             f"Working directory: {where}"]
+    if branch:
+        how = ([f"- `git log {base}..HEAD` — the commits this task made",
+                f"- `git diff {base} HEAD` — everything it changed"] if base else
+               ["- `git log --oneline -20` — recent commits, this task's on top",
+                "- `git log -p -3` — what the most recent ones changed"])
+        parts.append(
+            f"The work is on branch `{branch}`, checked out for you at "
+            f"`{where}`. That branch is the only place these changes exist — "
+            f"the main checkout never saw them. Start here:\n"
+            + "\n".join(how)
+            + "\nThen read the changed files themselves, and anything the "
+            "summary claims to have run.")
+    parts.append(f"What the implementor reported:\n{result_text[:4000]}")
+    parts.append("Verify it against the repository itself.")
+    return "\n\n".join(parts)
 
 
 #: Per list, per verdict. A reviewer that returns thirty of anything has
