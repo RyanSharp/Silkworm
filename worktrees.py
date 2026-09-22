@@ -65,6 +65,9 @@ def base_ref(repo, fetch: bool = True, prefer: str = "") -> str:
 
     Fetch is best-effort: being offline should mean branching from a slightly
     stale base, not failing to start the task at all.
+
+    The remote-tracking ref is preferred, but only while it is actually the
+    more advanced of the two -- see `_local_if_ahead`.
     """
     if fetch:
         try:
@@ -77,8 +80,46 @@ def base_ref(repo, fetch: bool = True, prefer: str = "") -> str:
     candidates += ["origin/HEAD", "origin/main", "origin/master", "main", "master"]
     for ref in candidates:
         if _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0:
-            return ref
+            return _local_if_ahead(repo, ref)
     return "HEAD"
+
+
+def _local_if_ahead(repo, ref: str) -> str:
+    """`ref`, unless the local branch under it has commits the remote lacks.
+
+    Preferring the remote is right when it is the more advanced of the two,
+    which is the normal case: it is what everyone else can see. It is wrong
+    when the local branch is ahead, and that happens routinely -- landing
+    fast-forwards the local base, and publishing it is the project's choice, so
+    a project that does not publish (or whose push was refused) has landed work
+    that exists only here.
+
+    Cutting the next task from the remote then hands it a baseline missing work
+    that has already landed. Measured: origin twelve commits behind local main,
+    and two tasks independently implementing the same fix because neither could
+    see the other's landing.
+
+    Strictly ahead only. If the two have diverged -- each holding commits the
+    other does not -- the remote is still the shared truth, and branching from
+    local would build on something nobody else has.
+    """
+    if not ref.startswith("origin/"):
+        return ref
+    # `origin/HEAD` is symbolic: it names `origin/main`, not a branch called
+    # HEAD, so the local counterpart has to be read off what it resolves to.
+    resolved = _git(repo, "rev-parse", "--abbrev-ref", ref).stdout.strip() or ref
+    name = resolved.split("/", 1)[1] if resolved.startswith("origin/") else resolved
+    if not name or name == "HEAD":
+        return ref
+    if _git(repo, "rev-parse", "--verify", "--quiet", name).returncode != 0:
+        return ref
+    if _git(repo, "merge-base", "--is-ancestor", resolved, name).returncode != 0:
+        return ref        # diverged, or local is behind: the remote still wins
+    if _git(repo, "rev-list", "--count",
+            f"{resolved}..{name}").stdout.strip() in ("", "0"):
+        return ref        # identical, so say it the usual way
+    log.info("%s is ahead of %s; branching from the local branch", name, resolved)
+    return name
 
 
 def path_for(repo, task_id: str) -> Path:

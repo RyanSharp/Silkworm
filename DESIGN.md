@@ -718,15 +718,38 @@ review — but pushing to a shared remote is still an outward act on someone
 else's repository, and the only step in landing that cannot be taken back
 quietly. It happens last, after the post-merge suite: publishing before proving
 the base would mean undoing a push, which is a force-push on a shared branch and
-a worse position than an unlanded branch. **A push that is refused undoes the
-landing.** A base that failed to publish has not really landed, and leaving the
-commit on local main would recreate the exact divergence publishing exists to
-prevent — this time silently, under a reply saying it worked. The base is reset,
-the branch is untouched, and it refuses at `publish`. Whether it published is
-settled by asking origin, not by the push's exit code: a push can fail after the
-remote accepted it, and one that times out may have taken — resetting there
-would drop an already-published commit, which is worse than the mess being
-prevented.
+a worse position than an unlanded branch.
+
+**A push that is refused leaves the landing where it is and says so.** Undoing
+it is the tempting answer — a base that did not publish is out of step with
+origin, which is the state this whole section exists to prevent — but it is the
+worse of the two. By that point the work has passed the suite twice, and
+discarding it because a remote was briefly out of reach means paying for both
+runs again to arrive at the same commit. What made local-ahead worth undoing was
+that it was *fatal*, and it no longer is: the merge targets this checkout's own
+commit, and `base_ref` cuts the next task from a local base that is ahead of its
+remote. Neither the lockout nor the stale baseline survives, so being ahead of
+origin is a fact to report rather than a reason to throw work away. The result
+carries `published: false` and the reason, and the reply says *local only, not
+pushed* with the error underneath — the ambiguity that let origin drift a dozen
+commits unnoticed was never the drift, it was `landed` meaning two things.
+
+Resetting would also be able to *invert* the divergence, which is strictly
+worse. Whether a push took is settled by asking origin rather than by its exit
+code, because a push can fail after the remote accepted it and one that times
+out may have taken. But if that confirmation cannot be reached either, putting
+the base back leaves origin *ahead* of local — the one direction that pushing
+again does not fix.
+
+**The next task is cut from whichever is further along.** `base_ref` preferred
+the remote-tracking ref unconditionally. That is right while origin is the more
+advanced of the two, and wrong the moment a landing moves the local base past
+it: the task starts from a baseline missing work that has already landed, which
+is how the same fix came to be implemented twice. It now prefers the local
+branch when the remote's tip is contained in it. *Strictly* ahead only — if the
+two have diverged, each holding something the other does not, the remote is
+still the shared truth, and branching from local would build on something nobody
+else has agreed to.
 
 **A base that genuinely moves says so.** Running the suite takes minutes, and
 another landing in that window means what passed is not what would be merged.

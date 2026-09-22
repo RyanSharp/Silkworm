@@ -21,8 +21,9 @@ happened:
   revert   -- if that fails, put the base back exactly where it was. A broken
               main is much worse than an unlanded branch.
   publish  -- if the project asks for it, push the base, so origin and the
-              local branch cannot drift apart. A push that is refused undoes
-              the landing: a base that did not publish has not really landed.
+              local branch cannot drift apart. A refused push leaves the
+              landing where it is and says so: the work is proven by this
+              point, and being ahead of origin is no longer fatal.
 
 It refuses rather than guesses: a dirty checkout, a conflicting rebase or a
 missing test command all stop the landing and hand it back with a reason.
@@ -191,6 +192,7 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     # pull-request question DESIGN.md rules out -- nothing is proposed to
     # anyone -- but it is still a decision about someone else's repository, so
     # it is theirs to make.
+    published, note = False, ""
     if publish:
         try:
             push = _git(repo, "push", "origin", base_name, timeout=300)
@@ -198,36 +200,50 @@ def land(worktree, repo, branch: str, base: str, run_tests,
         except subprocess.TimeoutExpired:
             # A push that timed out is genuinely ambiguous: it may have been
             # accepted and the acknowledgement lost. Guessing either way is
-            # wrong, so it is resolved below by asking origin.
+            # wrong, so it is settled below by asking origin.
             failed, why = True, "the push timed out"
-        # Ask origin rather than trusting the exit code, because a push can
-        # fail *after* the remote accepted it -- and then resetting the base
-        # would drop a commit that is already published, which is a worse mess
-        # than the one this is preventing.
+        # Ask origin rather than trust the exit code, because a push can fail
+        # *after* the remote accepted it -- and reporting that as unpublished
+        # sends someone looking for a divergence that is not there.
         if failed and _on_origin(repo, base_name) == head:
             log.warning("push of %s reported failure but origin has %s; "
                         "treating it as published", base_name, head[:8])
             failed = False
+        published = not failed
         if failed:
-            # A base that failed to publish is not landed. Leaving the commit
-            # on local main would recreate exactly the divergence publishing
-            # exists to prevent, except now silently and with the reply saying
-            # it worked. Put the base back; the branch is untouched and the
-            # landing can be retried once whatever refused the push is dealt
-            # with.
-            _git(repo, "reset", "--hard", before)
-            log.error("landing %s could not be published; reset %s back to %s",
-                      branch, base_name, before[:8])
-            return _fail("publish",
-                         str(why) +
-                         f"\n{base_name!r} could not be pushed to origin, so the "
-                         "landing was undone rather than left unpublished")
+            # The landing stands, and says it was not pushed.
+            #
+            # Undoing it instead is tempting -- a base that did not publish is
+            # out of step with origin, which is the state this whole change
+            # exists to prevent. It is still the worse of the two. By this
+            # point the work has passed the suite twice, and discarding that
+            # over an unreachable remote means paying for both runs again to
+            # reach the same commit.
+            #
+            # What made local-ahead worth undoing was that it was fatal, and it
+            # no longer is: the merge above targets this checkout's own commit
+            # rather than the remote-tracking ref, and `worktrees.base_ref`
+            # cuts the next task from a local base that is ahead of its remote.
+            # Neither the lockout nor the stale-baseline cost survives, so
+            # being ahead of origin is a fact to report, not a reason to throw
+            # work away.
+            #
+            # Resetting can also invert the divergence, which is strictly
+            # worse. If the push did reach origin but the acknowledgement was
+            # lost *and* `ls-remote` cannot confirm it, putting the base back
+            # leaves origin ahead of local -- the one direction that pushing
+            # again does not fix.
+            note = (f"{base_name!r} landed but could not be pushed, so it is "
+                    f"ahead of origin until someone pushes it:\n"
+                    + str(why).strip()[-400:])
+            log.error("landed %s on %s but could not publish: %s",
+                      branch, base_name, str(why).strip()[-200:])
 
     log.info("landed %s on %s (%s..%s)%s", branch, base_name, before[:8],
-             head[:8], " and published" if publish else "")
+             head[:8], " and published" if published else "")
     return {"landed": True, "stage": "done", "base": base_name,
-            "before": before, "head": head, "published": bool(publish),
-            "detail": ""}
+            "before": before, "head": head, "published": published,
+            "detail": note}
 
 
 def needs_a_person(outcome: dict) -> bool:
@@ -251,8 +267,14 @@ def summary(result: dict, branch: str) -> str:
         # without anyone noticing.
         where = ("pushed to origin" if result.get("published")
                  else "local only, not pushed")
-        return (f":shipit: _Landed on *{result.get('base')}* "
+        line = (f":shipit: _Landed on *{result.get('base')}* "
                 f"(`{result.get('head', '')[:8]}`, {where})._")
+        # A push that was asked for and refused is not the same as one that was
+        # never asked for. The landing stands either way, but only the first
+        # leaves something for a person to do.
+        if result.get("detail"):
+            line += f"\n```\n{result['detail'][-800:]}\n```"
+        return line
     if not result.get("eligible", True):
         # Never reached git, so there is no branch waiting and no output to
         # quote -- just the reason it was never a candidate.

@@ -1157,6 +1157,26 @@ def test_landing():
           g(repo, "rev-parse", "HEAD").stdout.strip() ==
           g(repo, "rev-parse", "w").stdout.strip())
 
+    # The other half of the same bug: what the *next* task is cut from.
+    # `base_ref` preferred the remote-tracking ref unconditionally, which is
+    # right while origin is the more advanced of the two and wrong the moment a
+    # landing moves the local base past it -- the task then starts from a
+    # baseline missing work that has already landed. That is how the same fix
+    # came to be implemented twice, by two agents neither of whom could see the
+    # other's landing.
+    check("the local base is ahead of origin at this point",
+          int(g(repo, "rev-list", "--count",
+                "origin/main..main").stdout.strip()) > 0,
+          "otherwise there is no difference for base_ref to prefer")
+    check("a base ahead of its remote is what the next task is cut from",
+          W.base_ref(repo, fetch=False) == "main",
+          "cutting from origin/main hands the task a stale baseline")
+    check("and the same when the project names its base",
+          W.base_ref(repo, fetch=False, prefer="main") == "main")
+    check("a worktree cut now actually contains the landed work",
+          g(repo, "merge-base", "--is-ancestor", "main",
+            W.base_ref(repo, fetch=False)).returncode == 0)
+
     # A base that *genuinely* moves between the proof and the merge is a
     # different failure and has to read as one. `--ff-only` refused both in the
     # same words, which is part of why the lockout above went unnoticed.
@@ -1200,10 +1220,13 @@ def test_landing():
           "'landed' meaning local-only is how origin drifted unnoticed")
 
     # A push that is refused -- someone else having pushed to the base is the
-    # ordinary case. The landing must come back off: a base that did not
-    # publish has not really landed, and leaving the commit on local main would
-    # recreate the very divergence publishing exists to prevent, while
-    # reporting success.
+    # ordinary case. The landing stands, and says it was not pushed.
+    #
+    # Undoing it instead would throw away work that has passed the suite twice
+    # because a remote was briefly out of reach, and the reason local-ahead
+    # used to be worth undoing is gone: the merge targets this checkout's own
+    # commit, and `base_ref` above cuts the next task from a local base that is
+    # ahead of its remote. Neither the lockout nor the stale baseline survives.
     rival = root / "rival"
     g(repo, "worktree", "add", "-q", "--detach", str(rival), "origin/main")
     (rival / "rival.txt").write_text("rival\n")
@@ -1214,14 +1237,36 @@ def test_landing():
     at_start = g(repo, "rev-parse", "HEAD").stdout.strip()
     nope = branch_from("nope", "main")
     r = M.land(nope, repo, "nope", "", tests, publish=True)
-    check("a landing whose push is refused is not reported as landed",
-          not r["landed"] and r["stage"] == "publish",
-          f"got {r.get('stage')}: {str(r.get('detail'))[:200]}")
-    check("and the base is put back where it was",
-          g(repo, "rev-parse", "HEAD").stdout.strip() == at_start,
-          "otherwise it is landed-but-unpublished, which is the original bug")
+    check("a landing whose push is refused still lands",
+          r["landed"], f"got {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("but does not claim to have published",
+          r.get("published") is False,
+          "saying 'landed' for local-only is how origin drifted unnoticed")
+    check("and the base keeps the commit rather than the work being redone",
+          g(repo, "rev-parse", "HEAD").stdout.strip() ==
+          g(repo, "rev-parse", "nope").stdout.strip(),
+          "it passed the suite twice; an unreachable remote is not a reason "
+          "to pay for both runs again")
+    check("and the base really did move, so that is not vacuously true",
+          g(repo, "rev-parse", "HEAD").stdout.strip() != at_start)
+    check("the reply says it is ahead of origin, and why",
+          "local only, not pushed" in M.summary(r, "nope") and
+          "could not be pushed" in M.summary(r, "nope"),
+          M.summary(r, "nope")[:300])
     check("while the branch itself is untouched, so it can be retried",
           g(repo, "rev-parse", "--verify", "--quiet", "nope").returncode == 0)
+
+    # Strictly ahead, though. The rejected push leaves each side holding
+    # something the other does not, and a diverged remote is still the shared
+    # truth -- branching from local there would build on something nobody else
+    # has agreed to.
+    check("the base and origin have diverged now",
+          g(repo, "merge-base", "--is-ancestor", "origin/main",
+            "main").returncode != 0,
+          "otherwise the diverged case is not being exercised")
+    check("a diverged base falls back to the remote",
+          W.base_ref(repo, fetch=False) == "origin/HEAD",
+          "ahead is not the same as diverged")
 
     # A push can also fail *after* the remote accepted it, and a push that
     # times out may or may not have taken. Resetting then would drop a commit
@@ -1255,6 +1300,9 @@ def test_landing():
           g(repo, "rev-parse", "origin/main").stdout.strip() ==
           g(repo, "rev-parse", "main").stdout.strip(),
           "resetting here would drop a published commit")
+    check("with the two in step, base_ref names the remote as usual",
+          W.base_ref(repo, fetch=False) == "origin/HEAD",
+          "the local branch is only preferred while it is actually ahead")
 
     g(repo, "remote", "remove", "origin")
 
