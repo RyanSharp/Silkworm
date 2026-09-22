@@ -98,13 +98,19 @@ paths at install time — clone anywhere.
 Day-to-day management (macOS today; Linux/systemd planned):
 
 ```sh
-silkworm status      # services, bot, visualizer, hooks — one health check
-silkworm restart     # bounce both services (e.g. after git pull)
+silkworm status      # services, bot, visualizer, hooks, revision — one health check
+silkworm restart     # bounce both services (e.g. after git pull, or a landing)
 silkworm logs        # tail the bot log
 silkworm uninstall   # remove the services (repo and sessions untouched)
 ```
 
 Tip: put it on your PATH — `ln -s ~/workspace/Silkworm/bin/silkworm /usr/local/bin/silkworm`.
+
+`silkworm status` reports the git revision the bot is *running*, not the one in
+the checkout, and fails when the two differ. Silkworm auto-merges onto its own
+main and nothing restarts it, so a landed fix can sit in the tree for days
+while the live process serves the revision it booted with — which is not
+otherwise visible from anywhere. The dashboard's alert bar says the same thing.
 
 Reboots are a non-event: sessions and thread mappings live on disk, the
 services come back at login, and the bot releases any terminal checkouts that

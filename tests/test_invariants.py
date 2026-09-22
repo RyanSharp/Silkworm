@@ -3530,7 +3530,7 @@ def test_slack_health():
           "it reported the bot reachable throughout the outage")
     viz = (BASE / "visualizer.py").read_text()
     check("the dashboard passes the link to its alert bar",
-          "renderAlerts(data.sessions, data.slack)" in viz,
+          "renderAlerts(data.sessions, data.slack," in viz,
           "during an outage the dashboard is the thing still working")
     check("and only alerts on a full sampling window",
           "slack.ready && !slack.connected" in viz,
@@ -7219,6 +7219,214 @@ def test_every_test_runs():
     check("every test_* defined in this file is discovered and run", not missing,
           f"never runs: {', '.join(missing)} — defined below the __main__ guard?")
 
+
+# --- a landed fix is not a running fix ---------------------------------------
+# Silkworm auto-merges reviewed work onto its own main and nothing restarts it,
+# so the commit sat in the tree while the live process kept serving the
+# revision it booted with. Six days of landings were invisible from outside:
+# startup logged the workspace and the turn limits but never the revision, and
+# the only way to answer "is the running bot the code I am reading" was to
+# probe for a behaviour difference and infer backwards.
+
+def test_revision_drift():
+    import revision as R
+    print("\nthe running revision is reported, and drift from it is visible")
+
+    here, there = "a" * 40, "b" * 40
+    same = R.drift({"sha": here, "branch": "main"}, {"sha": here, "branch": "main"})
+    check("a matching sha is current", same["state"] == "current")
+    check("and is not reported as behind anything", same["behind"] == 0)
+
+    moved = R.drift({"sha": here, "branch": "main"},
+                    {"sha": there, "branch": "main"}, 6)
+    check("a moved checkout is stale", moved["state"] == "stale", moved["state"])
+    check("and says how far behind", moved["behind"] == 6)
+    check("the message names both revisions and the gap",
+          "6 commits behind" in R.describe(moved)
+          and here[:8] in R.describe(moved) and there[:8] in R.describe(moved),
+          R.describe(moved))
+    check("one commit is not pluralised",
+          "1 commit behind" in R.describe(
+              R.drift({"sha": here}, {"sha": there}, 1)))
+
+    # Not knowing must never read as all-clear. A missing git, a directory that
+    # is not a repo, or a bot too old to report the field would otherwise every
+    # one of them come back "current" -- the same silence this check exists to
+    # break, told more confidently.
+    for label, started, head in (
+            ("no startup revision", {}, {"sha": here}),
+            ("no revision on disk", {"sha": here}, {}),
+            ("neither", {}, {})):
+        d = R.drift(started, head)
+        check(f"{label} is unknown, not current", d["state"] == "unknown", d["state"])
+
+    # `behind` only counts when git could count. A rebase or a dropped branch
+    # leaves the startup commit unreachable, and a guess of 0 would claim "up
+    # to date" about a revision it could not even find.
+    unreachable = R.drift({"sha": here}, {"sha": there}, -1)
+    check("an uncountable gap is still stale", unreachable["state"] == "stale")
+    check("but claims no count", unreachable["behind"] == 0)
+    check("and says so without a number",
+          "behind" in R.describe(unreachable) and "-1" not in R.describe(unreachable),
+          R.describe(unreachable))
+
+    # A process that booted from a modified tree is running code that was never
+    # any commit -- and if those edits were then reverted, code that exists
+    # nowhere on disk. A matching sha is the weakest evidence here, not the
+    # strongest, so it must not come back "current".
+    dirty = R.drift({"sha": here, "dirty": True}, {"sha": here})
+    check("a dirty boot is carried through", dirty["dirty"] is True)
+    check("and is unknown, not current", dirty["state"] == "unknown", dirty["state"])
+    check("named apart from having no revision at all",
+          dirty["why"] == "dirty-boot"
+          and R.drift({}, {})["why"] == "no-revision")
+    check("with a message that says why it cannot be checked",
+          "uncommitted" in R.describe(dirty) and "cannot be checked" in R.describe(dirty),
+          R.describe(dirty))
+    check("a clean match is still plainly current",
+          R.drift({"sha": here}, {"sha": here})["state"] == "current")
+
+    # The two git calls are separate processes, so a commit landing between
+    # them pairs an unchanged sha with a nonzero count. The sha is the answer.
+    raced = R.drift({"sha": here}, {"sha": here}, 2)
+    check("a count against an unchanged sha is not a gap",
+          raced["state"] == "current" and raced["behind"] == 0,
+          f"{raced['state']} / {raced['behind']}")
+
+    # Against a real repository, end to end.
+    repo = Path(tempfile.mkdtemp()) / "r"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True)
+    run("init", "-q", "-b", "main")
+    run("config", "user.email", "t@t"); run("config", "user.name", "t")
+    (repo / "f").write_text("one")
+    run("add", "."); run("commit", "-qm", "one")
+    first = R.of(repo)
+    check("a real checkout resolves to a sha and a branch",
+          len(first["sha"]) == 40 and first["branch"] == "main", str(first))
+    check("a clean tree is not dirty", first["dirty"] is False)
+
+    (repo / "f").write_text("two")
+    run("commit", "-qam", "two")
+    (repo / "f").write_text("three")
+    run("commit", "-qam", "three")
+    check("git counts what has landed since", R.behind(repo, first["sha"]) == 2)
+    live = R.state(repo, first)
+    check("the state route calls that stale", live["state"] == "stale", live["message"])
+    check("with the real distance", live["behind"] == 2, live["message"])
+    check("and a message to show", bool(live["message"]))
+    check("the same revision is current",
+          R.state(repo, R.of(repo))["state"] == "current")
+
+    # The dashboard polls /status every five seconds and this is two git
+    # subprocesses, so the answer is memoised whole -- both halves or neither,
+    # or a fresh HEAD gets paired with a count taken against the previous one.
+    (repo / "f").write_text("four")
+    run("commit", "-qam", "four")
+    check("a polled answer is served from cache, not re-resolved",
+          R.state(repo, first)["behind"] == 2, "it spawned git again")
+    check("and a zero TTL always re-resolves",
+          R.state(repo, first, ttl=0)["behind"] == 3,
+          "the cache must be a cache, not a one-shot")
+
+    # Detached HEAD reports the literal string rather than a name, and "on
+    # HEAD" in a startup log is not a branch anybody can go and look at.
+    run("checkout", "-q", "--detach")
+    detached = R.of(repo)
+    check("a detached HEAD reports no branch rather than the word HEAD",
+          detached["branch"] == "", detached["branch"])
+    check("and still compares against the checkout",
+          R.state(repo, detached, ttl=0)["state"] == "current")
+    run("checkout", "-q", "main")
+
+    (repo / "untracked").write_text("x")
+    R._cache.clear()
+    check("an uncommitted change makes the checkout dirty", R.of(repo)["dirty"] is True)
+    check("and booting from one is unknown end to end",
+          R.state(repo, R.of(repo), ttl=0)["why"] == "dirty-boot")
+
+    # Somewhere that is not a repository at all.
+    R._cache.clear()
+    outside = Path(tempfile.mkdtemp())
+    check("a non-repo resolves to nothing, not to a sha", R.of(outside)["sha"] == "")
+    check("and that is unknown rather than current",
+          R.state(outside, first)["state"] == "unknown")
+    check("counting from an unknown sha gives no number", R.behind(repo, "") == -1)
+    check("counting from a sha this repo never had gives no number",
+          R.behind(repo, "c" * 40) == -1)
+
+    # The wiring: the bot must record the revision at boot and report it, and
+    # the two status surfaces must read it rather than asking git themselves --
+    # which would describe the checkout instead of the process.
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    assigns = [n for n in tree.body if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", "") == "REVISION" for t in n.targets)]
+    check("bot.py resolves its revision once, at import", len(assigns) == 1)
+    check("from the checkout it was loaded from, not the workspace",
+          assigns and "BASE_DIR" in ast.dump(assigns[0].value)
+          and "revision" in ast.dump(assigns[0].value))
+    check("startup logs it", 'log.info("revision: %s%s on %s%s"' in src)
+    check("/status reports it",
+          "revision.state(BASE_DIR, REVISION)" in src)
+    # Asserted on the branch, not on the text: `_is_own_checkout(cwd)` also
+    # appears in the function's own `def` line, so a substring check passes
+    # happily with the call site replaced by `if False`.
+    landing = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "land_and_record")
+    guarded = [n for n in ast.walk(landing) if isinstance(n, ast.If)
+               and any(isinstance(c, ast.Call)
+                       and getattr(c.func, "id", "") == "_is_own_checkout"
+                       for c in ast.walk(n.test))]
+    check("landing checks whether it landed into Silkworm's own checkout",
+          len(guarded) == 1, f"found {len(guarded)} such branches")
+    check("and adds to the reply rather than replacing it",
+          guarded and any(isinstance(n, ast.AugAssign) for n in guarded[0].body),
+          "the shipit line must survive")
+    check("saying the running bot is still the old one",
+          guarded and "silkworm restart" in ast.dump(guarded[0]),
+          "the warning has to name the remedy")
+
+    # And the predicate itself, run rather than read.
+    own = bot_functions("_is_own_checkout", Path=Path, BASE_DIR=BASE)["_is_own_checkout"]
+    check("its own checkout is recognised", own(str(BASE)) is True)
+    check("through a non-canonical path", own(str(BASE / "tests" / "..")) is True)
+    check("another project's checkout is not", own(str(BASE / "tests")) is False)
+    check("and a path that cannot be resolved is not", own("") is False)
+
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("silkworm status reads the bot's revision, not git",
+          'bot.get("revision")' in cli and "rev-parse" not in cli)
+    # Asserted on the call, not on the text: the sentence can be present while
+    # being handed to a check that passes, which is the failure it warns about.
+    status = next(n for n in ast.walk(ast.parse(cli))
+                  if isinstance(n, ast.FunctionDef) and n.name == "do_status")
+    unanswered = [n for n in ast.walk(status)
+                  if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "check"
+                  and any("too old to report" in a.value or "could not resolve" in a.value
+                          for a in ast.walk(n) if isinstance(a, ast.Constant)
+                          and isinstance(a.value, str))]
+    check("both ways of not knowing the revision are checks in silkworm status",
+          len(unanswered) == 2, f"found {len(unanswered)}")
+    # Subscripting the payload would turn a version-skewed bot -- the exact
+    # situation this check exists for -- into a traceback that takes the rest
+    # of `silkworm status` down with it, credential checks included.
+    revision_reads = [n for n in ast.walk(status)
+                      if isinstance(n, ast.Subscript)
+                      and getattr(n.value, "id", "") == "rev"]
+    check("silkworm status never subscripts the revision payload",
+          not revision_reads,
+          "a bot reporting a field it does not fill must not crash the check")
+    check("and each one fails rather than passes",
+          all(isinstance(c.args[1], ast.Constant) and c.args[1].value is False
+              for c in unanswered),
+          "a bot that cannot say what it is running is not a bot that is up to date")
+
+    viz = (BASE / "visualizer.py").read_text()
+    check("the dashboard passes it to the alert bar",
+          "renderAlerts(data.sessions, data.slack, data.revision)" in viz)
+    check("and alerts on anything that is not current",
+          'revision.state !== "current"' in viz)
 
 if __name__ == "__main__":
     tests = discover()

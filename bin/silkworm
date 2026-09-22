@@ -255,6 +255,23 @@ def do_status() -> None:
     check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
     check("session hooks installed", hooks_installed())
 
+    # A landed fix is not a running fix. Silkworm auto-merges onto its own main
+    # and nothing restarts it, so the commit sits in the tree while the live
+    # process keeps serving what it booted with -- and until this check existed
+    # the only way to tell was to probe for a behaviour difference.
+    if bot.get("online"):
+        rev = bot.get("revision") or {}
+        if not rev:
+            # An older bot does not know the field. "Could not ask" is not
+            # "up to date", and this check exists precisely for that case.
+            check("revision", False,
+                  "this bot is too old to report its revision — run: silkworm restart")
+        elif rev.get("state") == "unknown":
+            check("revision", False, rev.get("message") or "could not resolve it")
+        else:
+            check(f"revision — {rev.get('message', '')}",
+                  rev.get("state") == "current", "run: silkworm restart")
+
     # A stale credential kills every turn and says nothing until you notice the
     # failures, so it gets checked rather than discovered.
     # What the bot resolved beats what .env currently says: editing .env without

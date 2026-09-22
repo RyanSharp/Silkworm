@@ -993,3 +993,64 @@ makes a save whole; it cannot make a read-modify-write exclusive.
 The cost is small: measured on a copy of the live `tasks.json` (2.95 MB, 706
 records) a full save goes from 7.0 ms to 8.9 ms, of which about 1 ms is the
 second copy. Almost all of the rest is `json.dumps`, which it paid before.
+
+## Landed is not running
+
+The live bot booted on 14 September and was never restarted. Twelve commits
+landed on main after that, and on 21 September it was still writing a `filed
+task` log line in the format `5053820` had replaced on the 20th — running code
+nine days older than the checkout it was reading from. Silkworm auto-merges
+reviewed, verified work onto its own main without a person, and it is the only
+project with a test command — so it is the main thing landing, into its own
+source tree. The reply says *Landed on main*, which reads as *this is now
+true*. It is on disk. It is not running.
+
+The suspicion that started this was the wrong commit: the five-proposal cap
+(`b88debd`, 12 September) *is* live, because the bot booted after it, and the
+CLI reporting "9 more allowed this turn" was a filing without `--propose`
+getting the correct larger budget. The premise was wrong and the problem was
+real, which is the argument for measuring it rather than inferring it.
+
+Nothing could tell you that from outside. Startup logged the workspace, the
+approval mode and the turn limits — that last one added for exactly this
+reason, one level up — but never the revision, and neither `silkworm status`
+nor the dashboard reported it. The only way to answer "is the running bot the
+code I am reading" was to probe for a behaviour difference and infer backwards.
+
+So the revision is resolved once at import, from the checkout the code was
+loaded from rather than the workspace it operates on, and compared against that
+checkout's HEAD on demand: `current`, `stale` with a commit count, or
+`unknown`. It surfaces in the startup log, in `silkworm status`, in the
+dashboard's alert bar, and on the landing reply itself, where the misleading
+claim is made.
+
+**`unknown` is never folded into `current`.** No git, a directory that is not a
+repository, a bot too old to report the field at all, or a process that booted
+from a modified tree would otherwise every one of them come back all-clear —
+the same silence this exists to break, told more confidently. The third is not
+hypothetical: it is what the check reported the first time it ran against the
+live bot. The fourth is the subtle one — restart mid-edit, then revert, and the
+running code is no commit and is nowhere on disk, so a matching sha is the
+weakest evidence available rather than the strongest.
+
+### Flagging, not restarting
+
+A successful landing on Silkworm's own repo could restart the bot. It does not,
+and the argument is not close:
+
+- **The trigger is the wrong shape.** Auto-merge lands precisely when work is
+  flowing. Restarting there kills every in-flight turn across every thread and
+  worker — including the conversation that asked for the change. `recovery.py`
+  rescues orphaned turns, but at a real cost, and "interrupted by a restart" is
+  already the most self-inflicted entry on the board.
+- **There is nothing to restart it.** The bot is not under launchd by default,
+  so a self-restart means `os.execv` with no supervisor behind it. Landing's
+  revert-if-broken covers a failing test suite; it does not cover a change that
+  imports cleanly under test and then will not boot.
+- **It is a loop worth entering deliberately.** A bot that merges its own code
+  and restarts into it has no human anywhere in the path, and the failure mode
+  is the whole system going dark rather than one task going wrong.
+
+Restarting is cheap and safe at a moment you pick. What was missing was knowing
+you needed to, and that is what this supplies — loudly, in the two places that
+already mean "something needs you", and on the reply that used to overstate.

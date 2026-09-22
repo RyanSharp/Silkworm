@@ -39,6 +39,7 @@ import home
 import jsonstore
 import learnings_git
 import repos
+import revision
 import roles
 import scoping
 import slack_health
@@ -64,6 +65,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("silkworm")
 
 BASE_DIR = Path(__file__).resolve().parent
+
+#: Resolved once, at import, because it is a fact about *this process* and the
+#: checkout keeps moving underneath it -- Silkworm auto-merges onto its own
+#: main, so asking git later answers a different question than "what am I
+#: running". Everything that reports drift compares against this.
+REVISION = revision.of(BASE_DIR)
 
 # --- Claude config ---------------------------------------------------------
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -1094,8 +1101,13 @@ def handle_status(payload: dict) -> dict:
     # file would call that fixed while the running bot still had the old value.
     auth = credentials.state(has_token=bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")))
     auth.pop("expires_at", None)
+    # Landed is not running: nothing restarts the bot when it merges onto its
+    # own main, so the checkout moves on without the process. Reported as what
+    # booted versus what is on disk, rather than one "version", because the
+    # useful fact is the gap between them.
     return {"online": True, "threads": threads,
-            "slack": slack.status(time.time()), "auth": auth}
+            "slack": slack.status(time.time()), "auth": auth,
+            "revision": revision.state(BASE_DIR, REVISION)}
 
 
 def handle_web_message(payload: dict) -> dict:
@@ -2743,13 +2755,36 @@ def land_and_record(task_id: str, channel: str = "", thread_ts: str = "") -> dic
     except Exception:
         log.exception("recording the landing of %s failed", task_id)
     if channel and outcome.get("stage") != "not-enabled":
+        text = merge.summary(outcome, branch)
+        # "Landed on main" reads as *this is now true*. When the repo being landed
+        # into is the one this process is running from, it is not: nothing restarts
+        # the bot, so the commit is on disk and the old code is still serving. Say
+        # so here, where the claim is made, rather than leaving it to be discovered.
+        if outcome.get("landed") and _is_own_checkout((task.get("scope") or {}).get("cwd")):
+            text += "\n:warning: _This is Silkworm's own checkout — the running bot is still on `" \
+                    f"{REVISION['sha'][:8] or 'unknown'}`. Run `silkworm restart` to pick it up._"
         try:
             app.client.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                        text=merge.summary(outcome, branch))
+                                        text=text)
         except Exception:
             log.exception("posting the landing result failed")
     return outcome
 
+
+
+def _is_own_checkout(cwd) -> bool:
+    """Whether a path is the tree this process was loaded from.
+
+    An empty path is not it. `Path("").resolve()` is the *current* directory,
+    which is this checkout whenever the bot runs from its own repo -- so the
+    obvious one-liner answers "yes" to having been given nothing.
+    """
+    if not cwd:
+        return False
+    try:
+        return Path(cwd).resolve() == BASE_DIR
+    except (OSError, ValueError):
+        return False
 
 #: Landings under way in this process, so a second request for the same task
 #: cannot start one beside it. A landing is not idempotent: both attempts would
@@ -3480,6 +3515,13 @@ if __name__ == "__main__":
     log.info("turn limits: cap=%s idle=%ds · task workers: %d",
              f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none",
              CLAUDE_IDLE_TIMEOUT, TASK_WORKERS)
+    # Same reason as the line above, one level down: a landed fix is not a
+    # running fix, and this is the only place the answer is written down at the
+    # moment it is still true. Everything else asks git, which by then is
+    # describing the checkout rather than the process.
+    log.info("revision: %s%s on %s%s", REVISION["sha"][:8] or "unknown",
+             " (dirty)" if REVISION["dirty"] else "",
+             REVISION["branch"] or "detached HEAD", f" · {BASE_DIR}")
     slack_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     threading.Thread(target=_slack_watchdog, args=(slack_handler,),
                      daemon=True, name="slack-health").start()

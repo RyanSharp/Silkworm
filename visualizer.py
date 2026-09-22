@@ -175,7 +175,16 @@ def load_sessions() -> dict:
     # bot_online only says the local server answered; it stayed true through a
     # seventeen-hour Slack outage. The link is a separate fact.
     return {"bot_online": bool(status.get("online")), "sessions": out,
-            "slack": status.get("slack") or {}}
+            "slack": status.get("slack") or {},
+            # A bot answering here is not a bot running the code on disk: it
+            # merges onto its own main and nothing restarts it. A bot that
+            # answers but reports nothing is old enough to predate the field,
+            # which is itself the answer; one that does not answer at all is
+            # offline, and the status dot already says so.
+            "revision": (status.get("revision") or
+                         ({"state": "unknown",
+                           "message": "this bot is too old to report its revision"}
+                          if status.get("online") else {}))}
 
 
 def find_transcript(session_id: str) -> Path | None:
@@ -1017,7 +1026,7 @@ async function loadList() {
   const data = await (await fetch("/api/sessions")).json();
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
-  renderAlerts(data.sessions, data.slack);
+  renderAlerts(data.sessions, data.slack, data.revision);
   refreshTaskBadge();
   renderKindFilter(data.sessions);
   const nav = document.getElementById("list");
@@ -1188,14 +1197,21 @@ async function learnCall(payload) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
 }
-function renderAlerts(sessions, slack) {
+function renderAlerts(sessions, slack, revision) {
   const bar = document.getElementById("alertbar");
   const stalled = sessions.filter(s => s.turn && s.turn.stalled);
   const pricey = sessions.filter(s => s.cost_flag);
   // Only trust a full sampling window; a bot that just started is not down.
   const down = slack && slack.ready && !slack.connected;
-  if (!stalled.length && !pricey.length && !down) { bar.innerHTML = ""; return; }
+  // Landed is not running. Nothing restarts the bot when it merges onto its
+  // own main, so the fix sits in the tree while the old process keeps serving.
+  // "unknown" is not "fine" either — a bot too old to report the field gives
+  // us nothing, which is the silence this is here to break.
+  const stale = revision && revision.state && revision.state !== "current";
+  if (!stalled.length && !pricey.length && !down && !stale) { bar.innerHTML = ""; return; }
   const parts = [];
+  if (stale) parts.push(`<span class="alert ${revision.state === "stale" ? "bad" : "warn"}">⚠ ${
+    esc(revision.message || "running revision unknown")} — silkworm restart</span>`);
   if (down) parts.push(`<span class="alert bad">⚠ not connected to Slack${
     slack.down_for ? " · " + dur(slack.down_for) : ""} — restarting itself</span>`);
   if (stalled.length) parts.push(
