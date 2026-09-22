@@ -5314,33 +5314,67 @@ def test_blocked_tasks_are_never_stranded():
     # A release that does not finish must leave the task exactly as it was.
     # Persisting the dropped blocker before the state change meant a crash in
     # between left a task `blocked` with an empty `blocked_on` -- the one shape
-    # the audit cannot find, which is the original bug wearing a new hat.
-    st3 = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
-    pid = st3.create("implement", driver="queue", result={"text": "done"})["id"]
-    rid = st3.create("review", role="reviewer", driver="queue", parent=pid)["id"]
-    st3.transition(pid, T.RUNNING)
-    st3.update(pid, blocked_on=[rid])
-    st3.transition(pid, T.BLOCKED)
-    st3.transition(rid, T.RUNNING)
-    real_save, writes = st3._save, []
+    # the audit cannot find, which is the original bug wearing a new hat. Run
+    # with every write in the release failing in turn, because which write is
+    # the dangerous one is exactly what a refactor gets wrong.
+    # From the second write on: the first is the blocker's own transition, and
+    # that failing is its caller's problem -- nothing has been released yet and
+    # the waiter is still legitimately waiting.
+    stranded_by_a_crash, escaped, recovered = [], [], []
+    for nth in range(2, 6):
+        st3 = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+        pid = st3.create("implement", driver="queue", result={"text": "done"})["id"]
+        rid = st3.create("review", role="reviewer", driver="queue", parent=pid)["id"]
+        st3.transition(pid, T.RUNNING)
+        st3.update(pid, blocked_on=[rid])
+        st3.transition(pid, T.BLOCKED)
+        st3.transition(rid, T.RUNNING)
+        real_save, writes = st3._save, []
 
-    def flaky_save():
-        writes.append(1)
-        if len(writes) == 2:          # the reviewer's write lands, the release's does not
-            raise OSError("disk went away")
-        real_save()
+        def flaky_save(_real=real_save, _writes=writes, _nth=nth):
+            _writes.append(1)
+            if len(_writes) == _nth:
+                raise OSError("disk went away")
+            _real()
 
-    st3._save = flaky_save
-    st3.transition(rid, T.FAILED, "Connection closed mid-response")
-    st3._save = real_save
-    reloaded = TaskStore(st3._path)   # as if the process had died and come back
-    stuck = reloaded.get(pid)
-    check("a release that fails does not swallow the blocker id",
-          stuck["blocked_on"] == [rid], stuck["blocked_on"])
-    check("a failed release still leaves the task findable",
-          reloaded.release_stranded() == [pid])
+        st3._save = flaky_save
+        try:
+            st3.transition(rid, T.FAILED, "Connection closed mid-response")
+        except Exception as exc:              # the release must swallow its own
+            escaped.append(f"write {nth}: {exc!r}")
+        st3._save = real_save
+        after = TaskStore(st3._path)          # as if the process had died and come back
+        rec = after.get(pid)
+        if rec["state"] == T.BLOCKED and not rec["blocked_on"]:
+            stranded_by_a_crash.append(nth)
+        after.release_stranded()
+        if after.get(pid)["state"] == T.BLOCKED:
+            recovered.append(nth)
+
+    check("a crash mid-release never empties blocked_on",
+          not stranded_by_a_crash, f"writes {stranded_by_a_crash} left it unfindable")
+    check("a crash mid-release always leaves the task findable",
+          not recovered, f"writes {recovered} stayed blocked after the audit")
     check("a release cannot turn its blocker's transition into an error",
-          reloaded.get(rid)["state"] == T.FAILED)
+          not escaped, "; ".join(escaped))
+
+    # A blocker that had already ended when the wait began is still a blocker
+    # that has ended: when the live one finishes, the waiter goes now, not on
+    # whenever the audit next runs.
+    st5 = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    pid = st5.create("implement", driver="queue", result={"text": "done"})["id"]
+    stale = st5.create("finished long ago")["id"]
+    live = st5.create("still going")["id"]
+    st5.transition(stale, T.CANCELLED)
+    st5.transition(pid, T.RUNNING)
+    st5.update(pid, blocked_on=[stale, live])
+    st5.transition(pid, T.BLOCKED)
+    st5.transition(live, T.RUNNING)
+    st5.transition(live, T.DONE)
+    check("an already-ended blocker does not hold the release up",
+          st5.get(pid)["state"] == T.AWAITING_APPROVAL, st5.get(pid)["state"])
+    check("and it is forgotten in the same breath",
+          st5.get(pid)["blocked_on"] == [], st5.get(pid)["blocked_on"])
 
     # Two blockers that ended before anyone looked: the audit frees the waiter
     # on the first one, and the second must not be left behind in blocked_on --
