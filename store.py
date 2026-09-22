@@ -148,12 +148,34 @@ class SessionStore:
                 self._save()
             return keys
 
-    def sweep(self, max_age_days: float) -> int:
-        cutoff = time.time() - max_age_days * 86400
+    #: What makes a record worth keeping, however old it gets. These are the
+    #: things hiding exists to protect: a thread you are finished looking at is
+    #: still one you spent money on.
+    KEEPS = ("title", "summary", "cost", "turns", "costs", "files", "events", "pending")
+
+    def forget_empty(self, days: float, keep=()) -> list[str]:
+        """Drop only records older than `days` that hold nothing. Returns the keys.
+
+        Age used to be the whole rule, which quietly undid hiding: a task run
+        was put away at 14 days, kept its old `updated` stamp because hiding is
+        not activity, and was deleted outright at 30 -- taking the title,
+        summary, cost history and file list with it. Nobody designed that
+        pipeline; it fell out of two features that never met.
+
+        So age is a floor now, not a reason. A record only goes if there is
+        nothing in it to lose (see KEEPS) and nothing pointing at it: `keep`
+        carries the thread keys tasks still refer to, because deleting one of
+        those orphans a task that may be waiting on a person.
+        """
+        cutoff = time.time() - days * 86400
+        keep = set(keep)
         with self._lock:
-            stale = [k for k, v in self._data.items() if v.get("updated", 0) < cutoff]
-            for k in stale:
+            gone = [k for k, v in self._data.items()
+                    if v.get("updated", 0) < cutoff
+                    and k not in keep
+                    and not any(v.get(f) for f in self.KEEPS)]
+            for k in gone:
                 del self._data[k]
-            if stale:
+            if gone:
                 self._save()
-            return len(stale)
+            return gone

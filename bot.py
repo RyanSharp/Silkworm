@@ -137,6 +137,9 @@ def _parse_channel_dirs(raw: str) -> dict[str, str]:
 
 CHANNEL_DIRS = _parse_channel_dirs(os.environ.get("CLAUDE_CHANNEL_DIRS", ""))
 
+# How old an *empty* session record has to be before it is forgotten. Records
+# with anything in them -- a title, a summary, cost history, files -- are kept
+# for ever and retired by hiding instead; see SessionStore.forget_empty.
 SESSION_MAX_AGE_DAYS = float(os.environ.get("SESSION_MAX_AGE_DAYS", "30"))
 # Finished tasks are kept forever -- they are the project's history -- but
 # past this the reply text and event log are dropped from them.
@@ -3362,10 +3365,18 @@ def _watchdog() -> None:
 
 
 def _sweeper() -> None:
+    """Six-hourly tidy: empty session husks, and yesterday's outbox dirs.
+
+    Threads are retired by hiding them, not by being deleted out from under
+    you -- so this only removes records with nothing in them and no task
+    pointing at them. See SessionStore.forget_empty.
+    """
     while True:
-        removed = store.sweep(SESSION_MAX_AGE_DAYS)
-        if removed:
-            log.info("swept %d stale session(s) older than %sd", removed, SESSION_MAX_AGE_DAYS)
+        referenced = {r.get("thread") for r in task_store.all().values() if r.get("thread")}
+        gone = store.forget_empty(SESSION_MAX_AGE_DAYS, keep=referenced)
+        if gone:
+            log.info("forgot %d empty session record(s) older than %sd: %s",
+                     len(gone), SESSION_MAX_AGE_DAYS, ", ".join(gone))
         try:
             task_store.compact_older_than(TASK_COMPACT_AFTER_DAYS)
         except Exception:

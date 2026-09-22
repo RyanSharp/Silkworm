@@ -621,6 +621,21 @@ stamp `updated`, or a thread you put away would look freshly used.
 This sits alongside the kind filter rather than replacing it: filtering answers
 "show me only conversations", hiding answers "I am finished with this one".
 
+That left one loose end for a while, and it pointed the wrong way. A separate
+six-hourly sweeper deleted any record untouched for thirty days, on age alone —
+so a task run was hidden at fourteen days, kept its stamp (hiding is not
+activity), and was deleted at thirty, taking exactly the title, summary, cost
+history and file list hiding existed to protect. Nobody designed that pipeline;
+it fell out of two features that never met.
+
+So **age is a floor, not a reason**. Hiding is the only way a thread with
+anything in it is retired, and it is never the first step of a delete. What
+still ages out is a **husk**: no title, no summary, no cost history, no files,
+no events, no turn in flight, and no task pointing at it — a record with
+nothing in it to lose. The last of those matters on its own: a task record
+refers to its thread by key, so deleting the session would orphan a task that
+may be sitting in a state waiting for a person.
+
 ## What a review found but did not block on
 
 The gate routed on the verdict's `ok` flag alone: pass completes the task,

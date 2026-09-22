@@ -923,6 +923,60 @@ def test_hiding_threads():
           "store.drop" not in bot[bot.index("def handle_hide"):bot.index("server = LocalServer")])
 
 
+# --- putting a thread away must not queue it up to be deleted -----------------
+# Hiding and deleting were built at different times and never met. A task run
+# was hidden at 14 days, kept its old `updated` stamp (hiding is not activity),
+# and the six-hourly sweeper then deleted it outright at 30 -- taking the
+# title, summary, cost history and file list the hiding was meant to protect.
+
+def test_putting_away_is_not_deleting():
+    print("\nage alone is not a reason to delete a thread")
+    st = tmp_store()
+    st.update("C:1", title="a task run", kind="task",
+              summary="what this run did", session_id="s-1")
+    st.add_cost("C:1", 1.25)
+    st.add_file("C:1", {"name": "report.md"})
+    # update()/add_cost() stamp `updated` themselves, so age is set behind them.
+    st._data["C:1"]["updated"] = time.time() - 15 * 86400
+    check("the bulk tidy hides an old task run",
+          st.hide_older_than(14, kinds=("task",)) == ["C:1"])
+
+    st._data["C:1"]["updated"] = time.time() - 40 * 86400   # past the old horizon
+    st.forget_empty(30)
+    rec = st.get("C:1")
+    check("a hidden thread is still there afterwards", rec is not None,
+          "hiding it at 14 days and deleting it at 30 is not retention")
+    check("its title survives", bool(rec) and rec.get("title") == "a task run")
+    check("its summary survives", bool(rec) and rec.get("summary") == "what this run did")
+    check("its cost history survives",
+          bool(rec) and rec.get("costs") == [1.25] and rec.get("cost") == 1.25,
+          "'I am done looking at this' is not 'erase what it cost me'")
+    check("its file list survives", bool(rec) and len(rec.get("files") or []) == 1)
+
+    # What may go: a husk. No title, no summary, no cost, no files, no events,
+    # nothing pointing at it -- there is nothing in it to lose.
+    st.update("C:husk", kind="task")
+    st.update("C:referenced", kind="task")
+    st.update("C:live", kind="task", pending={"session_id": "s"})
+    for k in ("C:husk", "C:referenced", "C:live"):
+        st._data[k]["updated"] = time.time() - 40 * 86400
+    gone = st.forget_empty(30, keep={"C:referenced"})
+    check("an empty record does age out", gone == ["C:husk"], f"got {gone}")
+    check("but never one a task still points at", st.get("C:referenced") is not None,
+          "deleting it orphans a task that may be waiting on a person")
+    check("and never one with a turn in flight", st.get("C:live") is not None)
+
+    check("age-only deletion is gone, not just uncalled",
+          not hasattr(st, "sweep"),
+          "leaving it in place invites it being wired back up")
+    bot = (BASE / "bot.py").read_text()
+    sweeper = bot[bot.index("def _sweeper"):]
+    sweeper = sweeper[:sweeper.index("\ndef ", 1)]
+    check("the six-hourly sweeper no longer deletes on age", "store.sweep(" not in bot)
+    check("and tells the store which threads tasks point at",
+          "keep=" in sweeper and "thread" in sweeper)
+
+
 # --- work is proven, not believed ------------------------------------------------
 # The reviewer is read-only and cannot run anything, and said so in a real
 # review: "could not run ./bin/silkworm test here, so the '567 passed' claim is
@@ -6401,7 +6455,7 @@ if __name__ == "__main__":
               test_review_gate, test_review_followups,
               test_unknown_role_fails_closed, test_front_doors_agree,
               test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_favicon, test_verification, test_landing, test_landing_is_visible,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_putting_away_is_not_deleting, test_favicon, test_verification, test_landing, test_landing_is_visible,
               test_parallel_tasks,
               test_worktrees, test_cancel_stops_the_child,
               test_worktree_survives_leaving_running,
