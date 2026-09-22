@@ -3088,7 +3088,11 @@ def _ideation_scheduler() -> None:
 
 
 def _task_scheduler() -> None:
-    """Requeue what a restart interrupted, then keep due retries moving.
+    """Requeue what a restart interrupted, then keep the board honest.
+
+    Two jobs on one beat: retries whose time has come, and tasks waiting on a
+    blocker that has already ended -- which are waiting for nothing, in a state
+    that shows up nowhere.
 
     Deliberately one thread rather than one per worker: `blocked -> queued` is
     a state transition, and several workers racing to make the same one would
@@ -3107,10 +3111,17 @@ def _task_scheduler() -> None:
         clear_interrupted_landings()
     except Exception:
         log.exception("clearing interrupted landings failed")
+    # After the requeue, not before: a reviewer the restart is about to put
+    # back in the queue has not stranded its parent, and auditing first would
+    # say it had.
     while True:
         try:
             for tid in task_store.due_retries(time.time()):
                 task_state(tid, tasks.QUEUED, "retry time reached")
+            # Anything waiting on a task that ended is waiting for nothing.
+            # Released here as well as when the blocker ends, so a task
+            # stranded by a crash in between still reaches the board.
+            task_store.release_stranded()
         except Exception:
             log.exception("task scheduler iteration failed")
         time.sleep(TASK_POLL_S)

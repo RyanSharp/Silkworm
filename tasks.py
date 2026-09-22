@@ -68,6 +68,13 @@ DRIVERS = ("inline", "queue")
 #: is the bulk, and once the work has landed nobody opens that again.
 RESULT_KEEPS = ("cost", "review", "landed", "landing")
 
+#: States a blocker never comes back from on its own. A task waiting on one of
+#: these will never be released by it, so the store releases it instead; see
+#: TaskStore._release_waiters. `done` belongs here: a reviewer that finishes
+#: normally moves its parent on before finishing, so a parent still `blocked`
+#: on a finished task was missed, not waiting.
+ENDED = TERMINAL + (FAILED,)
+
 #: state -> states it may move to. Anything absent is rejected, so an executor
 #: bug shows up as a refused transition rather than a task in a nonsense state.
 TRANSITIONS: dict[str, tuple] = {
@@ -281,8 +288,17 @@ class TaskStore:
             self._save()
             return dict(rec)
 
-    def transition(self, tid: str, to_state: str, detail: str = "") -> dict:
-        """Move a task's state, refusing anything the lifecycle disallows."""
+    def transition(self, tid: str, to_state: str, detail: str = "",
+                   _release: bool = True, _seen: set | None = None) -> dict:
+        """Move a task's state, refusing anything the lifecycle disallows.
+
+        Ending a task also releases whatever was waiting on it. That happens
+        here, not in the executor, because a blocker can end in half a dozen
+        places -- an error, a stop, a dismissal from the dashboard -- and only
+        one of them ever remembered to look. `_release=False` is for the one
+        case where the ending is not real: a task marked failed by a restart
+        and requeued in the same breath has not lost anybody their blocker.
+        """
         if to_state not in STATES:
             raise ValueError(f"unknown state {to_state!r}")
         with self._lock:
@@ -311,7 +327,103 @@ class TaskStore:
             self._save()
             log.info("task %s %s -> %s%s", tid, current, to_state,
                      f" ({detail})" if detail else "")
-            return dict(rec)
+            moved = dict(rec)
+        if _release and to_state in ENDED:
+            self._release_waiters(tid, to_state, detail, _seen or {tid})
+        return moved
+
+    # --- nothing waits on a task that has stopped ----------------------------
+    #
+    # `blocked` is the one state that is neither running, finished, nor asking
+    # for anything: it is not in NEEDS_ATTENTION, so a task sitting in it is
+    # invisible. That is correct while its blocker is still going, and a trap
+    # the moment the blocker stops. A reviewer that finishes normally moves its
+    # parent on itself; one that errored, was stopped, or was dismissed used to
+    # move nothing, and the implementor's finished work sat on a branch that
+    # nobody would ever be told about again. DESIGN.md says the board is the
+    # source of truth for the state of work, and it cannot be if work can fall
+    # off it.
+
+    def _ended(self, tid: str) -> bool:
+        """Whether a blocker (held under the lock) will never resolve anything."""
+        rec = self._data.get(tid)
+        return rec is None or rec.get("state") in ENDED
+
+    def _plan_release(self, blocker_id: str, ended_state: str | None,
+                      detail: str) -> list[tuple[str, str, str]]:
+        """Drop an ended blocker from its waiters and say where each should go.
+
+        Reading the waiters and editing `blocked_on` happen under one lock, so
+        two blockers ending at once cannot both believe they were the last.
+        """
+        what = {DONE: "finished", FAILED: "failed",
+                CANCELLED: "was cancelled"}.get(ended_state, "no longer exists")
+        plan, changed = [], False
+        with self._lock:
+            blocker = self._data.get(blocker_id) or {}
+            label = "review" if blocker.get("role") == "reviewer" else "blocker"
+            for wid, rec in self._data.items():
+                waiting = rec.get("blocked_on") or []
+                if blocker_id not in waiting or rec.get("state") != BLOCKED:
+                    # A waiter that has already moved on keeps its blocked_on:
+                    # that is what stops a reviewed task being reviewed twice.
+                    continue
+                rest = [b for b in waiting if b != blocker_id]
+                rec["blocked_on"] = rest
+                changed = True
+                if any(not self._ended(b) for b in rest):
+                    continue                    # still waiting on something live
+                why = f"{label} {blocker_id} {what}"
+                if detail:
+                    why += f": {detail}"
+                # Work that exists is work someone should look at. A task with
+                # nothing to show has not earned an approval prompt, and saying
+                # so on the board beats silence.
+                plan.append((wid, AWAITING_APPROVAL if rec.get("result") else FAILED, why))
+            if changed:
+                self._save()
+        return plan
+
+    def _release_waiters(self, blocker_id: str, ended_state: str | None,
+                         detail: str, seen: set) -> list[str]:
+        """Move every task stranded by `blocker_id` ending. Returns their ids."""
+        freed = []
+        for wid, to_state, why in self._plan_release(blocker_id, ended_state, detail):
+            if wid in seen:
+                continue                        # a cycle, or already handled
+            seen.add(wid)
+            try:
+                self.transition(wid, to_state, why[:200], _seen=seen)
+                freed.append(wid)
+                log.warning("task %s released from %s: %s", wid, blocker_id, why)
+            except (InvalidTransition, KeyError):
+                log.exception("could not release %s waiting on %s", wid, blocker_id)
+        return freed
+
+    def release_stranded(self) -> list[str]:
+        """Free tasks already waiting on a blocker that has ended.
+
+        The release above only fires as a blocker ends, which does nothing for
+        a task stranded before the rule existed, or by a crash in between. Run
+        at startup and on the scheduler's beat so `blocked` always means
+        "waiting on something that is still going".
+        """
+        with self._lock:
+            ended: dict[str, str | None] = {}
+            for rec in self._data.values():
+                if rec.get("state") != BLOCKED:
+                    continue
+                for b in rec.get("blocked_on") or []:
+                    if self._ended(b):
+                        ended[b] = (self._data.get(b) or {}).get("state")
+        freed = []
+        for bid, state in ended.items():
+            freed += self._release_waiters(
+                bid, state, "found by the stranded-task audit", set())
+        if freed:
+            log.warning("released %d task(s) stranded on an ended blocker: %s",
+                        len(freed), ", ".join(freed))
+        return freed
 
     def all(self) -> dict[str, dict]:
         with self._lock:
@@ -370,7 +482,9 @@ class TaskStore:
         for tid, rec in list(self._data.items()):
             if rec.get("state") != RUNNING or rec.get("driver") != "queue":
                 continue
-            self.transition(tid, FAILED, "interrupted by a restart")
+            # _release=False: it is going straight back in the queue, so
+            # anything blocked on it has not actually lost its blocker.
+            self.transition(tid, FAILED, "interrupted by a restart", _release=False)
             self.transition(tid, QUEUED, "requeued after a restart")
             moved += 1
         return moved

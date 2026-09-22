@@ -5187,6 +5187,137 @@ def test_task_retention():
     check("documented next to the session window",
           "TASK_COMPACT_AFTER_DAYS" in env
           and 0 < env.index("TASK_COMPACT_AFTER_DAYS") - env.index("SESSION_MAX_AGE_DAYS") < 600)
+# --- a task must not be stranded by its blocker ---------------------------------
+# An implementor waits in `blocked` for its reviewer. Only the reviewer
+# finishing normally ever moved it on, so a reviewer that errored, was stopped,
+# or was dismissed from the dashboard left the parent in a state that is not in
+# NEEDS_ATTENTION -- invisible for ever, with its finished work on a branch.
+
+def test_blocked_tasks_are_never_stranded():
+    import tasks as T
+    from tasks import TaskStore
+    print("\nnothing waits on a task that has stopped")
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+
+    def blocked_pair(**parent_fields):
+        """An implementor parked on its reviewer, exactly as resolve_review leaves it."""
+        parent = st.create("implement the thing", driver="queue", **parent_fields)
+        st.transition(parent["id"], T.RUNNING)
+        reviewer = st.create("review it", role="reviewer", driver="queue",
+                             parent=parent["id"], source="review")
+        st.update(parent["id"], blocked_on=[reviewer["id"]])
+        st.transition(parent["id"], T.BLOCKED, f"awaiting review {reviewer['id']}")
+        st.transition(reviewer["id"], T.RUNNING)
+        return parent["id"], reviewer["id"]
+
+    # 1. the reviewer dies on a ClaudeError
+    pid, rid = blocked_pair(result={"text": "did the thing"})
+    st.transition(rid, T.FAILED, "Connection closed mid-response")
+    parent = st.get(pid)
+    check("a failed reviewer does not strand its parent",
+          parent["state"] == T.AWAITING_APPROVAL, parent["state"])
+    check("the parent is back in the what-needs-me view",
+          parent["state"] in T.NEEDS_ATTENTION)
+    last = parent["events"][-1]["detail"]
+    check("the detail names what happened to the reviewer",
+          rid in last and "failed" in last, last)
+    check("the dead reviewer is dropped from blocked_on", parent["blocked_on"] == [],
+          "leaving it there makes a rerun skip both verification and review")
+
+    # 2. the user stops the reviewer: it lands in cancelled
+    pid, rid = blocked_pair(result={"text": "did the thing"})
+    st.transition(rid, T.CANCELLED, "stopped by the user")
+    parent = st.get(pid)
+    check("a cancelled reviewer does not strand its parent",
+          parent["state"] == T.AWAITING_APPROVAL, parent["state"])
+    check("the detail says it was cancelled",
+          "cancelled" in parent["events"][-1]["detail"])
+
+    # 3. the reviewer is dismissed from the dashboard (queued -> cancelled)
+    parent = st.create("implement", driver="queue", result={"text": "done"})
+    st.transition(parent["id"], T.RUNNING)
+    reviewer = st.create("review", role="reviewer", driver="queue", parent=parent["id"])
+    st.update(parent["id"], blocked_on=[reviewer["id"]])
+    st.transition(parent["id"], T.BLOCKED)
+    st.transition(reviewer["id"], T.CANCELLED, "dismiss via ui")
+    check("a dismissed reviewer does not strand its parent",
+          st.get(parent["id"])["state"] == T.AWAITING_APPROVAL)
+
+    # A task with nothing to show has not earned an approval prompt, but it
+    # must still say so somewhere the user looks.
+    pid, rid = blocked_pair()
+    st.transition(rid, T.FAILED, "gave up")
+    check("a parent with no work to show fails rather than asking for approval",
+          st.get(pid)["state"] == T.FAILED)
+
+    # The normal path must be untouched: the reviewer moves its parent on
+    # before finishing, and the parent keeps the reviewer id that stops it
+    # being reviewed a second time.
+    pid, rid = blocked_pair(result={"text": "did the thing"})
+    st.transition(pid, T.DONE, "review passed")
+    st.transition(rid, T.DONE)
+    check("a passed review still completes the parent", st.get(pid)["state"] == T.DONE)
+    check("a settled parent keeps the reviewer in blocked_on",
+          st.get(pid)["blocked_on"] == [rid],
+          "clearing it would let a rerun skip the gate")
+
+    # Waiting on two things: one ending is not the same as being free.
+    parent = st.create("implement", driver="queue", result={"text": "done"})
+    st.transition(parent["id"], T.RUNNING)
+    a, b = st.create("a", driver="queue"), st.create("b", driver="queue")
+    st.update(parent["id"], blocked_on=[a["id"], b["id"]])
+    st.transition(parent["id"], T.BLOCKED)
+    st.transition(a["id"], T.RUNNING)
+    st.transition(a["id"], T.CANCELLED)
+    check("one blocker of two ending leaves the task blocked",
+          st.get(parent["id"])["state"] == T.BLOCKED)
+    check("the ended blocker is still dropped",
+          st.get(parent["id"])["blocked_on"] == [b["id"]])
+    st.transition(b["id"], T.RUNNING)
+    st.transition(b["id"], T.DONE)
+    check("the last blocker ending releases it",
+          st.get(parent["id"])["state"] == T.AWAITING_APPROVAL)
+
+    # A restart is not a stranding: the reviewer is requeued in the same breath.
+    pid, rid = blocked_pair(result={"text": "done"})
+    st.requeue_interrupted()
+    check("a restart requeues the reviewer", st.get(rid)["state"] == T.QUEUED)
+    check("a requeued reviewer does not release its parent",
+          st.get(pid)["state"] == T.BLOCKED, st.get(pid)["state"])
+
+    # The audit: anything stranded before the rule existed, or by a crash
+    # between the blocker ending and the release, must still surface.
+    st2 = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    orphan = st2.create("implement", driver="queue", result={"text": "done"})
+    rev = st2.create("review", role="reviewer", driver="queue", parent=orphan["id"])
+    st2.transition(rev["id"], T.CANCELLED)
+    st2.transition(orphan["id"], T.RUNNING)
+    st2.update(orphan["id"], blocked_on=[rev["id"]])      # blocked after the fact
+    st2.transition(orphan["id"], T.BLOCKED)
+    check("the audit finds a task already stranded",
+          st2.release_stranded() == [orphan["id"]])
+    check("the audit puts it in front of the user",
+          st2.get(orphan["id"])["state"] == T.AWAITING_APPROVAL)
+    check("a second pass has nothing to do", st2.release_stranded() == [])
+
+    ghost = st2.create("implement", driver="queue")
+    st2.transition(ghost["id"], T.RUNNING)
+    st2.update(ghost["id"], blocked_on=["tsk_doesnotexist"])
+    st2.transition(ghost["id"], T.BLOCKED)
+    st2.release_stranded()
+    check("blocked on a task that does not exist is also stranded",
+          st2.get(ghost["id"])["state"] == T.FAILED)
+
+    check("releases survive a reload",
+          TaskStore(st2._path).get(orphan["id"])["state"] == T.AWAITING_APPROVAL)
+
+    # The audit is worth nothing if nothing calls it.
+    bot = (BASE / "bot.py").read_text()
+    sched = bot[bot.index("def _task_scheduler("):bot.index("def _task_worker(")]
+    check("the scheduler audits blocked tasks on its beat",
+          "release_stranded()" in sched)
+    check("the audit runs after the restart requeue, not before",
+          sched.index("requeue_interrupted") < sched.index("release_stranded"))
 
 
 # --- state files survive being killed mid-save --------------------------------
