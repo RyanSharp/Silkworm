@@ -1743,17 +1743,156 @@ def test_ideation():
     check("the scheduler records the date it ran", "ideate_on=" in bot,
           "or a restart in the small hours would run it twice")
 
+    # The nightly pass fed a pile nothing emptied: 41 tasks sat in `proposed`
+    # at once, on a board whose default view is "what needs me?". A night that
+    # would only be refused at filing time is a session spent to learn what
+    # the board already knew, so it does not start at all.
+    import scoping as S
+    fn = next(n for n in ast.walk(ast.parse(bot))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_ideation")
+    guards = [n for n in ast.walk(fn) if isinstance(n, ast.If)
+              and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                      and c.func.attr == "backlog_full" for c in ast.walk(n.test))]
+    creates = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+               and isinstance(n.func, ast.Attribute) and n.func.attr == "create"]
+    check("a deep board skips the night rather than filing a pass that gets refused",
+          len(guards) == 1 and bool(creates)
+          and all(line > guards[0].lineno for line in creates),
+          "a refused pass still costs a session to find out")
+    body = [n for g in guards for n in ast.walk(g) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)]
+    check("the skipped night creates nothing",
+          not any(c.func.attr == "create" for c in body),
+          "a skipped pass that still files a task has skipped nothing")
+    check("and is still marked as dealt with for today",
+          any(c.func.attr == "ensure" and any(k.arg == "ideate_on" for k in c.keywords)
+              for c in body),
+          "otherwise the scheduler re-decides it every five minutes until midnight")
+    # The skip stamps `ideate_on` so the scheduler stops re-deciding the same
+    # night every five minutes until midnight. What it must not do is cost the
+    # project its *next* look: the marker is a date, so it silences today and
+    # nothing further. Driven rather than read, because "stamped" and "stamped
+    # in a way that still lets tomorrow run" look identical in the source.
+    import projects as _P
+    _ps = _P.ProjectStore(Path(tempfile.mkdtemp()) / "p.json")
+    _ps.ensure("Silkworm", ideate_at="02:00")
+    _today = datetime(2026, 9, 22, 3, 0)
+    check("a project with room is due once its time has passed",
+          _P.due_for_ideation(_ps.all(), _today) == ["silkworm"])
+    # What run_ideation does when it skips, done here directly.
+    _ps.ensure("silkworm", ideate_on=_today.strftime("%Y-%m-%d"))
+    check("a skipped night is not re-decided for the rest of that night",
+          _P.due_for_ideation(_ps.all(), datetime(2026, 9, 22, 23, 59)) == [],
+          "the scheduler wakes every five minutes; it would skip, and log, "
+          "each time until midnight")
+    check("but the skip does not cost the project its next night",
+          _P.due_for_ideation(_ps.all(), datetime(2026, 9, 23, 3, 0)) == ["silkworm"],
+          "a marker that outlived the night it was set for would turn a full "
+          "board into a schedule that never runs again, even once emptied")
+
+    check("the skip is logged with the reason",
+          any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "info" for g in guards for n in ast.walk(g)),
+          "ideation going quiet should be findable, not a mystery")
+    # The panel is the only place a paused schedule can be seen: "it ran and
+    # found nothing" and "it did not run" look identical from outside.
+    check("the projects payload carries the limit the page compares against",
+          '"proposal_limit": scoping.max_open_proposals()' in bot)
+    import projects as P
+    rows = P.summarise([{"slug": "silkworm", "title": "Silkworm", "archived": False}],
+                       [{"project": "silkworm", "state": "proposed"},
+                        {"project": "silkworm", "state": "proposed"},
+                        {"project": "silkworm", "state": "queued"},
+                        {"project": "silkworm", "state": "failed"}],
+                       ("proposed", "awaiting_approval", "needs_input", "failed"))
+    check("a project summary counts its untriaged proposals on their own",
+          rows[0]["proposed"] == 2 and rows[0]["needs"] == 3,
+          f"got {rows[0]}")
+    check("the nightly panel is told the limit as well as the rows",
+          "renderNightly(rows, r.proposal_limit" in (BASE / "visualizer.py").read_text())
+    check("and a project with none says zero rather than omitting it",
+          P.summarise([{"slug": "odin", "title": "Odin", "archived": False}], [],
+                      ("proposed",))[0]["proposed"] == 0,
+          "an absent field reads as unknown in the page, not as none")
+
+
+def test_nightly_panel_shows_paused():
+    """A skipped night must look skipped, not quiet.
+
+    `renderNightly` is driven rather than read: a panel that renders the
+    button but never reaches the paused branch looks identical in the source.
+    """
+    import re, json as _j, subprocess as _sp, tempfile as _tf
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe nightly panel says when a project is paused")
+
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    prelude = """
+const _els = {};
+function _el(id) {
+  return _els[id] || (_els[id] = {innerHTML: "", value: "", style: {},
+    classList: {add(){}, remove(){}, toggle(){}}, appendChild(){}, addEventListener(){}});
+}
+globalThis.document = {getElementById: _el, addEventListener(){},
+  createElement: () => _el("_new"), querySelectorAll: () => [], body: _el("body")};
+globalThis.window = globalThis;
+globalThis.fetch = async () => ({json: async () => ({sessions: [], tasks: []}),
+                                 text: async () => ""});
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.localStorage = {getItem: () => null, setItem(){}};
+process.on("unhandledRejection", () => {});
+"""
+    drive = """
+const _n = _el("nightly");
+const rows = [{slug: "silkworm", title: "Silkworm", ideate_at: "02:00", proposed: 10},
+              {slug: "saga", title: "Saga", ideate_at: "02:00", proposed: 2},
+              {slug: "odin", title: "Odin", ideate_at: "", proposed: 40}];
+renderNightly(rows, 10);
+const out = {withLimit: _n.innerHTML};
+_n.innerHTML = "";
+renderNightly(rows, 0);
+out.noLimit = _n.innerHTML;
+console.log(JSON.stringify(out));
+"""
+    f = Path(_tf.mkdtemp()) / "h.js"
+    f.write_text(prelude + js + drive)
+    r = _sp.run(["node", str(f)], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        check("the panel renders in a browser-like context", False,
+              (r.stderr or "").strip().splitlines()[-1] if r.stderr else "no output")
+        return
+    out = _j.loads(r.stdout.strip().splitlines()[-1])
+    html = out["withLimit"]
+    silkworm = html[html.index("Silkworm"):html.index("Saga")]
+    saga = html[html.index("Saga"):]
+    check("a project at the limit is labelled paused, not scheduled",
+          "paused" in silkworm and "10 proposals waiting" in html,
+          f"got {silkworm!r}")
+    check("and says what to do about it",
+          "accept or dismiss" in html and "02:00" in silkworm)
+    check("a project with room still shows its time",
+          "paused" not in saga and "<b>02:00</b>" in saga, f"got {saga!r}")
+    check("one that is switched off is not called paused",
+          "Odin" in html and "paused" not in html[html.index("Odin"):],
+          "it has no schedule to pause")
+    check("no limit means nothing is claimed to be paused",
+          "paused" not in out["noLimit"],
+          "an older payload should not invent a state")
+
 
 def _file_task_impl():
     """Load handle_file_task out of bot.py without importing it.
 
     bot.py needs Slack tokens to import, so the route is compiled on its own
-    against the real roles/scoping/tasks modules and a temporary task store.
+    against the real roles/scoping/tasks/projects modules and a temporary task
+    store.
     Only the two session lookups are stubbed -- the decision under test, and
     every rule it depends on, is the shipped code.
     """
     import types
-    import roles as R, scoping as S, tasks as T
+    import projects as P, roles as R, scoping as S, tasks as T
     from tasks import TaskStore
 
     src = (BASE / "bot.py").read_text()
@@ -1777,7 +1916,8 @@ def _file_task_impl():
     made: list = []
     mod = types.ModuleType("filing")
     mod.__dict__.update(
-        re=__import__("re"), roles=R, scoping=S, tasks=T, task_store=ts,
+        re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
+        task_store=ts,
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
         store=types.SimpleNamespace(get=lambda k: {}),
         project_store=types.SimpleNamespace(
@@ -1854,6 +1994,114 @@ def test_scoping():
           S.MAX_PROPOSALS < S.MAX_PER_TURN
           and S.limit_for(True) == S.MAX_PROPOSALS
           and S.limit_for(False) == S.MAX_PER_TURN)
+
+    # The per-pass cap counts only what the running pass filed, so every night
+    # started from zero however many of its predecessors' proposals were still
+    # untriaged. That put 41 tasks in `proposed` at once, on a board whose
+    # whole premise is that it can reach empty.
+    check("a board already at the standing limit takes no more proposals",
+          "standing limit" in S.validate("Add an appearance preference",
+                                         propose=True, slug="silkworm",
+                                         open_now=S.max_open_proposals()),
+          "the per-pass cap resets nightly; nothing bounded the pile")
+    # Deliberately a count that is not the limit: asking with open_now equal
+    # to the limit makes the two numbers indistinguishable, and an assertion
+    # that cannot tell them apart passed while the count was dropped entirely.
+    said = S.backlog_refusal("silkworm", S.max_open_proposals() + 2)
+    check("the refusal says how many are waiting, what the limit is, and where",
+          str(S.max_open_proposals() + 2) in said
+          and str(S.max_open_proposals()) in said and "silkworm" in said,
+          f"got {said!r}")
+    check("one below the limit still goes through",
+          S.validate("Add an appearance preference", propose=True,
+                     open_now=S.max_open_proposals() - 1) == "",
+          "the limit is a ceiling on the pile, not a freeze at the approach")
+    check("work scoped with you is not rationed by the proposal backlog",
+          S.validate("Add an appearance preference", propose=False,
+                     open_now=S.max_open_proposals() * 10) == "",
+          "you agreed it; a nightly pass getting ahead of itself is not a "
+          "reason to refuse the thing you just asked for")
+    check("only untriaged proposals count toward it",
+          S.open_proposals([{"state": "proposed"}, {"state": "proposed"},
+                            {"state": "queued"}, {"state": "awaiting_approval"},
+                            {"state": "done"}, {"state": "cancelled"}]) == 2,
+          "accepted work is not a decision you still owe, and a dismissal is "
+          "an answer")
+    check("the standing limit leaves room for more than one night",
+          S.MAX_PROPOSALS < S.DEFAULT_OPEN_PROPOSALS <= 20,
+          "below one pass's worth it would refuse mid-night; far above it and "
+          "the list stops being readable, which is the failure it exists for")
+    check("it is configurable without editing the source",
+          "_env_int(\"MAX_OPEN_PROPOSALS\"" in (BASE / "scoping.py").read_text())
+    # bot.py imports this module and calls load_dotenv() afterwards, so a
+    # limit bound at import time is fixed before `.env` is read: documented,
+    # and inert. Set after import here for exactly that reason.
+    os.environ["MAX_OPEN_PROPOSALS"] = "3"
+    check("an override set after import is still honoured",
+          S.max_open_proposals() == 3 and S.backlog_full(3)
+          and not S.backlog_full(2),
+          "a constant evaluated at import would ignore everything in .env")
+    check("and the refusal quotes the configured limit, not the default",
+          "limit is 3" in S.backlog_refusal("silkworm", 4))
+    check("an override is read from the environment", S._env_int("MAX_OPEN_PROPOSALS", 10) == 3)
+    for bad in ("nonsense", "", "0", "-2"):
+        os.environ["MAX_OPEN_PROPOSALS"] = bad
+        check(f"{bad!r} falls back to the default rather than freezing ideation",
+              S.max_open_proposals() == S.DEFAULT_OPEN_PROPOSALS,
+              "a limit under one would silently stop a schedule the user "
+              "still believes is running")
+    os.environ.pop("MAX_OPEN_PROPOSALS", None)
+    check("and with nothing set at all, the default applies",
+          S.max_open_proposals() == S.DEFAULT_OPEN_PROPOSALS)
+
+    fn = next(n for n in ast.walk(ast.parse((BASE / "bot.py").read_text()))
+              if isinstance(n, ast.FunctionDef) and n.name == "handle_file_task")
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "validate"]
+    kw = {k.arg: k.value for c in calls for k in c.keywords}
+    check("the filing path counts the board, not a per-turn tally",
+          "open_now" in kw and "slug" in kw,
+          "otherwise a pass that began while there was room files past the limit")
+    guarded = [n for n in ast.walk(fn) if isinstance(n, ast.IfExp)
+               and any(isinstance(v, ast.Name) and v.id == "slug"
+                       for v in ast.walk(n.test))
+               and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                       and c.func.attr == "open_proposals" for c in ast.walk(n))]
+    check("an unfiled proposal is not counted against a project",
+          len(guarded) == 1,
+          'by_project("") is every task filed under no project at all — '
+          "mail triage's proposals — and counting them would refuse an "
+          "unrelated filing over a pile no project panel can show")
+    counted = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+               and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "open_proposals"]
+    check("and counts it live from the task store",
+          len(counted) == 1 and any(isinstance(a, ast.Call)
+                                    and isinstance(a.func, ast.Attribute)
+                                    and a.func.attr == "by_project"
+                                    for a in counted[0].args),
+          "a cached count would let a long pass file past the limit")
+    # Counting the board needs the project's key, and the obvious way to get
+    # one -- `project_store.ensure` -- creates the record and its home
+    # directory on disk. That write has to stay below the gates, or a refused
+    # filing leaves a project behind, done on behalf of a role whose whole
+    # point is that it cannot write. So the count slugifies instead.
+    gate = next(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "validate")
+    writes = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Attribute)
+              and n.func.attr in ("ensure", "home")
+              and isinstance(n.func.value, ast.Name)
+              and n.func.value.id == "project_store"]
+    check("naming a project to count it does not create one",
+          bool(writes) and all(line > gate for line in writes),
+          "a refused filing would leave a project record and a directory "
+          "behind it")
+    check("the count reaches the slug without writing",
+          any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "slugify" and n.lineno < gate
+              for n in ast.walk(fn)),
+          "by_project is keyed by slug, and slugify is the pure way there")
 
     bot = (BASE / "bot.py").read_text()
     h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
@@ -6469,7 +6717,7 @@ if __name__ == "__main__":
               test_review_gate, test_review_followups,
               test_unknown_role_fails_closed, test_front_doors_agree,
               test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_hiding_threads, test_putting_away_is_not_deleting, test_favicon, test_verification, test_landing, test_landing_is_visible,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_nightly_panel_shows_paused, test_hiding_threads, test_putting_away_is_not_deleting, test_favicon, test_verification, test_landing, test_landing_is_visible,
               test_parallel_tasks,
               test_worktrees, test_cancel_stops_the_child,
               test_worktree_survives_leaving_running,

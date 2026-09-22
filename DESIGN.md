@@ -523,6 +523,29 @@ nothing it filed could reach done. The cap lives where proposals are filed
 rather than in the prompt that asks for them: a run that miscounts, or decides
 its tenth finding is worth an exception, is refused at the third.
 
+**And capped standing, not only per pass.** That per-pass cap counts what the
+running pass filed and nothing else, so every night started from zero however
+many of its predecessors' proposals were still untriaged — a board that could
+only grow while acceptance lagged. That put 41 tasks in `proposed` at once,
+several of them describing problems that had since been fixed on main, on a
+system whose default view is "what needs me?" and whose first rule is that a
+board which cannot reach empty is the wrong board. So a project
+also has a standing limit — `MAX_OPEN_PROPOSALS`, ten by default, two nights'
+worth — and at it, the nightly pass **does not run**: no session is started,
+the night is marked as dealt with, and the skip is logged. Filing is refused at
+the same limit as well, so a pass that began while there was room still stops
+when the room runs out rather than filing past it.
+
+Ten because one night's proposals you have not got to yet is a normal morning,
+two is the board outpacing you, and a third night of the same is not
+information you did not already have. It is also about as many as can sit in
+the attention list beside everything else and still be read.
+
+A paused project says so in the nightly panel, because "it ran and found
+nothing" and "it did not run" look identical from outside. Dismissing or
+accepting anything starts it again the following night, which makes triage —
+not configuration — the thing that turns the tap back on.
+
 Scheduling is checked against the wall clock rather than slept precisely to, so
 a bot restarted at 02:00 still runs the pass when it returns, and one that has
 already run today does not run twice.

@@ -1450,9 +1450,14 @@ def handle_projects(payload: dict) -> dict:
     """Route for /projects — list, create and archive (localhost-trusted)."""
     action = payload.get("action", "list")
     if action == "list":
-        return {"ok": True, "projects": projects.summarise(
-            project_store.all(include_archived=bool(payload.get("archived"))),
-            list(task_store.all().values()), tasks.NEEDS_ATTENTION)}
+        return {"ok": True,
+                # So the nightly panel can show a project as paused rather
+                # than merely quiet: the limit lives in one place and the page
+                # compares against it instead of hard-coding a number.
+                "proposal_limit": scoping.max_open_proposals(),
+                "projects": projects.summarise(
+                    project_store.all(include_archived=bool(payload.get("archived"))),
+                    list(task_store.all().values()), tasks.NEEDS_ATTENTION)}
     if action == "ensure":
         name = (payload.get("name") or "").strip()
         if not name:
@@ -1728,7 +1733,26 @@ def handle_file_task(payload: dict) -> dict:
     propose = bool(payload.get("propose")) or restricted
     state = tasks.PROPOSED if propose else tasks.QUEUED
 
-    err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose)
+    # Named, not resolved. `ensure` creates the project's record and its home
+    # directory on disk, which has to stay below the checks so a refused
+    # filing leaves nothing behind; `slugify` is the same key `by_project`
+    # stores under, arrived at without writing anything.
+    entry = store.get(key) or {}
+    proj = (payload.get("project") or entry.get("project") or "").strip()
+    slug = projects.slugify(proj) if proj else ""
+
+    # Proposals are also bounded across passes, not just within one: the
+    # per-turn count starts at zero every run, so without this a nightly pass
+    # keeps adding to a pile nobody has got to. Counted live from the board so
+    # a pass that began while there was room still stops when the room runs
+    # out. Only for a named project: `by_project("")` is every task filed
+    # under no project at all, which is where mail triage puts its proposals,
+    # and pooling those would refuse an unrelated filing over a count no
+    # project panel can show. The nightly pass always names its project.
+    open_now = (scoping.open_proposals(task_store.by_project(slug))
+                if propose and slug else 0)
+    err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose,
+                           open_now=open_now, slug=slug)
     if err:
         return {"ok": False, "error": err}
 
@@ -1737,12 +1761,10 @@ def handle_file_task(payload: dict) -> dict:
     if err:
         return {"ok": False, "error": err}
 
-    # Resolved only once the filing is going to happen. Naming a project
-    # creates its record and its home directory on disk, and doing that above
-    # the checks meant a refused filing still left one behind -- a write, done
-    # on behalf of a role whose whole point is that it cannot write.
-    entry = store.get(key) or {}
-    proj = (payload.get("project") or entry.get("project") or "").strip()
+    # Created only once the filing is going to happen. Naming a project makes
+    # its record and its home directory on disk, and doing that above the
+    # checks meant a refused filing still left one behind -- a write, done on
+    # behalf of a role whose whole point is that it cannot write.
     if proj:
         proj = project_store.ensure(proj)["slug"]
         project_store.home(proj, create=True)
@@ -2982,6 +3004,20 @@ def run_ideation(slug: str) -> dict:
     work. The ideator role is read-only: it can propose, and nothing else.
     """
     rec = project_store.get(slug) or {}
+
+    # A night that would only be refused at filing time is a session spent to
+    # learn what the board already knew, so the pass does not start at all
+    # while the project is at its standing limit. `ideate_on` is stamped
+    # either way: the night has been dealt with, and re-deciding it every five
+    # minutes until midnight would fill the log with the same answer.
+    open_now = scoping.open_proposals(task_store.by_project(slug))
+    if scoping.backlog_full(open_now):
+        project_store.ensure(slug, ideate_on=datetime.now().strftime("%Y-%m-%d"))
+        log.info("skipped nightly ideation for %s: %d proposals already waiting",
+                 slug, open_now)
+        return {"ok": True, "skipped": "backlog", "open": open_now,
+                "limit": scoping.max_open_proposals()}
+
     scope = project_store.scope_for(slug) or {"cwd": str(CLAUDE_CWD)}
     goal = (
         f"Look over the {rec.get('title') or slug} project and propose work "

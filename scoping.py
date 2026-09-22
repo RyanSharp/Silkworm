@@ -15,6 +15,7 @@ are already reviewed by the only person whose review the gate exists to get.
 `proposed` is for things that arrive without you.
 """
 
+import os
 import re
 
 import tasks
@@ -30,6 +31,50 @@ MAX_PER_TURN = 10
 #: the ideator runs unattended, so a run that miscounts would spend the one
 #: thing the whole gate protects -- a decision per proposal.
 MAX_PROPOSALS = 2
+
+
+def _env_int(name: str, default: int) -> int:
+    """An override from the environment, or the default if it is not usable.
+
+    A limit below one would mean the nightly pass could never file anything,
+    which is what turning ideation off is for -- so a value that low, or one
+    that is not a number at all, falls back rather than silently disabling a
+    schedule the user still believes is running.
+    """
+    try:
+        value = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
+#: Standing, across passes, per project. MAX_PROPOSALS bounds one night; this
+#: bounds the pile. The per-pass cap counts only what the running pass filed,
+#: so every night starts from zero however many of its predecessors' proposals
+#: are still untriaged, and the board can only grow while acceptance lags --
+#: which is how `proposed` came to hold 41 tasks at once, several of them
+#: describing problems that had since been fixed on main.
+#:
+#: Two nights' worth of the per-pass cap: one night you have not got to yet is
+#: a normal morning, two is the board outpacing you, and a third is not
+#: information you did not already have. It is also about as many proposals as
+#: can sit in the "what needs me?" list beside the other attention states and
+#: still be read rather than scrolled past -- and if the board cannot reach
+#: empty, it is the wrong board.
+DEFAULT_OPEN_PROPOSALS = 2 * MAX_PROPOSALS
+
+
+def max_open_proposals() -> int:
+    """The standing limit in force, from the environment or the default.
+
+    Read per call rather than bound at import: bot.py imports this module
+    before it calls load_dotenv(), so a constant evaluated here would be
+    fixed before `.env` was read and MAX_OPEN_PROPOSALS would be documented
+    but inert -- settable only by exporting it into the real environment,
+    which is not how anything else here is configured.
+    """
+    return _env_int("MAX_OPEN_PROPOSALS", DEFAULT_OPEN_PROPOSALS)
+
 
 #: Long enough to act on without the implementor guessing what you meant.
 MIN_GOAL_CHARS = 15
@@ -66,14 +111,52 @@ def limit_for(propose: bool = False) -> int:
     return MAX_PROPOSALS if propose else MAX_PER_TURN
 
 
-def validate(goal: str, filed_already: int = 0, propose: bool = False) -> str:
-    """Returns an error message, or '' if this task may be filed."""
+def open_proposals(project_tasks) -> int:
+    """How many of a project's proposals are still waiting to be triaged.
+
+    Only `proposed`: that is the ideator's own untriaged output, and the only
+    pile a further night makes worse. Work you already accepted is queued, and
+    a task waiting on your approval ran and produced something.
+    """
+    return sum(1 for t in project_tasks if t.get("state") == tasks.PROPOSED)
+
+
+def backlog_full(open_now: int) -> bool:
+    """Whether a project already has as many open proposals as it may hold."""
+    return open_now >= max_open_proposals()
+
+
+def backlog_refusal(slug: str, open_now: int) -> str:
+    """Why a proposal is being refused, addressed to whoever tried to file it.
+
+    A reason rather than a silent drop: the pass that hits this should stop
+    and say so in its reply, not keep looking for a proposal that would be
+    accepted.
+    """
+    return (f"{open_now} proposals for {slug or 'this project'} are already "
+            f"waiting to be triaged, and the standing limit is "
+            f"{max_open_proposals()} — file nothing further and say so in your "
+            "reply. Accepting or dismissing what is already on the board is "
+            "worth more than another idea on top of it.")
+
+
+def validate(goal: str, filed_already: int = 0, propose: bool = False,
+             open_now: int = 0, slug: str = "") -> str:
+    """Returns an error message, or '' if this task may be filed.
+
+    `open_now` is how many proposals the project already has untriaged, which
+    only bounds proposals: work you scoped in conversation is agreed, and
+    refusing it because a nightly pass got ahead of itself would punish the
+    wrong filing.
+    """
     goal = (goal or "").strip()
     if len(goal) < MIN_GOAL_CHARS:
         return (f"a task needs a goal of at least {MIN_GOAL_CHARS} characters — "
                 "whoever picks it up has only this to go on")
     if len(goal) > MAX_GOAL_CHARS:
         return f"that goal is over {MAX_GOAL_CHARS} characters; split it"
+    if propose and backlog_full(open_now):
+        return backlog_refusal(slug, open_now)
     limit = limit_for(propose)
     if filed_already >= limit:
         if propose:

@@ -1280,19 +1280,27 @@ async function setIdeate(slug) {
   renderProjects();
 }
 
-function renderNightly(rows) {
+function renderNightly(rows, limit) {
   const el = document.getElementById("nightly");
   if (!el) return;
   if (!rows.length) { el.innerHTML = ""; return; }
   const on = rows.filter(p => p.ideate_at).length;
   el.innerHTML =
     `<span class="nlabel">🌙 nightly review${on ? "" : " — none scheduled"}</span>` +
-    rows.map(p =>
-      `<button class="${p.ideate_at ? "on" : ""}" onclick="setIdeate('${esc(p.slug)}')"
-         title="${p.ideate_at
+    rows.map(p => {
+      // A project at its standing limit is skipped until some of what is
+      // already proposed is triaged. Said here, because "it stopped running"
+      // and "it ran and found nothing" look identical from outside.
+      const paused = p.ideate_at && limit && (p.proposed || 0) >= limit;
+      return `<button class="${p.ideate_at ? "on" : ""}" onclick="setIdeate('${esc(p.slug)}')"
+         title="${paused
+           ? `paused — ${p.proposed} proposals waiting, the limit is ${limit}; `
+             + `accept or dismiss some and it runs again at ${p.ideate_at}`
+           : p.ideate_at
            ? `reads the project at ${p.ideate_at} and files proposals for you to accept`
            : "off — click to schedule a nightly look"}"
-       >${esc(p.title)}${p.ideate_at ? ` <b>${p.ideate_at}</b>` : ""}</button>`).join("");
+       >${esc(p.title)}${p.ideate_at ? ` <b>${paused ? "paused" : p.ideate_at}</b>` : ""}</button>`;
+    }).join("");
 }
 
 async function renderProjects() {
@@ -1303,7 +1311,7 @@ async function renderProjects() {
     body: JSON.stringify({action: "list"})})).json();
   const rows = (r.projects || []).filter(p => !p.archived);
   projectRows = rows;
-  renderNightly(rows);
+  renderNightly(rows, r.proposal_limit || 0);
   sel.innerHTML = `<option value="">all projects</option>` + rows.map(p =>
     `<option value="${esc(p.slug)}">${esc(p.title)}${
       p.needs ? ` (${p.needs})` : p.open ? ` · ${p.open}` : ""}</option>`).join("");

@@ -344,16 +344,23 @@ def summarise(projects: list[dict], tasks: list[dict],
         slug = t.get("project") or ""
         if not slug:
             continue
-        row = by_slug.setdefault(slug, {"open": 0, "needs": 0, "total": 0})
+        row = by_slug.setdefault(slug, {"open": 0, "needs": 0, "total": 0,
+                                        "proposed": 0})
         row["total"] += 1
         if t.get("state") in needs_attention:
             row["needs"] += 1
+        # Counted on its own as well as inside `needs`: it is the one pile a
+        # nightly pass can add to by itself, so a project stops being looked
+        # at while it is deep, and the panel should be able to say so.
+        if t.get("state") == "proposed":
+            row["proposed"] += 1
         if t.get("state") in ("proposed", "queued", "running", "blocked",
                               "awaiting_approval", "needs_input"):
             row["open"] += 1
     out = []
     for p in projects:
-        counts = by_slug.get(p["slug"], {"open": 0, "needs": 0, "total": 0})
+        counts = by_slug.get(p["slug"],
+                             {"open": 0, "needs": 0, "total": 0, "proposed": 0})
         out.append({**p, **counts})
     # Anything filed under a project that was never registered still shows up,
     # rather than vanishing because its record is missing.
