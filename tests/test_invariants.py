@@ -62,6 +62,25 @@ def bot_functions(*names, **globals_):
     return ns
 
 
+def discover():
+    """Every test in this file, in definition order.
+
+    Found, not listed. This used to be a tuple of names written out by hand at
+    the bottom of the file, and a tuple is silent about what is missing from
+    it: a test left off it never ran, reported nothing, and the closing
+    "N passed, 0 failed" still read as healthy. That is the wrong kind of
+    silence now that a green run here is what authorises a branch to be rebased
+    and landed with nobody watching.
+
+    The one gap discovery leaves is a def that lands *below* the __main__
+    guard, which is not bound yet when this looks -- `test_every_test_runs`
+    reads the file itself to catch that.
+    """
+    return [fn for name, fn in globals().items()
+            if name.startswith("test_") and isinstance(fn, types.FunctionType)
+            and fn.__module__ == __name__]
+
+
 # --- a transient error must never discard a thread's history ------------------
 # A mid-turn API hiccup ("Connection closed mid-response") once wiped four
 # threads: the retry path dropped the session entry and started fresh.
@@ -6829,34 +6848,38 @@ def test_front_doors_agree():
             check(f"  and {role!r} is a role that exists", R.known(role),
                   "roles.get() would fall back to read-only and the runner refuse it")
 
+
+# --- no test is defined and then never run ------------------------------------
+# For as long as the suite ran a hand-written list, a test added to this file
+# but left off that list never ran, said nothing about it, and left the total
+# looking healthy. Discovery removed the list; this covers the last way a test
+# defined here could still fail to run.
+
+def test_every_test_runs():
+    print("\nevery test defined here is actually run")
+    defined = [n.name for n in ast.parse(Path(__file__).read_text()).body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name.startswith("test_")]
+    # Without this, a parse that found nothing would leave the check below
+    # passing over an empty list.
+    check("this file's tests can be read back from its source", len(defined) > 1,
+          "found no test definitions to compare against")
+    dupes = sorted({n for n in defined if defined.count(n) > 1})
+    check("no test is defined twice, shadowing the earlier one", not dupes,
+          f"defined more than once: {', '.join(dupes)}")
+    missing = sorted(set(defined) - {fn.__name__ for fn in discover()})
+    check("every test_* defined in this file is discovered and run", not missing,
+          f"never runs: {', '.join(missing)} — defined below the __main__ guard?")
+
+
 if __name__ == "__main__":
-    for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
-              test_timeout_is_distinct, test_recovery, test_procs,
-              test_dashboard_classifiers, test_watermark, test_bounded_state,
-              test_schema, test_command_dedup, test_viz_bind_requires_token,
-              test_task_lifecycle, test_turn_is_a_task, test_task_runner_claim,
-              test_review_gate, test_review_followups,
-              test_unknown_role_fails_closed, test_front_doors_agree,
-              test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_nightly_panel_shows_paused, test_a_deep_board_costs_no_session, test_hiding_threads, test_putting_away_is_not_deleting, test_favicon, test_verification, test_landing, test_landing_is_visible,
-              test_parallel_tasks,
-              test_worktrees, test_cancel_stops_the_child,
-              test_worktree_survives_leaving_running,
-              test_isolation_is_not_a_scheduling_decision,
-              test_credentials_check,
-              test_turn_deadline_is_idleness,
-              test_mail_facts, test_projects,
-              test_transient_retry, test_supersede_stale_failures,
-              test_file_uploads_are_handled, test_thread_kind_filter,
-              test_unmerged_branches,
-              test_dashboard_js_is_whole,
-              test_every_open_state_has_a_button,
-              test_discarding_a_branch_keeps_it, test_task_retention,
-              test_atomic_persistence,
-              test_home_tab,
-              test_spent_retry_does_not_preempt_review,
-              test_thread_links_open_the_thread,
-        test_state_files_have_one_reader_and_one_writer):
+    tests = discover()
+    if not tests:
+        # Otherwise this prints "0 passed, 0 failed" and exits 0: a green run
+        # that verified nothing, which is exactly what landing must not trust.
+        print("  ✘ no tests were discovered in this file")
+        sys.exit(1)
+    for t in tests:
         try:
             t()
         except Exception as exc:
