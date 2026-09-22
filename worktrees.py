@@ -218,7 +218,12 @@ def attach(repo, task_id: str, branch: str, label: str = "land") -> Path | None:
         return None
     path = path_for(repo, task_id, label)
     if path.exists():
-        return path
+        # Only if it is what was asked for. A directory left behind by a
+        # release that could not remove it, or by a prune that dropped the
+        # admin entry and not the tree, would otherwise be handed to a review
+        # as the work it is auditing -- and the landing, which attaches under
+        # a different name, would go ahead and merge on the strength of it.
+        return path if branch_of(path) == branch else None
     ROOT.mkdir(parents=True, exist_ok=True)
     with _repo_create_lock(repo):
         r = _git(repo, "worktree", "add", str(path), branch)

@@ -322,5 +322,17 @@ def parse_verdict(text: str) -> dict:
                 "parsed": True,
             }
     log.warning("no verdict found in reviewer output; treating as needing review")
-    return {"ok": False, "summary": "reviewer returned no readable verdict",
-            "findings": [], "followups": [], "unverified": [], "parsed": False}
+    return no_verdict("reviewer returned no readable verdict")
+
+
+def no_verdict(summary: str) -> dict:
+    """A verdict that says nothing, shaped like one that does.
+
+    Everything downstream -- the Slack note, the dashboard, the landing gate --
+    reads these keys, so the two ways a review can produce nothing (it rambled,
+    or it could never start) have to agree on the shape as well as on failing
+    closed. They diverged in this codebase once already, on a different set of
+    three definitions of the same thing.
+    """
+    return {"ok": False, "summary": summary[:300], "findings": [],
+            "followups": [], "unverified": [], "parsed": False}

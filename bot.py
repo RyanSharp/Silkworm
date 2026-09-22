@@ -2264,6 +2264,37 @@ def review_branch(task: dict) -> str:
     return parent.get("branch") or ""
 
 
+def refuse_review(task: dict, branch: str, progress, channel: str,
+                  thread_ts: str) -> None:
+    """End a review that cannot reach the work, without letting it certify.
+
+    The gate exists so that nothing completes on its own say-so, and the
+    landing chain now merges off a passing verdict. A review that cannot get
+    at the branch therefore has exactly one safe outcome: no verdict, and the
+    work it was gating goes in front of a person. Failing the review alone
+    would strand its parent in `blocked` with nothing left to unblock it.
+    """
+    tid, parent_id = task["id"], task.get("parent") or ""
+    why = f"could not check out `{branch}`, so nothing was reviewed"
+    log.warning("review %s of %s: %s", tid, parent_id, why)
+    progress.finalize(f":hand: _Review not run — {why}._")
+    task_state(tid, tasks.FAILED, why[:160])
+    parent = task_store.get(parent_id)
+    if not parent:
+        return
+    task_store.update(parent_id, result={
+        **(parent.get("result") or {}),
+        "review": roles.no_verdict(why)})
+    task_state(parent_id, tasks.AWAITING_APPROVAL, why[:160])
+    try:
+        app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=(f":hand: *Review could not run* — {why}. `{parent_id}` is "
+                  f"waiting for you rather than completing unreviewed."))
+    except Exception:
+        log.exception("posting the refused review failed")
+
+
 def execute_task(task: dict) -> None:
     """Run one claimed task. Already in `running` — the claim did that."""
     tid = task["id"]
@@ -2321,13 +2352,22 @@ def execute_task(task: dict) -> None:
     # unresolved: the sweep keeps what a non-terminal task owns, and the
     # implementor stays blocked until the verdict lands.
     borrowed = review_branch(task)
-    if borrowed and worktrees.is_repo(cwd):
+    if borrowed:
         progress.update(":deciduous_tree: _Checking out the work to review…_")
-        worktree = worktrees.attach(cwd, task.get("parent") or tid,
-                                    borrowed, label="review")
-        if worktree:
-            cwd = worktree
-            task_store.update(tid, scope={**scope, "worktree": str(worktree)})
+        worktree = (worktrees.attach(cwd, task["parent"], borrowed, label="review")
+                    if worktrees.is_repo(cwd) else None)
+        if not worktree:
+            # No checkout, no review. Carrying on in the main tree is worse
+            # than not reviewing at all: the prompt has already promised this
+            # reviewer a checkout of `borrowed`, so it runs `git log
+            # <fork point>..HEAD` there and reads whatever has landed on the
+            # base branch since — other people's commits, which it will find
+            # nothing wrong with. A passing verdict on those then lands work
+            # nobody looked at. So the gate refuses instead.
+            refuse_review(task, borrowed, progress, channel, thread_ts)
+            return
+        cwd = worktree
+        task_store.update(tid, scope={**scope, "worktree": str(worktree)})
     elif (tasks.isolated(task) and worktrees.is_repo(cwd)
             and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
@@ -2437,7 +2477,17 @@ def execute_task(task: dict) -> None:
             removed, note = worktrees.release(worktree,
                                               delete_empty_branch=not borrowed)
             worktree = None                      # released; finally need not repeat it
-            if note and not borrowed:
+            if borrowed:
+                # The ordinary note would claim the implementor's branch as
+                # this turn's work. A *failed* release is the opposite: it is
+                # the only record that the branch is still checked out, and
+                # the landing a few lines below will refuse to reattach it
+                # for a reason nothing else anywhere states.
+                if not removed:
+                    log.warning("the review's checkout was not released: %s", note)
+                    wt_note = (f"\n\n_:deciduous_tree: The checkout this review "
+                               f"read {note} — the branch is still held._")
+            elif note:
                 wt_note = (f"\n\n_:deciduous_tree: Worked in an isolated checkout — {note}._"
                            if removed else
                            f"\n\n_:deciduous_tree: Isolated checkout {note}._")
@@ -2632,14 +2682,19 @@ def resolve_review(task: dict, role_name: str, text: str,
         # it was claimed predates that. Read the stale one and the prompt names
         # no branch, which is the whole bug wearing a smaller hat.
         branch = (task_store.get(tid) or task).get("branch") or ""
-        here = scope.get("cwd") or ""
-        where = str(worktrees.path_for(here, tid, "review")) if branch and here \
-            else here
+        # Resolved the way execute_task resolves it, including the fallback.
+        # Read straight off the scope, a task filed against a project with a
+        # base branch but no directory (`!base` on a repo-less project writes
+        # exactly that) left this empty while the review still ran in
+        # CLAUDE_CWD — so the prompt named the branch and then told it to look
+        # in "?", and dropped the two commands worth having.
+        here = str(scope.get("cwd") or CLAUDE_CWD)
+        where = str(worktrees.path_for(here, tid, "review")) if branch else here
         child = task_store.create(
             roles.review_goal(task, text, cwd=where, branch=branch,
                               base=worktrees.fork_point(
                                   here, branch, scope.get("branch") or "")
-                              if branch and here else ""),
+                              if branch else ""),
             role="reviewer", driver="queue",
             # Not isolated in the ordinary sense: a fresh worktree off the base
             # branch would hold none of the work. It gets a checkout of the
@@ -3331,7 +3386,7 @@ def repair_thread_cwds() -> int:
         if scoped.get("cwd") and Path(scoped["cwd"]).is_dir():
             target = scoped["cwd"]
         elif Path(cwd).parent == worktrees.ROOT:
-            # ".../<repo>--<task>" or ".../<repo>--land--<task>"
+            # ".../<repo>--<task>", ".../<repo>--land--<task>", "--review--"
             repo = Path(cwd).name.split(worktrees.SEP, 1)[0]
             guess = Path.home() / "workspace" / repo
             if guess.is_dir():
@@ -3419,9 +3474,15 @@ def live_worktree_tasks() -> set:
     a terminal state. A finished or cancelled task has had its checkout
     released the ordinary way, and one still on disk for it really is litter.
     """
-    return ({tid for tid, r in task_store.all().items()
+    live = ({tid for tid, r in task_store.all().items()
              if r.get("state") not in tasks.TERMINAL}
             | set(RUNNING_TASKS))
+    # And a review's checkout is keyed by the task it is reviewing, not by
+    # itself, because the work in it is that task's. Cancelling a parent
+    # mid-review is legal and drops it from the set above -- which would hand
+    # the sweep the directory its reviewer is currently standing in.
+    live |= {(task_store.get(t) or {}).get("parent") or "" for t in RUNNING_TASKS}
+    return live - {""}
 
 
 def _worktree_sweeper() -> None:

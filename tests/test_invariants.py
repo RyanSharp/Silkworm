@@ -872,6 +872,86 @@ def test_review_sees_the_work():
           "record_branch wrote it to the store on the way out of the checkout; "
           "the record this turn has been carrying predates that")
 
+    # --- a review that cannot reach the work must not certify it -------------
+    # Carrying on in the main checkout is worse than not reviewing: the prompt
+    # has already promised a checkout of the branch, so `git log <fork>..HEAD`
+    # there reads whatever has landed on the base branch since -- other
+    # people's commits, which it finds nothing wrong with, and a passing
+    # verdict on those lands work nobody looked at.
+    posted, ran = [], []
+
+    class Client:
+        def chat_postMessage(self, **kw):
+            posted.append(kw["text"]); return {"ts": "1.1"}
+
+    class Progress:
+        ts = "1.1"
+        def update(self, *a, **k): pass
+        def finalize(self, text): posted.append(text)
+
+    def review_turn(child_rec, **extra):
+        return _bot_func(
+            "execute_task", tasks=T, task_store=st, store=tmp_store(),
+            roles=roles, worktrees=W, Path=Path,
+            review_branch=ns["review_branch"], record_branch=ns["record_branch"],
+            run_turn=lambda goal, **kw: (
+                ran.append(Path(kw["cwd"])) or
+                types.SimpleNamespace(text='{"ok": true, "summary": "fine"}',
+                                      cost_usd=0.0, duration_ms=1, session_id="s")),
+            OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+            permission_args=lambda: [], log=logging.getLogger("test"),
+            task_thread=lambda t: ("C1", "1.0"),
+            task_state=lambda tid_, state, detail="": st.transition(tid_, state, detail),
+            _thread_lock=lambda key: threading.Lock(),
+            repo_guard=lambda *a, **k: contextlib.nullcontext(),
+            render_block=lambda _: "", chunk=lambda text: [text],
+            to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+            upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+            ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+            ProgressMessage=lambda *a, **k: Progress(), app=types.SimpleNamespace(
+                client=Client()), **extra)(child_rec)
+
+    gone = st.create("add another fix", role="implementor", driver="queue",
+                     isolate=True, scope={"cwd": str(repo)})["id"]
+    st.transition(gone, T.RUNNING)
+    gwt = W.create(repo, gone, fetch=False)
+    (gwt / "g.py").write_text("x\n")
+    git(gwt, "add", "-A"); git(gwt, "commit", "-qm", "work that gets lost")
+    ns["record_branch"](gone, gwt, {"cwd": str(repo)})
+    W.release(gwt)
+    ns["resolve_review"](st.get(gone), "implementor", "did it", "C1", "1.0")
+    orphan = [r for r in st.all().values() if r.get("parent") == gone][0]
+    # The branch goes: a send-back re-runs the implementor under the same id,
+    # and discard.drop clears the branch to get a fresh worktree.
+    git(repo, "branch", "-D", f"{W.BRANCH_PREFIX}{gone}")
+    st.transition(orphan["id"], T.RUNNING)
+    review_turn(st.get(orphan["id"]),
+                refuse_review=bot_functions(
+                    "refuse_review", roles=roles, tasks=T, task_store=st,
+                    log=logging.getLogger("test"),
+                    task_state=lambda tid_, s_, d="": st.transition(tid_, s_, d),
+                    app=types.SimpleNamespace(client=Client()))["refuse_review"])
+
+    check("a review with no checkout does not run at all", ran == [],
+          f"it ran in {ran}, which is not the tree it was told it was in")
+    check("and returns no verdict", st.get(orphan["id"])["state"] == T.FAILED)
+    check("the work it was gating waits for you instead",
+          st.get(gone)["state"] == T.AWAITING_APPROVAL,
+          "failing only the review strands its parent in blocked forever")
+    check("and is not recorded as having passed",
+          not ((st.get(gone).get("result") or {}).get("review") or {}).get("ok"),
+          "a landing runs off that flag")
+    check("and it says so rather than going quiet",
+          any("could not check out" in t for t in posted), posted)
+
+    # A directory that is not on the branch must not stand in for one.
+    stale = W.path_for(repo, "tsk_stale", "review")
+    stale.mkdir(parents=True)
+    check("a stale directory is refused, not reused",
+          W.attach(repo, "tsk_stale", branch, label="review") is None,
+          "handed over as the checkout, a review would audit whatever is in it")
+    stale.rmdir()
+
     # A sweep that cannot read the id back out of the path deletes it anyway.
     held = W.attach(repo, tid, branch, label="review")
     W.sweep(keep={tid}, min_age_s=0)
@@ -879,8 +959,39 @@ def test_review_sees_the_work():
           held.exists() and (held / "fix.py").exists(),
           "the task id sits behind the label, so splitting from the front "
           "read it as 'review--<id>' and matched nothing in the keep set")
+    # Cancelling is what makes this load-bearing: while the parent is merely
+    # blocked it is non-terminal and kept anyway, so the check would pass on
+    # its own and prove nothing.
+    st.transition(tid, T.CANCELLED, "changed my mind mid-review")
+    keeping = bot_functions("live_worktree_tasks", tasks=T, task_store=st,
+                            RUNNING_TASKS={child["id"]: object()}
+                            )["live_worktree_tasks"]()
+    check("a cancelled task is no longer kept on its own account",
+          tid not in {t for t, r in st.all().items()
+                      if r.get("state") not in T.TERMINAL})
+    check("but its checkout survives while a review is standing in it",
+          W.sweep(keep=keeping, min_age_s=0) == 0 and held.exists(),
+          "the checkout is keyed by the task under review, so cancelling that "
+          "task drops the directory its reviewer is currently in")
     W.sweep(keep=set(), min_age_s=0)
     check("and takes it once nothing owns it", not held.exists())
+
+    # A failed release of a borrowed checkout is the one note worth keeping:
+    # nothing else records that the branch is still held, and the landing will
+    # refuse to reattach it for a reason stated nowhere.
+    exe = (BASE / "bot.py").read_text()
+    exe = exe[exe.index("def execute_task("):exe.index("def verify_work(")]
+    check("a borrowed checkout that would not go is reported",
+          "if not removed:" in exe and "still held" in exe,
+          "suppressing the note suppressed the failure with it")
+
+    # The path the prompt predicts is resolved the way execute_task resolves
+    # it. A project with a base branch and no directory is a real shape.
+    gate = (BASE / "bot.py").read_text()
+    gate = gate[gate.index("def resolve_review("):gate.index("def land_if_ready(")]
+    check("the review's directory falls back the way the turn's does",
+          'scope.get("cwd") or CLAUDE_CWD' in gate,
+          "empty cwd named the branch and then sent it to \"?\"")
 
 
 # --- gmail ingestion ----------------------------------------------------------
