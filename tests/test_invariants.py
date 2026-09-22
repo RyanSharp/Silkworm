@@ -5074,6 +5074,11 @@ def test_held_checkouts():
           "approving that row is the moment the work becomes unreachable")
     marked = js.find("await renderHolding();")
     drawn = js.find("list.innerHTML = r.tasks.map")
+    body = js[js.index("async function renderHolding()"):js.index("function updateTaskBadge")]
+    check("and a failed survey costs the marker, never the list of rows",
+          "try {" in body and body.index("try {") < body.index('taskCall({action: "holding"'),
+          "renderTasks awaits this before drawing anything, so a rejected "
+          "request would blank the board instead of one row's marker")
     check("the row is marked before the buttons are drawn",
           -1 < marked < drawn,
           "an unawaited survey would race the buttons that act on it")

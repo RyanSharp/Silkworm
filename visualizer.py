@@ -1589,7 +1589,12 @@ async function renderHolding() {
   heldById = {};
   if (!el) return;
   const project = document.getElementById("tproj").value;
-  const r = await taskCall({action: "holding", project: project || undefined});
+  // Swallowed, because renderTasks awaits this before drawing anything: a
+  // blip on the survey must cost the marker on a row, never the list of rows.
+  // Driving it against a rejecting fetch is how that was found.
+  let r = null;
+  try { r = await taskCall({action: "holding", project: project || undefined}); }
+  catch (e) { el.innerHTML = ""; return; }
   const rows = (r && r.holding) || [];
   rows.forEach(h => { if (h.id) heldById[h.id] = h; });
   if (!rows.length) { el.innerHTML = ""; return; }
