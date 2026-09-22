@@ -1332,6 +1332,34 @@ def test_landing():
 
     g(repo, "remote", "remove", "origin")
 
+    # And when there is genuinely nothing to resolve: no main, no master, no
+    # remote to ask. base_ref's last resort is "HEAD", which is right for
+    # *starting* a task and wrong for landing one -- HEAD resolves to whichever
+    # branch the checkout is parked on, so the is-it-on-the-base guard compares
+    # a name against itself and can never refuse, and `git rebase HEAD` rebases
+    # the worktree onto itself. Measured before the fix: the work landed on a
+    # branch called "wip", unrebased, and reported success.
+    lone = root / "lone"; lone.mkdir()
+    g(lone, "init", "-q", "-b", "wip")
+    g(lone, "config", "user.email", "t@t"); g(lone, "config", "user.name", "t")
+    (lone / "v.txt").write_text("1\n"); (lone / "expect.txt").write_text("1\n")
+    g(lone, "add", "-A"); g(lone, "commit", "-qm", "base")
+    check("the fixture really has no base to find",
+          W.base_ref(lone, fetch=False) == "HEAD",
+          "otherwise this measures nothing")
+    lw = root / "lonework"
+    g(lone, "worktree", "add", "-q", "-b", "lb", str(lw), "wip")
+    (lw / "v.txt").write_text("2\n"); (lw / "expect.txt").write_text("2\n")
+    g(lw, "add", "-A")
+    g(lw, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "lb")
+    at = g(lone, "rev-parse", "HEAD").stdout.strip()
+    r = M.land(lw, lone, "lb", "", tests)
+    check("an unresolvable base refuses rather than guessing one",
+          not r["landed"] and r["stage"] == "base-unresolved",
+          f"got {r.get('stage')} — it would land on whatever was checked out")
+    check("and the checkout is untouched by the refusal",
+          g(lone, "rev-parse", "HEAD").stdout.strip() == at)
+
     bot = (BASE / "bot.py").read_text()
     li = bot[bot.index("def landing_enabled"):bot.index("def run_email_ingest")]
     check("the gate names the branch the way the survey does",

@@ -93,11 +93,27 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     # remote: what gets merged is decided below, from the local checkout.
     _git(repo, "fetch", "--quiet", "origin", timeout=120)
 
-    # A project that has not named a base gets the default branch resolved the
-    # same way a worktree does. Passing the empty string through meant
-    # `git rebase ''` -- "fatal: invalid upstream" -- which refused every
-    # landing on every project that had not set one, which is most of them.
-    ref = worktrees.base_ref(repo, fetch=False, prefer=base)
+    # Resolved exactly once, so the guard below and the rebase target below
+    # that cannot disagree about what the base is. A project that has not named
+    # one gets the default branch, the same way a worktree does. Passing the
+    # empty string straight through meant `git rebase ''` -- "fatal: invalid
+    # upstream" -- which refused every landing on every project that had not
+    # set a base, which is most of them.
+    #
+    # `fallback=""` rather than base_ref's usual "HEAD", because landing wants
+    # the opposite of what starting a task wants. "HEAD" resolves to whatever
+    # branch this checkout is parked on, which makes the guard below compare a
+    # name against itself and pass every time; and `git rebase HEAD` inside the
+    # worktree rebases it onto itself, a no-op. So a repository with no main,
+    # no master and no remote would land unrebased and unchallenged onto some
+    # feature branch someone happened to leave checked out. Refuse instead:
+    # there is no answer here worth guessing at.
+    ref = worktrees.base_ref(repo, fetch=False, prefer=base, fallback="")
+    if not ref:
+        return _fail("base-unresolved",
+                     "no base branch could be resolved: this repository has no "
+                     "main, no master and no remote to ask. Name one in the "
+                     "project's scope to land work here.")
     # `origin/HEAD` is a symbolic ref: splitting it on "/" gives "HEAD", not
     # the branch it points at, so the checkout-is-on-the-base check compared
     # "main" against "HEAD" and refused. Resolve it to the real name first.

@@ -54,7 +54,8 @@ def is_repo(path) -> bool:
         return False
 
 
-def base_ref(repo, fetch: bool = True, prefer: str = "") -> str:
+def base_ref(repo, fetch: bool = True, prefer: str = "",
+             fallback: str = "HEAD") -> str:
     """What to branch from: `prefer` if it exists, else the default branch.
 
     A project is not always working on main. The trader sits on a research
@@ -68,6 +69,12 @@ def base_ref(repo, fetch: bool = True, prefer: str = "") -> str:
 
     The remote-tracking ref is preferred, but only while it is actually the
     more advanced of the two -- see `_local_if_ahead`.
+
+    `fallback` is what comes back when none of the candidates exist, and it is
+    the caller's call because the two callers want opposite things. Starting a
+    task from "HEAD" is a fine last resort -- somewhere to branch from beats
+    not running at all. Landing onto it is not: see merge.land, which asks for
+    "" so it can refuse instead of guessing.
     """
     if fetch:
         try:
@@ -81,7 +88,7 @@ def base_ref(repo, fetch: bool = True, prefer: str = "") -> str:
     for ref in candidates:
         if _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0:
             return _local_if_ahead(repo, ref)
-    return "HEAD"
+    return fallback
 
 
 def _local_if_ahead(repo, ref: str) -> str:
