@@ -1687,7 +1687,8 @@ def _file_task_impl():
 
     src = (BASE / "bot.py").read_text()
     tree = ast.parse(src)
-    want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn")
+    want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn",
+            "begin_turn")
     def named(n):
         if isinstance(n, ast.FunctionDef):
             return n.name
@@ -1715,7 +1716,7 @@ def _file_task_impl():
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<filing>", "exec"),
          mod.__dict__)
-    return mod.handle_file_task, mod._filed_this_turn, ts, made
+    return mod.handle_file_task, mod._filed_this_turn, mod.begin_turn, ts, made
 
 
 def _cli_file_task_impl():
@@ -1800,9 +1801,76 @@ def test_scoping():
     check("project and scope are inherited from the thread",
           'entry.get("project")' in h and "project_store.scope_for" in h,
           "a bound conversation should not restate where its work belongs")
-    check("the per-turn budget resets each turn",
-          "_filed_this_turn.pop(key, None)" in bot,
-          "otherwise the cap becomes per-process and blocks later scoping")
+    # The budget used to be reset only on the live Slack path, and this check
+    # was a grep for the text of that one line -- so it passed throughout,
+    # while every task the queue runner started kept whatever the last run had
+    # spent. Two checks replace it: the budget itself is driven through the
+    # real filing route, and the two paths that start a turn are read for the
+    # reset. Reading is the weaker of the two, but execute_task cannot be run
+    # here, so what it pins is made as narrow as possible: the exact call, in
+    # the right place, whatever spelling it is written in.
+    file_task, _filed, begin_turn, _ts, _made = _file_task_impl()
+    THREAD = "C1:1785644289.053039"
+
+    def propose(key=THREAD):
+        return file_task({"key": key, "propose": True,
+                          "goal": "Add an appearance preference to Settings"})
+
+    spent = [propose() for _ in range(S.MAX_PROPOSALS)]
+    check("a pass may file up to the proposal cap",
+          all(r["ok"] for r in spent) and spent[-1]["remaining"] == 0)
+    check("and is refused once it has spent it",
+          "limit for one pass" in propose().get("error", ""))
+    begin_turn(THREAD)
+    check("the reset hands the next turn a whole budget back",
+          propose().get("ok") is True,
+          "a task keeps its thread key across runs, so a retried, reworked or "
+          "sent-back ideator would file nothing at all")
+    # Several tasks share one thread key -- a reviewer child, a wake-up,
+    # orphans handed back to the runner. A reset that cleared the whole budget
+    # would hand every other live turn one that had already been spent.
+    OTHER = "C1:1785644999.111111"
+    for _ in range(S.MAX_PROPOSALS):
+        propose(OTHER)
+    begin_turn(THREAD)
+    check("and leaves every other thread's alone",
+          "limit for one pass" in propose(OTHER).get("error", ""))
+
+    # Neither path may drift: a turn that starts without resetting first is
+    # the same bug, wherever it is written. Matched on the attribute as well
+    # as the bare name, because `claude_runner.run_turn(...)` is a third
+    # starter neither check would otherwise see.
+    tree = ast.parse(bot)
+    def calls(node, name):
+        return [c for c in ast.walk(node) if isinstance(c, ast.Call)
+                and (getattr(c.func, "id", "") == name
+                     or getattr(c.func, "attr", "") == name)]
+    starters = [f for f in ast.walk(tree)
+                if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and calls(f, "run_turn")]
+    check("both of the paths that start a turn are accounted for",
+          {f.name for f in starters} == {"handle_prompt", "execute_task"},
+          f"found {sorted(f.name for f in starters)}")
+    # Under the thread's lock, not merely somewhere above the run. Resetting
+    # before the lock is taken lets a second worker claiming a task on the
+    # same key wipe the budget of the turn already running on it -- which is
+    # the concurrent case the check above describes.
+    locked = []
+    for f in starters:
+        # The `with lock, ...` block the turn itself runs inside.
+        held = [w for w in ast.walk(f) if isinstance(w, ast.With)
+                and any(isinstance(i.context_expr, ast.Name)
+                        and i.context_expr.id == "lock" for i in w.items)
+                and calls(w, "run_turn")]
+        locked.append(bool(held))
+        for w in held:
+            reset, run = calls(w, "begin_turn"), calls(w, "run_turn")
+            locked.append(bool(reset) and min(c.lineno for c in reset)
+                          < min(c.lineno for c in run))
+    check("every path resets the budget under the lock, before it runs",
+          bool(starters) and all(locked),
+          "the queue runner ran every queued, ideator, implementor and "
+          "reviewer task without one")
     check("the model is told the capability exists", "scoping.HOW_TO" in bot)
 
     fn = next(n for n in ast.walk(ast.parse(bot))
@@ -1834,7 +1902,7 @@ def test_scoping():
     # editing the tree, and did not stop it commissioning an agent that would.
     # Driven through the real route rather than read off the source, because
     # the thing that broke was the behaviour, not the wording.
-    file_task, filed_this_turn, ts, projects_made = _file_task_impl()
+    file_task, filed_this_turn, _begin, ts, projects_made = _file_task_impl()
     store_of = ts.get
     KEY = "C1:1785644289.000100"
 

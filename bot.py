@@ -1640,6 +1640,31 @@ def filed_by_restricted_role(caller_role: str, key: str) -> bool:
                if t.get("thread") == key)
 
 
+def begin_turn(key: str) -> None:
+    """Give the turn about to run on this thread a fresh filing budget.
+
+    Every path that starts a turn has to call this, not just the live Slack
+    one. A task keeps the thread key it was first given for the rest of its
+    life, so when the reset only happened on the Slack path, any task run a
+    second time on the same key -- retried after a quota error, requeued after
+    a restart, reworked, sent back -- began with a budget the previous run had
+    already spent, and was refused without having filed anything. An ideator
+    hit that way files nothing at all, which is its entire purpose. (Each
+    night's pass is a new task on a new key, so it is a rerun that suffers,
+    not the following night.)
+
+    Called under the thread's lock, which is what makes it safe: several tasks
+    can share one key -- a reviewer child, a wake-up, orphans handed back to
+    the runner -- and resetting outside the lock would wipe the budget of a
+    turn already running on it.
+
+    A retry therefore gets a whole fresh budget rather than the remains of the
+    attempt that failed. That is the intent: a retried pass re-derives its work
+    from scratch, so what the last one spent says nothing about this one.
+    """
+    _filed_this_turn.pop(key, None)
+
+
 def handle_file_task(payload: dict) -> dict:
     """Route for /file-task — a turn filing work it just scoped with the user.
 
@@ -1910,7 +1935,7 @@ def handle_prompt(event: dict, say, client) -> None:
             recovery.mark_pending(store, key, msg_ts=reactions.msg,
                                   progress_ts=progress.ts,
                                   session_id=session_id, prompt=text)
-            _filed_this_turn.pop(key, None)   # a fresh budget for this turn
+            begin_turn(key)
             task_state(task_id, tasks.RUNNING)
             if not event.get("_web"):  # web prompts have a synthetic ts
                 store.update(key, last_msg_ts=msg_ts)
@@ -2219,6 +2244,7 @@ def execute_task(task: dict) -> None:
             session_id = None if fresh else (task.get("session_id") or entry.get("session_id"))
             recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
                                   session_id=session_id, prompt=task.get("goal", ""))
+            begin_turn(key)
             outbox.mkdir(parents=True, exist_ok=True)
 
             def on_start(handle) -> None:
