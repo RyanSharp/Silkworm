@@ -56,7 +56,10 @@ def _on_origin(repo, base_name: str) -> str:
     try:
         r = _git(repo, "ls-remote", "origin", f"refs/heads/{base_name}",
                  timeout=120)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
+        # Any failure to ask is the same answer: origin cannot confirm it.
+        # Raising instead would be worse than useless here -- see the note on
+        # the push, which is the only caller.
         return ""
     out = r.stdout.split() if r.returncode == 0 else []
     return out[0].strip() if out else ""
@@ -197,11 +200,23 @@ def land(worktree, repo, branch: str, base: str, run_tests,
         try:
             push = _git(repo, "push", "origin", base_name, timeout=300)
             failed, why = push.returncode != 0, (push.stderr or push.stdout)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError) as exc:
             # A push that timed out is genuinely ambiguous: it may have been
             # accepted and the acknowledgement lost. Guessing either way is
             # wrong, so it is settled below by asking origin.
-            failed, why = True, "the push timed out"
+            #
+            # Caught rather than raised, and this is the one place in `land`
+            # where that matters. Every other step that can fail runs *before*
+            # the fast-forward, so an exception there costs nothing but a
+            # refused landing. By here the base has already moved: raising
+            # would leave the work on the base while the caller recorded
+            # "landing errored" and never wrote `result.landed`, which is the
+            # only record that a task's commits reached the base at all. The
+            # landing happened; the most that can be wrong is whether it was
+            # published, and that is what the note is for.
+            failed = True
+            why = ("the push timed out" if isinstance(exc, subprocess.TimeoutExpired)
+                   else f"the push could not be run: {exc}")
         # Ask origin rather than trust the exit code, because a push can fail
         # *after* the remote accepted it -- and reporting that as unpublished
         # sends someone looking for a divergence that is not there.

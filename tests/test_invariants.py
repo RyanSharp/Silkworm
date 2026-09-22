@@ -1304,6 +1304,32 @@ def test_landing():
           W.base_ref(repo, fetch=False) == "origin/HEAD",
           "the local branch is only preferred while it is actually ahead")
 
+    # And a push that cannot even be run. This is the one step in `land` that
+    # happens *after* the base has moved, so an exception escaping here would
+    # leave the work merged while the caller recorded "landing errored" and
+    # never wrote `result.landed` -- the only record that the commits reached
+    # the base. The landing has to survive it.
+    boom = branch_from("boom", "main")
+    def push_explodes(cwd, *a, **kw):
+        if a and a[0] in ("push", "ls-remote"):
+            raise OSError("git is not on the path")
+        return real_push(cwd, *a, **kw)
+    M._git = push_explodes
+    try:
+        r = M.land(boom, repo, "boom", "", tests, publish=True)
+    finally:
+        M._git = real_push
+    check("a push that cannot run does not take the landing down with it",
+          r.get("landed") is True,
+          f"got {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("it is reported unpublished, with the reason",
+          r.get("published") is False and "could not be pushed" in r.get("detail", ""),
+          str(r.get("detail"))[:200])
+    check("and the base really does hold the work",
+          g(repo, "rev-parse", "HEAD").stdout.strip() ==
+          g(repo, "rev-parse", "boom").stdout.strip(),
+          "otherwise the case is not exercising a landing that already merged")
+
     g(repo, "remote", "remove", "origin")
 
     bot = (BASE / "bot.py").read_text()
