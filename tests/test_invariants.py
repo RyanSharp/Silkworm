@@ -6359,6 +6359,39 @@ def test_front_doors_agree():
           not any(name in js for name in R.FILEABLE),
           "a second copy of the list is a second thing to drift")
 
+    # There is a third door -- mail -- and it defaulted the way the dashboard
+    # did, so it filed work nothing would review, verify or land. Rather than
+    # pin that one line, state the rule all of them have to keep: work filed to
+    # run on its own says what it is. A conversation is exempt because it is
+    # not filed work (isolate=False) -- it runs where you are, and `assistant`
+    # is the right answer for it.
+    print("\n  every door that files isolated work names the role")
+    for mod in ("bot.py", "email_ingest.py"):
+        tree = ast.parse((BASE / mod).read_text())
+        for call in ast.walk(tree):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "create"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "task_store"):
+                continue
+            kw = {k.arg: k.value for k in call.keywords if k.arg}
+            isolated = isinstance(kw.get("isolate"), ast.Constant) and kw["isolate"].value is True
+            if not isolated:
+                continue
+            check(f"{mod}:{call.lineno} files isolated work under a named role",
+                  "role" in kw,
+                  "it would default to 'assistant', which is never reviewed, "
+                  "never verified, and therefore can never land")
+            named = kw.get("role")
+            if isinstance(named, ast.Constant):
+                role = named.value
+            elif isinstance(named, ast.Attribute) and named.attr == "DEFAULT_FILED":
+                role = R.DEFAULT_FILED
+            else:
+                continue                      # a variable: validated at the route
+            check(f"  and {role!r} is a role that exists", R.known(role),
+                  "roles.get() would fall back to read-only and the runner refuse it")
+
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,

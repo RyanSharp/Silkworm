@@ -22,6 +22,8 @@ import re
 import subprocess
 from email.header import decode_header, make_header
 
+import roles
+
 log = logging.getLogger("silkworm.email")
 
 SNIPPET_CHARS = 400
@@ -366,6 +368,14 @@ def ingest(task_store, state, *, host, user, password, mailbox=DEFAULT_MAILBOX,
             title=f["title"],
             state="proposed",          # never straight to work; triage is a guess
             driver="queue",
+            # The third door onto the board, and it defaulted the way the
+            # dashboard used to: `assistant`, whose review flag is False. Once
+            # accepted it ran in its own checkout with full permissions, and
+            # then no reviewer read it, verify_work never ran -- it is behind
+            # the same flag -- `verified` stayed None and land_if_ready refused
+            # the work for never having been verified. Mail is filed work like
+            # any other, so it is filed as the same thing.
+            role=roles.DEFAULT_FILED,
             isolate=True,              # filed work, not a conversation with you
             source="email",
             source_ref=f["id"],
