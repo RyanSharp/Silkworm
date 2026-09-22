@@ -3425,6 +3425,12 @@ def test_unmerged_branches():
     check("with its commit count", rows and rows[0]["commits"] == 1,
           "\"it is on a branch\" without a size is not enough to decide on")
     check("and the base it would go to", rows and rows[0]["base"] == "main")
+    stale = finished("tsk_aaa")
+    stale["base"] = "universe"
+    stale_rows = B.survey([stale])
+    check("the row names the base it measured, not one stored on the record",
+          stale_rows and stale_rows[0]["base"] == "main",
+          "printing one ref while counting against another is the bug itself")
     check("the summary line counts them", "1 finished task" in B.line(rows))
 
     # Merging it must make it disappear without anything telling us so: merge
@@ -3504,6 +3510,124 @@ def test_unmerged_branches():
     git(repo, "remote", "set-head", "origin", "main")
     check("a symbolic base ref reports the branch it points at",
           B.base_name(repo, "origin/HEAD") == "main")
+
+    # And a name with a slash in it survives being resolved. Taking the last
+    # segment reported the trader's `origin/research/point-in-time-universe`
+    # as `universe` -- a branch that does not exist, so nothing could be looked
+    # up under it or, below, measured against it.
+    git(repo, "branch", "research/point-in-time")
+    git(repo, "fetch", "-q", "origin")
+    check("a base whose branch name holds slashes is reported in full",
+          B.base_name(repo, "origin/research/point-in-time")
+          == "research/point-in-time",
+          f"got {B.base_name(repo, 'origin/research/point-in-time')!r}")
+
+    # The base a merge question is asked of has to be the base the row names.
+    # It was not. `worktrees.base_ref` prefers `origin/HEAD`, which is right
+    # for *cutting* new work; landing fast-forwards the *local* branch and
+    # never pushes, so origin falls one commit behind per landing. The row then
+    # resolved "main" for its label and counted against origin/main -- and
+    # branches whose every commit was on main were announced as stranded work,
+    # to the dashboard, to `silkworm status`, and to the nightly ideator, which
+    # was told the fix was "not on the base you are reading" about code that
+    # was. Three such branches at the time, twenty-one phantom commits, one of
+    # them main's own tip.
+    wt_d = work("tsk_ddd", "d")
+    W.release(wt_d)
+    git(repo, "merge", "--ff-only", "-q", "silkworm/tsk_ddd")
+
+    # The fixture is only worth anything if origin really is behind, and the
+    # branch really is merged. Both asserted rather than assumed: without the
+    # lag there is no disagreement for the fix to resolve.
+    check("landing leaves origin behind the local base, since it never pushes",
+          int(git(repo, "rev-list", "--count",
+                  "origin/main..main").stdout.strip()) == 1,
+          "no lag means the case this covers cannot arise")
+    check("and the branch is wholly contained in the local base",
+          git(repo, "merge-base", "--is-ancestor",
+              "silkworm/tsk_ddd", "main").returncode == 0)
+    refs, shown = B.base_for(repo, "")
+    check("everything measured against is a copy of the base it names",
+          shown == "main"
+          and all(B.base_name(repo, r) == shown for r in refs)
+          and "refs/heads/main" in refs,
+          f"names {shown!r}, measures {refs}")
+    check("work that is on the local base is not reported as stranded",
+          B.survey([finished("tsk_ddd")]) == [],
+          "counted against a remote-tracking ref that landing never advances")
+
+    # Preferring the local branch is not the same as requiring one. With no
+    # local branch of that name the remote-tracking ref is the only thing the
+    # name can mean, so it is both what gets named and what gets measured --
+    # the two still agree, which is the invariant, not "always local".
+    check("a preferred base picks up both copies when both exist",
+          B.base_for(repo, "research/point-in-time")
+          == (("refs/heads/research/point-in-time",
+               "refs/remotes/origin/research/point-in-time"),
+              "research/point-in-time"),
+          f"got {B.base_for(repo, 'research/point-in-time')}")
+    git(repo, "branch", "-D", "research/point-in-time")
+    refs, shown = B.base_for(repo, "research/point-in-time")
+    check("and one copy alone is enough, still naming what it measured",
+          refs == ("refs/remotes/origin/research/point-in-time",)
+          and shown == "research/point-in-time",
+          f"named {shown!r}, measured {refs}")
+
+    # And the mirror of the case above, which preferring the local branch got
+    # exactly as wrong in the other direction. A pull request merged on the
+    # forge advances `origin/main` and leaves the local branch behind; every
+    # isolated task fetches origin when its worktree is made, so this arrives
+    # on its own. `update-ref` is what that fetch leaves behind, without
+    # needing a second repository to push to.
+    wt_e = work("tsk_eee", "e")
+    W.release(wt_e)
+    git(repo, "update-ref", "refs/remotes/origin/main", "silkworm/tsk_eee")
+
+    check("the forge moved origin ahead of the local base",
+          int(git(repo, "rev-list", "--count",
+                  "main..origin/main").stdout.strip()) >= 1,
+          "no lag the other way means this case cannot arise either")
+    check("and the branch is on origin's copy but not the local one",
+          git(repo, "merge-base", "--is-ancestor",
+              "silkworm/tsk_eee", "origin/main").returncode == 0
+          and git(repo, "merge-base", "--is-ancestor",
+                  "silkworm/tsk_eee", "main").returncode != 0)
+    check("work merged on the forge is not reported as stranded either",
+          B.survey([finished("tsk_eee")]) == [],
+          "measuring against the local branch alone is the same bug reversed")
+    check("both copies of the base are measured against",
+          set(B.base_for(repo, "")[0])
+          == {"refs/heads/main", "refs/remotes/origin/main"},
+          f"got {B.base_for(repo, '')[0]}")
+
+    # A name that is ambiguous -- a branch and a tag sharing it -- makes
+    # `rev-parse --symbolic-full-name` exit zero with nothing to say. That used
+    # to fall through to the last-segment split and reproduce the trader bug
+    # exactly: a row reading `point-in-time` while counting against
+    # `research/point-in-time`.
+    git(repo, "branch", "research/ambiguous")
+    git(repo, "tag", "research/ambiguous")
+    refs, shown = B.base_for(repo, "research/ambiguous")
+    check("an ambiguous name is not chopped into a guess",
+          shown == "research/ambiguous"
+          and refs == ("refs/heads/research/ambiguous",),
+          f"named {shown!r}, measured {refs}")
+
+    # A tag is a legitimate answer from `base_ref`, which only asks git whether
+    # the ref verifies. It resolves to no branch, so the ref itself is the only
+    # honest name for it.
+    git(repo, "tag", "release/v1")
+    check("a tag base names and measures the same thing",
+          B.base_for(repo, "release/v1") == (("release/v1",), "release/v1"),
+          f"got {B.base_for(repo, 'release/v1')}")
+
+    # `ahead` splats its bases into the command line, so a bare string would
+    # splat into single characters and quietly count against nothing.
+    check("a single base may still be given as one string",
+          B.ahead(repo, "main", "silkworm/tsk_ccc")
+          == B.ahead(repo, ["main"], "silkworm/tsk_ccc") == 1)
+    check("and no bases at all counts nothing rather than everything",
+          B.ahead(repo, (), "silkworm/tsk_ccc") == 0)
 
     # The prompt block: an ideator told nothing re-derives a fix that already
     # exists on a branch, which is how one got implemented twice.

@@ -385,6 +385,35 @@ already merged is a much better failure than staying silent about one nobody
 did. It is its own request rather than part of the task list, since the badge
 polls that every five seconds.
 
+**The base is a branch, and a branch here has two copies.** The survey asked
+about one ref and named the other. It resolved its base the way a *new* worktree
+resolves one, which prefers `origin/main` — right for cutting work from, since
+fresh origin is where a branch should start. Landing, meanwhile, fast-forwards
+the local branch and does not push, so origin falls one commit further behind
+with every landing. The row took its name from `origin/HEAD` resolved — "main" —
+and its count from `origin/main`, and so contradicted itself: measured at twelve
+landings of lag, three branches whose every commit was on main were announced as
+"3 finished tasks on unmerged branches (21 commits)", one of them main's own tip.
+The nightly ideator was told those gaps were fixed "on those branches and not on
+the base you are reading" about code sitting on the base it was reading.
+
+Preferring the local copy instead only turns the error round, which a review of
+the first attempt at this caught: a pull request merged on the forge lands on
+`origin/main` alone, and every isolated task fetches origin when its worktree is
+made, so that case is no rarer than the other. The two copies drift in both
+directions and neither is the authority. So the row names the branch, and the
+count is of commits *no copy of it contains* — one `rev-list --not`, right in
+both directions, and nothing to keep in step.
+
+Resolving that name also had to stop taking the last path segment: the trader's
+`origin/research/point-in-time-universe` was reported as `universe`, naming no
+branch to look up or measure against. A name that cannot be resolved — ambiguous
+between a branch and a tag, a detached checkout — is now repeated back exactly as
+it was asked for rather than chopped into a guess, since an unlovely name that
+resolves beats a tidy one that does not. The row reports that name rather than
+reprinting the base stored on the record, which answers the different question of
+what the branch was *cut* from.
+
 This is visibility, not automation: nothing in it merges, deletes or pushes.
 
 **A project pointed at a real checkout is never ours to write.** `!project`

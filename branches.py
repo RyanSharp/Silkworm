@@ -112,15 +112,25 @@ def existing(repo) -> dict:
     return out
 
 
-def ahead(repo, base: str, branch: str) -> int:
-    """Commits on `branch` that `base` does not have.
+def ahead(repo, bases, branch: str) -> int:
+    """Commits on `branch` that no copy of the base has.
 
     This is the whole merge test. A branch already contained in the base has
     nothing ahead of it, so asking `git branch --merged` as well was a second
     way to compute the same answer -- and a second way no test could tell
     apart from the first, which is how it survived unnoticed.
+
+    `bases` is plural because a branch has two copies here, local and
+    remote-tracking, and either one having the work means the work is not
+    stranded. They drift in both directions: landing fast-forwards the local
+    branch and does not push, and a pull request merged on the forge advances
+    the remote one. Asking about a single ref got one of those two cases wrong
+    whichever ref was chosen -- so ask about the commits no copy contains.
     """
-    r = _git(repo, "rev-list", "--count", f"{base}..{branch}")
+    refs = (bases,) if isinstance(bases, str) else tuple(bases)
+    if not refs:
+        return 0
+    r = _git(repo, "rev-list", "--count", branch, "--not", *refs)
     try:
         return int(r.stdout.strip())
     except ValueError:
@@ -154,8 +164,7 @@ def survey(records) -> list:
         present = {name: rec for name, rec in wanted.items() if name in live}
         if not present:
             continue
-        base = worktrees.base_ref(repo, fetch=False, prefer=pref)
-        shown = base_name(repo, base)
+        base, shown = base_for(repo, pref)
         for name, rec in present.items():
             count = ahead(repo, base, name)
             if not count:
@@ -169,7 +178,13 @@ def survey(records) -> list:
                 "project": rec.get("project") or "",
                 "state": rec.get("state") or "",
                 "branch": name,
-                "base": rec.get("base") or shown,
+                # The base this was measured against, never the one stored on
+                # the record. That field means "what it was cut from, as
+                # resolved at the time", which is a different question and may
+                # answer differently -- and a row that counts against one ref
+                # while printing the name of another is the whole bug this
+                # module had.
+                "base": shown,
                 "commits": count,
                 "repo": repo,
                 "head": live[name][:8],
@@ -179,16 +194,85 @@ def survey(records) -> list:
     return sorted(rows, key=lambda r: -r["updated"])
 
 
+def _full_ref(repo, ref: str) -> str:
+    """Whatever `rev-parse --symbolic-full-name` makes of a ref.
+
+    Often not a ref name at all, and both callers below are written to act only
+    on the `refs/...` prefixes they recognise rather than on whatever comes
+    back. It exits *zero with empty output* when a refname is ambiguous -- a
+    branch and a tag sharing a name -- and returns the bare word "HEAD" when
+    the checkout is detached. Treating either of those as an answer is how the
+    naming below used to start guessing.
+    """
+    r = _git(repo, "rev-parse", "--symbolic-full-name", ref)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def base_name(repo, ref: str) -> str:
     """The branch a base ref names.
 
     `origin/HEAD` is a symbolic ref: splitting it on "/" gives "HEAD" rather
     than the branch it points at, which has already caused one landing to be
-    refused. Resolve it first, then take the last segment.
+    refused. So resolve it to a full ref name and strip only what qualifies
+    it -- the remote it came from, or `refs/heads/`.
+
+    Taking the last segment instead was a second bug of the same shape: a
+    branch name may hold slashes, and the trader's base
+    `origin/research/point-in-time-universe` was reported as `universe`, which
+    names no branch anyone can look up or measure against. So when the ref
+    cannot be resolved -- ambiguous, detached, a wedged repository -- it is
+    named exactly as it was asked for rather than chopped into a guess. An
+    unlovely name that resolves beats a tidy one that does not.
     """
-    r = _git(repo, "rev-parse", "--abbrev-ref", ref)
-    resolved = r.stdout.strip() if r.returncode == 0 else ""
-    return (resolved or ref).split("/")[-1] or ref
+    full = _full_ref(repo, ref)
+    for prefix in ("refs/heads/", "refs/tags/"):
+        if full.startswith(prefix):
+            return full[len(prefix):]
+    if full.startswith("refs/remotes/"):
+        # refs/remotes/<remote>/<branch>, and a remote name holds no slash,
+        # so one split takes the remote off and leaves the rest intact.
+        rest = full[len("refs/remotes/"):]
+        return rest.split("/", 1)[1] if "/" in rest else rest
+    return ref
+
+
+def base_for(repo, prefer: str = "") -> tuple[tuple, str]:
+    """Every ref that is the base, and the one name they all go by.
+
+    `worktrees.base_ref` answers a different question -- what to *cut* new work
+    from -- and for that it rightly prefers `origin/main`: fresh origin is
+    where a new branch should start. Asked instead what a finished branch has
+    already reached, one ref is not enough, because the base has two copies and
+    they drift apart in both directions.
+
+    Landing fast-forwards the *local* branch and deliberately does not push, so
+    origin falls one commit behind per landing. Measured rather than supposed:
+    origin/main twelve landings behind local main, and three branches whose
+    commits were every one of them on main announced as "3 finished tasks on
+    unmerged branches (21 commits)" -- one of those branches being main's own
+    tip. That number reaches the dashboard, `silkworm status`, and the nightly
+    ideator, which was told those gaps were "fixed on those branches and not on
+    the base you are reading" about code sitting on the base it was reading.
+
+    Preferring the local copy instead would only have turned the error round:
+    a branch merged on the forge lands on `origin/main` alone, and every task
+    fetches origin when its worktree is made, so that case is no rarer. Both
+    refs are the same branch under the same name, so the row can name it and
+    measure against all of it -- and `ahead` counts what no copy contains.
+    """
+    ref = worktrees.base_ref(repo, fetch=False, prefer=prefer)
+    name = base_name(repo, ref)
+    full = _full_ref(repo, ref)
+    refs = []
+    local = f"refs/heads/{name}"
+    if _git(repo, "rev-parse", "--verify", "--quiet", local).returncode == 0:
+        refs.append(local)
+    if full.startswith("refs/remotes/") and full not in refs:
+        refs.append(full)
+    # Nothing resolved -- a tag, a detached checkout, a repository git could
+    # not be run against. The ref as asked for is then the only thing the name
+    # can mean, so naming and measuring still agree.
+    return tuple(refs) or (ref,), name
 
 
 def line(rows) -> str:
