@@ -3576,6 +3576,61 @@ def test_atomic_persistence():
     check("the backup is a separate file, not a link to the primary",
           jsonstore.backup_path(sp).stat().st_ino != sp.stat().st_ino)
 
+    # The fallback has to be the backup actually being read, not the primary's
+    # remnants happening to parse: give the two copies different contents and
+    # name which one came back.
+    pick = d / "pick.json"
+    jsonstore.save(pick, {"kept": "the finished save"})
+    pick.write_text(json.dumps({"kept": "a write that was interrupted"})[:20])
+    check("recovery reads the backup, not what is left of the primary",
+          jsonstore.load(pick) == {"kept": "the finished save"})
+
+    # The backup is refreshed after the primary lands, not before, so it can
+    # only ever hold a save that finished. A primary write that dies takes
+    # nothing with it.
+    ordered = d / "ordered.json"
+    jsonstore.save(ordered, {"n": 1})
+    def die_replacing_primary(src, dst):
+        if str(dst) == str(ordered):
+            raise KeyboardInterrupt("killed before the primary landed")
+        return real_replace(src, dst)
+    os.replace = die_replacing_primary
+    try:
+        jsonstore.save(ordered, {"n": 2})
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.replace = real_replace
+    check("a save that never landed does not reach the backup",
+          json.loads(jsonstore.backup_path(ordered).read_text()) == {"n": 1},
+          f"{jsonstore.backup_path(ordered).read_text()[:40]!r}")
+
+    # Replacing a file with a fresh temp file would hand it whatever the umask
+    # says; write_text() wrote through the old one and kept its mode.
+    moded = d / "moded.json"
+    jsonstore.save(moded, {"a": 1})
+    os.chmod(moded, 0o600)
+    jsonstore.save(moded, {"a": 2})
+    check("a save keeps the mode the file already had",
+          moded.stat().st_mode & 0o777 == 0o600,
+          oct(moded.stat().st_mode & 0o777))
+
+    # A reader that does not own the file -- the dashboard is a second process
+    # on the bot's live state -- gets the fallback without touching anything.
+    # Renaming the primary out from under a running bot, which holds the real
+    # records in memory, is how a readable situation becomes a lost one.
+    theirs = d / "theirs.json"
+    jsonstore.save(theirs, {"owner": "the bot"})
+    theirs.write_text("{half")
+    check("a read-only caller still recovers",
+          jsonstore.load(theirs, repair=False) == {"owner": "the bot"})
+    check("without moving the owner's file aside or rewriting it",
+          theirs.read_text() == "{half" and not jsonstore.corrupt_path(theirs).exists())
+    check("leaving the repair to whoever owns it",
+          jsonstore.load(theirs) == {"owner": "the bot"}
+          and jsonstore.corrupt_path(theirs).exists()
+          and json.loads(theirs.read_text()) == {"owner": "the bot"})
+
     # Losing both copies must be loud. Starting empty here is the failure mode
     # that makes the loss invisible: an empty store looks like a fresh install.
     bp = d / "both.json"

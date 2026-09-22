@@ -20,6 +20,7 @@ from urllib.parse import urlparse, parse_qs
 
 import secrets
 
+import jsonstore
 import procs
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -73,9 +74,10 @@ def bot_call(path: str, payload: dict, timeout: float = 1.0) -> dict:
 # --- data loading ---------------------------------------------------------------
 
 def raw_sessions() -> dict[str, dict]:
-    if not SESSIONS_FILE.exists():
-        return {}
-    raw = json.loads(SESSIONS_FILE.read_text())
+    # repair=False: the bot owns this file and is the one writing it. Falling
+    # back to the backup in memory is fine for drawing a page; setting the
+    # primary aside and rewriting it from a second process is not.
+    raw = jsonstore.load(SESSIONS_FILE, default={}, repair=False) or {}
     return {k: ({"session_id": v} if isinstance(v, str) else v) for k, v in raw.items()}
 
 

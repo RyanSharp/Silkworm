@@ -72,6 +72,14 @@ def _write(path: Path, text: str) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())           # on disk, not just in the page cache
+        # write_text() wrote through an existing file and so kept its mode;
+        # replacing it with a fresh temp file would hand every store whatever
+        # the umask says instead. Carry the mode across rather than quietly
+        # widening a file someone locked down.
+        try:
+            os.chmod(tmp, path.stat().st_mode & 0o7777)
+        except OSError:
+            pass                            # no target yet, or a mode we can't set
         os.replace(tmp, path)               # atomic: readers see old or new
     finally:
         try:
@@ -95,13 +103,22 @@ def save(path: Path, data, *, indent: int = 2, keep_backup: bool = True) -> None
             log.warning("could not refresh %s: %s", backup_path(path).name, exc)
 
 
-def load(path: Path, *, default=None, strict: bool = True):
+def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     """Read `path`, falling back to `<name>.prev` if the primary won't parse.
 
     Returns `default` when there is genuinely nothing on disk yet. When there
     *was* something and none of it can be read, `strict` decides between raising
     CorruptStore (right for anything holding records) and returning `default`
     (right for a watermark, where the cost of starting over is a rescan).
+
+    `repair` is for readers that do not own the file. Recovering normally means
+    setting the wreckage aside and putting the recovered contents back, which is
+    right for the process that is about to keep writing there and wrong for
+    anyone else: the dashboard is a second process reading the bot's live
+    files, and it renaming one out from under a running bot -- which is holding
+    the real records in memory and will save them over the top -- would turn a
+    readable situation into a lost one. With `repair=False` the fallback still
+    happens, silently and in memory, and nothing on disk is touched.
     """
     primary_error = None
     if path.exists():
@@ -124,22 +141,25 @@ def load(path: Path, *, default=None, strict: bool = True):
                 log.error("%s %s (%s) — recovered from %s%s", path.name,
                           _why(primary_error), primary_error, backup.name,
                           f"; the unreadable copy is kept at {corrupt_path(path).name}"
-                          if isinstance(primary_error, _BAD_CONTENT) else "")
-                _set_aside(path, primary_error)
-            # Put the recovered contents back where they belong, so the next
-            # reader doesn't have to repeat this. No backup pass: it already
-            # holds exactly this.
-            save(path, data, keep_backup=False)
+                          if isinstance(primary_error, _BAD_CONTENT) and repair else "")
+                if repair:
+                    _set_aside(path, primary_error)
+            if repair:
+                # Put the recovered contents back where they belong, so the
+                # next reader doesn't have to repeat this. No backup pass: it
+                # already holds exactly this.
+                save(path, data, keep_backup=False)
             return data
 
     if primary_error is None:
         return default                          # nothing there yet: fresh install
 
-    _set_aside(path, primary_error)
+    if repair:
+        _set_aside(path, primary_error)
     fallback = (f"its backup {backup.name} {_why(backup_error)} either ({backup_error})"
                 if backup_error else f"there is no {backup.name} to fall back on")
     kept = (f" The unreadable copy is at {corrupt_path(path)}."
-            if isinstance(primary_error, _BAD_CONTENT) else "")
+            if isinstance(primary_error, _BAD_CONTENT) and repair else "")
     message = (f"{path} {_why(primary_error)} ({primary_error}) and {fallback}.{kept}"
                " Refusing to start empty — an empty store looks exactly like a "
                "fresh install.")
