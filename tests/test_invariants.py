@@ -3825,7 +3825,7 @@ def test_atomic_persistence():
           stubborn.read_text() == "{half", stubborn.read_text()[:40])
     check("so the next boot recovers again instead of finding nothing",
           attempt(jsonstore.load, stubborn) == {"records": "recoverable"}
-          and jsonstore.corrupt_path(stubborn).read_text() == "{half")
+          and attempt(jsonstore.corrupt_path(stubborn).read_text) == "{half")
 
     # A watermark is not records: re-scanning is cheaper than refusing to start.
     wm = d / "watermark.json"
