@@ -80,10 +80,14 @@ FIELDS: dict[str, tuple] = {
     # task's worktree, cut from origin, see work that has already landed.
     "publish": (False, "push the base to origin after landing, so the next task sees it"),
     # Out-of-hours ideation. "HH:MM" local time, or "" for off. `ideate_on` is
-    # the last date it ran, so a restart cannot make it run twice in a night
-    # and a missed night is simply skipped rather than fired late.
+    # the last date the night was *decided* -- run, or deliberately skipped
+    # because the project's proposal backlog was already at its standing
+    # limit. Deliberately not "last ran": reading it that way would report a
+    # session that never happened. It exists so a restart cannot make the pass
+    # run twice in a night, and a missed night is skipped rather than fired
+    # late.
     "ideate_at": ("",   "local HH:MM to look for improvements, or off"),
-    "ideate_on": ("",   "YYYY-MM-DD it last ran"),
+    "ideate_on": ("",   "YYYY-MM-DD the night was decided: run or skipped"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),

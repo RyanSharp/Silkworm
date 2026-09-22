@@ -6007,6 +6007,38 @@ def test_review_followups():
           file_followups(parent, ["x" * (scoping.MAX_GOAL_CHARS + 1)]) == [],
           "better a lost note in the log than an unrunnable task on the board")
 
+    # A review is the other unattended producer of proposals. Holding only the
+    # nightly pass to the standing limit would leave a board too deep for the
+    # ideator to touch quietly filling through this door instead -- while the
+    # panel reported it paused, and told the user triage would restart it.
+    # Under its own project: filling `silkworm` to the limit here would change
+    # what the review gate below is filing against.
+    deep = store.create("do the other thing", title="Other", project="backlogged",
+                        scope={"cwd": "/repo"})
+    while scoping.open_proposals(store.by_project("backlogged")) < scoping.max_open_proposals():
+        store.create("Padding the board out to its standing limit",
+                     project="backlogged", state=T.PROPOSED, role="implementor")
+    at_limit = len(store.all())
+    check("a review files nothing onto a board already at its standing limit",
+          file_followups(deep, ["something genuinely worth a decision"]) == []
+          and len(store.all()) == at_limit,
+          "the nightly pass stops here; the other producer of proposals must too")
+    check("and a project with room is unaffected by another's backlog",
+          len(file_followups(parent, ["a finding on a project with room"])) == 1,
+          "the limit is per project, like the nightly pass it mirrors")
+    # One place left, so the batch has to stop partway rather than being
+    # refused outright -- the case that tells a live count from one taken once.
+    spare = next(t for t in store.by_project("backlogged")
+                 if t["state"] == T.PROPOSED and t["goal"].startswith("Padding"))
+    store.transition(spare["id"], T.CANCELLED, "dismissed")
+    got = file_followups(deep, [f"another finding number {i}" for i in range(5)])
+    check("and with one place left it files one, not the whole batch",
+          len(got) == 1,
+          "a count taken once for the batch would file all five past the limit")
+    check("which leaves the board exactly full, never over",
+          scoping.open_proposals(store.by_project("backlogged"))
+          == scoping.max_open_proposals())
+
     # --- routing --------------------------------------------------------------
     bot = (BASE / "bot.py").read_text()
     gate = bot[bot.index("def resolve_review("):bot.index("def land_if_ready(")]

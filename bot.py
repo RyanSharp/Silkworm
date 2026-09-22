@@ -2505,7 +2505,16 @@ def file_followups(task: dict, followups: list[str]) -> list[str]:
                 "Check it is still true before changing anything -- the review "
                 "read the tree as it was then, and main has moved since. If it "
                 "is not, say so and stop.")
-        err = scoping.validate(goal, propose=True)
+        # Counted per finding rather than once for the batch: a review is the
+        # other unattended producer of proposals, so it is held to the same
+        # standing limit as the nightly pass -- otherwise a board too deep for
+        # the ideator to touch keeps filling through this door instead, and
+        # the panel reports it paused while it grows. Live, so the batch stops
+        # at the limit rather than filing all five past it.
+        err = scoping.validate(
+            goal, propose=True, slug=proj,
+            open_now=(scoping.open_proposals(task_store.by_project(proj))
+                      if proj else 0))
         if err:
             log.warning("not filing a review followup on %s: %s", task["id"], err)
             continue
