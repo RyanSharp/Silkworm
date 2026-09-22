@@ -722,15 +722,28 @@ copy rather than a hard link on purpose: a link shares an inode, so whatever
 truncated the primary would truncate the backup too, which is the one case it
 exists for.
 
-On load, an unreadable primary falls back to `.prev`, says in the log which copy
-it used, and keeps the wreckage at `.corrupt`. What it will not do is start
-empty. An empty store is indistinguishable from a fresh install — that is
-exactly how losing everything becomes invisible — so when both copies are gone
-it raises and says so. Watermarks (harvest state, mail state) opt out of that:
-they hold no records, and the cost of starting over is a rescan. A file it
-merely could not read — a permission, a momentarily exhausted fd table — is
-left exactly where it is rather than renamed, so a transient error doesn't get
-turned into a real one.
+On load, a primary that *parses as nothing* falls back to `.prev`, says in the
+log which copy it used, and keeps the wreckage at `.corrupt`. What it will not
+do is start empty. An empty store is indistinguishable from a fresh install —
+that is exactly how losing everything becomes invisible — so when both copies
+are gone it raises and says so. Watermarks (harvest state, mail state) opt out
+of that: they hold no records, and the cost of starting over is a rescan.
+
+A file it merely could not *read* — a permission, a momentarily exhausted fd
+table — gets none of that, and the distinction is the whole point. Such a file
+may be perfectly good; we know nothing about its contents either way. Earlier
+cuts of this correctly declined to rename it and then fell back to `.prev`
+anyway, which is worse: `.prev` is by definition an *older* save, the caller is
+the bot, and the bot holds what it is given in memory and writes it back on its
+next save. A passing `EACCES` would have rewound the board one save and left no
+sign. So for whoever owns the file there is no fallback there at all — it is
+reported, and neither file is touched. Refusing to start is recoverable; a
+silent rewind is not, and it is recoverable precisely because the good file is
+still sitting there for the next attempt.
+
+That refusal binds the writer, not every reader. `load(repair=False)` writes
+nothing and so cannot rewind anything, so it still takes the fallback in memory
+— a dashboard drawn from a slightly old copy beats a dashboard that 500s.
 
 Two things follow from the backup only existing once something has been
 written. A store that has only been *read* has no second copy yet, so a clean
