@@ -2495,6 +2495,9 @@ def land_if_ready(task: dict, channel: str, thread_ts: str) -> str:
     return merge.summary(result, branch)
 
 
+_email_lock = threading.Lock()
+
+
 def run_email_ingest() -> dict:
     """One Gmail pass. Off unless both credentials are set.
 
@@ -2505,19 +2508,25 @@ def run_email_ingest() -> dict:
     """
     if not (GMAIL_USER and GMAIL_APP_PASSWORD):
         return {"ok": False, "error": "GMAIL_USER / GMAIL_APP_PASSWORD not set"}
-    # Non-strict: a watermark, so the worst case is re-reading some mail.
-    state = jsonstore.load(EMAIL_STATE_FILE, default={}, strict=False) or {}
-    common = dict(host=GMAIL_HOST, user=GMAIL_USER, password=GMAIL_APP_PASSWORD,
-                  limit=GMAIL_MAX_PER_RUN, binary=CLAUDE_BIN,
-                  model=NAMING_MODEL or "haiku", env=claude_env(),
-                  cwd=str(CLAUDE_CWD))
-    facts = email_ingest.ingest_facts(
-        project_store, state.setdefault("labels", {}), **common)
-    triaged = {}
-    if GMAIL_TRIAGE:
-        triaged = email_ingest.ingest(
-            task_store, state, mailbox=GMAIL_MAILBOX, **common)
-    jsonstore.save(EMAIL_STATE_FILE, state)
+    # Serialised like its harvest twin. The poller and the dashboard's
+    # ingest-email action both land here, and two passes sharing one watermark
+    # each read it, advance their own copy and write it back -- so the later
+    # save drops whatever the other one marked seen, and that mail is proposed
+    # a second time. The save itself is atomic; the read-modify-write is not.
+    with _email_lock:
+        # Non-strict: a watermark, so the worst case is re-reading some mail.
+        state = jsonstore.load(EMAIL_STATE_FILE, default={}, strict=False) or {}
+        common = dict(host=GMAIL_HOST, user=GMAIL_USER, password=GMAIL_APP_PASSWORD,
+                      limit=GMAIL_MAX_PER_RUN, binary=CLAUDE_BIN,
+                      model=NAMING_MODEL or "haiku", env=claude_env(),
+                      cwd=str(CLAUDE_CWD))
+        facts = email_ingest.ingest_facts(
+            project_store, state.setdefault("labels", {}), **common)
+        triaged = {}
+        if GMAIL_TRIAGE:
+            triaged = email_ingest.ingest(
+                task_store, state, mailbox=GMAIL_MAILBOX, **common)
+        jsonstore.save(EMAIL_STATE_FILE, state)
     return {"ok": True, **facts, "triaged": triaged}
 
 

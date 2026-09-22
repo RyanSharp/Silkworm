@@ -317,6 +317,7 @@ def do_status() -> None:
 
 sys.path.insert(0, str(REPO))
 import credentials                                   # noqa: E402
+import jsonstore                                     # noqa: E402
 
 
 def env_has(name: str) -> bool:
@@ -460,12 +461,17 @@ def latest_summary(session_id: str, cwd: str) -> str | None:
 
 def do_import() -> None:
     """Register every running interactive claude session with Silkworm."""
-    known = set()
+    # Read it the way the store does. The bot rewrites this file underneath us,
+    # and catching only OSError left a half-written one crashing the CLI on the
+    # JSONDecodeError. repair=False: the bot owns the file, we are looking at it.
     try:
-        sessions = json.loads((REPO / "sessions.json").read_text())
-        known = {(v.get("session_id") if isinstance(v, dict) else v) for v in sessions.values()}
-    except OSError:
-        pass
+        sessions = jsonstore.load(REPO / "sessions.json", default={}, repair=False)
+    except jsonstore.CorruptStore as exc:
+        # Carrying on with an empty set would re-register sessions Silkworm
+        # already tracks, which is worse than not importing this once.
+        print(f"{WORM} cannot read sessions.json — {exc}")
+        return
+    known = {(v.get("session_id") if isinstance(v, dict) else v) for v in sessions.values()}
 
     out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True)
     pids = []

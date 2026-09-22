@@ -4233,6 +4233,104 @@ def test_review_followups():
 
 
 
+# --- everyone else who touches a state file -----------------------------------
+# The stores themselves go through jsonstore now, but two callers reach around
+# them: the CLI reads sessions.json directly, and the mail watermark is read,
+# edited and written back by two callers at once. An atomic save fixes neither.
+
+def test_state_files_have_one_reader_and_one_writer():
+    import threading as _th
+    import jsonstore
+
+    print("\nthe callers that reach around the stores")
+    d = Path(tempfile.mkdtemp())
+
+    # The CLI's `import` compares against sessions.json, which the bot rewrites
+    # underneath it. It caught OSError only, so a half-written file -- the very
+    # thing this module exists for -- crashed the CLI on a JSONDecodeError.
+    cli = ast.parse((BASE / "bin" / "silkworm").read_text())
+    do_import = next((n for n in ast.walk(cli) if isinstance(n, ast.FunctionDef)
+                      and n.name == "do_import"), None)
+    check("the CLI still has an import command to check", do_import is not None)
+    calls = [n for n in ast.walk(do_import) if isinstance(n, ast.Call)] if do_import else []
+    def called(node, dotted):
+        obj, _, attr = dotted.partition(".")
+        return (isinstance(node.func, ast.Attribute) and node.func.attr == attr
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == obj)
+    check("it does not parse the session store by hand",
+          not any(called(c, "json.loads") for c in calls))
+    loads = [c for c in calls if called(c, "jsonstore.load")]
+    check("it reads it the way the store does", len(loads) == 1)
+    check("and as a visitor, not the owner: no repair from a second process",
+          any(kw.arg == "repair" and kw.value.value is False
+              for c in loads for kw in c.keywords),
+          "renaming the bot's live file out from under it is the loss, not the fix")
+    # ...and it names things that exist. A lifted-function test would supply
+    # them; the real script has to import them itself.
+    imported = {a.asname or a.name.split(".")[0]
+                for n in ast.walk(cli) if isinstance(n, ast.Import) for a in n.names}
+    check("and imports the module it calls", "jsonstore" in imported, f"{sorted(imported)}")
+
+    # The mail watermark is the other one. Two callers -- the poll loop and the
+    # dashboard's ingest-email button -- each read it, mark their own messages
+    # seen and write it back, so the later save drops the other's progress and
+    # that mail is proposed a second time. os.replace makes each *save* whole;
+    # it cannot make a read-modify-write exclusive. Its harvest twin has always
+    # held a lock. Checked by running the real function, twice, at once.
+    tree = ast.parse((BASE / "bot.py").read_text())
+    check("bot.py defines the lock itself, rather than the test handing it one",
+          any(isinstance(n, ast.Assign) and any(
+                  isinstance(t_, ast.Name) and t_.id == "_email_lock" for t_ in n.targets)
+              for n in tree.body),
+          "otherwise the live bot raises NameError where the test passes")
+
+    state_file = d / "email_state.json"
+
+    class FakeIngest:
+        """Marks one message seen, slowly enough that an unlocked pass overlaps.
+
+        The pause is inside the pass, not a rendezvous between the two: under
+        the lock there is no second pass to meet, and a barrier would deadlock
+        on the fix rather than fail on the bug.
+        """
+        def ingest_facts(self, project_store, labels, **kw):
+            time.sleep(0.05)            # long enough for an unlocked pass to load too
+            labels[kw["who"]] = "seen"
+            return {"filed": 1}
+
+        def ingest(self, *a, **kw):
+            return {}
+
+    ns = bot_functions("run_email_ingest",
+                       GMAIL_USER="u", GMAIL_APP_PASSWORD="p", GMAIL_HOST="h",
+                       GMAIL_MAX_PER_RUN=1, GMAIL_TRIAGE=False, GMAIL_MAILBOX="INBOX",
+                       CLAUDE_BIN="claude", NAMING_MODEL="haiku",
+                       CLAUDE_CWD=d, claude_env=lambda: {},
+                       EMAIL_STATE_FILE=state_file, jsonstore=jsonstore,
+                       email_ingest=FakeIngest(), project_store=None, task_store=None,
+                       _email_lock=_th.Lock())
+    run = ns["run_email_ingest"]
+
+    # Each pass needs its own message id; the thread name is the simplest carrier.
+    class PerThread(FakeIngest):
+        def ingest_facts(self, project_store, labels, **kw):
+            kw["who"] = _th.current_thread().name
+            return FakeIngest.ingest_facts(self, project_store, labels, **kw)
+
+    ns["email_ingest"] = PerThread()
+    results = []
+    threads = [_th.Thread(target=lambda: results.append(run()), name=n)
+               for n in ("first", "second")]
+    [t_.start() for t_ in threads]
+    [t_.join(timeout=10) for t_ in threads]
+
+    seen = (jsonstore.load(state_file, default={}, strict=False) or {}).get("labels", {})
+    check("two passes at once do not lose each other's progress",
+          set(seen) == {"first", "second"}, f"kept {sorted(seen)}")
+    check("and both of them ran", len(results) == 2, f"{results}")
+
+
+
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
@@ -4252,7 +4350,8 @@ if __name__ == "__main__":
               test_unmerged_branches,
               test_dashboard_js_is_whole,
               test_discarding_a_branch_keeps_it, test_task_retention,
-              test_atomic_persistence):
+              test_atomic_persistence,
+        test_state_files_have_one_reader_and_one_writer):
         try:
             t()
         except Exception as exc:
