@@ -465,6 +465,42 @@ what the branch was *cut* from.
 
 This is visibility, not automation: nothing in it merges, deletes or pushes.
 
+**And work that never reached a commit is harder to see than work that did.**
+The same argument one level down. A checkout holding uncommitted changes is
+never swept and never deleted, which is right — and the only trace of one was a
+line at INFO every half hour, 508 of them over six days for two trader
+checkouts, in front of nobody who could act on a log line. A branch at least
+survives a disk tidy; an untracked file in a directory outside any repository
+does not.
+
+Both shapes of it were invisible, differently. A task still in
+`awaiting_approval` or `needs_input` is in the sweeper's keep set, so its tree
+is skipped before the dirty check is even reached: held indefinitely, in
+silence. A finished task's tree drops out of the keep set, reaches the dirty
+check, and is logged for ever. Correctly never deleted either way.
+
+`holding.py` answers *which checkouts are holding work, whose, and where*, for
+`silkworm status`, the Tasks panel and the task's own row. Asked of git rather
+than stored, for the reason merge state is: you can go and commit or delete
+those files yourself. It names the files rather than only counting them — of
+the twenty-one held checkouts it was written against, twenty were held by an
+untracked `.venv` and a `data` directory and one held two scripts and a
+document somebody had written, and no count can tell those apart.
+
+**Reclaim is handing the checkout back, not taking it.** Approving or
+dismissing a task is the moment its files stop being anybody's business, so
+that is where it is said — in the reply, in the task's event log, and durably
+in its own thread — and the tree is left exactly where it is. Reclaiming it
+automatically was considered and rejected: deleting is out by the rule above,
+and the only non-destructive automatic reclaim is committing the leftovers onto
+the task's branch, which for twenty of those twenty-one would commit a
+virtualenv to the project's branch. Whether what is in there is worth keeping
+is a judgement about the files, and it goes to the person who can make it,
+while they are already looking at the task.
+
+The half-hourly log line is now the first sighting only. Repeating it was never
+reporting; the survey stands still and can be read on purpose.
+
 **A project pointed at a real checkout is never ours to write.** `!project`
 sets a project's cwd from the thread it was run in and leaves `repo` empty, so
 keying "is this ours" on that field alone let a project pointed at a working
