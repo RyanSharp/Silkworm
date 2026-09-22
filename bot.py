@@ -1443,6 +1443,21 @@ def handle_projects(payload: dict) -> dict:
             return {"ok": False,
                     "error": "set a test command first — nothing may land unproven"}
         return {"ok": True, "project": project_store.ensure(slug, auto_merge=on)}
+    if action == "publish":
+        # Whether a landing is pushed. Separate from auto-merge on purpose:
+        # landing is a decision about this checkout, publishing is one about
+        # the remote, and a project can reasonably want the first without the
+        # second. Refused without auto-merge, which is the only thing that
+        # lands anything for this to publish.
+        slug = (payload.get("slug") or "").strip()
+        rec = project_store.get(slug)
+        if not rec:
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        on = bool(payload.get("on"))
+        if on and not rec.get("auto_merge"):
+            return {"ok": False,
+                    "error": "turn auto-merge on first — there is nothing to publish"}
+        return {"ok": True, "project": project_store.ensure(slug, publish=on)}
     if action == "ideate":
         # Nightly review, set from the dashboard rather than only from Slack.
         # Validated here rather than in the page: "2am" should work, and a
@@ -2570,7 +2585,8 @@ def land_if_ready(task: dict) -> dict:
     try:
         # Landing touches the shared checkout, so take the guard a turn takes.
         with repo_guard(cwd):
-            result = merge.land(here, cwd, branch, scope.get("branch") or "", run_tests)
+            result = merge.land(here, cwd, branch, scope.get("branch") or "",
+                                run_tests, publish=bool(proj.get("publish")))
     finally:
         worktrees.release(here)
     return {**result, "eligible": True, "branch": branch}

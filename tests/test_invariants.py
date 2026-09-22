@@ -1016,6 +1016,7 @@ def test_landing():
     import threading
     print("\nwork lands only once it has been shown to work")
 
+    import projects as P_
     root = Path(tempfile.mkdtemp())
     repo = root / "repo"; repo.mkdir()
     def g(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
@@ -1119,6 +1120,142 @@ def test_landing():
     r = M.land(y, repo, "y", "", tests)
     check("a landing works against a repo with a remote",
           r["landed"], f"refused at {r.get('stage')}: {str(r.get('detail'))[:70]}")
+
+    # The lockout, which no fixture without a remote can show. Landing
+    # fast-forwards the *local* base, and publishes only if the project asked
+    # -- so after a landing the local base is normally ahead of origin. A
+    # task's worktree is cut from `origin/HEAD`, meaning the next branch starts
+    # where origin is, not where the base it will be merged into is. Rebasing
+    # that branch onto origin/main is then a no-op leaving it without the
+    # commit the base gained, and the fast-forward is impossible -- not just
+    # for that branch, but for every branch from then on. Seen exactly this
+    # way: local main ahead of origin and eight branches refusing at 'merge'.
+    def branch_from(name, start):
+        wt = root / name
+        g(repo, "worktree", "add", "-q", "-b", name, str(wt), start)
+        # Its own file. This is about which commit is the base, not about
+        # conflicts -- touching v.txt would fail the rebase for a different
+        # reason and the case would pass while proving nothing.
+        (wt / f"{name}.txt").write_text(f"{name}\n")
+        g(wt, "add", "-A")
+        g(wt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name)
+        return wt
+
+    check("that landing left the local base ahead of origin",
+          int(g(repo, "rev-list", "--count",
+                "origin/main..main").stdout.strip()) == 1,
+          "without this the rest of the case cannot arise")
+    w = branch_from("w", "origin/main")
+    check("and a branch cut from origin lacks what the base gained",
+          g(repo, "merge-base", "--is-ancestor", "main", "w").returncode != 0,
+          "this is how every task's worktree is cut")
+    r = M.land(w, repo, "w", "", tests)
+    check("a second branch lands even though it was cut from the old base",
+          r["landed"],
+          f"refused at {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("and the base fast-forwarded onto it",
+          g(repo, "rev-parse", "HEAD").stdout.strip() ==
+          g(repo, "rev-parse", "w").stdout.strip())
+
+    # A base that *genuinely* moves between the proof and the merge is a
+    # different failure and has to read as one. `--ff-only` refused both in the
+    # same words, which is part of why the lockout above went unnoticed.
+    u = branch_from("u", "main")
+    def moves_base_mid_landing(cwd):
+        if str(cwd) != str(repo):
+            g(repo, "commit", "-q", "--allow-empty", "-m", "another landing")
+        return tests(cwd)
+    r = M.land(u, repo, "u", "", moves_base_mid_landing)
+    check("a base that moves between the proof and the merge is named as that",
+          not r["landed"] and r["stage"] == "base-moved",
+          f"got {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("and the refusal names both commits rather than blaming git",
+          "was at" in r["detail"] and "is at" in r["detail"],
+          r["detail"][:200])
+
+    # Publishing. Landing moves the local branch; origin hears about it only if
+    # the project asked. Off, the two drift -- survivable for landing now that
+    # the base is the local commit, but not for the *next* task, whose worktree
+    # is cut from origin and so cannot see what already landed. Not
+    # hypothetical: two tasks independently implemented the same fix.
+    check("publishing is off by default", P_.default("publish") is False,
+          "pushing to a shared remote is the project's decision, not ours")
+    check("and nothing so far has been published",
+          int(g(repo, "rev-list", "--count",
+                "origin/main..main").stdout.strip()) > 0,
+          "the local base is ahead of origin, as an unpublished landing leaves it")
+
+    pub = branch_from("pub", "main")
+    r = M.land(pub, repo, "pub", "", tests, publish=True)
+    check("a landing publishes when the project asks for it", r["landed"],
+          f"refused at {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("and origin then agrees with the local base",
+          g(repo, "rev-parse", "origin/main").stdout.strip() ==
+          g(repo, "rev-parse", "main").stdout.strip(),
+          "this is what lets the next task's worktree see landed work")
+    check("and the result says so rather than just 'landed'",
+          r.get("published") is True)
+    check("as does the reply",
+          "pushed to origin" in M.summary(r, "pub"),
+          "'landed' meaning local-only is how origin drifted unnoticed")
+
+    # A push that is refused -- someone else having pushed to the base is the
+    # ordinary case. The landing must come back off: a base that did not
+    # publish has not really landed, and leaving the commit on local main would
+    # recreate the very divergence publishing exists to prevent, while
+    # reporting success.
+    rival = root / "rival"
+    g(repo, "worktree", "add", "-q", "--detach", str(rival), "origin/main")
+    (rival / "rival.txt").write_text("rival\n")
+    g(rival, "add", "-A")
+    g(rival, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rival")
+    g(rival, "push", "-q", "origin", "HEAD:main")
+
+    at_start = g(repo, "rev-parse", "HEAD").stdout.strip()
+    nope = branch_from("nope", "main")
+    r = M.land(nope, repo, "nope", "", tests, publish=True)
+    check("a landing whose push is refused is not reported as landed",
+          not r["landed"] and r["stage"] == "publish",
+          f"got {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("and the base is put back where it was",
+          g(repo, "rev-parse", "HEAD").stdout.strip() == at_start,
+          "otherwise it is landed-but-unpublished, which is the original bug")
+    check("while the branch itself is untouched, so it can be retried",
+          g(repo, "rev-parse", "--verify", "--quiet", "nope").returncode == 0)
+
+    # A push can also fail *after* the remote accepted it, and a push that
+    # times out may or may not have taken. Resetting then would drop a commit
+    # that is already published -- a worse mess than the one this prevents --
+    # so the outcome is settled by asking origin rather than by the exit code.
+    # Back in step first -- origin is ahead after the rejection above, and a
+    # push that fails for that ordinary reason would not exercise this at all.
+    g(repo, "fetch", "-q", "origin")
+    g(repo, "reset", "-q", "--hard", "origin/main")
+    check("the base and origin start this case in step",
+          g(repo, "rev-parse", "HEAD").stdout.strip() ==
+          g(repo, "rev-parse", "origin/main").stdout.strip(),
+          "otherwise the push fails for a different reason and proves nothing")
+    ok = branch_from("ok", "main")
+    real_push = M._git
+    def push_lies(cwd, *a, **kw):
+        out = real_push(cwd, *a, **kw)
+        if a and a[0] == "push":
+            real_push(cwd, *a, **kw)      # it really does reach origin
+            out.returncode = 1            # and then reports otherwise
+        return out
+    M._git = push_lies
+    try:
+        r = M.land(ok, repo, "ok", "", tests, publish=True)
+    finally:
+        M._git = real_push
+    check("a push that reports failure after origin took it still counts",
+          r["landed"] and r.get("published") is True,
+          f"got {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("and the base keeps the commit origin already has",
+          g(repo, "rev-parse", "origin/main").stdout.strip() ==
+          g(repo, "rev-parse", "main").stdout.strip(),
+          "resetting here would drop a published commit")
+
     g(repo, "remote", "remove", "origin")
 
     bot = (BASE / "bot.py").read_text()
@@ -1139,8 +1276,10 @@ def test_landing():
           "worktrees.attach(" in li)
     check("and the temporary checkout is always released",
           "finally:" in li and "worktrees.release(here)" in li)
-    import projects as P
-    check("auto-merge is off by default", P.default("auto_merge") is False)
+    check("auto-merge is off by default", P_.default("auto_merge") is False)
+    check("and the project's publishing choice reaches the landing",
+          'publish=bool(proj.get("publish"))' in li,
+          "otherwise the setting exists and does nothing")
 
 
 # --- a project can be reviewed while you sleep -----------------------------------

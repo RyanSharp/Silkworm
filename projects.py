@@ -72,6 +72,13 @@ FIELDS: dict[str, tuple] = {
     # Off by default, and refused outright without a test command: landing work
     # unattended on a project that cannot prove itself is merging on a guess.
     "auto_merge": (False, "land reviewed, verified work on the base branch"),
+    # Whether a landing is published. Landing fast-forwards the *local* base;
+    # origin only hears about it if this is on. Off by default because pushing
+    # to a shared remote is an outward act on someone else's repository, and
+    # because it is the one step here that cannot be undone quietly. On, it
+    # keeps origin and the local base in step -- which is what lets the next
+    # task's worktree, cut from origin, see work that has already landed.
+    "publish": (False, "push the base to origin after landing, so the next task sees it"),
     # Out-of-hours ideation. "HH:MM" local time, or "" for off. `ideate_on` is
     # the last date it ran, so a restart cannot make it run twice in a night
     # and a missed night is simply skipped rather than fired late.

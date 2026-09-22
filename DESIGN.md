@@ -681,11 +681,67 @@ the very checkout it tested, so counting untracked files meant the first
 landing succeeded and every one after it refused. Untracked files are safe
 regardless: git refuses a fast-forward that would overwrite one.
 
-Three fixture bugs while testing this, each of which made a test prove nothing:
+**The base is the local branch, pinned to one commit.** What is rebased onto and
+what is fast-forwarded have to be the same thing. They were not: the base was
+resolved the way a *new* worktree resolves it, which prefers `origin/main`
+because fresh origin is the right place to cut new work from — while the merge
+fast-forwards the local branch, which by default is not pushed. So the first
+branch to land put local main ahead of origin, and every branch after it,
+rebased onto origin/main, could no longer fast-forward the base it was supposed
+to land on. Landing locked itself out after one success, and reported it as *the
+base moved again mid-landing* — which is the wrong explanation and is much of
+why it went unnoticed. Nothing had moved; the base had simply never been
+published. Measured here: local main twelve commits ahead of origin, thirteen
+`silkworm/tsk_*` branches unmerged behind it. Now the remote-tracking ref only
+*names* the base; the commit is read once from the checkout that will be merged
+into, and that commit is what the rebase targets.
+
+This is the floor rather than the whole answer, and it is deliberately not
+solved by publishing alone. Publishing makes the two refs agree *usually*, which
+would turn a permanent lockout into an intermittent one: a push that is refused,
+a project with no remote, or publishing simply left off all return to it. The
+rebase target and the merge target are the same object because `git merge
+--ff-only` merges into the checkout's HEAD, and that is true whoever else is
+pushing.
+
+**Publishing is a separate, opt-in decision.** Landing moves the local branch;
+origin hears about it only if the project asked. That drift is survivable for
+landing now, but not for the *next* task: a worktree is cut from `origin/HEAD`,
+so an implementor cannot see work that has already landed. Two tasks
+independently implemented the same fix that way, at roughly $4.50 each plus a
+reviewer each. Publishing is what keeps origin and the local base in step, and
+so what stops that.
+
+Off by default, per project, alongside `auto_merge`. This is not the
+pull-request question ruled out above — nothing is proposed to anyone for
+review — but pushing to a shared remote is still an outward act on someone
+else's repository, and the only step in landing that cannot be taken back
+quietly. It happens last, after the post-merge suite: publishing before proving
+the base would mean undoing a push, which is a force-push on a shared branch and
+a worse position than an unlanded branch. **A push that is refused undoes the
+landing.** A base that failed to publish has not really landed, and leaving the
+commit on local main would recreate the exact divergence publishing exists to
+prevent — this time silently, under a reply saying it worked. The base is reset,
+the branch is untouched, and it refuses at `publish`. Whether it published is
+settled by asking origin, not by the push's exit code: a push can fail after the
+remote accepted it, and one that times out may have taken — resetting there
+would drop an already-published commit, which is worse than the mess being
+prevented.
+
+**A base that genuinely moves says so.** Running the suite takes minutes, and
+another landing in that window means what passed is not what would be merged.
+`--ff-only` refuses that too, but in git's own words — the same words the
+lockout above produced, which is part of why it went unnoticed. The commit is
+re-read before the merge and a mismatch refuses at `base-moved`, naming where
+the base was and where it is now.
+
+Four fixture bugs while testing this, each of which made a test prove nothing:
 a two-line Python module let git auto-resolve a whole-file rewrite; identical-
-length edits let a stale `.pyc` answer for new source; and a branch created
-*after* the first landing has nothing left to conflict with. The mutations now
-confirm each assertion fails without its fix.
+length edits let a stale `.pyc` answer for new source; a branch created *after*
+the first landing has nothing left to conflict with; and a fixture built by
+`git init` with no origin at all cannot tell the base from the remote-tracking
+ref, so it never saw the lockout. The mutations now confirm each assertion fails
+without its fix.
 
 ### A refusal is a result, not a sentence
 
