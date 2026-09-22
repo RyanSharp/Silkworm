@@ -1510,6 +1510,148 @@ def test_ideation():
     check("off is spelled several plausible ways",
           '("", "off", "none", "clear")' in pr)
 
+    # A fresh session every night, shown the code and not the board, re-derives
+    # last night's gaps and files them again -- correctly, since a real gap is
+    # still there tomorrow. The same landing defect arrived twice under two
+    # framings, and one project collected seven proposals asking for the same
+    # re-run. So the goal has to carry the project's own board.
+    import tasks as T, scoping as S
+    ts = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+
+    def filed(title, state=T.PROPOSED, **kw):
+        rec = ts.create(title, title=title, project="silkworm",
+                        source="ideation", state=T.PROPOSED, **kw)
+        for step in {T.PROPOSED: (), T.BLOCKED: (T.QUEUED, T.RUNNING, T.BLOCKED),
+                     T.DONE: (T.QUEUED, T.RUNNING, T.DONE),
+                     T.CANCELLED: (T.CANCELLED,)}[state]:
+            rec = ts.transition(rec["id"], step)
+        return rec
+
+    waiting = filed("Add a test for the retry path")
+    accepted = filed("Split visualizer.py", state=T.BLOCKED)
+    shipped = filed("Give the dashboard a favicon", state=T.DONE)
+    said_no = filed("Rewrite it all in Rust", state=T.CANCELLED)
+    nightly = ts.create("Look over the silkworm project", title="Nightly review: Silkworm",
+                        project="silkworm", role="ideator", source="ideation",
+                        state=T.QUEUED)
+    elsewhere = ts.create("Fix the Saga webhook", title="Fix the Saga webhook",
+                          project="saga", source="ideation", state=T.PROPOSED)
+
+    board = ts.by_project("silkworm")
+    note = S.board_note(*S.already_filed(board, time.time()))
+
+    check("the nightly goal names a proposal still waiting to be triaged",
+          waiting["title"] in note,
+          "without it the ideator re-derives and refiles the same idea tonight")
+    check("and work already accepted and under way", accepted["title"] in note,
+          "accepted is the strongest reason not to propose it a second time")
+    check("and tells it not to file them again",
+          "do not file any of these again" in note)
+    check("finished work is not listed", shipped["title"] not in note,
+          "shipping something is not a reason never to touch that area again")
+    check("a dismissed proposal is remembered",
+          said_no["title"] in note and "do not bring them back" in note,
+          "an idea you rejected must not come back tomorrow looking fresh")
+    check("the nightly review task is not itself listed as an idea",
+          "Nightly review" not in note, f"{nightly['id']} is the job, not an idea")
+    check("another project's board is not listed",
+          elsewhere["title"] not in note, f"{elsewhere['id']} belongs to saga")
+    check("filing nothing is named as an acceptable night",
+          "file nothing and say so" in note,
+          "otherwise a pass with nothing new invents something to justify itself")
+
+    # A proposal you accepted and then stopped mid-run is not a dismissal: you
+    # wanted it. `attempts` is the only durable record of having run at all.
+    ran_then_stopped = filed("Rewrite the scheduler", state=T.BLOCKED)
+    ts.transition(ran_then_stopped["id"], T.CANCELLED)
+    check("work that was accepted, ran, and was then stopped is not a refusal",
+          ran_then_stopped["title"] not in
+          S.board_note(*S.already_filed(ts.by_project("silkworm"), time.time())),
+          "listing it as 'the user said no' would bury an idea that was wanted")
+    check("and the record that tells them apart is the one that survives "
+          "compaction",
+          ts.get(said_no["id"])["attempts"] == 0
+          and ts.get(ran_then_stopped["id"])["attempts"] >= 1,
+          "attempts is a plain int on the record, not an event that is trimmed")
+
+    # Every Slack message and every scheduled wake-up is a task too, carrying
+    # the thread's project and sitting non-terminal while it runs -- and
+    # staying there if a restart or a quota error kills it. None of them is an
+    # idea, and each one listed costs a slot a real proposal wanted.
+    turn = ts.create("check whether the rejects cleared", title="check whether the "
+                     "rejects cleared", project="silkworm", role="assistant",
+                     source="slack", state=T.QUEUED)
+    ts.transition(turn["id"], T.RUNNING)
+    ts.transition(turn["id"], T.FAILED, "quota")
+    wake = ts.create("look again in two hours", title="look again in two hours",
+                     project="silkworm", role="assistant", source="defer",
+                     state=T.QUEUED)
+    ts.transition(wake["id"], T.BLOCKED)
+    gate = ts.create("Review: something", title="Review: something",
+                     project="silkworm", role="reviewer", source="review",
+                     state=T.QUEUED)
+    desk = ts.create("Split the runner out of bot.py", title="Split the runner out "
+                     "of bot.py", project="silkworm", role="implementor",
+                     source="ui", state=T.QUEUED)
+    listed = S.board_note(*S.already_filed(ts.by_project("silkworm"), time.time()))
+    check("a conversation turn is not listed as an idea already had",
+          turn["title"] not in listed,
+          f"{turn['id']} is a message that failed on quota, not a proposal")
+    check("nor a scheduled wake-up", wake["title"] not in listed,
+          f"{wake['id']} inherits the thread's project and sits blocked")
+    check("nor the review gate itself", gate["title"] not in listed,
+          "the gate is the board running, not something on it")
+    check("but work typed into the dashboard is", desk["title"] in listed,
+          f"{desk['id']} is a real item the pass should not propose again")
+
+    # `update` always stamps `updated`, so age the record directly.
+    stale = dict(ts.get(said_no["id"]),
+                 updated=time.time() - (S.DISMISSAL_MEMORY_DAYS + 1) * 86400)
+    check("but a dismissal is forgotten eventually",
+          S.already_filed([stale], time.time())[1] == [],
+          "'not now' is not 'never'")
+    check("a project with a clear board gets no paragraph at all",
+          S.board_note([], []) == "",
+          "a healthy project should not pay tokens for an empty list")
+
+    for _ in range(S.MAX_LISTED + 5):
+        filed("x" * 400)
+    names, _ = S.already_filed(ts.by_project("silkworm"), time.time())
+    deep = S.board_note(names, [])
+    check("a long name is cut rather than sent whole",
+          names and max(len(n) for n in names) <= S.MAX_NAME_CHARS,
+          "the goal is rebuilt every night; one 400-char title is not worth it")
+    check("and a board longer than the listing is capped",
+          len(names) > S.MAX_LISTED
+          and deep.count("\n  - ") == S.MAX_LISTED,
+          f"got {len(names)} names, {deep.count(chr(10) + '  - ')} listed")
+    check("but a cut list says so, instead of passing for the whole board",
+          f"…and {len(names) - S.MAX_LISTED} more" in deep,
+          "'do not file any of these again' over a silent slice is how the "
+          "oldest untriaged proposal gets re-derived every night for ever")
+    check("the cap is set above a real board, not at it",
+          S.MAX_LISTED >= 40,
+          "at 20 it cut six of trader's open items, two of them the very "
+          "duplicates this paragraph exists to stop")
+
+    # Behavioural rather than textual: computing the note and then dropping it
+    # would leave every substring in place and the suite green, which is the
+    # one mistake a wiring test exists to catch. Ask the tree what run_ideation
+    # does with what it builds.
+    fn = next(n for n in ast.walk(ast.parse(bot))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_ideation")
+    called = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    appended = [n for n in ast.walk(fn) if isinstance(n, ast.AugAssign)
+                and isinstance(n.target, ast.Name) and n.target.id == "goal"
+                and isinstance(n.op, ast.Add) and "note" in ast.unparse(n.value)]
+    check("the nightly pass builds the board into the goal",
+          {"scoping.already_filed", "scoping.board_note"} <= called,
+          "the ideator is read-only over the repo; the board lives in Silkworm")
+    check("and adds it to the goal rather than computing and dropping it",
+          len(appended) == 2,
+          f"expected the board note and the unmerged-branch note; got "
+          f"{len(appended)} appends to goal")
+
     viz = (BASE / "visualizer.py").read_text()
     check("the panel shows which projects are scheduled", "function renderNightly" in viz)
     check("and says so when none are", "none scheduled" in viz,

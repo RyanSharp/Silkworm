@@ -17,6 +17,8 @@ are already reviewed by the only person whose review the gate exists to get.
 
 import re
 
+import tasks
+
 #: Per turn. A plan larger than this is not a plan, it is a model that has
 #: stopped counting -- and every task costs a session, or two with review.
 MAX_PER_TURN = 10
@@ -127,6 +129,145 @@ def unmerged_note(rows, limit: int = MAX_LISTED) -> str:
             "wrong is that it has not been merged, say that in your reply — do "
             "not file it as work, because implementing it again is exactly the "
             "mistake this list exists to stop.")
+
+
+# --- what the board already holds ---------------------------------------------
+
+#: Anything not finished and not turned down is still on the board. Derived
+#: rather than listed, so a state added later is covered without anyone
+#: remembering to come back here.
+OPEN_STATES = tuple(s for s in tasks.STATES if s not in tasks.TERMINAL)
+
+#: How long a dismissal is remembered. Long enough that a nightly job cannot
+#: wear you down by refiling; short enough that "not now" is not "never".
+DISMISSAL_MEMORY_DAYS = 30
+
+#: A ceiling on a pathological board, not a budget for a real one. Set at 20
+#: it cut six of trader's twenty-six open items -- including two of the seven
+#: duplicate gauntlet proposals this whole paragraph exists to stop, which the
+#: pass would then have re-derived for ever, since the cut is at the tail and
+#: the same six are oldest every night. Both lists are capped separately, so a
+#: long backlog cannot push every dismissal out; and when either is cut, the
+#: note says how many are missing rather than presenting a slice as the whole
+#: board. Worst case is a few thousand characters once a night, against a whole
+#: session wasted re-deriving one proposal -- which is why this is not bounded
+#: by MAX_GOAL_CHARS: that limit is about a goal a person has to act on, and
+#: this is a prompt nobody files.
+MAX_LISTED = 40
+MAX_NAME_CHARS = 100
+
+
+#: The board's own machinery: the review gate, and the nightly pass itself.
+#: Neither is an idea, and listing them as ones already had would be nonsense.
+MACHINERY_ROLES = ("reviewer", "ideator")
+
+#: Where a conversation turn comes from. A Slack or web message and a scheduled
+#: wake-up are all filed as tasks, all inherit their thread's project, and all
+#: sit in a non-terminal state while they run -- and one killed by a restart or
+#: a quota error stays there indefinitely. Telling the nightly pass not to file
+#: "check whether the paper book's rejects cleared" again costs a listing slot
+#: and tells it nothing. Paired with the role below, because `ui` is also where
+#: work typed into the dashboard comes from, and that *is* on the board.
+CONVERSATION_SOURCES = ("slack", "ui", "defer")
+
+
+def is_work(rec: dict) -> bool:
+    """Is this record a piece of work on the board, or the board running?"""
+    role = rec.get("role") or ""
+    if role in MACHINERY_ROLES:
+        return False
+    return not (role == "assistant" and rec.get("source") in CONVERSATION_SOURCES)
+
+
+def task_name(rec: dict) -> str:
+    """A short, recognisable label for a task in a list."""
+    name = (rec.get("title") or "").strip() or (rec.get("goal") or "").strip()
+    name = " ".join(name.split())
+    return _clip(name, MAX_NAME_CHARS)
+
+
+def already_filed(records, now: float) -> tuple[list[str], list[str]]:
+    """Split a project's tasks into (still open, recently dismissed) names.
+
+    Newest first: `board_note` cuts at the tail, so if a board is longer than
+    it will list, the oldest go -- and those are the same ones every night.
+
+    Dismissal is remembered only for a proposal that never ran: a task you
+    scoped yourself and then cancelled says nothing about whether the idea is
+    welcome, and one you accepted and then stopped mid-run was wanted -- its
+    stopping is not a reason never to raise it again. `attempts` is the
+    durable record of that, incremented only on entering `running`.
+
+    Both halves are filtered by `is_work`: the board's own machinery and the
+    conversation turns that happen to carry a project are not ideas.
+    """
+    cutoff = now - DISMISSAL_MEMORY_DAYS * 86400
+    open_names, dismissed = [], []
+    for rec in sorted(records, key=lambda r: -(r.get("created") or 0)):
+        if not is_work(rec):
+            continue
+        name = task_name(rec)
+        if not name:
+            continue
+        state = rec.get("state")
+        if state in OPEN_STATES:
+            open_names.append(name)
+        elif (state == tasks.CANCELLED and rec.get("source") == "ideation"
+              and not (rec.get("attempts") or 0)
+              and (rec.get("updated") or rec.get("created") or 0) >= cutoff):
+            dismissed.append(name)
+    return open_names, dismissed
+
+
+def _listing(heading: str, names, limit: int) -> str:
+    """One headed list, and a last line when it does not hold everything.
+
+    Truncating in silence would be the bug this module exists to stop: the
+    note says "do not file any of these again" and "if everything you find is
+    already listed, file nothing", and both read as claims about the whole
+    board. `unmerged_note` says how many it left out for the same reason.
+    """
+    shown = names[:limit]
+    body = "\n".join(f"  - {n}" for n in shown)
+    if len(names) > limit:
+        body += (f"\n  …and {len(names) - limit} more, not listed here — "
+                 "treat this as a sample of the board, not all of it")
+    return f"{heading}\n{body}\n\n"
+
+
+def board_note(open_names=(), dismissed=(), limit: int = MAX_LISTED) -> str:
+    """Tell the nightly pass what is already sitting in front of the user.
+
+    The ideator starts a fresh session every night and is shown the code, not
+    the board. A real gap is still a gap tomorrow, so it re-derives the same
+    idea and files it again -- correctly, for a job told nothing. That is not
+    hypothetical: the same defect was proposed on two consecutive nights under
+    two different framings, and one project collected seven proposals asking
+    for the same re-run. Every duplicate costs a dismissal, until a board full
+    of things you have already said no to stops being read.
+
+    Empty when there is nothing to say, so a project with a clear board pays
+    no tokens for the paragraph.
+    """
+    open_names, dismissed = list(open_names), list(dismissed)
+    if not open_names and not dismissed:
+        return ""
+
+    note = ""
+    if open_names:
+        note += _listing(
+            "Already on the board for this project — do not file any of "
+            "these again:", open_names, limit)
+    if dismissed:
+        note += _listing(
+            "Already proposed and dismissed — the user said no; do not "
+            "bring them back:", dismissed, limit)
+    return note + (
+        "Those ideas already exist and are already costing a decision. Say "
+        "something new, or sharpen one of them in your reply without filing "
+        "it again. If everything you find tonight is already listed, file "
+        "nothing and say so — that is a good night's work, not a failed "
+        "one.")
 
 
 HOW_TO = """When the user asks you to scope, plan or break down a piece of \

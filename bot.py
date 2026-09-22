@@ -2912,13 +2912,24 @@ def run_ideation(slug: str) -> dict:
         "must stand alone: whoever picks it up will not have read this.\n\n"
         "Then say what you looked at and what you filed."
     )
+    board = task_store.by_project(slug)
+
+    # Told nothing, a fresh session re-derives last night's ideas and files them
+    # again -- correctly, since a real gap is still there tomorrow. So the goal
+    # carries the project's own board: what is still open, and what was proposed
+    # and turned down. Otherwise every night costs the same dismissals over.
+    note = scoping.board_note(*scoping.already_filed(board, time.time()))
+    if note:
+        goal += "\n\n" + note
+
     # Told nothing about them, a fresh session reads the base, finds a gap that
     # is already fixed on an unmerged branch, and files it again -- which is how
     # one fix came to be implemented twice, at the cost of two sessions and two
     # reviewers each time. So the goal carries the list.
-    note = scoping.unmerged_note(branches.survey(task_store.by_project(slug)))
+    note = scoping.unmerged_note(branches.survey(board))
     if note:
         goal += "\n\n" + note
+
     task = task_store.create(goal, title=f"Nightly review: {rec.get('title') or slug}",
                              role="ideator", project=slug, state=tasks.QUEUED,
                              # Unattended work of its own, though the ideator
