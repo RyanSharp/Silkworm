@@ -289,7 +289,8 @@ class TaskStore:
             return dict(rec)
 
     def transition(self, tid: str, to_state: str, detail: str = "",
-                   _release: bool = True, _seen: set | None = None) -> dict:
+                   _release: bool = True, _seen: set | None = None,
+                   _unblock: tuple = ()) -> dict:
         """Move a task's state, refusing anything the lifecycle disallows.
 
         Ending a task also releases whatever was waiting on it. That happens
@@ -311,6 +312,14 @@ class TaskStore:
             if not can(current, to_state):
                 raise InvalidTransition(f"{tid}: {current} -> {to_state}")
             rec["state"] = to_state
+            if _unblock:
+                # Forgetting an ended blocker happens in the same write as the
+                # state change, never before it. Persisting the strip first and
+                # then dying would leave a task `blocked` with an empty
+                # `blocked_on` -- invisible to the board and to the audit that
+                # exists to find it, which is the exact strand this prevents.
+                rec["blocked_on"] = [b for b in (rec.get("blocked_on") or [])
+                                     if b not in _unblock]
             rec["updated"] = time.time()
             # A retry time is a reason to be blocked, and leaving `blocked`
             # spends it. Kept, it outlived the wait it was set for: a task that
@@ -350,15 +359,18 @@ class TaskStore:
         return rec is None or rec.get("state") in ENDED
 
     def _plan_release(self, blocker_id: str, ended_state: str | None,
-                      detail: str) -> list[tuple[str, str, str]]:
-        """Drop an ended blocker from its waiters and say where each should go.
+                      detail: str) -> list[tuple[str, str | None, str, tuple]]:
+        """Say what should become of each task waiting on an ended blocker.
 
-        Reading the waiters and editing `blocked_on` happen under one lock, so
-        two blockers ending at once cannot both believe they were the last.
+        Reads under the lock and writes nothing: the strip is handed to the
+        caller so it can be made in the same write as the state change. An
+        earlier version saved the strip here, which meant a crash in the gap
+        left a task `blocked` with an empty `blocked_on` -- the one shape the
+        audit below cannot find.
         """
         what = {DONE: "finished", FAILED: "failed",
                 CANCELLED: "was cancelled"}.get(ended_state, "no longer exists")
-        plan, changed = [], False
+        plan = []
         with self._lock:
             blocker = self._data.get(blocker_id) or {}
             label = "review" if blocker.get("role") == "reviewer" else "blocker"
@@ -368,35 +380,59 @@ class TaskStore:
                     # A waiter that has already moved on keeps its blocked_on:
                     # that is what stops a reviewed task being reviewed twice.
                     continue
-                rest = [b for b in waiting if b != blocker_id]
-                rec["blocked_on"] = rest
-                changed = True
-                if any(not self._ended(b) for b in rest):
-                    continue                    # still waiting on something live
+                # Every blocker that has ended goes, not only the one that just
+                # did. A leftover id makes a later rerun skip both verification
+                # and the review gate, which is the hazard blocked_on guards.
+                dead = tuple(b for b in waiting if self._ended(b))
+                if len(dead) < len(waiting):
+                    plan.append((wid, None, "", dead))   # still waiting on something live
+                    continue
                 why = f"{label} {blocker_id} {what}"
                 if detail:
                     why += f": {detail}"
                 # Work that exists is work someone should look at. A task with
                 # nothing to show has not earned an approval prompt, and saying
                 # so on the board beats silence.
-                plan.append((wid, AWAITING_APPROVAL if rec.get("result") else FAILED, why))
-            if changed:
-                self._save()
+                plan.append((wid, AWAITING_APPROVAL if rec.get("result") else FAILED,
+                             why, dead))
         return plan
+
+    def _drop_blockers(self, tid: str, dead: tuple) -> None:
+        """Forget ended blockers for a task that is still waiting on others."""
+        if not dead:
+            return
+        with self._lock:
+            rec = self._data.get(tid)
+            if rec is None:
+                return
+            rest = [b for b in (rec.get("blocked_on") or []) if b not in dead]
+            if rest != (rec.get("blocked_on") or []):
+                rec["blocked_on"] = rest
+                self._save()
 
     def _release_waiters(self, blocker_id: str, ended_state: str | None,
                          detail: str, seen: set) -> list[str]:
-        """Move every task stranded by `blocker_id` ending. Returns their ids."""
+        """Move every task stranded by `blocker_id` ending. Returns their ids.
+
+        Nothing raised here may reach the caller: this is bookkeeping around
+        somebody else's transition, which has already happened, and turning it
+        into an error would report a state change that did occur as a failure.
+        A release that does not happen leaves the waiter exactly as it was, so
+        the audit finds it on the next beat.
+        """
         freed = []
-        for wid, to_state, why in self._plan_release(blocker_id, ended_state, detail):
+        for wid, to_state, why, dead in self._plan_release(blocker_id, ended_state, detail):
+            if to_state is None:
+                self._drop_blockers(wid, dead)
+                continue
             if wid in seen:
                 continue                        # a cycle, or already handled
             seen.add(wid)
             try:
-                self.transition(wid, to_state, why[:200], _seen=seen)
+                self.transition(wid, to_state, why[:200], _seen=seen, _unblock=dead)
                 freed.append(wid)
                 log.warning("task %s released from %s: %s", wid, blocker_id, why)
-            except (InvalidTransition, KeyError):
+            except Exception:
                 log.exception("could not release %s waiting on %s", wid, blocker_id)
         return freed
 

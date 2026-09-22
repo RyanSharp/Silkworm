@@ -5311,6 +5311,52 @@ def test_blocked_tasks_are_never_stranded():
     check("releases survive a reload",
           TaskStore(st2._path).get(orphan["id"])["state"] == T.AWAITING_APPROVAL)
 
+    # A release that does not finish must leave the task exactly as it was.
+    # Persisting the dropped blocker before the state change meant a crash in
+    # between left a task `blocked` with an empty `blocked_on` -- the one shape
+    # the audit cannot find, which is the original bug wearing a new hat.
+    st3 = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    pid = st3.create("implement", driver="queue", result={"text": "done"})["id"]
+    rid = st3.create("review", role="reviewer", driver="queue", parent=pid)["id"]
+    st3.transition(pid, T.RUNNING)
+    st3.update(pid, blocked_on=[rid])
+    st3.transition(pid, T.BLOCKED)
+    st3.transition(rid, T.RUNNING)
+    real_save, writes = st3._save, []
+
+    def flaky_save():
+        writes.append(1)
+        if len(writes) == 2:          # the reviewer's write lands, the release's does not
+            raise OSError("disk went away")
+        real_save()
+
+    st3._save = flaky_save
+    st3.transition(rid, T.FAILED, "Connection closed mid-response")
+    st3._save = real_save
+    reloaded = TaskStore(st3._path)   # as if the process had died and come back
+    stuck = reloaded.get(pid)
+    check("a release that fails does not swallow the blocker id",
+          stuck["blocked_on"] == [rid], stuck["blocked_on"])
+    check("a failed release still leaves the task findable",
+          reloaded.release_stranded() == [pid])
+    check("a release cannot turn its blocker's transition into an error",
+          reloaded.get(rid)["state"] == T.FAILED)
+
+    # Two blockers that ended before anyone looked: the audit frees the waiter
+    # on the first one, and the second must not be left behind in blocked_on --
+    # a leftover id makes a retry skip verification and review.
+    st4 = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    pid = st4.create("implement", driver="queue", result={"text": "done"})["id"]
+    dead = [st4.create("a")["id"], st4.create("b")["id"]]
+    for d in dead:
+        st4.transition(d, T.CANCELLED)
+    st4.transition(pid, T.RUNNING)
+    st4.update(pid, blocked_on=dead)
+    st4.transition(pid, T.BLOCKED)
+    st4.release_stranded()
+    check("the audit forgets every ended blocker, not just the first",
+          st4.get(pid)["blocked_on"] == [], st4.get(pid)["blocked_on"])
+
     # The audit is worth nothing if nothing calls it.
     bot = (BASE / "bot.py").read_text()
     sched = bot[bot.index("def _task_scheduler("):bot.index("def _task_worker(")]
