@@ -555,6 +555,16 @@ PAGE = r"""<!doctype html>
   #unmerged button.b { cursor: pointer; }
   #unmerged button.b:hover { border-color: var(--c-fresh); }
   #unmerged .b b { color: var(--c-fresh); }
+  #holding { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    padding: 0 0 10px; }
+  #holding .nlabel { font-size: 11px; color: var(--gold); font-family: var(--mono); }
+  #holding .b { font-size: 11px; font-family: var(--mono); cursor: default;
+    background: #C08A1C1A; color: var(--ink); border: 1px solid #C08A1C77;
+    border-radius: 6px; padding: 2px 8px; }
+  #holding button.b { cursor: pointer; }
+  #holding button.b:hover { border-color: var(--gold); }
+  #holding .b b { color: var(--gold); }
+  .task .held { color: var(--gold); }
   .hidebtn { float: right; background: transparent; border: 0; cursor: pointer;
     color: var(--muted); font-size: 13px; line-height: 1; padding: 0 2px; }
   .hidebtn:hover { color: var(--fg); }
@@ -822,9 +832,12 @@ PAGE = r"""<!doctype html>
       tasks proposed for triage, waiting on approval, asking a question, or failed.
       Everything else is the system's business and stays out of the way.
       A finished task's commits stay on its own branch, so any that never reached
-      the base are listed below — nothing here merges them.</div>
+      the base are listed below — nothing here merges them. A checkout still
+      holding uncommitted files is listed too, because approving or dismissing
+      that task is the last time anything will mention it.</div>
     <div id="nightly"></div>
     <div id="unmerged"></div>
+    <div id="holding"></div>
     <div class="lform">
       <input class="text" id="tgoal" placeholder="what should it do?"
              onkeydown="if(event.key==='Enter')addTask()">
@@ -1475,6 +1488,14 @@ function threadLink(key) {
   const [ch, ts] = key.split(":");
   return `https://slack.com/archives/${ch}/p${ts.replace(".", "")}?thread_ts=${ts}&cid=${ch}`;
 }
+function held(t) {
+  // Said on the row itself, because approving or dismissing is the moment the
+  // files in that checkout stop being anybody's business.
+  const h = heldById[t.id];
+  if (!h) return "";
+  return ` · <span class="held" title="${esc(h.path)}\n\n${
+    esc((h.files || []).join("\n"))}">🧰 checkout holds ${h.changes} uncommitted</span>`;
+}
 function taskButtons(t) {
   const b = [];
   if (t.state === "proposed") {
@@ -1508,6 +1529,9 @@ async function renderTasks() {
   const list = document.getElementById("tlist");
   const project = document.getElementById("tproj").value;
   renderUnmerged();
+  // Awaited, not fired off: a row has to say whether its checkout is still
+  // holding work before it offers a button that makes that work unreachable.
+  await renderHolding();
   const r = await taskCall({action: taskView === "attention" ? "attention" : "list",
                             project: project || undefined});
   if (!r.ok) { list.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
@@ -1528,7 +1552,7 @@ async function renderTasks() {
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
-          age(t.created)}</div>${review(t)}${landing(t)}</span>
+          age(t.created)}${held(t)}</div>${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
   }).join("");
 }
@@ -1551,6 +1575,35 @@ async function renderUnmerged() {
       const label = `${esc(b.branch.replace(/^silkworm\//, ""))} <b>${b.commits}</b>`;
       return b.thread
         ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(b.thread)}')">${label}</button>`
+        : `<span class="b" title="${tip}">${label}</span>`;
+    }).join("");
+}
+// Checkouts that still hold uncommitted files. worktrees.py refuses to delete
+// one, which is right, and said so only in a log line every half hour -- 508 of
+// them over six days, for two trader checkouts nobody could see from here. Its
+// own request for the same reason as the branch survey: it walks every worktree
+// and asks git about each.
+let heldById = {};
+async function renderHolding() {
+  const el = document.getElementById("holding");
+  heldById = {};
+  if (!el) return;
+  const project = document.getElementById("tproj").value;
+  const r = await taskCall({action: "holding", project: project || undefined});
+  const rows = (r && r.holding) || [];
+  rows.forEach(h => { if (h.id) heldById[h.id] = h; });
+  if (!rows.length) { el.innerHTML = ""; return; }
+  el.innerHTML = `<span class="nlabel">🧰 ${esc(r.summary || "")}</span>` +
+    rows.map(h => {
+      // The file list is the point: a checkout held by a virtualenv and one
+      // held by a script somebody wrote look identical as a count.
+      const who = h.title || (h.known ? h.id : "no task on the board owns this");
+      const tip = `${esc(who)}\n${esc(h.state || "unknown state")}${
+        h.terminal ? " · finished, so nothing will ask about it again" : ""}\n${
+        esc(h.path)}\non ${esc(h.branch || "?")}\n\n${esc((h.files || []).join("\n"))}`;
+      const label = `${esc(h.name)} <b>${h.changes}</b>`;
+      return h.thread
+        ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(h.thread)}')">${label}</button>`
         : `<span class="b" title="${tip}">${label}</span>`;
     }).join("");
 }

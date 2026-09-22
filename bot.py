@@ -36,6 +36,7 @@ import defer
 import email_ingest
 import harvester
 import home
+import holding
 import jsonstore
 import learnings_git
 import repos
@@ -1337,6 +1338,18 @@ def handle_tasks(payload: dict) -> dict:
         return {"ok": True, "default": roles.DEFAULT_FILED,
                 "roles": [{"name": n, "hint": h, "default": n == roles.DEFAULT_FILED}
                           for n, h in roles.FILEABLE.items()]}
+    if action == "holding":
+        # Checkouts still holding uncommitted work. Its own action for the same
+        # reason as `unmerged`: this walks every worktree and asks git about
+        # each, and folding it into `list` would do that twice a minute.
+        # Every record, not the filtered ones: attribution is what makes a row
+        # readable, and a task filtered out of the view would turn its checkout
+        # into an unattributable one rather than hiding it. The filter is
+        # applied to the rows afterwards instead.
+        rows = holding.survey(list(task_store.all().values()))
+        if project:
+            rows = [r for r in rows if r["project"] == project]
+        return {"ok": True, "holding": rows, "summary": holding.line(rows)}
     if action == "ingest-email":
         try:
             return run_email_ingest()
@@ -1443,14 +1456,38 @@ def handle_tasks(payload: dict) -> dict:
         # to delete underneath it. That happened, and took a task's first pass
         # of uncommitted work with it.
         note = ""
-        current = (task_store.get(tid) or {}).get("state")
+        rec = task_store.get(tid) or {}
+        current = rec.get("state")
         if target == tasks.CANCELLED and current == tasks.RUNNING:
             note = ("stopped" if stop_task(tid) else
                     "no live child here — it was orphaned by a restart")
+        # Approving or dismissing is the moment a task stops being anybody's
+        # business, and if its isolated checkout still holds uncommitted files
+        # it is also the moment that work becomes unreachable -- nothing after
+        # this will ever mention it again.
+        #
+        # So the checkout is handed back rather than reclaimed: named, with
+        # what is in it, in the reply and durably in the task's own thread, and
+        # left untouched on disk. Reclaiming it automatically was considered
+        # and rejected on the evidence. Deleting is out by the standing rule.
+        # The only non-destructive automatic reclaim is to commit the leftovers
+        # onto the task's branch and release the tree -- and of the twenty-one
+        # held checkouts this was written against, twenty were held by an
+        # untracked .venv and a data directory. Committing those to the
+        # project's own branch is a worse outcome than the problem. Whether
+        # what is in there is worth keeping is a judgement about the files, so
+        # it goes to the person who can make it, at the moment they are already
+        # looking.
+        held = holding.for_task(rec) if action in ("approve", "dismiss") else None
+        if held:
+            note = f"{note}; {holding.short(held)}" if note else holding.short(held)
         try:
-            return {"ok": True, "note": note, "task": task_store.transition(
+            moved = task_store.transition(
                 tid, target, f"{action} via {payload.get('by', 'ui')}"
-                + (f" ({note})" if note else ""))}
+                + (f" ({note})" if note else ""))
+            if held:
+                tell_thread(rec.get("thread", ""), holding.note(held))
+            return {"ok": True, "note": note, "task": moved}
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
         except KeyError:
@@ -2214,6 +2251,23 @@ def task_thread(task: dict) -> tuple[str, str]:
     store.update(key, kind="task",
                  title=f"Task: {(task.get('title') or task['id'])[:52]}")
     return channel, thread_ts
+
+
+def tell_thread(key: str, text: str) -> None:
+    """Put a line in a task's own thread, where it survives the toast.
+
+    Never allowed to cost the action it is attached to: a task that could not
+    be told about its checkout is a worse outcome than one that could not be
+    approved. So a missing thread, a Slack outage or a malformed key logs and
+    is swallowed.
+    """
+    if not key or ":" not in key or not text:
+        return
+    try:
+        channel, thread_ts = key.split(":", 1)
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    except Exception:
+        log.exception("could not post to %s", key)
 
 
 def record_branch(tid: str, worktree, scope: dict) -> None:

@@ -3185,8 +3185,10 @@ def test_cancel_stops_the_child():
 
     st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     running_tasks = {}
+    import holding as H
     ns = bot_functions("stop_task", "handle_tasks", "live_worktree_tasks",
-                       tasks=T, task_store=st, RUNNING_TASKS=running_tasks)
+                       tasks=T, task_store=st, RUNNING_TASKS=running_tasks,
+                       holding=H)
     tasks_route, stop_task = ns["handle_tasks"], ns["stop_task"]
 
     def running_task(**fields):
@@ -4823,6 +4825,257 @@ def test_unmerged_branches():
           and "branches.survey" not in handler[:handler.index('if action == "unmerged":')],
           "folding it into `list` would shell out to git every five seconds")
 
+    W.ROOT = old_root
+
+
+# --- a checkout holding uncommitted work must be visible ---------------------
+# Nothing here may delete it, and nothing did -- but nothing said so either.
+# Two trader checkouts were logged "leaving orphaned worktree with uncommitted
+# work" 508 times over six days, every half hour, and appeared in `silkworm
+# status`, the dashboard and their own task rows exactly nowhere.
+
+def test_held_checkouts():
+    import holding as H
+    import tasks as T
+    import worktrees as W
+    from tasks import TaskStore
+    print("\ncheckouts still holding uncommitted work are visible")
+
+    root = Path(tempfile.mkdtemp())
+    old_root, W.ROOT = W.ROOT, root / "worktrees"
+    old_announced = set(W._announced)
+    W._announced.clear()
+    repo = root / "repo"; repo.mkdir()
+
+    def git(cwd, *a):
+        return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, text=True)
+
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("hello\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+
+    def task_in(state, tid_out=None):
+        """A task carried to `state` the legal way, with its own checkout."""
+        t = st.create("do a thing", driver="queue", isolate=True,
+                      scope={"cwd": str(repo)})
+        tid = t["id"]
+        st.update(tid, title=f"work for {tid}", project="proj",
+                  thread=f"C1:{tid}")
+        for step in {T.RUNNING: [T.RUNNING],
+                     T.AWAITING_APPROVAL: [T.RUNNING, T.AWAITING_APPROVAL],
+                     T.DONE: [T.RUNNING, T.DONE],
+                     T.CANCELLED: [T.CANCELLED]}[state]:
+            st.transition(tid, step)
+        wt = W.create(repo, tid, fetch=False)
+        st.update(tid, scope={**st.get(tid)["scope"], "worktree": str(wt)})
+        return tid, Path(wt)
+
+    def dirty(wt, *names):
+        for n in names:
+            (wt / n).write_text("half-finished\n")
+
+    # The two shapes of the bug, side by side. Non-terminal: live_worktree_tasks
+    # puts it in the sweeper's keep set, so the tree is skipped before the dirty
+    # check is even reached -- held for ever, in silence. Terminal: it drops out
+    # of the keep set, reaches the dirty check, and is logged twice an hour for
+    # ever with nothing able to act on the line.
+    waiting, wt_waiting = task_in(T.AWAITING_APPROVAL)
+    dirty(wt_waiting, "draft.md", "script.py")
+    finished, wt_finished = task_in(T.DONE)
+    dirty(wt_finished, "leftover.txt")
+
+    rows = H.survey(list(st.all().values()))
+    by_id = {r["id"]: r for r in rows}
+    check("a checkout held by a task still awaiting approval is reported",
+          waiting in by_id,
+          "the sweeper skips it before the dirty check, so nothing ever "
+          "mentions it at all")
+    check("and one held by a task that has finished is reported too",
+          finished in by_id,
+          "the sweeper logs this one every half hour and nobody reads it")
+    check("each row says where the checkout is",
+          by_id.get(waiting, {}).get("path") == str(wt_waiting)
+          and by_id.get(finished, {}).get("path") == str(wt_finished),
+          "a count with no path cannot be acted on")
+    check("and how much is uncommitted in it",
+          by_id.get(waiting, {}).get("changes") == 2
+          and by_id.get(finished, {}).get("changes") == 1)
+    check("and names the files, so a virtualenv is not mistaken for work",
+          sorted(by_id.get(waiting, {}).get("files") or []) == ["draft.md", "script.py"])
+    check("and which task owns it", by_id.get(waiting, {}).get("title") == f"work for {waiting}")
+    check("and whether anything will ever ask about it again",
+          by_id[waiting]["terminal"] is False and by_id[finished]["terminal"] is True,
+          "a finished task's checkout is stranded; a waiting one's is a promise")
+    check("the summary line counts them",
+          "2 checkouts still holding uncommitted work" in H.line(rows), H.line(rows))
+    check("and says nothing when there is nothing to say", H.line([]) == "")
+
+    # Work in progress is not stuck work. Reporting it would put a row on the
+    # panel every time anything ran, which is how a panel stops being read.
+    live, wt_live = task_in(T.RUNNING)
+    dirty(wt_live, "mid-edit.py")
+    check("a task running right now is not reported",
+          live not in {r["id"] for r in H.survey(list(st.all().values()))},
+          "somebody is typing in there")
+
+    # A clean checkout is not holding anything: the sweeper will take it away
+    # in the ordinary course, and it needs no row.
+    clean, _ = task_in(T.DONE)
+    check("a clean checkout is not reported",
+          clean not in {r["id"] for r in H.survey(list(st.all().values()))})
+
+    # The worst case, and the reason this reads the directory rather than the
+    # board: a tree whose task nobody can name.
+    orphan = W.create(repo, "tsk_nobody", fetch=False)
+    dirty(Path(orphan), "mystery.txt")
+    orphan_rows = [r for r in H.survey(list(st.all().values()))
+                   if r["id"] == "tsk_nobody"]
+    check("a checkout no task on the board claims is still reported",
+          len(orphan_rows) == 1 and orphan_rows[0]["known"] is False,
+          "being unattributable is a reason to say more about it, not less")
+
+    # Asked of git, never stored -- you can go and commit those files yourself,
+    # and a flag written at release time would still say they were there.
+    git(wt_finished, "add", "-A"); git(wt_finished, "commit", "-qm", "kept it")
+    check("committing the work by hand clears the row, with no flag to update",
+          finished not in {r["id"] for r in H.survey(list(st.all().values()))})
+
+    # One unreadable checkout must cost its own row and nothing else: this runs
+    # behind a dashboard panel and inside `silkworm status`.
+    real_run = H.subprocess.run
+    H.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no git"))
+    try:
+        check("a checkout git cannot be run against is skipped, not raised",
+              H.survey(list(st.all().values())) == [])
+    finally:
+        H.subprocess.run = real_run
+
+    # --- approving or dismissing is the moment it becomes unreachable --------
+    posted = []
+
+    class FakeClient:
+        def chat_postMessage(self, **kw): posted.append(kw)
+
+    ns = bot_functions("handle_tasks", "stop_task", "tell_thread",
+                       tasks=T, task_store=st, holding=H, RUNNING_TASKS={},
+                       app=types.SimpleNamespace(client=FakeClient()))
+    route = ns["handle_tasks"]
+
+    r = route({"action": "approve", "id": waiting})
+    check("approving a task that still holds a checkout says so in the reply",
+          r["ok"] and str(wt_waiting) in (r.get("note") or ""), r.get("note"))
+    check("the task's own event log records it too",
+          str(wt_waiting) in st.get(waiting)["events"][-1]["detail"],
+          "a toast scrolls away; this is the only durable copy on the record")
+    check("and the thread is told, where it outlives the toast",
+          any(str(wt_waiting) in (m.get("text") or "") for m in posted)
+          and any("draft.md" in (m.get("text") or "") for m in posted),
+          "naming the files is the point: what is in there is the whole "
+          "question, and the system cannot answer it")
+    check("the checkout itself is left exactly where it was",
+          wt_waiting.exists() and (wt_waiting / "draft.md").exists(),
+          "reclaiming it automatically would mean committing a virtualenv or "
+          "deleting somebody's afternoon")
+
+    dismissed, wt_dismissed = task_in(T.AWAITING_APPROVAL)
+    dirty(wt_dismissed, "notes.md")
+    posted.clear()
+    r = route({"action": "dismiss", "id": dismissed})
+    check("dismissing says it as well, being the same door",
+          r["ok"] and str(wt_dismissed) in (r.get("note") or "")
+          and any(str(wt_dismissed) in (m.get("text") or "") for m in posted),
+          r.get("note"))
+
+    clean_id, _ = task_in(T.AWAITING_APPROVAL)
+    posted.clear()
+    r = route({"action": "approve", "id": clean_id})
+    check("approving a task holding nothing says nothing about checkouts",
+          r["ok"] and not r.get("note") and not posted,
+          "a note on every approval is a note nobody reads")
+
+    # for_task reads the task's recorded checkout, so it costs one git call in
+    # a path a person is waiting on.
+    check("a released checkout is not reported against its task",
+          H.for_task({"scope": {"worktree": str(root / "gone")}}) is None)
+    check("nor is a task that never had one", H.for_task({"scope": {}}) is None)
+
+    # --- the sweeper stops re-announcing what it cannot act on --------------
+    keep = bot_functions("live_worktree_tasks", tasks=T, task_store=st,
+                         RUNNING_TASKS={})["live_worktree_tasks"]
+    stuck, wt_stuck = task_in(T.DONE)
+    dirty(wt_stuck, "still-here.txt")
+    logged = []
+    real_info = W.log.info
+    W.log.info = lambda msg, *a, **k: logged.append(msg % a if a else msg)
+    try:
+        W.sweep(keep=keep(), min_age_s=0)
+        first = [m for m in logged if "uncommitted work" in m and str(wt_stuck) in m]
+        logged.clear()
+        W.sweep(keep=keep(), min_age_s=0)
+        W.sweep(keep=keep(), min_age_s=0)
+        again = [m for m in logged if "uncommitted work" in m and str(wt_stuck) in m]
+    finally:
+        W.log.info = real_info
+    check("a held checkout is named in the log the first time it is met",
+          len(first) == 1, f"{first}")
+    check("and not again on every pass for ever",
+          again == [],
+          "508 lines over six days, half-hourly, with nothing able to act on one")
+    check("and it is still there, untouched",
+          wt_stuck.exists() and (wt_stuck / "still-here.txt").exists(),
+          "the rule that nothing destroys uncommitted work is the point")
+
+    # Both worktree layouts resolve back to a task id. `repo--land--taskid` is
+    # the checkout a landing borrows; splitting on the first separator turns it
+    # into "land--tsk_...", which matches no task at all.
+    check("a task's own checkout name resolves to its id",
+          W.task_of(root / f"repo{W.SEP}tsk_abc") == "tsk_abc")
+    check("and a landing's borrowed one resolves to the same id",
+          W.task_of(root / f"repo{W.SEP}land{W.SEP}tsk_abc") == "tsk_abc")
+
+    # --- it has to reach the places a person actually looks -----------------
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("`silkworm status` asks for the survey",
+          '{"action": "holding"}' in cli)
+    check("and prints the paths, not only a count",
+          "r.get('path', '')" in cli,
+          "a count you cannot locate is the same silence in a shorter form")
+    check("and treats 'could not ask' as unknown rather than all-clear",
+          cli.count("no checkout is holding uncommitted work") == 2,
+          "a bot running older code does not know the action")
+
+    bot = (BASE / "bot.py").read_text()
+    handler = bot[bot.index("def handle_tasks"):bot.index("def handle_projects")]
+    check("the survey is its own request, not part of the polled list",
+          'if action == "holding":' in handler
+          and "holding.survey" not in handler[:handler.index('if action == "holding":')],
+          "the badge polls `list` every five seconds, and this walks every "
+          "worktree asking git")
+    fn = next(n for n in ast.walk(ast.parse(bot))
+              if isinstance(n, ast.FunctionDef) and n.name == "tell_thread")
+    check("telling the thread can never cost the action it is attached to",
+          any(isinstance(n, ast.Try) for n in fn.body)
+          and not [n for n in ast.walk(fn) if isinstance(n, ast.Raise)],
+          "a task that could not be told is better than one that could not be "
+          "approved")
+
+    import re as _r
+    sys.argv = ["x"]
+    import visualizer as V
+    js = _r.search(r"<script>(.*?)</script>", V.PAGE, _r.S).group(1)
+    check("the dashboard has a panel for it", 'id="holding"' in V.PAGE
+          and "async function renderHolding()" in js)
+    check("and a task row says its checkout is still holding work",
+          "function held(t)" in js and "${held(t)}" in js,
+          "approving that row is the moment the work becomes unreachable")
+    check("the row is marked before the buttons are drawn",
+          js.index("await renderHolding();") < js.index("list.innerHTML = r.tasks.map"),
+          "an unawaited survey would race the buttons that act on it")
+
+    W._announced.clear(); W._announced.update(old_announced)
     W.ROOT = old_root
 
 

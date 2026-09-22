@@ -331,6 +331,32 @@ def do_status() -> None:
         if len(rows) > 12:
             print(f"      …and {len(rows) - 12} more")
 
+    # Work that never even reached a commit. A checkout holding uncommitted
+    # changes is never swept and never deleted -- correctly -- and until now
+    # the only trace of one was a log line at INFO, repeated every half hour to
+    # nobody. A branch at least survives a disk tidy; an untracked file in a
+    # directory outside any repository does not.
+    if bot.get("online"):
+        held = bot_call("/tasks", {"action": "holding"}, timeout=30)
+        hrows = held.get("holding") or []
+        if not held.get("ok"):
+            # Same rule as above: "could not ask" is not "nothing held".
+            check("no checkout is holding uncommitted work", False,
+                  f"could not ask: {held.get('error') or 'no answer'}")
+        else:
+            check("no checkout is holding uncommitted work", not hrows,
+                  f"{held.get('summary') or 'some is'} — commit it or clear it "
+                  f"yourself; nothing here will")
+        for r in hrows[:12]:
+            who = r.get("title") or ("no task on the board owns this"
+                                     if not r.get("known") else r.get("id", ""))
+            print(f"      {r.get('path', '')}")
+            print(f"        {r.get('changes', 0)} uncommitted "
+                  f"({', '.join(r.get('files') or [])[:64]}) · "
+                  f"{r.get('state') or 'unknown'} · {who[:52]}")
+        if len(hrows) > 12:
+            print(f"      …and {len(hrows) - 12} more")
+
 
 sys.path.insert(0, str(REPO))
 import credentials                                   # noqa: E402

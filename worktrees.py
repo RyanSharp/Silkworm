@@ -39,6 +39,7 @@ ROOT = Path.home() / "workspace" / ".worktrees"
 
 BRANCH_PREFIX = "silkworm/"
 SEP = "--"          # repo name and task id both contain '-' and '_'
+LAND = f"land{SEP}"  # marks the second checkout a landing borrows
 
 
 def _git(cwd, *args, timeout: int = 180):
@@ -138,6 +139,22 @@ def path_for(repo, task_id: str, label: str = "") -> Path:
     """
     name = Path(repo).name + SEP + (label + SEP if label else "") + task_id
     return ROOT / name
+
+
+def task_of(path) -> str:
+    """The task id in a worktree directory name, for either layout.
+
+    Two names come out of this module: `repo--taskid` for a task's own
+    checkout and `repo--land--taskid` for the one a landing borrows.
+    Reading the id by splitting on the first separator turns the second
+    into "land--tsk_...", which is no task id, so a landing checkout
+    matches no task at all.
+    """
+    name = Path(path).name
+    if SEP not in name:
+        return ""
+    tail = name.split(SEP, 1)[1]
+    return tail[len(LAND):] if tail.startswith(LAND) else tail
 
 
 #: `git worktree add` takes a repository-level lock while it writes refs, so
@@ -352,6 +369,15 @@ def age_s(path) -> float:
     return max(0.0, time.time() - newest)
 
 
+#: Held checkouts already named in the log. Two of these were announced 508
+#: times over six days -- every half hour, to nobody, with nothing able to act
+#: on the line. That is not reporting. The standing answer is holding.py, which
+#: puts them in `silkworm status` and the dashboard where they can be looked at
+#: on purpose; this set reduces the log to the one line that is actually news,
+#: the first time a sweep meets a tree it must leave behind.
+_announced: set = set()
+
+
 def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
     """Remove worktrees no live task owns. Never touches a dirty one.
 
@@ -368,6 +394,11 @@ def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
     """
     if not ROOT.exists():
         return 0
+    # A tree that is never going to be swept does not become more urgent by
+    # being mentioned again. Forget the ones that have gone, so a checkout
+    # recreated and dirtied afresh is announced once more.
+    here = {str(p) for p in ROOT.iterdir()}
+    _announced.intersection_update(here)
     removed = 0
     for path in ROOT.iterdir():
         if not path.is_dir() or SEP not in path.name:
@@ -382,7 +413,10 @@ def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
         if age_s(path) < min_age_s:
             continue
         if is_dirty(path):
-            log.info("leaving orphaned worktree with uncommitted work: %s", path)
+            if str(path) not in _announced:
+                _announced.add(str(path))
+                log.info("leaving orphaned worktree with uncommitted work: %s "
+                         "(it is listed by `silkworm status`)", path)
             continue
         ok, _ = release(path, delete_empty_branch=False)
         removed += int(ok)
