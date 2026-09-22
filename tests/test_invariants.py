@@ -958,10 +958,17 @@ def test_putting_away_is_not_deleting():
     st.update("C:husk", kind="task")
     st.update("C:referenced", kind="task")
     st.update("C:live", kind="task", pending={"session_id": "s"})
-    for k in ("C:husk", "C:referenced", "C:live"):
+    st.update("C:resumable", kind="task", session_id="s-2")
+    st.update("C:putaway", kind="task", hidden=True)
+    for k in ("C:husk", "C:referenced", "C:live", "C:resumable", "C:putaway"):
         st._data[k]["updated"] = time.time() - 40 * 86400
     gone = st.forget_empty(30, keep={"C:referenced"})
     check("an empty record does age out", gone == ["C:husk"], f"got {gone}")
+    check("but never one still holding a session to resume",
+          st.get("C:resumable") is not None)
+    check("and never one you deliberately put away",
+          st.get("C:putaway") is not None,
+          "deleting it would quietly undo the decision to hide it")
     check("but never one a task still points at", st.get("C:referenced") is not None,
           "deleting it orphans a task that may be waiting on a person")
     check("and never one with a turn in flight", st.get("C:live") is not None)

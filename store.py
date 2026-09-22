@@ -148,10 +148,14 @@ class SessionStore:
                 self._save()
             return keys
 
-    #: What makes a record worth keeping, however old it gets. These are the
-    #: things hiding exists to protect: a thread you are finished looking at is
-    #: still one you spent money on.
-    KEEPS = ("title", "summary", "cost", "turns", "costs", "files", "events", "pending")
+    #: What makes a record worth keeping, however old it gets. The first line
+    #: is what hiding exists to protect -- a thread you are finished looking at
+    #: is still one you spent money on. The second is live state: a session to
+    #: resume, a terminal holding it, a binding you set, a redelivery guard, a
+    #: decision to put it away. Between them, anything left is a husk.
+    KEEPS = ("title", "summary", "cost", "turns", "costs", "files", "events",
+             "session_id", "previous_sessions", "pending", "checked_out",
+             "terminal_live", "project", "last_msg_ts", "hidden")
 
     def forget_empty(self, days: float, keep=()) -> list[str]:
         """Drop only records older than `days` that hold nothing. Returns the keys.

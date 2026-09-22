@@ -630,11 +630,15 @@ it fell out of two features that never met.
 
 So **age is a floor, not a reason**. Hiding is the only way a thread with
 anything in it is retired, and it is never the first step of a delete. What
-still ages out is a **husk**: no title, no summary, no cost history, no files,
-no events, no turn in flight, and no task pointing at it — a record with
-nothing in it to lose. The last of those matters on its own: a task record
-refers to its thread by key, so deleting the session would orphan a task that
-may be sitting in a state waiting for a person.
+still ages out is a **husk**: nothing to lose (no title, summary, cost history,
+files or events) *and* no live state (no session to resume, no turn in flight,
+no terminal holding it, no project binding, no decision to hide it) *and* no
+task pointing at it. That last one matters on its own: a task record refers to
+its thread by key, so deleting the session would orphan a task that may be
+sitting in a state waiting for a person.
+
+That is deliberately close to never firing, and that is the point. The storage
+a session record occupies was never the problem; losing what it recorded was.
 
 ## What a review found but did not block on
 
