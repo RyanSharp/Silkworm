@@ -4907,7 +4907,8 @@ def test_held_checkouts():
           sorted(by_id.get(waiting, {}).get("files") or []) == ["draft.md", "script.py"])
     check("and which task owns it", by_id.get(waiting, {}).get("title") == f"work for {waiting}")
     check("and whether anything will ever ask about it again",
-          by_id[waiting]["terminal"] is False and by_id[finished]["terminal"] is True,
+          by_id.get(waiting, {}).get("terminal") is False
+          and by_id.get(finished, {}).get("terminal") is True,
           "a finished task's checkout is stranded; a waiting one's is a promise")
     check("the summary line counts them",
           "2 checkouts still holding uncommitted work" in H.line(rows), H.line(rows))
@@ -5071,8 +5072,10 @@ def test_held_checkouts():
     check("and a task row says its checkout is still holding work",
           "function held(t)" in js and "${held(t)}" in js,
           "approving that row is the moment the work becomes unreachable")
+    marked = js.find("await renderHolding();")
+    drawn = js.find("list.innerHTML = r.tasks.map")
     check("the row is marked before the buttons are drawn",
-          js.index("await renderHolding();") < js.index("list.innerHTML = r.tasks.map"),
+          -1 < marked < drawn,
           "an unawaited survey would race the buttons that act on it")
 
     W._announced.clear(); W._announced.update(old_announced)
