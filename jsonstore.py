@@ -21,11 +21,13 @@ What `load()` will not do is start empty. An empty store is indistinguishable
 from a fresh install, which is exactly how losing 400 task records becomes
 invisible; when there is nothing left to read, it raises and you find out.
 
-Nor will it fall back on a file it simply could not open. A permission or a
-momentarily exhausted fd table says nothing about the contents, and the backup
-is always an older save -- so substituting it there would hand the bot stale
-records, which it would then write back over a file that was fine all along.
-Only content we can read and cannot parse is treated as corruption.
+Nor, for whoever owns the file, will it fall back on one it simply could not
+open. A permission or a momentarily exhausted fd table says nothing about the
+contents, and the backup is always an older save -- so substituting it there
+would hand the bot stale records, which it would then write back over a file
+that was fine all along. Only content we can read and cannot parse is treated
+as corruption. A `repair=False` reader writes nothing and so cannot rewind
+anything; it still gets the fallback, and still touches neither file.
 """
 
 import json
@@ -159,7 +161,12 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     # EACCES or EMFILE would spend the board that way, silently, one save later.
     # So a primary we could not open is not recovered from and not touched: it
     # is reported. Refusing to start is recoverable; a silent rewind is not.
-    if primary_error is not None and not isinstance(primary_error, _BAD_CONTENT):
+    #
+    # That binds the owner, not everyone. The rewind happens because the caller
+    # writes what it was given back; a `repair=False` reader never writes, so
+    # the worst it can do with the backup is draw a slightly old page, and
+    # failing the dashboard over a passing EACCES would be the worse trade.
+    if repair and primary_error is not None and not isinstance(primary_error, _BAD_CONTENT):
         message = (f"{path} could not be read ({primary_error}). Leaving it "
                    f"exactly where it is -- a file that will not open may be "
                    f"perfectly good, and falling back to {backup.name} would "
@@ -176,14 +183,16 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
         except _READ_ERRORS as exc:
             backup_error = exc
         else:
-            # Only reachable for a primary that is absent or provably bad: an
-            # unreadable one returned above without consulting the backup.
+            # For an owner, only reachable with a primary that is absent or
+            # provably bad -- an unreadable one refused above. A read-only
+            # reader can also arrive here on one it merely could not open, and
+            # changes nothing on the way through.
             set_aside = repair and _set_aside(path, primary_error)
             if primary_error is None:
                 log.error("%s is missing — recovered from %s", path.name, backup.name)
             else:
-                log.error("%s did not parse (%s) — recovered from %s%s", path.name,
-                          primary_error, backup.name,
+                log.error("%s %s (%s) — recovered from %s%s", path.name,
+                          _why(primary_error), primary_error, backup.name,
                           f"; the unreadable copy is kept at {corrupt_path(path).name}"
                           if set_aside else "")
             # Put the recovered contents back where they belong, so the next
@@ -210,7 +219,7 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     fallback = (f"its backup {backup.name} {_why(backup_error)} either ({backup_error})"
                 if backup_error else f"there is no {backup.name} to fall back on")
     kept = f" The unreadable copy is at {corrupt_path(path)}." if set_aside else ""
-    message = (f"{path} did not parse ({primary_error}) and {fallback}.{kept}"
+    message = (f"{path} {_why(primary_error)} ({primary_error}) and {fallback}.{kept}"
                " Refusing to start empty — an empty store looks exactly like a "
                "fresh install.")
     if strict:

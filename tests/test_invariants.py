@@ -3780,6 +3780,21 @@ def test_atomic_persistence():
     check("so once the fd table clears, the newer save is still there",
           attempt(jsonstore.load, flaky) == {"records": "newer, and perfectly good"})
 
+    # The refusal binds whoever writes. A read-only reader -- the dashboard on
+    # the bot's live files -- cannot rewind anything, so it still gets the
+    # fallback: a page drawn from a slightly old copy beats failing the page
+    # over a passing EACCES. What it must not do is touch either file.
+    Path.read_text = only_primary
+    try:
+        seen = attempt(jsonstore.load, flaky, repair=False)
+    finally:
+        Path.read_text = real_read
+    check("a reader that writes nothing still gets the fallback",
+          seen == {"records": "the older save"}, f"{seen!r}")
+    check("and leaves the owner's primary alone",
+          reads(flaky) == {"records": "newer, and perfectly good"}
+          and not jsonstore.corrupt_path(flaky).exists())
+
     # A watermark takes the same refusal as a return-empty rather than a rewind.
     flaky_wm = d / "flakywm.json"
     jsonstore.save(flaky_wm, {"seen": "older"})
