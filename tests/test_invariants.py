@@ -1328,6 +1328,10 @@ def test_landing():
     check("and the project's publishing choice reaches the landing",
           'publish=bool(proj.get("publish"))' in li,
           "otherwise the setting exists and does nothing")
+    pub = bot[bot.index('if action == "publish"'):bot.index('if action == "ideate"')]
+    check("publishing cannot be turned on without auto-merge",
+          'rec.get("auto_merge")' in pub,
+          "nothing would land for it to publish")
 
 
 # --- a project can be reviewed while you sleep -----------------------------------
