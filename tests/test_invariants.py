@@ -3479,6 +3479,22 @@ def test_atomic_persistence():
     print("\nstate files survive being killed mid-save")
     d = Path(tempfile.mkdtemp())
 
+    def attempt(fn, *a, **kw):
+        """Run `fn`, reporting a raise as a value rather than as a crash.
+
+        Every check below is about a guard that can be broken, and a broken
+        guard usually raises -- a store that will not open, a file that is no
+        longer there. Without this the first one to go takes the rest of the
+        test with it and says nothing about them.
+        """
+        try:
+            return fn(*a, **kw)
+        except Exception as exc:                 # noqa: BLE001 - it is the answer
+            return exc
+
+    def reads(path):
+        return attempt(lambda: json.loads(path.read_text()))
+
     # No store may go back to truncate-then-write. Checked on the parse tree,
     # not the text, so a comment mentioning write_text doesn't pass for one.
     offenders, saves = [], 0
@@ -3541,7 +3557,8 @@ def test_atomic_persistence():
               f"{len(reopened.all())} of {len(ids) + 1} records")
         check("not silently empty", len(reopened.all()) >= len(ids))
     check("the unreadable copy is kept", jsonstore.corrupt_path(path).exists())
-    check("and the primary is readable again", json.loads(path.read_text()))
+    check("and the primary is readable again", bool(reads(path)) is True,
+          f"{reads(path)!r}")
 
     # The same for sessions, projects and learnings: same failure, same fix.
     sp = d / "sessions.json"
@@ -3549,32 +3566,75 @@ def test_atomic_persistence():
     sessions.update("C:1", session_id="abc")
     sessions.update("C:2", session_id="def")
     sp.write_text(sp.read_text()[:40])
+    back = attempt(SessionStore, sp)
     check("a truncated sessions.json keeps its threads",
-          SessionStore(sp).get("C:1")["session_id"] == "abc")
+          not isinstance(back, Exception)
+          and (back.get("C:1") or {}).get("session_id") == "abc", f"{back!r}")
 
     pp = d / "projects.json"
     ps = _projects.ProjectStore(pp)
     ps.ensure("Saga"); ps.ensure("Cadence")
     pp.write_text(pp.read_text()[:40])
+    back = attempt(_projects.ProjectStore, pp)
     check("a truncated projects.json keeps its projects",
-          _projects.ProjectStore(pp).get("saga") is not None)
+          not isinstance(back, Exception) and back.get("saga") is not None,
+          f"{back!r}")
 
     lp = d / "learnings.json"
     ls = LearningStore(lp)
     ls.add("do", "commit before a long build")
     ls.add("avoid", "never stash across worktrees")
     lp.write_text(lp.read_text()[:30])
+    back = attempt(LearningStore, lp)
     check("a truncated learnings.json keeps its learnings",
-          len(LearningStore(lp).all()) == 2)
+          not isinstance(back, Exception) and len(back.all()) == 2, f"{back!r}")
 
     # The backup tracks the last finished save, not the one before it, so
     # recovering costs at most the single write that was interrupted.
     check("the backup is the last completed save, not a stale one",
-          json.loads(jsonstore.backup_path(sp).read_text()).keys() == {"C:1", "C:2"})
+          (reads(jsonstore.backup_path(sp)) or {}) != {} and not isinstance(
+              reads(jsonstore.backup_path(sp)), Exception)
+          and reads(jsonstore.backup_path(sp)).keys() == {"C:1", "C:2"},
+          f"{reads(jsonstore.backup_path(sp))!r}")
     # And it is a file of its own. A hard link would share an inode with the
     # primary, so truncating one would truncate both -- no backup at all.
     check("the backup is a separate file, not a link to the primary",
-          jsonstore.backup_path(sp).stat().st_ino != sp.stat().st_ino)
+          attempt(lambda: jsonstore.backup_path(sp).stat().st_ino
+                  != sp.stat().st_ino) is True)
+
+    # The shared learnings directory has a .gitignore of its own, written when
+    # it was first set up -- before these sidecars existed. Re-running init has
+    # to add what is missing rather than skip the file for already being there,
+    # or one machine's recovery copy gets pushed to every other machine.
+    import learnings_git
+    shared = d / "shared"
+    shared.mkdir()
+    (shared / ".gitignore").write_text("harvest_state.json\n")
+    learnings_git.init(shared / "learnings.json")
+    ignored = (shared / ".gitignore").read_text().split()
+    check("init adds the sidecars to a .gitignore that already exists",
+          {"*.json.prev", "*.json.corrupt", "*.json*.tmp.*"} <= set(ignored), f"{ignored}")
+    check("and keeps what was already in it", "harvest_state.json" in ignored)
+    learnings_git.init(shared / "learnings.json")
+    check("without doubling up when run again",
+          (shared / ".gitignore").read_text().split() == ignored)
+
+    # A store that has only ever been read has no backup yet -- which would
+    # have left the first boot after this shipped with a file it had just
+    # proved good and no second copy of it. Reading one seeds it.
+    seeded = d / "seeded.json"
+    seeded.write_text(json.dumps({"written": "by an older build"}))
+    check("no backup before anything reads it",
+          not jsonstore.backup_path(seeded).exists())
+    check("a clean read seeds one", attempt(jsonstore.load, seeded)
+          == {"written": "by an older build"}
+          and reads(jsonstore.backup_path(seeded)) == {"written": "by an older build"})
+    # ...and a reader that does not own the file does not write into its directory.
+    unowned = d / "unowned.json"
+    unowned.write_text(json.dumps({"owner": "the bot"}))
+    jsonstore.load(unowned, repair=False)
+    check("but a read-only caller seeds nothing",
+          not jsonstore.backup_path(unowned).exists())
 
     # The fallback has to be the backup actually being read, not the primary's
     # remnants happening to parse: give the two copies different contents and
@@ -3583,7 +3643,7 @@ def test_atomic_persistence():
     jsonstore.save(pick, {"kept": "the finished save"})
     pick.write_text(json.dumps({"kept": "a write that was interrupted"})[:20])
     check("recovery reads the backup, not what is left of the primary",
-          jsonstore.load(pick) == {"kept": "the finished save"})
+          attempt(jsonstore.load, pick) == {"kept": "the finished save"})
 
     # The backup is refreshed after the primary lands, not before, so it can
     # only ever hold a save that finished. A primary write that dies takes
@@ -3602,8 +3662,8 @@ def test_atomic_persistence():
     finally:
         os.replace = real_replace
     check("a save that never landed does not reach the backup",
-          json.loads(jsonstore.backup_path(ordered).read_text()) == {"n": 1},
-          f"{jsonstore.backup_path(ordered).read_text()[:40]!r}")
+          reads(jsonstore.backup_path(ordered)) == {"n": 1},
+          f"{reads(jsonstore.backup_path(ordered))!r}")
 
     # Replacing a file with a fresh temp file would hand it whatever the umask
     # says; write_text() wrote through the old one and kept its mode.
@@ -3623,13 +3683,13 @@ def test_atomic_persistence():
     jsonstore.save(theirs, {"owner": "the bot"})
     theirs.write_text("{half")
     check("a read-only caller still recovers",
-          jsonstore.load(theirs, repair=False) == {"owner": "the bot"})
+          attempt(jsonstore.load, theirs, repair=False) == {"owner": "the bot"})
     check("without moving the owner's file aside or rewriting it",
           theirs.read_text() == "{half" and not jsonstore.corrupt_path(theirs).exists())
     check("leaving the repair to whoever owns it",
-          jsonstore.load(theirs) == {"owner": "the bot"}
+          attempt(jsonstore.load, theirs) == {"owner": "the bot"}
           and jsonstore.corrupt_path(theirs).exists()
-          and json.loads(theirs.read_text()) == {"owner": "the bot"})
+          and reads(theirs) == {"owner": "the bot"})
 
     # Losing both copies must be loud. Starting empty here is the failure mode
     # that makes the loss invisible: an empty store looks like a fresh install.
@@ -3669,13 +3729,13 @@ def test_atomic_persistence():
     check("and is left where it is, not renamed to .corrupt",
           unread.exists() and not jsonstore.corrupt_path(unread).exists())
     check("so the next attempt just works",
-          jsonstore.load(unread) == {"records": "here"})
+          attempt(jsonstore.load, unread) == {"records": "here"})
 
     # A watermark is not records: re-scanning is cheaper than refusing to start.
     wm = d / "watermark.json"
     wm.write_text("{trunc")
     check("a watermark falls back to empty instead",
-          jsonstore.load(wm, default={"x": 1}, strict=False) == {"x": 1})
+          attempt(jsonstore.load, wm, default={"x": 1}, strict=False) == {"x": 1})
 
     # Readers only ever see whole files, even while writers are hammering.
     hot = d / "hot.json"

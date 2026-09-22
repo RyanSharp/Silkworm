@@ -98,10 +98,16 @@ def init(learnings_file: Path, remote: str = "") -> dict:
             return {"ok": False, "error": "could not add remote"}
     if not learnings_file.exists():
         learnings_file.write_text("[]\n")
+    # The .prev/.corrupt/.tmp sidecars jsonstore.py keeps beside learnings.json
+    # are local recovery copies, not shared state. Added one at a time rather
+    # than only when the file is absent: this runs against directories that
+    # were set up before those sidecars existed, and writing nothing there is
+    # how a machine's backup copy ends up pushed to everyone else's.
     gi = repo / ".gitignore"
-    if not gi.exists():
-        # The .prev/.corrupt/.tmp sidecars jsonstore.py keeps beside
-        # learnings.json are local recovery copies, not shared state.
-        gi.write_text("harvest_state.json\n"
-                      "*.json.prev\n*.json.corrupt\n*.json*.tmp.*\n")
+    have = gi.read_text().splitlines() if gi.exists() else []
+    missing = [line for line in ("harvest_state.json", "*.json.prev",
+                                 "*.json.corrupt", "*.json*.tmp.*")
+               if line not in have]
+    if missing:
+        gi.write_text("".join(f"{line}\n" for line in have + missing))
     return {"ok": True, "dir": str(repo)}

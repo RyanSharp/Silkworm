@@ -123,9 +123,22 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     primary_error = None
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            text = path.read_text()
+            data = json.loads(text)
         except _READ_ERRORS as exc:
             primary_error = exc
+        else:
+            # A store that has been read but not yet written has no backup, so
+            # the first boot after this shipped would have had no second copy
+            # of a file it had just proved good. Seed it from the text we read,
+            # which is by definition the last save that finished. Once per
+            # file: after this, save() keeps it current.
+            if repair and not backup_path(path).exists():
+                try:
+                    _write(backup_path(path), text)
+                except OSError as exc:
+                    log.warning("could not seed %s: %s", backup_path(path).name, exc)
+            return data
 
     backup = backup_path(path)
     backup_error = None

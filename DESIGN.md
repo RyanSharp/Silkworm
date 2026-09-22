@@ -727,4 +727,22 @@ it used, and keeps the wreckage at `.corrupt`. What it will not do is start
 empty. An empty store is indistinguishable from a fresh install — that is
 exactly how losing everything becomes invisible — so when both copies are gone
 it raises and says so. Watermarks (harvest state, mail state) opt out of that:
-they hold no records, and the cost of starting over is a rescan.
+they hold no records, and the cost of starting over is a rescan. A file it
+merely could not read — a permission, a momentarily exhausted fd table — is
+left exactly where it is rather than renamed, so a transient error doesn't get
+turned into a real one.
+
+Two things follow from the backup only existing once something has been
+written. A store that has only been *read* has no second copy yet, so a clean
+read seeds one from the text it just proved good — otherwise the first boot
+after this shipped would have run with a file it had verified and no copy of
+it. And recovering is not free of side effects: it sets the wreckage aside and
+writes the recovered contents back. That is right for the process about to
+keep writing there and wrong for anyone else, so `load(repair=False)` still
+falls back, in memory, and touches nothing. The dashboard reads that way — it
+is a second process on the bot's live files, and renaming one out from under a
+running bot, which is holding the real records in memory and will save them
+over the top, would turn a recoverable situation into a lost one.
+
+The cost is small: on the live 2.5 MB `tasks.json` a save goes from 13.0 ms to
+14.6 ms, almost all of which is `json.dumps` either way.
