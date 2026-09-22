@@ -1882,6 +1882,92 @@ console.log(JSON.stringify(out));
           "an older payload should not invent a state")
 
 
+def _run_ideation_impl():
+    """Load run_ideation out of bot.py without importing it.
+
+    Mirrors _file_task_impl: bot.py needs Slack tokens to import, so the
+    function is compiled on its own against the real stores and the real
+    scoping/tasks modules. Only `branches.survey` is stubbed, because it
+    shells out to git; the decision under test is the shipped code.
+    """
+    import types
+    import projects as P, scoping as S, tasks as T
+    from tasks import TaskStore
+
+    src = (BASE / "bot.py").read_text()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "run_ideation")
+    root = Path(tempfile.mkdtemp())
+    ts, ps = TaskStore(root / "t.json"), P.ProjectStore(root / "p.json")
+    mod = types.ModuleType("ideating")
+    mod.__dict__.update(
+        scoping=S, tasks=T, task_store=ts, project_store=ps, datetime=datetime,
+        log=logging.getLogger("test"), CLAUDE_CWD=root, SILKWORM_BIN="silkworm",
+        branches=types.SimpleNamespace(survey=lambda _t: []))
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<ideating>", "exec"),
+         mod.__dict__)
+    return mod.run_ideation, ts, ps
+
+
+def test_a_deep_board_costs_no_session():
+    """The guard is run, not read.
+
+    Every other check on this is structural -- that the `if` is there, that
+    nothing is created inside it. None of them would notice a guard that was
+    present and never true, so this one drives the real function against real
+    stores and counts the sessions it would have started.
+    """
+    import projects as P, scoping, tasks
+    print("\na project at its standing limit is not looked at")
+    run_ideation, ts, ps = _run_ideation_impl()
+    ps.ensure("Silkworm", ideate_at="02:00")
+
+    out = run_ideation("silkworm")
+    check("an empty board still gets its nightly look",
+          out.get("id") and len(ts.all()) == 1,
+          f"got {out}")
+    check("and the night is recorded as run",
+          ps.get("silkworm")["ideate_on"] == datetime.now().strftime("%Y-%m-%d"))
+
+    for i in range(scoping.max_open_proposals()):
+        ts.create(f"Proposal number {i} worth deciding on", project="silkworm",
+                  state=tasks.PROPOSED, role="implementor")
+    before = len(ts.all())
+    ps.ensure("silkworm", ideate_on="")          # a fresh night
+    out = run_ideation("silkworm")
+    check("a board at the limit starts no session at all",
+          out.get("skipped") == "backlog" and not out.get("id")
+          and len(ts.all()) == before,
+          f"got {out} and {len(ts.all()) - before} new task(s)")
+    check("and the skip says how deep the board is and what the limit was",
+          out.get("open") == scoping.max_open_proposals()
+          and out.get("limit") == scoping.max_open_proposals(),
+          f"got {out}")
+
+    # The marker is the part that could wedge this permanently: stamped so the
+    # scheduler stops re-deciding tonight, but a *date*, so tomorrow is free.
+    today = datetime.now().strftime("%Y-%m-%d")
+    check("a skipped night is still marked as dealt with",
+          ps.get("silkworm")["ideate_on"] == today,
+          "the scheduler wakes every five minutes until midnight")
+    check("so it is not re-decided for the rest of tonight",
+          P.due_for_ideation(ps.all(), datetime.now().replace(hour=23, minute=59)) == [])
+
+    # Triage the backlog, and the next night must come back on its own.
+    for t in ts.by_project("silkworm"):
+        if t.get("state") == tasks.PROPOSED:
+            ts.transition(t["id"], tasks.CANCELLED, "dismissed")
+    tomorrow = datetime.now() + timedelta(days=1)
+    check("emptying the board brings the schedule back without touching config",
+          P.due_for_ideation(ps.all(), tomorrow.replace(hour=3, minute=0))
+          == ["silkworm"],
+          "a pause that needed a setting changed to undo would be a trap")
+    ps.ensure("silkworm", ideate_on="")
+    out = run_ideation("silkworm")
+    check("and the look actually runs again",
+          out.get("id") and not out.get("skipped"), f"got {out}")
+
+
 def _file_task_impl():
     """Load handle_file_task out of bot.py without importing it.
 
@@ -6717,7 +6803,7 @@ if __name__ == "__main__":
               test_review_gate, test_review_followups,
               test_unknown_role_fails_closed, test_front_doors_agree,
               test_email_ingest, test_modules_are_imported,
-              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_nightly_panel_shows_paused, test_hiding_threads, test_putting_away_is_not_deleting, test_favicon, test_verification, test_landing, test_landing_is_visible,
+              test_missing_cwd_is_named, test_slack_health, test_backfill, test_defer, test_repo_guard, test_scoping, test_ideation, test_nightly_panel_shows_paused, test_a_deep_board_costs_no_session, test_hiding_threads, test_putting_away_is_not_deleting, test_favicon, test_verification, test_landing, test_landing_is_visible,
               test_parallel_tasks,
               test_worktrees, test_cancel_stops_the_child,
               test_worktree_survives_leaving_running,
