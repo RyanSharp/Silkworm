@@ -54,6 +54,10 @@ _BAD_CONTENT = (json.JSONDecodeError, UnicodeDecodeError, ValueError)
 _READ_ERRORS = _BAD_CONTENT + (OSError,)
 
 
+class WrongShape(ValueError):
+    """Readable JSON, but not the kind of thing this store holds."""
+
+
 class CorruptStore(RuntimeError):
     """A store file and its backup were both unreadable."""
 
@@ -66,6 +70,24 @@ def corrupt_path(path: Path) -> Path:
     return path.with_name(path.name + CORRUPT_SUFFIX)
 
 
+def _parse(text: str, default):
+    """json.loads, plus the one thing json.loads will not tell you.
+
+    A store that holds a dict and reads back `null`, `0` or `[]` is not a store
+    that happens to be empty: it is the wrong file, an older format, or a write
+    that went somewhere it should not have. The callers coerce with `or {}`, so
+    without this it loads as empty and the next save writes that emptiness over
+    both copies -- the exact silent loss the rest of this module refuses. It is
+    content we can read and cannot use, which is corruption, so it recovers the
+    same way.
+    """
+    data = json.loads(text)
+    if default is not None and not isinstance(data, type(default)):
+        raise WrongShape(f"expected {type(default).__name__}, "
+                         f"found {type(data).__name__}")
+    return data
+
+
 def _scratch(path: Path) -> Path:
     # Same directory, so the final os.replace is a rename within one filesystem.
     # Pid and thread id keep two concurrent savers off each other's temp file.
@@ -76,14 +98,18 @@ def _write(path: Path, text: str) -> None:
     """Put `text` at `path` without the target ever holding a prefix of it."""
     tmp = _scratch(path)
     try:
-        with open(tmp, "w") as fh:
+        # Created at 0600 rather than at whatever the umask says: between here
+        # and the chmod below, this file holds the entire contents of a store
+        # someone may have deliberately locked down.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())           # on disk, not just in the page cache
         # write_text() wrote through an existing file and so kept its mode;
         # replacing it with a fresh temp file would hand every store whatever
         # the umask says instead. Carry the mode across rather than quietly
-        # widening a file someone locked down.
+        # widening -- or narrowing -- a file that already had one.
         try:
             os.chmod(tmp, path.stat().st_mode & 0o7777)
         except OSError:
@@ -131,11 +157,13 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     readable situation into a lost one. With `repair=False` the fallback still
     happens, silently and in memory, and nothing on disk is touched.
     """
+    if repair:
+        _sweep_scratch(path)                # orphans from a save that was killed
     primary_error = None
     if path.exists():
         try:
             text = path.read_text()
-            data = json.loads(text)
+            data = _parse(text, default)
         except _READ_ERRORS as exc:
             primary_error = exc
         else:
@@ -179,7 +207,7 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     backup_error = None
     if backup.exists():
         try:
-            data = json.loads(backup.read_text())
+            data = _parse(backup.read_text(), default)
         except _READ_ERRORS as exc:
             backup_error = exc
         else:
@@ -212,14 +240,23 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
                                 path.name, exc)
             return data
 
-    if primary_error is None:
-        return default                          # nothing there yet: fresh install
+    if primary_error is None and backup_error is None:
+        return default                          # nothing there at all: fresh install
 
-    set_aside = repair and _set_aside(path, primary_error)
-    fallback = (f"its backup {backup.name} {_why(backup_error)} either ({backup_error})"
+    # Nothing readable, and something was there. Both files stay exactly where
+    # they are -- the wreckage is only ever set aside to make room for contents
+    # to be written back, and there are none.
+    #
+    # Renaming it here is what made the refusal last exactly one boot. The
+    # primary would be *missing* the next time round, which reads as a fresh
+    # install and returns empty without so much as a log line; and the bot's
+    # launchd job has KeepAlive set, so nobody has to decide to try again. The
+    # guarantee is worth having only if it holds every time it is asked.
+    trouble = (f"{path} is missing" if primary_error is None
+               else f"{path} {_why(primary_error)} ({primary_error})")
+    fallback = (f"its backup {backup.name} {_why(backup_error)} too ({backup_error})"
                 if backup_error else f"there is no {backup.name} to fall back on")
-    kept = f" The unreadable copy is at {corrupt_path(path)}." if set_aside else ""
-    message = (f"{path} {_why(primary_error)} ({primary_error}) and {fallback}.{kept}"
+    message = (f"{trouble} and {fallback}. Both are left exactly where they are."
                " Refusing to start empty — an empty store looks exactly like a "
                "fresh install.")
     if strict:
@@ -229,7 +266,49 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
 
 
 def _why(error: Exception) -> str:
+    if isinstance(error, WrongShape):
+        return "is not a store of this kind"
     return "did not parse" if isinstance(error, _BAD_CONTENT) else "could not be read"
+
+
+def _sweep_scratch(path: Path) -> list:
+    """Delete temp files left behind by a writer that is no longer running.
+
+    `_write`'s own cleanup is a `finally`, which a signal does not run -- and a
+    signal is the case this module is about. Every `silkworm restart` that
+    lands mid-save leaves a full copy of the store behind, 3 MB for the board,
+    gitignored and therefore invisible, and nothing else ever removes it.
+
+    Done at load rather than at save: a restart is exactly when the orphans
+    appear and exactly when nothing else is writing, and it keeps the cost off
+    the path that runs on every create, update, transition and claim.
+
+    A temp file carries the pid of the writer that made it, so one still being
+    written is recognisable and left alone. A pid that has been reused by some
+    unrelated process reads as alive, which leaves litter rather than deleting
+    a live write -- the right way round.
+    """
+    swept = []
+    for f in path.parent.glob(f"{path.name}*.tmp.*"):
+        pid = f.name.rsplit(".tmp.", 1)[-1].split(".")[0]
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue                        # ours, and possibly in flight
+        try:
+            os.kill(int(pid), 0)
+            continue                        # still running: leave it be
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue                        # alive, or not ours to ask about
+        try:
+            f.unlink()
+            swept.append(f.name)
+        except OSError as exc:
+            log.warning("could not remove %s: %s", f.name, exc)
+    if swept:
+        log.info("removed %d temp file(s) left by a killed save: %s",
+                 len(swept), ", ".join(swept))
+    return swept
 
 
 def _set_aside(path: Path, error: Exception | None) -> bool:

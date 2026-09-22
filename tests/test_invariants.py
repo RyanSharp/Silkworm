@@ -3495,27 +3495,40 @@ def test_atomic_persistence():
     def reads(path):
         return attempt(lambda: json.loads(path.read_text()))
 
-    # No store may go back to truncate-then-write. Checked on the parse tree,
-    # not the text, so a comment mentioning write_text doesn't pass for one.
-    offenders, saves = [], 0
+    # No state file may go back to truncate-then-write. Checked on the parse
+    # tree, not the text, so a comment mentioning write_text doesn't pass for
+    # one -- and by the *name being written to* rather than by which module it
+    # is in, because the last one found doing this was learnings_git.py writing
+    # through a parameter, which a `self._path` rule could not see and a list
+    # of store modules did not include.
+    state = {"_path",                       # the four stores
+             "learnings_file", "state_path",  # passed in as a parameter
+             "EMAIL_STATE_FILE", "HARVEST_STATE", "LEARNINGS_FILE",
+             "SESSIONS_FILE", "TASKS_FILE", "PROJECTS_FILE"}
     def writes_in_place(node):
         return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in ("write_text", "write_bytes"))
-    for mod in ("store.py", "tasks.py", "projects.py", "learnings.py",
-                "harvester.py", "bot.py"):
+    def written_to(node):
+        target = node.func.value
+        return (target.attr if isinstance(target, ast.Attribute)
+                else target.id if isinstance(target, ast.Name) else None)
+    offenders, saves, scanned = [], 0, 0
+    for mod in sorted(f.name for f in BASE.glob("*.py")):
+        if mod == "jsonstore.py":           # the one place that may, carefully
+            continue
+        scanned += 1
         tree = ast.parse((BASE / mod).read_text())
         for node in ast.walk(tree):
-            # The store file itself, whatever the surrounding function is
-            # called. (Other files here -- a project's CLAUDE.md -- are fine.)
-            if (writes_in_place(node) and isinstance(node.func.value, ast.Attribute)
-                    and node.func.value.attr == "_path"):
+            # (Other files written here -- a project's CLAUDE.md -- are fine.)
+            if writes_in_place(node) and written_to(node) in state:
                 offenders.append(f"{mod}:{node.lineno}")
             if isinstance(node, ast.FunctionDef) and node.name == "_save":
                 saves += 1
                 offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
                               if writes_in_place(n)]
     check("every store's _save was found to check", saves == 4, f"found {saves}")
-    check("no store writes its file in place", not offenders, f"at {offenders}")
+    check("and every module was looked at", scanned > 20, f"{scanned}")
+    check("nothing writes a state file in place", not offenders, f"at {offenders}")
 
     # A save leaves either the whole old file or the whole new one.
     path = d / "tasks.json"
@@ -3716,14 +3729,61 @@ def test_atomic_persistence():
     jsonstore.save(bp, {"a": 1}); jsonstore.save(bp, {"a": 2})
     bp.write_text("{trunc")
     jsonstore.backup_path(bp).write_text("{also trunc")
-    try:
-        jsonstore.load(bp, default={})
-        raised = None
-    except jsonstore.CorruptStore as exc:
-        raised = exc
+    refusals = [attempt(jsonstore.load, bp, default={}) for _ in range(3)]
     check("both copies unreadable raises rather than starting empty",
-          isinstance(raised, jsonstore.CorruptStore))
-    check("and says where the wreckage is", raised and "both.json.corrupt" in str(raised))
+          isinstance(refusals[0], jsonstore.CorruptStore), f"{refusals[0]!r}")
+    check("and says so in terms of both files",
+          bool(refusals[0]) and "both.json.prev" in str(refusals[0]), str(refusals[0])[:120])
+    # The refusal has to hold every time it is asked. Setting the wreckage
+    # aside here is what made it last exactly one boot: the primary was then
+    # *missing* next time, which reads as a fresh install and returns empty
+    # without so much as a log line -- and the bot's launchd job has KeepAlive,
+    # so it would be asked again ten seconds later and come up with nothing.
+    check("and keeps refusing, rather than lasting one boot",
+          all(isinstance(r, jsonstore.CorruptStore) for r in refusals),
+          f"{[type(r).__name__ for r in refusals]}")
+    check("with both files left exactly where they were",
+          attempt(bp.read_text) == "{trunc"
+          and attempt(jsonstore.backup_path(bp).read_text) == "{also trunc"
+          and not jsonstore.corrupt_path(bp).exists())
+
+    # Same, for the case that makes it reachable at all: the first boot on this
+    # code, on a file the *old* code left truncated, with no backup yet.
+    first = d / "firstboot.json"
+    first.write_text('{"tsk_1": {"goal": "half a rec')
+    again = [attempt(jsonstore.load, first, default={}) for _ in range(3)]
+    check("a truncated store with no backup refuses every time",
+          all(isinstance(r, jsonstore.CorruptStore) for r in again),
+          f"{[type(r).__name__ for r in again]}")
+    check("and is still there to be recovered by hand",
+          attempt(first.read_text) == '{"tsk_1": {"goal": "half a rec')
+
+    # And the same when the primary is gone rather than broken -- deleted by
+    # hand, or by a tidy-up -- with a backup that will not parse. There is no
+    # way to tell that from a fresh install by looking, but the backup being
+    # there says a store existed, so it is not one.
+    gone = d / "gone.json"
+    jsonstore.backup_path(gone).write_text("{half a backup")
+    check("a missing store with an unreadable backup is not a fresh install",
+          isinstance(attempt(jsonstore.load, gone, default={}), jsonstore.CorruptStore),
+          f"{attempt(jsonstore.load, gone, default={})!r}")
+    check("but a directory with nothing in it is",
+          attempt(jsonstore.load, d / "never-existed.json", default={}) == {})
+
+    # Readable JSON that is not a store is corruption too, not an empty store.
+    # The callers coerce with `or {}`, so without this it loads as nothing and
+    # the next save writes that nothing over both copies.
+    shaped = d / "shaped.json"
+    jsonstore.save(shaped, {"tsk_1": {"goal": "real work"}})
+    for wrong in ("null", "[]", "0", '"a string"'):
+        shaped.write_text(wrong)
+        jsonstore.corrupt_path(shaped).unlink(missing_ok=True)
+        got = attempt(jsonstore.load, shaped, default={})
+        check(f"a store holding {wrong} recovers rather than coming up empty",
+              got == {"tsk_1": {"goal": "real work"}}, f"{got!r}")
+    shaped.write_text("{}")
+    check("while a store that is genuinely empty is left to be empty",
+          attempt(jsonstore.load, shaped, default={}) == {})
 
     # Not being able to read a file is not the same as the file being bad: a
     # permission or a momentarily exhausted fd table would otherwise get a
@@ -3868,14 +3928,17 @@ def test_atomic_persistence():
     hot = d / "hot.json"
     hs = _tasks.TaskStore(hot)
     hs.create("seed")
-    stop, bad, reads = _th.Event(), [], []
+    # `seen`, not `reads`: that name is the helper defined at the top of this
+    # test, and rebinding it to a list leaves anything added below calling a
+    # list.
+    stop, bad, seen = _th.Event(), [], []
     def writer(n):
         for i in range(40):
             hs.create(f"w{n}-{i}")
     def reader():
         while not stop.is_set():
             try:
-                reads.append(len(json.loads(hot.read_text())))
+                seen.append(len(json.loads(hot.read_text())))
             except Exception as exc:         # noqa: BLE001
                 bad.append(repr(exc))
     r = _th.Thread(target=reader, daemon=True); r.start()
@@ -3883,8 +3946,70 @@ def test_atomic_persistence():
     [w.start() for w in ws]; [w.join() for w in ws]
     stop.set(); r.join(timeout=5)
     check("concurrent readers never see a partial file", not bad, f"{bad[:2]}")
-    check("the reader actually read during the writes", len(reads) > 1)
+    check("the reader actually read during the writes", len(seen) > 1)
     check("every write landed", len(hs.all()) == 161)
+
+    # A temp file is cleaned up in a `finally`, which a signal does not run --
+    # and a signal is the case this module is about. Every restart landing
+    # mid-save otherwise leaves a full copy of the store behind: 3 MB for the
+    # board, gitignored and so invisible to `git status`, forever. Killed for
+    # real here, with the signal `silkworm restart` actually sends.
+    killed = d / "killed.json"
+    jsonstore.save(killed, {"a": 1})
+    child = subprocess.Popen([sys.executable, "-c", f"""
+import os, sys, time
+sys.path.insert(0, {str(BASE)!r})
+import jsonstore
+from pathlib import Path
+p = Path({str(killed)!r})
+real = os.replace
+def stall(src, dst, *a, **kw):
+    if str(src).startswith(str(p) + ".tmp"):
+        time.sleep(30)
+    return real(src, dst, *a, **kw)
+os.replace = stall
+jsonstore.save(p, {{"a": 2}})
+"""])
+    for _ in range(200):                     # wait for its temp file to appear
+        if any(".tmp." in f.name for f in d.iterdir()):
+            break
+        time.sleep(0.05)
+    child.kill(); child.wait(timeout=10)
+    orphans = [f.name for f in d.iterdir() if f.name.startswith("killed.json.tmp.")]
+    check("a real kill mid-save does leave its temp file behind", orphans, f"{orphans}")
+    # ...while a *different* process that is still writing keeps its own. The
+    # pid in the name is the only thing separating an orphan from a write in
+    # progress, so the live one here belongs to a real, live, unrelated pid --
+    # this process's own is skipped a step earlier and would prove nothing.
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    theirs = killed.with_name(f"{killed.name}.tmp.{alive.pid}.1")
+    theirs.write_text("in flight")
+    check("the next load sweeps the orphan up",
+          attempt(jsonstore.load, killed, default={}) == {"a": 1}
+          and not any(f.name in orphans for f in d.iterdir()), f"{orphans}")
+    check("and leaves another live writer's temp file alone",
+          theirs.exists(), "a sweep that cannot tell them apart deletes a write in progress")
+    alive.kill(); alive.wait(timeout=10)
+    jsonstore.load(killed, default={})
+    check("but takes it once that writer is gone too", not theirs.exists())
+
+    # The temp file holds the whole store before it is renamed into place, so
+    # it must not be readable by anyone the store itself is not.
+    private = d / "private.json"
+    jsonstore.save(private, {"a": 1})
+    os.chmod(private, 0o600)
+    at_rename = []
+    def note_mode(src, dst, *a, **kw):
+        at_rename.append(os.stat(src).st_mode & 0o777)
+        return real_replace(src, dst, *a, **kw)
+    os.replace = note_mode
+    try:
+        jsonstore.save(private, {"a": 2})
+    finally:
+        os.replace = real_replace
+    check("the temp file is never wider than the store it becomes",
+          at_rename and all(m == 0o600 for m in at_rename),
+          f"{[oct(m) for m in at_rename]}")
 
     # Finally, for real: a separate process opening a half-written store.
     boot = d / "boot.json"

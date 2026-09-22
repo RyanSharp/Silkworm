@@ -11,6 +11,8 @@ import logging
 import subprocess
 from pathlib import Path
 
+import jsonstore
+
 log = logging.getLogger("silkworm.learnings_git")
 
 
@@ -25,8 +27,12 @@ def is_git_backed(learnings_file: Path) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
-def _union(a: str, b: str) -> str:
-    """Merge two learnings.json blobs, keeping every unique learning by id."""
+def _union(a: str, b: str) -> list:
+    """Merge two learnings.json blobs, keeping every unique learning by id.
+
+    Returns the records rather than the text of them, so the one caller writes
+    them through jsonstore like every other writer of a state file.
+    """
     def load(s):
         try:
             return json.loads(s)
@@ -39,7 +45,7 @@ def _union(a: str, b: str) -> str:
             seen.add(rid)
             merged.append(rec)
     merged.sort(key=lambda x: x.get("created", 0))
-    return json.dumps(merged, indent=2)
+    return merged
 
 
 def sync(learnings_file: Path) -> dict:
@@ -73,7 +79,12 @@ def sync(learnings_file: Path) -> dict:
         ours = _git(repo, "show", f":2:{name}").stdout
         theirs = _git(repo, "show", f":3:{name}").stdout
         if ours or theirs:
-            learnings_file.write_text(_union(ours, theirs))
+            # Through jsonstore, like every other write of a state file: this
+            # one truncates learnings.json and refills it, and it is resolving
+            # a conflict between two machines' copies, so it is the write with
+            # the most in it to lose. It refreshes the backup too, which a bare
+            # write_text left holding pre-merge records.
+            jsonstore.save(learnings_file, _union(ours, theirs))
             _git(repo, "add", name)
         if _git(repo, "commit", "--no-edit").returncode != 0:
             _git(repo, "merge", "--abort")
@@ -97,7 +108,7 @@ def init(learnings_file: Path, remote: str = "") -> dict:
         if _git(repo, "remote", "add", "origin", remote).returncode != 0:
             return {"ok": False, "error": "could not add remote"}
     if not learnings_file.exists():
-        learnings_file.write_text("[]\n")
+        jsonstore.save(learnings_file, [])
     # The .prev/.corrupt/.tmp sidecars jsonstore.py keeps beside learnings.json
     # are local recovery copies, not shared state. Added one at a time rather
     # than only when the file is absent: this runs against directories that

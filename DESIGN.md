@@ -759,6 +759,23 @@ is a second process on the bot's live files, and renaming one out from under a
 running bot, which is holding the real records in memory and will save them
 over the top, would turn a recoverable situation into a lost one.
 
+Three things follow that are worth knowing before you need them. Refusing has
+to hold *every* time, so nothing is renamed on the way out: an earlier cut set
+the wreckage aside and then raised, which left the primary missing next boot —
+indistinguishable from a fresh install, returned empty without a log line, and
+the launchd job has KeepAlive, so the refusal lasted about ten seconds.
+Readable JSON of the wrong shape (`null`, `[]`, a number) counts as corruption
+rather than as an empty store, because the callers coerce with `or {}` and
+would otherwise write that emptiness over both copies. And `rm tasks.json` is
+no longer a reset — it is recovered from `.prev` and written back. Clearing a
+store means removing the backup too.
+
+Temp files are swept at load rather than at save: `_write` cleans up in a
+`finally`, which a signal does not run, so every restart landing mid-save left
+a full copy of the store behind — gitignored, and therefore invisible. A temp
+file carries its writer's pid, so one still being written is recognisable and
+left alone.
+
 Two callers reach past the stores at their files, and an atomic save fixes
 neither. The CLI's `import` read `sessions.json` with a bare `json.loads`
 inside an `except OSError`, so the one error it did not catch was the one this
