@@ -392,6 +392,16 @@ resolve wherever the reviewer is standing. Where there is no fork point to give
 it, the prompt offers commands that need none — a reviewer whose opening
 command errors is back to reading the summary.
 
+**No checkout, no verdict.** If the branch cannot be reached — sent back and
+re-cut under the same id, or still checked out because the implementor's tree
+was dirty — the review does not run. Carrying on in the main checkout is worse
+than not reviewing at all: the prompt has already promised a checkout of the
+branch, so the reviewer reads `<fork point>..HEAD` there and gets whatever has
+landed on the base since. It finds nothing wrong with other people's commits,
+and a passing verdict on those merges work nobody read. The review fails and
+the task it was gating goes in front of you instead, since failing only the
+review would strand its parent in `blocked` with nothing left to unblock it.
+
 The borrowed branch is somebody else's throughout. It is not recorded as the
 review's own work, it is never deleted as an empty branch, and it is released
 before the verdict is acted on, because the landing reattaches that same branch
