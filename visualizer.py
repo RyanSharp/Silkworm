@@ -1594,8 +1594,17 @@ async function renderHolding() {
   // Driving it against a rejecting fetch is how that was found.
   let r = null;
   try { r = await taskCall({action: "holding", project: project || undefined}); }
-  catch (e) { el.innerHTML = ""; return; }
-  const rows = (r && r.holding) || [];
+  catch (e) { r = null; }
+  if (!r || r.ok === false) {
+    // "Could not ask" is not "nothing held" -- `silkworm status` already draws
+    // that line and the panel did not. A bot running older code answers
+    // {ok: false, unknown action}, which read as an all-clear and quietly took
+    // the marker off every row while leaving the buttons that act on them.
+    el.innerHTML = `<span class="nlabel">🧰 could not ask whether any checkout `
+      + `is holding uncommitted work${r && r.error ? ` — ${esc(r.error)}` : ""}</span>`;
+    return;
+  }
+  const rows = r.holding || [];
   rows.forEach(h => { if (h.id) heldById[h.id] = h; });
   if (!rows.length) { el.innerHTML = ""; return; }
   el.innerHTML = `<span class="nlabel">🧰 ${esc(r.summary || "")}</span>` +

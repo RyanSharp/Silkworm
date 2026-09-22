@@ -62,18 +62,25 @@ def _git(cwd, *args, timeout: int = 30):
         return _Failed()
 
 
-def changes(worktree) -> list[str]:
-    """Every uncommitted path in this checkout, ignored files excluded.
+def changes(worktree) -> list[str] | None:
+    """Every uncommitted path in this checkout, or None if git could not say.
 
     The same question `worktrees.is_dirty` asks, keeping the answer. Porcelain
     collapses an untracked directory to a single entry instead of walking into
     it, which is what keeps this cheap against a checkout whose .venv holds
     forty thousand files -- and it is also the honest unit, because what a
     reader wants to know is "a virtualenv" rather than forty thousand names.
+
+    None rather than an empty list when git fails, because "I could not read
+    this" and "there is nothing in it" are the two answers this module exists
+    to keep apart. A child killed mid-rebase leaves an index.lock behind,
+    `git status` then exits non-zero, and reading that as clean would print
+    the all-clear over a checkout full of half-finished work -- at the exact
+    moment somebody is deciding whether to dismiss the task.
     """
     r = _git(worktree, "status", "--porcelain")
     if r.returncode != 0:
-        return []
+        return None
     return [line[3:].strip() for line in r.stdout.splitlines() if line[3:].strip()]
 
 
@@ -92,12 +99,18 @@ def branch_of(worktree) -> str:
 def _row(path, rec: dict) -> dict | None:
     """A row for this checkout, or None when it is holding nothing.
 
+    A checkout git could not read gets a row too, marked `unreadable`. The
+    alternative is dropping it, which reads downstream as an all-clear -- the
+    one direction this module must never fail in.
+
     Nothing else is asked of git until there is something to report: a clean
     checkout is the common case, and it costs one call.
     """
     files = changes(path)
-    if not files:
+    if files == []:
         return None
+    unreadable = files is None
+    files = files or []
     state = rec.get("state") or ""
     return {
         "id": rec.get("id") or worktrees.task_of(path),
@@ -109,6 +122,9 @@ def _row(path, rec: dict) -> dict | None:
         # collected. The reader is owed the difference.
         "terminal": state in tasks.TERMINAL,
         "known": bool(rec),
+        # git would not answer, so nothing here knows what is in there. Said
+        # out loud rather than rounded down to "nothing".
+        "unreadable": unreadable,
         "path": str(path),
         "name": Path(path).name,
         "branch": branch_of(path),
@@ -151,7 +167,9 @@ def survey(records=()) -> list[dict]:
         row = _row(path, rec)
         if row:
             rows.append(row)
-    return sorted(rows, key=lambda r: (-r["changes"], r["name"]))
+    # Unreadable first: it is the least certain row and the only one whose
+    # size is unknown rather than small. Then busiest, then by name.
+    return sorted(rows, key=lambda r: (not r["unreadable"], -r["changes"], r["name"]))
 
 
 def for_task(task: dict) -> dict | None:
@@ -173,18 +191,27 @@ def line(rows) -> str:
     """One line for `silkworm status` and the Slack-facing summary."""
     if not rows:
         return ""
-    paths = sum(r["changes"] for r in rows)
-    return (f"{len(rows)} checkout{'s' if len(rows) != 1 else ''} still holding "
-            f"uncommitted work ({paths} path{'s' if paths != 1 else ''})")
+    blind = [r for r in rows if r["unreadable"]]
+    held = [r for r in rows if not r["unreadable"]]
+    paths = sum(r["changes"] for r in held)
+    parts = []
+    if held:
+        parts.append(f"{len(held)} checkout{'s' if len(held) != 1 else ''} still "
+                     f"holding uncommitted work "
+                     f"({paths} path{'s' if paths != 1 else ''})")
+    if blind:
+        parts.append(f"{len(blind)} git could not read")
+    return ", and ".join(parts)
 
 
 def short(row) -> str:
     """Enough for a task's event log, which keeps fifty of these."""
     if not row:
         return ""
-    return (f"checkout left in place at {row['path']} "
-            f"({row['changes']} uncommitted path"
-            f"{'s' if row['changes'] != 1 else ''})")
+    what = ("git could not read it" if row["unreadable"] else
+            f"{row['changes']} uncommitted path"
+            f"{'s' if row['changes'] != 1 else ''}")
+    return f"checkout left in place at {row['path']} ({what})"
 
 
 def note(row) -> str:
@@ -196,6 +223,13 @@ def note(row) -> str:
     """
     if not row:
         return ""
+    if row["unreadable"]:
+        # Not "it is holding nothing". Nothing here knows what is in there, and
+        # saying so is the whole difference between a report and an all-clear.
+        return (f":deciduous_tree: Its isolated checkout is left exactly where "
+                f"it is — `{row['path']}` — and git would not say what is in "
+                f"it, so it may be holding uncommitted work. Nothing here will "
+                f"remove it; go and look.")
     shown = ", ".join(f"`{f}`" for f in row["files"][:4])
     more = (f" and {row['changes'] - 4} more" if row["changes"] > 4 else "")
     return (f":deciduous_tree: Its isolated checkout still holds "

@@ -39,7 +39,6 @@ ROOT = Path.home() / "workspace" / ".worktrees"
 
 BRANCH_PREFIX = "silkworm/"
 SEP = "--"          # repo name and task id both contain '-' and '_'
-LAND = f"land{SEP}"  # marks the second checkout a landing borrows
 
 
 def _git(cwd, *args, timeout: int = 180):
@@ -142,19 +141,16 @@ def path_for(repo, task_id: str, label: str = "") -> Path:
 
 
 def task_of(path) -> str:
-    """The task id in a worktree directory name, for either layout.
+    """The task id in a worktree directory name, whatever its label.
 
-    Two names come out of this module: `repo--taskid` for a task's own
-    checkout and `repo--land--taskid` for the one a landing borrows.
-    Reading the id by splitting on the first separator turns the second
-    into "land--tsk_...", which is no task id, so a landing checkout
-    matches no task at all.
+    Three names come out of this module: `repo--taskid` for a task's own
+    checkout, and `repo--land--taskid` / `repo--review--taskid` for the ones a
+    landing and a review borrow. Reading from the front turns the labelled ones
+    into "land--tsk_..." or "review--tsk_...", which is no task id; the id is
+    always the last segment.
     """
     name = Path(path).name
-    if SEP not in name:
-        return ""
-    tail = name.split(SEP, 1)[1]
-    return tail[len(LAND):] if tail.startswith(LAND) else tail
+    return name.rsplit(SEP, 1)[1] if SEP in name else ""
 
 
 #: `git worktree add` takes a repository-level lock while it writes refs, so
@@ -403,12 +399,13 @@ def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
     for path in ROOT.iterdir():
         if not path.is_dir() or SEP not in path.name:
             continue
-        # From the right. A labelled checkout is `<repo>--land--<id>` or
-        # `<repo>--review--<id>`, and splitting from the front read the task id
-        # as "land--<id>" -- which is in nobody's keep set, so a landing or a
-        # review in progress became sweepable the moment it was an hour old.
-        task_id = path.name.rsplit(SEP, 1)[1]
-        if task_id in keep:
+        # From the right, through task_of. A labelled checkout is
+        # `<repo>--land--<id>` or `<repo>--review--<id>`, and splitting from the
+        # front read the task id as "land--<id>" -- which is in nobody's keep
+        # set, so a landing or a review in progress became sweepable the moment
+        # it was an hour old. One parse, shared with holding.py, so the two
+        # cannot disagree about whose checkout this is.
+        if task_of(path) in keep:
             continue
         if age_s(path) < min_age_s:
             continue

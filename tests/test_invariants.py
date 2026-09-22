@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re as _re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -4944,13 +4945,39 @@ def test_held_checkouts():
     check("committing the work by hand clears the row, with no flag to update",
           finished not in {r["id"] for r in H.survey(list(st.all().values()))})
 
-    # One unreadable checkout must cost its own row and nothing else: this runs
-    # behind a dashboard panel and inside `silkworm status`.
+    # A checkout git will not answer about is the one case that must never be
+    # rounded down to "clean". A child killed mid-rebase leaves an index.lock,
+    # `git status` exits non-zero, and reading that as nothing prints the
+    # all-clear over a tree full of half-finished work -- at the moment
+    # somebody is deciding whether to dismiss the task.
+    locked, wt_locked = task_in(T.DONE)
+    dirty(wt_locked, "half-done.py")
+    (wt_locked / ".git").write_text((wt_locked / ".git").read_text() + "\nbroken\n")
+    blind = [r for r in H.survey(list(st.all().values())) if r["id"] == locked]
+    check("a checkout git will not answer about is still reported",
+          len(blind) == 1 and blind[0]["unreadable"] is True,
+          "dropping the row reads downstream as an all-clear, which is the one "
+          "direction this must never fail in")
+    check("and it is not counted as holding nothing",
+          "could not read" in H.line(blind), H.line(blind))
+    top = (H.survey(list(st.all().values())) or [{}])[0]
+    check("and it sorts above the checkouts whose size is known",
+          top.get("unreadable") is True,
+          "it is the least certain row, not the smallest")
+    check("and approving it says so rather than claiming it is empty",
+          bool(blind) and "may be holding uncommitted work" in H.note(blind[0]))
+    shutil.rmtree(wt_locked, ignore_errors=True)
+    W._git(repo, "worktree", "prune")
+
+    # One checkout git cannot be *run* against must still cost its own row and
+    # nothing else: this sits behind a dashboard panel and inside `silkworm
+    # status`, and neither may raise.
     real_run = H.subprocess.run
     H.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no git"))
     try:
-        check("a checkout git cannot be run against is skipped, not raised",
-              H.survey(list(st.all().values())) == [])
+        blind = H.survey(list(st.all().values()))
+        check("a checkout git cannot be run against is reported, not raised",
+              bool(blind) and all(r["unreadable"] for r in blind))
     finally:
         H.subprocess.run = real_run
 
@@ -5036,6 +5063,15 @@ def test_held_checkouts():
           W.task_of(root / f"repo{W.SEP}tsk_abc") == "tsk_abc")
     check("and a landing's borrowed one resolves to the same id",
           W.task_of(root / f"repo{W.SEP}land{W.SEP}tsk_abc") == "tsk_abc")
+    swept = ast.parse((BASE / "worktrees.py").read_text())
+    fn = next(n for n in ast.walk(swept)
+              if isinstance(n, ast.FunctionDef) and n.name == "sweep")
+    check("and the sweeper reads it that way too, not by splitting",
+          any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "task_of"
+              for n in ast.walk(fn))
+          and not [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                   and getattr(n.func, "attr", "") == "split"],
+          "a landing's checkout would match no task and never be kept")
 
     # --- it has to reach the places a person actually looks -----------------
     cli = (BASE / "bin" / "silkworm").read_text()
@@ -5079,6 +5115,10 @@ def test_held_checkouts():
           "try {" in body and body.index("try {") < body.index('taskCall({action: "holding"'),
           "renderTasks awaits this before drawing anything, so a rejected "
           "request would blank the board instead of one row's marker")
+    check("and a refusal is not drawn as an all-clear",
+          "r.ok === false" in body,
+          "a bot running older code answers {ok: false, unknown action}, which "
+          "would take the marker off every row and leave the buttons")
     check("the row is marked before the buttons are drawn",
           -1 < marked < drawn,
           "an unawaited survey would race the buttons that act on it")
