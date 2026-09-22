@@ -3747,6 +3747,80 @@ def test_atomic_persistence():
     check("so the next attempt just works",
           attempt(jsonstore.load, unread) == {"records": "here"})
 
+    # ...and that holds with a *readable* backup sitting right next to it, which
+    # is the whole case. The backup is an older save; handing it back for a
+    # primary we could not open means the bot boots on stale records and writes
+    # them over a file that was fine, so the guard has to fire before the
+    # fallback is even consulted. Declining to rename the primary and then
+    # overwriting it, which is where this landed twice before, is worse than
+    # renaming it: it is the same loss with the evidence destroyed too.
+    flaky = d / "flaky.json"
+    jsonstore.save(flaky, {"records": "the older save"})
+    jsonstore._write(flaky, '{"records": "newer, and perfectly good"}')
+    def only_primary(self, *a, **kw):
+        if self.name == "flaky.json":            # not flaky.json.prev
+            raise OSError(13, "Permission denied")
+        return real_read(self, *a, **kw)
+    Path.read_text = only_primary
+    try:
+        got = jsonstore.load(flaky)
+        raised = None
+    except Exception as exc:                     # noqa: BLE001
+        got, raised = None, exc
+    finally:
+        Path.read_text = real_read
+    check("a readable backup does not excuse substituting it for an unopenable primary",
+          isinstance(raised, jsonstore.CorruptStore), f"returned {got!r}")
+    check("and the reason names the file it refused to rewind",
+          bool(raised) and "flaky.json.prev" in str(raised), str(raised))
+    check("the primary is left byte-for-byte as it was",
+          reads(flaky) == {"records": "newer, and perfectly good"}, f"{reads(flaky)!r}")
+    check("with nothing set aside",
+          not jsonstore.corrupt_path(flaky).exists())
+    check("so once the fd table clears, the newer save is still there",
+          attempt(jsonstore.load, flaky) == {"records": "newer, and perfectly good"})
+
+    # A watermark takes the same refusal as a return-empty rather than a rewind.
+    flaky_wm = d / "flakywm.json"
+    jsonstore.save(flaky_wm, {"seen": "older"})
+    jsonstore._write(flaky_wm, '{"seen": "newer"}')
+    def only_wm(self, *a, **kw):
+        if self.name == "flakywm.json":
+            raise OSError(24, "Too many open files")
+        return real_read(self, *a, **kw)
+    Path.read_text = only_wm
+    try:
+        got = attempt(jsonstore.load, flaky_wm, default={}, strict=False)
+    finally:
+        Path.read_text = real_read
+    check("a watermark rescans rather than resuming from a stale backup", got == {})
+    check("and its file is untouched too", reads(flaky_wm) == {"seen": "newer"})
+
+    # Recovery empties the primary slot by moving the wreckage to .corrupt. If
+    # that move fails, the corrupt file is still the only copy of what went
+    # wrong -- so writing the recovered contents over it would destroy the
+    # evidence this promised to keep, and the log would say it had kept it.
+    stubborn = d / "stubborn.json"
+    jsonstore.save(stubborn, {"records": "recoverable"})
+    stubborn.write_text("{half")
+    real_replace = os.replace
+    def wont_rename(src, dst, *a, **kw):
+        if str(dst).endswith(jsonstore.CORRUPT_SUFFIX):
+            raise OSError(1, "Operation not permitted")
+        return real_replace(src, dst, *a, **kw)
+    os.replace = wont_rename
+    try:
+        got = attempt(jsonstore.load, stubborn)
+    finally:
+        os.replace = real_replace
+    check("a recovery that cannot set the wreckage aside still returns the records",
+          got == {"records": "recoverable"}, f"{got!r}")
+    check("and leaves the wreckage rather than writing over the only copy of it",
+          stubborn.read_text() == "{half", stubborn.read_text()[:40])
+    check("so the next boot recovers again instead of finding nothing",
+          attempt(jsonstore.load, stubborn) == {"records": "recoverable"}
+          and jsonstore.corrupt_path(stubborn).read_text() == "{half")
+
     # A watermark is not records: re-scanning is cheaper than refusing to start.
     wm = d / "watermark.json"
     wm.write_text("{trunc")

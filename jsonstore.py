@@ -20,6 +20,12 @@ older build, an editor saving in place, a half-flushed block after a power cut
 What `load()` will not do is start empty. An empty store is indistinguishable
 from a fresh install, which is exactly how losing 400 task records becomes
 invisible; when there is nothing left to read, it raises and you find out.
+
+Nor will it fall back on a file it simply could not open. A permission or a
+momentarily exhausted fd table says nothing about the contents, and the backup
+is always an older save -- so substituting it there would hand the bot stale
+records, which it would then write back over a file that was fine all along.
+Only content we can read and cannot parse is treated as corruption.
 """
 
 import json
@@ -111,6 +117,9 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     CorruptStore (right for anything holding records) and returning `default`
     (right for a watermark, where the cost of starting over is a rescan).
 
+    The fallback is for content we can prove is bad, and only that. A file we
+    merely could not *open* gets none of this: see below.
+
     `repair` is for readers that do not own the file. Recovering normally means
     setting the wreckage aside and putting the recovered contents back, which is
     right for the process that is about to keep writing there and wrong for
@@ -141,6 +150,25 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
             return data
 
     backup = backup_path(path)
+
+    # Being unable to read a file is not the same as knowing it is bad, and the
+    # difference decides who wins. The backup is by definition an *older* save;
+    # substituting it for a primary that may be perfectly good hands the caller
+    # stale records, and the caller is the bot, which holds them in memory and
+    # writes them straight back over the good file on its next save. A momentary
+    # EACCES or EMFILE would spend the board that way, silently, one save later.
+    # So a primary we could not open is not recovered from and not touched: it
+    # is reported. Refusing to start is recoverable; a silent rewind is not.
+    if primary_error is not None and not isinstance(primary_error, _BAD_CONTENT):
+        message = (f"{path} could not be read ({primary_error}). Leaving it "
+                   f"exactly where it is -- a file that will not open may be "
+                   f"perfectly good, and falling back to {backup.name} would "
+                   f"quietly rewind it to an older save.")
+        if strict:
+            raise CorruptStore(message)
+        log.error("%s Continuing with an empty %s.", message, path.name)
+        return default
+
     backup_error = None
     if backup.exists():
         try:
@@ -148,22 +176,26 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
         except _READ_ERRORS as exc:
             backup_error = exc
         else:
+            # Only reachable for a primary that is absent or provably bad: an
+            # unreadable one returned above without consulting the backup.
+            set_aside = repair and _set_aside(path, primary_error)
             if primary_error is None:
                 log.error("%s is missing — recovered from %s", path.name, backup.name)
             else:
-                log.error("%s %s (%s) — recovered from %s%s", path.name,
-                          _why(primary_error), primary_error, backup.name,
+                log.error("%s did not parse (%s) — recovered from %s%s", path.name,
+                          primary_error, backup.name,
                           f"; the unreadable copy is kept at {corrupt_path(path).name}"
-                          if isinstance(primary_error, _BAD_CONTENT) and repair else "")
-                if repair:
-                    _set_aside(path, primary_error)
-            if repair:
-                # Put the recovered contents back where they belong, so the
-                # next reader doesn't have to repeat this. No backup pass: it
-                # already holds exactly this. Tidying up is not worth losing
-                # over: we are holding the records, and refusing to hand them
-                # back because the disk is full would be the loss this whole
-                # module exists to prevent.
+                          if set_aside else "")
+            # Put the recovered contents back where they belong, so the next
+            # reader doesn't have to repeat this -- but only into a slot that is
+            # now empty. If setting the wreckage aside failed, writing over it
+            # here would destroy the one copy of the corruption we promised to
+            # keep, so leave both alone and recover again next time.
+            if repair and (primary_error is None or set_aside):
+                # No backup pass: it already holds exactly this. Tidying up is
+                # not worth losing over -- we are holding the records, and
+                # refusing to hand them back because the disk is full would be
+                # the loss this whole module exists to prevent.
                 try:
                     save(path, data, keep_backup=False)
                 except OSError as exc:
@@ -174,13 +206,11 @@ def load(path: Path, *, default=None, strict: bool = True, repair: bool = True):
     if primary_error is None:
         return default                          # nothing there yet: fresh install
 
-    if repair:
-        _set_aside(path, primary_error)
+    set_aside = repair and _set_aside(path, primary_error)
     fallback = (f"its backup {backup.name} {_why(backup_error)} either ({backup_error})"
                 if backup_error else f"there is no {backup.name} to fall back on")
-    kept = (f" The unreadable copy is at {corrupt_path(path)}."
-            if isinstance(primary_error, _BAD_CONTENT) and repair else "")
-    message = (f"{path} {_why(primary_error)} ({primary_error}) and {fallback}.{kept}"
+    kept = f" The unreadable copy is at {corrupt_path(path)}." if set_aside else ""
+    message = (f"{path} did not parse ({primary_error}) and {fallback}.{kept}"
                " Refusing to start empty — an empty store looks exactly like a "
                "fresh install.")
     if strict:
@@ -193,16 +223,22 @@ def _why(error: Exception) -> str:
     return "did not parse" if isinstance(error, _BAD_CONTENT) else "could not be read"
 
 
-def _set_aside(path: Path, error: Exception) -> None:
+def _set_aside(path: Path, error: Exception | None) -> bool:
     """Move an unparseable file out of the way, keeping it for inspection.
 
     Only when its *contents* are the problem. A file we merely couldn't read --
     a permission, a momentarily exhausted fd table -- is probably fine, and
     renaming it would turn a transient failure into a real one.
+
+    Reports whether the file was actually moved, so a caller can tell the
+    difference between a slot it has emptied and one still holding the only
+    copy of the wreckage.
     """
     if not isinstance(error, _BAD_CONTENT):
-        return
+        return False
     try:
         os.replace(path, corrupt_path(path))
     except OSError as exc:
         log.warning("could not set %s aside: %s", path.name, exc)
+        return False
+    return True
