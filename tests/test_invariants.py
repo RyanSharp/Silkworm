@@ -4345,6 +4345,19 @@ def test_state_files_have_one_reader_and_one_writer():
           set(seen) == {"first", "second"}, f"kept {sorted(seen)}")
     check("and both of them ran", len(results) == 2, f"{results}")
 
+    # Silkworm's own .gitignore has to cover the sidecars, and the names come
+    # from jsonstore rather than from typing them out again here -- a change to
+    # how a temp file is named is exactly what would leave a 3 MB copy of the
+    # board staged. Asked of git, not of fnmatch.
+    made = [jsonstore.backup_path(Path("tasks.json")),
+            jsonstore.corrupt_path(Path("tasks.json")),
+            jsonstore._scratch(Path("tasks.json")),
+            jsonstore._scratch(jsonstore.backup_path(Path("tasks.json")))]
+    tracked = [f.name for f in made
+               if subprocess.run(["git", "check-ignore", "-q", f.name],
+                                 cwd=BASE).returncode != 0]
+    check("every sidecar jsonstore can create is gitignored", not tracked, f"{tracked}")
+
 
 
 if __name__ == "__main__":
