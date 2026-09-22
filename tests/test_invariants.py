@@ -969,12 +969,19 @@ def test_putting_away_is_not_deleting():
     check("age-only deletion is gone, not just uncalled",
           not hasattr(st, "sweep"),
           "leaving it in place invites it being wired back up")
-    bot = (BASE / "bot.py").read_text()
-    sweeper = bot[bot.index("def _sweeper"):]
-    sweeper = sweeper[:sweeper.index("\ndef ", 1)]
-    check("the six-hourly sweeper no longer deletes on age", "store.sweep(" not in bot)
+    tree = ast.parse((BASE / "bot.py").read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "store"]
+    check("the six-hourly sweeper no longer deletes on age",
+          not any(c.func.attr == "sweep" for c in calls))
+    sweeper = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                    and n.name == "_sweeper"), None)
+    forgets = [n for n in ast.walk(sweeper) if isinstance(n, ast.Call)
+               and isinstance(n.func, ast.Attribute) and n.func.attr == "forget_empty"]
     check("and tells the store which threads tasks point at",
-          "keep=" in sweeper and "thread" in sweeper)
+          bool(forgets) and all(any(kw.arg == "keep" for kw in c.keywords) for c in forgets),
+          "without `keep` it would delete a session a waiting task refers to")
 
 
 # --- work is proven, not believed ------------------------------------------------

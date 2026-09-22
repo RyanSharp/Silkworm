@@ -127,7 +127,7 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `APPROVAL_AUTO_ALLOW` | read-only tools | Tools that never need approval in `slack` mode |
 | `CLAUDE_TIMEOUT` | `0` | Absolute per-turn cap in seconds; `0` = none |
 | `CLAUDE_IDLE_TIMEOUT` | `1800` | Stop a turn after this long with **no output at all** |
-| `SESSION_MAX_AGE_DAYS` | `30` | Forget idle thread sessions after this long |
+| `SESSION_MAX_AGE_DAYS` | `30` | Forget *empty* idle thread records after this long. Anything with a title, summary, cost history, files or a task pointing at it is kept and retired by hiding instead |
 | `TASK_COMPACT_AFTER_DAYS` | `14` | Drop the reply text and event log from finished tasks after this long; the record, its cost and anything still needing you are kept |
 | `TASK_WORKERS` | `1` | How many queued tasks run at once (each is a Claude session) |
 
