@@ -482,10 +482,12 @@ never leaves the process. Either one saying "restricted" holds the filing.
 
 It is told that **finding nothing is a good outcome.** A pass that must produce
 something produces busywork, and busywork costs the scarcest thing here: a
-decision. Capped at five proposals for the same reason — a night that finds ten
-things has not prioritised. The cap lives where proposals are filed rather than
-in the prompt that asks for them: a run that miscounts, or decides its tenth
-finding is worth an exception, is refused at the sixth.
+decision. Capped at two proposals for the same reason — a night that finds ten
+things has not prioritised. It was five until the board reached 58 proposals and
+the nightly pass was found re-filing work it had already proposed, because
+nothing it filed could reach done. The cap lives where proposals are filed
+rather than in the prompt that asks for them: a run that miscounts, or decides
+its tenth finding is worth an exception, is refused at the third.
 
 Scheduling is checked against the wall clock rather than slept precisely to, so
 a bot restarted at 02:00 still runs the pass when it returns, and one that has

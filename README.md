@@ -403,7 +403,7 @@ before they can complete. Dismiss the rest.
 
 The reviewer is read-only by enforcement, not instruction: it can read and file
 proposals, and cannot edit, commit or push. It's told that finding nothing is a
-good outcome, and capped at five proposals — refused at the sixth, not merely
+good outcome, and capped at two proposals — refused at the third, not merely
 asked for. A pass that must produce something produces busywork, and busywork
 costs you a decision.
 

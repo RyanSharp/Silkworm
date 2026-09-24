@@ -21,10 +21,13 @@ import re
 #: stopped counting -- and every task costs a session, or two with review.
 MAX_PER_TURN = 10
 
-#: A night that finds ten things has not prioritised. Fewer, better. Enforced
-#: rather than asked for: the ideator runs unattended, so a run that miscounts
-#: would spend the one thing the whole gate protects -- a decision per proposal.
-MAX_PROPOSALS = 5
+#: A night that finds ten things has not prioritised. Fewer, better -- and
+#: five was still too many: unattended nights outran review until the board sat
+#: 58 proposals deep, 11 of 16 on one project re-proposing the same three jobs
+#: because none of them could reach done. Two. Enforced rather than asked for:
+#: the ideator runs unattended, so a run that miscounts would spend the one
+#: thing the whole gate protects -- a decision per proposal.
+MAX_PROPOSALS = 2
 
 #: Long enough to act on without the implementor guessing what you meant.
 MIN_GOAL_CHARS = 15
