@@ -3742,6 +3742,35 @@ def test_unmerged_branches():
           S.unmerged_note([]) == "",
           "a healthy project should not pay tokens for an empty list")
 
+    # The cut used to be `rows[:12]` over `survey`'s newest-first order, so a
+    # repo with twenty-two unmerged branches showed twelve and dropped the ten
+    # oldest -- the ones a nightly pass has had the most chances to re-derive,
+    # which is the entire point of the paragraph.
+    # Built newest-first, the order `survey` really hands over, so that a note
+    # which took the caller's order would drop the oldest ten here too.
+    many = [{"branch": f"silkworm/b{i:02d}", "commits": 1, "base": "main",
+             "title": f"fix number {i}", "updated": 1000 + i}
+            for i in reversed(range(S.MAX_LISTED + 10))]
+    check("the fixture is actually longer than the cap, and newest-first",
+          len(many) > S.MAX_LISTED
+          and many[0]["updated"] > many[-1]["updated"],
+          "otherwise the truncation is never exercised in the shape it broke in")
+    long_note = S.unmerged_note(many)
+    check("a list longer than the cap still names its oldest branches",
+          all(f"silkworm/b{i:02d}" in long_note for i in range(S.MAX_LISTED)),
+          "the cut has to fall on the newest, never on the oldest")
+    check("and says how many it left out rather than showing a slice as the whole",
+          "10 newer ones" in long_note and "not all of them" in long_note,
+          "the closing instruction reads as a claim about every unmerged branch")
+    check("a list that fits is not announced as cut",
+          "not listed here" not in S.unmerged_note(many[:S.MAX_LISTED]))
+    check("the order the caller happens to use cannot decide what is dropped",
+          S.unmerged_note(list(reversed(many))) == long_note,
+          "survey sorts newest-first for the dashboard; the note must not inherit it")
+    check("and the cap sits above any list this has actually had to print",
+          S.MAX_LISTED >= 40,
+          "at 12 it cut ten of this repo's twenty-two branches every night")
+
     bot = (BASE / "bot.py").read_text()
     ideate = bot[bot.index("def run_ideation"):bot.index("def _ideation_scheduler")]
     check("the nightly pass actually carries the list",

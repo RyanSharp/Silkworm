@@ -33,6 +33,16 @@ MAX_PROPOSALS = 2
 MIN_GOAL_CHARS = 15
 MAX_GOAL_CHARS = 4000
 
+#: A ceiling on a pathological list, not a budget for a real one. At 12 it cut
+#: ten of this repo's twenty-two unmerged branches, every night, in near
+#: silence -- and because the rows arrive newest-first the ten cut were the ten
+#: oldest, which are precisely the branches a nightly pass has had the most
+#: chances to re-derive. Forty is above any list we have actually seen, so the
+#: cut is a guard against a runaway board rather than a thing that happens.
+#: Worst case is a few thousand characters once a night, against a whole
+#: session and a reviewer spent re-implementing something already written down.
+MAX_LISTED = 40
+
 
 def limit_for(propose: bool = False) -> int:
     """How many tasks one turn may file, given what it is filing.
@@ -69,7 +79,7 @@ def _clip(title, width: int = 90) -> str:
     return title if len(title) <= width else title[:width - 1].rstrip() + "…"
 
 
-def unmerged_note(rows, limit: int = 12) -> str:
+def unmerged_note(rows, limit: int = MAX_LISTED) -> str:
     """Tell the nightly pass what is already fixed on a branch nobody merged.
 
     The ideator reads the base branch, which is the honest thing to read -- and
@@ -79,21 +89,38 @@ def unmerged_note(rows, limit: int = 12) -> str:
     implemented twice, each time costing a session and a reviewer, because the
     first branch never landed.
 
+    Ordered oldest-first here, against the newest-first order `survey` returns
+    for the dashboard, where the question is "what did last night leave?". This
+    paragraph asks the opposite question. A branch that has sat for a month has
+    given a month of nightly passes the chance to rediscover what is on it;
+    last night's branch was named in last night's reply. Taking the caller's
+    order meant a cut fell on the oldest rows -- the ones this whole paragraph
+    exists to protect -- so the order is decided here rather than inherited.
+
     Empty when there is nothing to say, so a healthy project pays no tokens
     for the paragraph.
     """
     if not rows:
         return ""
+    # Branch name breaks ties so two rows updated in the same second cannot
+    # swap places between nights and make the cut look arbitrary.
+    rows = sorted(rows, key=lambda r: ((r.get("updated") or 0),
+                                       r.get("branch") or ""))
     shown = rows[:limit]
     body = "\n".join(
         f"  - {r.get('branch') or '?'} ({r.get('commits') or 0} commit"
         f"{'s' if (r.get('commits') or 0) != 1 else ''}, off "
         f"{r.get('base') or 'the base'}) — {_clip(r.get('title'))}"
         for r in shown)
-    more = (f"\n  …and {len(rows) - len(shown)} more"
-            if len(rows) > len(shown) else "")
+    if len(rows) > len(shown):
+        # Said out loud for the same reason `board_note` says it: the closing
+        # instruction below reads as a claim about every unmerged branch there
+        # is, and a silent slice would make that claim false.
+        body += (f"\n  …and {len(rows) - len(shown)} newer ones, not listed "
+                 "here — treat this as a sample of the branches, not all of "
+                 "them")
     return ("Already done, and sitting on a branch that was never merged:\n\n"
-            f"{body}{more}\n\n"
+            f"{body}\n\n"
             "Those gaps are fixed on those branches and not on the base you "
             "are reading, so the code will look like it still has them. Check "
             "the branch before proposing anything it covers. If the only thing "
