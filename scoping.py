@@ -35,14 +35,24 @@ MAX_PROPOSALS = 2
 MIN_GOAL_CHARS = 15
 MAX_GOAL_CHARS = 4000
 
-#: A ceiling on a pathological list, not a budget for a real one. At 12 it cut
-#: ten of the twenty-two unmerged branches this repo held when it was measured,
-#: every night -- and because the rows arrive newest-first the ten cut were the
-#: ten oldest, which are precisely the branches a nightly pass has had the most
-#: chances to re-derive. Forty is above any list we have actually seen, so the
-#: cut is a guard against a runaway board rather than a thing that happens.
-#: Worst case is a few thousand characters once a night, against a whole
-#: session and a reviewer spent re-implementing something already written down.
+#: A ceiling on a pathological list, not a budget for a real one, and one
+#: ceiling for every list the nightly pass is shown: the unmerged branches
+#: below, and the open and dismissed items in `board_note`. Both of the lower
+#: numbers tried cut precisely the rows worth keeping. At 12 it cut ten of the
+#: twenty-two unmerged branches this repo held when it was measured; at 20 it
+#: cut six of trader's twenty-six open items, two of the seven duplicate
+#: gauntlet proposals these notes exist to stop. Both times the cut fell at the
+#: tail, and because the rows arrive newest-first the ones dropped were the
+#: oldest -- precisely the ones a nightly pass has had the most chances to
+#: re-derive, and the same ones every night, for ever. Forty is above any list
+#: we have actually seen, so the cut is a guard against a runaway board rather
+#: than a thing that happens; each list is capped separately, so a long backlog
+#: cannot push every dismissal out; and when one is cut the note says how many
+#: are missing rather than presenting a slice as the whole board. Worst case is
+#: a few thousand characters once a night, against a whole session and a
+#: reviewer spent re-implementing something already written down -- which is
+#: also why this is not bounded by MAX_GOAL_CHARS: that limit is about a goal a
+#: person has to act on, and this is a prompt nobody files.
 MAX_LISTED = 40
 
 
@@ -142,18 +152,9 @@ OPEN_STATES = tuple(s for s in tasks.STATES if s not in tasks.TERMINAL)
 #: wear you down by refiling; short enough that "not now" is not "never".
 DISMISSAL_MEMORY_DAYS = 30
 
-#: A ceiling on a pathological board, not a budget for a real one. Set at 20
-#: it cut six of trader's twenty-six open items -- including two of the seven
-#: duplicate gauntlet proposals this whole paragraph exists to stop, which the
-#: pass would then have re-derived for ever, since the cut is at the tail and
-#: the same six are oldest every night. Both lists are capped separately, so a
-#: long backlog cannot push every dismissal out; and when either is cut, the
-#: note says how many are missing rather than presenting a slice as the whole
-#: board. Worst case is a few thousand characters once a night, against a whole
-#: session wasted re-deriving one proposal -- which is why this is not bounded
-#: by MAX_GOAL_CHARS: that limit is about a goal a person has to act on, and
-#: this is a prompt nobody files.
-MAX_LISTED = 40
+#: How much of a task's name a listing slot is worth. MAX_LISTED, which caps
+#: how many slots there are, is shared with the branch list and so is defined
+#: with the other budgets at the top of this module.
 MAX_NAME_CHARS = 100
 
 

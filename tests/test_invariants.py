@@ -3913,13 +3913,28 @@ def test_unmerged_branches():
           S.MAX_LISTED >= 40,
           "at 12 it cut ten of this repo's twenty-two branches every night")
 
-    # MAX_LISTED is deliberately shared between this note and `board_note`,
-    # which arrived on a different branch. Two branches naming the same
-    # constant merge without a conflict and leave two bindings of it, which
-    # git will not say a word about -- so say it here instead.
+    # MAX_LISTED is deliberately shared between this note and `board_note`.
+    # They were written on two branches, each of which defined the constant
+    # itself, and git merged the two disjoint hunks without a word: the
+    # consolidated tree had two bindings of MAX_LISTED forty lines apart, the
+    # second silently shadowing the first for every reader, while the default
+    # argument of unmerged_note stayed compiled against the first. Identical
+    # that day, free to drift any day after, and nothing would have said so.
+    #
+    # Every spelling of a module-level binding counts, not just the bare one.
+    # `MAX_LISTED: int = 40` parses as a different node, and
+    # `MAX_LISTED, MAX_NAME_CHARS = 40, 100` hides the names inside a tuple
+    # target -- which is not a hypothetical, because those two constants sat
+    # next to each other before this and pairing them is the obvious thing to
+    # write. So walk the targets for stored names rather than matching a shape.
     tree = ast.parse((BASE / "scoping.py").read_text())
-    names = [t.id for n in tree.body if isinstance(n, ast.Assign)
-             for t in n.targets if isinstance(t, ast.Name)]
+    names = []
+    for node in tree.body:
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) else [])
+        for target in targets:
+            names += [n.id for n in ast.walk(target)
+                      if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
     check("no constant in scoping.py is defined twice",
           len(names) == len(set(names)),
           f"defined more than once: {sorted({n for n in names if names.count(n) > 1})}")
