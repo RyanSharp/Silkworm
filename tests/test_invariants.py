@@ -3745,9 +3745,9 @@ def test_unmerged_branches():
     # The cut used to be `rows[:12]` over `survey`'s newest-first order, so a
     # repo with twenty-two unmerged branches showed twelve and dropped the ten
     # oldest -- the ones a nightly pass has had the most chances to re-derive,
-    # which is the entire point of the paragraph.
-    # Built newest-first, the order `survey` really hands over, so that a note
-    # which took the caller's order would drop the oldest ten here too.
+    # which is the entire point of the paragraph. So the fixture is built
+    # newest-first, the order `survey` really hands over: a note that took its
+    # caller's order would lose the oldest ten here exactly as it did there.
     many = [{"branch": f"silkworm/b{i:02d}", "commits": 1, "base": "main",
              "title": f"fix number {i}", "updated": 1000 + i}
             for i in reversed(range(S.MAX_LISTED + 10))]
@@ -3770,6 +3770,17 @@ def test_unmerged_branches():
     check("and the cap sits above any list this has actually had to print",
           S.MAX_LISTED >= 40,
           "at 12 it cut ten of this repo's twenty-two branches every night")
+
+    # MAX_LISTED is deliberately shared between this note and `board_note`,
+    # which arrived on a different branch. Two branches naming the same
+    # constant merge without a conflict and leave two bindings of it, which
+    # git will not say a word about -- so say it here instead.
+    tree = ast.parse((BASE / "scoping.py").read_text())
+    names = [t.id for n in tree.body if isinstance(n, ast.Assign)
+             for t in n.targets if isinstance(t, ast.Name)]
+    check("no constant in scoping.py is defined twice",
+          len(names) == len(set(names)),
+          f"defined more than once: {sorted({n for n in names if names.count(n) > 1})}")
 
     bot = (BASE / "bot.py").read_text()
     ideate = bot[bot.index("def run_ideation"):bot.index("def _ideation_scheduler")]

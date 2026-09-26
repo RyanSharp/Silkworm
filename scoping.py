@@ -34,9 +34,9 @@ MIN_GOAL_CHARS = 15
 MAX_GOAL_CHARS = 4000
 
 #: A ceiling on a pathological list, not a budget for a real one. At 12 it cut
-#: ten of this repo's twenty-two unmerged branches, every night, in near
-#: silence -- and because the rows arrive newest-first the ten cut were the ten
-#: oldest, which are precisely the branches a nightly pass has had the most
+#: ten of the twenty-two unmerged branches this repo held when it was measured,
+#: every night -- and because the rows arrive newest-first the ten cut were the
+#: ten oldest, which are precisely the branches a nightly pass has had the most
 #: chances to re-derive. Forty is above any list we have actually seen, so the
 #: cut is a guard against a runaway board rather than a thing that happens.
 #: Worst case is a few thousand characters once a night, against a whole
