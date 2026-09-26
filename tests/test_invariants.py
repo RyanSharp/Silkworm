@@ -1268,6 +1268,43 @@ def test_landing():
           W.base_ref(repo, fetch=False) == "origin/HEAD",
           "ahead is not the same as diverged")
 
+    # ...which is the one state that tells the two halves of the lockout fix
+    # apart. While the base is merely *ahead*, `base_ref` returns the local
+    # branch and the rebase target is the same commit either way, so the case
+    # above passes with either half reverted. Diverged, `base_ref` rightly
+    # names the remote -- and rebasing onto it would leave the branch off a
+    # commit the base is not descended from, which `--ff-only` cannot take.
+    # Only reading the commit off the checkout survives this.
+    #
+    # The divergence is built here rather than inherited from the refused push
+    # above. Reverting the rebase target makes that push *succeed*, which puts
+    # the two refs back in step -- so the case would have failed on its own
+    # fixture instead of on its claim, and said nothing about the fix.
+    g(repo, "commit", "-q", "--allow-empty", "-m", "only here")
+    mine = root / "mine"
+    g(repo, "worktree", "add", "-q", "--detach", str(mine), "origin/main")
+    g(mine, "commit", "-q", "--allow-empty", "-m", "only on origin")
+    g(mine, "push", "-q", "origin", "HEAD:main")
+    g(repo, "fetch", "-q", "origin")
+    check("the base and origin each hold what the other does not",
+          g(repo, "merge-base", "--is-ancestor", "origin/main",
+            "main").returncode != 0 and
+          g(repo, "merge-base", "--is-ancestor", "main",
+            "origin/main").returncode != 0,
+          "this case needs a genuine divergence, not merely being ahead")
+    check("and base_ref names the remote, as a diverged base should",
+          W.base_ref(repo, fetch=False) == "origin/HEAD")
+    dv = branch_from("dv", "main")
+    check("the branch is not descended from the ref base_ref names",
+          g(repo, "merge-base", "--is-ancestor", "origin/main", "dv").returncode != 0,
+          "otherwise rebasing onto the remote would work and prove nothing")
+    r = M.land(dv, repo, "dv", "", tests)
+    check("a landing onto a diverged base still merges into the local commit",
+          r["landed"], f"refused at {r.get('stage')}: {str(r.get('detail'))[:200]}")
+    check("and the base is that branch, not the remote's tip",
+          g(repo, "rev-parse", "HEAD").stdout.strip() ==
+          g(repo, "rev-parse", "dv").stdout.strip())
+
     # A push can also fail *after* the remote accepted it, and a push that
     # times out may or may not have taken. Resetting then would drop a commit
     # that is already published -- a worse mess than the one this prevents --
@@ -1329,6 +1366,35 @@ def test_landing():
           g(repo, "rev-parse", "HEAD").stdout.strip() ==
           g(repo, "rev-parse", "boom").stdout.strip(),
           "otherwise the case is not exercising a landing that already merged")
+
+    # The base's *name* is not only a label: publishing pushes it. Resolving it
+    # by taking the last path segment made a base of `research/main` read as
+    # `main`, which in a checkout parked on main passed the is-it-on-the-base
+    # guard by comparing "main" against "main" -- and then merged and pushed
+    # `main`, the wrong branch on a shared remote, reported as a clean landing.
+    # Measured exactly that way. The survey's resolver had already been fixed
+    # for slashed names; this is the second copy of it that had not.
+    g(repo, "fetch", "-q", "origin")
+    g(repo, "reset", "-q", "--hard", "origin/main")
+    g(repo, "branch", "-f", "research/main", "HEAD~1")
+    g(repo, "push", "-q", "-u", "origin", "research/main")
+    was_main = g(repo, "rev-parse", "main").stdout.strip()
+    was_slashed = g(repo, "rev-parse", "research/main").stdout.strip()
+    check("the fixture's two branches really are different commits",
+          was_main != was_slashed,
+          "otherwise pushing the wrong one is indistinguishable")
+    slashed = branch_from("slashed", "research/main")
+    r = M.land(slashed, repo, "slashed", "research/main", tests, publish=True)
+    check("a base whose name holds a slash is not chopped to its last segment",
+          not r["landed"] and r["stage"] == "base-branch",
+          f"got {r.get('stage')}/{r.get('base')}: {str(r.get('detail'))[:200]}")
+    check("and the refusal names the base in full",
+          "research/main" in r.get("detail", ""), str(r.get("detail"))[:200])
+    check("so the branch that merely shares its last segment is untouched",
+          g(repo, "rev-parse", "main").stdout.strip() == was_main and
+          g(repo, "ls-remote", "origin",
+            "refs/heads/main").stdout.split()[0] == was_main,
+          "it would otherwise have been merged and pushed instead")
 
     g(repo, "remote", "remove", "origin")
 
@@ -3599,6 +3665,40 @@ def test_unmerged_branches():
           set(B.base_for(repo, "")[0])
           == {"refs/heads/main", "refs/remotes/origin/main"},
           f"got {B.base_for(repo, '')[0]}")
+
+    # Neither case above needs *both* copies on its own: while the base is
+    # merely ahead, `base_ref` already names the local branch, and while it is
+    # merely behind, the remote it names is the copy holding the work. It is a
+    # base that has *diverged* -- each copy holding something the other does
+    # not -- that separates the two. There the remote is rightly named, and the
+    # work sits on the local copy alone, so measuring against the named ref by
+    # itself invents a stranded branch that is already merged.
+    # Cut by hand off the *local* branch. `work` goes through `base_ref`, which
+    # at this point rightly names origin -- and a branch cut from there merges
+    # into main by fast-forwarding past origin's tip, which would leave the two
+    # in step rather than diverged.
+    fff = root / "fff"
+    git(repo, "worktree", "add", "-q", "-b", "silkworm/tsk_fff", str(fff), "main")
+    (fff / "fff.txt").write_text("f")
+    git(fff, "add", "-A"); git(fff, "commit", "-qm", "work tsk_fff")
+    git(repo, "worktree", "remove", str(fff))
+    git(repo, "merge", "--ff-only", "-q", "silkworm/tsk_fff")
+    check("the base and origin each hold what the other does not",
+          git(repo, "merge-base", "--is-ancestor",
+              "origin/main", "main").returncode != 0
+          and git(repo, "merge-base", "--is-ancestor",
+                  "main", "origin/main").returncode != 0,
+          "without a real divergence one ref would answer this correctly")
+    check("and the ref the base is named by is not the copy holding the work",
+          W.base_ref(repo, fetch=False) == "origin/HEAD"
+          and git(repo, "merge-base", "--is-ancestor",
+                  "silkworm/tsk_fff", "origin/main").returncode != 0
+          and git(repo, "merge-base", "--is-ancestor",
+                  "silkworm/tsk_fff", "main").returncode == 0,
+          "otherwise the named ref alone would still give the right answer")
+    check("work merged into a diverged base is not reported as stranded",
+          B.survey([finished("tsk_fff")]) == [],
+          "one ref cannot answer this; both copies have to be measured")
 
     # A name that is ambiguous -- a branch and a tag sharing it -- makes
     # `rev-parse --symbolic-full-name` exit zero with nothing to say. That used

@@ -32,6 +32,7 @@ missing test command all stop the landing and hand it back with a reason.
 import logging
 import subprocess
 
+import branches
 import worktrees
 
 log = logging.getLogger("silkworm.merge")
@@ -114,11 +115,21 @@ def land(worktree, repo, branch: str, base: str, run_tests,
                      "no base branch could be resolved: this repository has no "
                      "main, no master and no remote to ask. Name one in the "
                      "project's scope to land work here.")
-    # `origin/HEAD` is a symbolic ref: splitting it on "/" gives "HEAD", not
-    # the branch it points at, so the checkout-is-on-the-base check compared
-    # "main" against "HEAD" and refused. Resolve it to the real name first.
-    resolved = _git(repo, "rev-parse", "--abbrev-ref", ref).stdout.strip()
-    base_name = (resolved or ref).split("/")[-1] or "main"
+    # Named the way the unmerged survey names it, rather than by a second copy
+    # of the same resolution. Both had to cope with `origin/HEAD` being a
+    # symbolic ref -- splitting it on "/" gives "HEAD", not the branch it
+    # points at, which refused a landing once -- and only one of them was ever
+    # fixed for the other half: a branch name may hold slashes, so taking the
+    # last segment turned a base of `origin/research/point-in-time-universe`
+    # into `universe`.
+    #
+    # That divergence is worse here than it was in the survey, because this
+    # name is not only a label. It is the branch that gets pushed. A project
+    # based on `research/main`, in a checkout parked on `main`, passed the
+    # guard below comparing "main" against "main" and then merged and pushed
+    # `main` -- the wrong branch, on a shared remote, reported as a clean
+    # landing. Measured exactly that way before this line changed.
+    base_name = branches.base_name(repo, ref)
     on = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if on != base_name:
         return _fail("base-branch",
@@ -142,6 +153,17 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     # commit. That holds whether or not the project publishes: publishing makes
     # the two refs agree *usually*, which would only turn a permanent lockout
     # into an intermittent one.
+    #
+    # `base_ref` no longer prefers the remote while the local branch is ahead
+    # of it, which closes that lockout a second time and from the other end --
+    # so the paragraph above describes a failure this line can no longer reach
+    # through `base_ref` alone. It stays because the two fixes cover different
+    # ground. A base that has *diverged* from its remote, one moved by a person
+    # between the fetch and here, or a `_local_if_ahead` whose git calls failed
+    # and so fell back to the remote, all still hand back a ref that is not the
+    # commit `git merge --ff-only` will merge into. Reading the commit once, off
+    # the checkout being merged into, is the only form of that answer which
+    # cannot be wrong.
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
     if not before:
         return _fail("base-branch",
