@@ -118,7 +118,13 @@ def thread_url(thread: str, base: str) -> str:
 
 
 def _text(t: str) -> dict:
-    return {"type": "mrkdwn", "text": t[:3000]}
+    """A mrkdwn object within Slack's 3000 characters. Cut at a line break
+    where there is one: escaping can grow text fivefold, and a blind cut can
+    land inside an `&amp;` or a `<url|name>` link and render as debris."""
+    if len(t) > 3000:
+        cut = t.rfind("\n", 0, 2990)
+        t = (t[:cut] if cut > 0 else t[:2990]) + "\n…"
+    return {"type": "mrkdwn", "text": t}
 
 
 def _button(text, action, tid, style=None, confirm=None, url=None) -> dict:
@@ -181,7 +187,9 @@ def _task_blocks(task: dict, now: float, base_url: str) -> list[dict]:
         body += "\n" + detail
     blocks = [{"type": "section", "block_id": f"t:{tid}", "text": _text(body)},
               {"type": "context", "elements": [_text(" · ".join(meta))]}]
-    buttons = [_button(*b[:2], tid, style=b[2], confirm=b[3])
+    # The value carries the state the button was drawn for; see seen_state().
+    stamp = f"{tid}|{task.get('state', '')}"
+    buttons = [_button(*b[:2], stamp, style=b[2], confirm=b[3])
                for b in BUTTONS.get(task.get("state"), [])]
     url = thread_url(task.get("thread", ""), base_url)
     if url:
@@ -277,6 +285,20 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     return {"type": "home", "blocks": blocks[:MAX_BLOCKS]}
 
 
+def seen_state(value: str) -> tuple[str, str]:
+    """(task id, the state it was in when its button was drawn).
+
+    A published view stays as it was until it is published again, and the
+    lifecycle lets a running task go back to queued or on to done. Clicked
+    later, a button drawn for `failed` would requeue a task that is by then
+    running -- a second agent in the same checkout -- and one drawn for
+    `awaiting_approval` would close a rerun. So a click is only acted on if
+    the task is still where you saw it.
+    """
+    tid, _, state = (value or "").partition("|")
+    return tid, state
+
+
 def rework_modal(task: dict, answer: bool) -> dict:
     """The notes prompt for Send back / Answer.
 
@@ -291,7 +313,8 @@ def rework_modal(task: dict, answer: bool) -> dict:
               "automatically; leave blank to send back with just those.")
     return {
         "type": "modal", "callback_id": MODAL_CALLBACK,
-        "private_metadata": json.dumps({"id": tid, "answer": answer}),
+        "private_metadata": json.dumps({"id": tid, "answer": answer,
+                                        "seen": task.get("state", "")}),
         "title": {"type": "plain_text", "text": "Answer" if answer else "Send back"},
         "submit": {"type": "plain_text", "text": "Send"},
         "close": {"type": "plain_text", "text": "Cancel"},
@@ -389,11 +412,13 @@ class Home:
         user = body["user"]["id"]
         act = body["actions"][0]
         action = act["action_id"].removeprefix("home_")
-        tid = act.get("value", "")
+        tid, seen = seen_state(act.get("value", ""))
         if not self.allowed(user):
             return self.publish(client, user)
         if action not in DIRECT:
             return
+        if self.moved_on(user, tid, seen):
+            return self.publish(client, user)
         try:
             r = self.call({"action": action, "id": tid, "by": f"slack:{user}"})
         except Exception as e:
@@ -408,11 +433,14 @@ class Home:
         act = body["actions"][0]
         if not self.allowed(user):
             return self.publish(client, user)
-        task = self.store.get(act.get("value", ""))
+        tid, seen = seen_state(act.get("value", ""))
+        task = self.store.get(tid)
         if not task:
             self.note(user, ":warning: That task no longer exists.")
             return self.publish(client, user)
-        task = dict(task, id=act["value"])
+        if self.moved_on(user, tid, seen):
+            return self.publish(client, user)
+        task = dict(task, id=tid)
         try:
             client.views_open(trigger_id=body["trigger_id"],
                               view=rework_modal(task, act["action_id"] == "home_answer"))
@@ -431,6 +459,9 @@ class Home:
                        errors={"notes": "An answer is needed to resume the task."})
         ack()
         tid = meta.get("id", "")
+        # The form can sit open for minutes; check again on the way out.
+        if self.moved_on(user, tid, meta.get("seen", "")):
+            return self.publish(client, user)
         try:
             r = self.call({"action": "rework", "id": tid, "notes": notes,
                            "by": f"slack:{user}"})
@@ -439,6 +470,15 @@ class Home:
             r = {"ok": False, "error": str(e)}
         self.note(user, self.outcome("answer" if meta.get("answer") else "rework", tid, r))
         self.publish(client, user)
+
+    def moved_on(self, user: str, tid: str, seen: str) -> bool:
+        """True, with a note to the user, if the task left `seen`."""
+        now = (self.store.get(tid) or {}).get("state")
+        if not seen or now == seen:
+            return False
+        self.note(user, f":arrows_counterclockwise: `{esc(tid)}` has moved on — it "
+                        f"is {esc(now or 'gone')} now, not {esc(seen)}. Nothing was done.")
+        return True
 
     @staticmethod
     def outcome(action: str, tid: str, r: dict) -> str:

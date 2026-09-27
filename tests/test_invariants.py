@@ -5695,6 +5695,38 @@ def test_home_tab():
     check("closing the form does nothing: no close handler is asked for",
           not modal.get("notify_on_close"))
 
+    # A Home view is not re-rendered until you open it again, and running may
+    # legally move to queued or done. So a button rendered for one state and
+    # clicked in another must be refused, or a stale Retry requeues work that
+    # is running -- two agents on one checkout -- and a stale Approve closes it.
+    fl = store.create("a task that failed once", state=T.QUEUED)["id"]
+    store.transition(fl, T.RUNNING); store.transition(fl, T.FAILED)
+    shown = h.view_for("U_ME")
+    retry = next(e for b in shown["blocks"] if b.get("block_id") == f"a:{fl}"
+                 for e in b["elements"] if e["action_id"] == "home_retry")
+    store.transition(fl, T.QUEUED); store.transition(fl, T.RUNNING)   # retried elsewhere
+    before = len(calls)
+    h.on_direct(ack, {"user": {"id": "U_ME"}, "trigger_id": "t",
+                      "actions": [{"action_id": "home_retry", "value": retry["value"]}]}, c)
+    check("a stale button does not act on a task that has moved on",
+          len(calls) == before and store.get(fl)["state"] == T.RUNNING)
+    check("and says so", "moved on" in texts(c.published[-1][1]))
+    aw = store.create("work to approve", state=T.QUEUED)["id"]
+    store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
+    shown = h.view_for("U_ME")
+    rework = next(e for b in shown["blocks"] if b.get("block_id") == f"a:{aw}"
+                  for e in b["elements"] if e["action_id"] == "home_rework")
+    h.on_modal(ack, {"user": {"id": "U_ME"}, "trigger_id": "t",
+                     "actions": [{"action_id": "home_rework", "value": rework["value"]}]}, c)
+    form = c.opened[-1]
+    store.transition(aw, T.DONE)                                      # approved elsewhere
+    before = len(calls)
+    h.on_submit(ack, {"user": {"id": "U_ME"}}, c,
+                {"private_metadata": form["private_metadata"],
+                 "state": {"values": {"notes": {"notes": {"value": "redo it"}}}}})
+    check("a send-back form opened before it was approved does not reopen it",
+          len(calls) == before and store.get(aw)["state"] == T.DONE)
+
     h.on_opened({"tab": "messages", "user": "U_ME"}, c)
     n = len(c.published)
     h.on_opened({"tab": "home", "user": "U_ME"}, c)

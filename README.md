@@ -493,6 +493,27 @@ session has a Slack thread and shows in the visualizer from the moment it
 starts. Exit the terminal and the thread reclaims itself; reply in Slack to
 keep going. If the bot is down, the session starts untracked.
 
+## The task board in Slack
+
+Away from the house, the dashboard is out of reach -- and it is where decisions
+wait. The app's **Home tab** carries the same "what needs me" board: work
+awaiting approval (with the reviewer's findings), tasks that asked you
+something, failures and proposals, then what is running and what is scheduled
+to wake. Open it by clicking the app's name in Slack, on any device.
+
+Its buttons are the dashboard's, state for state, and go through the same
+route, so Approve still lands the branch and Cancel still stops a running
+agent. Approve and Dismiss ask first. A button only acts if the task is still
+in the state it was drawn for; if it has moved on since, the tab says so and
+does nothing. People off `SLACK_ALLOWED_USERS` see none of it.
+
+It is the attention view, not the backlog: a large board is cut to fit Slack's
+limits and says how many are left for the dashboard.
+
+Needs `home_tab_enabled` and the `app_home_opened` event, both in
+`manifest.json`; an app created from an older manifest needs the new one pasted
+in (below).
+
 ## Reaching the dashboard from another machine
 
 The visualizer binds `127.0.0.1` only, and it should stay that way: it has no
