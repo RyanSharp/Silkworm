@@ -5522,6 +5522,186 @@ def test_state_files_have_one_reader_and_one_writer():
 
 
 
+
+# --- the Home tab: the task board, away from the local network ---------------
+# The dashboard binds loopback, so decisions that waited on it waited until you
+# were home. The Home tab is the same board in Slack. What must not happen is
+# for the two to disagree about what a click may do, for the board to leak to
+# someone off the allowlist, or for an oversized backlog to make Slack refuse
+# the whole view and show nothing.
+
+def test_home_tab():
+    import home
+    import tasks as T
+    print("\nthe Home tab")
+
+    class Client:
+        def __init__(self):
+            self.published, self.opened = [], []
+        def views_publish(self, user_id, view):
+            self.published.append((user_id, view))
+        def views_open(self, trigger_id, view):
+            self.opened.append(view)
+
+    def texts(view):
+        return json.dumps(view, ensure_ascii=False)
+
+    def buttons(view, tid):
+        for b in view["blocks"]:
+            if b.get("block_id") == f"a:{tid}":
+                return [e["action_id"].removeprefix("home_") for e in b["elements"]]
+        return []
+
+    now = time.time()
+    def rec(tid, state, **kw):
+        return {"id": tid, "state": state, "goal": f"goal of {tid}",
+                "updated": now - 3600, "created": now - 7200, **kw}
+
+    board = [rec("tsk_prop", T.PROPOSED), rec("tsk_aw", T.AWAITING_APPROVAL,
+                 result={"review": {"summary": "looks close",
+                                    "findings": ["one", "two", "three", "four"]}},
+                 verified=True),
+             rec("tsk_in", T.NEEDS_INPUT), rec("tsk_fail", T.FAILED,
+                 events=[{"kind": "failed", "detail": "claude exited (code 143)"}]),
+             rec("tsk_run", T.RUNNING), rec("tsk_done", T.DONE)]
+    view = home.render(board, now=now)
+
+    # Parity with the dashboard. Its taskButtons() is the other place a state
+    # decides what you may do; read it rather than restate it here.
+    js = (BASE / "visualizer.py").read_text()
+    fn = js[js.index("function taskButtons(t)"):]
+    fn = fn[:fn.index("return b.join")]
+    dash = {}
+    for cond, body in _re.findall(r'(?:if|else if) \(([^)]*)\) \{(.*?)\n  \}', fn, _re.S):
+        acts = _re.findall(r"taskAction\('\$\{t\.id\}','(\w+)'\)", body)
+        acts += ["answer" if flag == "true" else "rework"
+                 for flag in _re.findall(r"sendBack\('\$\{t\.id\}',(true|false)\)", body)]
+        for st in _re.findall(r't\.state === "(\w+)"', cond):
+            dash[st] = set(acts)
+    check("the dashboard's buttons were read", len(dash) >= 5, str(dash))
+    for st, acts in dash.items():
+        mine = {a for _, a, _, _ in home.BUTTONS.get(st, [])}
+        check(f"{st}: same actions as the dashboard", mine == acts,
+              f"home {sorted(mine)} vs dashboard {sorted(acts)}")
+
+    # Every action a button sends must be one handle_tasks actually handles,
+    # or the click comes back "unknown action" on your phone.
+    src = (BASE / "bot.py").read_text()
+    ht = src[src.index("def handle_tasks("):src.index("def handle_projects(")]
+    handled = set(_re.findall(r'action == "(\w+)"', ht))
+    for tup in _re.findall(r'action in \(([^)]*)\)', ht):
+        handled |= set(_re.findall(r'"(\w+)"', tup))
+    for a in home.DIRECT + ("rework",):
+        check(f"handle_tasks handles {a!r}", a in handled)
+
+    check("awaiting approval offers approve / send back / dismiss",
+          buttons(view, "tsk_aw") == ["approve", "rework", "dismiss"])
+    check("needs input offers answer", "answer" in buttons(view, "tsk_in"))
+    check("approve asks before landing", any(
+        e.get("confirm") for b in view["blocks"] if b.get("block_id") == "a:tsk_aw"
+        for e in b["elements"] if e["action_id"] == "home_approve"))
+    s = texts(view)
+    check("the review is shown before you approve", "looks close" in s and "one" in s)
+    check("findings beyond three are counted, not dropped", "1 more finding" in s)
+    check("why it failed is shown", "code 143" in s)
+    check("running work is listed", "goal of tsk_run" in s)
+    check("finished work is not on the board", "tsk_done" not in s)
+    order = [b["block_id"][2:] for b in view["blocks"] if b.get("block_id", "").startswith("t:")]
+    check("most urgent first: approval, input, failed, proposed",
+          order == ["tsk_aw", "tsk_in", "tsk_fail", "tsk_prop"], str(order))
+
+    # Goals are arbitrary text. Unescaped, one containing <!channel> would be
+    # a live mention in the view.
+    evil = home.render([rec("tsk_x", T.PROPOSED, title="ping <!channel> & <http://x|y>")], now=now)
+    s = texts(evil)
+    check("goals are escaped for mrkdwn", "<!channel>" not in s and "&lt;!channel&gt;" in s)
+
+    # Slack rejects a Home view over 100 blocks -- the whole view, not the
+    # tail -- so a large backlog must be cut, and the cut must be counted.
+    many = [rec(f"tsk_{i:03}", T.PROPOSED) for i in range(300)]
+    big = home.render(many + [rec("tsk_r", T.RUNNING)], now=now,
+                      watching=[{"goal": "w", "in_s": 60}], unmerged="67 finished tasks")
+    shown = sum(1 for b in big["blocks"] if b.get("block_id", "").startswith("t:"))
+    m = _re.search(r"…and (\d+) more waiting", texts(big))
+    check("a huge backlog stays under Slack's 100-block limit", len(big["blocks"]) <= 100,
+          str(len(big["blocks"])))
+    check("and says how many it left out", bool(m) and shown + int(m.group(1)) == 300,
+          f"shown {shown}, overflow {m and m.group(1)}")
+    s = texts(big)
+    check("the tail sections survive a full board",
+          "Running" in s and "Watching" in s and "67 finished tasks" in s)
+    for b in big["blocks"]:
+        ids = [e["action_id"] for e in b.get("elements", []) if "action_id" in e]
+        if len(ids) != len(set(ids)):
+            check("action ids unique within a block", False, str(ids)); break
+        if len(json.dumps(b.get("text", {}))) > 3100:
+            check("section text within Slack's limit", False); break
+
+    check("an empty board says so", "Nothing needs you" in texts(home.render([], now=now)))
+    check("unknown age is not fifty years", home.ago(0, now) == "?")
+    check("an overdue wake-up says so", home.until(-30) == "due now")
+    check("thread links from channel:ts", home.thread_url("D1:1790.25", "https://x.slack.com/")
+          == "https://x.slack.com/archives/D1/p179025")
+
+    # --- clicks, through the real handle_tasks and a real store ---------------
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
+                       stop_task=lambda tid: False, start_landing=lambda tid: None)
+    prop = store.create("a proposal worth accepting", state=T.PROPOSED)["id"]
+    need = store.create("a task that asked a question", state=T.QUEUED)["id"]
+    store.transition(need, T.RUNNING); store.transition(need, T.NEEDS_INPUT)
+    calls = []
+    def call(p):
+        calls.append(p)
+        return ns["handle_tasks"](p)
+
+    h = home.Home(store=store, call=call, allowed_users={"U_ME"})
+    c = Client()
+    click = lambda user, action, tid: {"user": {"id": user}, "trigger_id": "trig",
+                                       "actions": [{"action_id": f"home_{action}", "value": tid}]}
+    acked = []
+    ack = lambda *a, **k: acked.append(k)
+
+    h.on_direct(ack, click("U_STRANGER", "accept", prop), c)
+    check("someone off the allowlist cannot act", not calls
+          and store.get(prop)["state"] == T.PROPOSED)
+    check("and is shown nothing of the board",
+          "a proposal worth" not in texts(c.published[-1][1]))
+
+    h.on_direct(ack, click("U_ME", "accept", prop), c)
+    check("Accept moves the real task to queued", store.get(prop)["state"] == T.QUEUED)
+    check("attributed to the Slack user", "slack:U_ME" in json.dumps(store.get(prop)["events"]))
+    check("the result is shown at the top of the tab",
+          "Accepted" in texts(c.published[-1][1]))
+
+    h.on_direct(ack, click("U_ME", "accept", prop), c)          # already queued
+    h.on_direct(ack, click("U_ME", "dismiss", "tsk_nope"), c)
+    check("a refused click says why rather than failing silently",
+          "Couldn't dismiss" in texts(c.published[-1][1]))
+
+    h.on_modal(ack, click("U_ME", "answer", need), c)
+    modal = c.opened[-1]
+    check("Answer opens a form", modal["callback_id"] == home.MODAL_CALLBACK)
+    submit = lambda notes: {"private_metadata": modal["private_metadata"],
+                            "state": {"values": {"notes": {"notes": {"value": notes}}}}}
+    before = len(calls); acked.clear()
+    h.on_submit(ack, {"user": {"id": "U_ME"}}, c, submit("  "))
+    check("a blank answer is refused in the form", len(calls) == before
+          and acked and acked[-1].get("response_action") == "errors")
+    h.on_submit(ack, {"user": {"id": "U_ME"}}, c, submit("use the second option"))
+    t = store.get(need)
+    check("an answer requeues the task with it", t["state"] == T.QUEUED
+          and "use the second option" in t["goal"])
+    check("closing the form does nothing: no close handler is asked for",
+          not modal.get("notify_on_close"))
+
+    h.on_opened({"tab": "messages", "user": "U_ME"}, c)
+    n = len(c.published)
+    h.on_opened({"tab": "home", "user": "U_ME"}, c)
+    check("opening the Home tab publishes it; the Messages tab does not",
+          len(c.published) == n + 1)
+
+
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
@@ -5543,6 +5723,7 @@ if __name__ == "__main__":
               test_dashboard_js_is_whole,
               test_discarding_a_branch_keeps_it, test_task_retention,
               test_atomic_persistence,
+              test_home_tab,
         test_state_files_have_one_reader_and_one_writer):
         try:
             t()

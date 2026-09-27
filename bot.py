@@ -35,6 +35,7 @@ import credentials
 import defer
 import email_ingest
 import harvester
+import home
 import jsonstore
 import learnings_git
 import repos
@@ -1068,7 +1069,10 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
 # --- Main handler ---------------------------------------------------------------
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
-BOT_USER_ID = app.client.auth_test()["user_id"]
+_AUTH = app.client.auth_test()
+BOT_USER_ID = _AUTH["user_id"]
+# The workspace URL, for linking a task to its thread from the Home tab.
+TEAM_URL = _AUTH.get("url", "")
 
 def handle_status(payload: dict) -> dict:
     """Route for /status — thread runtime state for the visualizer."""
@@ -1758,6 +1762,15 @@ if CLAUDE_APPROVAL_MODE == "slack":
         resolve_thread=_resolve_thread)
     approvals.register(app)
     server.route("/approve", approvals.handle_request)
+
+# The task board in the app's Home tab, for when the dashboard is out of reach.
+# Its buttons call handle_tasks, the dashboard's own route, so the two cannot
+# disagree about what a click is allowed to do.
+home.register(app, home.Home(
+    store=task_store, call=handle_tasks, allowed_users=ALLOWED_USERS,
+    base_url=TEAM_URL,
+    watching=lambda: handle_tasks({"action": "watching"}).get("watching", []),
+    unmerged=lambda: branches.line(branches.survey(list(task_store.all().values())))))
 
 server.start()
 

@@ -6,6 +6,7 @@
     },
     "features": {
         "app_home": {
+            "home_tab_enabled": true,
             "messages_tab_enabled": true,
             "messages_tab_read_only_enabled": false
         },
@@ -39,7 +40,8 @@
         "event_subscriptions": {
             "bot_events": [
                 "app_mention",
-                "message.im"
+                "message.im",
+                "app_home_opened"
             ]
         },
         "interactivity": {
