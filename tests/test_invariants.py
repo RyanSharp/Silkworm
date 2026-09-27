@@ -3168,13 +3168,28 @@ def test_modules_are_imported():
     # went in: 970 checks passed without it. A test nothing calls is worse than
     # no test, because it reads as cover.
     own = ast.parse((BASE / "tests" / "test_invariants.py").read_text())
-    defined = {n.name for n in own.body
-               if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")}
-    main = next(n for n in own.body
+    # Top level and class bodies, not every nested def: a helper named test_*
+    # inside another test is not a test. async too -- a plain FunctionDef check
+    # would let `async def test_x` past, and the tuple cannot await one anyway.
+    scopes = [own] + [n for n in own.body if isinstance(n, ast.ClassDef)]
+    names = [n.name for sc in scopes for n in sc.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and n.name.startswith("test_")]
+    # Names from the tuple that is actually iterated, not every name appearing
+    # anywhere in the block: `SLOW = (test_x,)` sitting unused beside the loop
+    # would otherwise count test_x as run.
+    loop = next(n for sc in [own] for n in ast.walk(sc)
                 if isinstance(n, ast.If) and "__main__" in ast.dump(n.test))
-    listed = {n.id for n in ast.walk(main) if isinstance(n, ast.Name)}
-    check("this file defines tests at all", len(defined) > 40, f"found {len(defined)}")
-    unrun = sorted(defined - listed)
+    listed = {e.id for f in ast.walk(loop) if isinstance(f, ast.For)
+              for e in ast.walk(f.iter) if isinstance(e, ast.Name)}
+    check("this file defines tests at all", len(names) > 40, f"found {len(names)}")
+    # Python takes the last of two same-named defs and says nothing. That is a
+    # silent regression with a green suite -- the shadowed test simply stops
+    # running -- and a set of names cannot see it.
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    check("no test is defined twice", not dupes,
+          f"shadowed, so only the last one runs: {', '.join(dupes)}")
+    unrun = sorted(set(names) - listed)
     check("every test this file defines is in the list that runs them", not unrun,
           f"defined but never run: {', '.join(unrun)}")
 
@@ -4181,17 +4196,38 @@ def test_every_open_state_has_a_button():
         m = _re.search(r"""taskAction\([^,]+,\s*['"]([a-z_]+)['"]""", body)
         return m.group(1) if m else None
 
-    harness = (fn + "\nconst out = {};\n"
+    # esc() comes along because every other render function in the page uses it,
+    # and the harness splices only taskButtons: the day this function escapes
+    # anything, an un-prefixed harness would throw ReferenceError instead.
+    esc = _re.search(r"const esc = .*", js).group(0)
+    harness = (esc + "\n" + fn + "\nconst out = {};\n"
                + "for (const s of JSON.parse(process.env.STATES)) "
                  'out[s] = taskButtons({id: "tsk_1", state: s, thread: "T1"});\n'
                + "process.stdout.write(JSON.stringify(out));\n")
+    run, rendered = None, None
     try:
         run = subprocess.run(["node", "-e", harness], capture_output=True, text=True,
                              timeout=30,
                              env={**os.environ, "STATES": json.dumps(list(T.STATES))})
-        rendered = json.loads(run.stdout) if run.returncode == 0 else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        rendered = None
+    except (OSError, subprocess.SubprocessError):
+        pass                            # no node on this machine; checked below
+    if run is not None:
+        # A node that ran and failed is not a node that is missing. Collapsing
+        # the two is how this test quietly became nine substring checks: make
+        # taskButtons call a helper the harness has not spliced in and it exits
+        # 1, which read as "node unavailable" and passed green.
+        try:
+            rendered = json.loads(run.stdout)
+        except ValueError:
+            rendered = None
+        if rendered is None:
+            # node's last stderr line is its own version banner, so name the
+            # line that actually says what went wrong.
+            lines = [x.strip() for x in (run.stderr or "").splitlines() if x.strip()]
+            why = next((x for x in lines if "Error" in x),
+                       lines[0] if lines else f"node exited {run.returncode}, no output")
+            check("taskButtons() runs without throwing", False, why)
+            return
 
     if rendered is None:
         # No node here. The weaker claim still catches the failure this was
@@ -4203,11 +4239,16 @@ def test_every_open_state_has_a_button():
                 check(f"taskButtons() mentions {state}", f'"{state}"' in fn)
         return
 
-    # A fixture that renders nothing at all would satisfy every check below
-    # about terminal states, and half of the ones above it.
+    # A stub -- or a function that returned before reaching its branches --
+    # would satisfy every terminal-state check below. The Thread button is proof
+    # the fixture reached the end of the function; the outputs differing between
+    # states is proof it took more than one branch on the way. "<button" alone
+    # was not: Thread supplies one for every state, terminal ones included.
     check("the harness really ran the shipped function",
-          set(rendered) == set(T.STATES) and all("<button" in h for h in rendered.values()),
-          f"rendered {sorted(rendered)}")
+          set(rendered) == set(T.STATES)
+          and all("jumpTo(" in h for h in rendered.values())
+          and len(set(rendered.values())) > 1,
+          f"{len(set(rendered.values()))} distinct outputs for {len(rendered)} states")
 
     for state in T.STATES:
         acts = [a for a in (action_of(h) for h
