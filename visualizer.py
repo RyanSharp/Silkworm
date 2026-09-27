@@ -1335,6 +1335,16 @@ async function sendBack(id, needsAnswer) {
   if (notes === null) return;
   await taskAction(id, "rework", notes);
 }
+async function stopTask(id) {
+  // Cancelling a running task is not the same act as cancelling a queue entry,
+  // so it does not share the button. The backend kills the child, and whatever
+  // that agent had not committed in its own checkout goes with it. Worth one
+  // question: `cancelled` is terminal, so there is no way back from a misclick.
+  if (!confirm("Stop this agent mid-run?\n\n"
+             + "Its child process is killed and the task is cancelled. Anything "
+             + "it has not committed in its checkout is lost.")) return;
+  await taskAction(id, "cancel");
+}
 async function taskAction(id, action, notes) {
   const r = await taskCall(notes ? {action, id, notes, by: "you"} : {action, id});
   // Cancelling something that was running says whether the work was actually
@@ -1404,6 +1414,13 @@ function taskButtons(t) {
   } else if (t.state === "failed") {
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','retry')">Retry</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+  } else if (t.state === "running") {
+    // A running row used to offer nothing but Thread, which left the one
+    // surface that lists running tasks unable to stop one: the only way in was
+    // to open the anchor thread and type !stop. Said as "Stop" rather than
+    // "Cancel" because it ends a live agent mid-sentence rather than dropping a
+    // queue entry, and the toast reports which of those actually happened.
+    b.push(`<button class="ghost" onclick="stopTask('${t.id}')">Stop agent…</button>`);
   } else if (t.state === "queued" || t.state === "blocked") {
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','cancel')">Cancel</button>`);
   }

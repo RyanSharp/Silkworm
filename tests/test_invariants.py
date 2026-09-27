@@ -3162,6 +3162,22 @@ def test_modules_are_imported():
         check(f"{path.name} imports every sibling module it uses", not missing,
               f"uses but never imports: {', '.join(missing)}")
 
+    # And every test this file defines is actually run. The list below __main__
+    # is hand-maintained, so a test can be written, pass on its own, and never
+    # run in the suite -- which is how test_every_open_state_has_a_button first
+    # went in: 970 checks passed without it. A test nothing calls is worse than
+    # no test, because it reads as cover.
+    own = ast.parse((BASE / "tests" / "test_invariants.py").read_text())
+    defined = {n.name for n in own.body
+               if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")}
+    main = next(n for n in own.body
+                if isinstance(n, ast.If) and "__main__" in ast.dump(n.test))
+    listed = {n.id for n in ast.walk(main) if isinstance(n, ast.Name)}
+    check("this file defines tests at all", len(defined) > 40, f"found {len(defined)}")
+    unrun = sorted(defined - listed)
+    check("every test this file defines is in the list that runs them", not unrun,
+          f"defined but never run: {', '.join(unrun)}")
+
 
 # --- labelled mail is a fact about a project, not a task ---------------------
 # A booking confirmation needs nothing from you. Putting it on the board would
@@ -4079,6 +4095,150 @@ def test_dashboard_js_is_whole():
     check("the task row says when commits never landed", "${landing(t)}" in row,
           "landing() exists but the board never calls it")
 
+
+# --- every state you can be in must have a way out of it ----------------------
+# `running` offered nothing but Thread. handle_tasks() has had a branch that
+# kills the child of a running task since the day cancelling one only
+# relabelled the record -- the agent carried on working and spending in an
+# isolated checkout the sweeper was then free to delete underneath it, which
+# cost one task its first pass of uncommitted work. Nothing in the dashboard
+# reached it: the only way in was to open the anchor thread and type !stop, and
+# the dashboard is the surface that lists running tasks.
+#
+# Tying the button set to TRANSITIONS rather than to a list of states is what
+# stops a state added later from landing with no way out of it.
+
+def test_every_open_state_has_a_button():
+    import tasks as T
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nevery non-terminal state offers a permitted action")
+
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+
+    def moves_to(node):
+        """The state the first task_store.transition() under `node` moves to."""
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "transition" and len(n.args) >= 2
+                    and isinstance(n.args[1], ast.Attribute)):
+                return getattr(T, n.args[1].attr, None)
+        return None
+
+    # accept/dismiss/retry/cancel share one literal mapping in handle_tasks.
+    # Read it out of the source rather than restating it here: if `cancel` stops
+    # meaning CANCELLED, this test should follow bot.py rather than quietly
+    # disagree with it and pass anyway.
+    targets = {}
+    for n in ast.walk(fns["handle_tasks"]):
+        if (isinstance(n, ast.Dict) and n.keys
+                and all(isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        for k in n.keys)
+                and all(isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name)
+                        and v.value.id == "tasks" for v in n.values)
+                and "cancel" in [k.value for k in n.keys]):
+            targets = {k.value: getattr(T, v.attr, None)
+                       for k, v in zip(n.keys, n.values)}
+            break
+    check("the action map was read out of handle_tasks",
+          set(targets) == {"accept", "retry", "dismiss", "cancel"},
+          f"got {sorted(targets)} — the rest of this test rests on it")
+
+    # `approve` and `rework` are their own code paths, not entries in that dict.
+    targets["approve"] = moves_to(fns["approve_task"])
+    for n in ast.walk(fns["handle_tasks"]):
+        if (isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                and isinstance(n.test.comparators[0], ast.Constant)
+                and n.test.comparators[0].value == "rework"):
+            targets["rework"] = moves_to(n)
+    check("and so were approve and rework",
+          targets.get("approve") is T.DONE and targets.get("rework") is T.QUEUED,
+          f"approve={targets.get('approve')} rework={targets.get('rework')}")
+
+    js = _re.search(r"<script>(.*?)</script>", V.PAGE, _re.S).group(1)
+    fn = js[js.index("function taskButtons(t)"):js.index("async function renderTasks()")]
+
+    def action_of(handler):
+        """The backend action an onclick reaches, or None if it is not one.
+
+        Either taskAction(id, "<action>") directly, or a wrapper that confirms
+        or prompts first and then calls it. Resolved by what the wrapper calls
+        rather than by name, so renaming Stop or Send back cannot detach a
+        button from the action it stands for without this noticing.
+        """
+        m = _re.match(r"""taskAction\('[^']*',\s*['"]([a-z_]+)['"]\)""", handler)
+        if m:
+            return m.group(1)
+        name = handler.split("(")[0]
+        i = js.find(f"function {name}(")
+        if i < 0:
+            return None
+        end = js.find("\n}", i)
+        if end < 0:
+            return None                 # not a top-level function; say so, do not raise
+        body = js[i:end]
+        m = _re.search(r"""taskAction\([^,]+,\s*['"]([a-z_]+)['"]""", body)
+        return m.group(1) if m else None
+
+    harness = (fn + "\nconst out = {};\n"
+               + "for (const s of JSON.parse(process.env.STATES)) "
+                 'out[s] = taskButtons({id: "tsk_1", state: s, thread: "T1"});\n'
+               + "process.stdout.write(JSON.stringify(out));\n")
+    try:
+        run = subprocess.run(["node", "-e", harness], capture_output=True, text=True,
+                             timeout=30,
+                             env={**os.environ, "STATES": json.dumps(list(T.STATES))})
+        rendered = json.loads(run.stdout) if run.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        rendered = None
+
+    if rendered is None:
+        # No node here. The weaker claim still catches the failure this was
+        # written for: a non-terminal state the function does not mention at all
+        # falls through to Thread and nothing else.
+        print("    (node unavailable — taskButtons() checked by contract only)")
+        for state in T.STATES:
+            if state not in T.TERMINAL:
+                check(f"taskButtons() mentions {state}", f'"{state}"' in fn)
+        return
+
+    # A fixture that renders nothing at all would satisfy every check below
+    # about terminal states, and half of the ones above it.
+    check("the harness really ran the shipped function",
+          set(rendered) == set(T.STATES) and all("<button" in h for h in rendered.values()),
+          f"rendered {sorted(rendered)}")
+
+    for state in T.STATES:
+        acts = [a for a in (action_of(h) for h
+                            in _re.findall(r'onclick="([^"]+)"', rendered[state])) if a]
+        if state in T.TERMINAL:
+            # Offering one would be a button the state machine refuses, which
+            # the dashboard renders as a bare "Not allowed".
+            check(f"{state} is terminal and offers no action", not acts, f"offers {acts}")
+            continue
+        check(f"{state} offers an action, not just Thread", bool(acts),
+              "a state with no button is only reachable by typing !stop at it")
+        refused = [a for a in acts if not T.can(state, targets.get(a))]
+        check(f"and every action {state} offers is one TRANSITIONS permits",
+              not refused, f"offers {refused}, which transition() would refuse")
+
+    # The one this was written for, said plainly rather than left to the sweep.
+    running = [a for a in (action_of(h) for h
+                           in _re.findall(r'onclick="([^"]+)"', rendered[T.RUNNING])) if a]
+    check("a running agent can be stopped from the board",
+          T.CANCELLED in [targets.get(a) for a in running],
+          "handle_tasks kills the child; until now nothing in the UI reached it")
+    check("and it is not labelled the same as dropping a queue entry",
+          "Stop" in rendered[T.RUNNING] and "Cancel" in rendered[T.QUEUED]
+          and "Cancel" not in rendered[T.RUNNING],
+          "killing a live session and dropping an unstarted one are not one act")
+    # The note is the only part of the outcome the board cannot show: whether
+    # the child was really killed, or was orphaned by a restart and is now
+    # reap_runaways' problem.
+    act = _re.search(r"async function taskAction\(.*?^}", js, _re.S | _re.M).group(0)
+    check("and the reply's note reaches the user", "r.note" in act,
+          "handle_tasks returns it and nothing rendered it")
 
 
 
@@ -5919,6 +6079,7 @@ if __name__ == "__main__":
               test_file_uploads_are_handled, test_thread_kind_filter,
               test_unmerged_branches,
               test_dashboard_js_is_whole,
+              test_every_open_state_has_a_button,
               test_discarding_a_branch_keeps_it, test_task_retention,
               test_atomic_persistence,
               test_home_tab,
