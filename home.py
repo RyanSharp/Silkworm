@@ -201,7 +201,8 @@ def _task_blocks(task: dict, now: float, base_url: str) -> list[dict]:
 
 
 def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
-           base_url: str = "", notice: str = "", allowed: bool = True) -> dict:
+           base_url: str = "", notice: str = "", allowed: bool = True,
+           max_blocks: int = MAX_BLOCKS, max_attention: int = MAX_ATTENTION) -> dict:
     """The Home view for one user.
 
     `allowed=False` renders nothing of the board: task goals and reviewer
@@ -246,7 +247,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
                           f"*{HEADINGS.get(current, esc(current))}* ({count})")}]
         chunk += _task_blocks(t, now, base_url)
         # Room kept for the tail sections (running, watching, unmerged).
-        if shown >= MAX_ATTENTION or len(blocks) + len(board) + len(chunk) > MAX_BLOCKS - 12:
+        if shown >= max_attention or len(blocks) + len(board) + len(chunk) > max_blocks - 12:
             break
         board += chunk
         shown += 1
@@ -282,7 +283,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     if unmerged:
         blocks += [{"type": "divider"}, {"type": "context", "elements": [
             _text(f":warning: {esc(unmerged)} — land or drop them from the dashboard")]}]
-    return {"type": "home", "blocks": blocks[:MAX_BLOCKS]}
+    return {"type": "home", "blocks": blocks[:max_blocks]}
 
 
 def seen_state(value: str) -> tuple[str, str]:
@@ -491,8 +492,202 @@ class Home:
         return f":white_check_mark: {done} `{tid}`{note}"
 
 
+class Board(Home):
+    """The same board, as one message in a private channel, edited in place.
+
+    The Home tab worked, and broke something it had no business touching:
+    with it on, Slack's Threads view sent Reply to the app's Home instead of
+    the thread (confirmed by switching the tab off, which fixed it). A message
+    in a channel of its own reaches the same places -- phone, desktop, away
+    from the house -- and leaves the app's conversation alone.
+
+    What a message loses is privacy. A Home tab is drawn per person; a channel
+    message is read by everyone in the channel. So the board is only posted
+    where every member is on the allowlist, and taken down if that stops being
+    true. Results of a click go to the person who clicked, ephemerally, rather
+    than onto the shared board.
+    """
+
+    #: Slack caps a message at 50 blocks, half what a Home view may hold.
+    MAX_BLOCKS = 50
+    MAX_ATTENTION = 12
+    #: Relative times ("3m ago") drift without anything changing; redraw for
+    #: them this often, and otherwise only when the board's content changes.
+    STALE_S = 600
+
+    def __init__(self, *, state_path, channel="silkworm-board", bot_user="", **kw):
+        super().__init__(**kw)
+        self.channel_name = (channel or "").lstrip("#")
+        self.bot_user = bot_user
+        self.state_path = state_path
+        self._channel_id = ""
+        self._last = ("", 0.0)             # (fingerprint, when drawn)
+        self._warned = ""
+        self._sync_lock = threading.Lock()
+
+    # -- where it lives --
+
+    def _state(self) -> dict:
+        import jsonstore
+        return jsonstore.load(self.state_path, default={}, strict=False) or {}
+
+    def _save(self, **fields) -> None:
+        import jsonstore
+        jsonstore.save(self.state_path, {**self._state(), **fields})
+
+    def channel(self, client) -> str:
+        """The board channel's id: configured by id, or found by name among
+        the channels the bot is in. Empty if there is none yet."""
+        if self._channel_id:
+            return self._channel_id
+        name = self.channel_name
+        if name[:1] in ("C", "G") and name[1:].isalnum() and name.upper() == name:
+            self._channel_id = name
+            return name
+        cursor = None
+        while True:
+            r = client.conversations_list(types="private_channel,public_channel",
+                                          exclude_archived=True, limit=200,
+                                          cursor=cursor)
+            for c in r.get("channels") or []:
+                if c.get("name") == name and c.get("is_member"):
+                    self._channel_id = c["id"]
+                    return c["id"]
+            cursor = (r.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                return ""
+
+    def outsiders(self, client, channel: str) -> list[str]:
+        """Members who are neither the bot nor on the allowlist. With no
+        allowlist everyone is allowed, which is the bot's own rule too."""
+        if not self.allowed_users:
+            return []
+        members, cursor = [], None
+        while True:
+            r = client.conversations_members(channel=channel, limit=200, cursor=cursor)
+            members += r.get("members") or []
+            cursor = (r.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        return [m for m in members if m != self.bot_user and m not in self.allowed_users]
+
+    # -- drawing --
+
+    def blocks(self) -> list[dict]:
+        now = time.time()
+        try:
+            watching = self._watching() or []
+        except Exception:
+            log.exception("watching list failed")
+            watching = []
+        items = [dict(r, id=tid) for tid, r in self.store.all().items()]
+        return render(items, now=now, watching=watching, unmerged=self.unmerged(),
+                      base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
+                      max_attention=self.MAX_ATTENTION)["blocks"]
+
+    def fingerprint(self) -> str:
+        """What the board shows, minus the clock: which tasks, in which state,
+        last touched when -- so a redraw happens when something did."""
+        rows = sorted((tid, r.get("state"), r.get("updated"))
+                      for tid, r in self.store.all().items()
+                      if r.get("state") in tasks.NEEDS_ATTENTION + (tasks.RUNNING, tasks.QUEUED))
+        try:
+            watching = sorted(str(w.get("id")) for w in (self._watching() or []))
+        except Exception:
+            watching = []
+        return json.dumps([rows, watching, self.unmerged()], default=str)
+
+    def sync(self, client, force: bool = False) -> str:
+        """Bring the board message up to date. Returns what it did, for the
+        log and the tests: posted, updated, unchanged, or why it did not."""
+        with self._sync_lock:
+            try:
+                channel = self.channel(client)
+            except Exception:
+                log.exception("could not look up the board channel")
+                return "lookup-failed"
+            if not channel:
+                if self._warned != "no-channel":
+                    log.warning("no board channel: create a private channel named "
+                                "#%s and invite the bot to it", self.channel_name)
+                    self._warned = "no-channel"
+                return "no-channel"
+            state = self._state()
+            ts = state.get("ts") if state.get("channel") == channel else None
+            try:
+                outside = self.outsiders(client, channel)
+            except Exception:
+                log.exception("could not read the board channel's members")
+                return "members-failed"
+            if outside:
+                # Take the board down rather than leave it where someone off
+                # the allowlist can read goals and review findings.
+                if ts:
+                    try:
+                        client.chat_delete(channel=channel, ts=ts)
+                    except Exception:
+                        log.exception("could not take the board down")
+                    self._save(channel="", ts="")
+                if self._warned != f"outsiders:{outside}":
+                    log.warning("board not posted: #%s has members off the "
+                                "allowlist (%s)", self.channel_name, ", ".join(outside))
+                    self._warned = f"outsiders:{outside}"
+                return "outsiders"
+            self._warned = ""
+            print_ = self.fingerprint()
+            last, at = self._last
+            if ts and not force and print_ == last and time.time() - at < self.STALE_S:
+                return "unchanged"
+            blocks = self.blocks()
+            need = sum(1 for t in self.store.all().values()
+                       if t.get("state") in tasks.NEEDS_ATTENTION)
+            text = f"Silkworm board: {need} need you"
+            if ts:
+                try:
+                    client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
+                    self._last = (print_, time.time())
+                    return "updated"
+                except Exception as e:
+                    err = getattr(getattr(e, "response", None), "get", lambda *_: "")("error")
+                    if err in ("channel_not_found", "not_in_channel", "is_archived"):
+                        # Removed from the channel, or it was archived: forget
+                        # it, and look again on the next pass.
+                        self._channel_id = ""
+                        self._save(channel="", ts="")
+                        log.warning("the board channel went away (%s)", err)
+                        return "channel-gone"
+                    if err not in ("message_not_found", "cant_update_message"):
+                        log.exception("could not update the board")
+                        return "update-failed"
+                    # Deleted by hand: post a fresh one below.
+            r = client.chat_postMessage(channel=channel, text=text, blocks=blocks)
+            self._save(channel=channel, ts=r["ts"])
+            self._last = (print_, time.time())
+            return "posted"
+
+    # -- the handlers' one difference: where the result goes --
+
+    def publish(self, client, user: str) -> None:
+        """After a click: tell the person who clicked, privately, then redraw
+        the board for everyone. (Home's version redraws a per-person view.)"""
+        with self._lock:
+            text, _ = self._notices.pop(user, ("", 0))
+        if not self.allowed(user):
+            text = "This bot's task board only answers the people on its allowlist."
+        if text:
+            try:
+                channel = self.channel(client)
+                if channel:
+                    client.chat_postEphemeral(channel=channel, user=user, text=text)
+            except Exception:
+                log.exception("could not tell %s how their click went", user)
+        if self.allowed(user):
+            self.sync(client, force=True)
+
+
 def register(app, home: Home) -> None:
-    app.event("app_home_opened")(home.on_opened)
+    if not isinstance(home, Board):
+        app.event("app_home_opened")(home.on_opened)
     app.action("home_refresh")(home.on_refresh)
     app.action("home_thread")(home.on_link)
     for action in DIRECT:

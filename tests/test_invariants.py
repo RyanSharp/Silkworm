@@ -6212,7 +6212,7 @@ def test_atomic_persistence():
     # of store modules did not include.
     state = {"_path",                       # the four stores
              "learnings_file", "state_path",  # passed in as a parameter
-             "EMAIL_STATE_FILE", "HARVEST_STATE", "LEARNINGS_FILE",
+             "EMAIL_STATE_FILE", "HARVEST_STATE", "LEARNINGS_FILE", "BOARD_STATE",
              "SESSIONS_FILE", "TASKS_FILE", "PROJECTS_FILE"}
     def writes_in_place(node):
         return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -6235,7 +6235,8 @@ def test_atomic_persistence():
                 saves += 1
                 offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
                               if writes_in_place(n)]
-    check("every store's _save was found to check", saves == 4, f"found {saves}")
+    # Five: the four stores, and the task board's message pointer (home.Board).
+    check("every store's _save was found to check", saves == 5, f"found {saves}")
     check("and every module was looked at", scanned > 20, f"{scanned}")
     check("nothing writes a state file in place", not offenders, f"at {offenders}")
 
@@ -8322,6 +8323,133 @@ def test_dead_background_threads_are_reported():
     status_src = ast.unparse(next(n for n in cli.body
                                   if isinstance(n, ast.FunctionDef) and n.name == "do_status"))
     check("do_status runs the check", "check_daemons(bot.get('daemons'))" in status_src)
+
+
+
+# --- the task board as a channel message ---------------------------------------
+# The Home tab sent Reply in Slack's Threads view to the app's Home instead of
+# the thread (switching the tab off fixed it). The board moved to one message
+# in a private channel. A channel message is read by everyone in the channel,
+# so the rule that mattered for the Home tab -- nobody off the allowlist sees
+# the board -- has to be enforced on the channel's membership instead.
+
+def test_board_channel():
+    import home
+    import tasks as T
+    print("\nthe task board as a channel message")
+
+    class Err(Exception):
+        def __init__(self, error):
+            self.response = {"error": error}
+
+    class Slack:
+        def __init__(self, members=("U_ME", "B_BOT"), channels=None):
+            self.members = list(members)
+            self.channels = channels if channels is not None else [
+                {"id": "G_BOARD", "name": "silkworm-board", "is_member": True},
+                {"id": "C_OTHER", "name": "general", "is_member": True}]
+            self.calls, self.fail_update = [], None
+            self.n = 0
+        def conversations_list(self, **kw):
+            return {"channels": self.channels, "response_metadata": {}}
+        def conversations_members(self, channel, **kw):
+            return {"members": self.members, "response_metadata": {}}
+        def chat_postMessage(self, channel, text, blocks):
+            self.n += 1
+            self.calls.append(("post", channel, blocks)); return {"ts": f"1.{self.n}"}
+        def chat_update(self, channel, ts, text, blocks):
+            if self.fail_update:
+                raise Err(self.fail_update)
+            self.calls.append(("update", channel, ts, blocks))
+        def chat_delete(self, channel, ts):
+            self.calls.append(("delete", channel, ts))
+        def chat_postEphemeral(self, channel, user, text):
+            self.calls.append(("ephemeral", channel, user, text))
+        def views_open(self, trigger_id, view):
+            self.calls.append(("modal", view))
+
+    d = Path(tempfile.mkdtemp())
+    store = T.TaskStore(d / "t.json")
+    ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
+                       stop_task=lambda tid: False, start_landing=lambda tid: None)
+    def board(**kw):
+        return home.Board(state_path=d / "board.json", bot_user="B_BOT", store=store,
+                          call=ns["handle_tasks"], allowed_users={"U_ME"}, **kw)
+
+    b, s = board(), Slack()
+    prop = store.create("a proposal worth accepting", state=T.PROPOSED)["id"]
+    check("found by name among the bot's channels", b.channel(s) == "G_BOARD")
+    check("first pass posts the board", b.sync(s) == "posted"
+          and s.calls[-1][:2] == ("post", "G_BOARD"))
+    check("and remembers where", json.loads((d / "board.json").read_text())["ts"] == "1.1")
+    n = len(s.calls)
+    check("nothing changed, nothing sent", b.sync(s) == "unchanged" and len(s.calls) == n)
+    store.transition(prop, T.QUEUED)
+    check("a task moving redraws it in place", b.sync(s) == "updated"
+          and s.calls[-1][:3] == ("update", "G_BOARD", "1.1"))
+    b2 = board()                                   # a restart
+    store.create("another", state=T.PROPOSED)
+    check("after a restart it edits the same message rather than posting twice",
+          b2.sync(s) == "updated" and s.calls[-1][2] == "1.1")
+
+    s.fail_update = "message_not_found"            # deleted by hand
+    store.create("a third", state=T.PROPOSED)
+    check("deleted by hand, it is posted again", b2.sync(s) == "posted")
+    s.fail_update = None
+
+    many = [store.create(f"task {i}", state=T.PROPOSED) for i in range(80)]
+    b2.sync(s, force=True)
+    blocks = s.calls[-1][-1]
+    check("a full board fits Slack's 50-block message limit", len(blocks) <= 50, str(len(blocks)))
+    check("and counts what it left out", "more waiting" in json.dumps(blocks, ensure_ascii=False))
+
+    # Membership is the privacy boundary now.
+    s2 = Slack(members=("U_ME", "B_BOT", "U_STEPH"))
+    b3 = board()
+    check("not posted where someone off the allowlist can read it",
+          b3.sync(s2) == "outsiders" and not [c for c in s2.calls if c[0] == "post"])
+    s3 = Slack()
+    b4 = home.Board(state_path=d / "b4.json", bot_user="B_BOT", store=store,
+                    call=ns["handle_tasks"], allowed_users={"U_ME"})
+    b4.sync(s3)
+    s3.members.append("U_STEPH")                   # someone joins later
+    check("taken down when someone off the allowlist joins",
+          b4.sync(s3) == "outsiders" and s3.calls[-1][0] == "delete")
+    check("no channel yet, nothing posted and no crash",
+          board().sync(Slack(channels=[])) == "no-channel")
+
+    # Clicks: result to the clicker, privately; the board redrawn for everyone.
+    s4, b5 = Slack(), board()
+    b5.sync(s4)
+    tid = many[0]["id"]
+    body = lambda user, v: {"user": {"id": user}, "trigger_id": "t",
+                            "actions": [{"action_id": "home_accept", "value": v}]}
+    b5.on_direct(lambda *a, **k: None, body("U_STEPH", f"{tid}|proposed"), s4)
+    check("a click from off the allowlist does nothing but say so, privately",
+          store.get(tid)["state"] == T.PROPOSED
+          and s4.calls[-1][0] == "ephemeral" and s4.calls[-1][2] == "U_STEPH")
+    b5.on_direct(lambda *a, **k: None, body("U_ME", f"{tid}|proposed"), s4)
+    kinds = [c[0] for c in s4.calls[-2:]]
+    check("Accept works from the board message", store.get(tid)["state"] == T.QUEUED)
+    check("the result goes to the clicker only, then the board redraws",
+          kinds == ["ephemeral", "update"] and "Accepted" in s4.calls[-2][3])
+    b5.on_direct(lambda *a, **k: None, body("U_ME", f"{tid}|proposed"), s4)
+    check("a stale button is still refused", "moved on" in s4.calls[-2][3])
+
+    # The channel going away is noticed rather than failing for ever.
+    s5, b6 = Slack(), board()
+    b6.sync(s5); s5.fail_update = "channel_not_found"
+    store.create("one more", state=T.PROPOSED)
+    check("losing the channel is noticed, not retried for ever",
+          b6.sync(s5) == "channel-gone" and b6._channel_id == "")
+
+    src = (BASE / "bot.py").read_text()
+    check("the bot keeps it current in a supervised loop",
+          'daemons.start(_board_loop, "board")' in src)
+    m = json.loads((BASE / "manifest.json").read_text())
+    check("the Home tab stays off in the manifest",
+          not m["features"]["app_home"].get("home_tab_enabled")
+          and "app_home_opened" not in m["settings"]["event_subscriptions"]["bot_events"])
 
 
 if __name__ == "__main__":

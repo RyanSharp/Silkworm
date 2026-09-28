@@ -1189,6 +1189,10 @@ def handle_register_terminal(payload: dict) -> dict:
 
 
 HARVEST_STATE = BASE_DIR / "harvest_state.json"
+# Where the task board is posted, by name or id; see home.Board.
+BOARD_CHANNEL = os.environ.get("SILKWORM_BOARD_CHANNEL", "silkworm-board")
+BOARD_STATE = BASE_DIR / "board.json"
+BOARD_POLL_S = 60
 _harvest_lock = threading.Lock()
 
 
@@ -1906,14 +1910,18 @@ if CLAUDE_APPROVAL_MODE == "slack":
     approvals.register(app)
     server.route("/approve", approvals.handle_request)
 
-# The task board in the app's Home tab, for when the dashboard is out of reach.
+# The task board, for when the dashboard is out of reach: one message in a
+# private channel, kept current. (It was the app's Home tab until that turned
+# out to send Reply in Slack's Threads view to Home instead of the thread.)
 # Its buttons call handle_tasks, the dashboard's own route, so the two cannot
 # disagree about what a click is allowed to do.
-home.register(app, home.Home(
+BOARD = home.Board(
+    state_path=BOARD_STATE, channel=BOARD_CHANNEL, bot_user=BOT_USER_ID,
     store=task_store, call=handle_tasks, allowed_users=ALLOWED_USERS,
     base_url=TEAM_URL,
     watching=lambda: handle_tasks({"action": "watching"}).get("watching", []),
-    unmerged=lambda: branches.line(branches.survey(list(task_store.all().values())))))
+    unmerged=lambda: branches.line(branches.survey(list(task_store.all().values()))))
+home.register(app, BOARD)
 
 server.start()
 
@@ -3323,6 +3331,17 @@ def _ideation_scheduler() -> None:
         time.sleep(300)
 
 
+def _board_loop() -> None:
+    """Keep the board message current. It redraws only when what it shows has
+    changed (or its relative times have gone stale), so this is cheap."""
+    while True:
+        try:
+            BOARD.sync(app.client)
+        except Exception:
+            log.exception("board sync failed")
+        time.sleep(BOARD_POLL_S)
+
+
 def _task_scheduler() -> None:
     """Requeue what a restart interrupted, then keep the board honest.
 
@@ -3741,6 +3760,7 @@ if __name__ == "__main__":
     daemons.start(_watchdog, "watchdog")
     daemons.start(_backfiller, "backfill", forever=False)
     daemons.start(_task_scheduler, "tsched")
+    daemons.start(_board_loop, "board")
     for _i in range(max(1, TASK_WORKERS)):
         daemons.start(_task_worker, f"task{_i}", args=(_i,))
     daemons.start(_email_watcher, "email", forever=bool(GMAIL_USER and GMAIL_APP_PASSWORD))
