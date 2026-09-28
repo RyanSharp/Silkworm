@@ -1337,12 +1337,14 @@ async function sendBack(id, needsAnswer) {
 }
 async function stopTask(id) {
   // Cancelling a running task is not the same act as cancelling a queue entry,
-  // so it does not share the button. The backend kills the child, and whatever
-  // that agent had not committed in its own checkout goes with it. Worth one
-  // question: `cancelled` is terminal, so there is no way back from a misclick.
+  // so it does not share the button. The backend kills the child mid-turn; its
+  // checkout is released the way any other turn's is, and release() keeps a
+  // tree with uncommitted changes on disk rather than discarding it. Worth one
+  // question anyway: `cancelled` is terminal, so the run cannot be resumed.
   if (!confirm("Stop this agent mid-run?\n\n"
-             + "Its child process is killed and the task is cancelled. Anything "
-             + "it has not committed in its checkout is lost.")) return;
+             + "Its child process is killed and the task is cancelled; it cannot "
+             + "be resumed. Uncommitted work in its checkout is kept on disk, "
+             + "not discarded.")) return;
   await taskAction(id, "cancel");
 }
 async function taskAction(id, action, notes) {
