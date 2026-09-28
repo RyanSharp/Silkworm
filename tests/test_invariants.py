@@ -3590,7 +3590,7 @@ def test_modules_are_imported():
               f"uses but never imports: {', '.join(missing)}")
 
     # And every test this file defines is actually run. The list below __main__
-    # is hand-maintained, so a test can be written, pass on its own, and never
+    # used to be hand-maintained, so a test could be written, pass on its own, and never
     # run in the suite -- which is how test_every_open_state_has_a_button first
     # went in: 970 checks passed without it. A test nothing calls is worse than
     # no test, because it reads as cover.
@@ -3602,13 +3602,10 @@ def test_modules_are_imported():
     names = [n.name for sc in scopes for n in sc.body
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and n.name.startswith("test_")]
-    # Names from the tuple that is actually iterated, not every name appearing
-    # anywhere in the block: `SLOW = (test_x,)` sitting unused beside the loop
-    # would otherwise count test_x as run.
-    loop = next(n for sc in [own] for n in ast.walk(sc)
-                if isinstance(n, ast.If) and "__main__" in ast.dump(n.test))
-    listed = {e.id for f in ast.walk(loop) if isinstance(f, ast.For)
-              for e in ast.walk(f.iter) if isinstance(e, ast.Name)}
+    # Names the runner actually discovers, not every name defined: the list
+    # below __main__ was replaced by discover(), and a def that lands below the
+    # guard is still not bound when it looks.
+    listed = {fn.__name__ for fn in discover()}
     check("this file defines tests at all", len(names) > 40, f"found {len(names)}")
     # Python takes the last of two same-named defs and says nothing. That is a
     # silent regression with a green suite -- the shadowed test simply stops
@@ -3617,7 +3614,7 @@ def test_modules_are_imported():
     check("no test is defined twice", not dupes,
           f"shadowed, so only the last one runs: {', '.join(dupes)}")
     unrun = sorted(set(names) - listed)
-    check("every test this file defines is in the list that runs them", not unrun,
+    check("every test this file defines is one the runner discovers", not unrun,
           f"defined but never run: {', '.join(unrun)}")
 
 
