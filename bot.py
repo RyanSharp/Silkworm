@@ -1276,11 +1276,18 @@ def approve_task(payload: dict) -> dict:
     if not task:
         return {"ok": False, "error": "unknown task"}
     reviewed = task.get("state") == tasks.AWAITING_APPROVAL
+    # Approving is one of the two moments a held checkout becomes unreachable;
+    # see the note on dismiss in handle_tasks, which this mirrors.
+    held = holding.for_task(task)
+    note = holding.short(held) if held else ""
     try:
         done = task_store.transition(
-            tid, tasks.DONE, f"approve via {payload.get('by', 'ui')}")
+            tid, tasks.DONE, f"approve via {payload.get('by', 'ui')}"
+            + (f" ({note})" if note else ""))
     except tasks.InvalidTransition as e:
         return {"ok": False, "error": f"not allowed: {e}"}
+    if held:
+        tell_thread(task.get("thread", ""), holding.note(held))
     if reviewed:
         # The task is already `done`; a failure to even begin the landing must
         # not be reported as a refused approval. It used to propagate, and the
@@ -1291,7 +1298,7 @@ def approve_task(payload: dict) -> dict:
             start_landing(tid)
         except Exception:
             log.exception("could not start the landing for %s", tid)
-    return {"ok": True, "task": task_store.get(tid) or done}
+    return {"ok": True, "note": note, "task": task_store.get(tid) or done}
 
 
 def handle_tasks(payload: dict) -> dict:
@@ -1461,8 +1468,8 @@ def handle_tasks(payload: dict) -> dict:
         if target == tasks.CANCELLED and current == tasks.RUNNING:
             note = ("stopped" if stop_task(tid) else
                     "no live child here — it was orphaned by a restart")
-        # Approving or dismissing is the moment a task stops being anybody's
-        # business, and if its isolated checkout still holds uncommitted files
+        # Dismissing (and approving, in approve_task) is the moment a task stops
+        # being anybody's business, and if its isolated checkout still holds uncommitted files
         # it is also the moment that work becomes unreachable -- nothing after
         # this will ever mention it again.
         #
@@ -1478,7 +1485,7 @@ def handle_tasks(payload: dict) -> dict:
         # what is in there is worth keeping is a judgement about the files, so
         # it goes to the person who can make it, at the moment they are already
         # looking.
-        held = holding.for_task(rec) if action in ("approve", "dismiss") else None
+        held = holding.for_task(rec) if action == "dismiss" else None
         if held:
             note = f"{note}; {holding.short(held)}" if note else holding.short(held)
         try:

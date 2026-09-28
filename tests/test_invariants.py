@@ -4987,8 +4987,9 @@ def test_held_checkouts():
     class FakeClient:
         def chat_postMessage(self, **kw): posted.append(kw)
 
-    ns = bot_functions("handle_tasks", "stop_task", "tell_thread",
+    ns = bot_functions("handle_tasks", "approve_task", "stop_task", "tell_thread",
                        tasks=T, task_store=st, holding=H, RUNNING_TASKS={},
+                       start_landing=lambda tid: None,
                        app=types.SimpleNamespace(client=FakeClient()))
     route = ns["handle_tasks"]
 
@@ -5442,6 +5443,7 @@ def test_landing_is_visible():
     # --- approving flagged work goes through the same gate --------------------
     started = []
     app_ns = {"task_store": store, "tasks": T, "log": LOG,
+              "holding": __import__("holding"),
               "start_landing": lambda tid: bool(started.append(tid))}
     _bot_fns({"approve_task"}, app_ns)
     approve = app_ns.get("approve_task")
@@ -5587,6 +5589,7 @@ def test_landing_is_visible():
     # no longer qualifies -- so no landing is ever attempted. The old silence,
     # reached through the new code.
     boom = {"task_store": store, "tasks": T, "log": LOG,
+            "holding": __import__("holding"),
             "start_landing": lambda tid: (_ for _ in ()).throw(OSError("disk full"))}
     _bot_fns({"approve_task"}, boom)
     approve_boom = boom.get("approve_task")
@@ -7451,6 +7454,7 @@ def test_home_tab():
     # --- clicks, through the real handle_tasks and a real store ---------------
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
+                       holding=__import__("holding"),
                        stop_task=lambda tid: False, start_landing=lambda tid: None)
     prop = store.create("a proposal worth accepting", state=T.PROPOSED)["id"]
     need = store.create("a task that asked a question", state=T.QUEUED)["id"]
