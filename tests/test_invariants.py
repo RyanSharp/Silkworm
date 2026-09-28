@@ -5734,6 +5734,65 @@ def test_home_tab():
           len(c.published) == n + 1)
 
 
+
+# --- a spent retry time must not requeue a task out of its own review ---------
+# A quota retry sets retry_at and nothing ever cleared it. When the task later
+# parked in `blocked` to wait for its reviewer, the retry sweeper saw a blocked
+# task with a retry time in the past and requeued it within the minute. The
+# implementor ran a second time, went to `done` with the review and landing
+# gates skipped (both wait on `not blocked_on`), and the reviewed commits sat
+# on a branch nothing tried to land -- tsk_5b8bad528b and tsk_96ff880fa2, and
+# every other task that had once hit a limit.
+
+def test_spent_retry_does_not_preempt_review():
+    import tasks as T
+    print("\na spent retry time does not requeue a task out of its review")
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    tid = store.create("implement something", state=T.QUEUED, driver="queue")["id"]
+    t0 = time.time()
+    # Hits a quota limit: blocked with a retry time, exactly as fail_or_retry does.
+    store.transition(tid, T.RUNNING)
+    store.update(tid, retry_at=t0 + 60)
+    store.transition(tid, T.BLOCKED, "quota: retrying")
+    check("a due retry is found", store.due_retries(t0 + 61) == [tid])
+    store.transition(tid, T.QUEUED, "retry time reached")
+    check("waking consumes the retry time", not store.get(tid).get("retry_at"))
+    store.transition(tid, T.RUNNING)
+    # Finishes, and parks waiting for its reviewer -- as the review gate does.
+    store.update(tid, blocked_on=["tsk_reviewer"])
+    store.transition(tid, T.BLOCKED, "awaiting review tsk_reviewer")
+    check("a task waiting on its review is not a due retry",
+          store.due_retries(t0 + 3600) == [])
+
+    # A record written before the fix still carries the old time. The sweeper
+    # must not trust it: a task blocked on another task waits for that task.
+    reviewer = store.create("the review of it, still reading", state=T.QUEUED)["id"]
+    old = store.create("an older record", state=T.QUEUED)["id"]
+    store.transition(old, T.RUNNING)
+    store.update(old, retry_at=t0 - 5000, blocked_on=[reviewer])
+    store.transition(old, T.BLOCKED, f"awaiting review {reviewer}")
+    check("even with a stale retry time left on the record",
+          old not in store.due_retries(t0))
+
+    # But blocked_on outlives the review it named: retrying a failed task does
+    # not clear it. A guard on "has any blocked_on" would then strand a quota
+    # retry for ever. Only a task waiting on something still open is skipped.
+    rv = store.create("the review, long finished", state=T.QUEUED)["id"]
+    store.transition(rv, T.RUNNING); store.transition(rv, T.DONE)
+    q = store.create("retried after an earlier review", state=T.QUEUED)["id"]
+    store.transition(q, T.RUNNING)
+    store.update(q, blocked_on=[rv], retry_at=t0 - 1)
+    store.transition(q, T.BLOCKED, "quota: retrying")
+    check("a quota retry still fires when blocked_on names a finished task",
+          q in store.due_retries(t0))
+
+    # A scheduled wake-up (silkworm defer) is the other user of retry_at and
+    # must still fire.
+    w = store.create("check on the deploy", state=T.BLOCKED, source="defer",
+                     retry_at=t0 - 1)["id"]
+    check("a scheduled wake-up still fires", w in store.due_retries(t0))
+
+
 if __name__ == "__main__":
     for t in (test_resume_retry_requires_missing_transcript, test_stop_escalates_to_sigkill,
               test_timeout_is_distinct, test_recovery, test_procs,
@@ -5756,6 +5815,7 @@ if __name__ == "__main__":
               test_discarding_a_branch_keeps_it, test_task_retention,
               test_atomic_persistence,
               test_home_tab,
+              test_spent_retry_does_not_preempt_review,
         test_state_files_have_one_reader_and_one_writer):
         try:
             t()

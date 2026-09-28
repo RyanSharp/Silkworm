@@ -276,6 +276,13 @@ class TaskStore:
                 raise InvalidTransition(f"{tid}: {current} -> {to_state}")
             rec["state"] = to_state
             rec["updated"] = time.time()
+            # A retry time is a reason to be blocked, and leaving `blocked`
+            # spends it. Kept, it outlived the wait it was set for: a task that
+            # once hit a quota limit and later parked for its reviewer was
+            # requeued within the minute, ran again, and closed with its review
+            # and landing skipped.
+            if current == BLOCKED:
+                rec["retry_at"] = None
             events = rec.setdefault("events", [])
             events.append({"at": time.time(), "kind": to_state, "detail": detail[:200]})
             del events[:-50]
@@ -428,11 +435,28 @@ class TaskStore:
         return ids
 
     def due_retries(self, now: float) -> list[str]:
-        """Ids of blocked tasks whose retry time has arrived."""
+        """Ids of blocked tasks whose retry time has arrived.
+
+        Not a task blocked on another task: that one is waiting for the other
+        to finish, not for a clock, and requeueing it runs it again while its
+        reviewer is still reading the first attempt. Checked here as well as
+        cleared on the way out of `blocked`, because records written before
+        that carry a spent time into their next wait.
+        """
         with self._lock:
             return [tid for tid, r in self._data.items()
                     if r.get("state") == BLOCKED and r.get("retry_at")
-                    and r["retry_at"] <= now]
+                    and r["retry_at"] <= now and not self._waiting_on_open(r)]
+
+    def _waiting_on_open(self, rec: dict) -> bool:
+        """Whether a task is waiting on another that has not finished.
+
+        `blocked_on` alone is not enough: it outlives the review it named --
+        retrying a failed task does not clear it -- so treating any entry as a
+        live wait would strand that task's next quota retry for good. Caller
+        holds the lock."""
+        return any((self._data.get(t) or {}).get("state") not in TERMINAL
+                   and t in self._data for t in rec.get("blocked_on") or ())
 
     def has_pending_wakeup(self, thread: str) -> bool:
         """Whether a scheduled wake-up is still waiting on this thread."""
