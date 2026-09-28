@@ -401,10 +401,12 @@ def sweep(keep: set, min_age_s: float = MIN_AGE_S) -> int:
             continue
         # From the right, through task_of. A labelled checkout is
         # `<repo>--land--<id>` or `<repo>--review--<id>`, and splitting from the
-        # front read the task id as "land--<id>" -- which is in nobody's keep
-        # set, so a landing or a review in progress became sweepable the moment
-        # it was an hour old. One parse, shared with holding.py, so the two
-        # cannot disagree about whose checkout this is.
+        # front read the task id as "land--<id>", which matches no keep set.
+        # One parse, shared with holding.py, so the two cannot disagree about
+        # whose checkout this is. That fixes the parse, not the protection: a
+        # landing's task is already done, so it is in no keep set however it is
+        # spelled, and a clean landing checkout older than min_age_s can still
+        # go. Claiming it while in use is tsk_68a2886ea0's fix, not yet landed.
         if task_of(path) in keep:
             continue
         if age_s(path) < min_age_s:
