@@ -6255,7 +6255,7 @@ def test_front_doors_agree():
     print("\nfiling the same work either way gets the same task")
 
     create, dash_store, projects_made = _dashboard_create_impl()
-    file_task, filed_this_turn, _conv_store, _made = _file_task_impl()
+    file_task, filed_this_turn, _begin, _conv_store, _made = _file_task_impl()
     GOAL = "Cache the résumé parser's output"
     KEY = "C1:1785644289.000100"
 
