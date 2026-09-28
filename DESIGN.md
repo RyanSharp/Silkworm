@@ -530,13 +530,13 @@ only grow while acceptance lagged. That put 41 tasks in `proposed` at once,
 several of them describing problems that had since been fixed on main, on a
 system whose default view is "what needs me?" and whose first rule is that a
 board which cannot reach empty is the wrong board. So a project
-also has a standing limit — `MAX_OPEN_PROPOSALS`, ten by default, two nights'
+also has a standing limit — `MAX_OPEN_PROPOSALS`, four by default, two nights'
 worth — and at it, the nightly pass **does not run**: no session is started,
 the night is marked as dealt with, and the skip is logged. Filing is refused at
 the same limit as well, so a pass that began while there was room still stops
 when the room runs out rather than filing past it.
 
-Ten because one night's proposals you have not got to yet is a normal morning,
+Four -- twice the per-pass cap -- because one night's proposals you have not got to yet is a normal morning,
 two is the board outpacing you, and a third night of the same is not
 information you did not already have. It is also about as many as can sit in
 the attention list beside everything else and still be read.

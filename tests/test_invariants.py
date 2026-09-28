@@ -1902,6 +1902,7 @@ def _run_ideation_impl():
     mod = types.ModuleType("ideating")
     mod.__dict__.update(
         scoping=S, tasks=T, task_store=ts, project_store=ps, datetime=datetime,
+        time=time,
         log=logging.getLogger("test"), CLAUDE_CWD=root, SILKWORM_BIN="silkworm",
         branches=types.SimpleNamespace(survey=lambda _t: []))
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<ideating>", "exec"),
@@ -6077,7 +6078,9 @@ def test_review_followups():
     exec(compile(ast.Module(body=[gate_fn], type_ignores=[]), "<x>", "exec"), gns)
     resolve = gns["resolve_review"]
 
-    work = store.create("do it", title="Do it", project="silkworm", role="implementor",
+    # Its own project: the checks above have filled silkworm's board to the
+    # standing limit, and a full board refusing this finding is correct there.
+    work = store.create("do it", title="Do it", project="gate-e2e", role="implementor",
                         scope={"cwd": "/repo"}, blocked_on=["rev1"])
     store.transition(work["id"], T.BLOCKED, "awaiting review")
     reviewer = store.create("review it", role="reviewer", parent=work["id"])
