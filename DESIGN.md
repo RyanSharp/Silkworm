@@ -1,8 +1,16 @@
 # Task system — design
 
-Status: steps 1-4 built. Every Slack turn is a task, a queue runner executes
-tasks with no live message, the dashboard opens on what needs you, and implementor work is
-gated behind an independent review. Next: ingestion adapters (step 5).
+Status: steps 1-4 built, and step 5 in part. Every Slack turn is a task, a
+queue runner executes tasks with no live message, and the dashboard (and the
+Slack Home tab) opens on what needs you. Queued implementor work runs in its
+own worktree, is verified by the project's own test command, and is gated behind an
+independent read-only review. Projects that opt in land reviewed, verified work
+on their base branch themselves (rebase, retest, fast-forward, retest, revert).
+Pushing the result is a separate opt-in. Of step 5, email ingestion, worktree
+isolation and per-role tool restriction are built. The remaining ingestion
+adapters (GitHub, recurring schedules, failures from other systems) are not, and
+per-role tool scoping can't be edited from the dashboard. See *Verifying work*
+and *Landing work without a person* below.
 
 ## What this is
 

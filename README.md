@@ -423,8 +423,10 @@ not your checkout — its own files, its own branch, sharing history. So it can
 never leave your working tree dirty or on another branch, and it doesn't queue
 behind a conversation about the same repo.
 
-Its commits land on `silkworm/<task-id>`, which survives for you to review; the
-reply names the branch and how many commits it made. A worktree holding
+Its commits go on `silkworm/<task-id>`, and the reply names the branch and how
+many commits it made. By default that branch is where the work stays for you to
+review. A project with auto-merge on can also fast-forward its base branch
+without asking you. See [Verifying and landing work](#verifying-and-landing-work). A worktree holding
 uncommitted changes is left on disk and reported rather than removed, so
 unfinished work is never tidied away — and ones orphaned by a restart are swept
 periodically.
@@ -434,6 +436,200 @@ changes in your main tree, so "fix what I'm working on" needs to run where you
 are actually working. That's recorded on the task when it's created, not
 inferred from who happens to run it — a message orphaned by a restart is handed
 to the runner so it isn't lost, and it still runs in your checkout.
+
+## Verifying and landing work
+
+A queued implementor task does not finish when it says it has. What happens next
+depends on two per-project settings, both off by default: a **test command**
+and **auto-merge**. With neither, the task ends with its branch and nothing else.
+With both, Silkworm can fast-forward your base branch **on its own**, with nobody
+clicking anything. Nothing else in Silkworm writes to your base branch.
+
+The whole chain, for one implementor task:
+
+    implement → verify (your tests) → review → land (auto-merge only)
+
+### 1. Give the project a test command
+
+In a Slack thread filed under the project (`!project <name>` first):
+
+```
+!project test ./bin/silkworm test    # set it
+!project test                        # show it
+!project test off                    # clear it
+```
+
+Or from anything that can reach the bot on localhost (port `APPROVAL_PORT`,
+default 8787):
+
+```
+curl -s 127.0.0.1:8787/projects -H 'Content-Type: application/json' \
+  -d '{"action":"test-cmd","slug":"trader","cmd":"make test"}'
+```
+
+What `verify.py` does with it:
+
+- It runs the command in the task's own checkout once the implementor's turn
+  ends, **before** the review and before that checkout is released. No model is
+  involved: this is a subprocess and its exit code.
+- The command is split like a shell would split it (`shlex`) but is **not run
+  through a shell**. Pipes, `&&` and redirects won't work. If you need them, put
+  them in a script and point `test_cmd` at the script.
+- **Exit 0 means pass.** Any other exit code, or no result within 30 minutes,
+  means fail. The reply includes `🧪 Tests pass.` or `❌ Tests fail (exit N).`
+  A timeout shows as `exit None`.
+- **Failing work goes back to the implementor** with the last 2000 characters
+  of output attached and an instruction to fix the change rather than the
+  tests. It is sent back at most `MAX_VERIFY_ATTEMPTS` times (default 2). If it
+  still fails after that, it goes to **awaiting_approval** for you to look at.
+  Approving it then closes the task but does not merge it (see below).
+- A missing binary or an unparseable command counts as **could not run**, not as
+  a failure. The reply says `❔ Not verified — could not run …`.
+
+**A project with no test command is never verified and never auto-merged.** Its
+replies say `❔ Not verified — no test command is configured for this project`,
+and its work still goes to the reviewer. The reviewer is read-only and can't run
+anything, so without a test command nothing has shown that the code works.
+Having no suite is not the same as passing one, and Silkworm doesn't treat it
+that way.
+
+### 2. Turn on auto-merge
+
+There is no Slack command or dashboard button for this. Set it on the bot's
+local `/projects` route:
+
+```
+# on
+curl -s 127.0.0.1:8787/projects -H 'Content-Type: application/json' \
+  -d '{"action":"auto-merge","slug":"trader","on":true}'
+
+# off
+curl -s 127.0.0.1:8787/projects -H 'Content-Type: application/json' \
+  -d '{"action":"auto-merge","slug":"trader","on":false}'
+```
+
+The dashboard proxies the same route at `http://127.0.0.1:8790/api/projects`.
+Turning auto-merge on is **refused unless the project already has a test
+command** (`set a test command first — nothing may land unproven`). Clearing the
+test command afterwards doesn't turn auto-merge off, but every landing will then
+refuse at `no-test-command`.
+
+Before relying on it, check that:
+
+- **The project points at the repo.** `!project <name>` sent from a thread
+  whose working directory is the repo records that directory as the project's
+  `scope.cwd`. That checkout is the one landings merge into. Running
+  `!project <name>` again **replaces** the project's whole scope with the
+  thread's directory, which also clears a base set with `!project base`.
+- **The checkout is on the base branch and has no uncommitted edits to tracked
+  files.** Silkworm won't switch branches for you, and it won't merge over your
+  work in progress. Untracked files don't count.
+- **The base is the one you want.** By default it's the remote's default branch
+  (`origin/HEAD`), else `main`, else `master`. `!project base <branch>` sets
+  another one, and `!project base default` puts it back. A task copies the
+  project's scope when it is created, so a change applies to tasks filed after
+  it, both when they start and when they land. Tasks already on the board keep
+  the base they were filed with.
+
+`!project test` is the quickest way to check that the command is set. To see
+every setting, list the projects: `-d '{"action":"list"}'`.
+
+### 3. What a landing does
+
+A landing runs when **the review passes**. It also runs when you **Approve** a
+task that is in `awaiting_approval`, from the dashboard or the Slack Home tab,
+because approving flagged work counts as a decision it is fine. Approving a task
+that is still `blocked` on its review doesn't land it.
+
+Before it touches git, the work must pass four checks. The project has
+auto-merge on, the project has a test command, **this task's tests passed**, and
+the task has a checkout to land from. If any of those is missing, the work was
+never a candidate.
+
+After those checks, the order is fixed (`merge.land()`). Each step runs only if
+the previous one succeeded:
+
+1. **Check the base checkout.** Refuse if it has uncommitted changes to tracked
+   files, if no base branch can be resolved, or if the checkout is on a
+   different branch. Otherwise read the exact commit the base is on.
+2. **Rebase** the task's branch onto that commit, in a separate `land` checkout.
+   A conflict aborts the rebase and refuses.
+3. **Retest** the rebased branch with the project's test command.
+4. **Recheck** that the base is still on the commit it was rebased onto. The
+   suite takes minutes, and something else may have moved the base meanwhile.
+5. **Fast-forward only** (`git merge --ff-only`). A merge commit is never made,
+   and neither is a conflict resolution nobody reviewed.
+6. **Retest the base itself.**
+7. **Revert if that broke it.** If the post-merge tests fail, the base is
+   `reset --hard` to exactly the commit it was on before, and the landing
+   refuses.
+
+A landing takes the same checkout lock a conversation turn does, so it never
+runs alongside a turn in that repo.
+
+A successful landing replies `:shipit: Landed on main (a1b2c3d4, local only, not
+pushed)` and completes the task. The new commit is stored on the task record as
+`result.landed`. **Landing moves your local branch only.** Nothing is pushed
+unless the project also has `publish` on:
+
+```
+curl -s 127.0.0.1:8787/projects -H 'Content-Type: application/json' \
+  -d '{"action":"publish","slug":"trader","on":true}'
+```
+
+That is refused unless auto-merge is on. With `publish` on, Silkworm pushes the
+base to `origin` last, after the post-merge tests. If the push fails, the landing
+stays and the reply says it wasn't pushed, with git's error underneath. To check
+whether a push that reported failure actually took, Silkworm asks `origin`
+instead of trusting the exit code.
+
+### When a landing refuses
+
+**Every refusal leaves the branch in place.** The task's commits stay on
+`silkworm/<task-id>`, and the base is unchanged (with one exception,
+`interrupted`, below). That branch is named in two
+places:
+
+- **The Slack reply** in the task's thread:
+  `✋ Not landed (rebase). Branch silkworm/tsk_… is waiting for you.`, followed
+  by the reason and git's or the suite's output.
+- **The task record**, under `result.landing`: `stage`, `detail`, `branch`,
+  and whether it was `eligible`. The dashboard's task row shows it as
+  `not landed (rebase) — silkworm/tsk_… is waiting for you`. It survives task
+  compaction.
+
+If the landing refused **after a passing review**, the task is parked in
+**awaiting_approval**, with the reason `review passed but the landing refused
+(<stage>)`. It is not marked done. After fixing the cause (committing your
+edits, switching the checkout back, resolving the conflict), **Approve** retries
+the landing. Approving always completes the task, whether or not it lands. The
+outcome goes on the record.
+
+The stages, and what each means:
+
+| Stage | Meaning |
+|---|---|
+| `base-dirty` | Your checkout has uncommitted edits to tracked files |
+| `base-unresolved` | No base branch could be found: no `main`, no `master`, no remote. Set one with `!project base` |
+| `base-branch` | Your checkout is on another branch than the base, or the base's commit couldn't be read |
+| `attach` | The task's branch couldn't be checked out, e.g. the task made no commits or wasn't isolated |
+| `rebase` | Rebasing onto the base conflicts. The rebase is aborted |
+| `tests-after-rebase` | The change passed alone but fails on top of the current base |
+| `base-moved` | The base moved while the tests ran. The reply names both commits |
+| `merge` | The branch isn't a fast-forward of the base |
+| `tests-after-merge` | The base failed its tests after the merge, and was put back |
+| `errored` | The landing itself raised an error. See the bot log |
+| `interrupted` | A restart killed the landing. The record says nothing was merged, but if the restart came during the post-merge tests, the base may already be fast-forwarded and not reverted. Check it |
+| `in-progress` | Not a refusal: an Approve-started landing is running. The dashboard shows `landing…` |
+
+A rebase changes the branch itself. If a landing refuses after step 2, the
+branch you find has already been rebased onto the base.
+
+A task that was **never a candidate** is different. Its project has a test
+command but the tests never passed, or it has no checkout. That task completes
+normally, and the reply says `✋ Not landed: <reason>.` with the same reason
+stored on the record. A project that never turned auto-merge on gets neither the
+reply nor the record: its branch is simply the deliverable.
 
 ## Watching something over time
 
