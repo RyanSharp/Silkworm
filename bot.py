@@ -32,6 +32,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import backfill
 import branches
 import credentials
+import daemons
 import defer
 import email_ingest
 import harvester
@@ -1106,9 +1107,13 @@ def handle_status(payload: dict) -> dict:
     # own main, so the checkout moves on without the process. Reported as what
     # booted versus what is on disk, rather than one "version", because the
     # useful fact is the gap between them.
+    # The Slack link is not the only thing that can stop while the process
+    # stays up: every background loop ends for good on one escaped exception,
+    # and a dead thread logs nothing further. Say which ones are gone.
     return {"online": True, "threads": threads,
             "slack": slack.status(time.time()), "auth": auth,
-            "revision": revision.state(BASE_DIR, REVISION)}
+            "revision": revision.state(BASE_DIR, REVISION),
+            "daemons": daemons.status()}
 
 
 def handle_web_message(payload: dict) -> dict:
@@ -3657,26 +3662,56 @@ def _watchdog() -> None:
             log.exception("watchdog sweep failed")
 
 
-def _sweeper() -> None:
-    """Six-hourly tidy: empty session husks, and yesterday's outbox dirs.
+def _sweep_pass() -> None:
+    """Six-hourly tidy: empty session husks, finished tasks, yesterday's outboxes.
 
     Threads are retired by hiding them, not by being deleted out from under
-    you -- so this only removes records with nothing in them and no task
-    pointing at them. See SessionStore.forget_empty.
+    you -- so the first step only removes records with nothing in them and no
+    task pointing at them. See SessionStore.forget_empty.
+
+    Every step is guarded, and separately. Only the compaction used to be, and
+    the other two raise for real: the session step ends in a jsonstore save
+    that a full or read-only disk fails, and `iterdir()` then `stat()` races
+    the outbox directories turns create while this walks them. Either one
+    ended the thread -- the only caller of forget_empty() and
+    compact_older_than() -- so tasks.json would have grown forever with nothing
+    in the log to say it had stopped being tidied. Separately rather than as
+    one block because these are unrelated jobs: a sessions.json that cannot be
+    written must not be the reason tasks.json never compacts again.
     """
-    while True:
+    try:
         referenced = {r.get("thread") for r in task_store.all().values() if r.get("thread")}
         gone = store.forget_empty(SESSION_MAX_AGE_DAYS, keep=referenced)
         if gone:
             log.info("forgot %d empty session record(s) older than %sd: %s",
                      len(gone), SESSION_MAX_AGE_DAYS, ", ".join(gone))
-        try:
-            task_store.compact_older_than(TASK_COMPACT_AFTER_DAYS)
-        except Exception:
-            log.exception("compacting finished tasks failed")
+    except Exception:
+        log.exception("forgetting empty sessions failed")
+    try:
+        task_store.compact_older_than(TASK_COMPACT_AFTER_DAYS)
+    except Exception:
+        log.exception("compacting finished tasks failed")
+    try:
         for orphan in OUTBOX_ROOT.iterdir():
-            if orphan.is_dir() and orphan.stat().st_mtime < time.time() - 86400:
+            try:
+                stale = orphan.is_dir() and orphan.stat().st_mtime < time.time() - 86400
+            except OSError:
+                continue          # created or removed under us mid-walk; not ours
+            if stale:
                 shutil.rmtree(orphan, ignore_errors=True)
+    except Exception:
+        log.exception("sweeping old outboxes failed")
+
+
+def _sweeper() -> None:
+    while True:
+        try:
+            _sweep_pass()
+        except Exception:
+            # Nothing above should reach here; this is so that whatever is
+            # added to the pass next still costs one round rather than the
+            # thread, the way every sibling loop in this file is written.
+            log.exception("sweep pass failed")
         time.sleep(6 * 3600)
 
 
@@ -3694,21 +3729,24 @@ def _harvester() -> None:
 
 if __name__ == "__main__":
     reconcile_checkouts()
+    # Every long-lived loop is started through daemons.start, so /status can
+    # tell when one has stopped. forever=False marks a startup pass that is
+    # meant to finish; a feature switched off in .env returns at once on
+    # purpose, so its loop is only expected to persist when it is switched on.
     # Background: an orphaned turn may still be writing, so this waits on it.
-    threading.Thread(target=_recoverer, daemon=True, name="recoverer").start()
-    threading.Thread(target=_recovery_sweeper, daemon=True, name="rsweep").start()
-    threading.Thread(target=_worktree_sweeper, daemon=True, name="wtsweep").start()
-    threading.Thread(target=_sweeper, daemon=True, name="sweeper").start()
-    threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
-    threading.Thread(target=_backfiller, daemon=True, name="backfill").start()
-    threading.Thread(target=_task_scheduler, daemon=True, name="tsched").start()
+    daemons.start(_recoverer, "recoverer", forever=False)
+    daemons.start(_recovery_sweeper, "rsweep")
+    daemons.start(_worktree_sweeper, "wtsweep")
+    daemons.start(_sweeper, "sweeper")
+    daemons.start(_watchdog, "watchdog")
+    daemons.start(_backfiller, "backfill", forever=False)
+    daemons.start(_task_scheduler, "tsched")
     for _i in range(max(1, TASK_WORKERS)):
-        threading.Thread(target=_task_worker, args=(_i,), daemon=True,
-                         name=f"task{_i}").start()
-    threading.Thread(target=_email_watcher, daemon=True, name="email").start()
-    threading.Thread(target=_credential_watcher, daemon=True, name="creds").start()
-    threading.Thread(target=_ideation_scheduler, daemon=True, name="ideate").start()
-    threading.Thread(target=_harvester, daemon=True, name="harvester").start()
+        daemons.start(_task_worker, f"task{_i}", args=(_i,))
+    daemons.start(_email_watcher, "email", forever=bool(GMAIL_USER and GMAIL_APP_PASSWORD))
+    daemons.start(_credential_watcher, "creds")
+    daemons.start(_ideation_scheduler, "ideate")
+    daemons.start(_harvester, "harvester", forever=HARVEST_INTERVAL_H > 0)
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))
@@ -3725,6 +3763,5 @@ if __name__ == "__main__":
              " (dirty)" if REVISION["dirty"] else "",
              REVISION["branch"] or "detached HEAD", f" · {BASE_DIR}")
     slack_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
-    threading.Thread(target=_slack_watchdog, args=(slack_handler,),
-                     daemon=True, name="slack-health").start()
+    daemons.start(_slack_watchdog, "slack-health", args=(slack_handler,))
     slack_handler.start()

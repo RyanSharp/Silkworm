@@ -253,7 +253,7 @@ def test_recovery():
     sweep = sweep[:sweep.index("\ndef ", 1)]
     check("the sweep is its own thread, not a tail on the startup pass",
           "def _recovery_sweeper" in src and
-          'name="rsweep"' in src,
+          'daemons.start(_recovery_sweeper, "rsweep")' in src,
           "the startup pass waits up to an hour; a sweep behind it never engages")
     check("the sweep never waits on a live child", "wait_s=0" in sweep,
           "only a finished child gives a trustworthy reply")
@@ -1325,7 +1325,7 @@ def test_putting_away_is_not_deleting():
     check("the six-hourly sweeper no longer deletes on age",
           not any(c.func.attr == "sweep" for c in calls))
     sweeper = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                    and n.name == "_sweeper"), None)
+                    and n.name == "_sweep_pass"), None)
     forgets = [n for n in ast.walk(sweeper) if isinstance(n, ast.Call)
                and isinstance(n.func, ast.Attribute) and n.func.attr == "forget_empty"]
     check("and tells the store which threads tasks point at",
@@ -3157,7 +3157,8 @@ def test_worktrees():
     check("a failed task still releases its checkout",
           "could not release worktree" in ex, "otherwise every failure leaks one")
     check("the branch is named in the reply", "isolated checkout" in ex.lower())
-    check("orphans are swept periodically", 'name="wtsweep"' in bot)
+    check("orphans are swept periodically",
+          'daemons.start(_worktree_sweeper, "wtsweep")' in bot)
 
 
 # --- cancelling must stop the work, not just relabel it --------------------------
@@ -3404,7 +3405,7 @@ def test_credentials_check():
     bot = (BASE / "bot.py").read_text()
     w = bot[bot.index("def _credential_watcher"):bot.index("def _task_scheduler")]
     check("the bot warns on its own, without being asked",
-          'name="creds"' in bot and "chat_postMessage" in w)
+          'daemons.start(_credential_watcher, "creds")' in bot and "chat_postMessage" in w)
     check("it warns once per credential, not hourly",
           "_warned_expiry" in w and 'expiry != _warned_expiry[0]' in w,
           "a nag every hour is a nag you filter out")
@@ -8059,6 +8060,269 @@ def test_revision_drift():
           "renderAlerts(data.sessions, data.slack, data.revision)" in viz)
     check("and alerts on anything that is not current",
           'revision.state !== "current"' in viz)
+
+
+# --- a failing sweep costs one pass, never the thread --------------------------
+# _sweeper guarded only its middle step. The session step ends in a jsonstore
+# save a full disk fails, and iterdir() then stat() races the outbox dirs turns
+# create -- either ended the thread, which is the only caller of both, so
+# tasks.json would never have compacted again and nothing would have said so.
+
+class _Stop(Exception):
+    """Raised by a fake sleep to end an otherwise endless loop under test."""
+
+
+def _sweeper_ns(outbox, *, forget=None, compact=None):
+    import shutil as _shutil
+    ran = []
+
+    class Store:
+        def forget_empty(self, days, keep=()):
+            ran.append("forget")
+            if forget:
+                raise forget
+            return []
+
+    class Tasks:
+        def all(self):
+            return {}
+
+        def compact_older_than(self, days):
+            ran.append("compact")
+            if compact:
+                raise compact
+
+    ns = bot_functions("_sweep_pass", "_sweeper", store=Store(), task_store=Tasks(),
+                       OUTBOX_ROOT=outbox, shutil=_shutil,
+                       SESSION_MAX_AGE_DAYS=30, TASK_COMPACT_AFTER_DAYS=14)
+    ns["log"] = logging.getLogger("test.sweeper")
+    ns["log"].disabled = True
+    return ns, ran
+
+
+def _old_outbox(root, name):
+    d = root / name
+    d.mkdir()
+    old = time.time() - 3 * 86400
+    os.utime(d, (old, old))
+    return d
+
+
+def test_sweeper_survives_a_raising_step():
+    print("\nthe sweeper survives an exception from any of its steps")
+
+    # Each step raising in turn: the pass returns, and the other steps still ran.
+    for which in ("forget", "compact", "outbox"):
+        root = Path(tempfile.mkdtemp())
+        stale = _old_outbox(root, "old")
+        outbox = root
+        if which == "outbox":
+            class Gone:                       # the directory vanished under us
+                def iterdir(self):
+                    raise FileNotFoundError("outbox root removed")
+            outbox = Gone()
+        ns, ran = _sweeper_ns(outbox,
+                              forget=OSError(28, "No space left") if which == "forget" else None,
+                              compact=OSError(30, "Read-only") if which == "compact" else None)
+        try:
+            ns["_sweep_pass"]()
+            raised = None
+        except Exception as e:                # noqa: BLE001
+            raised = e
+        check(f"a raising {which} step does not escape the pass", raised is None, repr(raised))
+        check(f"and the other steps still ran when {which} raised",
+              ran == ["forget", "compact"], f"ran {ran}")
+        if which != "outbox":
+            check(f"old outboxes are still swept when {which} raised", not stale.exists())
+
+    # The race itself: a dir listed by iterdir() and gone before stat().
+    root = Path(tempfile.mkdtemp())
+    before, after = _old_outbox(root, "a"), _old_outbox(root, "z")
+
+    class Vanished:                           # still a dir at is_dir(), gone at stat()
+        def is_dir(self):
+            return True
+
+        def stat(self):
+            raise FileNotFoundError(2, "No such file or directory", "m-vanished")
+    vanished = Vanished()
+
+    class Racy:
+        def iterdir(self):
+            yield before
+            yield vanished                    # listed, then removed before stat
+            yield after
+    ns, _ = _sweeper_ns(Racy())
+    ns["_sweep_pass"]()
+    check("a dir removed mid-walk is skipped, not fatal to the walk",
+          not before.exists() and not after.exists(),
+          "the directories after the vanished one must still be swept")
+
+    # The loop itself: every step raising, three passes, and it is still going.
+    root = Path(tempfile.mkdtemp())
+    class Gone:
+        def iterdir(self):
+            raise FileNotFoundError("gone")
+    ns, ran = _sweeper_ns(Gone(), forget=OSError("disk full"), compact=RuntimeError("bad"))
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 3:
+            raise _Stop
+    ns["time"] = types.SimpleNamespace(sleep=sleep, time=time.time)
+    try:
+        ns["_sweeper"]()
+    except _Stop:
+        pass
+    check("with every step raising, the loop keeps going pass after pass",
+          len(sleeps) == 3 and ran.count("forget") == 3 and ran.count("compact") == 3,
+          f"sleeps={sleeps} ran={ran}")
+
+    # And the backstop: whatever is added to the pass later cannot end the loop.
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise ValueError("a future step nobody guarded")
+    ns["_sweep_pass"] = boom
+    sleeps.clear()
+    try:
+        ns["_sweeper"]()
+    except _Stop:
+        pass
+    except ValueError:
+        pass
+    check("an exception escaping the pass costs one round, not the thread",
+          len(calls) == 3, f"pass ran {len(calls)} time(s) before the loop ended")
+
+
+# --- a dead background thread is visible ----------------------------------------
+# Nothing checked whether any of the ~14 daemon threads was still alive. A loop
+# that raised simply stopped, logged nothing further, and the process -- and
+# every health check -- carried on looking fine.
+
+def test_dead_background_threads_are_reported():
+    import threading as _threading
+    import daemons
+    print("\nstatus names any background thread that has stopped")
+
+    hook = _threading.excepthook
+    _threading.excepthook = lambda args: None      # the raise is the point here
+    daemons.reset()
+    try:
+        hold = _threading.Event()
+
+        def forever():
+            hold.wait()
+
+        def crash():
+            raise OSError(28, "No space left on device")
+
+        def finishes():
+            return
+
+        daemons.start(forever, "alive")
+        daemons.start(crash, "crashed")
+        daemons.start(finishes, "loop-returned")
+        daemons.start(finishes, "startup-pass", forever=False)
+        daemons.start(crash, "startup-crashed", forever=False)
+        daemons.start(lambda n: hold.wait(), "worker0", args=(0,))
+        for t in _threading.enumerate():
+            if t.name in ("crashed", "loop-returned", "startup-pass", "startup-crashed"):
+                t.join(5)
+
+        st = daemons.status()
+        gone = {d["name"]: d for d in st["dead"]}
+        check("a live loop is not reported", "alive" not in gone and "worker0" not in gone)
+        check("a loop that raised is reported, with why",
+              "crashed" in gone and "No space left" in gone["crashed"]["reason"],
+              str(gone.get("crashed")))
+        check("a loop meant to run forever that returned is reported",
+              "loop-returned" in gone
+              and gone["loop-returned"]["reason"] == "returned without raising")
+        check("a startup pass that finished is not reported", "startup-pass" not in gone)
+        check("but one that raised is", "startup-crashed" in gone)
+        check("counts add up: a finished startup pass is neither alive nor dead",
+              st["count"] == 6 and st["alive"] == 2 and len(st["dead"]) == 3,
+              str(st))
+        check("dead_for is measured from when it was first noticed",
+              daemons.dead(time.time() + 120)[0]["dead_for"] >= 119)
+        hold.set()
+    finally:
+        _threading.excepthook = hook
+        daemons.reset()
+
+    # bot.py: the endpoint reports them, and every boot-time loop is registered.
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    status_fn = next(n for n in tree.body
+                     if isinstance(n, ast.FunctionDef) and n.name == "handle_status")
+    check("/status carries daemons.status()",
+          "daemons.status()" in ast.unparse(status_fn))
+    main = next(n for n in tree.body if isinstance(n, ast.If)
+                and "__name__" in ast.unparse(n.test))
+    raw = [n for n in ast.walk(main) if isinstance(n, ast.Call)
+           and ast.unparse(n.func) in ("threading.Thread", "Thread")]
+    check("no background loop is started behind the registry's back", not raw,
+          f"{len(raw)} bare threading.Thread in __main__")
+    started = {n.args[0].id for n in ast.walk(main) if isinstance(n, ast.Call)
+               and ast.unparse(n.func) == "daemons.start" and n.args
+               and isinstance(n.args[0], ast.Name)}
+    for name in ("_sweeper", "_worktree_sweeper", "_recovery_sweeper", "_watchdog",
+                 "_task_scheduler", "_task_worker", "_ideation_scheduler",
+                 "_credential_watcher", "_harvester", "_email_watcher",
+                 "_slack_watchdog", "_recoverer", "_backfiller"):
+        check(f"{name} is registered", name in started)
+
+    # The real handle_status, against fakes, returns what the CLI will read.
+    daemons.reset()
+    try:
+        daemons.start(lambda: None, "sweeper")
+        for t in _threading.enumerate():
+            if t.name == "sweeper":
+                t.join(5)
+        ns = bot_functions(
+            "handle_status", store=types.SimpleNamespace(all=lambda: {}), RUNNING={},
+            credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
+            slack=types.SimpleNamespace(status=lambda now: {}),
+            revision=types.SimpleNamespace(state=lambda *a: {}),
+            BASE_DIR=BASE, REVISION={}, os=os, daemons=daemons)
+        out = ns["handle_status"]({})
+        check("/status names the dead thread",
+              [d.get("name") for d in (out.get("daemons") or {}).get("dead", [])] == ["sweeper"],
+              str(out.get("daemons")))
+    finally:
+        daemons.reset()
+
+    # bin/silkworm: the check fails, and names it; an old bot is not all-clear.
+    cli = ast.parse((BASE / "bin" / "silkworm").read_text())
+    fn = next(n for n in cli.body
+              if isinstance(n, ast.FunctionDef) and n.name == "check_daemons")
+    printed = []
+
+    def fake_check(label, ok, hint=""):
+        printed.append((label, ok, hint))
+        return ok
+    mod = {"check": fake_check}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<cli>", "exec"), mod)
+    mod["check_daemons"]({"count": 14, "alive": 13, "dead": [
+        {"name": "sweeper", "reason": "OSError: [Errno 28] No space left", "dead_for": 7200}]})
+    label, ok, hint = printed[-1]
+    check("silkworm status fails when one has stopped", ok is False)
+    check("and names it, with the reason", "sweeper" in hint and "No space left" in hint, hint)
+    check("and shows how many are alive", "13/14" in label, label)
+    mod["check_daemons"]({"count": 14, "alive": 14, "dead": []})
+    check("all alive passes", printed[-1][1] is True)
+    mod["check_daemons"]({"count": 0, "alive": 0, "dead": []})
+    check("none registered yet (still booting) is not all-clear", printed[-1][1] is False,
+          "/status answers from import time, before any loop has started")
+    mod["check_daemons"](None)
+    check("a bot too old to report them fails rather than passes", printed[-1][1] is False)
+    status_src = ast.unparse(next(n for n in cli.body
+                                  if isinstance(n, ast.FunctionDef) and n.name == "do_status"))
+    check("do_status runs the check", "check_daemons(bot.get('daemons'))" in status_src)
+
 
 if __name__ == "__main__":
     tests = discover()

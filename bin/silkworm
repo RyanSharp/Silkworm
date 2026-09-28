@@ -237,6 +237,28 @@ def do_doctor() -> bool:
     return ok
 
 
+def check_daemons(d) -> bool:
+    """Report the bot's background threads: all alive, or which have stopped.
+
+    Pulled out of do_status so the wording can be tested without a live bot.
+    """
+    if not d:
+        # An older bot does not report them. Unknown is not all-clear.
+        return check("background threads", False,
+                     "this bot is too old to report them — run: silkworm restart")
+    if not d.get("count"):
+        # The local server answers from import time, before __main__ has
+        # started a single loop -- so none registered means booting (or stuck
+        # before it got that far), not healthy.
+        return check("background threads", False,
+                     "none started yet — still booting? check again, or see silkworm logs")
+    gone = d.get("dead") or []
+    names = "; ".join(f"{g.get('name')} ({g.get('reason') or 'stopped'}, "
+                      f"noticed {int((g.get('dead_for') or 0) // 60)}m ago)" for g in gone)
+    return check(f"background threads alive ({d.get('alive', 0)}/{d.get('count', 0)})",
+                 not gone, f"stopped: {names} — see silkworm logs, then: silkworm restart")
+
+
 def do_status() -> None:
     mgr = service_manager()
     print(f"{WORM} status")
@@ -254,6 +276,13 @@ def do_status() -> None:
               f"down for {int(down // 60)}m — it should self-restart; silkworm logs")
     check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
     check("session hooks installed", hooks_installed())
+
+    # A live process is not a working one: each background loop -- sweeper,
+    # schedulers, task workers -- ends for good on one escaped exception, and a
+    # dead thread logs nothing further. The only symptom was work that quietly
+    # stopped happening.
+    if bot.get("online"):
+        check_daemons(bot.get("daemons"))
 
     # A landed fix is not a running fix. Silkworm auto-merges onto its own main
     # and nothing restarts it, so the commit sits in the tree while the live
