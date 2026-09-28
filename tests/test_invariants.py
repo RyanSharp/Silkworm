@@ -8398,6 +8398,17 @@ def test_board_channel():
     s.fail_update = None
 
     many = [store.create(f"task {i}", state=T.PROPOSED) for i in range(80)]
+    # A realistic full board: every attention state (each brings a heading),
+    # plus running work, wake-ups and the unmerged line -- the tail the budget
+    # has to leave room for. One state alone fits by the item cap regardless.
+    for i in range(20):
+        x = store.create(f"work {i}", state=T.QUEUED)["id"]
+        store.transition(x, T.RUNNING)
+        if i < 15:
+            store.transition(x, (T.AWAITING_APPROVAL, T.NEEDS_INPUT, T.FAILED)[i % 3])
+    b2._watching = lambda: [{"id": f"w{i}", "goal": f"watch {i}", "in_s": 60} for i in range(20)]
+    b2._unmerged = lambda: "67 finished tasks on unmerged branches"
+    b2._cache = ("", 0.0)
     b2.sync(s, force=True)
     blocks = s.calls[-1][-1]
     check("a full board fits Slack's 50-block message limit", len(blocks) <= 50, str(len(blocks)))
