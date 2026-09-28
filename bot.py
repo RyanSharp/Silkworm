@@ -2278,14 +2278,20 @@ def refuse_review(task: dict, branch: str, progress, channel: str,
     why = f"could not check out `{branch}`, so nothing was reviewed"
     log.warning("review %s of %s: %s", tid, parent_id, why)
     progress.finalize(f":hand: _Review not run — {why}._")
-    task_state(tid, tasks.FAILED, why[:160])
     parent = task_store.get(parent_id)
+    # The no-verdict goes on the parent *before* the review is failed. Failing
+    # a blocker releases whatever waits on it, and the release sends a waiter
+    # with a result to awaiting_approval and one without to failed -- so
+    # writing it afterwards lost the race to a rule that would otherwise agree.
+    if parent:
+        task_store.update(parent_id, result={
+            **(parent.get("result") or {}),
+            "review": roles.no_verdict(why)})
+    task_state(tid, tasks.FAILED, why[:160])
     if not parent:
         return
-    task_store.update(parent_id, result={
-        **(parent.get("result") or {}),
-        "review": roles.no_verdict(why)})
-    task_state(parent_id, tasks.AWAITING_APPROVAL, why[:160])
+    if (task_store.get(parent_id) or {}).get("state") == tasks.BLOCKED:
+        task_state(parent_id, tasks.AWAITING_APPROVAL, why[:160])
     try:
         app.client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
