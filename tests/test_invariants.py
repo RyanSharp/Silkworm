@@ -8346,12 +8346,18 @@ def test_board_channel():
         def __init__(self, members=("U_ME", "B_BOT"), channels=None):
             self.members = list(members)
             self.channels = channels if channels is not None else [
-                {"id": "G_BOARD", "name": "silkworm-board", "is_member": True},
+                {"id": "G_BOARD", "name": "silkworm-board", "is_member": True,
+                 "is_private": True},
                 {"id": "C_OTHER", "name": "general", "is_member": True}]
             self.calls, self.fail_update = [], None
             self.n = 0
         def conversations_list(self, **kw):
             return {"channels": self.channels, "response_metadata": {}}
+        def conversations_info(self, channel, **kw):
+            c = next((c for c in self.channels if c["id"] == channel), None)
+            if c is None:
+                raise Err("channel_not_found")
+            return {"channel": c}
         def conversations_members(self, channel, **kw):
             return {"members": self.members, "response_metadata": {}}
         def chat_postMessage(self, channel, text, blocks):
@@ -8426,6 +8432,44 @@ def test_board_channel():
     s3.members.append("U_STEPH")                   # someone joins later
     check("taken down when someone off the allowlist joins",
           b4.sync(s3) == "outsiders" and s3.calls[-1][0] == "delete")
+    # A take-down that fails must be tried again, not forgotten: forgetting
+    # the message leaves it readable by the newcomer for good.
+    s6 = Slack()
+    b7 = home.Board(state_path=d / "b7.json", bot_user="B_BOT", store=store,
+                    call=ns["handle_tasks"], allowed_users={"U_ME"})
+    b7.sync(s6); s6.members.append("U_STEPH")
+    real_delete = s6.chat_delete
+    def flaky(channel, ts):
+        s6.chat_delete = real_delete
+        raise Err("ratelimited")
+    s6.chat_delete = flaky
+    b7.sync(s6)
+    b7.sync(s6)
+    check("a take-down that failed once is tried again",
+          any(c[0] == "delete" for c in s6.calls))
+    # Anyone in the workspace can read a public channel without joining it,
+    # so a clean member list says nothing there.
+    pub = Slack(channels=[{"id": "C_PUB", "name": "silkworm-board", "is_member": True,
+                           "is_private": False}])
+    check("never posted in a public channel, whoever its members are",
+          board().sync(pub) != "posted" and not [c for c in pub.calls if c[0] == "post"])
+    # A real-looking id: C_PUB would not parse as one, and the check would
+    # pass by finding no channel at all.
+    pub_id = Slack(channels=[{"id": "C0PUB123", "name": "anything", "is_member": True,
+                              "is_private": False}])
+    by_id = board(channel="C0PUB123")
+    check("an id is taken as an id", by_id.channel(pub_id) == "C0PUB123")
+    check("nor in one configured by id",
+          by_id.sync(pub_id) != "posted" and not [c for c in pub_id.calls if c[0] == "post"])
+    s8 = Slack()
+    b8 = home.Board(state_path=d / "b8.json", bot_user="B_BOT", store=store,
+                    call=ns["handle_tasks"], allowed_users={"U_ME"})
+    b8.sync(s8); s8.members.append("U_STEPH")
+    b8.on_member_joined({"channel": "C_OTHER", "user": "U_STEPH"}, s8)
+    check("a join elsewhere is ignored", s8.calls[-1][0] != "delete")
+    b8.on_member_joined({"channel": "G_BOARD", "user": "U_STEPH"}, s8)
+    check("a join to the board channel takes it down at once, not next pass",
+          s8.calls[-1][0] == "delete")
     check("no channel yet, nothing posted and no crash",
           board().sync(Slack(channels=[])) == "no-channel")
 

@@ -546,7 +546,9 @@ class Board(Home):
             return name
         cursor = None
         while True:
-            r = client.conversations_list(types="private_channel,public_channel",
+            # Private only: a public channel can be read by anyone in the
+            # workspace without joining it, so its member list proves nothing.
+            r = client.conversations_list(types="private_channel",
                                           exclude_archived=True, limit=200,
                                           cursor=cursor)
             for c in r.get("channels") or []:
@@ -619,15 +621,25 @@ class Board(Home):
             except Exception:
                 log.exception("could not read the board channel's members")
                 return "members-failed"
+            try:
+                private = bool(((client.conversations_info(channel=channel) or {})
+                                .get("channel") or {}).get("is_private"))
+            except Exception:
+                log.exception("could not tell whether the board channel is private")
+                return "info-failed"
+            if not private:
+                # Checked every pass, not once: a private channel can be made
+                # public, and then anyone in the workspace can read it.
+                self._take_down(client, channel, ts)
+                if self._warned != "public":
+                    log.warning("board not posted: #%s is public; it must be a "
+                                "private channel", self.channel_name)
+                    self._warned = "public"
+                return "public"
             if outside:
                 # Take the board down rather than leave it where someone off
                 # the allowlist can read goals and review findings.
-                if ts:
-                    try:
-                        client.chat_delete(channel=channel, ts=ts)
-                    except Exception:
-                        log.exception("could not take the board down")
-                    self._save(channel="", ts="")
+                self._take_down(client, channel, ts)
                 if self._warned != f"outsiders:{outside}":
                     log.warning("board not posted: #%s has members off the "
                                 "allowlist (%s)", self.channel_name, ", ".join(outside))
@@ -654,7 +666,9 @@ class Board(Home):
                         # it, and look again on the next pass.
                         self._channel_id = ""
                         self._save(channel="", ts="")
-                        log.warning("the board channel went away (%s)", err)
+                        log.warning("the board channel went away (%s); if the bot was "
+                                    "removed, its last board message is still there "
+                                    "and has to be deleted by hand", err)
                         return "channel-gone"
                     if err not in ("message_not_found", "cant_update_message"):
                         log.exception("could not update the board")
@@ -664,6 +678,27 @@ class Board(Home):
             self._save(channel=channel, ts=r["ts"])
             self._last = (print_, time.time())
             return "posted"
+
+    def _take_down(self, client, channel: str, ts) -> None:
+        """Delete the board message, and forget it only once it is gone.
+        Forgetting it after a failed delete would leave it up for good, where
+        the reason for taking it down can still read it."""
+        if not ts:
+            return
+        try:
+            client.chat_delete(channel=channel, ts=ts)
+        except Exception as e:
+            err = getattr(getattr(e, "response", None), "get", lambda *_: "")("error")
+            if err != "message_not_found":
+                log.exception("could not take the board down; will try again")
+                return
+        self._save(channel="", ts="")
+
+    def on_member_joined(self, event, client):
+        """Someone joined a channel: if it is the board's, check it now rather
+        than at the next pass, since a new member sees the history at once."""
+        if event.get("channel") and event.get("channel") == self._channel_id:
+            self.sync(client, force=True)
 
     # -- the handlers' one difference: where the result goes --
 
@@ -686,7 +721,9 @@ class Board(Home):
 
 
 def register(app, home: Home) -> None:
-    if not isinstance(home, Board):
+    if isinstance(home, Board):
+        app.event("member_joined_channel")(home.on_member_joined)
+    else:
         app.event("app_home_opened")(home.on_opened)
     app.action("home_refresh")(home.on_refresh)
     app.action("home_thread")(home.on_link)

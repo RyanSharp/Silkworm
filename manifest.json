@@ -40,7 +40,8 @@
         "event_subscriptions": {
             "bot_events": [
                 "app_mention",
-                "message.im"
+                "message.im",
+                "member_joined_channel"
             ]
         },
         "interactivity": {
