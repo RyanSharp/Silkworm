@@ -22,6 +22,7 @@ import secrets
 
 import jsonstore
 import procs
+import slacklinks
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -166,7 +167,7 @@ def load_sessions() -> dict:
             "running": st.get("running", False),
             "checked_out": st.get("checked_out", False),
             "terminal_live": st.get("terminal_live", False),
-            "slack_link": f"https://slack.com/archives/{channel}/p{thread_ts.replace('.', '')}",
+            "slack_link": slacklinks.thread_link(channel, thread_ts),
             "resume_cmd": f"cd {cwd or '~'} && claude --resume {sid}",
             "has_transcript": find_transcript(sid) is not None,
         })
@@ -1382,6 +1383,12 @@ function landing(t) {
   return `<div class="land bad">not landed (${esc(l.stage || "?")}) — ${
     esc(l.branch || "the branch")} is waiting for you${d}</div>`;
 }
+// Mirrors slacklinks.thread_link: without thread_ts and cid, Slack opens the
+// app (its Home tab) rather than the thread.
+function threadLink(key) {
+  const [ch, ts] = key.split(":");
+  return `https://slack.com/archives/${ch}/p${ts.replace(".", "")}?thread_ts=${ts}&cid=${ch}`;
+}
 function taskButtons(t) {
   const b = [];
   if (t.state === "proposed") {
@@ -1471,7 +1478,7 @@ async function renderLearnings() {
   list.innerHTML = items.map(x => {
     const on = x.enabled !== false;
     const src = x.source && x.source.includes(":")
-      ? `<a href="https://slack.com/archives/${x.source.replace(":", "/p").replace(".", "")}" target="_blank">source</a>` : "";
+      ? `<a href="${threadLink(x.source)}" target="_blank">source</a>` : "";
     return `<div class="lrow ${on ? "" : "off"}">
       <button class="tog" title="${on ? "disable" : "enable"}" onclick="toggleLearning('${x.id}', ${!on})">${on ? "🟢" : "⚪️"}</button>
       <span class="t ${x.type}">${x.type}</span>

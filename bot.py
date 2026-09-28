@@ -42,6 +42,7 @@ import repos
 import roles
 import scoping
 import slack_health
+import slacklinks
 import tasks
 import procs
 import projects
@@ -1058,7 +1059,7 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             for k, v in sorted(entries.items(), key=lambda kv: -kv[1].get("updated", 0))[:20]:
                 ch, ts = k.split(":", 1)
                 name = v.get("title") or "thread"
-                link = f"<https://slack.com/archives/{ch}/p{ts.replace('.', '')}|{name}>"
+                link = f"<{slacklinks.thread_link(ch, ts)}|{name}>"
                 lines.append(f"• {link} — {v.get('turns', 0)} turns, ${v.get('cost', 0):.2f}, {fmt_age(v.get('updated', 0))}")
             say(text=f"*Active sessions ({len(entries)}):*\n" + "\n".join(lines), thread_ts=thread_ts)
     else:
@@ -1163,7 +1164,7 @@ def handle_register_terminal(payload: dict) -> dict:
     ACTIVE_SESSIONS[sid] = (channel, ts)
     log.info("registered terminal session %s -> %s", sid[:8], key)
     return {"ok": True, "key": key,
-            "link": f"https://slack.com/archives/{channel}/p{ts.replace('.', '')}"}
+            "link": slacklinks.thread_link(channel, ts)}
 
 
 HARVEST_STATE = BASE_DIR / "harvest_state.json"

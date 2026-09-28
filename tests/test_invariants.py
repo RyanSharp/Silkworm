@@ -5641,7 +5641,7 @@ def test_home_tab():
     check("unknown age is not fifty years", home.ago(0, now) == "?")
     check("an overdue wake-up says so", home.until(-30) == "due now")
     check("thread links from channel:ts", home.thread_url("D1:1790.25", "https://x.slack.com/")
-          == "https://x.slack.com/archives/D1/p179025")
+          == "https://x.slack.com/archives/D1/p179025?thread_ts=1790.25&cid=D1")
 
     # --- clicks, through the real handle_tasks and a real store ---------------
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
@@ -5791,6 +5791,45 @@ def test_spent_retry_does_not_preempt_review():
     w = store.create("check on the deploy", state=T.BLOCKED, source="defer",
                      retry_at=t0 - 1)["id"]
     check("a scheduled wake-up still fires", w in store.due_retries(t0))
+# --- a thread link opens the thread, not the app -------------------------------
+# A bare /archives/<channel>/p<ts> link names the message but not the
+# conversation, and for a DM with an app Slack resolves it to the app. Once the
+# Home tab was switched on, the app opened on Home: every "open thread" link --
+# dashboard, !sessions, the Home tab itself -- landed there instead.
+
+def test_thread_links_open_the_thread():
+    import slacklinks
+    print("\na thread link opens the thread")
+    # Exactly what chat.getPermalink returned for this thread on 09-28.
+    real = ("https://stryin.slack.com/archives/D0BH336V73L/p1784068538524369"
+            "?thread_ts=1784068538.524369&cid=D0BH336V73L")
+    check("matches the permalink Slack itself generates",
+          slacklinks.thread_link("D0BH336V73L", "1784068538.524369",
+                                 "https://stryin.slack.com/") == real)
+    check("from a thread key", slacklinks.for_key("D0BH336V73L:1784068538.524369",
+                                                  "https://stryin.slack.com") == real)
+    check("not a key, no link", slacklinks.for_key("", "https://x") == ""
+          and slacklinks.for_key("nothing", "https://x") == "")
+
+    # One builder. Anything else hand-assembling an archive link will have the
+    # old shape back within a feature or two.
+    for f in sorted(BASE.glob("*.py")):
+        if f.name == "slacklinks.py":
+            continue
+        src = f.read_text()
+        py = [l for l in src.splitlines() if "archives/" in l and "function threadLink" not in l
+              and "`https://slack.com/archives/${ch}" not in l]
+        check(f"{f.name} builds no thread link of its own", not py, py[:1])
+
+    # The dashboard builds its link in the browser; run it and compare.
+    js = (BASE / "visualizer.py").read_text()
+    fn = js[js.index("function threadLink(key)"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    out = subprocess.run(["node", "-e", fn + "\nprocess.stdout.write(threadLink('D0BH336V73L:1784068538.524369'))"],
+                         capture_output=True, text=True)
+    check("the dashboard's link is the same one",
+          out.stdout == slacklinks.thread_link("D0BH336V73L", "1784068538.524369"),
+          out.stdout or out.stderr[:200])
 
 
 if __name__ == "__main__":
@@ -5816,6 +5855,7 @@ if __name__ == "__main__":
               test_atomic_persistence,
               test_home_tab,
               test_spent_retry_does_not_preempt_review,
+              test_thread_links_open_the_thread,
         test_state_files_have_one_reader_and_one_writer):
         try:
             t()

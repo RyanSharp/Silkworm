@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 
+import slacklinks
 import tasks
 
 log = logging.getLogger("silkworm.home")
@@ -111,10 +112,9 @@ def until(seconds) -> str:
 
 def thread_url(thread: str, base: str) -> str:
     """A link to a task's Slack thread, from its `channel:ts` key."""
-    if not base or ":" not in (thread or ""):
+    if not base:
         return ""
-    channel, ts = thread.split(":", 1)
-    return f"{base.rstrip('/')}/archives/{channel}/p{ts.replace('.', '')}"
+    return slacklinks.for_key(thread or "", base)
 
 
 def _text(t: str) -> dict:
