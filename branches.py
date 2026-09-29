@@ -13,9 +13,11 @@ so the gap was still there for the next night's pass to find. That second
 implementation cost a session and a reviewer to rediscover something already
 written down.
 
-Nothing here merges, deletes or pushes anything -- see DESIGN.md on why opening
-pull requests is deliberately out of scope. This only answers the question the
-system could not previously answer: *what is finished and not in the base?*
+Nothing here merges or pushes anything -- see DESIGN.md on why opening pull
+requests is deliberately out of scope. This mostly answers the question the
+system could not previously answer: *what is finished and not in the base?* The
+one thing it deletes is the other half of that answer -- a finished task's
+branch that is already entirely in the base -- see `prune_merged`.
 
 Merge state is asked of git rather than stored, because it changes without us:
 you land a branch by hand and a stored flag would still say unmerged. What is
@@ -32,6 +34,7 @@ import logging
 import subprocess
 from pathlib import Path
 
+import discard
 import tasks
 import worktrees
 
@@ -192,6 +195,79 @@ def survey(records) -> list:
                 "updated": rec.get("updated") or rec.get("created") or 0,
             })
     return sorted(rows, key=lambda r: -r["updated"])
+
+
+def contained(repo, bases, branch: str) -> bool:
+    """True only when git confirms every commit on `branch` is in some base.
+
+    Not `ahead(...) == 0`. That answers zero when git fails, which is the
+    right way to err for a survey -- a row missing from a panel -- and the
+    wrong way for anything that deletes.
+    """
+    refs = (bases,) if isinstance(bases, str) else tuple(bases)
+    return any(_git(repo, "merge-base", "--is-ancestor", branch, ref).returncode == 0
+               for ref in refs)
+
+
+def prune_merged(records, skip=()) -> list:
+    """Delete the branches of finished tasks that are already in the base.
+
+    Landing removes its own branch: once it is in the base, the release
+    after it counts no commits and drops it. Nothing removed a branch that
+    reached the base any other way -- landed by hand, or by landing code from
+    before it could tell a local base was ahead of origin -- so twenty-eight
+    of them sat in this repository fully merged, burying the handful in
+    `git branch` that still hold anything.
+
+    Only `done` and `cancelled` tasks, which cannot move again. That is not
+    quite the same as nobody coming back for the branch: Approve moves a task
+    to `done` and *then* lands it, on another thread, for as long as the suite
+    takes twice. `skip` is the caller's list of those -- a branch that goes in
+    the middle of a landing whose post-merge tests then fail and reset the
+    base is left with nothing holding it at all. A branch still checked out
+    somewhere is refused by git itself. And the delete goes through
+    `discard.drop`, so if the containment check were ever wrong the tip is
+    tagged before it goes rather than lost. Returns the branches deleted.
+    """
+    groups: dict = {}
+    for rec in records:
+        if rec.get("state") not in tasks.TERMINAL or rec.get("id") in skip:
+            continue
+        repo = repo_for(rec)
+        if not repo:
+            continue
+        pref = ((rec.get("scope") or {}).get("branch") or "").strip()
+        groups.setdefault((str(repo), pref), []).append(rec)
+
+    pruned = []
+    for (repo, pref), group in groups.items():
+        # One wedged repository costs its own branches, not every repository
+        # after it on every pass: discard's git calls can raise.
+        try:
+            pruned += _prune_repo(repo, pref, group)
+        except Exception:
+            log.exception("could not prune merged branches in %s", repo)
+    return pruned
+
+
+def _prune_repo(repo, pref: str, group) -> list:
+    live = existing(repo)
+    names = [n for n in {name_for(r) for r in group} if n in live]
+    if not names:
+        return []
+    base, _ = base_for(repo, pref)
+    pruned = []
+    for name in names:
+        if not contained(repo, base, name):
+            continue
+        deleted, tag, msg = discard.drop(repo, name)
+        if deleted:
+            pruned.append(name)
+            log.info("pruned merged branch %s in %s%s", name, repo,
+                     f" (kept as {tag})" if tag else "")
+        else:
+            log.info("left merged branch %s in %s: %s", name, repo, msg)
+    return pruned
 
 
 def _full_ref(repo, ref: str) -> str:

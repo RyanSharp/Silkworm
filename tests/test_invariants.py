@@ -4447,6 +4447,172 @@ console.log(JSON.stringify(out));
 # twice on different nights, because the first never landed and the gap was
 # still there for the next pass to find.
 
+def test_pruning_merged_branches():
+    import branches as B
+    import tasks as T
+    import worktrees as W
+    print("\nfinished branches already in the base are pruned, and nothing else")
+
+    root = Path(tempfile.mkdtemp())
+    old_root = W.ROOT
+    W.ROOT = root / "worktrees"
+    repo = root / "repo"; repo.mkdir()
+
+    def git(cwd, *a):
+        return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, text=True)
+
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("hello\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    def rec(tid, state=T.DONE):
+        r = T.make(f"do {tid}", state=T.QUEUED, scope={"cwd": str(repo)})
+        r["id"] = tid
+        r["state"] = state
+        return r
+
+    def work(tid):
+        wt = W.create(repo, tid, fetch=False)
+        (Path(wt) / f"{tid}.txt").write_text(tid)
+        git(wt, "add", "-A"); git(wt, "commit", "-qm", f"work {tid}")
+        W.release(wt)
+        return f"silkworm/{tid}"
+
+    def has(branch):
+        return git(repo, "rev-parse", "--verify", "--quiet",
+                   f"refs/heads/{branch}").returncode == 0
+
+    try:
+        # The case that prompted this: landed by hand, so nothing tidied it.
+        landed = work("tsk_hand")
+        git(repo, "merge", "--ff-only", "-q", landed)
+        kept = work("tsk_open")
+        pruned = B.prune_merged([rec("tsk_hand"), rec("tsk_open")])
+        check("a done task's branch that is in the base is pruned",
+              pruned == [landed] and not has(landed), f"got {pruned}")
+        check("without a tag, since the base already holds it",
+              git(repo, "tag", "-l", "discarded/*").stdout.strip() == "",
+              "a tag per landing would be clutter of its own")
+        check("a done task's branch with work not in the base is kept",
+              has(kept), "that is stranded work, not litter")
+
+        # Anything that can still move may come back for its branch.
+        for state in (T.AWAITING_APPROVAL, T.NEEDS_INPUT, T.FAILED, T.RUNNING,
+                      T.QUEUED, T.BLOCKED, T.PROPOSED):
+            b = work(f"tsk_{state}")
+            git(repo, "merge", "--ff-only", "-q", b)
+            B.prune_merged([rec(f"tsk_{state}", state=state)])
+            check(f"a merged branch of a task in {state} is left alone", has(b))
+        b = work("tsk_cancel")
+        git(repo, "merge", "--ff-only", "-q", b)
+        B.prune_merged([rec("tsk_cancel", state=T.CANCELLED)])
+        check("a cancelled task's merged branch is pruned", not has(b))
+
+        # A git failure must read as "keep it". ahead() says 0 when git fails,
+        # which is the survey's safe direction and a deleter's unsafe one.
+        b = work("tsk_gitfail")
+        real_git = B._git
+        # Both ways of measuring fail, so the test holds against either.
+        B._git = lambda cwd, *a, **k: (B._Failed() if a and a[0] in ("merge-base", "rev-list")
+                                       else real_git(cwd, *a, **k))
+        try:
+            B.prune_merged([rec("tsk_gitfail")])
+        finally:
+            B._git = real_git
+        check("a branch git could not measure is kept", has(b),
+              "an unmeasured branch was deleted as if it were merged")
+
+        # Checked out somewhere -- a landing in progress -- git refuses, and
+        # the prune says so rather than raising.
+        b = work("tsk_busy")
+        git(repo, "merge", "--ff-only", "-q", b)
+        here = W.attach(repo, "tsk_busy", b)
+        try:
+            B.prune_merged([rec("tsk_busy")])
+            check("a merged branch checked out in a worktree is left", has(b))
+        finally:
+            W.release(here, delete_empty_branch=False)
+
+        # Approve moves a task to done and *then* lands it. Between the
+        # fast-forward and the post-merge suite the branch is in the base and
+        # may be checked out nowhere, and if that suite fails the base is reset
+        # -- so the branch is the only thing left holding the work.
+        b = work("tsk_landing")
+        git(repo, "merge", "--ff-only", "-q", b)
+        B.prune_merged([rec("tsk_landing")], skip={"tsk_landing"})
+        check("a done task whose landing is under way keeps its branch", has(b),
+              "Approve lands after done; pruning mid-landing can lose the work")
+
+        # One repository that raises must not cost the others their pass.
+        other = root / "other"; other.mkdir()
+        git(other, "init", "-q", "-b", "main")
+        git(other, "config", "user.email", "t@t"); git(other, "config", "user.name", "t")
+        (other / "o.txt").write_text("o\n")
+        git(other, "add", "-A"); git(other, "commit", "-qm", "base")
+        git(other, "branch", "silkworm/tsk_otherrepo")
+        wedged = rec("tsk_hand")
+        wedged["scope"] = {"cwd": str(repo)}
+        fine = T.make("x", state=T.QUEUED, scope={"cwd": str(other)})
+        fine["id"], fine["state"] = "tsk_otherrepo", T.DONE
+        real_existing = B.existing
+        B.existing = lambda r: ((_ for _ in ()).throw(RuntimeError("wedged"))
+                                if Path(r) == repo else real_existing(r))
+        try:
+            got = B.prune_merged([wedged, fine])
+        except Exception as e:
+            got = e
+        finally:
+            B.existing = real_existing
+        check("a repository that raises does not stop the others",
+              got == ["silkworm/tsk_otherrepo"], f"got {got!r}")
+    finally:
+        W.ROOT = old_root
+
+
+def test_the_sweeper_prunes_around_landings():
+    import threading
+    from unittest.mock import MagicMock
+    print("\nthe sweeper prunes under the landing guard, skipping landings")
+
+    class Stop(Exception):
+        pass
+
+    lock = threading.Lock()
+    seen = []
+
+    def prune(records, skip=()):
+        seen.append((sorted(r["id"] for r in records), set(skip), lock.locked()))
+        return []
+
+    board = {"tsk_live": {"id": "tsk_live", "state": "done"},
+             "tsk_marked": {"id": "tsk_marked", "state": "done",
+                            "result": {"landing": {"stage": "in-progress"}}},
+             "tsk_idle": {"id": "tsk_idle", "state": "done",
+                          "result": {"landing": {"stage": "done"}}}}
+    fn = _bot_func("_worktree_sweeper",
+                   worktrees=types.SimpleNamespace(sweep=lambda keep: 0),
+                   live_worktree_tasks=lambda: set(),
+                   branches=types.SimpleNamespace(prune_merged=prune),
+                   task_store=types.SimpleNamespace(all=lambda: dict(board)),
+                   _landing_guard=lock, _landing_now={"tsk_live"},
+                   LANDING_UNDERWAY="in-progress", log=MagicMock(),
+                   time=types.SimpleNamespace(
+                       sleep=lambda s: (_ for _ in ()).throw(Stop())))
+    try:
+        fn()
+    except Stop:
+        pass
+    check("the sweeper prunes merged branches", len(seen) == 1)
+    if seen:
+        ids, skip, held = seen[0]
+        check("with every task on the board", ids == ["tsk_idle", "tsk_live", "tsk_marked"])
+        check("skipping a landing running in this process", "tsk_live" in skip)
+        check("and one the record says is under way", "tsk_marked" in skip)
+        check("but not a finished one", "tsk_idle" not in skip)
+        check("while holding the landing guard, so none can start mid-prune", held)
+
+
 def test_unmerged_branches():
     import branches as B
     import tasks as T

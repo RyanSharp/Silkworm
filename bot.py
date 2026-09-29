@@ -3597,6 +3597,22 @@ def _worktree_sweeper() -> None:
                 log.info("swept %d orphaned worktree(s)", n)
         except Exception:
             log.exception("worktree sweep failed")
+        # Its own try: a repository git chokes on must not stop the worktree
+        # sweep above from running next time, or the other way round.
+        #
+        # Under the landing guard, so no landing can start part-way through,
+        # and skipping every one already running: Approve lands a task that is
+        # already `done`, and its branch is not litter until that finishes.
+        try:
+            with _landing_guard:
+                records = task_store.all().values()
+                busy = set(_landing_now) | {
+                    r.get("id") for r in records
+                    if ((r.get("result") or {}).get("landing") or {}).get("stage")
+                    == LANDING_UNDERWAY}
+                branches.prune_merged(records, skip=busy)
+        except Exception:
+            log.exception("merged-branch prune failed")
         time.sleep(1800)
 
 
