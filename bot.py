@@ -2948,11 +2948,22 @@ def land_if_ready(task: dict) -> dict:
     def run_tests(where):
         return verify.run(proj["test_cmd"], where)
 
+    def on_merge(base_name, before):
+        # What clear_interrupted_landings needs if a restart lands between the
+        # fast-forward and the outcome being recorded. Raising here refuses the
+        # merge, which is the point: unrecorded, that window reads as "nothing
+        # was merged".
+        record_landing(task, {"eligible": True, "landed": False,
+                              "stage": LANDING_UNDERWAY, "branch": branch,
+                              "detail": "merging", "checkpointed": True,
+                              "base": base_name, "base_before": before})
+
     try:
         # Landing touches the shared checkout, so take the guard a turn takes.
         with repo_guard(cwd):
             result = merge.land(here, cwd, branch, scope.get("branch") or "",
-                                run_tests, publish=bool(proj.get("publish")))
+                                run_tests, publish=bool(proj.get("publish")),
+                                on_merge=on_merge)
     finally:
         worktrees.release(here)
     return {**result, "eligible": True, "branch": branch}
@@ -2972,7 +2983,8 @@ def record_landing(task: dict, outcome: dict) -> None:
     # and merging its outcome into a dict fetched before it started would drop
     # anything written in between -- the review verdict, most of all.
     current = task_store.get(task["id"]) or task
-    keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base")
+    keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base",
+            "checkpointed", "base_before")
     result = {**(current.get("result") or {}),
               "landing": {k: outcome[k] for k in keep if k in outcome}}
     if outcome.get("landed"):
@@ -3060,7 +3072,7 @@ def start_landing(task_id: str) -> bool:
     record_landing(task, {"eligible": True, "landed": False,
                           "stage": LANDING_UNDERWAY,
                           "branch": branches.name_for(task),
-                          "detail": "landing under way"})
+                          "detail": "landing under way", "checkpointed": True})
 
     def run():
         try:
@@ -3089,6 +3101,57 @@ def start_landing(task_id: str) -> bool:
     return True
 
 
+def _interrupted_landing_detail(task: dict, landing: dict) -> str:
+    """Say what a killed landing left behind, as far as can be known.
+
+    "Nothing was merged" is only true up to the fast-forward. `merge.land`
+    moves the base *before* its post-merge suite, and resets it only if that
+    suite finishes and fails -- so a restart during that run leaves the base
+    carrying commits nothing finished proving, with no reset ever coming.
+
+    `merge.land` checkpoints the base's name and commit just before it
+    fast-forwards, so the marker says which side of that line the restart
+    fell on. Asking git alone cannot: an empty branch is already an ancestor
+    of the base, and the checkout may no longer be parked on it.
+    """
+    prefix = "the bot restarted while it was landing; "
+    unsure = (prefix + "the base may already have moved without the tests "
+              "after the merge finishing -- check it before trusting it")
+    if not landing.get("checkpointed"):
+        return unsure                 # written by a bot that did not checkpoint
+    before, base = landing.get("base_before"), landing.get("base")
+    if not before:
+        return prefix + "nothing was merged"   # killed before the fast-forward
+    cwd = (task.get("scope") or {}).get("cwd")
+    branch = landing.get("branch") or ""
+    try:
+        now = subprocess.run(["git", "rev-parse", "--verify", "-q",
+                              f"refs/heads/{base}"], cwd=cwd, capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+        def is_ancestor(a, b):
+            return subprocess.run(["git", "merge-base", "--is-ancestor", a, b],
+                                  cwd=cwd, capture_output=True, text=True,
+                                  timeout=30).returncode == 0
+        # The branch brought something `before` lacked, and the base has it
+        # now. Either half alone is not enough: an empty branch is on any base
+        # that moved for some other reason.
+        has = (not is_ancestor(branch, before)
+               and is_ancestor(branch, f"refs/heads/{base}"))
+    except Exception:
+        # Startup must not stall on this: a checkout that cannot be asked gets
+        # the answer that names both possibilities.
+        return unsure
+    if now == before:
+        # Either the fast-forward never ran, or the post-merge suite failed and
+        # put the base back -- both leave nothing merged.
+        return prefix + "nothing was merged"
+    if now and has:
+        return (prefix + f"{branch} was fast-forwarded onto {base} "
+                f"(from {before[:8]}), but the tests after the merge were never "
+                f"seen to pass -- check {base} before trusting it")
+    return unsure
+
+
 def clear_interrupted_landings() -> list[str]:
     """Rewrite landings a restart killed, so no row says "landing…" for ever.
 
@@ -3105,8 +3168,7 @@ def clear_interrupted_landings() -> list[str]:
             continue
         try:
             record_landing(rec, {**landing, "stage": "interrupted",
-                                 "detail": "the bot restarted while it was "
-                                           "landing; nothing was merged"})
+                                 "detail": _interrupted_landing_detail(rec, landing)})
             stale.append(tid)
         except Exception:
             log.exception("could not clear the stale landing on %s", tid)

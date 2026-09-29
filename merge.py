@@ -67,7 +67,7 @@ def _on_origin(repo, base_name: str) -> str:
 
 
 def land(worktree, repo, branch: str, base: str, run_tests,
-         publish: bool = False) -> dict:
+         publish: bool = False, on_merge=None) -> dict:
     """Rebase, retest, fast-forward, retest, and revert if that broke it.
 
     `run_tests(cwd)` is injected so the caller owns what "the tests" means and
@@ -75,6 +75,12 @@ def land(worktree, repo, branch: str, base: str, run_tests,
 
     `publish` pushes the base to origin once everything else has passed. It is
     the project's decision, not this module's: see the note on the push itself.
+
+    `on_merge(base_name, before)` is called just before the fast-forward, the
+    first step that moves the base. A process killed after that point leaves
+    the base moved and the post-merge suite unfinished, with no reset coming,
+    so whoever cleans up after a restart needs to know it got this far and
+    what the base was before. If it cannot be told, nothing is merged.
     """
     # Tracked changes only. Running the suite leaves build droppings --
     # __pycache__, .pytest_cache, coverage files -- in the very checkout it
@@ -196,7 +202,16 @@ def land(worktree, repo, branch: str, base: str, run_tests,
                      f"rebased onto it and is at {now[:8]} now, so the tested "
                      f"commit is not the one that would be merged")
 
-    # 4. fast-forward only: no merge commit resolving anything unreviewed
+    # 4. fast-forward only: no merge commit resolving anything unreviewed.
+    # Checkpoint first: past this line a restart can no longer be read as
+    # "nothing was merged", and only a record written beforehand can say so.
+    if on_merge:
+        try:
+            on_merge(base_name, before)
+        except Exception as exc:
+            return _fail("checkpoint",
+                         f"could not record that the merge was starting ({exc}), "
+                         "so nothing was merged")
     ff = _git(repo, "merge", "--ff-only", branch)
     if ff.returncode != 0:
         return _fail("merge", (ff.stderr or ff.stdout) +

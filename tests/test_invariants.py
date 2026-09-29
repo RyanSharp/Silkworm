@@ -1603,6 +1603,29 @@ def test_landing():
           "was at" in r["detail"] and "is at" in r["detail"],
           r["detail"][:200])
 
+    # The fast-forward is the first step that moves the base, and the suite
+    # after it can run for minutes. A restart in that window leaves the base
+    # moved and never reset, so land checkpoints what the base was just before
+    # -- and the checkpoint must be written while the base has not moved yet.
+    ck = branch_from("ck", "main")
+    seen = []
+    def checkpoint(name, before):
+        seen.append((name, before, g(repo, "rev-parse", "HEAD").stdout.strip()))
+    r = M.land(ck, repo, "ck", "", tests, on_merge=checkpoint)
+    check("a landing checkpoints the base once, just before it moves it",
+          r["landed"] and len(seen) == 1 and seen[0][0] == "main"
+          and seen[0][1] == seen[0][2] and r["head"] != seen[0][1],
+          f"got {seen} / {r.get('stage')}")
+    ck2 = branch_from("ck2", "main")
+    at = g(repo, "rev-parse", "HEAD").stdout.strip()
+    def cannot(name, before):
+        raise OSError("disk full")
+    r = M.land(ck2, repo, "ck2", "", tests, on_merge=cannot)
+    check("a checkpoint that cannot be written refuses the merge",
+          not r["landed"] and r["stage"] == "checkpoint"
+          and g(repo, "rev-parse", "HEAD").stdout.strip() == at,
+          f"got {r.get('stage')}")
+
     # Publishing. Landing moves the local branch; origin hears about it only if
     # the project asked. Off, the two drift -- survivable for landing now that
     # the base is the local commit, but not for the *next* task, whose worktree
@@ -5693,14 +5716,16 @@ def test_landing_is_visible():
     # The landing runs on a daemon thread, which a restart ends without
     # unwinding. Its marker is durable and nothing else revisits it, so the row
     # would keep saying "landing…" about something that stopped days ago.
-    sweep_ns = {"task_store": store, "log": LOG}
-    _bot_fns({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY"},
-             sweep_ns)
+    import subprocess as _sp
+    sweep_ns = {"task_store": store, "log": LOG, "subprocess": _sp}
+    _bot_fns({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY",
+              "_interrupted_landing_detail"}, sweep_ns)
     sweep = sweep_ns.get("clear_interrupted_landings")
     mid = store.create("do the thing", project="p")
     store.update(mid["id"], result={"landing": {
         "eligible": True, "landed": False, "stage": "in-progress",
-        "branch": "silkworm/" + mid["id"], "detail": "landing under way"}})
+        "branch": "silkworm/" + mid["id"], "detail": "landing under way",
+        "checkpointed": True}})
     settled = store.create("do the thing", project="p")
     store.update(settled["id"], result={"landing": {
         "eligible": True, "landed": True, "stage": "done", "head": "abc1234"}})
@@ -5710,8 +5735,53 @@ def test_landing_is_visible():
           bool(sweep) and cleared == [mid["id"]]
           and after_mid.get("stage") == "interrupted",
           f"got {cleared} / {after_mid.get('stage')!r}")
-    check("and says nothing was merged",
-          "nothing was merged" in (after_mid.get("detail") or ""))
+    check("and, killed before the fast-forward, says nothing was merged",
+          (after_mid.get("detail") or "").endswith("nothing was merged"),
+          repr(after_mid.get("detail")))
+
+    # A restart during merge.land's post-merge suite leaves the base
+    # fast-forwarded and never reset. The checkpoint land writes just before
+    # the fast-forward is what tells the two apart -- git alone cannot: an
+    # empty branch is already an ancestor of its base.
+    detail = sweep_ns.get("_interrupted_landing_detail")
+    ask = (lambda task, landing: detail(task, landing)) if detail else (lambda *a: "")
+    with tempfile.TemporaryDirectory() as td:
+        def g(*a):
+            return _sp.run(["git", *a], cwd=td, check=True, capture_output=True,
+                           text=True).stdout.strip()
+        def commit(m):
+            g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+              "--allow-empty", "-m", m)
+        g("init", "-q", "-b", "main")
+        commit("base")
+        before = g("rev-parse", "HEAD")
+        g("checkout", "-q", "-b", "silkworm/landed")
+        commit("work")
+        g("checkout", "-q", "-b", "silkworm/empty", "main")
+        g("checkout", "-q", "main")
+        task = {"scope": {"cwd": td}}
+        ckpt = {"checkpointed": True, "base": "main", "base_before": before}
+        unmoved = ask(task, {**ckpt, "branch": "silkworm/empty"})
+        g("merge", "-q", "--ff-only", "silkworm/landed")
+        g("checkout", "-q", "silkworm/empty")      # a person parks it elsewhere
+        merged = ask(task, {**ckpt, "branch": "silkworm/landed"})
+        empty_after = ask(task, {**ckpt, "branch": "silkworm/empty"})
+    old_marker = ask({"scope": {}}, {"branch": "silkworm/x"})
+    nowhere = ask({"scope": {"cwd": "/nowhere/at/all"}},
+                  {**ckpt, "branch": "silkworm/landed"})
+    check("a landing killed after its fast-forward says the base moved",
+          "was fast-forwarded onto main" in merged
+          and "nothing was merged" not in merged, repr(merged))
+    check("even with the checkout since parked on another branch",
+          "was fast-forwarded" in merged, repr(merged))
+    check("an empty branch at an unmoved base is not read as merged",
+          unmoved.endswith("nothing was merged"), repr(unmoved))
+    check("nor as merged when the base moved for some other reason",
+          "may already have moved" in empty_after, repr(empty_after))
+    check("a marker from a bot that never checkpointed claims neither",
+          "may already have moved" in old_marker, repr(old_marker))
+    check("and a checkout that cannot be asked claims neither",
+          "may already have moved" in nowhere, repr(nowhere))
     sched = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
                  if isinstance(n, ast.FunctionDef) and n.name == "_task_scheduler")
     check("and the sweep runs at startup, beside the one for interrupted turns",
