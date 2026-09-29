@@ -61,6 +61,15 @@ classified, parked in `blocked` with a `retry_at`, and requeued automatically
 after a handful of attempts. Real failures still stop and ask. Filing "the API
 was busy" under "needs you" is exactly how a board stops being trusted.
 
+Those conditions are global, not about the task, so the first one also **holds
+the queue runner** until it is plausibly over (capped at a few hours; lifted
+early by any turn that succeeds) instead of claiming the next task into the
+same wall — which once walked 15 tasks in 39 seconds, and some 260 in a day.
+And a run that dies before its first tool call is refunded the attempt it cost,
+counted as a `false_start` instead: an outage that never let work begin must
+not spend the budget that decides when a person looks. False starts are capped
+separately, and still lengthen the backoff.
+
 A failed turn also has no way to notice that its thread recovered without it.
 When a task completes, earlier **failed conversational turns on the same
 thread** are superseded: if the conversation carried on and produced answers,

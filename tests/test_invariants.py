@@ -8451,6 +8451,7 @@ def test_dead_background_threads_are_reported():
                 t.join(5)
         ns = bot_functions(
             "handle_status", store=types.SimpleNamespace(all=lambda: {}), RUNNING={},
+            RUNNER_HOLD=__import__("retry").Hold(),
             credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
             slack=types.SimpleNamespace(status=lambda now: {}),
             revision=types.SimpleNamespace(state=lambda *a: {}),
@@ -8673,6 +8674,199 @@ def test_board_channel():
           and "app_home_opened" not in m["settings"]["event_subscriptions"]["bot_events"])
 
 
+# --- one global outage must not drain the queue ----------------------------------
+# The runner claimed, ran, and claimed again with no memory of how the last one
+# ended. A quota message kills every turn in three seconds, so on 2026-09-26 it
+# walked 15 tasks in 39 seconds -- each given a worktree, each parked unrun --
+# and on 2026-09-22 did it five times, some 260 claims. Every claim spent one of
+# the task's MAX_AUTO_RETRIES, so five outages failed work that never started.
+
+def _outage_harness():
+    """The real worker, executor and fail_or_retry, over a scratch store."""
+    import threading
+    import retry as R, tasks as T, roles
+    from tasks import TaskStore
+
+    class Idle(BaseException):
+        """Raised by the worker's first sleep: the pass is over."""
+
+    root = Path(tempfile.mkdtemp())
+    st = TaskStore(root / "t.json")
+    hold = R.Hold()
+    calls = []
+
+    def run_turn(goal, **kw):
+        calls.append(goal)
+        if "does work" in goal:
+            kw["on_activity"]("Bash", {"command": "make"})
+        raise ClaudeError("You've hit your session limit · resets 6pm")
+
+    fail_or_retry = _bot_func("fail_or_retry", task_store=st, retry=R, tasks=T,
+                              RUNNER_HOLD=hold, log=logging.getLogger("test"),
+                              task_state=lambda tid, s, d="": st.transition(tid, s, d))
+    execute_task = _bot_func(
+        "execute_task", tasks=T, task_store=st, store=tmp_store(), roles=roles,
+        review_branch=lambda task: None, Path=Path, run_turn=run_turn,
+        shutil=shutil, OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+        permission_args=lambda: [], log=logging.getLogger("test"),
+        task_thread=lambda t: ("C1", "1.0"),
+        task_state=lambda tid, s, d="": st.transition(tid, s, d),
+        _thread_lock=lambda key: threading.Lock(),
+        repo_guard=lambda *a, **k: contextlib.nullcontext(),
+        render_block=lambda _: "", RUNNING={}, RUNNING_TASKS={},
+        ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+        RUNNER_HOLD=hold, fail_or_retry=fail_or_retry)
+
+    def idle(_s):
+        raise Idle()
+    worker = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
+                       RUNNER_HOLD=hold, TASK_POLL_S=5, log=logging.getLogger("test"),
+                       time=types.SimpleNamespace(sleep=idle, time=time.time))
+
+    def one_pass():
+        """Run the worker until it first waits."""
+        try:
+            worker(0)
+        except Idle:
+            pass
+
+    def next_window():
+        """The outage window passes: the hold lapses, the scheduler requeues."""
+        hold.open()
+        for tid in st.due_retries(time.time() + 2 * 86400):
+            st.transition(tid, T.QUEUED, "retry time reached")
+
+    return types.SimpleNamespace(st=st, hold=hold, calls=calls, T=T, R=R,
+                                 one_pass=one_pass, next_window=next_window,
+                                 cwd=str(root))
+
+
+def test_a_global_outage_does_not_drain_the_queue():
+    print("\none global outage must not drain the queue")
+    h = _outage_harness()
+    st, T, R = h.st, h.T, h.R
+    ids = [st.create(f"task {i}", driver="queue", source="ui",
+                     scope={"cwd": h.cwd})["id"] for i in range(10)]
+    for i, tid in enumerate(ids):              # claim() takes the oldest first
+        st.update(tid, created=1000.0 + i)
+
+    h.one_pass()
+    states = [st.get(t)["state"] for t in ids]
+    check("a quota failure stops the runner after one task",
+          len(h.calls) == 1, f"{len(h.calls)} turns run in one pass")
+    check("the one that hit it is parked for the reset",
+          states[0] == T.BLOCKED and st.get(ids[0])["retry_at"])
+    check("everything behind it is still queued, unclaimed",
+          states[1:] == [T.QUEUED] * 9, str(states))
+    check("and nothing behind it was charged an attempt",
+          all(not st.get(t)["attempts"] for t in ids[1:]))
+    check("the runner is held, not merely slowed",
+          h.hold.remaining() > 60, f"{h.hold.remaining():.0f}s")
+    check("a run that never reached work costs no attempt",
+          st.get(ids[0])["attempts"] == 0 and st.get(ids[0])["false_starts"] == 1,
+          str({k: st.get(ids[0])[k] for k in ("attempts", "false_starts")}))
+
+    # Many outage windows in a row, more than the retry budget.
+    windows = R.MAX_AUTO_RETRIES * 2
+    for _ in range(windows):
+        h.next_window()
+        h.one_pass()
+    recs = [st.get(t) for t in ids]
+    check(f"{windows} outages later nothing has failed",
+          not [r for r in recs if r["state"] == T.FAILED],
+          str([r["state"] for r in recs]))
+    check("and no task has spent any of its retry budget",
+          all(not r["attempts"] for r in recs))
+    check("each window cost one probe, not a pass over the queue",
+          len(h.calls) == windows + 1, f"{len(h.calls)} turns")
+    check("the refunds are counted, not forgotten",
+          sum(r["false_starts"] for r in recs) == windows + 1)
+
+    # Still bounded: a task that can never start does eventually ask.
+    st.update(ids[0], false_starts=R.MAX_FALSE_STARTS)
+    before = len(h.calls)
+    h.next_window(); h.one_pass()
+    check("a task that never gets started still fails in the end",
+          st.get(ids[0])["state"] == T.FAILED, st.get(ids[0])["state"])
+    # Counted, because the next task's failure would close the hold anyway:
+    # the question is whether the runner went on to claim it at all.
+    check("and still holds the runner, though it is not retried",
+          len(h.calls) == before + 1 and h.hold.remaining() > 60,
+          f"{len(h.calls) - before} turns in the pass")
+
+    # A success anywhere is evidence the outage is over.
+    bot = (BASE / "bot.py").read_text()
+    check("every successful turn lifts the hold",
+          bot.count("RUNNER_HOLD.open()") >= 2)
+
+
+def test_work_that_started_still_spends_its_budget():
+    print("\na run that did real work still counts against its retries")
+    h = _outage_harness()
+    st, T, R = h.st, h.T, h.R
+    tid = st.create("this one does work", driver="queue", source="ui",
+                    scope={"cwd": h.cwd})["id"]
+    h.one_pass()
+    check("a run that reached a tool call is charged",
+          st.get(tid)["attempts"] == 1 and not st.get(tid)["false_starts"])
+    for _ in range(R.MAX_AUTO_RETRIES):
+        h.next_window(); h.one_pass()
+    check("and after MAX_AUTO_RETRIES of them it asks for a person",
+          st.get(tid)["state"] == T.FAILED,
+          "otherwise the refund has quietly made retries unlimited")
+    check("the budget ran out exactly where it always did",
+          len(h.calls) == R.MAX_AUTO_RETRIES, f"{len(h.calls)} runs")
+
+
+def test_false_starts_still_back_off():
+    import retry as R
+    print("\nrefunded runs still lengthen the backoff")
+    now = 1_000_000.0
+    first = R.retry_at("529 overloaded", 0, now=now)[1] - now
+    later = R.retry_at("529 overloaded", 0, now=now, false_starts=6)[1] - now
+    check("an overloaded API is not retried every minute forever",
+          later > first and later == R.BACKOFF_CAP_S, f"{first}s then {later}s")
+    check("backoff is unchanged for runs that did work",
+          R.retry_at("529 overloaded", 3, now=now)[1] - now == 4 * R.BACKOFF_BASE_S)
+    real = time.time()
+    hold = R.Hold()
+    hold.close(real + 100, "a"); hold.close(real + 50, "b")
+    check("the hold only ever extends", 99 < hold.remaining(real) <= 100)
+    check("and lapses on its own, with no success needed to lift it",
+          hold.remaining(real + 101) == 0)
+    hold.close(real + 86400, "resets 6pm, read at 6:01pm")
+    check("a misread reset time cannot idle the queue for a day",
+          hold.remaining() <= R.HOLD_CAP_S and hold.remaining() > R.HOLD_CAP_S - 5)
+
+    # Inline turns report whether they started too; a Slack turn killed by the
+    # same quota must not be charged for it either.
+    tree = ast.parse((BASE / "bot.py").read_text())
+    hp = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "handle_prompt")
+    calls = [c for c in ast.walk(hp) if isinstance(c, ast.Call)
+             and ast.unparse(c.func) == "fail_or_retry"]
+    check("every failure path in handle_prompt says whether the turn started",
+          calls and all(any(k.arg == "started" and ast.unparse(k.value) == "worked[0]"
+                             for k in c.keywords) for c in calls),
+          f"{len(calls)} call(s)")
+    marks = [n for n in ast.walk(hp) if isinstance(n, ast.FunctionDef)
+             and n.name == "on_activity"
+             and "worked[0] = True" in ast.unparse(n)]
+    check("and a tool call is what marks it started", len(marks) == 1)
+
+    # The refund must not make an accepted proposal read as a dismissed one.
+    import scoping, tasks as T
+    rec = {"title": "wanted idea", "goal": "g", "state": T.CANCELLED,
+           "source": "ideation", "role": "implementor", "attempts": 0,
+           "false_starts": 1, "created": real, "updated": real}
+    _open, dismissed = scoping.already_filed([rec], real)
+    check("a proposal an outage cancelled is not remembered as dismissed",
+          "wanted idea" not in dismissed, str(dismissed))
+    _open, dismissed = scoping.already_filed([{**rec, "false_starts": 0}], real)
+    check("while one that truly never ran still is", "wanted idea" in dismissed,
+          "otherwise the check above proves nothing")
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:
@@ -8690,3 +8884,4 @@ if __name__ == "__main__":
     for f in FAILED:
         print(f"  FAILED: {f}")
     sys.exit(1 if FAILED else 0)
+

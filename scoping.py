@@ -280,7 +280,9 @@ def already_filed(records, now: float) -> tuple[list[str], list[str]]:
     scoped yourself and then cancelled says nothing about whether the idea is
     welcome, and one you accepted and then stopped mid-run was wanted -- its
     stopping is not a reason never to raise it again. `attempts` is the
-    durable record of that, incremented only on entering `running`.
+    durable record of that, incremented only on entering `running` -- together
+    with `false_starts`, where the attempts of runs an outage killed before
+    they began are moved: those were accepted, and wanted, all the same.
 
     Both halves are filtered by `is_work`: the board's own machinery and the
     conversation turns that happen to carry a project are not ideas.
@@ -298,6 +300,7 @@ def already_filed(records, now: float) -> tuple[list[str], list[str]]:
             open_names.append(name)
         elif (state == tasks.CANCELLED and rec.get("source") == "ideation"
               and not (rec.get("attempts") or 0)
+              and not (rec.get("false_starts") or 0)
               and (rec.get("updated") or rec.get("created") or 0) >= cutoff):
             dismissed.append(name)
     return open_names, dismissed

@@ -198,6 +198,10 @@ RUNNING: dict[str, object] = {}          # thread key -> RunHandle
 #: that only rewrites the record leaves an agent working in a checkout nobody
 #: is protecting any more, which has already cost a task its first pass.
 RUNNING_TASKS: dict[str, object] = {}
+#: Closed when a turn dies of something global (quota, overload, network), so
+#: the queue runner stops claiming until it is plausibly over instead of
+#: walking the whole queue into the same wall. See retry.Hold.
+RUNNER_HOLD = retry.Hold()
 ACTIVE_SESSIONS: dict[str, tuple[str, str]] = {}  # session_id -> (channel, thread_ts)
 _seen_events: OrderedDict[str, None] = OrderedDict()
 _users_cache: dict[str, str] = {}
@@ -496,17 +500,29 @@ def name_thread(key: str, prompt: str, reply: str) -> None:
         log.exception("naming failed for %s", key)
 
 
-def fail_or_retry(task_id: str | None, error: str) -> bool:
+def fail_or_retry(task_id: str | None, error: str, started: bool = True) -> bool:
     """Park a transient failure for a later retry instead of asking for help.
 
     Returns True if it was parked. Quota exhaustion and API overload are not
     failures a person can do anything about, so surfacing them would just
     train you to ignore the list.
+
+    A transient failure is not about this task, so it also holds the queue
+    runner off until the condition is plausibly over -- whether or not this
+    task is parked. And `started=False` -- the turn died before its first tool
+    call -- refunds the attempt the run cost: an outage that never let the
+    work begin must not spend the budget that decides when a person looks.
     """
+    kind = retry.classify(error)
+    if kind:
+        RUNNER_HOLD.close(retry.wait_until(kind, error), error)
     if not task_id:
         return False
     task = task_store.get(task_id) or {}
-    plan = retry.retry_at(error, task.get("attempts") or 0)
+    if kind and not started:
+        task = task_store.refund_attempt(task_id) or task
+    plan = retry.retry_at(error, task.get("attempts") or 0,
+                          false_starts=task.get("false_starts") or 0)
     if not plan:
         return False
     kind, when = plan
@@ -1110,10 +1126,14 @@ def handle_status(payload: dict) -> dict:
     # The Slack link is not the only thing that can stop while the process
     # stays up: every background loop ends for good on one escaped exception,
     # and a dead thread logs nothing further. Say which ones are gone.
+    # A held runner looks exactly like an idle one from the board -- queued
+    # work, not moving -- so say that it is holding, and why.
     return {"online": True, "threads": threads,
             "slack": slack.status(time.time()), "auth": auth,
             "revision": revision.state(BASE_DIR, REVISION),
-            "daemons": daemons.status()}
+            "daemons": daemons.status(),
+            "runner_hold": {"seconds": round(RUNNER_HOLD.remaining()),
+                            "reason": RUNNER_HOLD.reason()[:160]}}
 
 
 def handle_web_message(payload: dict) -> dict:
@@ -2046,6 +2066,7 @@ def handle_prompt(event: dict, say, client) -> None:
     reactions = ThreadReactions(client, channel, thread_ts,
                                 None if event.get("_web") else msg_ts)
     reactions.working()
+    worked = [False]                  # reached a tool call; see execute_task
     lock = _thread_lock(key)
     if lock.locked():
         progress.update(":hourglass_flowing_sand: _Queued behind an earlier message in this thread…_")
@@ -2072,6 +2093,7 @@ def handle_prompt(event: dict, say, client) -> None:
                 recovery.note_session(store, key, sid)
 
             def on_activity(name: str, tool_input: dict) -> None:
+                worked[0] = True
                 progress.update(f":hourglass_flowing_sand: `{name}` {describe_tool(name, tool_input)[:120]}")
 
             def on_start(handle) -> None:
@@ -2117,6 +2139,7 @@ def handle_prompt(event: dict, say, client) -> None:
                     progress.update(":hourglass_flowing_sand: _Old session was gone — starting fresh…_")
                     result = run_turn(prompt, session_id=None, **kwargs)
 
+                RUNNER_HOLD.open()
                 store.update(key, session_id=result.session_id, model=entry.get("model"), cwd=str(cwd))
                 store.add_cost(key, result.cost_usd)
                 if session_id is None and not entry.get("title"):
@@ -2159,13 +2182,13 @@ def handle_prompt(event: dict, say, client) -> None:
         progress.finalize(f":warning: {e}")
         reactions.failed()
         store.add_event(key, "timeout", str(e))
-        if not fail_or_retry(task_id, str(e)):
+        if not fail_or_retry(task_id, str(e), started=worked[0]):
             task_state(task_id, tasks.FAILED, str(e)[:160])
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
         reactions.failed()
         store.add_event(key, "error", str(e)[:160])
-        if not fail_or_retry(task_id, str(e)):
+        if not fail_or_retry(task_id, str(e), started=worked[0]):
             task_state(task_id, tasks.FAILED, str(e)[:160])
     except Exception:
         log.exception("unhandled error in thread %s", key)
@@ -2472,6 +2495,10 @@ def execute_task(task: dict) -> None:
     if learn_block:
         system_note += "\n\n" + learn_block
 
+    # Whether the turn got as far as a tool call. One that died before that --
+    # a quota message, typically, three seconds in -- never started the work,
+    # and must not be charged an attempt for it.
+    worked = [False]
     lock = _thread_lock(key)
     try:
         with lock, repo_guard(cwd, progress):
@@ -2488,6 +2515,11 @@ def execute_task(task: dict) -> None:
                 RUNNING[key] = handle
                 RUNNING_TASKS[tid] = handle
 
+            def on_activity(name: str, tool_input: dict) -> None:
+                worked[0] = True
+                progress.update(f":hourglass_flowing_sand: `{name}` "
+                                f"{describe_tool(name, tool_input)[:120]}")
+
             try:
                 result = run_turn(
                     task.get("goal", ""), session_id=session_id,
@@ -2499,10 +2531,10 @@ def execute_task(task: dict) -> None:
                     env=claude_env(key, task.get("defers") or 0, role=role_name),
                     timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                     on_init=lambda sid: task_store.update(tid, session_id=sid),
-                    on_activity=lambda n, i: progress.update(
-                        f":hourglass_flowing_sand: `{n}` {describe_tool(n, i)[:120]}"),
+                    on_activity=on_activity,
                     on_start=on_start,
                 )
+                RUNNER_HOLD.open()
                 # A fresh run must not repoint the thread at its throwaway
                 # session, or the next Slack message resumes the review.
                 if not fresh:
@@ -2597,7 +2629,7 @@ def execute_task(task: dict) -> None:
         task_state(tid, tasks.CANCELLED, "stopped by the user")
     except ClaudeError as e:
         progress.finalize(f":warning: {e}")
-        if not fail_or_retry(tid, str(e)):
+        if not fail_or_retry(tid, str(e), started=worked[0]):
             task_state(tid, tasks.FAILED, str(e)[:160])
     except Exception as e:
         log.exception("task %s failed", tid)
@@ -3396,10 +3428,17 @@ def _task_worker(n: int) -> None:
     """
     while True:
         try:
+            # Held while something global (quota, overload) is killing turns.
+            # Claiming anyway fails the next task the same way in seconds --
+            # a fresh worktree each, parked unrun -- until the queue is empty.
+            held = RUNNER_HOLD.remaining()
+            if held:
+                time.sleep(min(held, TASK_POLL_S))
+                continue
             task = task_store.claim()
             if task:
                 execute_task(task)
-                continue           # drain without waiting
+                continue           # drain without waiting, unless that closed the hold
         except Exception:
             log.exception("task worker %d failed", n)
         time.sleep(TASK_POLL_S)

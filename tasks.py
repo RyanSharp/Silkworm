@@ -152,6 +152,12 @@ FIELDS: dict[str, tuple] = {
     "commits":     (0,     "commits it made, counted as its checkout closed"),
     "events":      (list,  "state changes and notable occurrences, capped at 50"),
     "attempts":    (0,     "how many times execution has been tried"),
+    # Runs that died of something global (quota, overload) before doing any
+    # work. Their `attempts` increment is refunded -- that counter decides
+    # between "retry later" and "a person must look", and an outage that never
+    # let the task start says nothing about the task -- and counted here
+    # instead, so they are still bounded and still visible.
+    "false_starts": (0,    "runs refunded because they never reached real work"),
     # Set once the record has been through compact_older_than: the work landed
     # long enough ago that the reply text and event log were dropped. The
     # record itself stays, so a missing result never has to be guessed at.
@@ -505,6 +511,24 @@ class TaskStore:
             del events[:-50]
             self._save()
             log.info("task %s claimed by the runner", rec["id"])
+            return dict(rec)
+
+    def refund_attempt(self, tid: str) -> dict | None:
+        """Take back the `attempts` a run cost when it never reached real work.
+
+        Every claim spends an attempt, and the retry budget is counted in
+        them. A run killed by a quota outage before its first tool call spent
+        one each for nothing, so a few outages failed tasks that had never
+        started. Counted in `false_starts` instead, in the same write.
+        """
+        with self._lock:
+            rec = self._data.get(tid)
+            if rec is None:
+                return None
+            rec["attempts"] = max(0, (rec.get("attempts") or 0) - 1)
+            rec["false_starts"] = (rec.get("false_starts") or 0) + 1
+            rec["updated"] = time.time()
+            self._save()
             return dict(rec)
 
     def requeue_interrupted(self) -> int:
