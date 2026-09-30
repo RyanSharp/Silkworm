@@ -9421,19 +9421,37 @@ version = {{ file = "ios/project.yml", key = "CFBundleShortVersionString" }}
     hook.unlink()
     check("so the retry works", R.release(repo, "ios")["released"])
 
-    # A command that outlives its timeout is killed, children and all.
+    # A command that outlives its timeout is killed, children and all. The
+    # marker is unique to this run and matched exactly (never pgrep -f, which
+    # matches any process whose command line merely mentions it), and the
+    # release runs under a deadline: a kill that misses the child leaves it
+    # holding the output pipe, and waiting on that would hang the suite
+    # rather than fail it.
+    import random as _r
+    import threading as _th
+    secs = str(_r.randint(300000, 399999))
     commit(".silkworm/release.toml", (repo / ".silkworm/release.toml").read_text()
-           .replace('commands = ["echo token', 'commands = ["sleep 4242; echo token'), "slow")
+           .replace('commands = ["echo token', f'commands = ["sleep {secs}; echo token'), "slow")
     g("push", "-q", "origin", "main")
+    def sleepers():
+        out = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
+        return [l.split(None, 1)[0] for l in out.splitlines()
+                if l.split(None, 1)[1:] == [f"sleep {secs}"]]
     old = R.COMMAND_TIMEOUT_S
     R.COMMAND_TIMEOUT_S = 1
+    box = {}
+    worker = _th.Thread(target=lambda: box.setdefault("r", R.release(repo, "backend")), daemon=True)
     try:
-        r = R.release(repo, "backend")
+        worker.start(); worker.join(20)
     finally:
         R.COMMAND_TIMEOUT_S = old
     _t.sleep(0.5)
-    alive = subprocess.run(["pgrep", "-f", "sleep 4242"], capture_output=True, text=True).stdout.strip()
-    check("a timed-out deploy is killed, not left running", not alive and not r["released"], alive)
+    alive = sleepers()
+    for pid in alive:
+        subprocess.run(["kill", "-9", pid])
+    check("a timed-out deploy is killed, not left running",
+          not worker.is_alive() and not alive and not box.get("r", {}).get("released"),
+          f"still running: {alive}" if alive else "the release never returned")
 
     steps_err = None
     try:
