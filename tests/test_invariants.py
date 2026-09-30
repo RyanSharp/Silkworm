@@ -9342,8 +9342,105 @@ after = ["backend"]
           f"{tags} {posted}")
     check("each one reported", sum("released as" in p for p in posted) == 2, str(posted))
     posted.clear()
+    ns["run_release"]("cadence", repo, "main", ["ios"], "patch", posted.append)
+    check("asked for something with nothing pending, it says so", any("nothing to release" in p for p in posted),
+          str(posted))
+    posted.clear()
     ns["release_plan"]("cadence", repo, posted.append)
     check("the plan says when there is nothing left", posted and "nothing since" in posted[0], str(posted))
+
+
+
+def test_releases_ship_only_what_is_published():
+    import os as _os
+    import time as _t
+    import releases as R
+    print("\nreleases ship only what origin has, and a failure leaves nothing behind")
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "work"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], capture_output=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a], capture_output=True, text=True)
+    def commit(path, text, msg):
+        p = repo / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+        g("add", path); g("commit", "-q", "-m", msg)
+    secret_file = root / "creds.env"
+    secret_file.write_text('export DEPLOY_TOKEN="tok_live_supersecret123" # a note\n')
+    commit(".silkworm/release.toml", f'''
+[targets.backend]
+paths = ["supabase/"]
+ship = "command"
+env_files = ["{secret_file}"]
+commands = ["echo token=$DEPLOY_TOKEN; echo slack=${{SLACK_BOT_TOKEN:-unset}}; exit 1"]
+[targets.ios]
+paths = ["ios/"]
+ship = "tag"
+version = {{ file = "ios/project.yml", key = "CFBundleShortVersionString" }}
+''', "config")
+    commit("ios/project.yml", 'CFBundleShortVersionString: "1.0.0"\n', "ios")
+    commit("supabase/0001.sql", "x\n", "migration")
+    g("push", "-q", "origin", "main")
+
+    (repo / "supabase/stray.sql").write_text("drop table everything;\n")
+    try:
+        R.release(repo, "backend"); ok = False
+    except R.ReleaseError as e:
+        ok = "untracked" in str(e) or "uncommitted" in str(e)
+    check("an untracked file in the checkout blocks a release", ok)
+    (repo / "supabase/stray.sql").unlink()
+
+    commit("ios/local.swift", "x\n", "not pushed")
+    try:
+        R.release(repo, "ios"); ok = False
+    except R.ReleaseError as e:
+        ok = "ahead" in str(e) or "push" in str(e)
+    check("unpushed commits block a release: ship only what origin has", ok)
+    g("push", "-q", "origin", "main")
+
+    _os.environ["SLACK_BOT_TOKEN"] = "xoxb-should-not-reach-a-deploy"
+    try:
+        r = R.release(repo, "backend")
+    finally:
+        _os.environ.pop("SLACK_BOT_TOKEN", None)
+    out = r["steps"][0]["output"]
+    check("a quoted value with a trailing comment is read correctly",
+          "supersecret" not in out and "token=***" in out, out)
+    check("the bot's own tokens do not reach a deploy", "slack=unset" in out, out)
+
+    # A refused push must not leave a local tag or bump behind to trip the retry.
+    subprocess.run(["git", "-C", str(origin), "config", "receive.denyNonFastForwards", "true"])
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n"); hook.chmod(0o755)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    r = R.release(repo, "ios")
+    check("a refused push is reported", not r["released"])
+    check("and leaves no local tag", not g("tag", "-l", "ios/*").stdout.strip())
+    check("and no local bump commit", g("rev-parse", "HEAD").stdout.strip() == head
+          and 'CFBundleShortVersionString: "1.0.0"' in (repo / "ios/project.yml").read_text())
+    hook.unlink()
+    check("so the retry works", R.release(repo, "ios")["released"])
+
+    # A command that outlives its timeout is killed, children and all.
+    commit(".silkworm/release.toml", (repo / ".silkworm/release.toml").read_text()
+           .replace('commands = ["echo token', 'commands = ["sleep 4242; echo token'), "slow")
+    g("push", "-q", "origin", "main")
+    old = R.COMMAND_TIMEOUT_S
+    R.COMMAND_TIMEOUT_S = 1
+    try:
+        r = R.release(repo, "backend")
+    finally:
+        R.COMMAND_TIMEOUT_S = old
+    _t.sleep(0.5)
+    alive = subprocess.run(["pgrep", "-f", "sleep 4242"], capture_output=True, text=True).stdout.strip()
+    check("a timed-out deploy is killed, not left running", not alive and not r["released"], alive)
+
+    steps_err = None
+    try:
+        R.plan(repo, None, "2.0.0")
+    except R.ReleaseError as e:
+        steps_err = str(e)
+    check("an explicit version cannot apply to every target at once", bool(steps_err))
 
 
 if __name__ == "__main__":

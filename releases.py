@@ -37,6 +37,7 @@ person asking for one; see `bot.handle_release`.
 import logging
 import os
 import re
+import signal
 import subprocess
 import tomllib
 from pathlib import Path
@@ -240,6 +241,10 @@ def plan(repo, names: list[str] | None = None, level: str = "patch") -> list[dic
     backend, but it does refuse to ship ahead of a backend change it may need.
     """
     targets = load(repo)
+    if not names and (parse(level) or level == "major"):
+        # One explicit version, or a major bump, is a decision about one
+        # thing; applied to every target at once it is almost never meant.
+        raise ReleaseError(f"{level} applies to a single target, not to all of them")
     wanted = names or [n for n in targets if pending(repo, targets[n])]
     steps = []
     for name in order(targets, wanted):
@@ -247,49 +252,93 @@ def plan(repo, names: list[str] | None = None, level: str = "patch") -> list[dic
         commits = pending(repo, t)
         if not commits and name not in (names or []):
             continue
+        # The level asked for is for the targets asked for. A dependency pulled
+        # in to go first is a patch: `!release app 2.0.0` is not a claim about
+        # the backend's version.
+        mine = level if (names is None or name in names) else "patch"
+        v = fmt(next_version(repo, t, mine)) if commits else None
         steps.append({"target": name, "ship": t["ship"], "commits": commits,
-                      "version": fmt(next_version(repo, t, level)) if commits else None,
-                      "tag": f"{tag_prefix(t)}{fmt(next_version(repo, t, level))}"
-                             if commits else None})
+                      "level": mine, "version": v,
+                      "tag": f"{tag_prefix(t)}{v}" if v else None})
     return steps
 
 
 # --- doing it ------------------------------------------------------------------
 
-def _env(target: dict) -> dict:
-    env = dict(os.environ)
+#: What a deploy inherits from the bot. Nothing else: the bot's environment
+#: holds its Slack tokens and its Claude credential, and a deploy tool has no
+#: business seeing either.
+INHERIT = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TERM")
+
+
+def _value(raw: str) -> str:
+    """The value of a KEY=value line, as a shell would read it: quoted up to
+    the matching quote, or bare up to an unquoted comment."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        end = raw.find(raw[0], 1)
+        return raw[1:end] if end > 0 else raw[1:]
+    return re.split(r"\s+#", raw, 1)[0].strip()
+
+
+def _env(target: dict) -> tuple[dict, list[str]]:
+    """The deploy's environment, and the values in it to redact from any
+    output shown to a person."""
+    env = {k: os.environ[k] for k in INHERIT if k in os.environ}
+    secrets = []
     for f in target["env_files"]:
         p = Path(os.path.expanduser(f))
         if not p.exists():
             raise ReleaseError(f"credentials file {f} is missing")
         for line in p.read_text().splitlines():
-            m = re.match(r"^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$", line)
-            if m:
-                env[m.group(1)] = m.group(2).strip("'\"")
+            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line)
+            if m and not line.lstrip().startswith("#"):
+                env[m.group(1)] = _value(m.group(2))
+                secrets.append(env[m.group(1)])
     env.update(target["env"])
-    return env
+    return env, [v for v in secrets if len(v) >= 6]
 
 
-def _run(command: str, repo, env) -> dict:
-    """One deploy command, in the repo, by the user's shell rules. The output
-    is kept (tail only) because it is what says what a deploy did."""
+def redact(text: str, secrets) -> str:
+    for v in sorted(set(secrets), key=len, reverse=True):
+        text = text.replace(v, "***")
+    return text
+
+
+def _run(command: str, repo, env, secrets=()) -> dict:
+    """One deploy command, in the repo. The output is kept (tail only, with
+    credentials redacted) because it is what says what a deploy did.
+
+    Not a login shell: one would source the user's profile after this env was
+    set, and a token exported there would silently win over the target's. And
+    in its own process group, so a timeout kills the deploy tool itself -- not
+    only the shell, leaving `db push` applying behind a report that it failed.
+    """
+    proc = subprocess.Popen(["/bin/zsh", "-c", os.path.expanduser(command)],
+                            cwd=str(repo), env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
-        r = subprocess.run(["/bin/zsh", "-lc", os.path.expanduser(command)],
-                           cwd=str(repo), env=env, capture_output=True, text=True,
-                           timeout=COMMAND_TIMEOUT_S)
-        out = (r.stdout + r.stderr)[-OUTPUT_CHARS:]
-        return {"command": command, "ok": r.returncode == 0, "code": r.returncode,
-                "output": out}
+        out, _ = proc.communicate(timeout=COMMAND_TIMEOUT_S)
+        code = proc.returncode
     except subprocess.TimeoutExpired:
-        return {"command": command, "ok": False, "code": None,
-                "output": f"timed out after {COMMAND_TIMEOUT_S}s"}
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, _ = proc.communicate()
+        out = (out or "") + (f"\nkilled after {COMMAND_TIMEOUT_S}s; it may have "
+                             "partly applied before it was stopped")
+        code = None
+    return {"command": command, "ok": code == 0, "code": code,
+            "output": (out or "")[-OUTPUT_CHARS:]}
 
 
 def preview(repo, name: str) -> list[dict]:
     """Run a target's preview commands (a migration dry run): what it would
     change, shown before anyone confirms something that cannot be undone."""
     t = load(repo)[name]
-    return [_run(c, repo, _env(t)) for c in t["preview"]]
+    env, secrets = _env(t)
+    return [_run(c, repo, env, secrets) for c in t["preview"]]
 
 
 def ready(repo, base: str) -> str:
@@ -302,13 +351,26 @@ def ready(repo, base: str) -> str:
     branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if branch != base:
         return f"the checkout is on {branch or 'a detached HEAD'}, not {base}"
-    if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        return "the checkout has uncommitted changes"
-    _git(repo, "fetch", "--quiet", "origin", timeout=60)
+    # Untracked files too: a deploy reads the working tree, and a stray
+    # migration in supabase/ would be applied to production by `db push`.
+    # (Ignored files -- build output -- are still ignored.)
+    dirty = _git(repo, "status", "--porcelain", "--untracked-files=normal").stdout.strip()
+    if dirty:
+        return ("the checkout has uncommitted or untracked files: "
+                + ", ".join(line[3:] for line in dirty.splitlines()[:5]))
+    f = _git(repo, "fetch", "--quiet", "origin", timeout=60)
+    if f.returncode != 0:
+        return f"could not fetch origin, so cannot tell what it has: {f.stderr.strip()[-200:]}"
     behind = _git(repo, "rev-list", "--count", f"{base}..origin/{base}").stdout.strip()
     if behind and behind != "0":
         return (f"{base} is {behind} commit(s) behind origin -- pull first, so the "
                 "release is of what everyone else sees")
+    # Ahead too: a release ships only what origin has, so the tag names a
+    # commit anyone can see and nothing unreviewed rides along with it.
+    ahead = _git(repo, "rev-list", "--count", f"origin/{base}..{base}").stdout.strip()
+    if ahead and ahead != "0":
+        return (f"{base} has {ahead} commit(s) origin does not -- push them first, so "
+                "the release is of what everyone else sees")
     return ""
 
 
@@ -337,9 +399,9 @@ def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
               "commits": commits, "steps": [], "released": False}
 
     if t["ship"] == "command":
-        env = _env(t)
+        env, secrets = _env(t)
         for c in t["commands"]:
-            step = _run(c, repo, env)
+            step = _run(c, repo, env, secrets)
             record["steps"].append(step)
             if not step["ok"]:
                 record["error"] = f"{c} failed (exit {step['code']}); nothing was tagged"
@@ -350,7 +412,9 @@ def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
         _git(repo, "add", t["version"]["file"])
         c = _git(repo, "commit", "-q", "-m", f"Release {name} {fmt(version)}")
         if c.returncode != 0:
-            _git(repo, "checkout", "--", t["version"]["file"])
+            # From HEAD: the index already holds the bump, so restoring from it
+            # would leave the checkout dirty and refuse every later release.
+            _git(repo, "checkout", "HEAD", "--", t["version"]["file"])
             record["error"] = f"could not commit the version bump: {c.stderr.strip()[-200:]}"
             return record
 
@@ -365,9 +429,19 @@ def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
                             "ok": p.returncode == 0, "code": p.returncode,
                             "output": (p.stdout + p.stderr)[-OUTPUT_CHARS:]})
     if p.returncode != 0:
-        record["error"] = ("tagged locally but the push was refused; nothing reached "
-                           "origin -- `git push --atomic origin "
-                           + " ".join(refs) + "` from the checkout retries it")
+        if t["ship"] == "tag":
+            # Nothing shipped: the push was the release. Undo what was only
+            # local, or the next attempt finds its own tag and says there is
+            # nothing to release.
+            _git(repo, "tag", "-d", tag)
+            if t["version"]:
+                _git(repo, "reset", "--hard", "-q", "HEAD~1")
+            record["error"] = "origin refused the push; nothing was released, and the retry is clean"
+        else:
+            # The deploy did happen, so the local tag is true -- it is only
+            # origin that does not have it yet.
+            record["error"] = (f"deployed, but origin refused the tag; `git push origin "
+                               f"refs/tags/{tag}` from the checkout publishes it")
         return record
     record["released"] = True
     return record

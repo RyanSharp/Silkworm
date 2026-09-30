@@ -920,9 +920,12 @@ def run_release(slug: str, repo, base: str, names, level: str, post) -> list[dic
             for step in steps:
                 name = step["target"]
                 if not step["commits"]:
+                    # Asked for by name and nothing to ship: say so, or the
+                    # thread shows "Releasing…" and then nothing at all.
+                    post(f"*{name}* has nothing to release since its last tag.")
                     continue
                 try:
-                    r = releases.release(repo, name, level if name in (names or [name]) else "patch", base)
+                    r = releases.release(repo, name, step["level"], base)
                 except releases.ReleaseError as e:
                     post(f":x: *{name}* not released: {e}. Stopping here.")
                     return done
