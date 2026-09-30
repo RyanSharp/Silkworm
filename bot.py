@@ -37,6 +37,7 @@ import defer
 import email_ingest
 import harvester
 import home
+import discard
 import holding
 import jsonstore
 import learnings_git
@@ -1324,10 +1325,45 @@ def approve_task(payload: dict) -> dict:
         # re-clicked, the state was no longer awaiting_approval, and no landing
         # was ever attempted. That is the original silence, through new code.
         try:
-            start_landing(tid)
+            start_landing(tid, approved=True)
         except Exception:
             log.exception("could not start the landing for %s", tid)
     return {"ok": True, "note": note, "task": task_store.get(tid) or done}
+
+
+def land_or_drop(action: str, payload: dict) -> dict:
+    """Decide what happens to a finished task's stranded branch.
+
+    Land is Approve for work already closed: the same landing, rebase and
+    suite twice, refused on conflict. Drop deletes the branch, tagging first
+    whatever no other ref holds (discard.drop), so it is recoverable. Only on
+    finished tasks -- anything earlier still has its own buttons, and a branch
+    under a running task is that task's to change.
+    """
+    tid = payload.get("id", "")
+    task = task_store.get(tid)
+    if not task:
+        return {"ok": False, "error": "unknown task"}
+    if task.get("state") not in (tasks.DONE, tasks.CANCELLED):
+        return {"ok": False, "error": f"only finished work; this one is {task.get('state')}"}
+    task = dict(task, id=tid)
+    if action == "land":
+        if not start_landing(tid, approved=True):
+            return {"ok": False, "error": "a landing for it is already under way"}
+        return {"ok": True, "note": "landing under way — rebase, tests, merge, tests; "
+                                    "the result is posted to its thread"}
+    repo = branches.repo_for(task)
+    branch = branches.name_for(task)
+    if not repo:
+        return {"ok": False, "error": "it has no repository to drop a branch from"}
+    with repo_guard(str(repo)):
+        deleted, tag, note = discard.drop(repo, branch)
+    if not deleted:
+        return {"ok": False, "error": note}
+    record_landing(task, {"eligible": False, "landed": False, "stage": "dropped",
+                          "branch": branch,
+                          "detail": f"kept as {tag}" if tag else "nothing on it was new"})
+    return {"ok": True, "note": f"dropped; recover with {tag}" if tag else "dropped"}
 
 
 def handle_tasks(payload: dict) -> dict:
@@ -1481,6 +1517,8 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": False, "error": f"not allowed: {e}"}
     if action == "approve":
         return approve_task(payload)
+    if action in ("land", "drop"):
+        return land_or_drop(action, payload)
     if action in ("accept", "dismiss", "retry", "cancel"):
         target = {"accept": tasks.QUEUED, "retry": tasks.QUEUED,
                   "dismiss": tasks.CANCELLED, "cancel": tasks.CANCELLED}[action]
@@ -2948,7 +2986,7 @@ def landing_enabled(task: dict) -> bool:
     return bool((project_store.get(task.get("project") or "") or {}).get("auto_merge"))
 
 
-def land_if_ready(task: dict) -> dict:
+def land_if_ready(task: dict, approved: bool = False) -> dict:
     """Land a task's branch if the project allows it and the work earned it.
 
     Everything here is a refusal by default. A project must opt in, must be
@@ -2975,7 +3013,12 @@ def land_if_ready(task: dict) -> dict:
         return {"eligible": False, "landed": False, "stage": stage,
                 "detail": detail, "branch": branch}
 
-    if not landing_enabled(task):
+    # `approved` is a person saying "land this" -- Approve, or Land on
+    # finished work. Auto-merge is the project saying it on their behalf, so
+    # it gates only the landing nobody asked for. Without this split a
+    # project with auto-merge off could not merge anything at all: approving
+    # closed the task and left the branch, which is how 59 of them piled up.
+    if not landing_enabled(task) and not approved:
         return never("not-enabled", "this project does not land its own work")
     if not (proj.get("test_cmd") or "").strip():
         return never("no-test-command",
@@ -2984,7 +3027,11 @@ def land_if_ready(task: dict) -> dict:
     # awaiting_approval because its tests failed MAX_VERIFY_ATTEMPTS times is
     # not verified, so approving it -- which means "stop trying", not "merge
     # it" -- cannot reach a merge through here.
-    if not task.get("verified"):
+    # Failed its tests: never, however it is asked for -- approving parked
+    # work means "stop trying", not "merge it". Never tested, because the
+    # project had no suite then: a person may ask, since landing runs the
+    # suite itself, twice, before and after the merge.
+    if task.get("verified") is False or (not approved and not task.get("verified")):
         return never("unverified", "the change was never verified")
     if not cwd:
         return never("no-checkout", "it has no checkout to land from")
@@ -3053,12 +3100,13 @@ def record_landing(task: dict, outcome: dict) -> None:
     task_store.update(task["id"], result=result)
 
 
-def land_and_record(task_id: str, channel: str = "", thread_ts: str = "") -> dict:
+def land_and_record(task_id: str, channel: str = "", thread_ts: str = "",
+                    approved: bool = False) -> dict:
     """Attempt a landing, record the outcome, and narrate it. Never raises."""
     task = task_store.get(task_id) or {"id": task_id}
     branch = branches.name_for(task)
     try:
-        outcome = land_if_ready(task)
+        outcome = land_if_ready(task, approved=approved)
     except Exception:
         log.exception("landing %s failed", task_id)
         outcome = {"eligible": True, "landed": False, "stage": "errored",
@@ -3111,7 +3159,7 @@ _landing_guard = threading.Lock()
 LANDING_UNDERWAY = "in-progress"
 
 
-def start_landing(task_id: str) -> bool:
+def start_landing(task_id: str, approved: bool = False) -> bool:
     """Run a landing off the calling thread, marking it as under way first.
 
     A landing rebases and runs the project's suite twice; the dashboard gives
@@ -3120,7 +3168,7 @@ def start_landing(task_id: str) -> bool:
     fixed, so the in-progress marker goes down before the thread starts.
     """
     task = task_store.get(task_id)
-    if not task or not landing_enabled(task):
+    if not task or not (approved or landing_enabled(task)):
         return False
     with _landing_guard:
         # Two Approve clicks land in two server threads, and both read the
@@ -3142,7 +3190,7 @@ def start_landing(task_id: str) -> bool:
             # not get an anchor message posted for it hours after it finished.
             if task.get("thread") and ":" in task["thread"]:
                 channel, _, thread_ts = task["thread"].partition(":")
-            land_and_record(task_id, channel, thread_ts)
+            land_and_record(task_id, channel, thread_ts, approved=approved)
         except Exception:
             # land_and_record guards itself, so this is the thread dying before
             # it gets there. Leaving the marker would say "landing…" for ever.

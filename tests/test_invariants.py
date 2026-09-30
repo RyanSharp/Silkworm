@@ -1864,8 +1864,10 @@ def test_landing():
     check("the gate names the branch the way the survey does",
           "branches.name_for(task)" in li and "BRANCH_PREFIX" not in li,
           "two ways to name it are two things that can disagree")
+    # Opting in is still decided in one place. What it gates changed: an
+    # unasked-for landing, not one a person approved.
     check("a project must opt in, decided in one place",
-          li.count('"auto_merge"') == 1 and "if not landing_enabled(task):" in li,
+          li.count('"auto_merge"') == 1 and "if not landing_enabled(task) and not approved:" in li,
           "the gate and the board must not disagree about who lands its own work")
     check("and must be able to prove itself", 'proj.get("test_cmd")' in li,
           "landing on a project with no suite is merging on a guess")
@@ -5634,7 +5636,7 @@ def test_landing_is_visible():
     started = []
     app_ns = {"task_store": store, "tasks": T, "log": LOG,
               "holding": __import__("holding"),
-              "start_landing": lambda tid: bool(started.append(tid))}
+              "start_landing": lambda tid, approved=False: bool(started.append((tid, approved)))}
     _bot_fns({"approve_task"}, app_ns)
     approve = app_ns.get("approve_task")
 
@@ -5648,8 +5650,10 @@ def test_landing_is_visible():
     reviewed = parked(T.AWAITING_APPROVAL, "a review flagged this")
     if approve:
         approve({"id": reviewed, "by": "you"})
+    # And says a person asked for it, which is what lets a project with
+    # auto-merge off merge approved work at all.
     check("approving flagged work goes through the landing gate",
-          bool(approve) and started == [reviewed],
+          bool(approve) and started == [(reviewed, True)],
           "approve maps straight to done; four reviewed commits stayed on a branch")
     check("and approving still completes the task",
           bool(approve) and store.get(reviewed)["state"] == T.DONE)
@@ -5802,7 +5806,7 @@ def test_landing_is_visible():
     start_ns = {"task_store": store, "tasks": T, "branches": B, "log": LOG,
                 "threading": _th,
                 "landing_enabled": lambda task: True,
-                "land_and_record": lambda tid, c, t: (threads_run.append(tid),
+                "land_and_record": lambda tid, c, t, **kw: (threads_run.append(tid),
                                                       holding.set(),
                                                       release.wait(5))}
     _bot_fns({"start_landing", "record_landing", "LANDING_UNDERWAY",
@@ -8963,6 +8967,20 @@ def test_uncommitted_work_is_sent_back():
     import worktrees as W
     import tasks as T
     print("\nwork left uncommitted goes back before it reaches review")
+# --- a person can land work on any project -------------------------------------
+# Auto-merge was the only door to the base. A project with it off could not
+# merge anything at all: Approve closed the task and left the branch, and 59
+# finished tasks piled up on branches with no button that would do anything.
+
+def test_approval_lands_on_any_project():
+    import logging
+    import types
+    import merge as M
+    import worktrees as W
+    import branches as B
+    import discard as D
+    import tasks as T
+    print("\na person can land work on any project")
 
     repo = Path(tempfile.mkdtemp())
     g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
@@ -8972,12 +8990,15 @@ def test_uncommitted_work_is_sent_back():
     g("checkout", "-q", "-b", "silkworm/tsk_work")
     (repo / "f.txt").write_text("work\n")
     g("add", "f.txt")
+    g("checkout", "-q", "-b", "silkworm/tsk_work")
+    (repo / "f.txt").write_text("work\n"); g("add", "f.txt")
     g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "real work")
     g("checkout", "-q", "main")
 
     class Projects:
         def get(self, slug):
             return {"auto_merge": True, "test_cmd": "true"}
+            return {"auto_merge": False, "test_cmd": "true"}     # auto-merge OFF
     attached = []
     class Worktrees:
         BRANCH_PREFIX = W.BRANCH_PREFIX
@@ -8986,6 +9007,7 @@ def test_uncommitted_work_is_sent_back():
         def attach(self, cwd, tid, branch):
             attached.append(branch)
             return None                                # stop before git merges anything
+            attached.append(branch); return None
     ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
           "branches": B, "log": logging.getLogger("test")}
     _bot_fns({"land_if_ready", "landing_enabled"}, ns)
@@ -9053,6 +9075,54 @@ def test_uncommitted_work_is_sent_back():
                           for c in ast.walk(n))), None)
     check("the suite does not run over loose work",
           guard is not None and "loose" in ast.unparse(guard.test))
+    t = {"id": "tsk_work", "project": "p", "scope": {"cwd": str(repo)}}
+
+    r = land({**t, "verified": True})
+    check("unasked, auto-merge off still means no", r.get("stage") == "not-enabled")
+    r = land({**t, "verified": True}, approved=True)
+    check("approved, it goes on to land", attached == ["silkworm/tsk_work"], f"{r!r}")
+    attached.clear()
+    r = land({**t, "verified": False}, approved=True)
+    check("work that failed its tests is never landed, even approved",
+          r.get("stage") == "unverified" and not attached)
+    r = land({**t, "verified": None}, approved=True)
+    check("work never tested (no suite then) may be landed on request -- landing runs the suite",
+          attached == ["silkworm/tsk_work"])
+
+    # Land and Drop, on finished work only.
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    begun, recorded = [], []
+    import contextlib
+    ns2 = {"task_store": store, "tasks": T, "branches": B, "discard": D,
+           "log": logging.getLogger("test"),
+           "start_landing": lambda tid, approved=False: begun.append((tid, approved)) or True,
+           "record_landing": lambda task, out: recorded.append(out),
+           "repo_guard": lambda cwd: contextlib.nullcontext()}
+    _bot_fns({"land_or_drop"}, ns2)
+    lod = ns2.get("land_or_drop")
+    check("there is a Land/Drop action", bool(lod))
+    run = store.create("still going", state=T.QUEUED)["id"]
+    store.transition(run, T.RUNNING)
+    check("not on work still running", lod("land", {"id": run}).get("ok") is False and not begun)
+    done = store.create("finished work", state=T.QUEUED, scope={"cwd": str(repo)},
+                        branch="silkworm/tsk_work")["id"]
+    store.transition(done, T.RUNNING); store.transition(done, T.DONE)
+    r = lod("land", {"id": done})
+    check("Land starts an approved landing", r.get("ok") and begun == [(done, True)], f"{r} {begun}")
+    tip = g("rev-parse", "silkworm/tsk_work").stdout.strip()
+    r = lod("drop", {"id": done})
+    gone = g("rev-parse", "--verify", "-q", "refs/heads/silkworm/tsk_work").returncode != 0
+    check("Drop deletes the branch", r.get("ok") and gone, f"{r}")
+    tags = g("tag", "-l", "discarded/*").stdout.split()
+    check("keeping what was on it under a tag",
+          len(tags) == 1 and g("rev-parse", tags[0] + "^{commit}").stdout.strip() == tip, str(tags))
+    check("and the record says it was dropped", recorded and recorded[-1]["stage"] == "dropped")
+
+    js = (BASE / "visualizer.py").read_text()
+    fn = js[js.index("async function renderUnmerged()"):]
+    fn = fn[:fn.index("\n}\n")]
+    check("the dashboard offers Land and Drop on each stranded branch",
+          "'land'" in fn and "'drop'" in fn)
 
 
 if __name__ == "__main__":

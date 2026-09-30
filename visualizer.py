@@ -1416,7 +1416,10 @@ async function taskAction(id, action, notes) {
   const r = await taskCall(notes ? {action, id, notes, by: "you"} : {action, id});
   // Cancelling something that was running says whether the work was actually
   // stopped, which is the only part of it you cannot see from the board.
-  toast(r.ok ? `Task ${action}ed${r.note ? ` — ${r.note}` : ""}`
+  // Land only starts a landing; "Task landed" would claim a merge that has
+  // not happened. Those two say what they did in their own words.
+  toast(r.ok ? ((action === "land" || action === "drop") && r.note ? r.note
+               : `Task ${action}ed${r.note ? ` — ${r.note}` : ""}`)
              : (r.error || "Not allowed"));
   renderTasks();
   refreshTaskBadge();
@@ -1576,9 +1579,16 @@ async function renderUnmerged() {
       const tip = `${esc(b.title)}\n${esc(b.head)} · ${esc(b.id)} · ${
         esc(b.state)} · off ${esc(b.base)}\n${esc(b.repo)}`;
       const label = `${esc(b.branch.replace(/^silkworm\//, ""))} <b>${b.commits}</b>`;
-      return b.thread
+      const name = b.thread
         ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(b.thread)}')">${label}</button>`
         : `<span class="b" title="${tip}">${label}</span>`;
+      // Land: the same landing Approve starts (rebase, suite, merge, suite).
+      // Drop: delete the branch, tagging what no other ref holds first.
+      return `<span class="ub">${name}`
+        + `<button class="ghost" title="rebase onto the base, test, merge, test" `
+        + `onclick="taskAction('${esc(b.id)}','land')">Land</button>`
+        + `<button class="ghost" title="delete the branch; its commits are kept under a tag" `
+        + `onclick="if(confirm('Drop ${esc(b.branch)}? Its commits are kept under a discarded/ tag.'))taskAction('${esc(b.id)}','drop')">Drop</button></span>`;
     }).join("");
 }
 // Checkouts that still hold uncommitted files. worktrees.py refuses to delete
