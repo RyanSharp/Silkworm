@@ -9153,6 +9153,199 @@ def test_approval_lands_on_any_project():
           "'land'" in fn and "'drop'" in fn)
 
 
+
+# --- releases: merged is not released -----------------------------------------
+# A push to Cadence's main started an Xcode Cloud archive bound for TestFlight,
+# so every task that landed would have been a build. Merging and releasing are
+# separate events, and a repo holds several things that ship separately.
+
+def test_releases():
+    import releases as R
+    print("\nreleases: merged is not released")
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "work"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], capture_output=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a], capture_output=True, text=True)
+    def commit(path, text, msg):
+        p = repo / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+        g("add", path); g("commit", "-q", "-m", msg)
+    (repo / ".silkworm").mkdir()
+    (repo / ".silkworm" / "release.toml").write_text('''
+[targets.backend]
+paths = ["supabase/"]
+ship = "command"
+commands = ["echo deployed-backend > .deploy-log"]
+preview = ["echo would-apply-0001"]
+
+[targets.ios]
+paths = ["ios/"]
+ship = "tag"
+version = { file = "ios/project.yml", key = "CFBundleShortVersionString" }
+after = ["backend"]
+
+[targets.web]
+paths = ["web/"]
+ship = "command"
+commands = ["exit 3"]
+''')
+    commit(".silkworm/release.toml", (repo / ".silkworm/release.toml").read_text(), "config")
+    commit("ios/project.yml", 'targets:\n  App:\n    CFBundleShortVersionString: "1.1.0"\n'
+                              '  Widget:\n    CFBundleShortVersionString: "1.1.0"\n', "ios")
+    commit("supabase/migrations/0001.sql", "select 1;\n", "migration")
+    commit("web/index.html", "hi\n", "site")
+    g("push", "-q", "origin", "main")
+
+    targets = R.load(repo)
+    check("targets are read from the project's own repo", sorted(targets) == ["backend", "ios", "web"])
+    check("pending is per target, by path",
+          [c.split(" ", 1)[1] for c in R.pending(repo, targets["ios"])] == ["ios"]
+          and [c.split(" ", 1)[1] for c in R.pending(repo, targets["web"])] == ["site"])
+    check("the next version bumps what the file says", R.fmt(R.next_version(repo, targets["ios"], "minor")) == "1.2.0")
+    check("a target never released and unversioned starts at 1.0.0",
+          R.fmt(R.next_version(repo, targets["backend"], "patch")) == "1.0.0")
+    steps = R.plan(repo, ["ios"], "minor")
+    check("releasing the app releases a pending backend first",
+          [s["target"] for s in steps] == ["backend", "ios"], str(steps))
+    check("and says what each carries", len(steps) == 2 and steps[1]["tag"] == "ios/v1.2.0"
+          and steps[1]["commits"])
+
+    r = R.release(repo, "backend")
+    check("a command target deploys, then is tagged", r["released"] and r["tag"] == "backend/v1.0.0"
+          and (repo / ".deploy-log").read_text().strip() == "deployed-backend", str(r.get("error")))
+    remote_tags = subprocess.run(["git", "-C", str(origin), "tag"], capture_output=True, text=True).stdout.split()
+    check("and the tag reached origin", "backend/v1.0.0" in remote_tags)
+    check("after which it has nothing pending", R.pending(repo, targets["backend"]) == [])
+    (repo / ".deploy-log").unlink()
+
+    r = R.release(repo, "web")
+    check("a failed deploy is not tagged: a tag always means it shipped",
+          not r["released"] and "failed" in r.get("error", "")
+          and not g("tag", "-l", "web/*").stdout.strip())
+
+    r = R.release(repo, "ios", "minor")
+    check("a tag target bumps every occurrence of its version",
+          r["released"] and (repo / "ios/project.yml").read_text().count('"1.2.0"') == 2, str(r.get("error")))
+    log_ = subprocess.run(["git", "-C", str(origin), "log", "-1", "--format=%s", "main"],
+                          capture_output=True, text=True).stdout.strip()
+    check("and pushes the bump and the tag together", log_ == "Release ios 1.2.0"
+          and "ios/v1.2.0" in subprocess.run(["git", "-C", str(origin), "tag"],
+                                             capture_output=True, text=True).stdout.split())
+    try:
+        R.release(repo, "ios")
+        check("nothing pending, nothing released", False)
+    except R.ReleaseError as e:
+        check("nothing pending, nothing released", "nothing to release" in str(e))
+
+    commit("ios/a.swift", "x\n", "more ios")
+    (repo / "ios/a.swift").write_text("dirty\n")
+    try:
+        R.release(repo, "ios")
+        check("never from a dirty checkout", False)
+    except R.ReleaseError as e:
+        check("never from a dirty checkout", "uncommitted" in str(e))
+    g("checkout", "--", "ios/a.swift")
+    other = root / "other"
+    subprocess.run(["git", "clone", "-q", str(origin), str(other)], capture_output=True)
+    (other / "README").write_text("x\n")
+    subprocess.run(["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t", "add", "README"])
+    subprocess.run(["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "elsewhere"])
+    subprocess.run(["git", "-C", str(other), "push", "-q", "origin", "main"], capture_output=True)
+    try:
+        R.release(repo, "ios")
+        check("never while behind origin", False)
+    except R.ReleaseError as e:
+        check("never while behind origin", "behind origin" in str(e))
+    try:
+        R.next_version(repo, targets["ios"], "1.0.0")
+        check("a release never goes backwards", False)
+    except R.ReleaseError:
+        check("a release never goes backwards", True)
+    check("the preview runs without releasing",
+          R.preview(repo, "backend")[0]["output"].strip() == "would-apply-0001")
+
+    bad = root / "bad"; (bad / ".silkworm").mkdir(parents=True)
+    for cfg, why in (('[targets.a]\npaths=["a/"]\nship="tag"\nafter=["b"]\n[targets.b]\npaths=["b/"]\nship="tag"\nafter=["a"]\n', "a cycle"),
+                     ('[targets.a]\npaths=["a/"]\nship="deploy"\n', "an unknown ship"),
+                     ('[targets.a]\npaths=["a/"]\nship="tag"\nafter=["nope"]\n', "a missing dependency")):
+        (bad / ".silkworm/release.toml").write_text(cfg)
+        try:
+            R.load(bad); check(f"a config with {why} is refused on reading", False)
+        except R.ReleaseError:
+            check(f"a config with {why} is refused on reading", True)
+
+
+
+def test_release_command():
+    import logging
+    import contextlib
+    import threading
+    import releases as R
+    print("\n!release: plan first, then release in order, stopping at a failure")
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "work"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], capture_output=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a], capture_output=True, text=True)
+    def commit(path, text, msg):
+        p = repo / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+        g("add", path); g("commit", "-q", "-m", msg)
+    commit(".silkworm/release.toml", '''
+[targets.backend]
+paths = ["supabase/"]
+ship = "command"
+commands = ["exit 7"]
+[targets.ios]
+paths = ["ios/"]
+ship = "tag"
+after = ["backend"]
+''', "config")
+    commit("supabase/0001.sql", "x\n", "migration")
+    commit("ios/app.swift", "x\n", "app")
+    g("push", "-q", "origin", "main")
+
+    class Projects:
+        def scope_for(self, slug):
+            return {"cwd": str(repo)} if slug == "cadence" else {}
+    import worktrees as W
+    ns = {"releases": R, "project_store": Projects(), "worktrees": W, "threading": threading,
+          "log": logging.getLogger("test"),
+          "repo_guard": lambda cwd: contextlib.nullcontext()}
+    _bot_fns({"release_command", "release_plan", "run_release", "_releasing", "_releasing_guard"}, ns)
+    cmd = ns["release_command"]
+    check("no arguments: usage", "Usage" in cmd("", print))
+    check("an unknown project is named", "no repository" in cmd("nope", print))
+    check("a bad level is refused before anything runs", "not patch" in cmd("cadence ios sideways", print))
+
+    posted = []
+    done = ns["run_release"]("cadence", repo, "main", ["ios"], "minor", posted.append)
+    check("a failing dependency stops the release before the app",
+          not g("tag", "-l").stdout.strip() and any("backend" in p and "Stopping" in p for p in posted),
+          str(posted))
+    check("and the app was not tagged", not any("ios" in p and "released as" in p for p in posted))
+    check("the release is marked finished even when it fails", not ns["_releasing"])
+
+    ns["_releasing"].add("cadence")
+    check("one release per project at a time", "already running" in cmd("cadence all", print))
+    ns["_releasing"].discard("cadence")
+
+    (repo / ".silkworm/release.toml").write_text((repo / ".silkworm/release.toml").read_text()
+                                                  .replace('commands = ["exit 7"]', 'commands = ["true"]'))
+    g("commit", "-qam", "fix the deploy"); g("push", "-q", "origin", "main")
+    posted.clear()
+    ns["run_release"]("cadence", repo, "main", ["ios"], "minor", posted.append)
+    tags = g("tag", "-l").stdout.split()
+    check("fixed, the backend goes first and then the app",
+          tags == ["backend/v1.0.0", "ios/v1.0.0"] or sorted(tags) == ["backend/v1.0.0", "ios/v1.0.0"],
+          f"{tags} {posted}")
+    check("each one reported", sum("released as" in p for p in posted) == 2, str(posted))
+    posted.clear()
+    ns["release_plan"]("cadence", repo, posted.append)
+    check("the plan says when there is nothing left", posted and "nothing since" in posted[0], str(posted))
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

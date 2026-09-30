@@ -51,6 +51,7 @@ import tasks
 import procs
 import projects
 import recovery
+import releases
 import retry
 import merge
 import summaries
@@ -824,8 +825,122 @@ HELP = """*Commands* (send inside a thread):
 • `!stats` — this thread's session info (model, turns, cost)
 • `!sessions` — list all active thread sessions
 • `!help` — this message
-Attach files to a message and Claude can read them; files Claude produces get uploaded back here.`!project <name>` — file this thread's tasks under a project
+• `!project <name>` — file this thread's tasks under a project
+• `!release <project>` — what is ready to release, per target (nothing ships)
+• `!release <project> <target|all> [patch|minor|major|x.y.z]` — release it, dependencies first
+Attach files to a message and Claude can read them; files Claude produces get uploaded back here.
 """
+
+
+#: Projects with a release in progress, so a second !release waits its turn.
+_releasing: set[str] = set()
+_releasing_guard = threading.Lock()
+
+
+def release_command(arg: str, post) -> str:
+    """`!release <project> [<target|all> [level]]`. Returns the immediate
+    reply; the plan or the release itself runs off the Slack handler (a
+    migration dry run or a deploy takes longer than Slack will wait) and
+    reports through `post`."""
+    parts = arg.split()
+    if not parts:
+        return ("Usage: `!release <project>` to see what is ready, or "
+                "`!release <project> <target|all> [patch|minor|major|x.y.z]` to release it.")
+    slug = parts[0].lower()
+    scope = project_store.scope_for(slug) or {}
+    repo = scope.get("cwd")
+    if not repo or not worktrees.is_repo(repo):
+        return f"`{slug}` has no repository to release from."
+    try:
+        targets = releases.load(repo)
+    except releases.ReleaseError as e:
+        return f":warning: `{slug}`'s release.toml: {e}"
+    if not targets:
+        return (f"`{slug}` has no release targets. Merging is its release; add "
+                f"`.silkworm/release.toml` to its repo to give it some.")
+    base = scope.get("branch") or "main"
+    if len(parts) == 1:
+        threading.Thread(target=release_plan, args=(slug, repo, post),
+                         daemon=True, name=f"plan-{slug}").start()
+        return f":mag: Working out what `{slug}` has ready to release…"
+    names = None if parts[1] == "all" else [parts[1]]
+    level = parts[2] if len(parts) > 2 else "patch"
+    if level not in releases.LEVELS and not releases.parse(level):
+        return f"`{level}` is not patch, minor, major or a version like 1.2.0."
+    with _releasing_guard:
+        if slug in _releasing:
+            return f"A release of `{slug}` is already running."
+        _releasing.add(slug)
+    threading.Thread(target=run_release, args=(slug, repo, base, names, level, post),
+                     daemon=True, name=f"release-{slug}").start()
+    return f":rocket: Releasing `{slug}` ({'everything pending' if names is None else names[0]}, {level})…"
+
+
+def release_plan(slug: str, repo, post) -> None:
+    """What `!release <project>` shows: per target, what is pending and what
+    version it would become -- and, where a target has one, the output of its
+    preview, so a migration is read before it is applied."""
+    try:
+        targets = releases.load(repo)
+        lines = [f"*Ready to release in `{slug}`*"]
+        for name, t in targets.items():
+            commits = releases.pending(repo, t)
+            last = releases.last_release(repo, t)[0] or "never released"
+            if not commits:
+                lines.append(f"• *{name}*: nothing since `{last}`")
+                continue
+            nxt = releases.fmt(releases.next_version(repo, t, "patch"))
+            lines.append(f"• *{name}*: {len(commits)} change{'s' if len(commits) != 1 else ''} "
+                         f"since `{last}` → `{name}/v{nxt}` as a patch "
+                         f"({'tag' if t['ship'] == 'tag' else 'deploys from here'})"
+                         + (f", after {', '.join(t['after'])}" if t["after"] else ""))
+            lines += [f"    `{c[:90]}`" for c in commits[:5]]
+            if len(commits) > 5:
+                lines.append(f"    …and {len(commits) - 5} more")
+            for step in releases.preview(repo, name):
+                lines.append(f"    _preview_ `{step['command']}`:\n```\n"
+                             f"{step['output'].strip()[-800:] or '(no output)'}\n```")
+        lines.append("Release with `!release " + slug + " <target|all> [patch|minor|major|x.y.z]`.")
+        post("\n".join(lines))
+    except Exception as e:
+        log.exception("release plan for %s failed", slug)
+        post(f":warning: Could not work out the release plan: {e}")
+
+
+def run_release(slug: str, repo, base: str, names, level: str, post) -> list[dict]:
+    """Release in dependency order, stopping at the first failure. Holds the
+    repo guard throughout, so a landing cannot move the base mid-release."""
+    done = []
+    try:
+        with repo_guard(str(repo)):
+            steps = releases.plan(repo, names, level)
+            if not steps:
+                post(f"`{slug}` has nothing to release.")
+                return done
+            for step in steps:
+                name = step["target"]
+                if not step["commits"]:
+                    continue
+                try:
+                    r = releases.release(repo, name, level if name in (names or [name]) else "patch", base)
+                except releases.ReleaseError as e:
+                    post(f":x: *{name}* not released: {e}. Stopping here.")
+                    return done
+                done.append(r)
+                if not r["released"]:
+                    tail = next((s["output"] for s in reversed(r["steps"]) if not s["ok"]), "")
+                    post(f":x: *{name}* not released: {r.get('error')}. Stopping here."
+                         + (f"\n```\n{tail.strip()[-900:]}\n```" if tail else ""))
+                    return done
+                post(f":white_check_mark: *{name}* released as `{r['tag']}` "
+                     f"({len(r['commits'])} change{'s' if len(r['commits']) != 1 else ''}).")
+    except Exception as e:
+        log.exception("release of %s failed", slug)
+        post(f":warning: The release of `{slug}` errored: {e}")
+    finally:
+        with _releasing_guard:
+            _releasing.discard(slug)
+    return done
 
 
 def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
@@ -980,6 +1095,10 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             say(text=":octagonal_sign: Stopping…", thread_ts=thread_ts)
         else:
             say(text="Nothing is running in this thread.", thread_ts=thread_ts)
+    elif lower.startswith("!release"):
+        say(text=release_command(cmd[len("!release"):].strip(),
+                                 lambda text: say(text=text, thread_ts=thread_ts)),
+            thread_ts=thread_ts)
     elif lower.startswith("!model"):
         parts = cmd.split(None, 1)
         if len(parts) == 1:
