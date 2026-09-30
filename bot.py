@@ -2940,6 +2940,15 @@ def land_if_ready(task: dict) -> dict:
     # The task's own worktree was released when its turn ended, so reattach the
     # branch. Rebasing and retesting need somewhere to happen that is not the
     # checkout being merged into.
+    # Before looking for a checkout: a task that found its job already done
+    # has nothing to land, and saying "could not check out" about it reads
+    # as git refusing work that needs a person.
+    empty = branches.nothing_to_land(
+        cwd, branch, worktrees.base_ref(cwd, fetch=False,
+                                        prefer=scope.get("branch") or "", fallback=""))
+    if empty:
+        return never("nothing-to-land", empty)
+
     here = worktrees.attach(cwd, task["id"], branch)
     if not here:
         return {"eligible": True, "landed": False, "stage": "attach",

@@ -115,6 +115,34 @@ def existing(repo) -> dict:
     return out
 
 
+def exists(repo, branch: str) -> bool:
+    """Whether `branch` is a local branch in `repo`."""
+    return _git(repo, "rev-parse", "--verify", "--quiet",
+                f"refs/heads/{branch}").returncode == 0
+
+
+def nothing_to_land(repo, branch: str, base: str) -> str:
+    """Why a task's branch has nothing to land, or "" if it has something.
+
+    A branch the executor deleted as empty, or one whose every commit the base
+    already holds, is a task that found its job done -- not a landing git
+    refused. Answered before a landing goes looking for a checkout, because the
+    absence of a branch used to reach the user as "not landed (attach)", a
+    refusal asking for a person, seven times in one day.
+
+    An unresolvable base says nothing either way: "" lets the landing run and
+    refuse with its own named stage rather than be waved through here.
+    """
+    if not exists(repo, branch):
+        return "its branch is gone: it made no commits the base did not already have"
+    if not base:
+        return ""
+    local = base.split("/", 1)[1] if base.startswith("origin/") else base
+    if ahead(repo, [base, local], branch) == 0:
+        return "everything on its branch is already on the base"
+    return ""
+
+
 def ahead(repo, bases, branch: str) -> int:
     """Commits on `branch` that no copy of the base has.
 

@@ -8937,6 +8937,62 @@ def test_false_starts_still_back_off():
           "otherwise the check above proves nothing")
 
 
+
+# --- a task with nothing to land is not a refused landing ----------------------
+# Seven Silkworm tasks in a day read "not landed (attach)" -- a refusal, asking
+# for a person -- when they had simply found their job already done. Their
+# branches held nothing new, so the executor rightly deleted them as empty;
+# the landing then went looking for a branch that was gone and reported the
+# absence as git saying no.
+
+def test_nothing_to_land_is_not_a_refusal():
+    import logging
+    import merge as M
+    import worktrees as W
+    import branches as B
+    print("\na task with nothing to land is not a refused landing")
+
+    repo = Path(tempfile.mkdtemp())
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+    g("init", "-q", "-b", "main")
+    g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+    g("branch", "silkworm/tsk_empty")                  # on the base, nothing new
+    g("checkout", "-q", "-b", "silkworm/tsk_work")
+    (repo / "f.txt").write_text("work\n")
+    g("add", "f.txt")
+    g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "real work")
+    g("checkout", "-q", "main")
+
+    class Projects:
+        def get(self, slug):
+            return {"auto_merge": True, "test_cmd": "true"}
+    attached = []
+    class Worktrees:
+        BRANCH_PREFIX = W.BRANCH_PREFIX
+        def __getattr__(self, name):
+            return getattr(W, name)
+        def attach(self, cwd, tid, branch):
+            attached.append(branch)
+            return None                                # stop before git merges anything
+    ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
+          "branches": B, "log": logging.getLogger("test")}
+    _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    land = ns["land_if_ready"]
+    base = {"project": "p", "verified": True, "scope": {"cwd": str(repo)}}
+
+    for tid, why in (("tsk_gone", "its branch was tidied away as empty"),
+                     ("tsk_empty", "everything on its branch is already on the base")):
+        r = land({**base, "id": tid})
+        check(f"{why}: nothing to land", r.get("stage") == "nothing-to-land"
+              and not r.get("eligible"), f"got {r!r}")
+        check(f"{why}: not a refusal anyone must chase", not M.needs_a_person(r))
+    check("and neither went looking for a checkout",
+          not any(b.endswith(("tsk_gone", "tsk_empty")) for b in attached), str(attached))
+    r = land({**base, "id": "tsk_work"})
+    check("a branch with real work still goes on to land",
+          attached == ["silkworm/tsk_work"] and r.get("stage") == "attach", f"{attached} {r!r}")
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

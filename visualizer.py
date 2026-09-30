@@ -1477,6 +1477,9 @@ function landing(t) {
   const d = l.detail ? `<div class="d">${esc(String(l.detail).slice(-300))}</div>` : "";
   // Never a candidate (unverified, no suite) versus git asked and refused.
   // Only the second leaves a branch for anyone to do something about.
+  // A task that found its job already done: not a failure to land anything.
+  if (l.stage === "nothing-to-land")
+    return `<div class="land ok">nothing to land — ${esc(l.detail || "")}</div>`;
   if (!l.eligible)
     return `<div class="land">not landed — ${esc(l.detail || l.stage || "?")}</div>`;
   return `<div class="land bad">not landed (${esc(l.stage || "?")}) — ${
