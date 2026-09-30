@@ -8955,32 +8955,6 @@ def test_nothing_to_land_is_not_a_refusal():
     import worktrees as W
     import branches as B
     print("\na task with nothing to land is not a refused landing")
-# --- work left uncommitted goes back before it reaches review ------------------
-# A Cadence implementor finished with three changes loose in its checkout. The
-# suite would have tested them, but the reviewer checks the branch out -- and
-# git refused, because the checkout still held it -- so "nothing was reviewed";
-# it was approved, and closed with the work still on no branch at all.
-
-def test_uncommitted_work_is_sent_back():
-    import logging
-    import types
-    import worktrees as W
-    import tasks as T
-    print("\nwork left uncommitted goes back before it reaches review")
-# --- a person can land work on any project -------------------------------------
-# Auto-merge was the only door to the base. A project with it off could not
-# merge anything at all: Approve closed the task and left the branch, and 59
-# finished tasks piled up on branches with no button that would do anything.
-
-def test_approval_lands_on_any_project():
-    import logging
-    import types
-    import merge as M
-    import worktrees as W
-    import branches as B
-    import discard as D
-    import tasks as T
-    print("\na person can land work on any project")
 
     repo = Path(tempfile.mkdtemp())
     g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
@@ -8990,15 +8964,12 @@ def test_approval_lands_on_any_project():
     g("checkout", "-q", "-b", "silkworm/tsk_work")
     (repo / "f.txt").write_text("work\n")
     g("add", "f.txt")
-    g("checkout", "-q", "-b", "silkworm/tsk_work")
-    (repo / "f.txt").write_text("work\n"); g("add", "f.txt")
     g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "real work")
     g("checkout", "-q", "main")
 
     class Projects:
         def get(self, slug):
             return {"auto_merge": True, "test_cmd": "true"}
-            return {"auto_merge": False, "test_cmd": "true"}     # auto-merge OFF
     attached = []
     class Worktrees:
         BRANCH_PREFIX = W.BRANCH_PREFIX
@@ -9007,7 +8978,6 @@ def test_approval_lands_on_any_project():
         def attach(self, cwd, tid, branch):
             attached.append(branch)
             return None                                # stop before git merges anything
-            attached.append(branch); return None
     ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
           "branches": B, "log": logging.getLogger("test")}
     _bot_fns({"land_if_ready", "landing_enabled"}, ns)
@@ -9025,6 +8995,24 @@ def test_approval_lands_on_any_project():
     r = land({**base, "id": "tsk_work"})
     check("a branch with real work still goes on to land",
           attached == ["silkworm/tsk_work"] and r.get("stage") == "attach", f"{attached} {r!r}")
+
+
+# --- work left uncommitted goes back before it reaches review ------------------
+# A Cadence implementor finished with three changes loose in its checkout. The
+# suite would have tested them, but the reviewer checks the branch out -- and
+# git refused, because the checkout still held it -- so "nothing was reviewed";
+# it was approved, and closed with the work still on no branch at all.
+
+def test_uncommitted_work_is_sent_back():
+    import logging
+    import types
+    import worktrees as W
+    import tasks as T
+    print("\nwork left uncommitted goes back before it reaches review")
+
+    repo = Path(tempfile.mkdtemp())
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+    g("init", "-q", "-b", "main")
     (repo / ".gitignore").write_text("build/\n")
     (repo / "a.txt").write_text("a\n")
     g("add", "-A"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base")
@@ -9075,6 +9063,46 @@ def test_approval_lands_on_any_project():
                           for c in ast.walk(n))), None)
     check("the suite does not run over loose work",
           guard is not None and "loose" in ast.unparse(guard.test))
+
+
+# --- a person can land work on any project -------------------------------------
+# Auto-merge was the only door to the base. A project with it off could not
+# merge anything at all: Approve closed the task and left the branch, and 59
+# finished tasks piled up on branches with no button that would do anything.
+
+def test_approval_lands_on_any_project():
+    import logging
+    import types
+    import merge as M
+    import worktrees as W
+    import branches as B
+    import discard as D
+    import tasks as T
+    print("\na person can land work on any project")
+
+    repo = Path(tempfile.mkdtemp())
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+    g("init", "-q", "-b", "main")
+    g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+    g("checkout", "-q", "-b", "silkworm/tsk_work")
+    (repo / "f.txt").write_text("work\n"); g("add", "f.txt")
+    g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "real work")
+    g("checkout", "-q", "main")
+
+    class Projects:
+        def get(self, slug):
+            return {"auto_merge": False, "test_cmd": "true"}     # auto-merge OFF
+    attached = []
+    class Worktrees:
+        BRANCH_PREFIX = W.BRANCH_PREFIX
+        def __getattr__(self, name):
+            return getattr(W, name)
+        def attach(self, cwd, tid, branch):
+            attached.append(branch); return None
+    ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
+          "branches": B, "log": logging.getLogger("test")}
+    _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    land = ns["land_if_ready"]
     t = {"id": "tsk_work", "project": "p", "scope": {"cwd": str(repo)}}
 
     r = land({**t, "verified": True})
