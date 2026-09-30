@@ -330,7 +330,7 @@ def _run(command: str, repo, env, secrets=()) -> dict:
                              "partly applied before it was stopped")
         code = None
     return {"command": command, "ok": code == 0, "code": code,
-            "output": (out or "")[-OUTPUT_CHARS:]}
+            "output": redact((out or "")[-OUTPUT_CHARS:], secrets)}
 
 
 def preview(repo, name: str) -> list[dict]:
