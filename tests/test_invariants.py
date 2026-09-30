@@ -8951,6 +8951,18 @@ def test_nothing_to_land_is_not_a_refusal():
     import worktrees as W
     import branches as B
     print("\na task with nothing to land is not a refused landing")
+# --- work left uncommitted goes back before it reaches review ------------------
+# A Cadence implementor finished with three changes loose in its checkout. The
+# suite would have tested them, but the reviewer checks the branch out -- and
+# git refused, because the checkout still held it -- so "nothing was reviewed";
+# it was approved, and closed with the work still on no branch at all.
+
+def test_uncommitted_work_is_sent_back():
+    import logging
+    import types
+    import worktrees as W
+    import tasks as T
+    print("\nwork left uncommitted goes back before it reaches review")
 
     repo = Path(tempfile.mkdtemp())
     g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
@@ -8991,6 +9003,56 @@ def test_nothing_to_land_is_not_a_refusal():
     r = land({**base, "id": "tsk_work"})
     check("a branch with real work still goes on to land",
           attached == ["silkworm/tsk_work"] and r.get("stage") == "attach", f"{attached} {r!r}")
+    (repo / ".gitignore").write_text("build/\n")
+    (repo / "a.txt").write_text("a\n")
+    g("add", "-A"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base")
+    check("a clean checkout has nothing loose", W.uncommitted(repo) == [])
+    (repo / "a.txt").write_text("changed\n")
+    (repo / "new.txt").write_text("new\n")
+    (repo / "build").mkdir(); (repo / "build" / "out.o").write_text("x")
+    loose = sorted(W.uncommitted(repo))
+    check("modified and new files are loose; ignored build output is not",
+          loose == ["a.txt", "new.txt"], str(loose))
+
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    posted = []
+    client = types.SimpleNamespace(chat_postMessage=lambda **kw: posted.append(kw["text"]))
+    ns = {"task_store": store, "tasks": T, "app": types.SimpleNamespace(client=client),
+          "log": logging.getLogger("test"),
+          "task_state": lambda tid, st, detail="": store.transition(tid, st, detail)}
+    _bot_fns({"send_back_uncommitted", "MAX_COMMIT_ATTEMPTS"}, ns)
+    tid = store.create("implement it", state=T.QUEUED, role="implementor")["id"]
+    store.transition(tid, T.RUNNING)
+    check("first time: sent back", ns["send_back_uncommitted"](store.get(tid) | {"id": tid},
+                                                               loose, "C", "1.1"))
+    t = store.get(tid)
+    check("requeued to try again", t["state"] == T.QUEUED)
+    check("told which files, and why it matters",
+          "new.txt" in t["goal"] and "uncommitted" in t["goal"] and "commit" in t["goal"].lower())
+    store.transition(tid, T.RUNNING)
+    ns["send_back_uncommitted"](store.get(tid) | {"id": tid}, loose, "C", "1.1")
+    check("second time: stops and asks, rather than loop",
+          store.get(tid)["state"] == T.AWAITING_APPROVAL and "Still uncommitted" in posted[-1])
+
+    # Wired where it has to be: after the turn, before the suite and before
+    # review -- found by the parse tree, not by searching the text.
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+              and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "verify_work"
+                      for c in ast.walk(n)) and n.name != "verify_work")
+    def first(name):
+        return min((c.lineno for c in ast.walk(fn) if isinstance(c, ast.Call)
+                    and (getattr(c.func, "id", "") == name
+                         or getattr(c.func, "attr", "") == name)), default=10**9)
+    check("loose work is looked for before the suite runs",
+          first("uncommitted") < first("verify_work"), fn.name)
+    check("and sent back before review is asked for",
+          first("send_back_uncommitted") < first("resolve_review"))
+    guard = next((n for n in ast.walk(fn) if isinstance(n, ast.If)
+                  and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "verify_work"
+                          for c in ast.walk(n))), None)
+    check("the suite does not run over loose work",
+          guard is not None and "loose" in ast.unparse(guard.test))
 
 
 if __name__ == "__main__":

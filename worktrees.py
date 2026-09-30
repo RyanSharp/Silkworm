@@ -261,6 +261,15 @@ def is_dirty(worktree) -> bool:
     return r.returncode == 0 and bool(r.stdout.strip())
 
 
+def uncommitted(worktree) -> list[str]:
+    """Paths with changes that no commit holds: modified, staged, or new and
+    not ignored. Empty if the checkout is clean or cannot be read."""
+    r = _git(worktree, "status", "--porcelain", "--untracked-files=all")
+    if r.returncode != 0:
+        return []
+    return [line[3:] for line in r.stdout.splitlines() if len(line) > 3]
+
+
 def branch_of(worktree) -> str:
     r = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
     return r.stdout.strip() if r.returncode == 0 else ""

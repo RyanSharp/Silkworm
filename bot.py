@@ -2566,7 +2566,15 @@ def execute_task(task: dict) -> None:
         # verify.run reported as "could not run" -- correctly -- and the caller
         # read as "nothing to verify". Every task passed unverified, silently.
         checked = None
-        if roles.needs_review(role_name) and not task.get("blocked_on"):
+        # Work left uncommitted is invisible to everything after this: the
+        # suite would test it, but the reviewer checks the branch out and
+        # finds nothing, and landing has nothing to land -- one Cadence task
+        # was reviewed as "could not check out", approved, and closed with
+        # its three changes still loose in a checkout. So it goes back first.
+        loose = (worktrees.uncommitted(worktree)
+                 if (worktree and not borrowed and roles.needs_review(role_name)
+                     and not task.get("blocked_on")) else [])
+        if roles.needs_review(role_name) and not task.get("blocked_on") and not loose:
             checked = verify_work(task, cwd)
             if checked["ran"]:
                 task_store.update(tid, verified=bool(checked["ok"]))
@@ -2615,6 +2623,8 @@ def execute_task(task: dict) -> None:
         task_store.update(tid, session_id=result.session_id,
                           result={"text": result.text[:4000], "cost": result.cost_usd,
                                   "files_uploaded": uploaded})
+        if loose and send_back_uncommitted(task, loose, channel, thread_ts):
+            return
         if checked and not checked["ok"] and checked["ran"]:
             if send_back_for_tests(task, checked, channel, thread_ts):
                 return
@@ -2699,6 +2709,48 @@ def send_back_for_tests(task: dict, result: dict, channel: str, thread_ts: str) 
     task_store.update(tid, goal=(task.get("goal", "") + "\n\n"
                                  + verify.rework_note(result)))
     task_state(tid, tasks.QUEUED, f"tests failed; sent back (attempt {tried})")
+    return True
+
+
+#: Once is enough: a second run that still leaves its work loose is not going
+#: to commit it on a third, and the files are worth a person's look.
+MAX_COMMIT_ATTEMPTS = 1
+
+
+def send_back_uncommitted(task: dict, files: list[str], channel: str,
+                          thread_ts: str) -> bool:
+    """Requeue work its implementor left uncommitted. True if it was handled.
+
+    Committing it here instead would guess at intent -- a scratch file, a
+    build output and the actual change all look alike from outside -- and the
+    implementor is the one that knows which is which. Its checkout is kept, so
+    the next run finds the files where it left them.
+    """
+    tid = task["id"]
+    tried = int(task.get("commit_attempts") or 0) + 1
+    task_store.update(tid, commit_attempts=tried)
+    listing = "\n".join(f"  {f}" for f in files[:30])
+    more = f"\n  …and {len(files) - 30} more" if len(files) > 30 else ""
+    if tried > MAX_COMMIT_ATTEMPTS:
+        app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":warning: *Still uncommitted after {tried} runs* — nothing "
+                 f"was reviewed. Leaving it for you:\n```\n{listing}{more}\n```")
+        task_state(tid, tasks.AWAITING_APPROVAL,
+                   f"left {len(files)} change(s) uncommitted after {tried} runs")
+        return True
+    app.client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=f":arrows_counterclockwise: *Uncommitted work — sending it back* "
+             f"({len(files)} file{'s' if len(files) != 1 else ''}). Review and "
+             f"landing read the branch, and these are not on it.")
+    task_store.update(tid, goal=(task.get("goal", "") + "\n\n" + (
+        "Your last run left changes uncommitted in this task's checkout. Review "
+        "and landing only see what is committed on the branch, so as it stands "
+        "none of it can be reviewed or merged. Commit what belongs to the task, "
+        "and remove or ignore anything that does not (scratch files, build "
+        "output). Uncommitted:\n\n" + listing + more)))
+    task_state(tid, tasks.QUEUED, f"left work uncommitted; sent back (run {tried})")
     return True
 
 

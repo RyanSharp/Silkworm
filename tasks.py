@@ -173,6 +173,7 @@ FIELDS: dict[str, tuple] = {
     # work was proven rather than merely believed.
     "verified":        (None,  "True/False from the test command, None = not run"),
     "verify_attempts": (0,     "times it was sent back for failing tests"),
+    "commit_attempts": (0,     "times it was sent back for leaving its work uncommitted"),
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }
