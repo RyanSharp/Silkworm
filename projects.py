@@ -306,6 +306,25 @@ def parse_at(text: str) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+def unready(rec) -> str:
+    """Why this project may not take unsupervised work, or "" if it may.
+
+    Unsupervised means nobody is in the loop between a task starting and its
+    result reaching the base: nightly ideation, and implementor tasks the
+    queue runs on its own. That is only safe where the project can prove a
+    change (a test command) and decides for itself what happens to proven
+    work (auto-merge). Without those, an unattended task ends as a branch
+    nothing tests and nothing merges -- which is how sixty of them piled up.
+    """
+    if not rec:
+        return "is not a registered project"
+    missing = [what for what, have in (("a test command", (rec.get("test_cmd") or "").strip()),
+                                       ("auto-merge", rec.get("auto_merge")))
+               if not have]
+    return ("needs " + " and ".join(missing) + " before it can take unsupervised work"
+            if missing else "")
+
+
 def due_for_ideation(records, now) -> list:
     """Slugs whose scheduled time has passed today and that have not run.
 
@@ -319,6 +338,8 @@ def due_for_ideation(records, now) -> list:
     for rec in records:
         at = (rec.get("ideate_at") or "").strip()
         if not at or rec.get("archived") or rec.get("ideate_on") == today:
+            continue
+        if unready(rec):                 # switched on before the rule existed
             continue
         if hhmm >= at:
             due.append(rec["slug"])
