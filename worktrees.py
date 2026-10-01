@@ -211,7 +211,8 @@ def create(repo, task_id: str, fetch: bool = True, base: str = "") -> Path | Non
     return path
 
 
-def attach(repo, task_id: str, branch: str, label: str = "land") -> Path | None:
+def attach(repo, task_id: str, branch: str, label: str = "land",
+           detach: bool = False) -> Path | None:
     """A checkout of an existing branch, for work that has already been done.
 
     Landing happens after the review, by which time the task's own worktree is
@@ -223,6 +224,12 @@ def attach(repo, task_id: str, branch: str, label: str = "land") -> Path | None:
     without this it stands in the main checkout and reviews a tree the change
     never reached. `label` is only so that `git worktree list` says which of
     the two a directory is.
+
+    `detach` is for a reader. Git lets one checkout hold a branch, so taking
+    it fails whenever another checkout still does -- an implementor's, kept
+    because something in it was left uncommitted -- and two Cadence reviews
+    failed five times each on exactly that. A review never commits; the
+    commit at the branch's tip is all it needs, and that it can always have.
     """
     repo = Path(repo)
     if not is_repo(repo):
@@ -236,10 +243,18 @@ def attach(repo, task_id: str, branch: str, label: str = "land") -> Path | None:
         # admin entry and not the tree, would otherwise be handed to a review
         # as the work it is auditing -- and the landing, which attaches under
         # a different name, would go ahead and merge on the strength of it.
+        if detach:
+            # Detached, "what was asked for" is the branch's tip, untouched:
+            # an older commit would be reviewed as the current work.
+            tip = _git(repo, "rev-parse", branch).stdout.strip()
+            ok = (_git(path, "rev-parse", "HEAD").stdout.strip() == tip
+                  and not is_dirty(path))
+            return path if ok else None
         return path if branch_of(path) == branch else None
     ROOT.mkdir(parents=True, exist_ok=True)
     with _repo_create_lock(repo):
-        r = _git(repo, "worktree", "add", str(path), branch)
+        r = _git(repo, "worktree", "add", *(["--detach"] if detach else []),
+                 str(path), branch)
     if r.returncode != 0:
         log.warning("could not attach %s for landing: %s",
                     branch, (r.stderr or "").strip()[-300:])

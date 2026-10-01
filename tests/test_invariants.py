@@ -9153,6 +9153,53 @@ def test_approval_lands_on_any_project():
           "'land'" in fn and "'drop'" in fn)
 
 
+
+# --- a review reads the commit, it does not take the branch --------------------
+# Two Cadence reviews failed five times each: the implementor's checkout was
+# kept (a generated file had changed in it) and so still held the branch, and
+# git lets one checkout hold a branch. The review only reads; it never needed
+# the branch, only the commit at its tip.
+
+def test_review_does_not_take_the_branch():
+    import worktrees as W
+    print("\na review reads the commit, it does not take the branch")
+    repo = Path(tempfile.mkdtemp()) / "r"
+    g = lambda *a, cwd=repo: subprocess.run(["git", "-C", str(cwd), "-c", "user.email=t@t",
+                                             "-c", "user.name=t", *a], capture_output=True, text=True)
+    repo.mkdir(); g("init", "-q", "-b", "main"); g("commit", "-q", "--allow-empty", "-m", "base")
+    held = repo.parent / "held"
+    g("worktree", "add", "-q", "-b", "silkworm/tsk_x", str(held))
+    (held / "f.txt").write_text("work\n"); g("add", "f.txt", cwd=held)
+    g("commit", "-q", "-m", "the work", cwd=held)
+    (held / "scratch").write_text("left behind\n")           # kept: it is dirty
+    old_root = W.ROOT
+    W.ROOT = repo.parent / "wts"
+    try:
+        check("taking the branch is refused while another checkout holds it",
+              W.attach(repo, "tsk_x", "silkworm/tsk_x", label="land") is None)
+        here = W.attach(repo, "tsk_x", "silkworm/tsk_x", label="review", detach=True)
+        tip = g("rev-parse", "silkworm/tsk_x").stdout.strip()
+        check("a review gets the branch's commit regardless",
+              here is not None and g("rev-parse", "HEAD", cwd=here).stdout.strip() == tip)
+        check("and sees the committed work", here is not None and (here / "f.txt").exists())
+        check("but not what was left uncommitted", here is not None and not (here / "scratch").exists())
+        again = W.attach(repo, "tsk_x", "silkworm/tsk_x", label="review", detach=True)
+        check("asked again, the same checkout is reused", again == here)
+        g("commit", "-q", "--allow-empty", "-m", "more", cwd=held)
+        moved = W.attach(repo, "tsk_x", "silkworm/tsk_x", label="review", detach=True)
+        check("a checkout at an older commit is not reused as if current", moved is None
+              or g("rev-parse", "HEAD", cwd=moved).stdout.strip()
+              == g("rev-parse", "silkworm/tsk_x").stdout.strip())
+    finally:
+        W.ROOT = old_root
+    calls = [c for c in ast.walk(ast.parse((BASE / "bot.py").read_text()))
+             if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "attach"
+             and any(k.arg == "label" and getattr(k.value, "value", "") == "review" for k in c.keywords)]
+    check("the review asks for a detached checkout",
+          calls and all(any(k.arg == "detach" and getattr(k.value, "value", None) is True
+                            for k in c.keywords) for c in calls), f"{len(calls)} review attach call(s)")
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

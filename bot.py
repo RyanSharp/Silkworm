@@ -2495,7 +2495,7 @@ def execute_task(task: dict) -> None:
     borrowed = review_branch(task)
     if borrowed:
         progress.update(":deciduous_tree: _Checking out the work to review…_")
-        worktree = (worktrees.attach(cwd, task["parent"], borrowed, label="review")
+        worktree = (worktrees.attach(cwd, task["parent"], borrowed, label="review", detach=True)
                     if worktrees.is_repo(cwd) else None)
         if not worktree:
             # No checkout, no review. Carrying on in the main tree is worse
