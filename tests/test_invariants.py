@@ -9578,6 +9578,91 @@ version = {{ file = "ios/project.yml", key = "CFBundleShortVersionString" }}
     check("an explicit version cannot apply to every target at once", bool(steps_err))
 
 
+
+# --- the board is a screen, not a scroll ---------------------------------------
+# Slack opens a channel at the bottom of its newest message. The board spent
+# three blocks on every task, so with eleven waiting you landed at its foot and
+# scrolled back up to read it. One line per task, actions in a menu, and the
+# summary at the bottom where you land.
+
+def test_board_is_compact():
+    import home
+    import tasks as T
+    print("\nthe board is a screen, not a scroll")
+    now = time.time()
+    rec = lambda tid, st, **kw: {"id": tid, "state": st, "goal": f"goal of {tid}",
+                                 "updated": now - 60, "thread": "D1:1.2", **kw}
+    board = [rec("tsk_aw", T.AWAITING_APPROVAL, result={"review": {
+                 "summary": "close", "findings": [f"finding {i}" for i in range(7)]}}),
+             rec("tsk_in", T.NEEDS_INPUT), rec("tsk_pr", T.PROPOSED),
+             rec("tsk_fl", T.FAILED, events=[{"kind": "failed", "detail": "exit 143"}])]
+    v = home.render(board, now=now, base_url="https://x.slack.com", compact=True,
+                    max_blocks=50, max_attention=12)
+    rows = [b for b in v["blocks"] if b.get("block_id", "").startswith("t:")]
+    check("one block per task", len(rows) == 4 and not any(
+        b.get("block_id", "").startswith("a:") for b in v["blocks"]))
+    menu = lambda tid: [o["value"].split("|")[0] for b in rows if b["block_id"] == f"t:{tid}"
+                        for o in b["accessory"]["options"]]
+    for tid, st in (("tsk_aw", T.AWAITING_APPROVAL), ("tsk_in", T.NEEDS_INPUT),
+                    ("tsk_pr", T.PROPOSED), ("tsk_fl", T.FAILED)):
+        want = [b[1] for b in home.BUTTONS[st]] + ["thread"]
+        check(f"{st}: the menu offers the dashboard's actions and the thread", menu(tid) == want,
+              str(menu(tid)))
+    check("the summary and Refresh are at the bottom, where Slack opens",
+          "need you" in json.dumps(v["blocks"][-2:]) and "home_refresh" in json.dumps(v["blocks"][-2:]))
+    many = home.render([rec(f"tsk_{i:03}", T.PROPOSED) for i in range(300)], now=now,
+                       compact=True, max_blocks=50, max_attention=12)
+    check("a long board still fits a message", len(many["blocks"]) <= 50)
+    bstore = T.TaskStore(Path(tempfile.mkdtemp()) / "b.json")
+    bstore.create("one waiting", state=T.PROPOSED)
+    drawn = home.Board(state_path=Path(tempfile.mkdtemp()) / "board.json", store=bstore,
+                       call=None, allowed_users=set()).blocks()
+    check("and the board in the channel is the compact one",
+          any(b.get("accessory", {}).get("type") == "overflow" for b in drawn)
+          and not any(b.get("block_id", "").startswith("a:") for b in drawn))
+
+    # Picking an action opens its confirmation, with the full detail; only
+    # submitting it acts.
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
+                       stop_task=lambda tid: False, start_landing=lambda tid, **kw: None,
+                       holding=__import__("holding"), tell_thread=lambda *a: None)
+    aw = store.create("work to approve", state=T.QUEUED)["id"]
+    store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
+    store.update(aw, result={"review": {"summary": "ok-ish",
+                                        "findings": [f"issue number {i}" for i in range(7)]}})
+    opened, posted = [], []
+    client = types.SimpleNamespace(views_open=lambda trigger_id, view: opened.append(view),
+                                   views_publish=lambda **kw: posted.append(kw))
+    h = home.Home(store=store, call=ns["handle_tasks"], allowed_users={"U_ME"})
+    pick = lambda user, value: {"user": {"id": user}, "trigger_id": "t",
+                                "actions": [{"action_id": "home_menu",
+                                             "selected_option": {"value": value}}]}
+    h.on_menu(lambda *a, **k: None, pick("U_ME", f"approve|{aw}|awaiting_approval"), client)
+    check("picking Approve does not approve", store.get(aw)["state"] == T.AWAITING_APPROVAL)
+    check("it opens a confirmation", opened and opened[-1]["callback_id"] == home.CONFIRM_CALLBACK)
+    shown = json.dumps(opened[-1])
+    check("showing every finding, not three", all(f"issue number {i}" in shown for i in range(7)))
+    h.on_confirm(lambda *a, **k: None, {"user": {"id": "U_ME"}}, client, opened[-1])
+    check("confirming it approves", store.get(aw)["state"] == T.DONE)
+    n = len(opened)
+    h.on_menu(lambda *a, **k: None, pick("U_ME", f"dismiss|{aw}|awaiting_approval"), client)
+    check("an action on a task that has moved on opens nothing", len(opened) == n)
+    pr = store.create("a proposal", state=T.PROPOSED)["id"]
+    h.on_menu(lambda *a, **k: None, pick("U_STEPH", f"accept|{pr}|proposed"), client)
+    check("someone off the allowlist gets no window", len(opened) == n)
+    h.on_menu(lambda *a, **k: None, pick("U_ME", f"accept|{pr}|proposed"), client)
+    form = opened[-1]
+    store.transition(pr, T.CANCELLED)                    # dismissed elsewhere meanwhile
+    h.on_confirm(lambda *a, **k: None, {"user": {"id": "U_ME"}}, client, form)
+    check("a confirmation left open while the task moved on does nothing",
+          store.get(pr)["state"] == T.CANCELLED)
+    need = store.create("asks something", state=T.QUEUED)["id"]
+    store.transition(need, T.RUNNING); store.transition(need, T.NEEDS_INPUT)
+    h.on_menu(lambda *a, **k: None, pick("U_ME", f"answer|{need}|needs_input"), client)
+    check("Answer still opens the answer form", opened[-1]["callback_id"] == home.MODAL_CALLBACK)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

@@ -65,6 +65,9 @@ BUTTONS = {
 #: Actions that are a plain call to handle_tasks; the others open a modal.
 DIRECT = ("accept", "dismiss", "approve", "retry", "cancel")
 MODAL_CALLBACK = "home_rework"
+CONFIRM_CALLBACK = "home_confirm"
+STATE_ICON = {tasks.AWAITING_APPROVAL: ":eyes:", tasks.NEEDS_INPUT: ":speech_balloon:",
+              tasks.FAILED: ":x:", tasks.PROPOSED: ":bulb:"}
 
 
 # --- rendering (pure) ---------------------------------------------------------
@@ -200,9 +203,102 @@ def _task_blocks(task: dict, now: float, base_url: str) -> list[dict]:
     return blocks
 
 
+def _summary_line(task: dict) -> str:
+    """The one thing worth seeing before opening it, on a single line."""
+    review = (task.get("result") or {}).get("review") or {}
+    if task.get("state") == tasks.AWAITING_APPROVAL and review:
+        n = len(review.get("findings") or [])
+        head = review.get("summary") or ""
+        return (f"{n} finding{'s' if n != 1 else ''}: " if n else "") + head
+    events = task.get("events") or []
+    if task.get("state") in (tasks.FAILED, tasks.NEEDS_INPUT) and events:
+        return (events[-1] or {}).get("detail") or ""
+    return ""
+
+
+def _task_line(task: dict, now: float, base_url: str) -> dict:
+    """A task as one section with its actions in a menu.
+
+    The board used to spend three blocks on each task -- title, context,
+    button row -- and Slack opens a channel at the bottom of its newest
+    message, so a board of eleven was a scroll back up to its own top. One
+    line each keeps it a screen; detail is a tap away, in the confirmation
+    that every action now opens.
+    """
+    tid, state = task.get("id", ""), task.get("state", "")
+    meta = [STATE_ICON.get(state, ""), f"`{tid}`"]
+    if task.get("project"):
+        meta.append(esc(task["project"]))
+    meta.append(ago(task.get("updated") or task.get("created"), now))
+    line = esc(clip(_summary_line(task), 110))
+    text = f"*{esc(clip(label(task), 90))}*\n{' · '.join(m for m in meta if m)}" + \
+        (f" — _{line}_" if line else "")
+    options = [{"text": {"type": "plain_text", "text": b[0].rstrip("…")[:75]},
+                "value": f"{b[1]}|{tid}|{state}"} for b in BUTTONS.get(state, [])]
+    url = thread_url(task.get("thread", ""), base_url)
+    if url:
+        options.append({"text": {"type": "plain_text", "text": "Open thread"},
+                        "value": f"thread|{tid}|{state}", "url": url})
+    block = {"type": "section", "block_id": f"t:{tid}", "text": _text(text)}
+    if options:
+        block["accessory"] = {"type": "overflow", "action_id": "home_menu",
+                              "options": options[:5]}
+    return block
+
+
+def full_detail(task: dict) -> str:
+    """Everything worth reading before deciding, for the confirmation."""
+    state = task.get("state")
+    review = (task.get("result") or {}).get("review") or {}
+    lines = []
+    if state == tasks.AWAITING_APPROVAL and review:
+        if review.get("summary"):
+            lines.append(f"*Review:* {esc(review['summary'])}")
+        lines += [f"• {esc(clip(f, 600))}" for f in (review.get("findings") or [])[:20]]
+        if task.get("verified") is True:
+            lines.append(":test_tube: tests pass")
+        elif task.get("verified") is False:
+            lines.append(":x: tests failed")
+    elif state in (tasks.FAILED, tasks.NEEDS_INPUT):
+        detail = ((task.get("events") or [{}])[-1] or {}).get("detail") or ""
+        if detail:
+            lines.append(f"_{esc(detail)}_")
+    goal = (task.get("goal") or "").strip()
+    if goal:
+        lines.append("*Goal:*\n" + esc(clip(goal, 1500)))
+    return "\n".join(lines) or "_Nothing more recorded._"
+
+
+#: What the confirm button says for each action.
+VERB = {"accept": "Accept", "dismiss": "Dismiss", "approve": "Approve",
+        "retry": "Retry", "cancel": "Cancel task"}
+
+
+def confirm_modal(task: dict, action: str) -> dict:
+    """Confirm an action, with the detail that decides it in front of you.
+    Closing it does nothing -- "never mind" is not "yes"."""
+    tid = task.get("id", "")
+    return {
+        "type": "modal", "callback_id": CONFIRM_CALLBACK,
+        "private_metadata": json.dumps({"action": action, "id": tid,
+                                        "seen": task.get("state", "")}),
+        "title": {"type": "plain_text", "text": VERB.get(action, action)[:24]},
+        "submit": {"type": "plain_text", "text": VERB.get(action, action)[:24]},
+        "close": {"type": "plain_text", "text": "Back"},
+        "blocks": [
+            {"type": "section", "text": _text(f"*{esc(clip(label(task), 200))}*\n`{tid}`"
+                                              + (f" · {esc(task['project'])}" if task.get("project") else ""))},
+            {"type": "section", "text": _text(full_detail(task))},
+        ] + ([{"type": "context", "elements": [_text(
+            "Approving lands the branch: rebase, tests, merge, tests.")]}]
+             if action == "approve" else []),
+    }
+
+
 def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
            base_url: str = "", notice: str = "", allowed: bool = True,
-           max_blocks: int = MAX_BLOCKS, max_attention: int = MAX_ATTENTION) -> dict:
+           max_blocks: int = MAX_BLOCKS, max_attention: int = MAX_ATTENTION,
+           compact: bool = False) -> dict:
     """The Home view for one user.
 
     `allowed=False` renders nothing of the board: task goals and reviewer
@@ -245,7 +341,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
             chunk += [{"type": "divider"},
                       {"type": "section", "text": _text(
                           f"*{HEADINGS.get(current, esc(current))}* ({count})")}]
-        chunk += _task_blocks(t, now, base_url)
+        chunk += [_task_line(t, now, base_url)] if compact else _task_blocks(t, now, base_url)
         # Room kept for the tail sections (running, watching, unmerged).
         if shown >= max_attention or len(blocks) + len(board) + len(chunk) > max_blocks - 12:
             break
@@ -283,6 +379,13 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     if unmerged:
         blocks += [{"type": "divider"}, {"type": "context", "elements": [
             _text(f":warning: {esc(unmerged)} — land or drop them from the dashboard")]}]
+    if compact:
+        # Slack opens a channel at the bottom of its newest message, so the
+        # summary and Refresh go where you land, not at the top you scroll to.
+        top = [b for b in blocks[:4] if b.get("block_id") == "home:top"
+               or (b.get("type") == "context" and "need you" in json.dumps(b))]
+        blocks = [b for b in blocks if b not in top]
+        blocks += [{"type": "divider"}] + top[::-1]
     return {"type": "home", "blocks": blocks[:max_blocks]}
 
 
@@ -472,6 +575,57 @@ class Home:
         self.note(user, self.outcome("answer" if meta.get("answer") else "rework", tid, r))
         self.publish(client, user)
 
+    def on_menu(self, ack, body, client):
+        """An action picked from a task's menu. Every one opens a window --
+        the confirmation with the full detail, or the send-back notes -- so
+        nothing is done by a mis-tap on a phone."""
+        ack()
+        user = body["user"]["id"]
+        act = body["actions"][0]
+        action, _, rest = ((act.get("selected_option") or {}).get("value") or "").partition("|")
+        tid, seen = seen_state(rest)
+        if action == "thread":
+            return                                  # a link; Slack opened it
+        if not self.allowed(user):
+            return self.publish(client, user)
+        task = self.store.get(tid)
+        if not task:
+            self.note(user, ":warning: That task no longer exists.")
+            return self.publish(client, user)
+        if self.moved_on(user, tid, seen):
+            return self.publish(client, user)
+        task = dict(task, id=tid)
+        if action in ("rework", "answer"):
+            view = rework_modal(task, action == "answer")
+        elif action in DIRECT:
+            view = confirm_modal(task, action)
+        else:
+            return
+        try:
+            client.views_open(trigger_id=body["trigger_id"], view=view)
+        except Exception:
+            log.exception("could not open the %s window", action)
+
+    def on_confirm(self, ack, body, client, view):
+        ack()
+        user = body["user"]["id"]
+        if not self.allowed(user):
+            return
+        meta = json.loads(view.get("private_metadata") or "{}")
+        action, tid = meta.get("action", ""), meta.get("id", "")
+        if action not in DIRECT:
+            return
+        # The window can sit open for minutes; check again on the way out.
+        if self.moved_on(user, tid, meta.get("seen", "")):
+            return self.publish(client, user)
+        try:
+            r = self.call({"action": action, "id": tid, "by": f"slack:{user}"})
+        except Exception as e:
+            log.exception("board action %s on %s failed", action, tid)
+            r = {"ok": False, "error": str(e)}
+        self.note(user, self.outcome(action, tid, r))
+        self.publish(client, user)
+
     def moved_on(self, user: str, tid: str, seen: str) -> bool:
         """True, with a note to the user, if the task left `seen`."""
         now = (self.store.get(tid) or {}).get("state")
@@ -585,7 +739,7 @@ class Board(Home):
         items = [dict(r, id=tid) for tid, r in self.store.all().items()]
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
-                      max_attention=self.MAX_ATTENTION)["blocks"]
+                      max_attention=self.MAX_ATTENTION, compact=True)["blocks"]
 
     def fingerprint(self) -> str:
         """What the board shows, minus the clock: which tasks, in which state,
@@ -732,3 +886,5 @@ def register(app, home: Home) -> None:
     app.action("home_rework")(home.on_modal)
     app.action("home_answer")(home.on_modal)
     app.view(MODAL_CALLBACK)(home.on_submit)
+    app.action("home_menu")(home.on_menu)
+    app.view(CONFIRM_CALLBACK)(home.on_confirm)
