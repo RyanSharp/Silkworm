@@ -1907,10 +1907,13 @@ def test_ideation():
         except ValueError:
             check(f"{bad!r} is refused", True)
 
-    recs = [{"slug": "trader", "ideate_at": "02:00", "ideate_on": "", "archived": False},
-            {"slug": "saga", "ideate_at": "02:00", "ideate_on": "2026-09-06", "archived": False},
-            {"slug": "odin", "ideate_at": "", "ideate_on": "", "archived": False},
-            {"slug": "old", "ideate_at": "02:00", "ideate_on": "", "archived": True}]
+    ready = {"test_cmd": "make test", "auto_merge": True}
+    recs = [{"slug": "trader", "ideate_at": "02:00", "ideate_on": "", "archived": False, **ready},
+            {"slug": "saga", "ideate_at": "02:00", "ideate_on": "2026-09-06", "archived": False, **ready},
+            {"slug": "odin", "ideate_at": "", "ideate_on": "", "archived": False, **ready},
+            {"slug": "old", "ideate_at": "02:00", "ideate_on": "", "archived": True, **ready},
+            # Switched on before the rule existed, and not ready: skipped.
+            {"slug": "benji", "ideate_at": "02:00", "ideate_on": "", "archived": False}]
     due = projects.due_for_ideation(recs, dt.datetime(2026, 9, 6, 3, 0))
     check("only a project whose time has passed and has not run is due", due == ["trader"],
           f"got {due}")
@@ -2142,7 +2145,7 @@ def test_ideation():
     # in a way that still lets tomorrow run" look identical in the source.
     import projects as _P
     _ps = _P.ProjectStore(Path(tempfile.mkdtemp()) / "p.json")
-    _ps.ensure("Silkworm", ideate_at="02:00")
+    _ps.ensure("Silkworm", ideate_at="02:00", test_cmd="true", auto_merge=True)
     _today = datetime(2026, 9, 22, 3, 0)
     check("a project with room is due once its time has passed",
           _P.due_for_ideation(_ps.all(), _today) == ["silkworm"])
@@ -2268,7 +2271,7 @@ def _run_ideation_impl():
     ts, ps = TaskStore(root / "t.json"), P.ProjectStore(root / "p.json")
     mod = types.ModuleType("ideating")
     mod.__dict__.update(
-        scoping=S, tasks=T, task_store=ts, project_store=ps, datetime=datetime,
+        scoping=S, tasks=T, task_store=ts, project_store=ps, datetime=datetime, projects=P,
         time=time,
         log=logging.getLogger("test"), CLAUDE_CWD=root, SILKWORM_BIN="silkworm",
         branches=types.SimpleNamespace(survey=lambda _t: []))
@@ -2288,7 +2291,7 @@ def test_a_deep_board_costs_no_session():
     import projects as P, scoping, tasks
     print("\na project at its standing limit is not looked at")
     run_ideation, ts, ps = _run_ideation_impl()
-    ps.ensure("Silkworm", ideate_at="02:00")
+    ps.ensure("Silkworm", ideate_at="02:00", test_cmd="true", auto_merge=True)
 
     out = run_ideation("silkworm")
     check("an empty board still gets its nightly look",
@@ -8793,7 +8796,10 @@ def _outage_harness():
 
     def idle(_s):
         raise Idle()
+    # Readiness is its own test (test_unsupervised_work_needs_a_ready_project);
+    # here every project is ready, so the hold under test is the only one.
     worker = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
+                       hold_unsupervised=lambda task: False,
                        RUNNER_HOLD=hold, TASK_POLL_S=5, log=logging.getLogger("test"),
                        time=types.SimpleNamespace(sleep=idle, time=time.time))
 
@@ -9151,6 +9157,72 @@ def test_approval_lands_on_any_project():
     fn = fn[:fn.index("\n}\n")]
     check("the dashboard offers Land and Drop on each stranded branch",
           "'land'" in fn and "'drop'" in fn)
+
+
+
+# --- unsupervised work needs a project that can prove and merge it -------------
+# Ideation and queued implementor tasks run with nobody in the loop. On a
+# project with no test command and no auto-merge, each one ended as a branch
+# nothing tested and nothing merged -- sixty of them, across four projects.
+
+def test_unsupervised_work_needs_a_ready_project():
+    import logging
+    import projects as P
+    import tasks as T
+    print("\nunsupervised work needs a project that can prove and merge it")
+    check("ready: a test command and auto-merge",
+          P.unready({"test_cmd": "make test", "auto_merge": True}) == "")
+    check("no test command: not ready", "test command" in P.unready({"auto_merge": True}))
+    check("no auto-merge: not ready", "auto-merge" in P.unready({"test_cmd": "x"}))
+    check("no project at all: not ready", P.unready(None) != "")
+
+    root = Path(tempfile.mkdtemp())
+    ts, ps = T.TaskStore(root / "t.json"), P.ProjectStore(root / "p.json")
+    ps.ensure("Cadence", test_cmd="make -C ios test", auto_merge=True)
+    ps.ensure("Saga")
+    told = []
+    ns = {"projects": P, "project_store": ps, "tasks": T, "task_store": ts,
+          "task_state": lambda tid, st, detail="": ts.transition(tid, st, detail),
+          "tell_thread": lambda key, text: told.append(text)}
+    _bot_fns({"hold_unsupervised"}, ns)
+    hold = ns["hold_unsupervised"]
+    def claimed(project, role="implementor"):
+        tid = ts.create("do it", project=project, role=role, state=T.QUEUED, driver="queue")["id"]
+        ts.transition(tid, T.RUNNING)
+        return dict(ts.get(tid), id=tid)
+    t = claimed("saga")
+    check("an implementor task for an unready project is not run", hold(t) is True)
+    check("it waits on the board with the reason",
+          ts.get(t["id"])["state"] == T.NEEDS_INPUT and "test command" in ts.get(t["id"])["events"][-1]["detail"])
+    check("and its thread is told", told and "Not run" in told[-1])
+    check("a task with no project is held too", hold(claimed("")) is True)
+    check("a ready project's task runs", hold(claimed("cadence")) is False)
+    check("investigation (assistant) is not held", hold(claimed("saga", "assistant")) is False)
+    check("nor is a read-only review", hold(claimed("saga", "reviewer")) is False)
+
+    # The gate sits where the queue starts work, so no door can route around it.
+    tree = ast.parse((BASE / "bot.py").read_text())
+    worker = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_task_worker")
+    lines = {c.func.id: c.lineno for c in ast.walk(worker)
+             if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+    check("the runner checks readiness before it runs anything",
+          "hold_unsupervised" in lines and lines["hold_unsupervised"] < lines.get("execute_task", 0))
+
+    # Ideation: refused when switched on, skipped when already on, and not
+    # filed even if asked for directly.
+    hp = {"projects": P, "project_store": ps, "log": logging.getLogger("test")}
+    _bot_fns({"handle_projects"}, hp)
+    r = hp["handle_projects"]({"action": "ideate", "slug": "saga", "at": "02:00"})
+    check("ideation cannot be switched on for an unready project",
+          r.get("ok") is False and "test command" in r.get("error", ""), str(r))
+    r = hp["handle_projects"]({"action": "ideate", "slug": "cadence", "at": "02:00"})
+    check("but can for a ready one", r.get("ok") is True, str(r))
+    r = hp["handle_projects"]({"action": "ideate", "slug": "saga", "at": "off"})
+    check("and can always be switched off", r.get("ok") is True, str(r))
+    run_ideation, its, ips = _run_ideation_impl()
+    ips.ensure("Saga", ideate_at="02:00")
+    out = run_ideation("saga")
+    check("a pass for an unready project files nothing", out.get("ok") is False and not its.all(), str(out))
 
 
 if __name__ == "__main__":

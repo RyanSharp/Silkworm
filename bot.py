@@ -1634,6 +1634,9 @@ def handle_projects(payload: dict) -> dict:
         want = (payload.get("at") or "").strip()
         if want.lower() in ("", "off", "none", "clear"):
             return {"ok": True, "project": project_store.ensure(slug, ideate_at="")}
+        why = projects.unready(project_store.get(slug))
+        if why:
+            return {"ok": False, "error": f"{slug} {why}"}
         try:
             at = projects.parse_at(want)
         except ValueError as e:
@@ -3460,6 +3463,10 @@ def run_ideation(slug: str) -> dict:
     work. The ideator role is read-only: it can propose, and nothing else.
     """
     rec = project_store.get(slug) or {}
+    why = projects.unready(rec)
+    if why:
+        log.info("not ideating on %s: it %s", slug, why)
+        return {"ok": False, "error": f"{slug} {why}"}
 
     # A night that would only be refused at filing time is a session spent to
     # learn what the board already knew, so the pass does not start at all
@@ -3585,6 +3592,28 @@ def _task_scheduler() -> None:
         time.sleep(TASK_POLL_S)
 
 
+def hold_unsupervised(task: dict) -> bool:
+    """Refuse to run an implementor task for a project not ready for it.
+
+    Checked here, where the queue starts work, rather than at each of the
+    places a task can be created -- filed from a conversation, the dashboard,
+    an accepted proposal, a retry, a send-back, a review's follow-up. One gate
+    nothing can route around. It goes to needs_input with the reason, so it
+    is on the board rather than silently parked.
+    """
+    if task.get("role") != "implementor":
+        return False
+    why = projects.unready(project_store.get(task.get("project") or ""))
+    if not why:
+        return False
+    name = task.get("project") or "a task with no project"
+    task_state(task["id"], tasks.NEEDS_INPUT, f"not run: {name} {why}"[:160])
+    tell_thread(task.get("thread", ""),
+                f":no_entry: Not run: `{name}` {why}. Configure it, then retry; "
+                f"or run this one in a conversation, where you can see it.")
+    return True
+
+
 def _task_worker(n: int) -> None:
     """Claim and run queued work, alongside the other workers.
 
@@ -3607,6 +3636,8 @@ def _task_worker(n: int) -> None:
                 time.sleep(min(held, TASK_POLL_S))
                 continue
             task = task_store.claim()
+            if task and hold_unsupervised(task):
+                continue
             if task:
                 execute_task(task)
                 continue           # drain without waiting, unless that closed the hold
