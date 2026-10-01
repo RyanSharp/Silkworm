@@ -8727,13 +8727,29 @@ def test_board_channel():
     check("a click from off the allowlist does nothing but say so, privately",
           store.get(tid)["state"] == T.PROPOSED
           and s4.calls[-1][0] == "ephemeral" and s4.calls[-1][2] == "U_STEPH")
+    # The result goes into the board, not under it. An ephemeral reply is
+    # invisible to the channel's history but not to the person who clicked:
+    # each one pushed the board up their screen.
+    n = len(s4.calls)
     b5.on_direct(lambda *a, **k: None, body("U_ME", f"{tid}|proposed"), s4)
-    kinds = [c[0] for c in s4.calls[-2:]]
+    after = s4.calls[n:]
     check("Accept works from the board message", store.get(tid)["state"] == T.QUEUED)
-    check("the result goes to the clicker only, then the board redraws",
-          kinds == ["ephemeral", "update"] and "Accepted" in s4.calls[-2][3])
+    check("nothing is posted under the board", not [c for c in after if c[0] in ("ephemeral", "post")],
+          str([c[0] for c in after]))
+    drawn = json.dumps(after[-1][-1], ensure_ascii=False) if after and after[-1][0] == "update" else ""
+    check("the result is in the board itself", "Accepted" in drawn)
+    check("at the bottom, where Slack opens", "Accepted" in json.dumps(after[-1][-1][-4:], ensure_ascii=False)
+          if after else False)
+    n = len(s4.calls)
     b5.on_direct(lambda *a, **k: None, body("U_ME", f"{tid}|proposed"), s4)
-    check("a stale button is still refused", "moved on" in s4.calls[-2][3])
+    check("a stale button is still refused, in the board", "moved on" in json.dumps(s4.calls[-1][-1]))
+    old_s = b5.NOTICE_S
+    b5.NOTICE_S = 0
+    try:
+        check("and once it is stale the next pass takes it down",
+              b5.sync(s4) == "updated" and "moved on" not in json.dumps(s4.calls[-1][-1]))
+    finally:
+        b5.NOTICE_S = old_s
 
     # The channel going away is noticed rather than failing for ever.
     s5, b6 = Slack(), board()

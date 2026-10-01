@@ -327,7 +327,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
             f"*{len(queued)}* queued · updated {time.strftime('%H:%M', time.localtime(now))}")]},
     ]
     if notice:
-        blocks.insert(1, {"type": "section", "text": _text(notice)})
+        blocks.insert(1, {"type": "section", "block_id": "home:notice", "text": _text(notice)})
 
     # Needs you, grouped by state. Built into a separate list first so the
     # overflow line can say exactly how many did not fit.
@@ -382,10 +382,13 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     if compact:
         # Slack opens a channel at the bottom of its newest message, so the
         # summary and Refresh go where you land, not at the top you scroll to.
-        top = [b for b in blocks[:4] if b.get("block_id") == "home:top"
-               or (b.get("type") == "context" and "need you" in json.dumps(b))]
-        blocks = [b for b in blocks if b not in top]
-        blocks += [{"type": "divider"}] + top[::-1]
+        head = blocks[:5]
+        notice_b = [b for b in head if b.get("block_id") == "home:notice"]
+        summary = [b for b in head if b.get("type") == "context" and "need you" in json.dumps(b)]
+        refresh = [b for b in head if b.get("block_id") == "home:top"]
+        moved = notice_b + summary + refresh
+        blocks = [b for b in blocks if b not in moved]
+        blocks += [{"type": "divider"}] + moved
     return {"type": "home", "blocks": blocks[:max_blocks]}
 
 
@@ -739,7 +742,20 @@ class Board(Home):
         items = [dict(r, id=tid) for tid, r in self.store.all().items()]
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
-                      max_attention=self.MAX_ATTENTION, compact=True)["blocks"]
+                      max_attention=self.MAX_ATTENTION, compact=True,
+                      notice=self.current_notice())["blocks"]
+
+    def current_notice(self) -> str:
+        """The latest click's result, while it is fresh. On the board itself,
+        not posted under it: an ephemeral reply is invisible to the channel's
+        history but not to the person who clicked, and each one pushed the
+        board up their screen. Everyone who can see the board is on the
+        allowlist, so there is nobody to hide it from."""
+        now = time.time()
+        with self._lock:
+            fresh = [(at, text) for text, at in self._notices.values()
+                     if now - at <= self.NOTICE_S]
+        return max(fresh)[1] if fresh else ""
 
     def fingerprint(self) -> str:
         """What the board shows, minus the clock: which tasks, in which state,
@@ -751,7 +767,9 @@ class Board(Home):
             watching = sorted(str(w.get("id")) for w in (self._watching() or []))
         except Exception:
             watching = []
-        return json.dumps([rows, watching, self.unmerged()], default=str)
+        # The notice too, so that its expiry is a change and the next pass
+        # redraws without it rather than leaving it up until something else moves.
+        return json.dumps([rows, watching, self.unmerged(), self.current_notice()], default=str)
 
     def sync(self, client, force: bool = False) -> str:
         """Bring the board message up to date. Returns what it did, for the
@@ -857,21 +875,20 @@ class Board(Home):
     # -- the handlers' one difference: where the result goes --
 
     def publish(self, client, user: str) -> None:
-        """After a click: tell the person who clicked, privately, then redraw
-        the board for everyone. (Home's version redraws a per-person view.)"""
-        with self._lock:
-            text, _ = self._notices.pop(user, ("", 0))
+        """After a click: redraw the board, with the result in it. Only a
+        refusal to someone off the allowlist goes privately -- they are not
+        meant to be in the channel at all, and get nothing of the board."""
         if not self.allowed(user):
-            text = "This bot's task board only answers the people on its allowlist."
-        if text:
             try:
                 channel = self.channel(client)
                 if channel:
-                    client.chat_postEphemeral(channel=channel, user=user, text=text)
+                    client.chat_postEphemeral(
+                        channel=channel, user=user,
+                        text="This bot's task board only answers the people on its allowlist.")
             except Exception:
-                log.exception("could not tell %s how their click went", user)
-        if self.allowed(user):
-            self.sync(client, force=True)
+                log.exception("could not tell %s they are not on the allowlist", user)
+            return
+        self.sync(client, force=True)
 
 
 def register(app, home: Home) -> None:
