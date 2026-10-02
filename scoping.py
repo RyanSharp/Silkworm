@@ -274,8 +274,9 @@ MACHINERY_ROLES = ("reviewer", "ideator")
 #: sit in a non-terminal state while they run -- and one killed by a restart or
 #: a quota error stays there indefinitely. Telling the nightly pass not to file
 #: "check whether the paper book's rejects cleared" again costs a listing slot
-#: and tells it nothing. Paired with the role below, because `ui` is also where
-#: work typed into the dashboard comes from, and that *is* on the board.
+#: and tells it nothing. Work typed into the dashboard's task form is filed as
+#: `dashboard`, not `ui`, so it is on the board whatever its role. Paired with
+#: the role below because older records filed from that form say `ui`.
 CONVERSATION_SOURCES = ("slack", "ui", "defer")
 
 

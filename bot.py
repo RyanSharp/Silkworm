@@ -1586,7 +1586,12 @@ def handle_tasks(payload: dict) -> dict:
             t = task_store.create(payload.get("goal", ""),
                                   role=role,
                                   project=proj,
-                                  source=payload.get("source", "ui"),
+                                  # Not "ui": a message typed into the web
+                                  # chat is filed under that, and
+                                  # scoping.is_work reads an assistant task
+                                  # from it as a conversation turn. One
+                                  # filed here is work you asked for.
+                                  source=payload.get("source", "dashboard"),
                                   state=state,
                                   # Nobody is holding a live message for these,
                                   # so the runner is what will execute them.

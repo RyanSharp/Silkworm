@@ -127,7 +127,7 @@ FIELDS: dict[str, tuple] = {
     "goal":        ("",    "what the task should achieve; the prompt"),
     "state":       (QUEUED, "lifecycle state; see STATES"),
     "role":        ("assistant", "role template this runs as"),
-    "source":      ("ui",  "where it came from: ui | slack | github | email | …"),
+    "source":      ("ui",  "where it came from: ui | dashboard | slack | github | email | …"),
     # What body of work this belongs to. Distinct from scope: scope is where it
     # may act, project is what it is part of. Plenty of projects have no repo.
     "project":     ("",    "project slug, or empty for unfiled"),

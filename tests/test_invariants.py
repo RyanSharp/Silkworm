@@ -2042,6 +2042,21 @@ def test_ideation():
     check("but work typed into the dashboard is", desk["title"] in listed,
           f"{desk['id']} is a real item the pass should not propose again")
 
+    # The dashboard route used to file under `ui` too -- the source a web chat
+    # message gets -- so an assistant task typed into the form read as a
+    # conversation turn and was never listed. It files as `dashboard` now.
+    create, _store, _made = _dashboard_create_impl()
+    asked = create({"action": "create", "goal": "Summarise last week's fills",
+                    "role": "assistant", "project": "silkworm"})["task"]
+    check("the dashboard files its tasks under their own source",
+          asked["source"] == "dashboard" and asked["source"] != "ui",
+          f"filed as {asked['source']!r}, which a web chat turn also uses")
+    check("so an assistant task typed into it is work on the board",
+          S.is_work(asked),
+          "it was asked for from the task form, not said in a conversation")
+    check("while a web chat turn still is not",
+          not S.is_work({"role": "assistant", "source": "ui"}))
+
     # `update` always stamps `updated`, so age the record directly.
     stale = dict(ts.get(said_no["id"]),
                  updated=time.time() - (S.DISMISSAL_MEMORY_DAYS + 1) * 86400)
