@@ -19,6 +19,7 @@ from datetime import datetime
 import branches
 import costs
 import jsonstore
+import merge
 import tasks
 
 log = logging.getLogger("silkworm.digest")
@@ -28,13 +29,15 @@ WINDOW_S = 24 * 3600
 
 #: Default local time to post, overridden by DIGEST_AT in .env.
 DEFAULT_AT = "08:00"
+#: DIGEST_AT values that switch it off. Not "0", which reads as midnight.
+OFF = ("", "off", "none")
 
 #: Titles listed per line before the rest are counted instead.
 LIST_LIMIT = 5
 
-#: Landing stages that are not refusals: still going, never this project's
-#: model, or a person dropping the branch on purpose.
-NOT_REFUSALS = ("underway", "not-enabled", "dropped")
+#: Landing stages that are not refusals even when merge.needs_a_person would
+#: say so: still going (bot.LANDING_UNDERWAY), or dropped on purpose.
+NOT_REFUSALS = ("in-progress", "dropped")
 
 #: "Stuck" is measured against how long tasks usually sit in a state -- three
 #: times the median -- but never less than these, so a history of instant
@@ -73,7 +76,7 @@ class Schedule:
     def __init__(self, path, at: str = DEFAULT_AT):
         self.path = path
         self.at = at
-        self._last_on = str((jsonstore.load(path, default={}) or {}).get("last_on") or "")
+        self._last_on = self._read(path)
 
     @property
     def last_on(self) -> str:
@@ -85,6 +88,13 @@ class Schedule:
     def mark(self, now: datetime) -> None:
         self._last_on = now.strftime("%Y-%m-%d")
         jsonstore.save(self.path, {"last_on": self._last_on, "at": time.time()})
+
+    @staticmethod
+    def _read(path) -> str:
+        # Lenient: an unreadable marker must not stop the digest for good. The
+        # worst it costs is one repeat of a day already posted.
+        state = jsonstore.load(path, default={}, strict=False)
+        return str(state.get("last_on") or "") if isinstance(state, dict) else ""
 
 
 # --- what ----------------------------------------------------------------------
@@ -123,15 +133,17 @@ def _last_event(rec: dict, kind: str | None = None) -> dict | None:
 
 
 def _landing_at(rec: dict):
-    """When its landing outcome was recorded. Records from before landings
-    were dated fall back to an event: the last `done` for a landing (it lands
-    as it finishes or as it is approved), the last event of any kind for a
-    refusal. Never `updated`, which any later write moves."""
-    landing = (rec.get("result") or {}).get("landing") or {}
+    """When its landing outcome was recorded. A landing recorded before they
+    were dated falls back to its last `done` (it lands as it finishes or as it
+    is approved). An undated refusal has no such anchor -- any later event
+    would make a week-old refusal read as today's -- so it is not dated at all;
+    its branch still shows under "unmerged". Never `updated`, which any later
+    write moves."""
+    result = rec.get("result") or {}
+    landing = result.get("landing") or {}
     if landing.get("at"):
         return landing["at"]
-    e = _last_event(rec, tasks.DONE) if (rec.get("result") or {}).get("landed") else None
-    e = e or _last_event(rec)
+    e = _last_event(rec, tasks.DONE) if result.get("landed") else None
     return e.get("at") if e else None
 
 
@@ -186,8 +198,8 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
         if result.get("landed") and at and at >= since:
             add(proj, "landed", _title(rec))
-        elif (landing and not landing.get("landed")
-              and landing.get("stage") not in NOT_REFUSALS and at and at >= since):
+        elif (merge.needs_a_person(landing) and landing.get("stage") not in NOT_REFUSALS
+              and at and at >= since):
             stage = _esc(landing.get("stage") or "?")
             detail = _esc((landing.get("detail") or "").strip()[:90])
             add(proj, "refused", f"{_title(rec)} ({stage}{': ' + detail if detail else ''})")
@@ -210,10 +222,15 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
         state = rec.get("state")
         if state in STUCK_FLOOR_S:
-            waiting_for_a_time = (state == tasks.BLOCKED and rec.get("retry_at")
-                                  and rec["retry_at"] > now)
+            # Blocked for a reason that is on the board already: a wake-up set
+            # for later, or a blocker still open (which, if it is the thing
+            # that is stuck, is listed itself -- or is waiting on you).
+            excused = state == tasks.BLOCKED and (
+                (rec.get("retry_at") and rec["retry_at"] > now)
+                or any((by_id.get(b) or {}).get("state") not in tasks.ENDED
+                       for b in rec.get("blocked_on") or () if b in by_id))
             dwell = now - _entered(rec)
-            if not waiting_for_a_time and dwell > stuck_limit(state, usual):
+            if not excused and dwell > stuck_limit(state, usual):
                 add(proj, "stuck", f"{_title(rec)} — {state} {_age(dwell)}")
 
     waiting: dict = {}

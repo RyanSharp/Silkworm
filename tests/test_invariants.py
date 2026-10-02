@@ -11908,6 +11908,8 @@ def _digest_store():
                                    for ago, k, d in events])
         with st._lock:
             st._data[r["id"]]["created"] = now - 100 * H
+            # As a live record would read: last written at its last event.
+            st._data[r["id"]]["updated"] = now - min([e[0] for e in events] or [100]) * H
         return r["id"]
 
     ids = {}
@@ -11929,12 +11931,36 @@ def _digest_store():
     ids["refused"] = rec("Rebase me", "silkworm", T.DONE,
                          [(6, T.RUNNING, ""), (5, T.DONE, "")], attempts=1,
                          result={"cost": 0.5, "landing": {
-                             "landed": False, "stage": "rebase",
+                             "eligible": True, "landed": False, "stage": "rebase",
                              "detail": "conflict in bot.py", "at": now - 5 * H}})
     ids["dropped"] = rec("Dropped on purpose", "silkworm", T.DONE,
                          [(6, T.RUNNING, ""), (5, T.DONE, "")], attempts=1,
                          result={"cost": 0.25, "landing": {
                              "landed": False, "stage": "dropped", "at": now - 5 * H}})
+    ids["merging"] = rec("Merging right now", "silkworm", T.DONE,
+                         [(1, T.RUNNING, ""), (0.5, T.DONE, "")], attempts=1,
+                         result={"cost": 0.0, "landing": {
+                             "eligible": True, "landed": False, "stage": "in-progress",
+                             "detail": "merging", "at": now - 0.1 * H}})
+    ids["nothing"] = rec("Already on main", "silkworm", T.DONE,
+                         [(1, T.RUNNING, ""), (0.5, T.DONE, "")], attempts=1,
+                         result={"cost": 0.0, "landing": {
+                             "eligible": False, "landed": False,
+                             "stage": "nothing-to-land", "at": now - 0.5 * H}})
+    # Refused a week ago, before landings were dated, and touched since.
+    ids["old_refusal"] = rec("Refused last week", "silkworm", T.CANCELLED,
+                             [(170, T.RUNNING, ""), (169, T.DONE, ""), (1, T.CANCELLED, "")],
+                             attempts=1, result={"cost": 0.0, "landing": {
+                                 "eligible": True, "landed": False, "stage": "rebase"}})
+    blocker = rec("Review still running", "", T.RUNNING, [(1, T.RUNNING, "")],
+                  role="reviewer", attempts=1, result={"cost": 0.0})
+    ids["waits"] = rec("Waits on its review", "trader", T.BLOCKED,
+                       [(20, T.BLOCKED, "awaiting review")], blocked_on=[blocker],
+                       attempts=1, result={"cost": 0.0})
+    gone = rec("Ended blocker", "", T.CANCELLED, [(19, T.CANCELLED, "")])
+    ids["stranded"] = rec("Waits on nothing", "trader", T.BLOCKED,
+                          [(20, T.BLOCKED, "awaiting review")], blocked_on=[gone],
+                          attempts=1, result={"cost": 0.0})
     ids["held"] = rec("Add photo crop", "cadence", T.NEEDS_INPUT,
                       [(1, T.NEEDS_INPUT, "not run: cadence needs a test command")])
     ids["restart"] = rec("Killed by a restart", "silkworm", T.QUEUED,
@@ -11987,6 +12013,14 @@ def test_daily_digest_renders_from_a_real_store():
     check("digest: a refused landing names its stage and why",
           "landing refused: Rebase me (rebase: conflict in bot.py)" in silk, silk)
     check("digest: a branch dropped on purpose is not a refusal", "Dropped on purpose" not in text)
+    check("digest: a landing still under way is not a refusal", "Merging right now" not in text)
+    check("digest: nothing to land (never eligible) is not a refusal", "Already on main" not in text)
+    check("digest: an undated refusal is not passed off as today's", "Refused last week" not in text)
+    tree = ast.parse((BASE / "bot.py").read_text())
+    underway = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                    and any(getattr(t, "id", "") == "LANDING_UNDERWAY" for t in n.targets))
+    check("digest: knows the bot's real in-progress stage", underway in digest.NOT_REFUSALS,
+          underway)
     check("digest: a held task says why it was held",
           "Add photo crop — held: not run: cadence needs a test command" in cadence, cadence)
     check("digest: a restart kill says so, and what became of it",
@@ -11999,6 +12033,8 @@ def test_daily_digest_renders_from_a_real_store():
           "Queued forever — queued 20h" in trader, trader)
     check("digest: one queued an hour, or blocked until a set wake-up, is not",
           "Just queued" not in text and "Wakes tomorrow" not in text)
+    check("digest: blocked on a blocker still open is not stuck", "Waits on its review" not in text)
+    check("digest: blocked on one that ended is", "Waits on nothing — blocked 20h" in trader, trader)
     check("digest: 'stuck' scales with how long that state usually takes",
           digest.stuck_limit(T.QUEUED, {T.QUEUED: 10 * 3600}) == 30 * 3600
           and digest.stuck_limit(T.QUEUED, {T.QUEUED: 60}) == digest.STUCK_FLOOR_S[T.QUEUED])
@@ -12008,10 +12044,11 @@ def test_daily_digest_renders_from_a_real_store():
           "unmerged: 2 finished tasks on unmerged branches (5 commits)" in trader, trader)
     check("digest: release tags are listed", "released: ios/v1.2.0" in cadence, cadence)
     # Read by costs.by_project's rules: spend dated by when the run ended, and
-    # anything that ran with no cost recorded (the blocked wake-up, the held
-    # task, the restart kill) makes its project's figure a floor.
+    # anything that ran in the window with no cost recorded (the held task, the
+    # restart kill) makes its project's figure a floor. The blocked wake-up ran
+    # with no cost too, but last did anything 30h ago: not today's spend.
     check("digest: cost per project, from the runs in the window",
-          trader.startswith("*trader* · $7.00+"), trader.splitlines()[:1])
+          trader.splitlines()[0] == "*trader* · $7.00", trader.splitlines()[:1])
     check("digest: cost with a part unknown is a floor, not a total",
           silk.startswith("*silkworm* · $0.75+"), silk.splitlines()[:1])
     check("digest: a reviewer's cost counts under its parent's project",
@@ -12054,6 +12091,11 @@ def test_daily_digest_schedule_once_a_day_with_catch_up():
     check("digest schedule: a restart remembers today's post",
           not again.due(D(2026, 10, 2, 8, 5)), again.last_on)
     check("digest schedule: and posts tomorrow", again.due(D(2026, 10, 3, 9, 0)))
+    bad = Path(tempfile.mkdtemp()) / "digest.json"
+    bad.write_text("{not json")
+    check("digest schedule: an unreadable marker does not stop the digest",
+          digest.Schedule(bad, "08:00").due(D(2026, 10, 2, 9, 0)))
+    check("digest: '0' is midnight, not off", "0" not in digest.OFF)
 
     # The post went out but the marker file could not be written: this process
     # must still not post again.

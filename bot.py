@@ -4053,7 +4053,7 @@ def send_digest(schedule, now: datetime) -> dict:
 def _digest_scheduler() -> None:
     """Post the daily digest once a day, at DIGEST_AT or as soon after as the
     bot is up -- the same wall-clock catch-up as nightly ideation."""
-    if DIGEST_AT.lower() in ("", "off", "0", "none"):
+    if DIGEST_AT.lower() in digest.OFF:
         log.info("daily digest off (DIGEST_AT=%s)", DIGEST_AT or "\"\"")
         return
     try:
@@ -4582,7 +4582,7 @@ if __name__ == "__main__":
     daemons.start(_credential_watcher, "creds")
     daemons.start(_ideation_scheduler, "ideate")
     daemons.start(_digest_scheduler, "digest",
-                  forever=DIGEST_AT.lower() not in ("", "off", "0", "none"))
+                  forever=DIGEST_AT.lower() not in digest.OFF)
     daemons.start(_harvester, "harvester", forever=HARVEST_INTERVAL_H > 0)
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
