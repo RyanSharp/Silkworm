@@ -99,6 +99,15 @@ CLAUDE_IDLE_TIMEOUT = int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800"))
 # make raising it safe; each worker is a live Claude session, so it is a quota
 # decision as much as a concurrency one.
 TASK_WORKERS = int(os.environ.get("TASK_WORKERS", "1"))
+# Reviews get a lane of their own. They are read-only, in a detached checkout
+# and a fresh session, so nothing they do can collide with an implementor --
+# but sharing its worker, every review waited out whatever implementor was
+# running, which is hours at the median and days at p90, while the work it
+# would approve sat blocked. One by default, so reviews still never run two at
+# once. 0 hands reviews back to the task workers, as before the lane existed.
+REVIEW_WORKERS = int(os.environ.get("REVIEW_WORKERS", "1"))
+#: The roles the review lane claims, and the task workers therefore leave.
+REVIEW_ROLES = frozenset({"reviewer"})
 #: Absolute, because a turn's PATH is not ours to assume.
 SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
@@ -2296,6 +2305,8 @@ def handle_prompt(event: dict, say, client) -> None:
                                 None if event.get("_web") else msg_ts)
     reactions.working()
     worked = [False]                  # reached a tool call; see execute_task
+    mine = [None]                     # this turn's RunHandle; see release_turn
+    turn_id = uuid.uuid4().hex        # names this turn's recovery marker
     lock = _thread_lock(key)
     if lock.locked():
         progress.update(":hourglass_flowing_sand: _Queued behind an earlier message in this thread…_")
@@ -2309,7 +2320,7 @@ def handle_prompt(event: dict, say, client) -> None:
             # it. Inside the lock, so it describes the turn actually running.
             recovery.mark_pending(store, key, msg_ts=reactions.msg,
                                   progress_ts=progress.ts,
-                                  session_id=session_id, prompt=text)
+                                  session_id=session_id, prompt=text, turn=turn_id)
             begin_turn(key)
             task_state(task_id, tasks.RUNNING)
             if not event.get("_web"):  # web prompts have a synthetic ts
@@ -2329,6 +2340,7 @@ def handle_prompt(event: dict, say, client) -> None:
                 progress.update(f":hourglass_flowing_sand: `{name}` {describe_tool(name, tool_input)[:120]}")
 
             def on_start(handle) -> None:
+                mine[0] = handle
                 RUNNING[key] = handle
                 RUNNING_TASKS[task_id] = handle
 
@@ -2428,9 +2440,7 @@ def handle_prompt(event: dict, say, client) -> None:
         reactions.failed()
         task_state(task_id, tasks.FAILED, "unhandled error")
     finally:
-        RUNNING.pop(key, None)
-        RUNNING_TASKS.pop(task_id, None)
-        recovery.clear_pending(store, key)
+        release_turn(key, task_id, mine[0], turn_id)
 
 
 @app.event("app_mention")
@@ -2630,6 +2640,22 @@ def refuse_review(task: dict, branch: str, progress, channel: str,
         log.exception("posting the refused review failed")
 
 
+def release_turn(key: str, tid: str, handle, turn: str) -> None:
+    """Take a finished turn off the books: only its own entries, not the thread's.
+
+    Runs after the thread lock is released, so the next turn on the thread may
+    already be in -- a review claimed the moment its implementor parked, on
+    the same thread. Popping by key alone then erased *that* turn: `!stop` and
+    the dashboard said nothing was running, and a restart found no marker to
+    recover it from.
+    """
+    if handle is not None and RUNNING.get(key) is handle:
+        RUNNING.pop(key, None)
+    if handle is not None and RUNNING_TASKS.get(tid) is handle:
+        RUNNING_TASKS.pop(tid, None)
+    recovery.clear_pending(store, key, turn=turn)
+
+
 def execute_task(task: dict) -> None:
     """Run one claimed task. Already in `running` — the claim did that."""
     tid = task["id"]
@@ -2789,6 +2815,8 @@ def execute_task(task: dict) -> None:
     # and must not be charged an attempt for it.
     worked = [False]
     ended = [False]
+    mine = [None]                     # this turn's RunHandle, once it has one
+    turn_id = uuid.uuid4().hex        # names this turn's recovery marker
     lock = _thread_lock(key)
     try:
         with lock, repo_guard(cwd, progress):
@@ -2805,11 +2833,12 @@ def execute_task(task: dict) -> None:
                     session_id = None        # gone from disk; --resume would fail
                 prompt = task.get("goal", "")
             recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
-                                  session_id=session_id, prompt=prompt)
+                                  session_id=session_id, prompt=prompt, turn=turn_id)
             begin_turn(key)
             outbox.mkdir(parents=True, exist_ok=True)
 
             def on_start(handle) -> None:
+                mine[0] = handle
                 RUNNING[key] = handle
                 RUNNING_TASKS[tid] = handle
 
@@ -2974,9 +3003,7 @@ def execute_task(task: dict) -> None:
                 task_store.update(tid, checkpoint=None)
             except Exception:
                 log.exception("could not clear the checkpoint on %s", tid)
-        RUNNING.pop(key, None)
-        RUNNING_TASKS.pop(tid, None)
-        recovery.clear_pending(store, key)
+        release_turn(key, tid, mine[0], turn_id)
 
 
 #: How many times work may be sent back for failing its own tests before it
@@ -4043,7 +4070,19 @@ def hold_unsupervised(task: dict) -> bool:
     return True
 
 
-def _task_worker(n: int) -> None:
+def lane_filter(lane: str) -> dict:
+    """What a worker in `lane` may claim, as keyword arguments to claim().
+
+    The review lane takes reviews and nothing else. The task workers take
+    everything else -- and reviews too when there is no review lane to take
+    them, or they would never run at all.
+    """
+    if lane == "review":
+        return {"only_roles": REVIEW_ROLES}
+    return {"except_roles": REVIEW_ROLES} if REVIEW_WORKERS > 0 else {}
+
+
+def _task_worker(n: int, lane: str = "task") -> None:
     """Claim and run queued work, alongside the other workers.
 
     Safe to run several of these because the pieces underneath were built for
@@ -4054,7 +4093,13 @@ def _task_worker(n: int) -> None:
     A task waiting on its reviewer does not hold a worker -- the review is
     enqueued as its own task and the implementor parks in `blocked` -- so
     workers cannot all end up waiting on each other.
+
+    Two lanes run this: the task workers, and the review lane (see
+    REVIEW_WORKERS), which differ only in what they may claim. Both stop for
+    the same hold and the same drain -- a quota wall kills a review exactly as
+    it kills anything else, and a restart must wait for a review too.
     """
+    claim_filter = lane_filter(lane)
     while True:
         try:
             # Held while something global (quota, overload) is killing turns.
@@ -4070,14 +4115,14 @@ def _task_worker(n: int) -> None:
             if draining:
                 time.sleep(min(draining, TASK_POLL_S))
                 continue
-            task = task_store.claim()
+            task = task_store.claim(**claim_filter)
             if task and hold_unsupervised(task):
                 continue
             if task:
                 execute_task(task)
                 continue           # drain without waiting, unless that closed the hold
         except Exception:
-            log.exception("task worker %d failed", n)
+            log.exception("%s worker %d failed", lane, n)
         time.sleep(TASK_POLL_S)
 
 
@@ -4455,6 +4500,8 @@ if __name__ == "__main__":
     daemons.start(_board_loop, "board")
     for _i in range(max(1, TASK_WORKERS)):
         daemons.start(_task_worker, f"task{_i}", args=(_i,))
+    for _i in range(max(0, REVIEW_WORKERS)):
+        daemons.start(_task_worker, f"review{_i}", args=(_i, "review"))
     daemons.start(_email_watcher, "email", forever=bool(GMAIL_USER and GMAIL_APP_PASSWORD))
     daemons.start(_credential_watcher, "creds")
     daemons.start(_ideation_scheduler, "ideate")
@@ -4464,9 +4511,9 @@ if __name__ == "__main__":
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))
     # Logged because "is the new limit actually in effect" is otherwise only
     # answerable by reading .env and trusting that the service was restarted.
-    log.info("turn limits: cap=%s idle=%ds · task workers: %d",
+    log.info("turn limits: cap=%s idle=%ds · task workers: %d · review workers: %d",
              f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none",
-             CLAUDE_IDLE_TIMEOUT, TASK_WORKERS)
+             CLAUDE_IDLE_TIMEOUT, TASK_WORKERS, REVIEW_WORKERS)
     # Same reason as the line above, one level down: a landed fix is not a
     # running fix, and this is the only place the answer is written down at the
     # moment it is still true. Everything else asks git, which by then is

@@ -34,14 +34,19 @@ def now_iso() -> str:
 
 
 def mark_pending(store, key: str, *, msg_ts: str | None, progress_ts: str | None,
-                 session_id: str | None, prompt: str = "") -> None:
-    """Record that a turn is in flight, so a restart can pick it up."""
+                 session_id: str | None, prompt: str = "", turn: str = "") -> None:
+    """Record that a turn is in flight, so a restart can pick it up.
+
+    `turn` names the turn that wrote it, so that turn can later clear its own
+    marker and no other (see clear_pending).
+    """
     store.update(key, pending={
         "started": now_iso(),
         "msg_ts": msg_ts,
         "progress_ts": progress_ts,
         "session_id": session_id,
         "prompt": prompt[:200],
+        "turn": turn,
     })
 
 
@@ -55,7 +60,18 @@ def note_session(store, key: str, session_id: str) -> None:
         store.update(key, pending=pending)
 
 
-def clear_pending(store, key: str) -> None:
+def clear_pending(store, key: str, *, turn: str = "") -> None:
+    """Forget a thread's in-flight marker.
+
+    Given `turn`, only the marker that turn wrote: a turn ending after its
+    thread lock is released can otherwise clear the marker of the next turn on
+    the same thread -- a review starting on its implementor's thread, say --
+    and a restart then finds nothing to recover.
+    """
+    if turn:
+        pending = (store.get(key) or {}).get("pending")
+        if not pending or pending.get("turn") != turn:
+            return
     store.update(key, pending=None)
 
 

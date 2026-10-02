@@ -511,17 +511,48 @@ class TaskStore:
         pending = self.by_state(QUEUED)
         return pending[0] if pending else None
 
-    def claim(self) -> dict | None:
+    def claim(self, *, only_roles=None, except_roles=None) -> dict | None:
         """Take the oldest queued task the runner is allowed to execute.
 
         The claim (queued -> running) happens under the same lock that selects
         it, so two runners -- or a runner and a restart -- can never both pick
         up the same task. Tasks with driver="inline" are owned by a live Slack
         turn and are never claimed here.
+
+        `only_roles` / `except_roles` split the queue into lanes: reviews have one
+        of their own, so a read-only review is not stuck behind an implementor
+        that may run for hours, while implementors stay strictly one at a time.
+        The filter is applied in the same select, under the same lock -- a
+        lane picking a task and then checking its role would be a second step
+        another lane could slip between.
+
+        Nor is a task claimed while another queue task is running on its thread
+        or is its parent or child. Their turns share the thread's lock, so the
+        claim would only park a worker waiting on it -- and a review claimed
+        while its reworked implementor runs would check out the branch before
+        that implementor finished moving it. Queue tasks only: those are put
+        back on every restart, so a stale `running` cannot wedge a thread.
         """
         with self._lock:
+            busy = [r for r in self._data.values()
+                    if r.get("state") == RUNNING and r.get("driver") == "queue"]
+            threads = {r.get("thread") for r in busy if r.get("thread")}
+            ids = {r.get("id") for r in busy}
+            parents = {r.get("parent") for r in busy if r.get("parent")}
+
+            def fits(r) -> bool:
+                role = r.get("role") or "assistant"
+                if only_roles is not None and role not in only_roles:
+                    return False
+                if except_roles is not None and role in except_roles:
+                    return False
+                if r.get("thread") and r.get("thread") in threads:
+                    return False
+                return r.get("parent") not in ids and r.get("id") not in parents
+
             candidates = [r for r in self._data.values()
-                          if r.get("state") == QUEUED and r.get("driver") == "queue"]
+                          if r.get("state") == QUEUED and r.get("driver") == "queue"
+                          and fits(r)]
             if not candidates:
                 return None
             rec = min(candidates, key=lambda r: r.get("created", 0))

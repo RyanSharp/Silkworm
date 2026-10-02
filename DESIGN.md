@@ -764,6 +764,47 @@ The isolation work stands regardless: a queued task still gets its own worktree
 off its project's base branch, because that is what stops it disturbing the
 checkout you work in, which has nothing to do with concurrency.
 
+## Reviews have their own lane
+
+One worker ran everything, so a review -- read-only, in a detached checkout of
+the implementor's branch, in a fresh session -- waited out whatever
+implementor happened to be running: about five hours at the median from an
+implementor starting to its task finishing, two and a half days at p90, with
+finished work blocked on a check that takes minutes.
+
+So reviews have a lane of their own (`REVIEW_WORKERS`, one by default). The
+task workers no longer claim reviewer tasks, and the review lane claims
+nothing else, so implementors stay strictly one at a time and reviews never
+run two at once unless configured. `0` puts reviews back on the task workers.
+The role filter is applied inside `claim`, in the same select-and-transition
+under one lock, so two lanes cannot both take a task. Both lanes stop for the
+same quota hold and the same deploy drain.
+
+Two turns at once is safe because everything per-turn is keyed by thread or by
+task id, each turn has its own checkout (and so its own repo lock), and turns
+on one thread already serialise on that thread's lock. What two lanes newly
+allowed was a review claimed while its own implementor ran again after a
+rework: they share a thread, so it would only have held the lane waiting on
+the lock, after checking out a branch the implementor was still moving. `claim`
+therefore skips any task whose thread, parent or child has a queue task
+running. Queue tasks only -- they are put back on every restart, so a stale
+`running` (a turn that raised before it started) holds its thread's queue work
+until the next restart and no longer; a live Slack turn does not hold queue
+work back, as before.
+
+The lanes did open one real race. A turn's cleanup runs after it lets go of the
+thread lock, and a review is claimed on its implementor's thread the moment
+the implementor parks -- so the implementor's cleanup, popping `RUNNING` and
+the recovery marker by thread key, erased the review that had just started:
+`!stop` and the board said nothing was running, and a restart found nothing to
+recover. `release_turn` now removes only what the ending turn owns: its own
+RunHandle, and the marker tagged with its own turn id.
+
+Still open: a passing review lands from the review lane, and landing waits for
+the main checkout's lock. A queue task running in the main checkout itself (not
+isolated, or whose worktree could not be made) holds that lock for its whole
+turn, and the review lane waits with it.
+
 ## Messages lost three deep in a thread
 
 A message that arrived while an earlier turn was running queued behind it on

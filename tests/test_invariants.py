@@ -3328,9 +3328,12 @@ def test_cancel_stops_the_child():
         body = ast.dump(fn)
         check(f"{fname} registers its child by task id", "RUNNING_TASKS" in body)
         final = [x for t in ast.walk(fn) if isinstance(t, ast.Try) for x in t.finalbody]
+        fin = ast.dump(ast.Module(body=final, type_ignores=[]))
         check(f"{fname} lets it go in finally",
-              "RUNNING_TASKS" in ast.dump(ast.Module(body=final, type_ignores=[])),
+              "RUNNING_TASKS" in fin or "id='release_turn'" in fin,
               "a handle left behind would keep a finished task's checkout forever")
+    rel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "release_turn")
+    check("release_turn lets go of the task's handle", "RUNNING_TASKS" in ast.dump(rel))
 
 
 # --- a checkout must outlive its task leaving RUNNING ----------------------------
@@ -9184,7 +9187,7 @@ def _outage_harness():
     # Readiness is its own test (test_unsupervised_work_needs_a_ready_project);
     # here every project is ready, so the hold under test is the only one.
     worker = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
-                       hold_unsupervised=lambda task: False,
+                       hold_unsupervised=lambda task: False, lane_filter=lambda lane: {},
                        RUNNER_HOLD=hold, DRAIN=__import__("drain").Drain(), TASK_POLL_S=5, log=logging.getLogger("test"),
                        time=types.SimpleNamespace(sleep=idle, time=time.time))
 
@@ -10232,7 +10235,7 @@ def test_drain_lapses_and_holds_the_runner():
     dr = D.Drain()
     worker = _bot_func("_task_worker", task_store=st,
                        execute_task=lambda task: ran.append(task["id"]),
-                       hold_unsupervised=lambda task: False,
+                       hold_unsupervised=lambda task: False, lane_filter=lambda lane: {},
                        RUNNER_HOLD=R.Hold(), DRAIN=dr, TASK_POLL_S=5,
                        log=logging.getLogger("test"),
                        time=types.SimpleNamespace(sleep=idle, time=time.time))
@@ -11517,6 +11520,371 @@ def test_a_rerun_adds_to_a_tasks_cost():
     check("the second run's cost is added to the first's",
           (got.get("result") or {}).get("cost") == 3.5,
           str({k: got.get(k) for k in ("state", "result")}))
+
+
+
+# --- reviews have their own lane -------------------------------------------------
+
+def _review_roles():
+    """REVIEW_ROLES as bot.py defines it, evaluated rather than retyped."""
+    tree = ast.parse((BASE / "bot.py").read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "REVIEW_ROLES" for t in n.targets))
+    return eval(compile(ast.Expression(node.value), "bot.py", "eval"))
+
+
+def _lanes(review_workers=1):
+    return bot_functions("lane_filter", REVIEW_WORKERS=review_workers,
+                         REVIEW_ROLES=_review_roles())["lane_filter"]
+
+
+def test_reviews_are_claimed_by_their_own_lane():
+    """A review waited behind whatever implementor held the one worker.
+
+    Median five hours, p90 two and a half days, for a read-only check in its
+    own checkout. Reviews now have a lane; the task workers no longer take
+    them, so implementors stay one at a time and reviews stop queueing behind
+    them.
+    """
+    import tasks as T
+    import threading as th
+    print("\nreviews have their own lane")
+    check("the review lane claims the reviewer role", "reviewer" in _review_roles())
+    lane = _lanes()
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    impl = st.create("build it", role="implementor", driver="queue", thread="C:1")
+    rev = st.create("review it", role="reviewer", driver="queue", thread="C:2")
+    asst = st.create("look into it", role="assistant", driver="queue", thread="C:3")
+    for i, t in enumerate((rev, impl, asst)):     # the review is the oldest
+        st.update(t["id"], created=1000.0 + i)
+
+    got = st.claim(**lane("review"))
+    check("the review lane takes the review", got and got["id"] == rev["id"], str(got and got["id"]))
+    check("and nothing else, though implementors are queued",
+          st.claim(**lane("review")) is None)
+    taken = [st.claim(**lane("task")), st.claim(**lane("task"))]
+    check("the task workers take the rest, oldest first",
+          [t and t["id"] for t in taken] == [impl["id"], asst["id"]])
+
+    st2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    r2 = st2.create("review it", role="reviewer", driver="queue", thread="C:9")
+    check("the task workers never take a review while the lane exists",
+          st2.claim(**lane("task")) is None and st2.get(r2["id"])["state"] == T.QUEUED)
+    check("with REVIEW_WORKERS=0 they do, or reviews would never run",
+          (st2.claim(**_lanes(0)("task")) or {}).get("id") == r2["id"])
+
+    # The real race: both lanes, several workers each, one store.
+    st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    want = {}
+    for i in range(24):
+        for role in ("implementor", "reviewer"):
+            tid = st3.create(f"{role} {i}", role=role, driver="queue",
+                             thread=f"C:{role}{i}")["id"]
+            want[tid] = role
+            # Implementors oldest, so a review lane that ignored its filter
+            # would take one on its very first claim, whatever the timing.
+            st3.update(tid, created=(1000.0 if role == "implementor" else 2000.0) + i)
+    got = {"task": [], "review": []}
+    def worker(name):
+        while True:
+            t = st3.claim(**lane(name))
+            if not t:
+                return
+            got[name].append(t["id"])
+    ths = [th.Thread(target=worker, args=(n,)) for n in ("task", "review") * 4]
+    [t.start() for t in ths]
+    [t.join(30) for t in ths]
+    every = got["task"] + got["review"]
+    check("racing lanes claim every task exactly once",
+          len(every) == 48 and len(set(every)) == 48, f"{len(every)} / {len(set(every))}")
+    check("no implementor was claimed by the review lane",
+          all(want[t] == "reviewer" for t in got["review"]) and len(got["review"]) == 24)
+    check("no review was claimed by a task worker",
+          all(want[t] == "implementor" for t in got["task"]) and len(got["task"]) == 24)
+
+    # Started like every other long-lived loop, so /status sees it.
+    tree = ast.parse((BASE / "bot.py").read_text())
+    starts = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
+              and isinstance(c.func, ast.Attribute) and c.func.attr == "start"
+              and isinstance(c.func.value, ast.Name) and c.func.value.id == "daemons"
+              and c.args and isinstance(c.args[0], ast.Name) and c.args[0].id == "_task_worker"]
+    lanes = {e.value for c in starts for k in c.keywords if k.arg == "args"
+             and isinstance(k.value, ast.Tuple) for e in k.value.elts
+             if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    check("the review lane is started through daemons.start", "review" in lanes, str(lanes))
+    check("its size is configurable", 'os.environ.get("REVIEW_WORKERS"' in (BASE / "bot.py").read_text())
+    worker = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_task_worker")
+    calls = [c for c in ast.walk(worker) if isinstance(c, ast.Call)
+             and isinstance(c.func, ast.Attribute) and c.func.attr == "claim"]
+    check("every claim the worker makes goes through its lane's filter",
+          calls and all(any(k.arg is None for k in c.keywords) for c in calls))
+
+
+def test_a_task_is_not_claimed_beside_its_relatives():
+    """Two lanes make it possible to claim a review while its implementor runs.
+
+    Possible after a rework: the implementor is queued again while its review
+    still waits. They share a thread, so the second would only sit on the
+    thread's lock holding a worker -- and a review that checked out the branch
+    first would read a tip the implementor was still moving.
+    """
+    import tasks as T
+    print("\nno claim beside a running relative")
+    lane = _lanes()
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    parent = st.create("build it", role="implementor", driver="queue", thread="C:1")
+    st.transition(parent["id"], T.RUNNING, "reworked, running again")
+    rev = st.create("review it", role="reviewer", driver="queue", thread="C:1",
+                    parent=parent["id"])
+    check("a review is not claimed while its implementor runs",
+          st.claim(**lane("review")) is None)
+    other = st.create("review another", role="reviewer", driver="queue", thread="C:2")
+    check("an unrelated review still is", (st.claim(**lane("review")) or {}).get("id") == other["id"])
+    st.transition(parent["id"], T.DONE, "finished")
+    check("and the waiting one once the implementor stops",
+          (st.claim(**lane("review")) or {}).get("id") == rev["id"])
+
+    st2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    p2 = st2.create("build it", role="implementor", driver="queue", thread="C:1")
+    r2 = st2.create("review it", role="reviewer", driver="queue", thread="C:7", parent=p2["id"])
+    st2.transition(r2["id"], T.RUNNING, "reviewing")
+    check("nor an implementor while its own review runs, whatever the thread",
+          st2.claim(**lane("task")) is None)
+    sib = st2.create("wake up", role="assistant", driver="queue", thread="C:7")
+    check("nor anything else on a thread a queue task is running on",
+          st2.claim(**lane("task")) is None and st2.get(sib["id"])["state"] == T.QUEUED)
+
+    st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    slack = st3.create("a slack turn", thread="C:1")             # inline
+    st3.transition(slack["id"], T.RUNNING, "live")
+    q = st3.create("review it", role="reviewer", driver="queue", thread="C:1")
+    check("a live Slack turn does not hold the thread's queue work",
+          (st3.claim(**lane("review")) or {}).get("id") == q["id"],
+          "inline records are not reset at startup, so one left behind would wedge it")
+
+
+def test_a_review_runs_while_an_implementor_is_running():
+    """The point of the lane, with the real worker loop on a real store."""
+    import drain as D
+    import retry as R
+    import tasks as T
+    import threading as th
+    print("\na review runs while an implementor is running")
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    impl = st.create("build it", role="implementor", driver="queue", thread="C:1")
+    rev = st.create("review it", role="reviewer", driver="queue", thread="C:2")
+    started, reviewed = th.Event(), th.Event()
+    seen = {}
+
+    def execute_task(task):
+        if task["role"] == "implementor":
+            started.set()
+            # Hours, in life. Here: until the review is done, or the review is
+            # stuck behind it -- in which case this gives up and says so.
+            seen["review finished first"] = reviewed.wait(10)
+            st.transition(task["id"], T.DONE, "built")
+        else:
+            started.wait(10)
+            seen["implementor running"] = st.get(impl["id"])["state"] == T.RUNNING
+            st.transition(task["id"], T.DONE, "reviewed")
+            reviewed.set()
+
+    class Idle(BaseException):
+        pass
+    def idle(_s):
+        raise Idle()
+
+    def lane_worker(name):
+        worker = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
+                           hold_unsupervised=lambda task: False, lane_filter=_lanes(),
+                           RUNNER_HOLD=R.Hold(), DRAIN=D.Drain(), TASK_POLL_S=5,
+                           log=logging.getLogger("test"),
+                           time=types.SimpleNamespace(sleep=idle, time=time.time))
+        try:
+            worker(0, name)
+        except Idle:
+            pass
+    ths = [th.Thread(target=lane_worker, args=(n,)) for n in ("task", "review")]
+    [t.start() for t in ths]
+    [t.join(30) for t in ths]
+    check("the review ran while the implementor was still running",
+          seen.get("implementor running") is True, str(seen))
+    check("and finished before it", seen.get("review finished first") is True, str(seen))
+    check("both are done", st.get(impl["id"])["state"] == st.get(rev["id"])["state"] == T.DONE)
+
+    # The lane honours the same hold and drain as the task workers.
+    for name, hold, drn in (("hold", R.Hold(), D.Drain()), ("drain", R.Hold(), D.Drain())):
+        st4 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+        r4 = st4.create("review it", role="reviewer", driver="queue", thread="C:2")
+        if name == "hold":
+            hold.close(time.time() + 600, "quota")
+        else:
+            drn.start(600)
+        ran = []
+        w = _bot_func("_task_worker", task_store=st4, execute_task=lambda t: ran.append(t),
+                      hold_unsupervised=lambda task: False, lane_filter=_lanes(),
+                      RUNNER_HOLD=hold, DRAIN=drn, TASK_POLL_S=5, log=logging.getLogger("test"),
+                      time=types.SimpleNamespace(sleep=idle, time=time.time))
+        try:
+            w(0, "review")
+        except Idle:
+            pass
+        check(f"the review lane claims nothing under a {name}",
+              not ran and st4.get(r4["id"])["state"] == T.QUEUED)
+
+
+def _turn_runner(st, sessions, locks, RUNNING, RUNNING_TASKS, run_turn, resolve_review):
+    """execute_task as the workers run it, sharing the real per-turn bookkeeping."""
+    import roles
+    import tasks as T
+    release = bot_functions("release_turn", RUNNING=RUNNING, RUNNING_TASKS=RUNNING_TASKS,
+                            store=sessions, recovery=recovery)["release_turn"]
+
+    class Progress:
+        def __init__(self, *a):
+            self.ts = "p.1"
+        update = finalize = delete = lambda self, *a: None
+
+    def run(task):
+        _bot_func("execute_task", tasks=T, task_store=st, store=sessions, roles=roles,
+                  ProgressMessage=Progress,
+                  recovery=recovery, uuid=__import__("uuid"), release_turn=release,
+                  Path=Path, run_turn=run_turn, review_branch=lambda t: "",
+                  worktrees=__import__("worktrees"), shutil=shutil,
+                  OUTBOX_ROOT=Path(tempfile.mkdtemp()), SILKWORM_BIN="/x/silkworm",
+                  permission_args=lambda: [], log=logging.getLogger("test"),
+                  task_thread=lambda t: tuple(t["thread"].split(":")),
+                  task_state=lambda tid, s, d="": st.transition(tid, s, d),
+                  _thread_lock=locks["_thread_lock"], repo_guard=locks["repo_guard"],
+                  render_block=lambda _: "", chunk=lambda text: [text],
+                  to_mrkdwn=lambda text: text, resolve_review=resolve_review,
+                  verify_work=lambda t, c: {"ran": False, "ok": False},
+                  upload_outbox=lambda *a, **k: [], RUNNING=RUNNING,
+                  RUNNING_TASKS=RUNNING_TASKS, ClaudeStopped=ClaudeStopped,
+                  ClaudeError=ClaudeError)(task)
+    return run
+
+
+def _real_locks():
+    import threading as th
+    return bot_functions("_thread_lock", "_repo_lock", "repo_guard",
+                         threading=th, Path=Path, contextlib=contextlib,
+                         _thread_locks={}, _thread_locks_guard=th.Lock(),
+                         _repo_locks={}, _repo_locks_guard=th.Lock())
+
+
+def test_two_turns_at_once_do_not_clobber_each_other():
+    """Real execute_task turns overlapping, as the two lanes now make them.
+
+    Different threads in different checkouts: neither waits on the other. And
+    the case only the lanes create -- a review claimed on its implementor's
+    thread the moment the implementor parks, while that implementor's turn is
+    still on its way out. Its cleanup used to pop the thread's RunHandle and
+    recovery marker by key, which by then were the review's: `!stop` and the
+    board said nothing was running, and a restart had nothing to recover.
+    """
+    import threading as th
+    import tasks as T
+    print("\ntwo turns at once")
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    sessions = tmp_store()
+    a, b = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    (a / ".git").mkdir()
+    (b / ".git").mkdir()                 # two checkouts, so two repo locks
+    impl = st.create("build it", role="implementor", driver="queue", thread="C:1",
+                     isolate=False, scope={"cwd": str(a)})
+    rev = st.create("review it", role="reviewer", driver="queue", thread="C:2",
+                    isolate=False, scope={"cwd": str(b)})
+    RUNNING, RUNNING_TASKS = {}, {}
+    impl_in, review_done = th.Event(), th.Event()
+    seen = {}
+
+    def run_turn(goal, **kw):
+        handle = object()
+        kw["on_start"](handle)
+        if "build" in goal:
+            impl_in.set()
+            seen["review finished during the build"] = review_done.wait(10)
+            seen["build still keyed after the review"] = (
+                RUNNING.get("C:1") is handle and RUNNING_TASKS.get(impl["id"]) is handle
+                and (sessions.get("C:1") or {}).get("pending") is not None)
+        else:
+            impl_in.wait(10)
+            seen["both running at once"] = (set(RUNNING) == {"C:1", "C:2"}
+                                            and set(RUNNING_TASKS) == {impl["id"], rev["id"]})
+        return types.SimpleNamespace(text="ok", cost_usd=0.1, duration_ms=1,
+                                     session_id="s-" + goal[:5])
+
+    def finished(task, *a, **k):
+        if task["role"] == "reviewer":
+            review_done.set()
+        return False
+
+    run = _turn_runner(st, sessions, _real_locks(), RUNNING, RUNNING_TASKS, run_turn, finished)
+    for t in (impl, rev):
+        st.transition(t["id"], T.RUNNING, "claimed")
+    ths = [th.Thread(target=run, args=(st.get(t["id"]),)) for t in (impl, rev)]
+    [t.start() for t in ths]
+    [t.join(30) for t in ths]
+    check("the two turns ran at once", seen.get("both running at once") is True, str(seen))
+    check("the review finished while the implementor was mid-turn",
+          seen.get("review finished during the build") is True, str(seen))
+    check("the review ending did not touch the implementor's handles or marker",
+          seen.get("build still keyed after the review") is True, str(seen))
+    check("both handles are gone once both turns end", not RUNNING and not RUNNING_TASKS)
+    check("and both markers", not (sessions.get("C:1") or {}).get("pending")
+          and not (sessions.get("C:2") or {}).get("pending"))
+    check("both tasks finished", st.get(impl["id"])["state"] == st.get(rev["id"])["state"] == T.DONE)
+
+    # The hand-off on one thread.
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    sessions = tmp_store()
+    RUNNING, RUNNING_TASKS = {}, {}
+    parent = st.create("build it", role="implementor", driver="queue", thread="C:5",
+                       isolate=False, scope={"cwd": str(a)})
+    child = {}
+    review_in, parent_gone = th.Event(), th.Event()
+    seen = {}
+
+    def run_turn2(goal, **kw):
+        handle = object()
+        kw["on_start"](handle)
+        if "review" in goal:
+            review_in.set()
+            parent_gone.wait(10)          # the implementor's turn has fully ended
+            seen["review still running"] = RUNNING.get("C:5") is handle
+            seen["review still a running task"] = RUNNING_TASKS.get(child["id"]) is handle
+            seen["review's marker survived"] = bool((sessions.get("C:5") or {}).get("pending"))
+        return types.SimpleNamespace(text="ok", cost_usd=0.1, duration_ms=1, session_id="s")
+
+    threads = []
+    def park_for_review(task, *a, **k):
+        if task["role"] != "implementor":
+            return False
+        # What resolve_review does, then the review lane claiming it at once.
+        r = st.create("review it", role="reviewer", driver="queue", thread="C:5",
+                      isolate=False, scope={"cwd": str(a)}, parent=task["id"])
+        child["id"] = r["id"]
+        st.transition(task["id"], T.BLOCKED, "awaiting review")
+        st.transition(r["id"], T.RUNNING, "claimed by the review lane")
+        t = th.Thread(target=run, args=(st.get(r["id"]),))
+        threads.append(t)
+        t.start()
+        review_in.wait(10)                # in, before this turn's cleanup runs
+        return True
+
+    run = _turn_runner(st, sessions, _real_locks(), RUNNING, RUNNING_TASKS, run_turn2,
+                       park_for_review)
+    st.transition(parent["id"], T.RUNNING, "claimed")
+    run(st.get(parent["id"]))
+    parent_gone.set()
+    [t.join(30) for t in threads]
+    check("a review that starts as its implementor ends is still listed as running",
+          seen.get("review still running") is True, str(seen))
+    check("and still stoppable by task id", seen.get("review still a running task") is True, str(seen))
+    check("and still recoverable after a restart", seen.get("review's marker survived") is True, str(seen))
+    check("its own cleanup still clears it",
+          not RUNNING and not RUNNING_TASKS and not (sessions.get("C:5") or {}).get("pending"))
 
 
 if __name__ == "__main__":
