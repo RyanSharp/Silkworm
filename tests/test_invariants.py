@@ -12205,6 +12205,261 @@ def test_a_landing_outcome_is_dated():
           "landing" in T.RESULT_KEEPS)
 
 
+
+# --- the implementor git guard -------------------------------------------------
+# On 2026-10-02 a Cadence implementor merged its own commit into the checkout's
+# main and pushed it to origin before verification or review had run. The
+# prompt said not to; nothing enforced it. These hooks make git refuse it, for
+# an implementor's turn only -- the user and the bot's own landing must not
+# notice they exist.
+
+def test_implementor_git_guard():
+    import git_guard as GG
+    import merge as M
+    print("\nimplementor git guard: git refuses what only landing may do")
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "repo"
+    tid = "tsk_guard1"
+    clean = GG.strip(dict(os.environ))           # the user, the bot's landing
+    agent = {**clean, **GG.env_for("implementor", tid)}
+
+    def git(cwd, *a, env=None):
+        return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                              cwd=str(cwd), capture_output=True, text=True,
+                              env=env if env is not None else clean)
+
+    def sha(ref, cwd=repo):
+        return git(cwd, "rev-parse", "-q", "--verify", ref).stdout.strip()
+
+    check("this git has reference-transaction (2.28+)", GG.git_version() >= GG.MIN_GIT,
+          str(GG.git_version()))
+    git(root, "init", "-q", "--bare", "-b", "main", str(origin))
+    git(root, "init", "-q", "-b", "main", str(repo))
+    (repo / "a.txt").write_text("a\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "a")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "main")
+
+    # Hooks already in place, which must be chained rather than lost: each
+    # records that it ran, and what it was given.
+    hooks = repo / ".git" / "hooks"
+    log_ = root / "chained.log"
+    (hooks / "pre-push").write_text(f'#!/bin/sh\necho "pre-push $1" >> "{log_}"\ncat >/dev/null\n')
+    (hooks / "reference-transaction").write_text(
+        f'#!/bin/sh\nwhile read -r o n r; do echo "rt $1 $r" >> "{log_}"; done\n')
+    for h in ("pre-push", "reference-transaction"):
+        (hooks / h).chmod(0o755)
+    before_rt = (hooks / "reference-transaction").read_text()
+
+    res = GG.install(repo)
+    check("install: both hooks go in", res["ok"] and sorted(res["changed"]) == sorted(GG.HOOKS),
+          str(res))
+    check("install: an existing hook is moved aside and chained, not replaced",
+          sorted(res["chained"]) == sorted(GG.HOOKS)
+          and (hooks / ("reference-transaction" + GG.CHAINED_SUFFIX)).read_text() == before_rt,
+          str(res))
+    again = GG.install(repo)
+    check("install is idempotent: a second run changes nothing and chains nothing again",
+          again["ok"] and not again["changed"] and not again["chained"]
+          and (hooks / ("reference-transaction" + GG.CHAINED_SUFFIX)).read_text() == before_rt,
+          str(again))
+    check("status reads it as installed", GG.state(repo)[0], GG.state(repo)[1])
+
+    wt = root / "wt"
+    git(repo, "worktree", "add", "-q", "-b", f"silkworm/{tid}", str(wt), "main")
+    log_.write_text("")
+
+    # --- an implementor, in its own worktree ---------------------------------
+    (wt / "b.txt").write_text("b\n")
+    git(wt, "add", "-A", env=agent)
+    r = git(wt, "commit", "-q", "-m", "b", env=agent)
+    check("implementor: committing to its own branch works", r.returncode == 0, r.stderr[-200:])
+    check("and the existing reference-transaction hook still ran (chained)",
+          f"rt committed refs/heads/silkworm/{tid}" in log_.read_text(), log_.read_text()[-300:])
+    r = git(wt, "commit", "-q", "--amend", "-m", "b2", env=agent)
+    check("implementor: amending works", r.returncode == 0, r.stderr[-200:])
+    (repo / "c.txt").write_text("c\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "c")      # the user, on main
+    r = git(wt, "rebase", "-q", "main", env=agent)
+    check("implementor: rebasing its own branch onto the base works",
+          r.returncode == 0 and (wt / "c.txt").exists(), r.stderr[-200:])
+    r = git(wt, "fetch", "-q", "origin", env=agent)
+    check("implementor: fetch works (remote-tracking refs are allowed)", r.returncode == 0,
+          r.stderr[-200:])
+    r = git(wt, "pack-refs", "--all", env=agent)
+    r2 = git(wt, "gc", "-q", env=agent)
+    check("implementor: pack-refs / gc work (they move no ref)",
+          r.returncode == 0 and r2.returncode == 0, (r.stderr + r2.stderr)[-200:])
+
+    main_at, origin_at = sha("main"), sha("main", origin)
+    r = git(wt, "update-ref", "refs/heads/main", "HEAD", env=agent)
+    check("implementor: moving main directly is refused",
+          r.returncode != 0 and sha("main") == main_at and "silkworm" in r.stderr, r.stderr[-200:])
+    r = git(repo, "merge", "-q", "--no-edit", f"silkworm/{tid}", env=agent)
+    check("implementor: merging into main (in the main checkout) is refused",
+          r.returncode != 0 and sha("main") == main_at, r.stderr[-200:])
+    git(repo, "merge", "--abort")
+    git(repo, "reset", "-q", "--hard", "main")
+    r = git(wt, "push", "origin", "HEAD:main", env=agent)
+    check("implementor: pushing to the remote's main is refused",
+          r.returncode != 0 and sha("main", origin) == origin_at
+          and "may not push" in r.stderr, r.stderr[-300:])
+    r = git(wt, "push", "origin", f"silkworm/{tid}", env=agent)
+    check("implementor: pushing even its own branch is refused",
+          r.returncode != 0 and not sha(f"refs/heads/silkworm/{tid}", origin), r.stderr[-200:])
+    r = git(wt, "tag", "v9", env=agent)
+    check("implementor: tagging is refused", r.returncode != 0 and not sha("refs/tags/v9"),
+          r.stderr[-200:])
+    r = git(wt, "branch", "other", env=agent)
+    check("implementor: making another branch is refused",
+          r.returncode != 0 and not sha("refs/heads/other"), r.stderr[-200:])
+    other = {**clean, **GG.env_for("implementor", "tsk_someone_else")}
+    tip = sha(f"refs/heads/silkworm/{tid}")
+    (wt / "d.txt").write_text("d\n")
+    git(wt, "add", "-A", env=other)
+    r = git(wt, "commit", "-q", "-m", "d", env=other)
+    check("implementor: another task's branch is not its own",
+          r.returncode != 0 and sha(f"refs/heads/silkworm/{tid}") == tip, r.stderr[-200:])
+    git(wt, "reset", "-q", "--hard", env=clean)
+    for role in ("reviewer", "assistant"):
+        r = git(wt, "tag", f"t-{role}", env={**clean, **GG.env_for(role, tid)})
+        check(f"the guard is the implementor's only: a {role} is not refused",
+              r.returncode == 0, r.stderr[-200:])
+        git(repo, "tag", "-d", f"t-{role}")
+
+    # --- the user, and the bot's own landing: untouched --------------------
+    log_.write_text("")
+    r = git(repo, "tag", "u1")
+    check("unset: the user can tag", r.returncode == 0, r.stderr[-200:])
+    r = git(repo, "branch", "scratch")
+    check("unset: the user can make a branch", r.returncode == 0, r.stderr[-200:])
+    r = git(repo, "push", "-q", "origin", "main")
+    check("unset: the user can push, and the existing pre-push hook still ran",
+          r.returncode == 0 and sha("main", origin) == sha("main")
+          and "pre-push origin" in log_.read_text(), r.stderr[-200:] + log_.read_text()[-200:])
+    # The real landing, with publish, as the bot runs it: in-process, with
+    # whatever this process's environment is -- stripped, exactly as bot.py
+    # strips its own at import. Run by an implementor, this suite inherits the
+    # role, and that is the point of stripping it.
+    saved = {k: os.environ.pop(k) for k in (GG.ROLE_VAR, GG.ID_VAR) if k in os.environ}
+    try:
+        lr = M.land(wt, repo, f"silkworm/{tid}", "main", lambda cwd: {"ok": True, "ran": True},
+                    publish=True)
+    finally:
+        os.environ.update(saved)
+    check("unset: Silkworm's own landing merges and publishes through the hooks",
+          lr.get("landed") and lr.get("published") is True
+          and sha("main") == sha(f"refs/heads/silkworm/{tid}") == sha("main", origin),
+          f"{lr.get('stage')}: {str(lr.get('detail'))[:200]}")
+    r = git(repo, "update-ref", "refs/heads/main", "main~1")
+    check("unset: the user can move main", r.returncode == 0, r.stderr[-200:])
+
+    # --- core.hooksPath, and a hook we must not clobber ----------------------
+    r2 = root / "r2"
+    git(root, "init", "-q", "-b", "main", str(r2))
+    custom = root / "myhooks"
+    custom.mkdir()
+    (custom / "pre-push").write_text("#!/bin/sh\nexit 0\n"); (custom / "pre-push").chmod(0o755)
+    git(r2, "config", "core.hooksPath", str(custom))
+    res = GG.install(r2)
+    check("core.hooksPath: installs where git will look, chaining what is there",
+          res["ok"] and (custom / "reference-transaction").exists()
+          and (custom / ("pre-push" + GG.CHAINED_SUFFIX)).read_text() == "#!/bin/sh\nexit 0\n"
+          and not (r2 / ".git" / "hooks" / "pre-push").exists(), str(res))
+    (custom / "pre-push").write_text("#!/bin/sh\necho someone-elses\n")
+    res = GG.install(r2)
+    check("a foreign hook with the chained name already taken is refused, not overwritten",
+          not res["ok"] and (custom / "pre-push").read_text() == "#!/bin/sh\necho someone-elses\n"
+          and (custom / ("pre-push" + GG.CHAINED_SUFFIX)).read_text() == "#!/bin/sh\nexit 0\n",
+          str(res))
+    check("and status reports it unguarded", not GG.state(r2)[0], GG.state(r2)[1])
+
+    # --- status --------------------------------------------------------------
+    pj = root / "projects.json"
+    pj.write_text(json.dumps({
+        "ready": {"slug": "ready", "scope": {"cwd": str(repo)}, "test_cmd": "true",
+                  "auto_merge": True},
+        "loose": {"slug": "loose", "scope": {"cwd": str(r2)}, "test_cmd": "", "auto_merge": False},
+    }))
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    loader = SourceFileLoader("silkworm_cli", str(BASE / "bin" / "silkworm"))
+    cli = module_from_spec(spec_from_loader("silkworm_cli", loader))
+    loader.exec_module(cli)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        rows = cli.check_git_guards(pj)
+    check("status: reports the guard on each ready project, and only those",
+          rows == [("ready", True, rows[0][2] if rows else "")]
+          and "implementor git guard on ready" in out.getvalue(), out.getvalue())
+    (hooks / "pre-push").unlink()
+    with contextlib.redirect_stdout(io.StringIO()):
+        rows = cli.check_git_guards(pj)
+    check("status: a missing hook reads as unguarded", rows and rows[0][1] is False, str(rows))
+
+
+def test_guard_env_reaches_task_turns_only():
+    import git_guard as GG
+    import roles as R_
+    print("\nimplementor git guard: who carries the role")
+    ns = bot_functions("claude_env", git_guard=GG, os=os, APPROVAL_PORT=1,
+                       CLAUDE_APPROVAL_MODE="skip", APPROVAL_TIMEOUT=1)
+    saved = {k: os.environ.get(k) for k in (GG.ROLE_VAR, GG.ID_VAR)}
+    # As if this process had itself been started from inside a task turn.
+    os.environ[GG.ROLE_VAR], os.environ[GG.ID_VAR] = "implementor", "tsk_leak"
+    try:
+        task = ns["claude_env"]("C:1", 0, role="implementor", task_id="tsk_abc")
+        slack = ns["claude_env"]("C:1")
+        bare = ns["claude_env"]()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("a task turn's env names its role and id",
+          task.get(GG.ROLE_VAR) == "implementor" and task.get(GG.ID_VAR) == "tsk_abc", str(
+              {k: task.get(k) for k in (GG.ROLE_VAR, GG.ID_VAR)}))
+    check("a Slack turn, and every helper run, carries neither -- not even inherited",
+          all(GG.ROLE_VAR not in e and GG.ID_VAR not in e for e in (slack, bare)))
+
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def env_calls(fn):
+        return [c for c in ast.walk(fns[fn]) if isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name) and c.func.id == "claude_env"]
+    ex = env_calls("execute_task")
+    check("execute_task hands its task id to the turn's env",
+          ex and all(any(k.arg == "task_id" and isinstance(k.value, ast.Name)
+                         and k.value.id == "tid" for k in c.keywords) for c in ex), f"{len(ex)} call(s)")
+    others = [c for f in fns if f != "execute_task" for c in env_calls(f)]
+    check("and nothing else does: no other claude_env call names a task id",
+          others and not any(k.arg == "task_id" for c in others for k in c.keywords))
+    stripped = [n for n in tree.body if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                and ast.unparse(n.value) == "git_guard.strip(os.environ)"]
+    check("the bot strips the role from its own environment at import, so landing never has it",
+          len(stripped) == 1)
+    main = next(n for n in tree.body if isinstance(n, ast.If)
+                and "__main__" in ast.unparse(n.test))
+    check("the bot installs the guard at startup",
+          any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+              and c.func.id == "install_git_guards" for c in ast.walk(main)))
+    sweeper = fns["_worktree_sweeper"]
+    check("and re-installs it on the sweeper's round, so a project that became ready is covered",
+          any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+              and c.func.id == "install_git_guards" for c in ast.walk(sweeper)))
+    for action in ("test_cmd=cmd", "auto_merge=on"):
+        block = (BASE / "bot.py").read_text().split(f"project_store.ensure(slug, {action})", 1)
+        check(f"setting {action.split('=')[0]} from the dashboard re-installs at once",
+              len(block) == 2 and "install_git_guards(slug)" in block[1][:200])
+
+    p = R_.IMPLEMENTOR_SYSTEM.lower()
+    check("the implementor is told it must not push or move the base branch",
+          "do not push" in p and "base branch" in p and "hook" in p)
+    check("and that 'done when it is on main' is met by reporting it ready to land",
+          "ready to land" in p and "on main" in p)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

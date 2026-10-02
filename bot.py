@@ -39,6 +39,7 @@ import defer
 import digest
 import drain
 import email_ingest
+import git_guard
 import harvester
 import home
 import discard
@@ -68,6 +69,11 @@ from localserver import LocalServer
 from store import SessionStore
 
 load_dotenv()
+# This process lands, verifies and releases, and none of that is a task's
+# turn. Were it ever started from inside one (a deploy run by hand from a task
+# shell), it would inherit the implementor's role and its own landing would
+# be refused by the very hooks that exist to leave landing to it.
+git_guard.strip(os.environ)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("silkworm")
@@ -481,8 +487,11 @@ def permission_args() -> list[str]:
     return ["--permission-mode", CLAUDE_PERMISSION_MODE]
 
 
-def claude_env(key: str = "", defers: int = 0, role: str = "") -> dict:
-    env = dict(os.environ)
+def claude_env(key: str = "", defers: int = 0, role: str = "", task_id: str = "") -> dict:
+    # Never inherited: only a task turn carries the guard's variables, and only
+    # the ones written below. Everything else this builds an env for -- naming,
+    # summaries, a Slack turn -- is not a task, and must not be judged as one.
+    env = git_guard.strip(dict(os.environ))
     env["SILKWORM_BOT"] = "1"  # lets the global session_hook ignore our own runs
     # So a turn can schedule a wake-up against its own thread rather than
     # holding itself open until whatever it is watching finishes.
@@ -496,6 +505,11 @@ def claude_env(key: str = "", defers: int = 0, role: str = "") -> dict:
     # typed, so it has no way to put an assignment in front of the CLI and
     # describe itself as something less supervised.
     env["SILKWORM_ROLE"] = role or "assistant"
+    # Who is running git, for the hooks git_guard installs: an implementor may
+    # commit to its own branch and nothing else, and may not push. The landing
+    # and the verifier run in this process, which never carries these.
+    if task_id:
+        env.update(git_guard.env_for(role or "assistant", task_id))
     if CLAUDE_APPROVAL_MODE == "slack":
         env["SLACK_BOT_APPROVAL_PORT"] = str(APPROVAL_PORT)
         env["SLACK_BOT_APPROVAL_TIMEOUT"] = str(APPROVAL_TIMEOUT)
@@ -1051,6 +1065,7 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                     thread_ts=thread_ts)
             else:
                 project_store.ensure(slug, test_cmd=want)
+                install_git_guards(slug)
                 say(text=f":test_tube: *{slug}* verifies with `{want}`. Work that "
                          "fails it goes back to be fixed rather than to you.",
                     thread_ts=thread_ts)
@@ -1787,7 +1802,9 @@ def handle_projects(payload: dict) -> dict:
         cmd = (payload.get("cmd") or "").strip()
         if cmd.lower() in ("off", "none", "clear"):
             cmd = ""
-        return {"ok": True, "project": project_store.ensure(slug, test_cmd=cmd)}
+        rec = project_store.ensure(slug, test_cmd=cmd)
+        install_git_guards(slug)
+        return {"ok": True, "project": rec}
     if action == "auto-merge":
         slug = (payload.get("slug") or "").strip()
         rec = project_store.get(slug)
@@ -1797,7 +1814,9 @@ def handle_projects(payload: dict) -> dict:
         if on and not (rec.get("test_cmd") or "").strip():
             return {"ok": False,
                     "error": "set a test command first — nothing may land unproven"}
-        return {"ok": True, "project": project_store.ensure(slug, auto_merge=on)}
+        rec = project_store.ensure(slug, auto_merge=on)
+        install_git_guards(slug)            # may just have become ready
+        return {"ok": True, "project": rec}
     if action == "publish":
         # Whether a landing is pushed. Separate from auto-merge on purpose:
         # landing is a decision about this checkout, publishing is one about
@@ -2504,6 +2523,36 @@ def reconcile_checkouts() -> None:
             log.info("released stale pre-boot checkout %s", key)
 
 
+def install_git_guards(slug: str = "") -> None:
+    """Put the implementor guard into every ready project's repository.
+
+    Ready means unsupervised work may run there (projects.unready), which is
+    exactly where nobody is watching what an implementor does with git. Run at
+    startup and whenever a project's readiness or checkout changes; installing
+    is idempotent, so it costs nothing to repeat. Never raises: a project whose
+    repo cannot take the hooks is logged, and `silkworm status` says so.
+    """
+    try:
+        rows = git_guard.ready_repos(project_store.all(include_archived=False))
+    except Exception:
+        log.exception("could not list projects for the git guard")
+        return
+    for name, cwd in rows:
+        if slug and name != slug:
+            continue
+        try:
+            res = git_guard.install(cwd)
+        except Exception:
+            log.exception("git guard: install into %s (%s) failed", cwd, name)
+            continue
+        if not res["ok"]:
+            log.error("git guard: %s (%s) is unguarded: %s", name, cwd, res["error"])
+        elif res["changed"]:
+            log.info("git guard: installed %s into %s (%s)%s", ", ".join(res["changed"]),
+                     cwd, name, f"; chained existing {', '.join(res['chained'])}"
+                     if res["chained"] else "")
+
+
 TASK_POLL_S = 10
 
 
@@ -2860,7 +2909,8 @@ def execute_task(task: dict) -> None:
                                                         bin=SILKWORM_BIN),
                     model=entry.get("model") or CLAUDE_MODEL,
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
-                    env=claude_env(key, task.get("defers") or 0, role=role_name),
+                    env=claude_env(key, task.get("defers") or 0, role=role_name,
+                                   task_id=tid),
                     timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                     # The moment the session exists, not when the turn ends:
                     # a restart kills the turn before it ends, and then this
@@ -4388,6 +4438,11 @@ def _worktree_sweeper() -> None:
     anyway, since the work is already in it.
     """
     while True:
+        # A project can become ready, or move its checkout, by more routes than
+        # the ones that call this directly (a !project rebinding, a hand-edited
+        # projects.json, a hook someone deleted). Idempotent, so repeating it
+        # here bounds how long any of those leaves a repo unguarded.
+        install_git_guards()
         try:
             n = worktrees.sweep(keep=live_worktree_tasks())
             if n:
@@ -4561,6 +4616,7 @@ def _harvester() -> None:
 
 if __name__ == "__main__":
     reconcile_checkouts()
+    install_git_guards()
     # Every long-lived loop is started through daemons.start, so /status can
     # tell when one has stopped. forever=False marks a startup pass that is
     # meant to finish; a feature switched off in .env returns at once on

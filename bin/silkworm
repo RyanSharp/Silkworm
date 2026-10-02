@@ -370,6 +370,7 @@ def do_status() -> None:
               f"down for {int(down // 60)}m — it should self-restart; silkworm logs")
     check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
     check("session hooks installed", hooks_installed())
+    check_git_guards()
 
     # A live process is not a working one: each background loop -- sweeper,
     # schedulers, task workers -- ends for good on one escaped exception, and a
@@ -481,7 +482,33 @@ def do_status() -> None:
 
 sys.path.insert(0, str(REPO))
 import credentials                                   # noqa: E402
+import git_guard                                     # noqa: E402
 import jsonstore                                     # noqa: E402
+
+
+def check_git_guards(path: Path | None = None) -> list[tuple[str, bool, str]]:
+    """Whether each ready project's repo refuses an implementor's push/base move.
+
+    Read from the repositories themselves rather than asked of the bot: the
+    hooks are what is in force, whatever the bot believes it installed, and
+    they are in force (or not) whether or not the bot is up.
+    """
+    try:
+        recs = jsonstore.load(path or REPO / "projects.json", default={}, repair=False) or {}
+    except Exception as e:
+        check("implementor git guard", False, f"could not read projects.json: {e}")
+        return []
+    rows = git_guard.ready_repos([{**r, "slug": r.get("slug") or s}
+                                  for s, r in recs.items()])
+    if not rows:
+        print("    no ready project to guard")
+    out = []
+    for slug, cwd in rows:
+        ok, why = git_guard.state(cwd)
+        check(f"implementor git guard on {slug}", ok,
+              f"{why} — the bot installs it at startup: run silkworm restart")
+        out.append((slug, ok, why))
+    return out
 
 
 def env_has(name: str) -> bool:

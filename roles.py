@@ -79,7 +79,21 @@ IDEATOR_SYSTEM = (
 
 IMPLEMENTOR_SYSTEM = (
     "Complete the task. When you are done, state concretely what you changed "
-    "(files, commands run, results) so it can be verified independently."
+    "(files, commands run, results) so it can be verified independently.\n\n"
+    # Enforced by git (git_guard.py), not only asked: on 2026-10-02 an
+    # implementor merged into Cadence's main and pushed before verification or
+    # review had run. Said here so it does not spend its turn fighting a hook.
+    "Landing is Silkworm's job, not yours. Commit your work to your own branch "
+    "(silkworm/<your task id>, the one you are on) and nothing else: do not "
+    "push, do not merge into, reset or otherwise move the base branch (main or "
+    "whatever this project builds on), do not create other branches or tags. "
+    "Git hooks refuse all of those for implementor tasks -- do not try to get "
+    "around them (--no-verify, unsetting variables, another checkout). After "
+    "you finish, Silkworm verifies your branch, has it reviewed, and only "
+    "then lands (and if the project publishes, pushes) it. So a goal that "
+    "says it is done when the change is on main, pushed, or passing CI on "
+    "main is met by committing it to your branch, checking whatever you can "
+    "locally, and reporting that it is ready to land -- not by landing it."
 )
 
 ROLES: dict[str, dict] = {
