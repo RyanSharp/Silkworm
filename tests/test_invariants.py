@@ -10043,12 +10043,48 @@ def test_restart_waits_for_ports():
     # The old process must be gone before probing, or it answers for the new one.
     old = free_port()
     listen_after(old, 0, 1.5)
-    time.sleep(0.3)
+    while not cli.port_listening(old):
+        time.sleep(0.05)
     t0 = time.monotonic()
-    Fake({"bot": old})._wait_ports_free(timeout=5)
+    held = Fake({"bot": old})._wait_ports_free(timeout=5)
     took = time.monotonic() - t0
     check("probing waits for the old listener to let go",
-          1.0 < took < 4.0 and not cli.port_listening(old), f"took={took:.1f}s")
+          0.5 < took < 4.0 and held == [] and not cli.port_listening(old),
+          f"took={took:.1f}s held={held}")
+
+    # A holder that never lets go would answer the probe while the new copy
+    # crash-loops on bind: that is a failed restart, not a successful one.
+    stuck = free_port()
+    listen_after(stuck, 0, 10)
+    while not cli.port_listening(stuck):
+        time.sleep(0.05)
+    agents = Path(tempfile.mkdtemp())
+    class Held(Fake):
+        AGENTS = agents
+        SERVICES = {"com.silkworm.bot": ["bot.py"]}
+        started = []
+        def _stop(self, label): pass
+        def _free_ports(self): pass
+        def _start(self, plist): self.started.append(plist.stem)
+        def _wait_ports_free(self, timeout=15.0):
+            return super()._wait_ports_free(timeout=1)
+    (agents / "com.silkworm.bot.plist").write_text("")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        ok = Held({"bot": stuck}).restart()
+    check("a port still held after the wait fails the restart",
+          ok is False and f":{stuck} is still held" in out.getvalue()
+          and "answering" not in out.getvalue(), out.getvalue())
+    check("the services are still started for launchd to retry",
+          Held.started == ["com.silkworm.bot"])
+
+    # The visualizer's readiness probe must be cheap: /api/stats re-reads
+    # every transcript and took 1.3-1.5s live, against a 2s probe timeout.
+    probes = cli.LaunchdManager()._probes()
+    check("the visualizer is probed on a static route, not /api/stats",
+          probes["com.silkworm.viz"][0] is cli.viz_serving
+          and "/favicon.svg" in (BASE / "bin" / "silkworm").read_text()
+          .split("def viz_serving", 1)[1].split("def ", 1)[0])
 
     # And the CLI's exit status carries the result, so scripts can trust it.
     class Stub:

@@ -157,9 +157,11 @@ class LaunchdManager:
             self._stop(label)
             plist.write_text(self._plist(label, script))
         self._free_ports()
-        self._wait_ports_free()
+        held = self._wait_ports_free()
         for label in self.SERVICES:
             self._start(self.AGENTS / f"{label}.plist")
+        if self._held(held):
+            return False
         return self._report_up("installed and started")
 
     def uninstall(self) -> None:
@@ -175,9 +177,11 @@ class LaunchdManager:
                 return False
             self._stop(label)
         self._free_ports()
-        self._wait_ports_free()
+        held = self._wait_ports_free()
         for label in self.SERVICES:
             self._start(self.AGENTS / f"{label}.plist")
+        if self._held(held):
+            return False
         return self._report_up("restarted")
 
     # launchctl returning says launchd accepted the job, not that anything is
@@ -189,16 +193,24 @@ class LaunchdManager:
     def _probes(self) -> dict:
         return {"com.silkworm.bot": (lambda: bool(bot_call("/status", {}, timeout=2).get("online")),
                                      bot_port()),
-                "com.silkworm.viz": (viz_up, viz_port())}
+                "com.silkworm.viz": (viz_serving, viz_port())}
 
-    def _wait_ports_free(self, timeout: float = 15.0) -> None:
+    def _wait_ports_free(self, timeout: float = 15.0) -> list:
         """Until the old processes let go, a probe would hear them and call
-        the new ones up. Best-effort: a port still held after this is left for
-        the new process to fail on, which _report_up then shows."""
+        the new ones up. Returns the ports still held at the deadline: there
+        the holder would answer for the new process while it crash-loops on
+        bind, so the caller must report failure rather than probe."""
         deadline = time.monotonic() + timeout
         ports = [port for _, port in self._probes().values()]
-        while any(port_listening(p) for p in ports) and time.monotonic() < deadline:
+        while (held := [p for p in ports if port_listening(p)]) and time.monotonic() < deadline:
             time.sleep(0.5)
+        return held
+
+    def _held(self, ports: list) -> bool:
+        for port in ports:
+            print(f"  {R}✘{N} :{port} is still held by another process — "
+                  f"lsof -iTCP:{port} -sTCP:LISTEN, stop it, then: silkworm restart")
+        return bool(ports)
 
     def _report_up(self, verb: str) -> bool:
         probes = self._probes()
@@ -260,6 +272,17 @@ def port_listening(port: str) -> bool:
         with socket.create_connection(("127.0.0.1", int(port)), timeout=1):
             return True
     except (OSError, ValueError):
+        return False
+
+
+def viz_serving() -> bool:
+    """The visualizer is up -- not that its stats are. /api/stats re-reads
+    every transcript and takes over a second on a real install, so as a
+    readiness probe it timed out against a healthy server."""
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{viz_port()}/favicon.svg", timeout=2).read()
+        return True
+    except Exception:
         return False
 
 
@@ -567,9 +590,11 @@ def do_setup() -> None:
 
     subprocess.run([sys.executable, str(REPO / "install_hooks.py")], check=True)
     print(f"{WORM} installing login services…")
-    service_manager().install()
+    up = service_manager().install()
     print()
     do_status()
+    if not up:
+        sys.exit(f"\n{WORM} services did not come up — see silkworm logs, then: silkworm restart")
     print(f"\n{WORM} done — DM your bot in Slack, and open http://127.0.0.1:{viz_port()}")
 
 
