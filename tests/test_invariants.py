@@ -2392,6 +2392,7 @@ def _file_task_impl():
     mod = types.ModuleType("filing")
     mod.__dict__.update(
         re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
+        dedup=__import__("dedup"), branches=__import__("branches"),
         task_store=ts,
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
         store=types.SimpleNamespace(get=lambda k: {}),
@@ -2831,6 +2832,14 @@ def test_scoping():
           or "--project" in r.stdout)
 
 
+#: Words that share nothing, for fixtures that need many different goals.
+_DISTINCT_WORDS = ("apple", "bridge", "candle", "dolphin", "engine", "forest",
+                   "glacier", "harbor", "island", "jungle", "kettle", "lantern",
+                   "meadow", "needle", "orchard", "pepper", "quarry", "river",
+                   "saddle", "tunnel", "umbrella", "valley", "walnut", "yarrow",
+                   "zephyr")
+
+
 def _bot_func(name, **namespace):
     """One function out of bot.py, loaded without importing it.
 
@@ -2859,6 +2868,11 @@ def _bot_func(name, **namespace):
     mod = types.ModuleType(f"bot_{name}")
     for free_name in free - bound - set(dir(builtins)):
         mod.__dict__[free_name] = MagicMock(name=free_name)
+    # Pure arithmetic over records, with nothing to stub: a mock here would
+    # only turn a cost into an object the store cannot serialise.
+    for real in ("costs", "dedup"):
+        if real in free:
+            mod.__dict__[real] = __import__(real)
     mod.__dict__.update(namespace)
     exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{name}>", "exec"),
          mod.__dict__)
@@ -7531,6 +7545,7 @@ def test_review_followups():
     fn = next(n for n in src.body if isinstance(n, ast.FunctionDef)
               and n.name == "file_followups")
     ns = {"task_store": store, "scoping": scoping, "tasks": T, "log": logging.getLogger("t"),
+          "dedup": __import__("dedup"), "branches": __import__("branches"),
           "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<x>", "exec"), ns)
     file_followups = ns["file_followups"]
@@ -7557,7 +7572,9 @@ def test_review_followups():
     check("the title is readable in a list, not the whole finding",
           child["title"].startswith("From review: ") and len(child["title"]) <= 70)
 
-    many = file_followups(parent, [f"finding number {i}" for i in range(20)])
+    # Twenty different findings, not one finding twenty times: the same words
+    # filed twice are now refused as a duplicate, which is not the cap.
+    many = file_followups(parent, list(_DISTINCT_WORDS[:20]))
     check("filing is capped like any other unattended pass",
           len(many) == scoping.limit_for(propose=True))
     check("a followup that cannot be made into a valid goal is skipped, not filed",
@@ -7588,7 +7605,7 @@ def test_review_followups():
     spare = next(t for t in store.by_project("backlogged")
                  if t["state"] == T.PROPOSED and t["goal"].startswith("Padding"))
     store.transition(spare["id"], T.CANCELLED, "dismissed")
-    got = file_followups(deep, [f"another finding number {i}" for i in range(5)])
+    got = file_followups(deep, list(_DISTINCT_WORDS[20:25]))
     check("and with one place left it files one, not the whole batch",
           len(got) == 1,
           "a count taken once for the batch would file all five past the limit")
@@ -10807,6 +10824,381 @@ def test_resume_edge_cases():
         check(f"sent back {how}: requeued without the stale checkpoint",
               rec["state"] == T.QUEUED and not rec.get("checkpoint"),
               str({k: rec.get(k) for k in ("state", "checkpoint")}))
+
+
+def test_proposals_are_deduplicated():
+    """A proposal the board already holds is refused, naming what it matched.
+
+    226 of 228 proposals in the fortnight to 2026-10-01 were accepted, and
+    twelve implementor runs finished with nothing to land: the duplicate got
+    through filing and then through triage. Both unattended filing doors are
+    driven here -- the `/file-task` route the nightly ideator calls, and the
+    review gate's follow-ups -- against a real TaskStore.
+    """
+    print("\nproposals are refused when the board already holds them")
+    import dedup
+    import tasks as T
+    from unittest.mock import MagicMock
+
+    # The measured threshold separates a rephrasing from a different job.
+    a = ("Make tasks.json and sessions.json survive being killed mid-write: "
+         "TaskStore._save and SessionStore._save truncate the file and then "
+         "write it back, so a crash in between loses the whole board.")
+    b = ("Write tasks.json and sessions.json atomically so being killed "
+         "mid-write cannot truncate the board: TaskStore._save and "
+         "SessionStore._save write the file back in place.")
+    c = ("Show what each task cost on the dashboard, including the reviewer "
+         "it spawned, and a per-project weekly spend line on the board.")
+    check("a rephrasing of the same job scores over the line",
+          dedup.similarity(a, b) >= dedup.THRESHOLD,
+          f"{dedup.similarity(a, b):.2f}")
+    check("a different job does not",
+          dedup.similarity(a, c) < dedup.THRESHOLD, f"{dedup.similarity(a, c):.2f}")
+    wrapped = {"goal": "A review of tsk_1 (Some title) found this alongside that "
+                       "task, rather than in it:\n\nthe frobnicator leaks handles"
+                       "\n\nCheck it is still true before changing anything -- the "
+                       "review read the tree as it was then. If it is not, stop.",
+               "title": "From review: the frobnicator leaks handles"}
+    check("a follow-up is compared by its finding, not its shared framing",
+          dedup.words(dedup.gist(wrapped))
+          == dedup.words("the frobnicator leaks handles") != frozenset(),
+          str(sorted(dedup.words(dedup.gist(wrapped)))))
+
+    # --- the nightly pass's door ----------------------------------------------
+    handle, filed_this_turn, begin_turn, ts, made = _file_task_impl()
+    key = "C1:1.0"
+    first = handle({"key": key, "goal": a, "propose": True, "project": "proj"})
+    check("the first proposal files", first.get("ok"), str(first))
+    before = len(ts.all())
+    dup = handle({"key": key, "goal": b, "propose": True, "project": "proj"})
+    check("a near-duplicate proposal is refused",
+          not dup.get("ok") and len(ts.all()) == before, str(dup))
+    check("and the refusal names the task it matched, with its title",
+          (dup.get("error") or "").startswith(f"duplicate of {first['id']}: ")
+          and "survive being killed" in dup.get("error", ""), dup.get("error"))
+    other = handle({"key": key, "goal": c, "propose": True, "project": "proj"})
+    check("a different idea on the same project still files", other.get("ok"), str(other))
+    elsewhere = handle({"key": "C2:1.0", "goal": b, "propose": True, "project": "other"})
+    check("the same idea on another project is not a duplicate",
+          elsewhere.get("ok"), str(elsewhere))
+    scoped = handle({"key": "C3:1.0", "goal": b, "project": "proj"})
+    check("work scoped in conversation is not checked: you agreed to it",
+          scoped.get("ok") and scoped.get("state") == T.QUEUED, str(scoped))
+
+    # What counts: open, recently finished, unmerged -- not old or dismissed.
+    now = time.time()
+    def finished(goal, state, days_ago, **kw):
+        rec = ts.create(goal, title=goal[:70], project="hist", role="implementor",
+                        **kw)
+        if state == T.DONE:
+            ts.transition(rec["id"], T.RUNNING)
+        ts.transition(rec["id"], state)
+        with ts._lock:
+            ts._data[rec["id"]]["updated"] = now - days_ago * 86400
+        return ts.get(rec["id"])
+    recent = finished(a, T.DONE, 3)
+    hist = ts.by_project("hist")
+    check("work finished this week is a duplicate",
+          (dedup.find(b, hist, now=now) or [{}])[0].get("id") == recent["id"])
+    ts._data.pop(recent["id"])
+    old = finished(a, T.DONE, dedup.RECENT_DAYS + 6)
+    hist = ts.by_project("hist")
+    check("work finished weeks ago is not: it may have regressed since",
+          dedup.find(b, hist, now=now) is None)
+    check("unless its branch never merged",
+          (dedup.find(b, hist, unmerged_ids=[old["id"]], now=now)
+           or [{}])[0].get("id") == old["id"])
+    ts._data.pop(old["id"])
+    finished(a, T.CANCELLED, 1)
+    check("a dismissed proposal is the board note's business, not a refusal",
+          dedup.find(b, ts.by_project("hist"), now=now) is None)
+
+    # survey asks git; a git that will not answer must not cost the filing.
+    def broken(records):
+        raise RuntimeError("git timed out")
+    def guarded(*a):
+        try:
+            return dedup.duplicate(*a)
+        except Exception as e:
+            return f"raised {e!r}"
+    got = guarded(b, ts.by_project("proj"), broken)
+    check("an unanswerable survey still compares open work",
+          got.startswith("duplicate of"), got)
+    check("and refuses nothing it cannot match",
+          guarded(c + " but for mail", [], broken) == "")
+    surveyed = []
+    dedup.duplicate(b, ts.by_project("proj"),
+                    lambda recs: surveyed.append(len(recs)) or [])
+    check("the unmerged half is asked of the project's own records",
+          surveyed == [len(ts.by_project("proj"))], str(surveyed))
+
+    # --- the review gate's door -------------------------------------------------
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ns = {"task_store": store, "scoping": __import__("scoping"), "tasks": T,
+          "log": logging.getLogger("t"), "dedup": dedup,
+          "branches": __import__("branches"),
+          "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
+    _bot_fns({"file_followups"}, ns)
+    file_followups = ns["file_followups"]
+    open_one = store.create(a, title=a[:70], project="proj", role="implementor",
+                            state=T.PROPOSED)
+    parent = store.create("do the parent thing", title="Parent", project="proj",
+                          role="implementor")
+    seen: list = []
+    got = file_followups(parent, [b, c], seen)
+    check("a follow-up repeating open work is not filed",
+          len(got) == 1 and "survive" not in store.get(got[0])["goal"], str(got))
+    check("and what it matched is handed back to the gate",
+          len(seen) == 1 and seen[0].startswith(f"duplicate of {open_one['id']}: "),
+          str(seen))
+    again = file_followups(parent, [c])
+    check("two reviews finding the same thing file it once",
+          again == [], str(again))
+    # A follow-up is found next to the reviewed work and shares its words;
+    # it must not be refused as a duplicate of that very task.
+    near = ("The queue worker retry loop also retries immediately on a runner "
+            "timeout error; it should back off there too.")
+    reviewed = store.create("Make the queue worker back off when the runner "
+                            "reports a quota error instead of retrying at once.",
+                            project="neighbour", role="implementor")
+    store.transition(reviewed["id"], T.RUNNING)
+    store.transition(reviewed["id"], T.BLOCKED, "awaiting review")
+    check("the fixture really does read as a duplicate of its parent",
+          dedup.find(near, store.by_project("neighbour")) is not None)
+    kin = file_followups(store.get(reviewed["id"]), [near])
+    check("a follow-up is never refused as a duplicate of the task under review",
+          len(kin) == 1, str(kin))
+
+    # The gate records it on the parent and says it in the thread.
+    store2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ns2 = dict(ns, task_store=store2)
+    _bot_fns({"file_followups"}, ns2)
+    store2.create(a, title="Atomic saves — and survive a corrupt file",
+                  project="proj", role="implementor", state=T.PROPOSED)
+    impl = store2.create("the implementor's job", title="Impl", project="proj",
+                         role="implementor")
+    rev = store2.create("review it", role="reviewer", parent=impl["id"])
+    app = MagicMock()
+    resolve = _bot_func("resolve_review", task_store=store2, tasks=T,
+                        roles=__import__("roles"), app=app,
+                        file_followups=ns2["file_followups"],
+                        log=logging.getLogger("t"))
+    verdict = ('```json\n' + json.dumps({"ok": True, "summary": "fine",
+                                         "followups": [b]}) + '\n```')
+    resolve(dict(rev), "reviewer", verdict, "C1", "1.0")
+    review = (store2.get(impl["id"]).get("result") or {}).get("review") or {}
+    check("the gate records the refused follow-up on the task",
+          len(review.get("duplicates") or []) == 1
+          and review.get("filed") == [], str(review))
+    posted = " ".join(str(c.kwargs.get("text", ""))
+                      for c in app.client.chat_postMessage.call_args_list)
+    check("and the thread says what it duplicated",
+          "Not filed, already on the board" in posted and "duplicate of" in posted,
+          posted[:300])
+    check("naming it in full, even when its title has a dash in it",
+          "Atomic saves — and survive a corrupt file (proposed)" in posted, posted[:400])
+
+
+def test_task_costs():
+    """What work costs: a task with its reviews, a project over a week.
+
+    A missing cost is unknown, not zero -- adding it as $0 makes a floor read
+    as a total.
+    """
+    print("\ntask and project costs")
+    import costs
+    import home
+    import tasks as T
+
+    ts = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    impl = ts.create("implement the thing", title="Implement", project="proj",
+                     role="implementor")
+    ts.transition(impl["id"], T.RUNNING)
+    ts.update(impl["id"], result={"cost": 2.5})
+    ts.transition(impl["id"], T.AWAITING_APPROVAL)
+    r1 = ts.create("review", role="reviewer", parent=impl["id"])
+    ts.transition(r1["id"], T.RUNNING)
+    ts.update(r1["id"], result={"cost": 0.75})
+    ts.transition(r1["id"], T.DONE)
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    reviews = costs.reviews_by_parent(recs)
+    total = costs.total(ts.get(impl["id"]), reviews.get(impl["id"], ()))
+    check("a task's total includes the review it spawned",
+          total == {"usd": 3.25, "complete": True}, str(total))
+    check("rendered as dollars", costs.fmt(total) == "$3.25")
+
+    # A second review that died without recording a cost.
+    r2 = ts.create("review again", role="reviewer", parent=impl["id"])
+    ts.transition(r2["id"], T.RUNNING)
+    ts.transition(r2["id"], T.FAILED)
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    reviews = costs.reviews_by_parent(recs)
+    total = costs.total(ts.get(impl["id"]), reviews.get(impl["id"], ()))
+    check("a run with no recorded cost makes the total a floor, not a sum with $0",
+          total == {"usd": 3.25, "complete": False}, str(total))
+    check("and it is shown as one", costs.fmt(total) == "$3.25+")
+    lost = ts.create("ran, nothing recorded", project="proj", role="implementor")
+    ts.transition(lost["id"], T.RUNNING)
+    check("a task with nothing recorded at all is unknown, not $0",
+          costs.fmt(costs.total(ts.get(lost["id"]))) == "$?")
+    waiting = ts.create("not run yet", project="proj", state=T.PROPOSED,
+                        role="implementor")
+    check("one that never ran has no figure to show",
+          costs.total(ts.get(waiting["id"])) is None)
+    check("a cost of zero is a cost, not a missing one",
+          costs.total({"state": T.DONE, "result": {"cost": 0.0}})
+          == {"usd": 0.0, "complete": True})
+
+    # The week, per project: the reviewer is filed under no project.
+    now = time.time()
+    old = ts.create("last month", project="proj", role="implementor")
+    ts.transition(old["id"], T.RUNNING)
+    ts.update(old["id"], result={"cost": 100.0})
+    with ts._lock:
+        ts._data[old["id"]]["updated"] = now - 10 * 86400
+    other = ts.create("elsewhere", project="other", role="assistant")
+    ts.transition(other["id"], T.RUNNING)
+    ts.update(other["id"], result={"cost": 1.0})
+    ts.transition(other["id"], T.DONE)
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    week = costs.by_project(recs, now)
+    check("a project's week counts its reviews and leaves older work out",
+          week["proj"]["usd"] == 3.25 and week["other"]["usd"] == 1.0, str(week))
+    check("and is marked incomplete when a run recorded nothing",
+          week["proj"]["complete"] is False and week["other"]["complete"] is True)
+    # Dated by when the money was spent, not when the record was touched.
+    stale = ts.create("ran a fortnight ago", project="dated", role="implementor")
+    ts.transition(stale["id"], T.RUNNING)
+    ts.update(stale["id"], result={"cost": 50.0})
+    ts.transition(stale["id"], T.AWAITING_APPROVAL)
+    with ts._lock:
+        for e in ts._data[stale["id"]]["events"]:
+            e["at"] = now - 14 * 86400
+    ts.transition(stale["id"], T.DONE, "approved today")
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    check("approving old work today does not put its cost in this week",
+          "dated" not in costs.by_project(recs, now),
+          str(costs.by_project(recs, now).get("dated")))
+    # Reworked today: only today's run is this week's.
+    rec = ts.get(stale["id"])
+    fields = costs.add_run(dict(rec, events=rec["events"] + [
+        {"at": now - 60, "kind": T.RUNNING}]), 5.0, now=now)
+    check("a rerun adds to the total", fields["cost"] == 55.0, str(fields))
+    with ts._lock:
+        ts._data[stale["id"]]["result"] = fields
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    got = costs.by_project(recs, now).get("dated") or {}
+    check("and only the rerun's dollars count in this week", got.get("usd") == 5.0, str(got))
+    with ts._lock:
+        ts._data.pop(stale["id"])
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    line = costs.week_line(week)
+    check("the week reads biggest first", line.index("proj") < line.index("other"), line)
+
+    # --- the board ------------------------------------------------------------
+    board = [dict(r, id=k) for k, r in ts.all().items()]
+    for compact in (True, False):
+        view = home.render(board, now=now, compact=compact)
+        text = json.dumps(view)
+        row = next(b for b in view["blocks"] if b.get("block_id") == f"t:{impl['id']}")
+        rowtext = json.dumps(row) + json.dumps(
+            next((b for b in view["blocks"] if b.get("type") == "context"
+                  and impl["id"] in json.dumps(b)), {}))
+        check(f"the board shows a task's cost with its reviews ({'compact' if compact else 'full'})",
+              "$3.25+" in rowtext, rowtext[:300])
+        check(f"and the project week in its summary ({'compact' if compact else 'full'})",
+              "last 7d" in text and "proj $3.25+" in text)
+    compact = home.render(board, now=now, compact=True)
+    row = next(b for b in compact["blocks"] if b.get("block_id") == f"t:{impl['id']}")
+    check("a compact task is still one line of title and one of meta",
+          row["text"]["text"].count("\n") == 1, row["text"]["text"])
+    check("the summary with the week is still where the board lands",
+          "last 7d" in json.dumps(compact["blocks"][-3:]))
+
+    # --- the dashboard ----------------------------------------------------------
+    handle = _bot_func("handle_tasks", task_store=ts, tasks=T,
+                       log=logging.getLogger("t"),
+                       _with_costs=None, _spend=None)
+    ns = {"task_store": ts, "costs": costs}
+    _bot_fns({"_with_costs", "_spend"}, ns)
+    handle.__globals__.update(_with_costs=ns["_with_costs"], _spend=ns["_spend"])
+    r = handle({"action": "attention"})
+    row = next(t for t in r["tasks"] if t["id"] == impl["id"])
+    check("the dashboard's task rows carry the total",
+          row.get("cost_total") == {"usd": 3.25, "complete": False}, str(row.get("cost_total")))
+    check("without writing it into the store",
+          "cost_total" not in ts.get(impl["id"]))
+    check("and the panel gets the week",
+          "proj $3.25+" in r.get("spend_line", ""), r.get("spend_line"))
+    only = handle({"action": "list", "project": "other"})
+    check("filtered to a project, the week is that project's",
+          set(only.get("spend") or {}) == {"other"}, str(only.get("spend")))
+
+    # The panel renders what the payload carries.
+    js = _re.search(r"<script>(.*?)</script>", (BASE / "visualizer.py").read_text(),
+                    _re.S).group(1)
+    fn = js[js.index("function costText"):js.index("function taskButtons")]
+    probe = fn + """
+      console.log(JSON.stringify([
+        costText({cost_total: {usd: 3.25, complete: true}}),
+        costText({cost_total: {usd: 3.25, complete: false}}),
+        costText({cost_total: {usd: 0, complete: false}}),
+        costText({cost_total: null}),
+        costText({cost_total: {usd: 5602.4, complete: true}})]));"""
+    out = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    if out.returncode != 0:
+        check("the dashboard's cost text runs", False, out.stderr[:300])
+    else:
+        got = json.loads(out.stdout)
+        check("the dashboard shows the total, its floor, and unknown, as the board does",
+              ">$3.25<" in got[0] and ">$3.25+<" in got[1] and ">$?<" in got[2]
+              and got[3] == "" and ">$5,602<" in got[4], str(got))
+
+
+def test_a_rerun_adds_to_a_tasks_cost():
+    """A task sent back runs again under the same id; its cost is the sum.
+
+    Each run used to replace `result` whole, so a task reworked twice
+    reported only its last run -- an undercount on exactly the tasks that
+    cost the most.
+    """
+    print("\na rerun adds to a task's cost")
+    import logging
+    import threading
+    import roles
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    root = Path(tempfile.mkdtemp())
+    rec = st.create("answer a question again", role="assistant", project="p",
+                    driver="queue", isolate=False, scope={"cwd": str(root)})
+    # The first run, as execute_task left it.
+    st.transition(rec["id"], T.RUNNING)
+    st.update(rec["id"], result={"text": "first", "cost": 1.5})
+    st.transition(rec["id"], T.NEEDS_INPUT, "asked a question")
+    st.transition(rec["id"], T.QUEUED, "answered")
+    st.transition(rec["id"], T.RUNNING, "claimed")
+
+    def run_turn(goal, **kw):
+        return types.SimpleNamespace(text="second", cost_usd=2.0,
+                                     duration_ms=1, session_id="s")
+    _bot_func("execute_task", tasks=T, task_store=st, store=tmp_store(),
+              roles=roles, Path=Path, run_turn=run_turn,
+              review_branch=lambda t: "", worktrees=__import__("worktrees"),
+              OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+              permission_args=lambda: [], log=logging.getLogger("test"),
+              task_thread=lambda t: ("C1", "1.0"),
+              task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+              _thread_lock=lambda key: threading.Lock(),
+              repo_guard=lambda *a, **k: contextlib.nullcontext(),
+              render_block=lambda _: "", chunk=lambda text: [text],
+              to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+              upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+              ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+              )(st.get(rec["id"]))
+    got = st.get(rec["id"])
+    check("the second run's cost is added to the first's",
+          (got.get("result") or {}).get("cost") == 3.5,
+          str({k: got.get(k) for k in ("state", "result")}))
 
 
 if __name__ == "__main__":

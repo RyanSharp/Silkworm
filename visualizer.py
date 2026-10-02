@@ -836,6 +836,7 @@ PAGE = r"""<!doctype html>
       holding uncommitted files is listed too, because approving or dismissing
       that task is the last time anything will mention it.</div>
     <div id="nightly"></div>
+    <div id="spend" class="hint"></div>
     <div id="unmerged"></div>
     <div id="holding"></div>
     <div class="lform">
@@ -1502,6 +1503,18 @@ function held(t) {
   return ` · <span class="held" title="${esc(h.path)}\n\n${
     esc((h.files || []).join("\n"))}">🧰 checkout holds ${h.changes} uncommitted</span>`;
 }
+// Mirrors costs.fmt: what the task cost, its reviews included. A missing
+// cost is unknown, never zero, so a total with a part missing is a floor
+// and says so with "+"; one with nothing known at all is "$?".
+function costText(t) {
+  const c = t.cost_total;
+  if (!c) return "";
+  const usd = c.usd || 0;
+  if (!usd && !c.complete) return ` · <span title="cost not recorded">$?</span>`;
+  const s = usd >= 100 ? `$${Math.round(usd).toLocaleString("en-US")}` : `$${usd.toFixed(2)}`;
+  return ` · <span title="${c.complete ? "this task and its reviews"
+    : "a lower bound: some runs recorded no cost"}">${s}${c.complete ? "" : "+"}</span>`;
+}
 function taskButtons(t) {
   const b = [];
   if (t.state === "proposed") {
@@ -1542,6 +1555,8 @@ async function renderTasks() {
                             project: project || undefined});
   if (!r.ok) { list.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
   updateTaskBadge(r.counts);
+  const spend = document.getElementById("spend");
+  if (spend) spend.textContent = r.spend_line ? `💰 ${r.spend_line}` : "";
   if (!r.tasks.length) {
     list.innerHTML = taskView === "attention"
       ? `<div class="hint">Nothing needs you. 🎉</div>`
@@ -1558,7 +1573,7 @@ async function renderTasks() {
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
-          age(t.created)}${held(t)}</div>${review(t)}${landing(t)}</span>
+          age(t.created)}${costText(t)}${held(t)}</div>${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
   }).join("");
 }

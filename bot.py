@@ -31,8 +31,10 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import backfill
 import branches
+import costs
 import credentials
 import daemons
+import dedup
 import defer
 import drain
 import email_ingest
@@ -1521,6 +1523,22 @@ def land_or_drop(action: str, payload: dict) -> dict:
     return {"ok": True, "note": f"dropped; recover with {tag}" if tag else "dropped"}
 
 
+def _with_costs(items: list) -> list:
+    """Each task with `cost_total`: its own cost plus its reviews', and
+    whether that is complete. Copies -- the store's records are not touched."""
+    reviews = costs.reviews_by_parent(task_store.all().values())
+    return [dict(t, cost_total=costs.total(t, reviews.get(t.get("id"), ())))
+            for t in items]
+
+
+def _spend(project: str = "") -> dict:
+    """The last week's spend per project, for the panel's summary line."""
+    rows = costs.by_project(task_store.all().values())
+    if project:
+        rows = {k: v for k, v in rows.items() if k == project}
+    return {"spend": rows, "spend_line": costs.week_line(rows)}
+
+
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
@@ -1532,10 +1550,11 @@ def handle_tasks(payload: dict) -> dict:
         items = (task_store.by_state(state) if state
                  else sorted(task_store.all().values(),
                              key=lambda t: -(t.get("created") or 0)))
-        return {"ok": True, "tasks": _filter(items)[:200], "counts": task_store.counts()}
+        return {"ok": True, "tasks": _with_costs(_filter(items)[:200]),
+                "counts": task_store.counts(), **_spend(project)}
     if action == "attention":
-        return {"ok": True, "tasks": _filter(task_store.needs_attention()),
-                "counts": task_store.counts()}
+        return {"ok": True, "tasks": _with_costs(_filter(task_store.needs_attention())),
+                "counts": task_store.counts(), **_spend(project)}
     if action == "watching":
         # Scheduled wake-ups specifically, not everything parked in `blocked`:
         # a quota-blocked retry is the system waiting on itself, while a watch
@@ -2044,6 +2063,18 @@ def handle_file_task(payload: dict) -> dict:
                            open_now=open_now, slug=slug)
     if err:
         return {"ok": False, "error": err}
+
+    # A proposal the board already holds is refused, naming what it matched,
+    # so the ideator's reply says "already open as X" instead of the morning
+    # board saying it twice. Proposals only: work scoped with you in
+    # conversation was agreed by the person this check exists to spare. Only
+    # for a named project, for the same reason as the backlog count above.
+    if propose and slug:
+        err = dedup.duplicate(goal, task_store.by_project(slug), branches.survey,
+                              title=goal[:70])
+        if err:
+            log.info("refused a proposal from %s: %s", key, err)
+            return {"ok": False, "error": err, "duplicate": True}
 
     role = (payload.get("role") or roles.DEFAULT_FILED).strip()
     err = roles.validate_filed(role)
@@ -2831,7 +2862,8 @@ def execute_task(task: dict) -> None:
             # with no successor is a watch that quietly stopped watching, which
             # is the exact silence this whole mechanism exists to prevent.
             task_store.update(tid, session_id=result.session_id,
-                              result={"text": defer.QUIET, "cost": result.cost_usd})
+                              result={"text": defer.QUIET,
+                                      **costs.add_run(task_store.get(tid), result.cost_usd)})
             if task_store.has_pending_wakeup(key):
                 progress.delete()
                 task_state(tid, tasks.DONE, "nothing to report yet")
@@ -2899,8 +2931,11 @@ def execute_task(task: dict) -> None:
         progress.finalize(parts[0])
         for part in parts[1:]:
             app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
+        # Added to, not replaced: a task sent back for rework runs again under
+        # the same id, and overwriting would report only its last run.
         task_store.update(tid, session_id=result.session_id,
-                          result={"text": result.text[:4000], "cost": result.cost_usd,
+                          result={"text": result.text[:4000],
+                                  **costs.add_run(task_store.get(tid), result.cost_usd),
                                   "files_uploaded": uploaded})
         if loose and send_back_uncommitted(task, loose, channel, thread_ts):
             return
@@ -3043,7 +3078,8 @@ def send_back_uncommitted(task: dict, files: list[str], channel: str,
     return True
 
 
-def file_followups(task: dict, followups: list[str]) -> list[str]:
+def file_followups(task: dict, followups: list[str],
+                   duplicates: list | None = None) -> list[str]:
     """File a passing review's non-blocking findings as proposals.
 
     A review that passes the work completes it silently, and that rule is what
@@ -3086,9 +3122,26 @@ def file_followups(task: dict, followups: list[str]) -> list[str]:
         if err:
             log.warning("not filing a review followup on %s: %s", task["id"], err)
             continue
+        # The same refusal the nightly pass gets, and recorded the same way:
+        # a review is the other unattended producer of proposals, and a
+        # follow-up repeating open or unmerged work costs a decision for
+        # nothing. Said back to the caller, so the verdict shows what matched.
+        title = f"From review: {finding[:52]}"
+        # Not against the task under review, or the job it belongs to: a
+        # follow-up is found next to that work and shares its words, and is
+        # by definition not part of it.
+        dup = (dedup.duplicate(goal, task_store.by_project(proj), branches.survey,
+                               title=title,
+                               exclude={task["id"], task.get("root") or task["id"]})
+               if proj else "")
+        if dup:
+            log.info("not filing a review followup on %s: %s", task["id"], dup)
+            if duplicates is not None:
+                duplicates.append(dup)
+            continue
         try:
             child = task_store.create(
-                goal, title=f"From review: {finding[:52]}", role="implementor",
+                goal, title=title, role="implementor",
                 project=proj, state=tasks.PROPOSED, driver="queue",
                 # Filed work: whoever picks it up starts fresh, so it gets its
                 # own checkout rather than whatever tree you are mid-edit in.
@@ -3174,12 +3227,15 @@ def resolve_review(task: dict, role_name: str, text: str,
     # those go out as proposals, so they reach the same view by the route
     # built for things worth a decision but not an interruption.
     filed: list[str] = []
+    duplicates: list[str] = []
     if parent and verdict["ok"] and verdict["followups"]:
         try:
-            filed = file_followups(parent, verdict["followups"])
+            filed = file_followups(parent, verdict["followups"], duplicates)
         except Exception:
             log.exception("filing review followups for %s failed", parent_id)
     verdict = {**verdict, "filed": filed}
+    if duplicates:
+        verdict["duplicates"] = duplicates
 
     note = (":white_check_mark: *Review passed* — " if verdict["ok"]
             else ":mag: *Review flagged this* — ") + (verdict["summary"] or "")
@@ -3191,6 +3247,9 @@ def resolve_review(task: dict, role_name: str, text: str,
         note += "\n" + "\n".join(f"• {f}" for f in verdict["followups"])
         if filed:
             note += "\n" + "  ".join(f"`{i}`" for i in filed)
+        if duplicates:
+            note += "\n_Not filed, already on the board:_\n" + "\n".join(
+                f"• {d.rsplit(' — not filed', 1)[0]}" for d in duplicates)
     if verdict["unverified"]:
         note += "\n_The review could not check:_ " + "; ".join(verdict["unverified"])
     try:
@@ -3739,7 +3798,9 @@ def run_ideation(slug: str) -> dict:
         f"at most {scoping.MAX_PROPOSALS} of them, fewer if fewer are "
         "warranted, and none at all if the project is in good shape. Each goal "
         "must stand alone: whoever picks it up will not have read this.\n\n"
-        "Then say what you looked at and what you filed."
+        "A filing refused as a duplicate names the task it matched; do not "
+        "rephrase it to get it past the check. Then say what you looked at, "
+        "what you filed, and what was refused as a duplicate of what."
     )
     board = task_store.by_project(slug)
 

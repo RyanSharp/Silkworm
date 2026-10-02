@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 
+import costs
 import slacklinks
 import tasks
 
@@ -176,7 +177,8 @@ def _detail(task: dict) -> str:
     return ""
 
 
-def _task_blocks(task: dict, now: float, base_url: str) -> list[dict]:
+def _task_blocks(task: dict, now: float, base_url: str,
+                 cost: str = "") -> list[dict]:
     tid = task.get("id", "")
     meta = [f"`{tid}`"]
     if task.get("project"):
@@ -184,6 +186,8 @@ def _task_blocks(task: dict, now: float, base_url: str) -> list[dict]:
     if task.get("role") and task.get("role") != "assistant":
         meta.append(esc(task["role"]))
     meta.append(ago(task.get("updated") or task.get("created"), now))
+    if cost:
+        meta.append(cost)
     body = f"*{esc(clip(label(task), 150))}*"
     detail = _detail(task)
     if detail:
@@ -216,7 +220,7 @@ def _summary_line(task: dict) -> str:
     return ""
 
 
-def _task_line(task: dict, now: float, base_url: str) -> dict:
+def _task_line(task: dict, now: float, base_url: str, cost: str = "") -> dict:
     """A task as one section with its actions in a menu.
 
     The board used to spend three blocks on each task -- title, context,
@@ -230,6 +234,10 @@ def _task_line(task: dict, now: float, base_url: str) -> dict:
     if task.get("project"):
         meta.append(esc(task["project"]))
     meta.append(ago(task.get("updated") or task.get("created"), now))
+    # What it cost so far, its reviews included: the figure that says whether
+    # a rework or another night on it is worth it. A `+` marks a floor.
+    if cost:
+        meta.append(cost)
     line = esc(clip(_summary_line(task), 110))
     text = f"*{esc(clip(label(task), 90))}*\n{' · '.join(m for m in meta if m)}" + \
         (f" — _{line}_" if line else "")
@@ -317,6 +325,10 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     running = sorted((t for t in items if t.get("state") == tasks.RUNNING),
                      key=lambda t: -(t.get("updated") or 0))
     queued = [t for t in items if t.get("state") == tasks.QUEUED]
+    reviews = costs.reviews_by_parent(items)
+
+    def cost_of(t):
+        return costs.fmt(costs.total(t, reviews.get(t.get("id"), ())))
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "Silkworm"}},
@@ -326,6 +338,9 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
             f"*{len(attention)}* need you · *{len(running)}* running · "
             f"*{len(queued)}* queued · updated {time.strftime('%H:%M', time.localtime(now))}")]},
     ]
+    spend = costs.week_line(costs.by_project(items, now))
+    if spend:
+        blocks[2]["elements"].append(_text(f":moneybag: {esc(spend)}"))
     if notice:
         blocks.insert(1, {"type": "section", "block_id": "home:notice", "text": _text(notice)})
 
@@ -341,7 +356,8 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
             chunk += [{"type": "divider"},
                       {"type": "section", "text": _text(
                           f"*{HEADINGS.get(current, esc(current))}* ({count})")}]
-        chunk += [_task_line(t, now, base_url)] if compact else _task_blocks(t, now, base_url)
+        chunk += ([_task_line(t, now, base_url, cost_of(t))] if compact
+                  else _task_blocks(t, now, base_url, cost_of(t)))
         # Room kept for the tail sections (running, watching, unmerged).
         if shown >= max_attention or len(blocks) + len(board) + len(chunk) > max_blocks - 12:
             break
