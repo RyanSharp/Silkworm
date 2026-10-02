@@ -99,10 +99,20 @@ Day-to-day management (macOS today; Linux/systemd planned):
 
 ```sh
 silkworm status      # services, bot, visualizer, hooks, revision — one health check
-silkworm restart     # bounce both services (e.g. after git pull, or a landing)
+silkworm deploy      # load new code without killing work: drain, wait, restart, confirm
+silkworm restart     # bounce both services now, killing whatever turn is running
 silkworm logs        # tail the bot log
 silkworm uninstall   # remove the services (repo and sessions untouched)
 ```
+
+`silkworm deploy` is the one to load new code with. It refuses unless the
+checkout is clean on its base branch and `silkworm test` passes, then asks the
+bot to drain (the queue runner claims nothing new; running turns carry on),
+waits until nothing has been running for 30s, restarts, and checks the bot is
+back, connected to Slack, and running the checkout's HEAD. It gives up without
+restarting after `--max-wait` (default 2h); `--now` skips the wait. A queued
+task a restart does interrupt is resumed in its own session and checkout when
+it next runs, rather than started over.
 
 Tip: put it on your PATH — `ln -s ~/workspace/Silkworm/bin/silkworm /usr/local/bin/silkworm`.
 

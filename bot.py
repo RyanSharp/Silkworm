@@ -34,6 +34,7 @@ import branches
 import credentials
 import daemons
 import defer
+import drain
 import email_ingest
 import harvester
 import home
@@ -204,6 +205,11 @@ RUNNING_TASKS: dict[str, object] = {}
 #: the queue runner stops claiming until it is plausibly over instead of
 #: walking the whole queue into the same wall. See retry.Hold.
 RUNNER_HOLD = retry.Hold()
+#: Set by `silkworm deploy` before a restart: the runner claims nothing new
+#: while what is already running finishes. In this process only, and with a
+#: deadline, so neither the restart nor an abandoned deploy can leave the queue
+#: stopped. See drain.py.
+DRAIN = drain.Drain()
 ACTIVE_SESSIONS: dict[str, tuple[str, str]] = {}  # session_id -> (channel, thread_ts)
 _seen_events: OrderedDict[str, None] = OrderedDict()
 _users_cache: dict[str, str] = {}
@@ -1256,7 +1262,32 @@ def handle_status(payload: dict) -> dict:
             "revision": revision.state(BASE_DIR, REVISION),
             "daemons": daemons.status(),
             "runner_hold": {"seconds": round(RUNNER_HOLD.remaining()),
-                            "reason": RUNNER_HOLD.reason()[:160]}}
+                            "reason": RUNNER_HOLD.reason()[:160]},
+            "drain": {"seconds": round(DRAIN.remaining()),
+                      "reason": DRAIN.reason()[:160]}}
+
+
+def handle_drain(payload: dict) -> dict:
+    """Route for /drain -- `silkworm deploy` readying this process to restart.
+
+    `start` stops the runner claiming for `seconds` (capped; it lapses on its
+    own), `stop` lifts it, `status` only reports. Every answer says what a
+    restart now would kill, so the deploy can wait on that and name it.
+    """
+    action = payload.get("action") or "status"
+    if action == "start":
+        DRAIN.start(payload.get("seconds") or drain.DEFAULT_S,
+                    why=str(payload.get("why") or "deploy")[:120])
+    elif action == "stop":
+        DRAIN.stop()
+    elif action != "status":
+        return {"ok": False, "error": f"unknown action {action!r}"}
+    return {"ok": True, "draining": DRAIN.remaining() > 0,
+            "seconds": round(DRAIN.remaining()),
+            "running": drain.busy(list(task_store.all().values()),
+                                  landing=set(_landing_now),
+                                  live=set(RUNNING_TASKS)),
+            "revision": REVISION.get("sha") or ""}
 
 
 def handle_web_message(payload: dict) -> dict:
@@ -2068,6 +2099,7 @@ def handle_hide(payload: dict) -> dict:
 server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
+server.route("/drain", handle_drain)
 server.route("/web-message", handle_web_message)
 server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
@@ -2259,6 +2291,9 @@ def handle_prompt(event: dict, say, client) -> None:
                 # A new session has no id until now; recovery needs it to find
                 # the transcript if this process dies mid-turn.
                 recovery.note_session(store, key, sid)
+                # And the task's record says which session it is from the
+                # start, not only once the turn has finished.
+                task_store.update(task_id, session_id=sid)
 
             def on_activity(name: str, tool_input: dict) -> None:
                 worked[0] = True
@@ -2590,6 +2625,25 @@ def execute_task(task: dict) -> None:
     key = f"{channel}:{thread_ts}"
     progress = ProgressMessage(app.client, channel, thread_ts)
 
+    # A turn a restart killed is resumed, not redone. Its checkpoint names the
+    # session it was running (written the moment that session began), and the
+    # session holds the goal and everything already done towards it -- running
+    # the goal again from a fresh session re-spent all of that, on every one of
+    # the restarts that kept interrupting work. One shot: the turn's end (the
+    # finally below) takes it off the record, so a failure is retried as
+    # ordinary work; only another kill leaves one. Without a transcript there
+    # is nothing to resume, and the run starts fresh as before.
+    resume_sid = (task.get("checkpoint") or {}).get("session_id") or ""
+    lost_sid = ""
+    if resume_sid and not harvester.find_transcript(resume_sid):
+        log.warning("task %s: interrupted session %s has no transcript on disk; "
+                    "starting it fresh", tid, resume_sid[:8])
+        lost_sid, resume_sid = resume_sid, ""
+    if resume_sid:
+        log.info("task %s: resuming session %s after a restart", tid, resume_sid[:8])
+        progress.update(":arrows_counterclockwise: _Resuming where a restart "
+                        "interrupted this…_")
+
     # Self-contained work in a repository gets its own checkout. It cannot then
     # leave your working tree dirty or on another branch, and it no longer
     # queues behind a conversation about the same repo. Only self-contained
@@ -2642,7 +2696,14 @@ def execute_task(task: dict) -> None:
     elif (tasks.isolated(task) and worktrees.is_repo(cwd)
             and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
-        worktree = worktrees.create(cwd, tid, base=scope.get("branch") or "")
+        # A resumed session goes back to the checkout it was working in: its
+        # edits are there, and so are its commits. The directory normally
+        # survives the restart (create() hands back one that exists); if it
+        # did not, the branch did, and is reattached -- create() would treat a
+        # leftover branch as half-made and start from the base without it.
+        worktree = ((worktrees.attach(cwd, tid, worktrees.BRANCH_PREFIX + tid, label="")
+                     if resume_sid else None)
+                    or worktrees.create(cwd, tid, base=scope.get("branch") or ""))
         if worktree:
             cwd = worktree
             task_store.update(tid, scope={**scope, "worktree": str(worktree)})
@@ -2672,10 +2733,18 @@ def execute_task(task: dict) -> None:
         with lock, repo_guard(cwd, progress):
             entry = store.get(key) or {}
             # A fresh role starts its own session; resuming the thread's would
-            # hand the reviewer the very conversation it is meant to audit.
-            session_id = None if fresh else (task.get("session_id") or entry.get("session_id"))
+            # hand the reviewer the very conversation it is meant to audit. An
+            # interrupted turn's own session is not that: it is this task's,
+            # whatever the role, and it is resumed.
+            if resume_sid:
+                session_id, prompt = resume_sid, tasks.RESUME_PROMPT
+            else:
+                session_id = None if fresh else (task.get("session_id") or entry.get("session_id"))
+                if session_id and session_id == lost_sid:
+                    session_id = None        # gone from disk; --resume would fail
+                prompt = task.get("goal", "")
             recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
-                                  session_id=session_id, prompt=task.get("goal", ""))
+                                  session_id=session_id, prompt=prompt)
             begin_turn(key)
             outbox.mkdir(parents=True, exist_ok=True)
 
@@ -2690,7 +2759,7 @@ def execute_task(task: dict) -> None:
 
             try:
                 result = run_turn(
-                    task.get("goal", ""), session_id=session_id,
+                    prompt, session_id=session_id,
                     binary=CLAUDE_BIN, cwd=cwd,
                     permission_args=roles.permission_args(role_name, permission_args(),
                                                         bin=SILKWORM_BIN),
@@ -2698,7 +2767,12 @@ def execute_task(task: dict) -> None:
                     append_system_prompt=system_note, extra_args=CLAUDE_EXTRA_ARGS,
                     env=claude_env(key, task.get("defers") or 0, role=role_name),
                     timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
-                    on_init=lambda sid: task_store.update(tid, session_id=sid),
+                    # The moment the session exists, not when the turn ends:
+                    # a restart kills the turn before it ends, and then this
+                    # is the only record of what to resume.
+                    on_init=lambda sid: task_store.update(
+                        tid, session_id=sid,
+                        checkpoint={"session_id": sid, "at": time.time()}),
                     on_activity=on_activity,
                     on_start=on_start,
                 )
@@ -2823,6 +2897,12 @@ def execute_task(task: dict) -> None:
                 worktrees.release(worktree, delete_empty_branch=not borrowed)
             except Exception:
                 log.exception("could not release worktree %s", worktree)
+        # The turn ended here, in this process, so there is nothing to resume.
+        # Only a turn killed outright -- by a restart -- leaves one behind.
+        try:
+            task_store.update(tid, checkpoint=None)
+        except Exception:
+            log.exception("could not clear the checkpoint on %s", tid)
         RUNNING.pop(key, None)
         RUNNING_TASKS.pop(tid, None)
         recovery.clear_pending(store, key)
@@ -3761,6 +3841,12 @@ def _task_worker(n: int) -> None:
             held = RUNNER_HOLD.remaining()
             if held:
                 time.sleep(min(held, TASK_POLL_S))
+                continue
+            # Draining for a restart: what is running finishes, nothing new
+            # starts, so the restart has nothing left to kill.
+            draining = DRAIN.remaining()
+            if draining:
+                time.sleep(min(draining, TASK_POLL_S))
                 continue
             task = task_store.claim()
             if task and hold_unsupervised(task):

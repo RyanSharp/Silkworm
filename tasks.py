@@ -135,7 +135,10 @@ FIELDS: dict[str, tuple] = {
     "scope":       (dict,  "{repo, cwd, branch, worktree, paths} — where it may act"),
     "thread":      ("",    "Slack thread key for narration, if any"),
     "session_id":  (None,  "Claude Code session executing it"),
-    "checkpoint":  (None,  "in-flight marker; recovery.py's pending, generalised"),
+    # Written the moment a queued turn's session exists (on_init) and cleared
+    # when the turn ends, so one still here after a restart is a turn that was
+    # killed part-way -- and names the session to resume rather than redo.
+    "checkpoint":  (None,  "{session_id, at} of the turn in flight, if any"),
     "parent":      (None,  "task that spawned this one"),
     "root":        (None,  "top-level task this belongs to"),
     "blocked_on":  (list,  "task ids that must finish first"),
@@ -215,6 +218,17 @@ def make(goal: str, **fields) -> dict:
     if not roles.known(task["role"]):
         raise ValueError(f"unknown role {task['role']!r}")
     return task
+
+
+#: What a turn killed by a restart is resumed with, in place of its goal. The
+#: session already holds the goal and everything done towards it; restating the
+#: goal reads as "start again", which is the cost this exists to avoid.
+RESUME_PROMPT = (
+    "Your previous turn on this task was interrupted by a Silkworm restart "
+    "before it finished. Carry on from where you were. Check the actual state "
+    "first (git status, git log, files you were editing) -- some of the work "
+    "may already be done or committed -- then finish the task and report the "
+    "outcome as you would have.")
 
 
 #: Sources whose work is a conversation with you, or a continuation of one.
@@ -538,15 +552,25 @@ class TaskStore:
         A queue task in `running` with nobody running it cannot make progress,
         so it is recorded as interrupted and put back. Inline tasks are left
         alone: recovery.py already rescues their reply from the transcript.
+
+        Put back to be *resumed*, not redone. Its checkpoint -- the session the
+        killed turn was running, recorded when that session began -- and its
+        worktree are both left exactly where they are: the runner resumes the
+        session in the same checkout when it next claims the task. Clearing
+        either here would start the work again from nothing, which is what
+        every restart used to cost.
         """
         moved = 0
         for tid, rec in list(self._data.items()):
             if rec.get("state") != RUNNING or rec.get("driver") != "queue":
                 continue
+            sid = (rec.get("checkpoint") or {}).get("session_id") or ""
             # _release=False: it is going straight back in the queue, so
             # anything blocked on it has not actually lost its blocker.
             self.transition(tid, FAILED, "interrupted by a restart", _release=False)
-            self.transition(tid, QUEUED, "requeued after a restart")
+            self.transition(tid, QUEUED,
+                            f"requeued after a restart; will resume session {sid[:8]}"
+                            if sid else "requeued after a restart")
             moved += 1
         return moved
 

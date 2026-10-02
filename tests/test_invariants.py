@@ -844,8 +844,11 @@ def test_review_sees_the_work():
     gate = src[src.index("def resolve_review("):src.index("def land_if_ready(")]
     fn = next(n for n in ast.walk(ast.parse(src))
               if isinstance(n, ast.FunctionDef) and n.name == "execute_task")
+    # The review's checkout is the detached one; the other attach is a resumed
+    # task getting its own branch back after a restart.
     calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-             and getattr(n.func, "attr", "") == "attach"]
+             and getattr(n.func, "attr", "") == "attach"
+             and any(k.arg == "detach" for k in n.keywords)]
     check("execute_task checks out the branch under review",
           len(calls) == 1 and any(k.arg == "label" for k in calls[0].keywords),
           "without this the reviewer runs in whatever scope it inherited")
@@ -8582,8 +8585,14 @@ def test_revision_drift():
     check("and a path that cannot be resolved is not", own("") is False)
 
     cli = (BASE / "bin" / "silkworm").read_text()
+    # Scoped to do_status: `deploy` resolves HEAD itself, to compare with
+    # what the bot reports -- status must not.
+    status_src = ast.get_source_segment(cli, next(
+        n for n in ast.walk(ast.parse(cli))
+        if isinstance(n, ast.FunctionDef) and n.name == "do_status"))
     check("silkworm status reads the bot's revision, not git",
-          'bot.get("revision")' in cli and "rev-parse" not in cli)
+          'bot.get("revision")' in status_src and "rev-parse" not in status_src
+          and "git_out" not in status_src)
     # Asserted on the call, not on the text: the sentence can be present while
     # being handed to a check that passes, which is the failure it warns about.
     status = next(n for n in ast.walk(ast.parse(cli))
@@ -8838,7 +8847,7 @@ def test_dead_background_threads_are_reported():
                 t.join(5)
         ns = bot_functions(
             "handle_status", store=types.SimpleNamespace(all=lambda: {}), RUNNING={},
-            RUNNER_HOLD=__import__("retry").Hold(),
+            RUNNER_HOLD=__import__("retry").Hold(), DRAIN=__import__("drain").Drain(),
             credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
             slack=types.SimpleNamespace(status=lambda now: {}),
             revision=types.SimpleNamespace(state=lambda *a: {}),
@@ -9126,7 +9135,7 @@ def _outage_harness():
     # here every project is ready, so the hold under test is the only one.
     worker = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
                        hold_unsupervised=lambda task: False,
-                       RUNNER_HOLD=hold, TASK_POLL_S=5, log=logging.getLogger("test"),
+                       RUNNER_HOLD=hold, DRAIN=__import__("drain").Drain(), TASK_POLL_S=5, log=logging.getLogger("test"),
                        time=types.SimpleNamespace(sleep=idle, time=time.time))
 
     def one_pass():
@@ -10121,6 +10130,512 @@ def test_restart_waits_for_ports():
                       code == want, f"exit {code}")
     finally:
         cli.service_manager, sys.argv = real, argv
+
+
+
+# --- deploy drains instead of killing --------------------------------------------
+# The bot restarted 13 times in 10 days (2026-09-18..10-01) to load new code.
+# Every restart killed the turn running at the time -- nine runs ended exit
+# 143 -- and an interrupted queue task started over, re-spending its session.
+
+def _load_cli():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("silkworm_cli_deploy",
+                                                  str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("silkworm_cli_deploy", loader)
+    cli = importlib.util.module_from_spec(spec)
+    loader.exec_module(cli)
+    return cli
+
+
+def test_drain_lapses_and_holds_the_runner():
+    import drain as D
+    import retry as R
+    import tasks as T
+    from tasks import TaskStore
+    print("\ndraining stops the runner claiming, and lapses on its deadline")
+
+    d = D.Drain()
+    check("a new drain is not draining", d.remaining() == 0)
+    t0 = 1_000_000.0
+    d.start(600, now=t0)
+    check("a drain holds until its deadline",
+          d.remaining(now=t0 + 599) > 0 and d.remaining(now=t0 + 601) == 0,
+          f"{d.remaining(now=t0 + 599)} / {d.remaining(now=t0 + 601)}")
+    d.start(10 * 86400, now=t0)
+    check("however long it is asked for, it is capped",
+          d.remaining(now=t0 + D.CAP_S + 1) == 0)
+    d.start(600)
+    check("stop lifts it", d.stop() and d.remaining() == 0)
+
+    # The real worker, over a real store, held by a real drain.
+    class Idle(BaseException):
+        pass
+    root = Path(tempfile.mkdtemp())
+    st = TaskStore(root / "t.json")
+    tid = st.create("queued work", driver="queue", source="ui",
+                    scope={"cwd": str(root)})["id"]
+    ran = []
+    def idle(_s):
+        raise Idle()
+    dr = D.Drain()
+    worker = _bot_func("_task_worker", task_store=st,
+                       execute_task=lambda task: ran.append(task["id"]),
+                       hold_unsupervised=lambda task: False,
+                       RUNNER_HOLD=R.Hold(), DRAIN=dr, TASK_POLL_S=5,
+                       log=logging.getLogger("test"),
+                       time=types.SimpleNamespace(sleep=idle, time=time.time))
+    def one_pass():
+        try:
+            worker(0)
+        except Idle:
+            pass
+    dr.start(3600)
+    one_pass()
+    check("the runner claims nothing while draining",
+          not ran and st.get(tid)["state"] == T.QUEUED, f"{ran} {st.get(tid)['state']}")
+    # A deploy that died part-way: its drain's time is up, nobody stopped it.
+    dr.start(60, now=time.time() - 120)
+    one_pass()
+    check("and claims again once the drain's deadline passes, unstopped",
+          ran == [tid], str(ran))
+
+    # The route: what a restart would kill, any driver, plus live landings.
+    for title, driver in (("a slack turn", "inline"), ("a queued task", "queue")):
+        x = st.create(title, driver=driver, source="ui", scope={"cwd": str(root)})
+        st.transition(x["id"], T.RUNNING, "go")
+    st.create("still queued", driver="queue", source="ui", scope={"cwd": str(root)})
+    dr2 = D.Drain()
+    handle = _bot_func("handle_drain", DRAIN=dr2, drain=D, task_store=st,
+                       _landing_now={"tsk_landing"}, RUNNING_TASKS={},
+                       REVISION={"sha": "abc"})
+    r = handle({"action": "start", "seconds": 900})
+    titles = sorted(row["title"] for row in r["running"])
+    check("/drain start drains, with the deadline asked for",
+          r["ok"] and r["draining"] and 0 < dr2.remaining() <= 900, str(r)[:200])
+    check("every running task counts, Slack conversations included",
+          {"a slack turn", "a queued task"} <= set(titles) and "still queued" not in titles,
+          str(titles))
+    check("a landing in flight counts too",
+          any(row["kind"] == "landing" and row["id"] == "tsk_landing" for row in r["running"]))
+    check("a running record no child holds is marked, not hidden",
+          all(row["live"] is False for row in r["running"] if row["kind"] == "task"))
+    r = handle({"action": "stop"})
+    check("/drain stop lifts it", r["ok"] and not r["draining"] and dr2.remaining() == 0)
+    check("an unknown action is refused, not read as status",
+          handle({"action": "pause"})["ok"] is False)
+
+
+class _FakeBot:
+    """The bot's HTTP API as `silkworm deploy` sees it, on a fake clock."""
+
+    def __init__(self, clock, running_until=0.0, head="h" * 40, drain_ok=True,
+                 connected=True, boots=None):
+        self.clock, self.running_until = clock, running_until
+        self.head, self.drain_ok, self.connected = head, drain_ok, connected
+        self.boots = boots or head
+        self.draining, self.drain_calls, self.restarted_at = False, [], None
+        self.gaps = []          # (from, to) windows with nothing running
+
+    def running(self):
+        t = self.clock()
+        if self.restarted_at is not None:
+            return []
+        if any(a <= t < b for a, b in self.gaps):
+            return []
+        if t < self.running_until:
+            return [{"id": "tsk_busy", "kind": "task", "title": "long turn",
+                     "driver": "queue", "live": True}]
+        return []
+
+    def __call__(self, path, payload):
+        if path == "/status":
+            if self.restarted_at is not None:
+                return {"online": True, "slack": {"connected": self.connected},
+                        "revision": {"started": self.boots}}
+            return {"online": True, "slack": {"connected": True},
+                    "revision": {"started": "old"}}
+        if path == "/drain":
+            if not self.drain_ok:
+                return {}
+            self.drain_calls.append(dict(payload))
+            if payload.get("action") == "start":
+                self.draining = True
+            elif payload.get("action") == "stop":
+                self.draining = False
+            return {"ok": True, "draining": self.draining, "running": self.running()}
+        return {}
+
+
+def _deploy(cli, argv, bot, clock, restarts, *, git=None, suite=lambda: 0):
+    class Mgr:
+        def restart(self):
+            restarts.append(clock())
+            bot.restarted_at = clock()
+            return True
+    def fake_git(repo, *args):
+        if args[:1] == ("rev-parse",) and "--abbrev-ref" in args:
+            return 0, "main"
+        if args[:1] == ("rev-parse",):
+            return 0, bot.head
+        if args[:1] == ("status",):
+            return 0, ""
+        return 1, ""
+    t = [0.0]
+    def sleep(s):
+        t[0] += s
+    clock.__dict__["t"] = t
+    out = io.StringIO()
+    saved = os.environ.pop("SILKWORM_THREAD", None)
+    try:
+        with contextlib.redirect_stdout(out):
+            code = cli.do_deploy(argv, repo=Path("/nonexistent"), call=bot,
+                                 manager=Mgr(), git=git or fake_git, suite=suite,
+                                 clock=lambda: t[0], sleep=sleep, confirm_s=10)
+    finally:
+        if saved is not None:
+            os.environ["SILKWORM_THREAD"] = saved
+    return code, out.getvalue(), t
+
+
+def test_deploy_waits_then_restarts_onto_head():
+    print("\nsilkworm deploy drains, waits for quiet, restarts, confirms")
+    cli = _load_cli()
+
+    class Clock:
+        def __call__(self):
+            return self.t[0]
+    clock = Clock(); clock.t = [0.0]
+
+    # Busy for ten minutes, then quiet.
+    restarts = []
+    bot = _FakeBot(clock, running_until=600)
+    code, out, t = _deploy(cli, [], bot, clock, restarts)
+    check("a deploy waits out the running turn, then restarts and succeeds",
+          code == 0 and len(restarts) == 1, f"code={code} restarts={restarts}\n{out}")
+    check("it restarts only after 30s with nothing running",
+          restarts and restarts[0] >= 600 + cli.DEPLOY_QUIET_S, str(restarts))
+    starts = [c for c in bot.drain_calls if c.get("action") == "start"]
+    check("the drain asked for outlasts the wait, and is bounded",
+          starts and cli.DEPLOY_MAX_WAIT_S < starts[0]["seconds"]
+          <= cli.DEPLOY_MAX_WAIT_S + cli.DEPLOY_DRAIN_MARGIN_S, str(starts))
+    check("it says what it is waiting on while it waits",
+          "waiting on 1 running" in out and "tsk_busy" in out, out)
+    check("each confirmation step is reported",
+          "connected to slack" in out and "the checkout's HEAD" in out, out)
+
+    # A gap shorter than the quiet window is not quiet.
+    restarts = []
+    bot = _FakeBot(clock, running_until=600)
+    bot.gaps = [(100, 120)]
+    _deploy(cli, [], bot, clock, restarts)
+    check("a 20s lull between turns does not count as quiet",
+          restarts and restarts[0] >= 600 + cli.DEPLOY_QUIET_S, str(restarts))
+
+    # Never quiet: give up, do not restart, lift the drain, say what was running.
+    restarts = []
+    bot = _FakeBot(clock, running_until=10 ** 9)
+    code, out, t = _deploy(cli, ["--max-wait", "10m"], bot, clock, restarts)
+    check("still busy at --max-wait: no restart, and a failing exit",
+          code != 0 and not restarts, f"code={code} restarts={restarts}")
+    check("it gives up at the max wait, not before or long after",
+          600 <= t[0] < 700, f"{t[0]}")
+    check("the drain is lifted when it gives up",
+          bot.drain_calls[-1].get("action") == "stop" and not bot.draining,
+          str(bot.drain_calls[-1:]))
+    check("and it names what was still running",
+          "still busy" in out and "tsk_busy" in out.split("still busy", 1)[1], out)
+
+    # --now: no wait.
+    restarts = []
+    bot = _FakeBot(clock, running_until=10 ** 9)
+    code, out, t = _deploy(cli, ["--now"], bot, clock, restarts)
+    check("--now restarts without waiting, naming what it interrupts",
+          code == 0 and restarts == [0.0] and "tsk_busy" in out, f"{code} {restarts}\n{out}")
+
+    # Confirmation is checked, not assumed.
+    for label, kw in (("on another revision", {"boots": "b" * 40}),
+                      ("not connected to Slack", {"connected": False})):
+        restarts = []
+        bot = _FakeBot(clock, **kw)
+        code, out, t = _deploy(cli, [], bot, clock, restarts)
+        check(f"a bot that comes back {label} fails the deploy",
+              code != 0 and restarts, f"code={code}\n{out}")
+
+    # A bot too old to drain is not quietly restarted under running work.
+    restarts = []
+    bot = _FakeBot(clock, running_until=10 ** 9, drain_ok=False)
+    code, out, t = _deploy(cli, [], bot, clock, restarts)
+    check("a bot that cannot drain is refused without --now",
+          code != 0 and not restarts and "--now" in out, out)
+
+    # From inside a turn it would wait on itself and then kill itself. The
+    # same deploy outside a turn goes ahead, so the refusal is the turn's doing.
+    saved = os.environ.get("SILKWORM_THREAD")
+    try:
+        for inside in (False, True):
+            restarts = []
+            bot = _FakeBot(clock)
+            os.environ.pop("SILKWORM_THREAD", None)
+            if inside:
+                os.environ["SILKWORM_THREAD"] = "C1:1.0"
+            class Mgr:
+                def restart(self):
+                    restarts.append(1)
+                    bot.restarted_at = 0
+                    return True
+            def fake_git(repo, *args):
+                if "--abbrev-ref" in args:
+                    return 0, "main"
+                return (0, bot.head) if args[:1] == ("rev-parse",) else (
+                    (0, "") if args[:1] == ("status",) else (1, ""))
+            out = io.StringIO()
+            t = [0.0]
+            with contextlib.redirect_stdout(out):
+                code = cli.do_deploy([], repo=Path("/nonexistent"), call=bot,
+                                     manager=Mgr(), suite=lambda: 0, git=fake_git,
+                                     clock=lambda: t[0],
+                                     sleep=lambda s: t.__setitem__(0, t[0] + s),
+                                     confirm_s=10)
+            if inside:
+                check("deploy refuses to run from inside a Silkworm turn",
+                      code != 0 and not bot.drain_calls and not restarts, out.getvalue())
+            else:
+                check("(the same deploy outside a turn goes ahead)",
+                      code == 0 and restarts, out.getvalue())
+    finally:
+        if saved is None:
+            os.environ.pop("SILKWORM_THREAD", None)
+        else:
+            os.environ["SILKWORM_THREAD"] = saved
+
+    # And the CLI dispatches it.
+    real, argv = cli.do_deploy, sys.argv
+    try:
+        cli.do_deploy = lambda a: 7 if a == ["--now"] else 0
+        sys.argv = ["silkworm", "deploy", "--now"]
+        try:
+            cli.main(); code = 0
+        except SystemExit as e:
+            code = e.code
+        check("`silkworm deploy` exits with do_deploy's status, args after the subcommand",
+              code == 7, f"exit {code}")
+    finally:
+        cli.do_deploy, sys.argv = real, argv
+
+
+def test_deploy_preflight_refuses_unfit_checkouts():
+    print("\nsilkworm deploy refuses a checkout it should not become")
+    cli = _load_cli()
+    root = Path(tempfile.mkdtemp())
+    repo = root / "repo"; repo.mkdir()
+    def git(*a): return subprocess.run(["git", *a], cwd=str(repo),
+                                       capture_output=True, text=True)
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (repo / "a.txt").write_text("a\n")
+    git("add", "-A"); git("commit", "-qm", "base")
+
+    ran = []
+    def suite(rc):
+        def run():
+            ran.append(rc)
+            return rc
+        return run
+    def pre(skip, rc):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cli.deploy_preflight(repo, skip, suite=suite(rc))
+
+    ok = pre(False, 0)
+    check("a clean main that passes its tests may deploy", ok == [] and ran == [0], str(ok))
+    (repo / "loose.txt").write_text("untracked is fine\n")
+    check("untracked files do not count as uncommitted", pre(True, 0) == [])
+
+    ran.clear()
+    bad = pre(False, 1)
+    check("a failing suite refuses", any("test suite fails" in p for p in bad), str(bad))
+    ran.clear()
+    check("--skip-tests does not run it", pre(True, 1) == [] and ran == [])
+
+    (repo / "a.txt").write_text("edited\n")
+    bad = pre(True, 0)
+    check("uncommitted tracked changes refuse", any("uncommitted" in p for p in bad), str(bad))
+    git("checkout", "-q", "--", "a.txt")
+
+    git("checkout", "-qb", "feature")
+    bad = pre(True, 0)
+    check("a checkout off its base branch refuses",
+          any("not main" in p for p in bad), str(bad))
+    ran.clear()
+    pre(False, 0)
+    check("and does not spend the suite on a refusal", ran == [])
+
+    # The full command stops at preflight: nothing drained, nothing restarted.
+    calls = []
+    saved = os.environ.pop("SILKWORM_THREAD", None)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = cli.do_deploy([], repo=repo, call=lambda p, b: calls.append(p) or {},
+                                 manager=types.SimpleNamespace(
+                                     restart=lambda: calls.append("restart")),
+                                 suite=suite(0))
+    finally:
+        if saved is not None:
+            os.environ["SILKWORM_THREAD"] = saved
+    check("a refused deploy touches neither the bot nor the services",
+          code != 0 and calls == [], str(calls))
+
+    check("durations parse as the usage says",
+          (cli.parse_duration("90"), cli.parse_duration("15m"), cli.parse_duration("2h"))
+          == (90, 900, 7200))
+
+
+# --- an interrupted task resumes its session, it does not start over ------------
+
+def _resume_harness(repo, st, sess, transcripts, seen):
+    import shutil, threading, logging
+    import tasks as T, roles, worktrees as W
+
+    def run_turn(prompt, **kw):
+        seen.append({"prompt": prompt, "session_id": kw.get("session_id"),
+                     "cwd": Path(kw["cwd"]),
+                     "files": sorted(p.name for p in Path(kw["cwd"]).iterdir())})
+        kw["on_init"]("sess-new")
+        return types.SimpleNamespace(text="done", cost_usd=0.0, duration_ms=1,
+                                     session_id="sess-new")
+    return _bot_func(
+        "execute_task", tasks=T, task_store=st, store=sess, roles=roles,
+        review_branch=lambda task: None, worktrees=W, Path=Path, time=time,
+        run_turn=run_turn, shutil=shutil,
+        harvester=types.SimpleNamespace(
+            find_transcript=lambda sid: Path(f"/x/{sid}.jsonl") if sid in transcripts else None),
+        OUTBOX_ROOT=repo.parent / "outbox", SILKWORM_BIN="/x/silkworm",
+        permission_args=lambda: [], log=logging.getLogger("test"),
+        task_thread=lambda t: ("C1", "1.0"),
+        task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+        _thread_lock=lambda key: threading.Lock(),
+        repo_guard=lambda *a, **k: contextlib.nullcontext(),
+        render_block=lambda _: "", chunk=lambda text: [text],
+        to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+        upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+        ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError)
+
+
+def test_an_interrupted_task_resumes_its_session():
+    import tasks as T, worktrees as W
+    from tasks import TaskStore
+    print("\na restart-interrupted task resumes its session in its checkout")
+
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "wts"
+    repo = root / "repo"; repo.mkdir()
+    def git(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                            capture_output=True, text=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("a\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+
+    st = TaskStore(root / "t.json")
+    sess = tmp_store()
+
+    # First, the turn as it starts: the session is on the record at once.
+    tid = st.create("build the thing", driver="queue", source="ui", isolate=True,
+                    thread="C1:1.0", scope={"cwd": str(repo)})["id"]
+    seen = []
+    during = {}
+    def first_turn(prompt, **kw):
+        kw["on_init"]("sess-1")
+        during.update(st.get(tid))
+        # The process dies here. Nothing below it -- the turn's end, the
+        # executor's finally -- runs; so stop the harness the same way.
+        raise SystemExit("killed by a restart")
+    st.transition(tid, T.RUNNING, "claimed")
+    ex = _resume_harness(repo, st, sess, set(), seen)
+    ex.__globals__["run_turn"] = first_turn
+    real_release = W.release
+    try:
+        # A killed process releases nothing, so neither does this run.
+        W.release = lambda *a, **k: (False, "kept")
+        ex.__globals__["record_branch"] = lambda *a, **k: None
+        try:
+            ex(st.get(tid))
+        except SystemExit:
+            pass
+    finally:
+        W.release = real_release
+    check("the session id is on the task the moment the session starts",
+          during.get("session_id") == "sess-1"
+          and (during.get("checkpoint") or {}).get("session_id") == "sess-1",
+          str({k: during.get(k) for k in ("session_id", "checkpoint")}))
+    # What the killed turn left behind: half-done work in its checkout. (The
+    # executor's finally ran in this test process and cleared the checkpoint,
+    # which a killed one would not -- so the record is put back as it was.)
+    wt = W.path_for(repo, tid)
+    (wt / "half_done.txt").write_text("in progress\n")
+    st.update(tid, checkpoint={"session_id": "sess-1", "at": time.time()})
+
+    # The restart.
+    moved = st.requeue_interrupted()
+    rec = st.get(tid)
+    check("the restart requeues it with its session and worktree kept",
+          moved == 1 and rec["state"] == T.QUEUED
+          and (rec.get("checkpoint") or {}).get("session_id") == "sess-1"
+          and rec["scope"].get("worktree") == str(wt),
+          str({k: rec.get(k) for k in ("state", "checkpoint", "scope")}))
+
+    claimed = st.claim()
+    seen = []
+    _resume_harness(repo, st, sess, {"sess-1"}, seen)(claimed)
+    check("the next run resumes the interrupted session",
+          seen and seen[0]["session_id"] == "sess-1", str(seen[:1]))
+    check("with the short resume prompt, not the whole goal again",
+          seen and seen[0]["prompt"] == T.RESUME_PROMPT, str(seen[:1])[:200])
+    check("in the same checkout, where its half-done work still is",
+          seen and seen[0]["cwd"] == wt and "half_done.txt" in seen[0]["files"],
+          str(seen[:1]))
+    check("and only once: the checkpoint is gone when the turn ends",
+          not st.get(tid).get("checkpoint"))
+
+    # No transcript left on disk: nothing to resume, so start fresh as before.
+    tid2 = st.create("build another", driver="queue", source="ui", isolate=True,
+                     thread="C1:1.0", scope={"cwd": str(repo)})["id"]
+    st.update(tid2, session_id="sess-gone",
+              checkpoint={"session_id": "sess-gone", "at": time.time()})
+    st.transition(tid2, T.RUNNING, "claimed")
+    st.requeue_interrupted()
+    seen = []
+    _resume_harness(repo, st, sess, set(), seen)(st.claim())
+    check("an interrupted session with no transcript falls back to a fresh run",
+          seen and seen[0]["session_id"] is None and seen[0]["prompt"] == "build another",
+          str(seen[:1]))
+
+    # The checkout itself did not survive, but its branch did, with a commit on
+    # it: the resumed session gets that branch back, not a fresh one off main.
+    tid3 = st.create("build a third", driver="queue", source="ui", isolate=True,
+                     thread="C1:1.0", scope={"cwd": str(repo)})["id"]
+    wt3 = W.create(repo, tid3, fetch=False)
+    (wt3 / "committed.txt").write_text("done before the restart\n")
+    git(wt3, "add", "-A"); git(wt3, "commit", "-qm", "partial")
+    git(repo, "worktree", "remove", "--force", str(wt3))
+    st.update(tid3, checkpoint={"session_id": "sess-3", "at": time.time()})
+    st.transition(tid3, T.RUNNING, "claimed")
+    st.requeue_interrupted()
+    seen = []
+    _resume_harness(repo, st, sess, {"sess-3"}, seen)(st.claim())
+    check("a lost checkout is rebuilt from the task's own branch, commits and all",
+          seen and seen[0]["session_id"] == "sess-3"
+          and "committed.txt" in seen[0]["files"], str(seen[:1]))
+
+    # An ordinary rerun (no checkpoint) is untouched by any of this.
+    tid4 = st.create("plain", driver="queue", source="ui", thread="C1:1.0",
+                     scope={"cwd": str(root)})["id"]
+    st.transition(tid4, T.RUNNING, "claimed")
+    seen = []
+    _resume_harness(repo, st, sess, {"sess-1"}, seen)(st.get(tid4))
+    check("a task that was not interrupted runs its goal",
+          seen and seen[0]["prompt"] == "plain", str(seen[:1]))
 
 
 if __name__ == "__main__":

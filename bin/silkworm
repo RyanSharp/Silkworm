@@ -18,6 +18,8 @@
     silkworm install | uninstall    (un)install the login services (bot + visualizer)
     silkworm status                 health check: services, bot, visualizer, hooks
     silkworm restart                restart the services
+    silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
+                                    restart onto this checkout without killing work
     silkworm logs                   tail the bot log
     silkworm doctor                 check prerequisites
     silkworm test                   run the regression tests
@@ -675,6 +677,270 @@ def do_import() -> None:
             return
 
 
+# --- deploy: a restart that does not kill work -----------------------------------
+#
+# Thirteen restarts in ten days to load new code killed every turn that was
+# running at the time -- nine runs ended exit 143 -- and an interrupted task
+# started over from scratch. `restart` is still there for when that is what you
+# want; this is the one to load code with.
+
+#: Nothing running for this long before restarting: one turn ending is often
+#: followed straight away by the next (a review after its implementor, a reply
+#: to a reply), and restarting in that gap would kill the second.
+DEPLOY_QUIET_S = 30
+DEPLOY_MAX_WAIT_S = 2 * 3600
+#: How often the wait says what it is still waiting on.
+DEPLOY_PROGRESS_S = 60
+#: Asked of the bot on top of the wait, so the drain outlasts it -- but not by
+#: much: a deploy killed part-way leaves a drain that lapses on its own.
+DEPLOY_DRAIN_MARGIN_S = 600
+#: How long the restarted bot gets to reconnect to Slack and report itself.
+DEPLOY_CONFIRM_S = 90
+
+
+def parse_duration(text: str) -> int:
+    """`90`, `90s`, `15m`, `2h` -> seconds. Raises ValueError otherwise."""
+    text = (text or "").strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}.get(text[-1:], 0)
+    n = float(text[:-1] if mult else text)
+    if n < 0:
+        raise ValueError(text)
+    return int(n * (mult or 1))
+
+
+def git_out(repo: Path, *args: str) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return r.returncode, r.stdout.strip()
+
+
+def base_branch(repo: Path, git=git_out) -> str:
+    """The branch deploys come from: origin's default, else `main`.
+
+    Resolved through symbolic-ref rather than by splitting a string -- the
+    split once answered "HEAD" -- and stripped of exactly the remote prefix.
+    """
+    code, ref = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if code == 0 and ref.startswith("origin/") and len(ref) > len("origin/"):
+        return ref[len("origin/"):]
+    return "main"
+
+
+def run_suite() -> int:
+    py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+    return subprocess.run([py, str(REPO / "tests" / "test_invariants.py")],
+                          capture_output=True, text=True).returncode
+
+
+def busy_line(row: dict) -> str:
+    kind = "landing" if row.get("kind") == "landing" else (row.get("driver") or "task")
+    orphan = "" if row.get("live", True) else " — no live process holds it"
+    return f"{row.get('id', '?')} ({kind}) {row.get('title', '')[:56]}{orphan}"
+
+
+def deploy_preflight(repo: Path, skip_tests: bool, *, git=git_out, suite=run_suite) -> list:
+    """Reasons not to deploy this checkout. Empty means go.
+
+    The running bot is about to become whatever this tree is, so the tree must
+    be a commit on the base branch (the revision check afterwards compares
+    against HEAD, and a dirty tree is no commit) and must pass its own tests.
+    """
+    problems = []
+    code, branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    base = base_branch(repo, git)
+    if code != 0 or not branch:
+        problems.append("could not tell which branch this checkout is on")
+    elif branch != base:
+        problems.append(f"checkout is on {branch}, not {base} — deploy from {base}")
+    code, dirty = git(repo, "status", "--porcelain", "--untracked-files=no")
+    if code != 0:
+        problems.append("could not read git status")
+    elif dirty:
+        n = len(dirty.splitlines())
+        problems.append(f"{n} uncommitted change(s) to tracked files — commit or stash them")
+    if problems or skip_tests:
+        return problems           # no point spending the suite on a refusal
+    print(f"  {Y}·{N} running the test suite…")
+    if suite() != 0:
+        problems.append("the test suite fails — run: silkworm test")
+    return problems
+
+
+def wait_for_quiet(call, *, max_wait: float, quiet_s: float = DEPLOY_QUIET_S,
+                   progress_s: float = DEPLOY_PROGRESS_S, drain_s: float = 0,
+                   clock=time.monotonic, sleep=time.sleep, poll_s: float = 5) -> tuple[bool, list]:
+    """Wait until nothing has been running for `quiet_s`. (ok, still running).
+
+    "Nothing" is judged by the bot, and an unanswered question is never
+    quiet: a bot that stops answering mid-wait is not evidence it is idle.
+    If the drain is found lifted -- the bot restarted under us, or someone
+    undrained it -- it is put back, or new work would start mid-wait.
+    """
+    start = clock()
+    quiet_since = None
+    last_said = None
+    rows: list = []
+    while True:
+        now = clock()
+        r = call("/drain", {"action": "status"})
+        if r.get("ok"):
+            rows = r.get("running") or []
+            if not r.get("draining") and drain_s:
+                call("/drain", {"action": "start", "why": "deploy",
+                                "seconds": max(60, drain_s - (now - start))})
+        if r.get("ok") and not rows:
+            quiet_since = now if quiet_since is None else quiet_since
+            if now - quiet_since >= quiet_s:
+                return True, []
+        else:
+            quiet_since = None
+        if now - start >= max_wait:
+            return False, rows if r.get("ok") else [{"id": "?", "title": "the bot stopped answering",
+                                                      "kind": "task", "live": True}]
+        if last_said is None or now - last_said >= progress_s:
+            waited = int(now - start)
+            if not r.get("ok"):
+                print(f"  {Y}·{N} {waited}s: the bot is not answering — waiting")
+            elif rows:
+                print(f"  {Y}·{N} {waited}s: waiting on {len(rows)} running:")
+                for row in rows[:8]:
+                    print(f"      {busy_line(row)}")
+            else:
+                print(f"  {Y}·{N} {waited}s: nothing running — "
+                      f"restarting after {int(quiet_s)}s of quiet")
+            last_said = now
+        sleep(poll_s)
+
+
+def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
+              suite=run_suite, clock=time.monotonic, sleep=time.sleep,
+              confirm_s: float = DEPLOY_CONFIRM_S) -> int:
+    """Restart the bot onto this checkout without killing work. Exit status."""
+    call = call or (lambda path, payload: bot_call(path, payload, timeout=10))
+    now, skip_tests, max_wait = False, False, DEPLOY_MAX_WAIT_S
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--now":
+            now = True
+        elif a == "--skip-tests":
+            skip_tests = True
+        elif a == "--max-wait" and i + 1 < len(argv):
+            try:
+                max_wait = parse_duration(argv[i + 1])
+            except ValueError:
+                print(f"{WORM} --max-wait takes a duration like 90m or 2h, not {argv[i + 1]!r}")
+                return 2
+            i += 1
+        else:
+            print("usage: silkworm deploy [--now] [--skip-tests] [--max-wait 2h]")
+            return 2
+        i += 1
+
+    print(f"{WORM} deploy {repo}")
+    # From inside a turn this would wait on its own turn for two hours, and
+    # then restart the process it is a child of.
+    if os.environ.get("SILKWORM_THREAD"):
+        print(f"  {R}✘{N} not from inside a Silkworm turn: it would wait on itself, "
+              f"and the restart kills the turn running it — run it from a terminal")
+        return 1
+
+    problems = deploy_preflight(repo, skip_tests, git=git, suite=suite)
+    for p in problems:
+        print(f"  {R}✘{N} {p}")
+    if problems:
+        return 1
+    print(f"  {G}✔{N} checkout is clean on its base branch"
+          + (" (tests skipped)" if skip_tests else ", tests pass"))
+    code, head = git(repo, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        print(f"  {R}✘{N} could not resolve HEAD")
+        return 1
+
+    drained = False
+    status = call("/status", {})
+    if not status.get("online"):
+        # Nothing answering means nothing running to protect.
+        print(f"  {Y}·{N} the bot is not answering — nothing to drain, starting it")
+    else:
+        drain_s = max_wait + DEPLOY_DRAIN_MARGIN_S
+        r = call("/drain", {"action": "start", "seconds": drain_s, "why": "deploy"})
+        if r.get("ok") and r.get("draining"):
+            drained = True
+            print(f"  {G}✔{N} draining: the runner claims nothing new "
+                  f"(lapses on its own in {int(drain_s // 60)}m)")
+        elif now:
+            print(f"  {Y}·{N} could not drain (this bot predates it) — restarting anyway (--now)")
+        else:
+            print(f"  {R}✘{N} could not drain: the running bot does not know how "
+                  f"(too old) — use --now to restart regardless, or silkworm restart")
+            return 1
+
+    try:
+        if drained and not now:
+            print(f"  {Y}·{N} waiting for {DEPLOY_QUIET_S}s with nothing running "
+                  f"(gives up after {int(max_wait // 60)}m)…")
+            ok, rows = wait_for_quiet(call, max_wait=max_wait, drain_s=drain_s,
+                                      clock=clock, sleep=sleep)
+            if not ok:
+                call("/drain", {"action": "stop"})
+                print(f"  {R}✘{N} still busy after {int(max_wait // 60)}m — not restarting; "
+                      f"drain lifted. Still running:")
+                for row in rows[:12]:
+                    print(f"      {busy_line(row)}")
+                return 1
+            print(f"  {G}✔{N} nothing running")
+        elif drained:
+            rows = call("/drain", {"action": "status"}).get("running") or []
+            if rows:
+                print(f"  {Y}·{N} --now: interrupting {len(rows)} running "
+                      f"(queued work resumes its session after the restart):")
+                for row in rows[:12]:
+                    print(f"      {busy_line(row)}")
+    except KeyboardInterrupt:
+        if drained:
+            call("/drain", {"action": "stop"})
+        print(f"\n  {Y}·{N} interrupted — not restarting; drain lifted")
+        return 130
+
+    mgr = manager or service_manager()
+    if not mgr.restart():
+        print(f"  {R}✘{N} restart failed — see above; silkworm logs")
+        return 1
+
+    return 0 if confirm_deploy(call, head, confirm_s=confirm_s,
+                               clock=clock, sleep=sleep) else 1
+
+
+def confirm_deploy(call, head: str, *, confirm_s: float = DEPLOY_CONFIRM_S,
+                   clock=time.monotonic, sleep=time.sleep) -> bool:
+    """That the bot came back, reconnected, and is running `head`."""
+    deadline = clock() + confirm_s
+    st: dict = {}
+    while True:
+        st = call("/status", {}) or {}
+        up = bool(st.get("online"))
+        linked = bool((st.get("slack") or {}).get("connected"))
+        started = (st.get("revision") or {}).get("started") or ""
+        if (up and linked and started == head) or clock() >= deadline:
+            break
+        sleep(2)
+    ok = check(f"bot reachable on :{bot_port()}", up, "silkworm logs may say why")
+    ok &= check("connected to slack", up and linked,
+                f"not connected after {int(confirm_s)}s — silkworm logs")
+    if not up:
+        ok &= check("running revision", False, "the bot never answered")
+    elif not started:
+        ok &= check("running revision", False, "the bot did not report one")
+    else:
+        ok &= check(f"running {started[:8]}, the checkout's HEAD", started == head,
+                    f"running {started[:8]}, but HEAD is {head[:8]}")
+    return ok
+
+
 def do_launch(args: list[str]) -> None:
     cwd = os.getcwd()
     title_parts = []
@@ -828,6 +1094,8 @@ def main() -> None:
         service_manager().uninstall()
     elif cmd == "restart":
         sys.exit(0 if service_manager().restart() else 1)
+    elif cmd == "deploy":
+        sys.exit(do_deploy(args[1:]))   # args[0] is the subcommand itself
     elif cmd == "status":
         do_status()
     elif cmd == "logs":
