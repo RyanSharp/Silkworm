@@ -12391,6 +12391,11 @@ def test_implementor_git_guard():
     check("status: reports the guard on each ready project, and only those",
           rows == [("ready", True, rows[0][2] if rows else "")]
           and "implementor git guard on ready" in out.getvalue(), out.getvalue())
+    status_fn = next(n for n in ast.parse((BASE / "bin" / "silkworm").read_text()).body
+                     if isinstance(n, ast.FunctionDef) and n.name == "do_status")
+    check("status: `silkworm status` runs the guard check",
+          any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+              and c.func.id == "check_git_guards" for c in ast.walk(status_fn)))
     (hooks / "pre-push").unlink()
     with contextlib.redirect_stdout(io.StringIO()):
         rows = cli.check_git_guards(pj)
