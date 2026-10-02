@@ -526,7 +526,11 @@ exactly that case: `origin/silkworm/tsk_e37a60256d` is the tip of
 `discarded/2026-09-12/silkworm/tsk_e37a60256d-e3541be`. So the survey reads the
 discard tags and skips a branch whose *tip* one of them records — matched on
 branch and tip together, because a re-run reuses the name and a branch that
-gained commits after being retired is not the thing anyone retired.
+gained commits after being retired is not the thing anyone retired. That
+needs the tag to exist, and `discard` used to skip it whenever another ref held
+the tip — including the branch's own copy on origin, which is every branch
+pushed for a PR. So a branch's own remote-tracking copy no longer counts as
+keeping it: it is the same branch, gone at the next `fetch --prune`.
 
 The nightly note's own ordering fault — the first twelve rows of a
 newest-first list, hiding the oldest — was fixed separately on main

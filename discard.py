@@ -57,7 +57,17 @@ def held_elsewhere(repo, sha: str, ignore: str = "") -> list:
     if r.returncode != 0:
         return []
     skip = {f"refs/heads/{ignore}"} if ignore else set()
-    return [ref for ref in r.stdout.split() if ref not in skip]
+    # The branch's own remote-tracking copy does not count either. It is the
+    # same branch, gone the moment a `fetch --prune` sees origin drop it, so
+    # it is no guarantee against gc -- and the tag is also the record that
+    # this tip was thrown away on purpose. `branches.retired` reads it to keep
+    # a pushed branch's remote copy, which nothing here deletes, from coming
+    # straight back as unmerged work; skipping the tag because origin had the
+    # same tip left exactly those branches impossible to clear.
+    same = f"/{ignore}" if ignore else None
+    return [ref for ref in r.stdout.split() if ref not in skip
+            and not (same and ref.startswith("refs/remotes/")
+                     and ref.endswith(same))]
 
 
 def tag_for(branch: str, sha: str, when: str = "") -> str:

@@ -5018,6 +5018,25 @@ def test_unmerged_branches():
           "the tag records one tip, not a branch name for ever")
     git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_rrr", fff_tip)
 
+    # The real path, not a hand-written tag: drop a branch while it is still
+    # local and also on origin. `discard` used to count origin's copy as
+    # already keeping the tip, wrote no tag, and so left nothing for `retired`
+    # to match -- the remote copy came straight back as remote-only work, on a
+    # row the panel offers no Drop for. Every branch ever pushed for a PR.
+    wt_t = work("tsk_ttt", "t")
+    W.release(wt_t)
+    git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_ttt",
+        "silkworm/tsk_ttt")
+    check("the fixture is pushed, and the survey reports it",
+          len(B.survey([finished("tsk_ttt")])) == 1)
+    dropped, tag, _ = D.drop(repo, "silkworm/tsk_ttt")
+    check("discarding a pushed branch still writes the tag that records it",
+          dropped and tag.startswith(f"{D.NAMESPACE}/"),
+          f"dropped={dropped} tag={tag!r}")
+    check("so its remote copy does not come back as unmerged work",
+          B.survey([finished("tsk_ttt")]) == [],
+          "nothing prunes origin's copy, and the panel offers no Drop for it")
+
     # The same hole from the other side. Branches here have been observed reset
     # to a pre-work commit between turns; measured on the local copy alone that
     # reads as merged, while the commits are sitting on origin.
