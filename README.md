@@ -526,6 +526,20 @@ command** (`set a test command first — nothing may land unproven`). Clearing t
 test command afterwards doesn't turn auto-merge off, but every landing will then
 refuse at `no-test-command`.
 
+**Only Silkworm lands.** In every ready project (test command *and* auto-merge),
+the bot installs two git hooks into the repo's shared hooks directory at startup
+and whenever the project becomes ready (`git_guard.py`). An implementor task's
+turn runs with `SILKWORM_TASK_ROLE=implementor` and `SILKWORM_TASK_ID` set, and
+under that role git refuses every push (`pre-push`) and any ref update except
+the task's own `silkworm/<task id>` branch, `HEAD`, remote-tracking refs and
+tags a fetch follows (`reference-transaction`). Nothing else carries the role,
+so your own git and the bot's landing, verification and releases are
+unaffected. A hook already in place is kept and chained as
+`<name>.silkworm-chained`. The installer refuses, and `silkworm status` reports
+the project unguarded, for a relative or in-tree `core.hooksPath`, or for an
+existing hook that dispatches on `$0` (husky). This stops a well-meaning agent,
+not a determined one: `git push --no-verify` skips `pre-push`.
+
 Before relying on it, check that:
 
 - **The project points at the repo.** `!project <name>` sent from a thread

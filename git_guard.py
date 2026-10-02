@@ -21,6 +21,15 @@ core.hooksPath), so every worktree of the repo shares them:
                         remote-tracking refs (so fetch works), and the
                         per-worktree bookkeeping a rebase or stash writes.
                         That is: no moving main, no other branch, no tags.
+                        Two commands write refs they do not choose and are
+                        recognised by the git subcommand that runs them:
+                        fetch may follow the remote's tags, and pack-refs
+                        (gc) may rewrite refs it leaves at the same value.
+
+Refused rather than guessed at, and reported by `silkworm status`: a relative
+or in-tree core.hooksPath (each worktree would read its own copy, or the
+install would dirty the base), and an existing hook that finds its work by its
+own name ($0), which renaming would silently break.
 
 A hook already in place is not replaced: it is moved aside to
 <name>.silkworm-chained and run by ours, with the same arguments and stdin.
@@ -73,6 +82,26 @@ exit 0
 
 REFERENCE_TRANSACTION = _HEAD + f"""
 input=$(cat)
+zero() {{ case "$1" in ""|*[!0]*) return 1 ;; esac; return 0; }}
+# Whether every refused line leaves its ref's value as it was: a create in
+# packed-refs of the value the ref already has, or a delete of a loose ref
+# whose value packed-refs already holds. That is all packing does.
+unmoved() {{
+    packed="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/packed-refs"
+    while read -r old new ref; do
+        case " $bad$tags " in *" $ref "*) ;; *) continue ;; esac
+        if zero "$old" && ! zero "$new"; then
+            [ "$(git rev-parse -q --verify "$ref" 2>/dev/null)" = "$new" ] || return 1
+        elif ! zero "$old" && zero "$new"; then
+            grep -qxF "$old $ref" "$packed" 2>/dev/null || return 1
+        else
+            return 1
+        fi
+    done <<EOF
+$input
+EOF
+    return 0
+}}
 state="$1"                       # kept: the command lookup below reuses $@
 if [ "$state" = "prepared" ] && [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
     own="refs/heads/silkworm/${{{ID_VAR}:-}}"
@@ -106,13 +135,17 @@ EOF
         [ $# -gt 0 ] && shift
         while [ $# -gt 0 ]; do
             case "$1" in
-                -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env) shift 2 ;;
+                -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env|--attr-source) shift 2 ;;
                 -*) shift ;;
                 *) break ;;
             esac
         done
         case "${1:-}" in
-            pack-refs) bad="" tags="" ;;
+            # Not on the name alone: ps joins argv with spaces, so
+            # `git -c 'a.b=x pack-refs' update-ref ...` reads as pack-refs too.
+            # Packing is recognisable by what it does -- every ref keeps its
+            # value -- so that is checked as well.
+            pack-refs) unmoved && bad="" tags="" ;;
             fetch) tags="" ;;
         esac
         bad="$bad$tags"

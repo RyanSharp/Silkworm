@@ -12330,6 +12330,9 @@ def test_implementor_git_guard():
     r = git(wt, "update-ref", "-m", "fix pack-refs", "refs/heads/main", "HEAD", env=agent)
     check("implementor: only pack-refs itself is exempt, not a command mentioning it",
           r.returncode != 0 and sha("main") == main_at, r.stderr[-200:])
+    r = git(wt, "-c", "x.y=z pack-refs", "update-ref", "refs/heads/main", "HEAD", env=agent)
+    check("implementor: a command disguised as pack-refs on ps's command line is refused",
+          r.returncode != 0 and sha("main") == main_at, r.stderr[-200:])
     r = git(wt, "-c", "x.y=fetch", "update-ref", "refs/tags/v8", "HEAD", env=agent)
     check("implementor: and only fetch itself may follow tags, not a command mentioning it",
           r.returncode != 0 and not sha("refs/tags/v8"), r.stderr[-200:])
