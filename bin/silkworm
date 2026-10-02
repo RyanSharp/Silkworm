@@ -29,6 +29,7 @@ the ServiceManager below is the only platform-specific part. Stdlib only.
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -148,7 +149,7 @@ class LaunchdManager:
                 if pid.strip().isdigit() and int(pid) != os.getpid():
                     subprocess.run(["kill", pid.strip()], capture_output=True)
 
-    def install(self) -> None:
+    def install(self) -> bool:
         LOGS.mkdir(exist_ok=True)
         self.AGENTS.mkdir(parents=True, exist_ok=True)
         for label, (script,) in ((k, tuple(v)) for k, v in self.SERVICES.items()):
@@ -156,9 +157,10 @@ class LaunchdManager:
             self._stop(label)
             plist.write_text(self._plist(label, script))
         self._free_ports()
+        self._wait_ports_free()
         for label in self.SERVICES:
             self._start(self.AGENTS / f"{label}.plist")
-            print(f"  {G}✔{N} {label} installed and started")
+        return self._report_up("installed and started")
 
     def uninstall(self) -> None:
         for label in self.SERVICES:
@@ -166,16 +168,55 @@ class LaunchdManager:
             (self.AGENTS / f"{label}.plist").unlink(missing_ok=True)
             print(f"  {G}✔{N} {label} removed")
 
-    def restart(self) -> None:
+    def restart(self) -> bool:
         for label in self.SERVICES:
             if not (self.AGENTS / f"{label}.plist").exists():
                 print(f"  {R}✘{N} {label} not installed — run: silkworm install")
-                return
+                return False
             self._stop(label)
         self._free_ports()
+        self._wait_ports_free()
         for label in self.SERVICES:
             self._start(self.AGENTS / f"{label}.plist")
-            print(f"  {G}✔{N} {label} restarted")
+        return self._report_up("restarted")
+
+    # launchctl returning says launchd accepted the job, not that anything is
+    # serving: success used to print from that alone, so a service crash-looping
+    # on boot read as restarted, and a `silkworm status` run moments later
+    # reported both down while they were still binding. Wait for the ports.
+    UP_TIMEOUT = 90.0
+
+    def _probes(self) -> dict:
+        return {"com.silkworm.bot": (lambda: bool(bot_call("/status", {}, timeout=2).get("online")),
+                                     bot_port()),
+                "com.silkworm.viz": (viz_up, viz_port())}
+
+    def _wait_ports_free(self, timeout: float = 15.0) -> None:
+        """Until the old processes let go, a probe would hear them and call
+        the new ones up. Best-effort: a port still held after this is left for
+        the new process to fail on, which _report_up then shows."""
+        deadline = time.monotonic() + timeout
+        ports = [port for _, port in self._probes().values()]
+        while any(port_listening(p) for p in ports) and time.monotonic() < deadline:
+            time.sleep(0.5)
+
+    def _report_up(self, verb: str) -> bool:
+        probes = self._probes()
+        pending = dict(probes)
+        deadline = time.monotonic() + self.UP_TIMEOUT
+        while pending and time.monotonic() < deadline:
+            for label in list(pending):
+                if pending[label][0]():
+                    del pending[label]
+            if pending:
+                time.sleep(1)
+        for label, (_, port) in probes.items():
+            if label in pending:
+                print(f"  {R}✘{N} {label} {verb} but not answering on :{port} after "
+                      f"{int(self.UP_TIMEOUT)}s — see {LOGS / (label.split('.')[-1] + '.err.log')}")
+            else:
+                print(f"  {G}✔{N} {label} {verb}, answering on :{port}")
+        return not pending
 
     def loaded(self, label: str) -> bool:
         out = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
@@ -212,6 +253,14 @@ def hooks_installed() -> bool:
     except OSError:
         return False
     return "session_hook.py" in json.dumps(settings.get("hooks", {}))
+
+
+def port_listening(port: str) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=1):
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 def viz_up() -> bool:
@@ -749,11 +798,11 @@ def main() -> None:
         sys.exit(0 if do_doctor() else 1)
     elif cmd == "install":
         LOGS.mkdir(exist_ok=True)
-        service_manager().install()
+        sys.exit(0 if service_manager().install() else 1)
     elif cmd == "uninstall":
         service_manager().uninstall()
     elif cmd == "restart":
-        service_manager().restart()
+        sys.exit(0 if service_manager().restart() else 1)
     elif cmd == "status":
         do_status()
     elif cmd == "logs":

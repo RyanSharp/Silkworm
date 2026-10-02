@@ -9974,6 +9974,104 @@ def test_board_is_compact():
     check("Answer still opens the answer form", opened[-1]["callback_id"] == home.MODAL_CALLBACK)
 
 
+
+# --- restart reports what is serving, not what launchctl accepted --------------
+# `silkworm restart` printed "restarted" as soon as launchctl returned. A
+# `silkworm status` 25s later then called both services unreachable while they
+# were still binding -- and a service that never came up read exactly the same
+# as one that had.
+
+def test_restart_waits_for_ports():
+    import importlib.machinery
+    import importlib.util
+    import socket
+    import threading
+    print("\nrestart waits until the services answer")
+
+    loader = importlib.machinery.SourceFileLoader("silkworm_cli", str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("silkworm_cli", loader)
+    cli = importlib.util.module_from_spec(spec)
+    loader.exec_module(cli)
+
+    def free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return str(s.getsockname()[1])
+
+    def listen_after(port, delay, hold):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        def run():
+            time.sleep(delay)
+            srv.bind(("127.0.0.1", int(port)))
+            srv.listen()
+            time.sleep(hold)
+            srv.close()
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    class Fake(cli.LaunchdManager):
+        UP_TIMEOUT = 4.0
+        def __init__(self, ports):
+            self.ports = ports
+        def _probes(self):
+            return {f"com.silkworm.{n}": ((lambda p=p: cli.port_listening(p)), p)
+                    for n, p in self.ports.items()}
+
+    slow, never = free_port(), free_port()
+    listen_after(slow, 1.5, 10)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        t0 = time.monotonic()
+        ok = Fake({"bot": slow})._report_up("restarted")
+        took = time.monotonic() - t0
+    check("a service that binds late is waited for, not called down",
+          ok and 1.0 < took < 4.0 and "answering on :" + slow in out.getvalue(),
+          f"ok={ok} took={took:.1f}s {out.getvalue()!r}")
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        ok = Fake({"bot": slow, "viz": never})._report_up("restarted")
+    text = out.getvalue()
+    check("one that never binds is reported failed, by name and port",
+          not ok and "com.silkworm.viz restarted but not answering on :" + never in text
+          and "viz.err.log" in text, text)
+    check("and the one that did bind is still reported up",
+          "com.silkworm.bot restarted, answering on :" + slow in text, text)
+
+    # The old process must be gone before probing, or it answers for the new one.
+    old = free_port()
+    listen_after(old, 0, 1.5)
+    time.sleep(0.3)
+    t0 = time.monotonic()
+    Fake({"bot": old})._wait_ports_free(timeout=5)
+    took = time.monotonic() - t0
+    check("probing waits for the old listener to let go",
+          1.0 < took < 4.0 and not cli.port_listening(old), f"took={took:.1f}s")
+
+    # And the CLI's exit status carries the result, so scripts can trust it.
+    class Stub:
+        def __init__(self, ok): self.ok = ok
+        def restart(self): return self.ok
+        def install(self): return self.ok
+    real, argv = cli.service_manager, sys.argv
+    try:
+        for cmd in ("restart", "install"):
+            for ok, want in ((True, 0), (False, 1)):
+                cli.service_manager = lambda ok=ok: Stub(ok)
+                sys.argv = ["silkworm", cmd]
+                try:
+                    cli.main()
+                    code = 0
+                except SystemExit as e:
+                    code = e.code
+                check(f"silkworm {cmd} exits {want} when services are {'up' if ok else 'down'}",
+                      code == want, f"exit {code}")
+    finally:
+        cli.service_manager, sys.argv = real, argv
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:
