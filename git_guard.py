@@ -34,7 +34,9 @@ reference-transaction half cannot be skipped with a flag.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import threading
 from pathlib import Path
 
 ROLE_VAR = "SILKWORM_TASK_ROLE"
@@ -71,9 +73,10 @@ exit 0
 
 REFERENCE_TRANSACTION = _HEAD + f"""
 input=$(cat)
-if [ "$1" = "prepared" ] && [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
+state="$1"                       # kept: the command lookup below reuses $@
+if [ "$state" = "prepared" ] && [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
     own="refs/heads/silkworm/${{{ID_VAR}:-}}"
-    bad=""
+    bad="" tags=""
     while read -r old new ref; do
         [ -n "$ref" ] || continue
         case "$ref" in
@@ -81,6 +84,7 @@ if [ "$1" = "prepared" ] && [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
             # fetch; and per-worktree bookkeeping a rebase, bisect or stash
             # writes, none of which moves anything another checkout reads.
             refs/remotes/*|refs/rewritten/*|refs/bisect/*|refs/worktree/*|refs/stash) ;;
+            refs/tags/*) tags="$tags $ref" ;;
             refs/*) bad="$bad $ref" ;;
             # Pseudo-refs (ORIG_HEAD, MERGE_HEAD, ...) are per-worktree.
             *) ;;
@@ -88,14 +92,30 @@ if [ "$1" = "prepared" ] && [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
     done <<EOF
 $input
 EOF
-    if [ -n "$bad" ]; then
-        # Packing refs (git pack-refs, which gc runs) rewrites every ref as a
-        # create in packed-refs plus a delete of the loose file -- the same
-        # lines as a real move, but no ref changes value. Asked only here, on
-        # the way to refusing, so ordinary updates never pay for a ps.
-        case "$(ps -o args= -p "$PPID" 2>/dev/null)" in
-            *pack-refs*) bad="" ;;
+    if [ -n "$bad$tags" ]; then
+        # Which git command this is, asked only on the way to refusing so an
+        # ordinary update never pays for a ps: the first word after `git` and
+        # its global options. Two commands write refs they do not choose:
+        #   pack-refs (gc runs it) rewrites every ref as a create in
+        #     packed-refs plus a delete of the loose file -- the same lines as
+        #     a real move, though no ref changes value;
+        #   fetch (and so pull) follows the remote's tags into refs/tags --
+        #     the remote's, not the task's, and moving no branch.
+        set -f                   # split the command line, but never glob it
+        set -- $(ps -o args= -p "$PPID" 2>/dev/null)
+        [ $# -gt 0 ] && shift
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env) shift 2 ;;
+                -*) shift ;;
+                *) break ;;
+            esac
+        done
+        case "${1:-}" in
+            pack-refs) bad="" tags="" ;;
+            fetch) tags="" ;;
         esac
+        bad="$bad$tags"
     fi
     if [ -n "$bad" ]; then
         echo "silkworm: an implementor task may only move its own branch ($own)." >&2
@@ -107,7 +127,7 @@ EOF
     fi
 fi
 if [ -x "$chained" ]; then
-    if [ -n "$input" ]; then printf '%s\\n' "$input"; fi | "$chained" "$@"
+    if [ -n "$input" ]; then printf '%s\\n' "$input"; fi | "$chained" "$state"
     exit $?
 fi
 exit 0
@@ -148,24 +168,42 @@ def git_version() -> tuple[int, ...]:
     return tuple(nums)
 
 
-def hooks_dir(repo) -> Path | None:
-    """Where git looks for this repository's hooks, shared by its worktrees.
+def where(repo) -> tuple[Path | None, str]:
+    """Where git looks for this repository's hooks, or why the guard cannot go
+    anywhere every worktree would see it.
 
-    core.hooksPath if it is set (relative to the main worktree, which is where
-    a relative one is meant to point), else <common git dir>/hooks.
+    <common git dir>/hooks, shared by every worktree -- or an absolute
+    core.hooksPath outside the work tree. Two layouts are refused rather than
+    guessed at. A relative core.hooksPath is resolved by git against the top
+    of whichever worktree runs the hook, so each task's worktree reads its own
+    copy and one install guards nothing but the main checkout. And a hooks
+    directory inside the work tree is usually tracked (husky, .githooks), so
+    writing into it dirties the checkout, and landing refuses a dirty base.
     """
     code, common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if code != 0 or not common:
-        return None
+        return None, f"{repo} is not a git repository"
     common_p = Path(common)
     code, hp = _git(repo, "config", "--get", "core.hooksPath")
-    if code == 0 and hp:
-        p = Path(os.path.expanduser(hp))
-        if not p.is_absolute():
-            base = common_p.parent if common_p.name == ".git" else common_p
-            p = base / p
-        return p
-    return common_p / "hooks"
+    if code != 0 or not hp:
+        return common_p / "hooks", ""
+    p = Path(os.path.expanduser(hp))
+    if not p.is_absolute():
+        return None, (f"core.hooksPath is relative ({hp}), so every worktree reads "
+                      "its own hooks; guard it by hand or make it absolute")
+    top = common_p.parent if common_p.name == ".git" else common_p
+    try:
+        inside = p.resolve().is_relative_to(top.resolve())
+    except OSError:
+        inside = False
+    if inside and common_p.name == ".git":
+        return None, (f"core.hooksPath ({hp}) is inside the work tree; installing "
+                      "there would dirty the checkout landing merges into")
+    return p, ""
+
+
+def hooks_dir(repo) -> Path | None:
+    return where(repo)[0]
 
 
 def _ours(path: Path) -> bool:
@@ -175,54 +213,82 @@ def _ours(path: Path) -> bool:
         return False
 
 
+#: A hook that finds its work by its own name or location -- husky's
+#: `basename "$0"`, `$(dirname "$0")/husky.sh` -- stops working the moment
+#: it is renamed to <name>.silkworm-chained, silently, for you as well as for
+#: tasks. Such a hook is reported, not chained.
+_SELF_REFERENCE = re.compile(r'\$\{?0\b|\$\{?BASH_SOURCE')
+
+#: One install at a time in this process: the sweeper and the dashboard can
+#: both reach a repo at once, and two installs interleaving between "is there
+#: an aside?" and the rename would move the guard on top of your hook.
+_LOCK = threading.Lock()
+
+
+def _err(msg, changed=(), chained=()) -> dict:
+    return {"ok": False, "changed": list(changed), "chained": list(chained), "error": msg}
+
+
 def install(repo) -> dict:
     """Install (or refresh) both hooks for `repo`. Idempotent.
 
     Returns {"ok", "changed": [...], "chained": [...], "error"}. A hook that
     was already there and is not ours is moved to <name>.silkworm-chained and
-    run by ours. If that name is taken too -- ours was replaced after it had
-    chained something -- nothing is overwritten and it is reported instead.
+    run by ours. Every hook is checked before anything is touched, and
+    nothing is overwritten: an aside name already taken (ours was replaced
+    after it chained something), or a hook that would break if renamed, is
+    reported and leaves the repository as it was.
     """
     if git_version() < MIN_GIT:
-        return {"ok": False, "changed": [], "chained": [],
-                "error": f"git {'.'.join(map(str, MIN_GIT))}+ is needed for "
-                         "the reference-transaction hook"}
-    d = hooks_dir(repo)
+        return _err(f"git {'.'.join(map(str, MIN_GIT))}+ is needed for "
+                    "the reference-transaction hook")
+    d, why = where(repo)
     if d is None:
-        return {"ok": False, "changed": [], "chained": [],
-                "error": f"{repo} is not a git repository"}
-    changed, chained = [], []
-    try:
-        d.mkdir(parents=True, exist_ok=True)
+        return _err(why)
+    with _LOCK:
+        to_chain = []
         for name in HOOKS:
-            path, want = d / name, SCRIPTS[name]
-            if path.exists() or path.is_symlink():
-                if _ours(path):
-                    if path.read_text() == want and os.access(path, os.X_OK):
-                        continue
-                else:
-                    aside = d / (name + CHAINED_SUFFIX)
-                    if aside.exists() or aside.is_symlink():
-                        return {"ok": False, "changed": changed, "chained": chained,
-                                "error": f"{path} is not Silkworm's and {aside.name} "
-                                         "already exists; refusing to overwrite either"}
-                    os.rename(path, aside)
+            path = d / name
+            if (path.exists() or path.is_symlink()) and not _ours(path):
+                aside = d / (name + CHAINED_SUFFIX)
+                if aside.exists() or aside.is_symlink():
+                    return _err(f"{path} is not Silkworm's and {aside.name} already "
+                                "exists; refusing to overwrite either")
+                try:
+                    text = path.read_text(errors="replace")
+                except OSError as e:
+                    return _err(f"cannot read {path}: {e}")
+                if _SELF_REFERENCE.search(text):
+                    return _err(f"{path} finds its work by its own name or location "
+                                "($0), so renaming it to chain it would silently "
+                                "disable it; merge the guard into it by hand")
+                to_chain.append(name)
+        changed, chained = [], []
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for name in HOOKS:
+                path, want = d / name, SCRIPTS[name]
+                if name in to_chain:
+                    os.rename(path, d / (name + CHAINED_SUFFIX))
                     chained.append(name)
-            tmp = d / f".{name}.silkworm-tmp"
-            tmp.write_text(want)
-            tmp.chmod(0o755)
-            os.replace(tmp, path)
-            changed.append(name)
-    except OSError as e:
-        return {"ok": False, "changed": changed, "chained": chained, "error": str(e)}
+                elif (path.is_file() and path.read_text() == want
+                        and os.access(path, os.X_OK)):
+                    continue
+                tmp = d / f".{name}.silkworm-tmp.{os.getpid()}.{threading.get_ident()}"
+                tmp.write_text(want)
+                tmp.chmod(0o755)
+                os.replace(tmp, path)
+                changed.append(name)
+        except OSError as e:
+            return _err(str(e), changed, chained)
     return {"ok": True, "changed": changed, "chained": chained, "error": ""}
 
 
 def state(repo) -> tuple[bool, str]:
     """Whether the guard is in force for `repo`, and if not, why not."""
-    d = hooks_dir(repo)
+    d, why = where(repo)
     if d is None:
-        return False, "not a git repository"
+        return False, why
     missing = [n for n in HOOKS
                if not ((d / n).is_file() and (d / n).read_text(errors="replace") == SCRIPTS[n]
                        and os.access(d / n, os.X_OK))]

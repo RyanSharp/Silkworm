@@ -12313,6 +12313,26 @@ def test_implementor_git_guard():
     r = git(wt, "branch", "other", env=agent)
     check("implementor: making another branch is refused",
           r.returncode != 0 and not sha("refs/heads/other"), r.stderr[-200:])
+    # A tag pushed to origin mid-task (release CI) is followed into refs/tags
+    # by any fetch or pull. That is the remote's tag, not the task's.
+    side = root / "side"
+    git(root, "clone", "-q", str(origin), str(side))
+    git(side, "commit", "-q", "--allow-empty", "-m", "elsewhere")
+    git(side, "tag", "v7")
+    git(side, "push", "-q", "origin", "HEAD:refs/heads/side", "v7")
+    log_.write_text("")
+    r = git(wt, "fetch", "origin", env=agent)
+    check("implementor: fetch still works when origin has a new tag to follow",
+          r.returncode == 0 and sha("refs/tags/v7"), r.stderr[-300:])
+    check("and the chained hook was still handed the state, not the command line",
+          "rt prepared refs/tags/v7" in log_.read_text(), log_.read_text()[-300:])
+    git(repo, "tag", "-d", "v7")
+    r = git(wt, "update-ref", "-m", "fix pack-refs", "refs/heads/main", "HEAD", env=agent)
+    check("implementor: only pack-refs itself is exempt, not a command mentioning it",
+          r.returncode != 0 and sha("main") == main_at, r.stderr[-200:])
+    r = git(wt, "-c", "x.y=fetch", "update-ref", "refs/tags/v8", "HEAD", env=agent)
+    check("implementor: and only fetch itself may follow tags, not a command mentioning it",
+          r.returncode != 0 and not sha("refs/tags/v8"), r.stderr[-200:])
     other = {**clean, **GG.env_for("implementor", "tsk_someone_else")}
     tip = sha(f"refs/heads/silkworm/{tid}")
     (wt / "d.txt").write_text("d\n")
@@ -12373,6 +12393,54 @@ def test_implementor_git_guard():
           and (custom / ("pre-push" + GG.CHAINED_SUFFIX)).read_text() == "#!/bin/sh\nexit 0\n",
           str(res))
     check("and status reports it unguarded", not GG.state(r2)[0], GG.state(r2)[1])
+
+    def fresh(name):
+        r_ = root / name
+        git(root, "init", "-q", "-b", "main", str(r_))
+        git(r_, "commit", "-q", "--allow-empty", "-m", "a")
+        return r_
+    r3 = fresh("r3")
+    (r3 / ".githooks").mkdir()
+    git(r3, "config", "core.hooksPath", ".githooks")
+    res = GG.install(r3)
+    check("a relative core.hooksPath is refused (each worktree would read its own)",
+          not res["ok"] and "relative" in res["error"]
+          and not list((r3 / ".githooks").iterdir()) and not GG.state(r3)[0], str(res))
+    git(r3, "config", "core.hooksPath", str(r3 / ".githooks"))
+    res = GG.install(r3)
+    check("a hooks directory inside the work tree is refused (it would dirty the base)",
+          not res["ok"] and "work tree" in res["error"]
+          and not list((r3 / ".githooks").iterdir()) and not GG.state(r3)[0], str(res))
+    r4 = fresh("r4")
+    husky = '#!/bin/sh\n. "$(dirname "$0")/husky.sh"\nrun "$(basename "$0")"\n'
+    (r4 / ".git" / "hooks" / "reference-transaction").write_text(husky)
+    res = GG.install(r4)
+    check("a hook that dispatches on its own name ($0) is not renamed out from under itself",
+          not res["ok"] and "$0" in res["error"]
+          and (r4 / ".git" / "hooks" / "reference-transaction").read_text() == husky
+          and not (r4 / ".git" / "hooks" / ("reference-transaction" + GG.CHAINED_SUFFIX)).exists()
+          and not (r4 / ".git" / "hooks" / "pre-push").exists(), str(res))
+    import threading as _th
+    r5 = fresh("r5")
+    mine = "#!/bin/sh\necho mine\n"
+    (r5 / ".git" / "hooks" / "pre-push").write_text(mine)
+    (r5 / ".git" / "hooks" / "pre-push").chmod(0o755)
+    outs = []
+
+    class Slow:                  # widens the check-then-rename window to 200ms
+        def search(self, text):
+            time.sleep(0.2)
+            return None
+    real_re, GG._SELF_REFERENCE = GG._SELF_REFERENCE, Slow()
+    try:
+        ts = [_th.Thread(target=lambda: outs.append(GG.install(r5))) for _ in range(4)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+    finally:
+        GG._SELF_REFERENCE = real_re
+    check("concurrent installs chain the hook once and lose nothing",
+          (r5 / ".git" / "hooks" / ("pre-push" + GG.CHAINED_SUFFIX)).read_text() == mine
+          and GG.state(r5)[0] and sum(len(o["chained"]) for o in outs) == 1
+          and not list((r5 / ".git" / "hooks").glob(".*silkworm-tmp*")), str(outs)[:300])
 
     # --- status --------------------------------------------------------------
     pj = root / "projects.json"
