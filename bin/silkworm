@@ -259,6 +259,26 @@ def check_daemons(d) -> bool:
                  not gone, f"stopped: {names} — see silkworm logs, then: silkworm restart")
 
 
+def unmerged_row(r: dict) -> str:
+    """One branch, for the status listing.
+
+    `commits` is None when git was asked for the count and would not answer,
+    and `.get("commits", 0)` printed that as the word None -- while `or 0`
+    would have printed it as an empty branch, which is the one thing a branch
+    in this list is not. It is shown as "?" instead. A branch with no local
+    copy is named with the remote in front of it, since that is the only name
+    anything will find it under.
+    """
+    n = r.get("commits")
+    # A row with no `local` field came from an older bot; taken to be local,
+    # which is the dashboard's default too, so the two cannot disagree.
+    where = f"{r['remote']}/" if r.get("remote") and \
+        not r.get("local", True) else ""
+    return (f"{where}{r.get('branch', '')} "
+            f"({'?' if n is None else n} on {r.get('base', '?')}) "
+            f"{(r.get('title') or '')[:52]}")
+
+
 def do_status() -> None:
     mgr = service_manager()
     print(f"{WORM} status")
@@ -354,9 +374,7 @@ def do_status() -> None:
             check("finished work is all merged", not rows,
                   f"{unmerged.get('summary') or 'some is not'} — land or drop them")
         for r in rows[:12]:
-            print(f"      {r.get('branch', '')} "
-                  f"({r.get('commits', 0)} on {r.get('base', '?')}) "
-                  f"{(r.get('title') or '')[:52]}")
+            print(f"      {unmerged_row(r)}")
         if len(rows) > 12:
             print(f"      …and {len(rows) - 12} more")
 

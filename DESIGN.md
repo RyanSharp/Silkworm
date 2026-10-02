@@ -480,6 +480,68 @@ resolves beats a tidy one that does not. The row reports that name rather than
 reprinting the base stored on the record, which answers the different question of
 what the branch was *cut* from.
 
+**A branch you can only see half of is the same problem again.** Two paths did
+the opposite of what the module is for. The branch list asked git for
+`refs/heads/silkworm/` alone, so a branch that had been pushed and then lost its
+local ref was not there to be surveyed — and losing the local ref is ordinary: a
+worktree release can recreate it from a stale base, a sweep or a hand can delete
+it, and branches here have been observed reset to a pre-work commit between
+turns. Push first and the commits are safe on origin while the row disappears.
+`origin/silkworm/tsk_e37a60256d` was sitting in this repository with one commit
+not in main and no local branch, named by the dashboard panel, by `silkworm
+status` and by the nightly note in none of the three. So both copies are read —
+still no fetch, since remote-tracking refs are on disk — and a branch is one
+entry however many refs hold it, measured across all of them. The mirror case
+falls out of the same change: a local ref wound back to the base while origin
+still holds the work is no longer read as merged. A row with no local copy says
+so, because it is real unmerged work that `git switch` will not find by name.
+The two halves ask in the same shape: one literal prefix per configured
+remote, not a `refs/remotes/*/silkworm/*` glob, since for-each-ref matches a
+glob one path segment at a time and so would have missed both a branch name
+carrying a further slash and a remote whose own name carries one — while the
+local pattern, being a literal prefix, matches however deep either goes. A
+half-blind survey is the thing being removed, not a shape to reproduce on the
+other side.
+
+And `ahead` caught `ValueError` on the commit count and returned 0. `_git` never
+raises — that is deliberate, so one wedged repository costs its own rows rather
+than the whole survey — so it returns a stub with empty stdout when the
+subprocess cannot run, and every git failure parsed as "0 commits ahead". Zero is
+the one number that must never be invented here: the survey reads it as merged
+and drops the row. The single outcome this module exists to prevent, produced by
+a timeout. It now answers `None`, the row survives with its count unknown, and
+the panel, the summary line and the nightly note each say so rather than
+rounding it to nothing.
+
+Reading remotes has one consequence that had to be paid for in the same change:
+it brought deliberately discarded branches back from the dead. `silkworm
+discard` deletes `refs/heads/` and keeps the tip alive as a `discarded/*` tag;
+nothing prunes the remote-tracking copy, and `base_ref` fetches without
+`--prune`, so origin's copy returns on every fetch for as long as the branch is
+on origin. Without a filter, discarding a branch that had ever been pushed would
+pin it into the panel, into `silkworm status` and into every nightly prompt for
+that project for ever, with nothing in the product able to clear it — and the
+board could never reach empty. The one remote-only branch in this checkout was
+exactly that case: `origin/silkworm/tsk_e37a60256d` is the tip of
+`discarded/2026-09-12/silkworm/tsk_e37a60256d-e3541be`. So the survey reads the
+discard tags and skips a branch whose *tip* one of them records — matched on
+branch and tip together, because a re-run reuses the name and a branch that
+gained commits after being retired is not the thing anyone retired.
+
+The nightly note's own ordering fault — the first twelve rows of a
+newest-first list, hiding the oldest — was fixed separately on main
+(`MAX_LISTED`, oldest first, the cut announced). What it gained here is the
+two new facts a row can carry: a count git would not give is written as
+"commit count unknown" rather than `or 0`'s "0 commits", and a remote-only
+branch says which remote it is on.
+
+Those remote-only rows are named but not acted on. Land and Drop on the
+dashboard both work on the local branch — Land would report "its branch is
+gone: nothing to land" over commits sitting on origin, and Drop would delete
+nothing — so a remote-only row offers neither. `prune_merged` likewise only
+considers local branches, since it deletes through `discard.drop`, which
+touches `refs/heads/` alone.
+
 This is visibility, not automation: nothing in it merges, deletes or pushes.
 
 **And work that never reached a commit is harder to see than work that did.**

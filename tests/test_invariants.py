@@ -4919,6 +4919,151 @@ def test_unmerged_branches():
     check("and no bases at all counts nothing rather than everything",
           B.ahead(repo, (), "silkworm/tsk_ccc") == 0)
 
+    # A branch that was pushed and then lost its local ref. Asking only
+    # `refs/heads/` made it invisible, and not hypothetically:
+    # `origin/silkworm/tsk_e37a60256d` sat in this repository with one commit
+    # not in main and no local branch, and was named by neither the dashboard
+    # panel, nor `silkworm status`, nor the nightly note. A worktree release, a
+    # sweep or a hand can all delete the local copy; push first and the commits
+    # survive while the row does not. `update-ref` is what a push and a fetch
+    # leave behind, without needing a second repository to push to.
+    wt_r = work("tsk_rrr", "f")
+    W.release(wt_r)
+    git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_rrr",
+        "silkworm/tsk_rrr")
+    git(repo, "branch", "-D", "silkworm/tsk_rrr")
+    check("the fixture really is remote-only, or it proves nothing",
+          git(repo, "rev-parse", "--verify", "--quiet",
+              "refs/heads/silkworm/tsk_rrr").returncode != 0
+          and git(repo, "rev-parse", "--verify", "--quiet",
+                  "refs/remotes/origin/silkworm/tsk_rrr").returncode == 0)
+    remote_only = B.survey([finished("tsk_rrr")])
+    check("a branch that exists only on a remote is still reported",
+          len(remote_only) == 1 and remote_only[0]["commits"] == 1,
+          "pushed, local ref deleted, and it fell out of the safety net")
+    check("and the row says there is no local branch to go and look at",
+          remote_only and remote_only[0]["local"] is False
+          and remote_only[0]["remote"] == "origin")
+    # Several remotes can hold the same branch, and the row names one of them.
+    # Taking whichever git listed first names an alphabetical accident: "on
+    # alpha only" about a branch that is on origin too.
+    git(repo, "update-ref", "refs/remotes/alpha/silkworm/tsk_rrr",
+        "refs/remotes/origin/silkworm/tsk_rrr")
+    two = B.existing(repo).get("silkworm/tsk_rrr",
+                               {"refs": (), "remote": ""})
+    check("a branch on several remotes is measured across all of them",
+          len(two["refs"]) == 2 and "refs/remotes/alpha/silkworm/tsk_rrr"
+          in two["refs"])
+    check("and is named by origin rather than by whichever sorted first",
+          two["remote"] == "origin", f"named {two['remote']!r}")
+    git(repo, "update-ref", "-d", "refs/remotes/alpha/silkworm/tsk_rrr")
+
+    # for-each-ref matches a glob with WM_PATHNAME, so `refs/remotes/*/silkworm/*`
+    # is one path segment and misses both a branch name with a further slash
+    # and a remote whose own name holds one -- while the local pattern, being a
+    # literal prefix, matches however deep either goes. The two halves of the
+    # survey have to see the same shapes.
+    git(repo, "remote", "add", "my/remote", str(repo))
+    git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_hhh/part",
+        "refs/remotes/origin/silkworm/tsk_rrr")
+    git(repo, "update-ref", "refs/remotes/my/remote/silkworm/tsk_iii",
+        "refs/remotes/origin/silkworm/tsk_rrr")
+    deep = B.existing(repo)
+    check("a remote branch name with a slash in it is seen",
+          "silkworm/tsk_hhh/part" in deep,
+          "the local half of the same survey sees one")
+    check("and a remote whose own name holds a slash is read correctly",
+          deep.get("silkworm/tsk_iii", {}).get("remote") == "my/remote",
+          f"got {deep.get('silkworm/tsk_iii')}")
+    check("while the remote's own HEAD is still not a branch",
+          not any(k.endswith("HEAD") for k in deep))
+    git(repo, "update-ref", "-d", "refs/remotes/origin/silkworm/tsk_hhh/part")
+    git(repo, "update-ref", "-d", "refs/remotes/my/remote/silkworm/tsk_iii")
+    git(repo, "remote", "remove", "my/remote")
+
+    # Reading remotes brought discarded branches back from the dead. `git
+    # branch -D` removes refs/heads only, this module never pushes, and
+    # `base_ref` fetches without --prune, so the remote-tracking copy is
+    # recreated on every fetch for as long as the branch is on origin. The one
+    # remote-only branch in the real checkout turned out to be exactly this:
+    # `origin/silkworm/tsk_e37a60256d` is the tip of
+    # `discarded/2026-09-12/silkworm/tsk_e37a60256d-e3541be`.
+    import discard as D
+    check("the fixture is a branch the survey would otherwise report",
+          len(B.survey([finished("tsk_rrr")])) == 1,
+          "nothing to silence means this proves nothing")
+    dropped, tag, _ = D.drop(repo, "silkworm/tsk_rrr", when="2026-09-12")
+    check("discard has nothing local left to delete once it is remote-only",
+          not dropped and not tag,
+          "the fixture is meant to be past the point where -D can help")
+    # So do what the real reset did while the branch was still local: tag the
+    # tip under the discarded namespace. That tag is the decision record.
+    fff_tip = git(repo, "rev-parse",
+                  "refs/remotes/origin/silkworm/tsk_rrr").stdout.strip()
+    git(repo, "tag", "-a", D.tag_for("silkworm/tsk_rrr", fff_tip, "2026-09-12"),
+        fff_tip, "-m", "retired")
+    check("a tip somebody deliberately retired is not resurrected",
+          B.survey([finished("tsk_rrr")]) == [],
+          "nothing prunes the remote copy, so this would never go quiet again")
+    check("the tag is matched on branch and tip, not on either alone",
+          ("silkworm/tsk_rrr", fff_tip[:7]) in B.retired(repo)
+          and ("silkworm/tsk_aaa", fff_tip[:7]) not in B.retired(repo),
+          "a re-run reuses a branch name with a different tip")
+    # And a tip that has moved on since it was retired is not the tip anyone
+    # retired, so the branch speaks up again.
+    git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_rrr",
+        "silkworm/tsk_ccc")
+    check("a branch that gained commits after being retired comes back",
+          len(B.survey([finished("tsk_rrr")])) == 1,
+          "the tag records one tip, not a branch name for ever")
+    git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_rrr", fff_tip)
+
+    # The same hole from the other side. Branches here have been observed reset
+    # to a pre-work commit between turns; measured on the local copy alone that
+    # reads as merged, while the commits are sitting on origin.
+    wt_g = work("tsk_ggg", "g")
+    W.release(wt_g)
+    git(repo, "update-ref", "refs/remotes/origin/silkworm/tsk_ggg",
+        "silkworm/tsk_ggg")
+    git(repo, "update-ref", "refs/heads/silkworm/tsk_ggg", "origin/main")
+    check("the local copy really was reset back to the base",
+          B.ahead(repo, ["origin/main"], "refs/heads/silkworm/tsk_ggg") == 0
+          and B.ahead(repo, ["origin/main"],
+                      "refs/remotes/origin/silkworm/tsk_ggg") == 1,
+          "without the reset there is no disagreement between the copies")
+    reset = B.survey([finished("tsk_ggg")])
+    check("a branch is measured across every copy of itself",
+          len(reset) == 1 and reset[0]["commits"] == 1,
+          "the local ref was wound back; the work is still on origin")
+    check("and it is not mistaken for a remote-only branch",
+          reset and reset[0]["local"] is True)
+
+    # `_git` never raises -- a timeout or a git that cannot be run comes back
+    # as a stub with empty stdout. Reading that as 0 meant "merged", and
+    # `survey` drops merged branches, so the one outcome this module exists to
+    # prevent was produced by a stopwatch.
+    real_git = B._git
+    B._git = lambda cwd, *a, **k: (B._Failed() if a and a[0] == "rev-list"
+                                   else real_git(cwd, *a, **k))
+    try:
+        check("a git call that will not answer yields no count, not zero",
+              B.ahead(repo, ["main"], "silkworm/tsk_ccc") is None,
+              "zero reads as merged, and merged means the row disappears")
+        blind = B.survey([finished("tsk_ccc")])
+        check("and the branch keeps its row rather than vanishing",
+              len(blind) == 1 and blind[0]["commits"] is None,
+              "a branch nobody could measure is not a branch nobody left")
+        check("the summary counts it without inventing commits for it",
+              B.line(blind) == "1 finished task on unmerged branch "
+                               "(1 unmeasured)", B.line(blind))
+        check("and a count that is known is still added up beside it",
+              B.line(blind + [{"commits": 3}, {"commits": None}])
+              == "3 finished tasks on unmerged branches (3 commits, "
+                 "2 unmeasured)",
+              B.line(blind + [{"commits": 3}, {"commits": None}]))
+    finally:
+        B._git = real_git
+
     # The prompt block: an ideator told nothing re-derives a fix that already
     # exists on a branch, which is how one got implemented twice.
     import scoping as S
@@ -4986,6 +5131,59 @@ def test_unmerged_branches():
     check("no constant in scoping.py is defined twice",
           len(names) == len(set(names)),
           f"defined more than once: {sorted({n for n in names if names.count(n) > 1})}")
+
+    # An unknown count must not be printed as nothing on the branch, which is
+    # the one thing a branch in this list cannot be.
+    check("a count git refused to give is admitted rather than zeroed",
+          "commit count unknown" in S.unmerged_note(
+              [{"branch": "silkworm/tsk_x", "commits": None, "base": "main",
+                "title": "t", "updated": 1}]),
+          "'0 commits' describes an empty branch, which this never is")
+    check("and a branch with no local copy says where it actually is",
+          "on origin only" in S.unmerged_note(remote_only),
+          S.unmerged_note(remote_only))
+    # An older bot's payload has no `local` field at all. The dashboard reads
+    # that as local and says nothing extra; these two must not disagree about
+    # the same row, and the quieter guess is the right one to share.
+    legacy = [{"branch": "silkworm/tsk_x", "commits": 1, "base": "main",
+               "title": "t", "updated": 1, "remote": "origin"}]
+    check("a payload from before the field is not called remote-only",
+          "on origin only" not in S.unmerged_note(legacy),
+          "the panel treats a missing `local` as local; so must this")
+
+    # `silkworm status` prints the same rows, and reached them through
+    # `.get("commits", 0)` -- which renders an unmeasured branch as the word
+    # None. Driven out of the shipped CLI rather than grepped for.
+    import types as _types
+    cli_src = (BASE / "bin" / "silkworm").read_text()
+    row_fn = next(n for n in ast.parse(cli_src).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "unmerged_row")
+    cli = _types.ModuleType("cli")
+    exec(compile(ast.Module(body=[row_fn], type_ignores=[]), "<cli>", "exec"),
+         cli.__dict__)
+    check("the status listing shows an unmeasured branch as unknown",
+          cli.unmerged_row({"branch": "silkworm/tsk_x", "commits": None,
+                            "base": "main", "title": "t"})
+          == "silkworm/tsk_x (? on main) t",
+          cli.unmerged_row({"branch": "silkworm/tsk_x", "commits": None,
+                            "base": "main", "title": "t"}))
+    check("and names a remote-only branch under the name git knows it by",
+          cli.unmerged_row({"branch": "silkworm/tsk_x", "commits": 1,
+                            "base": "main", "title": "t", "remote": "origin",
+                            "local": False})
+          == "origin/silkworm/tsk_x (1 on main) t",
+          cli.unmerged_row({"branch": "silkworm/tsk_x", "commits": 1,
+                            "base": "main", "title": "t", "remote": "origin",
+                            "local": False}))
+    check("while an ordinary row is left exactly as it was",
+          cli.unmerged_row({"branch": "silkworm/tsk_x", "commits": 2,
+                            "base": "main", "title": "t", "local": True})
+          == "silkworm/tsk_x (2 on main) t")
+    check("and a payload from before the field is not called remote-only",
+          cli.unmerged_row({"branch": "silkworm/tsk_x", "commits": 2,
+                            "base": "main", "title": "t", "remote": "origin"})
+          == "silkworm/tsk_x (2 on main) t",
+          "the panel treats a missing `local` as local; so must this")
 
     bot = (BASE / "bot.py").read_text()
     ideate = bot[bot.index("def run_ideation"):bot.index("def _ideation_scheduler")]
@@ -5321,6 +5519,84 @@ def test_held_checkouts():
 
     W._announced.clear(); W._announced.update(old_announced)
     W.ROOT = old_root
+
+
+# --- and the panel has to say what the survey found -------------------------
+# The row is the only place some of these branches are named at all, so the
+# rendering is driven for real rather than read: a panel that drops a row, or
+# prints "null" where a count should be, looks fine from the Python side.
+
+def test_unmerged_panel_renders():
+    import re, json as _j, subprocess as _sp, tempfile as _tf
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe unmerged-branch panel")
+
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    prelude = """
+const _els = {};
+function _el(id) {
+  return _els[id] || (_els[id] = {innerHTML: "", value: "", style: {},
+    classList: {add(){}, remove(){}, toggle(){}}, appendChild(){}, addEventListener(){}});
+}
+globalThis.document = {getElementById: _el, addEventListener(){},
+  createElement: () => _el("_new"), querySelectorAll: () => [], body: _el("body")};
+globalThis.window = globalThis;
+globalThis.fetch = async () => ({json: async () => ({sessions: [], tasks: []}),
+                                 text: async () => ""});
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.localStorage = {getItem: () => null, setItem(){}};
+process.on("unhandledRejection", () => {});
+"""
+    drive = """
+const ROWS = [
+  {id: "tsk_1", title: "a local one", branch: "silkworm/tsk_1", base: "main",
+   commits: 2, head: "abcdef12", state: "done", repo: "/r", thread: "",
+   local: true, remote: ""},
+  {id: "tsk_2", title: "unmeasurable", branch: "silkworm/tsk_2", base: "main",
+   commits: null, head: "abcdef34", state: "done", repo: "/r", thread: "",
+   local: true, remote: ""},
+  {id: "tsk_3", title: "pushed then deleted", branch: "silkworm/tsk_3",
+   base: "main", commits: 1, head: "abcdef56", state: "done", repo: "/r",
+   thread: "", local: false, remote: "origin"},
+];
+taskCall = async () => ({ok: true, unmerged: ROWS, summary: "3 finished tasks"});
+renderUnmerged().then(() => {
+  console.log(JSON.stringify({html: _el("unmerged").innerHTML}));
+});
+"""
+    f = Path(_tf.mkdtemp()) / "h.js"
+    f.write_text(prelude + js + drive)
+    r = _sp.run(["node", str(f)], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        check("the panel runs in a browser-like context", False,
+              (r.stderr or "").strip().splitlines()[-1] if r.stderr else "no output")
+        return
+    html = _j.loads(r.stdout.strip().splitlines()[-1])["html"]
+
+    check("every branch the survey found reaches the panel",
+          html.count("<b>") == 3, html)
+    check("an ordinary branch shows its count", "tsk_1 <b>2</b>" in html, html)
+    check("a count git would not give is shown as a question, not as null",
+          "tsk_2 <b>?</b>" in html and "null" not in html,
+          "\"null\" in the panel is how a reader learns to ignore the panel")
+    check("and the tip says why there is no number",
+          "git could not count its commits" in html, html)
+    check("a branch with no local copy is named where it actually is",
+          "origin/tsk_3 <b>1</b>" in html, html)
+    check("and says so in full on hover",
+          "no local branch" in html, html)
+    # Land and Drop both act on the local branch. On a remote-only row Land
+    # would answer "its branch is gone: nothing to land" over commits sitting
+    # on origin, so neither button may be offered there.
+    rows_html = html.split('<span class="ub">')[1:]
+    remote_row = next((h for h in rows_html if "origin/tsk_3" in h), "")
+    check("a remote-only branch offers no Land or Drop to misreport it",
+          remote_row and "'land'" not in remote_row and "'drop'" not in remote_row,
+          remote_row)
+    check("while a local branch keeps both",
+          sum("'land'" in h and "'drop'" in h for h in rows_html) == 2, html)
 
 
 def test_dashboard_js_is_whole():

@@ -174,6 +174,31 @@ def _clip(title, width: int = 90) -> str:
     return title if len(title) <= width else title[:width - 1].rstrip() + "…"
 
 
+def _size(commits) -> str:
+    """How big a branch is, or the admission that nobody counted.
+
+    None means git was asked and would not answer. Printing that as "0
+    commits" -- which `or 0` did -- describes a branch with nothing on it,
+    which is the one thing a branch in this list is guaranteed not to be.
+    """
+    if commits is None:
+        return "commit count unknown"
+    return f"{commits} commit{'s' if commits != 1 else ''}"
+
+
+def _where(row) -> str:
+    """Named only when there is no local branch, since otherwise the branch
+    name already says where to look. A row with only a remote copy is still
+    unmerged work, but `git switch` will not find it by that name.
+
+    A row with no `local` field at all came from an older bot and is taken to
+    be local: the same default the dashboard uses, so the two cannot disagree
+    about the same payload, and the quieter of the two guesses.
+    """
+    return f", on {row['remote']} only" if row.get("remote") and \
+        not row.get("local", True) else ""
+
+
 def unmerged_note(rows, limit: int = MAX_LISTED) -> str:
     """Tell the nightly pass what is already fixed on a branch nobody merged.
 
@@ -203,9 +228,8 @@ def unmerged_note(rows, limit: int = MAX_LISTED) -> str:
                                        r.get("branch") or ""))
     shown = rows[:limit]
     body = "\n".join(
-        f"  - {r.get('branch') or '?'} ({r.get('commits') or 0} commit"
-        f"{'s' if (r.get('commits') or 0) != 1 else ''}, off "
-        f"{r.get('base') or 'the base'}) — {_clip(r.get('title'))}"
+        f"  - {r.get('branch') or '?'} ({_size(r.get('commits'))}{_where(r)}, "
+        f"off {r.get('base') or 'the base'}) — {_clip(r.get('title'))}"
         for r in shown)
     if len(rows) > len(shown):
         # Said out loud for the same reason `board_note` says it: the closing

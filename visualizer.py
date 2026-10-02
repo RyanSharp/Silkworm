@@ -1576,14 +1576,30 @@ async function renderUnmerged() {
   if (!rows.length) { el.innerHTML = ""; return; }
   el.innerHTML = `<span class="nlabel">🌿 ${esc(r.summary || "")}</span>` +
     rows.map(b => {
+      // null means git was asked for the count and would not answer. Shown
+      // as "?" rather than dropped or zeroed: a branch nobody can measure is
+      // still a branch nobody merged, and this panel is the only place it
+      // gets named.
+      const n = (b.commits === null || b.commits === undefined) ? "?" : b.commits;
+      // A branch that exists only on a remote is real unmerged work, but
+      // `git switch` will not find it under the bare name, so the name says
+      // where it is.
+      const where = (b.local === false && b.remote) ? esc(b.remote) + "/" : "";
       const tip = `${esc(b.title)}\n${esc(b.head)} · ${esc(b.id)} · ${
-        esc(b.state)} · off ${esc(b.base)}\n${esc(b.repo)}`;
-      const label = `${esc(b.branch.replace(/^silkworm\//, ""))} <b>${b.commits}</b>`;
+        esc(b.state)} · off ${esc(b.base)}${
+        n === "?" ? "\ngit could not count its commits" : ""}${
+        where ? "\nno local branch — only on " + esc(b.remote) : ""}\n${esc(b.repo)}`;
+      const label = `${where}${esc(b.branch.replace(/^silkworm\//, ""))} <b>${n}</b>`;
       const name = b.thread
         ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(b.thread)}')">${label}</button>`
         : `<span class="b" title="${tip}">${label}</span>`;
       // Land: the same landing Approve starts (rebase, suite, merge, suite).
       // Drop: delete the branch, tagging what no other ref holds first.
+      // Both buttons act on the local branch. With none, Land would report
+      // "its branch is gone: nothing to land" over commits sitting on the
+      // remote, and Drop would delete nothing -- so neither is offered, and
+      // the row stays a name to go and fetch.
+      if (where) return `<span class="ub">${name}</span>`;
       return `<span class="ub">${name}`
         + `<button class="ghost" title="rebase onto the base, test, merge, test" `
         + `onclick="taskAction('${esc(b.id)}','land')">Land</button>`

@@ -27,7 +27,9 @@ and the base it was cut from.
 Deliberately local: no fetch. A dashboard panel must not wait on the network,
 and the cost of being slightly behind is naming a branch that someone else
 already merged, which is a great deal better than staying silent about one
-nobody did.
+nobody did. Remote-tracking refs are read all the same -- they are on disk,
+and a branch that was pushed and then lost its local copy is the case where
+the commits survive and the row does not.
 """
 
 import logging
@@ -95,23 +97,154 @@ def repo_for(task: dict) -> Path | None:
     return None
 
 
-def existing(repo) -> dict:
-    """Every silkworm branch in this repo, as branch -> tip sha.
+def _remotes(repo) -> list:
+    """The remotes configured here, or none if git cannot be asked.
 
-    One call for the whole repo. The alternative -- asking per task -- is a
-    subprocess per record, and this runs behind a dashboard panel.
+    Asked rather than pattern-matched out of the ref paths: `git remote add
+    my/remote <url>` is accepted, so the first path segment under
+    `refs/remotes/` is not reliably the remote's name.
     """
-    r = _git(repo, "for-each-ref", "--format=%(refname:short) %(objectname)",
-             f"refs/heads/{worktrees.BRANCH_PREFIX}")
+    r = _git(repo, "remote")
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+#: The two places a branch can be, spelled once. A remote-tracking ref is a
+#: copy of somebody's branch and not a branch you can check out, but it is
+#: every bit as much a place finished commits are sitting.
+_HEADS, _REMOTES = "refs/heads/", "refs/remotes/"
+
+
+def existing(repo) -> dict:
+    """Every silkworm branch in this repo, wherever its copies are.
+
+    Keyed by branch name, so `silkworm/tsk_x` is one entry whether it is local,
+    on a remote, or both. Each entry carries every ref that holds it, its tip,
+    and whether a local branch of that name exists at all.
+
+    Remotes are included because a branch with no local ref was invisible
+    here, and this module's whole failure mode is meant to be naming a branch
+    too eagerly rather than hiding one. A local ref is not permanent: a
+    worktree release can recreate it from a stale base, a sweep or a hand can
+    delete it, and branches in this repo have been observed reset to a
+    pre-work commit between turns. Push first and any of those leaves the
+    commits safe on origin and the branch gone from the survey --
+    `origin/silkworm/tsk_e37a60256d`, one commit not in main, named by the
+    dashboard, by `silkworm status` and by the nightly note in none of the
+    three.
+
+    Still one call for the whole repo. The alternative -- asking per task -- is
+    a subprocess per record, and this runs behind a dashboard panel.
+    """
+    # One literal prefix per remote, rather than one `refs/remotes/*/...`
+    # glob. Measured: for-each-ref matches a glob with WM_PATHNAME, so `*` is
+    # a single path segment -- `origin/silkworm/a/b` and any remote whose own
+    # name holds a slash both fell outside it, while the local pattern is a
+    # literal prefix and matches however deep the name goes. That asymmetry
+    # is a half-blind survey of exactly the kind this module is here to stop.
+    # Longest first, so a remote called `up` cannot claim a ref belonging to
+    # one called `up/stream`.
+    known = sorted(_remotes(repo), key=len, reverse=True)
+    pats = [f"{_HEADS}{worktrees.BRANCH_PREFIX}"]
+    pats += [f"{_REMOTES}{name}/{worktrees.BRANCH_PREFIX}" for name in known]
+    # And a one-segment glob besides, for refs left under `refs/remotes/` by a
+    # remote that is no longer configured. Those hold commits too, and the rule
+    # here is never to hide one; the name of a remote that does not exist can
+    # only be guessed at, so it is guessed at from the path.
+    pats.append(f"{_REMOTES}*/{worktrees.BRANCH_PREFIX}*")
+    r = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)", *pats)
     if r.returncode != 0:
         log.warning("could not list branches in %s: %s", repo,
                     (r.stderr or "").strip()[-200:])
         return {}
-    out = {}
+    out: dict = {}
     for line in r.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 2:
-            out[parts[0]] = parts[1]
+        if len(parts) != 2:
+            continue
+        ref, sha = parts
+        if ref.startswith(_HEADS):
+            name, remote = ref[len(_HEADS):], ""
+        else:
+            # The remote is taken from the pattern that asked for the ref
+            # rather than guessed from the path, since `git remote add
+            # my/remote <url>` is accepted and a partition on the first
+            # slash would file its branches under "my".
+            remote = next((n for n in known
+                           if ref.startswith(f"{_REMOTES}{n}/")), "")
+            if remote:
+                name = ref[len(_REMOTES) + len(remote) + 1:]
+            else:
+                # No configured remote owns it. One segment is then the only
+                # reading available, and a leftover is better named roughly
+                # than dropped.
+                remote, _, name = ref[len(_REMOTES):].partition("/")
+                if not remote or not name:
+                    continue
+        if not name.startswith(worktrees.BRANCH_PREFIX):
+            continue
+        e = out.setdefault(name, {"refs": [], "sha": "", "remote": "",
+                                  "local": False})
+        e["refs"].append(ref)
+        if remote:
+            # Several remotes can hold the same branch, and the row shows one
+            # name. Prefer origin, which is the one everything else here means
+            # by "the remote"; otherwise whichever git listed first.
+            if not e["remote"] or remote == "origin":
+                e["remote"] = remote
+        else:
+            # The local copy is the one a landing would use, so it names the
+            # tip when there is one; a remote-only branch has only the other.
+            e["local"], e["sha"] = True, sha
+        if not e["sha"]:
+            e["sha"] = sha
+    for e in out.values():
+        e["refs"] = tuple(e["refs"])
+    return out
+
+
+def retired(repo) -> set:
+    """Every (branch, short sha) a human deliberately threw away.
+
+    `discard.py` tags a branch tip before deleting the branch, so that the work
+    survives gc; the tag is named `discarded/<date>/<branch>-<short sha>`. That
+    tag is the record of a decision -- this tip is not wanted -- and the survey
+    has to honour it, because the local branch being gone is no longer enough
+    to keep it quiet.
+
+    It was exactly enough before this module read remotes, and stopped being so
+    the moment it did. `git branch -D` removes `refs/heads/` only, the survey
+    deliberately never pushes, and `worktrees.base_ref` fetches without
+    `--prune` -- so `refs/remotes/origin/silkworm/<id>` is recreated on every
+    fetch for as long as the branch is on origin. Without this, discarding a
+    branch that had ever been pushed would put it back in the panel, back in
+    `silkworm status`, and back into every nightly prompt for that project, for
+    ever, with nothing in the product able to clear it. Measured: the one
+    remote-only branch in this checkout, `origin/silkworm/tsk_e37a60256d`, is
+    the tip of `discarded/2026-09-12/silkworm/tsk_e37a60256d-e3541be`.
+
+    Matched on branch *and* tip, not on either alone: the same branch name gets
+    reused by a re-run -- four of the fifteen names in the 2026-09-12 reset
+    appear twice with divergent tips -- and a tip that later gained commits is
+    not the tip anyone retired.
+
+    A repository that cannot be asked yields an empty set and so hides nothing,
+    which is the direction this module errs in everywhere else.
+    """
+    r = _git(repo, "for-each-ref", "--format=%(refname:short)",
+             f"refs/tags/{discard.NAMESPACE}/")
+    if r.returncode != 0:
+        log.warning("could not list discarded tags in %s: %s", repo,
+                    (r.stderr or "").strip()[-200:])
+        return set()
+    out = set()
+    for name in r.stdout.split():
+        rest = name[len(discard.NAMESPACE) + 1:]
+        # discarded/<date>/<branch>-<sha7>: the date is one segment, the
+        # branch may hold slashes and hyphens, and the sha is always last.
+        rest = rest.split("/", 1)[1] if "/" in rest else rest
+        branch, _, sha7 = rest.rpartition("-")
+        if branch and sha7:
+            out.add((branch, sha7))
     return out
 
 
@@ -143,8 +276,9 @@ def nothing_to_land(repo, branch: str, base: str) -> str:
     return ""
 
 
-def ahead(repo, bases, branch: str) -> int:
-    """Commits on `branch` that no copy of the base has.
+def ahead(repo, bases, branch) -> int | None:
+    """Commits on `branch` that no copy of the base has, or None if git would
+    not say.
 
     This is the whole merge test. A branch already contained in the base has
     nothing ahead of it, so asking `git branch --merged` as well was a second
@@ -157,15 +291,35 @@ def ahead(repo, bases, branch: str) -> int:
     branch and does not push, and a pull request merged on the forge advances
     the remote one. Asking about a single ref got one of those two cases wrong
     whichever ref was chosen -- so ask about the commits no copy contains.
+
+    `branch` is plural for the same reason and about the same two copies: a
+    local ref reset to the base while origin still holds the commits is work
+    that is sitting there, so the count is of everything on *any* copy of the
+    branch and no copy of the base.
+
+    None rather than a number when the call fails, because zero is the one
+    answer that must never be invented here. `_git` never raises -- it returns
+    a stub with empty stdout when the subprocess cannot run -- so a timeout,
+    a wedged index or a missing git used to parse as "0 commits ahead", which
+    `survey` reads as merged and drops. The one outcome this module exists to
+    prevent, produced by a stopwatch. A caller that cannot show "unknown"
+    should show the row anyway; it must not show nothing.
     """
     refs = (bases,) if isinstance(bases, str) else tuple(bases)
-    if not refs:
+    tips = (branch,) if isinstance(branch, str) else tuple(branch)
+    if not refs or not tips:
         return 0
-    r = _git(repo, "rev-list", "--count", branch, "--not", *refs)
+    r = _git(repo, "rev-list", "--count", *tips, "--not", *refs)
+    if r.returncode != 0:
+        log.warning("could not count %s against %s in %s: %s", tips, refs,
+                    repo, (r.stderr or "").strip()[-200:])
+        return None
     try:
         return int(r.stdout.strip())
     except ValueError:
-        return 0
+        log.warning("unreadable commit count for %s in %s: %r", tips, repo,
+                    r.stdout[:80])
+        return None
 
 
 def survey(records) -> list:
@@ -196,12 +350,26 @@ def survey(records) -> list:
         if not present:
             continue
         base, shown = base_for(repo, pref)
+        gone = retired(repo)
         for name, rec in present.items():
-            count = ahead(repo, base, name)
-            if not count:
+            found = live[name]
+            if (name, found["sha"][:7]) in gone:
+                # Discarded on purpose, and its tip kept by a tag rather than
+                # by a branch. Reading remotes brought these back from the
+                # dead: nothing prunes the remote-tracking copy, so without
+                # this the board could never reach empty again.
+                continue
+            count = ahead(repo, base, found["refs"])
+            if count == 0:
                 # Everything on it is already in the base -- it was merged, by
                 # us or by hand -- or it never held anything. Either way there
                 # is nothing to land and nothing to say.
+                #
+                # Compared against zero rather than tested for truth, because
+                # `ahead` also answers None: git was asked and would not say.
+                # Reading that as "merged" is how a timeout used to delete a
+                # branch from the one list that names it, so an unknown count
+                # keeps its row and travels as None for the callers to show.
                 continue
             rows.append({
                 "id": rec.get("id") or "",
@@ -218,7 +386,13 @@ def survey(records) -> list:
                 "base": shown,
                 "commits": count,
                 "repo": repo,
-                "head": live[name][:8],
+                "head": found["sha"][:8],
+                # Where the branch actually is. A row with no local copy is
+                # still work sitting unmerged, but it is not a branch anyone
+                # can check out by that name, and saying so is the difference
+                # between a useful row and a confusing one.
+                "local": found["local"],
+                "remote": found["remote"],
                 "thread": rec.get("thread") or "",
                 "updated": rec.get("updated") or rec.get("created") or 0,
             })
@@ -228,9 +402,9 @@ def survey(records) -> list:
 def contained(repo, bases, branch: str) -> bool:
     """True only when git confirms every commit on `branch` is in some base.
 
-    Not `ahead(...) == 0`. That answers zero when git fails, which is the
-    right way to err for a survey -- a row missing from a panel -- and the
-    wrong way for anything that deletes.
+    Not `ahead(...) == 0`. `ahead` now answers None rather than zero when git
+    fails, but a deleter should not rest on a caller remembering to tell those
+    apart: this asks a yes/no question whose only "yes" is git saying so.
     """
     refs = (bases,) if isinstance(bases, str) else tuple(bases)
     return any(_git(repo, "merge-base", "--is-ancestor", branch, ref).returncode == 0
@@ -280,7 +454,12 @@ def prune_merged(records, skip=()) -> list:
 
 def _prune_repo(repo, pref: str, group) -> list:
     live = existing(repo)
-    names = [n for n in {name_for(r) for r in group} if n in live]
+    # Local branches only. `existing` also reports copies that live solely on
+    # a remote, which is right for a survey -- they are work sitting unmerged
+    # -- and meaningless here: `discard.drop` deletes `refs/heads/`, and this
+    # module never touches a remote.
+    names = [n for n in {name_for(r) for r in group}
+             if n in live and live[n]["local"]]
     if not names:
         return []
     base, _ = base_for(repo, pref)
@@ -380,10 +559,22 @@ def base_for(repo, prefer: str = "") -> tuple[tuple, str]:
 
 
 def line(rows) -> str:
-    """One line for `silkworm status` and the Slack-facing summary."""
+    """One line for `silkworm status` and the Slack-facing summary.
+
+    A row whose count is None is counted as a branch and not as commits: git
+    refused to measure it, and quietly folding that in as a zero would make the
+    summary agree with the bug it is reporting.
+    """
     if not rows:
         return ""
-    commits = sum(r["commits"] for r in rows)
+    counted = [r.get("commits") for r in rows if r.get("commits") is not None]
+    unknown = len(rows) - len(counted)
+    size = []
+    if counted or not unknown:
+        total = sum(counted)
+        size.append(f"{total} commit{'s' if total != 1 else ''}")
+    if unknown:
+        size.append(f"{unknown} unmeasured")
     return (f"{len(rows)} finished task{'s' if len(rows) != 1 else ''} on "
             f"unmerged branch{'es' if len(rows) != 1 else ''} "
-            f"({commits} commit{'s' if commits != 1 else ''})")
+            f"({', '.join(size)})")
