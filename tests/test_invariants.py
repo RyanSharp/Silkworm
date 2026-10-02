@@ -10285,6 +10285,9 @@ def _deploy(cli, argv, bot, clock, restarts, *, git=None, suite=lambda: 0):
     t = [0.0]
     def sleep(s):
         t[0] += s
+        # A wait that never ends must fail the test, not hang the suite.
+        if t[0] > 86400:
+            raise RuntimeError("deploy waited a simulated day without ending")
     clock.__dict__["t"] = t
     out = io.StringIO()
     saved = os.environ.pop("SILKWORM_THREAD", None)
@@ -10362,6 +10365,31 @@ def test_deploy_waits_then_restarts_onto_head():
         code, out, t = _deploy(cli, [], bot, clock, restarts)
         check(f"a bot that comes back {label} fails the deploy",
               code != 0 and restarts, f"code={code}\n{out}")
+
+    # A restart that fails can leave the old bot running: it must not stay
+    # drained for the next two hours.
+    bot = _FakeBot(clock)
+    class Broken:
+        def restart(self):
+            return False
+    t = [0.0]
+    saved = os.environ.pop("SILKWORM_THREAD", None)
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.do_deploy(["--now"], repo=Path("/nonexistent"), call=bot,
+                                 manager=Broken(), suite=lambda: 0,
+                                 git=lambda repo, *a: ((0, "main") if "--abbrev-ref" in a else
+                                                       (0, bot.head) if a[0] == "rev-parse" else
+                                                       (0, "") if a[0] == "status" else (1, "")),
+                                 clock=lambda: t[0],
+                                 sleep=lambda s: t.__setitem__(0, t[0] + s))
+    finally:
+        if saved is not None:
+            os.environ["SILKWORM_THREAD"] = saved
+    check("a failed restart lifts the drain and fails the deploy",
+          code != 0 and bot.drain_calls[-1].get("action") == "stop" and not bot.draining,
+          f"{code} {bot.drain_calls}\n{out.getvalue()}")
 
     # A bot too old to drain is not quietly restarted under running work.
     restarts = []
@@ -10493,7 +10521,7 @@ def test_deploy_preflight_refuses_unfit_checkouts():
 
 # --- an interrupted task resumes its session, it does not start over ------------
 
-def _resume_harness(repo, st, sess, transcripts, seen):
+def _resume_harness(repo, st, sess, transcripts, seen, alive=()):
     import shutil, threading, logging
     import tasks as T, roles, worktrees as W
 
@@ -10510,6 +10538,8 @@ def _resume_harness(repo, st, sess, transcripts, seen):
         run_turn=run_turn, shutil=shutil,
         harvester=types.SimpleNamespace(
             find_transcript=lambda sid: Path(f"/x/{sid}.jsonl") if sid in transcripts else None),
+        procs=types.SimpleNamespace(session_alive=lambda sid: sid in alive),
+        RESUME_WAIT_S=60, fail_or_retry=lambda *a, **k: False,
         OUTBOX_ROOT=repo.parent / "outbox", SILKWORM_BIN="/x/silkworm",
         permission_args=lambda: [], log=logging.getLogger("test"),
         task_thread=lambda t: ("C1", "1.0"),
@@ -10636,6 +10666,147 @@ def test_an_interrupted_task_resumes_its_session():
     _resume_harness(repo, st, sess, {"sess-1"}, seen)(st.get(tid4))
     check("a task that was not interrupted runs its goal",
           seen and seen[0]["prompt"] == "plain", str(seen[:1]))
+
+
+def test_resume_edge_cases():
+    import tasks as T, worktrees as W
+    from tasks import TaskStore
+    print("\nresuming: live orphans, false starts, moved checkouts, rework")
+
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "wts"
+    repo = root / "repo"; repo.mkdir()
+    def git(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                            capture_output=True, text=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("a\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+    st = TaskStore(root / "t.json")
+    sess = tmp_store()
+
+    def interrupted(goal, sid, cwd=None):
+        tid = st.create(goal, driver="queue", source="ui", isolate=True,
+                        thread="C1:1.0", scope={"cwd": str(repo)})["id"]
+        cp = {"session_id": sid, "at": time.time()}
+        if cwd is not None:
+            cp["cwd"] = str(cwd)
+        st.update(tid, session_id=sid, checkpoint=cp)
+        st.transition(tid, T.RUNNING, "claimed")
+        st.requeue_interrupted()
+        # Claimed by id: claim() takes the oldest queued task, which would be
+        # an earlier case's, not this one.
+        before = st.get(tid)["attempts"]
+        st.transition(tid, T.RUNNING, "claimed by the runner")
+        return tid, st.get(tid) | {"attempts_before": before}
+
+    # The restart did not take the child with it: it is still running.
+    tid, task = interrupted("orphaned", "sess-live")
+    seen = []
+    _resume_harness(repo, st, sess, {"sess-live"}, seen, alive={"sess-live"})(task)
+    rec = st.get(tid)
+    check("a session whose child is still alive is not resumed under it",
+          seen == [], str(seen[:1]))
+    check("the task waits for it, parked with a retry time, not failed",
+          rec["state"] == T.BLOCKED and rec["retry_at"] and rec["retry_at"] > time.time(),
+          str({k: rec.get(k) for k in ("state", "retry_at")}))
+    check("still holding its checkpoint, and charged no attempt",
+          (rec.get("checkpoint") or {}).get("session_id") == "sess-live"
+          and rec["attempts"] == task["attempts_before"] and not rec["false_starts"],
+          str({k: rec.get(k) for k in ("checkpoint", "attempts", "false_starts")}))
+
+    # The resumed run hits a quota wall before doing anything.
+    tid, task = interrupted("quota", "sess-q")
+    def quota(prompt, **kw):
+        kw["on_init"]("sess-q")
+        raise ClaudeError("You've hit your session limit · resets 6pm")
+    ex = _resume_harness(repo, st, sess, {"sess-q"}, [])
+    ex.__globals__["run_turn"] = quota
+    ex(task)
+    check("a resume that dies before any work keeps its checkpoint for the retry",
+          (st.get(tid).get("checkpoint") or {}).get("session_id") == "sess-q",
+          str(st.get(tid).get("checkpoint")))
+    # ...but one that got going and then failed is ordinary failed work.
+    tid, task = interrupted("worked then failed", "sess-w")
+    def worked_then_failed(prompt, **kw):
+        kw["on_init"]("sess-w")
+        kw["on_activity"]("Bash", {"command": "make"})
+        raise ClaudeError("Claude reported an error")
+    ex = _resume_harness(repo, st, sess, {"sess-w"}, [])
+    ex.__globals__["run_turn"] = worked_then_failed
+    ex(task)
+    check("a resume that did work and then failed does not keep it",
+          not st.get(tid).get("checkpoint"), str(st.get(tid).get("checkpoint")))
+
+    # The session ran somewhere other than where this run would put it.
+    tid, task = interrupted("moved", "sess-m", cwd=root / "somewhere-else")
+    seen = []
+    _resume_harness(repo, st, sess, {"sess-m"}, seen)(task)
+    check("a session from another directory is not resumed here; it starts fresh",
+          seen and seen[0]["session_id"] is None and seen[0]["prompt"] == "moved",
+          str(seen[:1]))
+    # ...and where it did run is recorded, so this can be told.
+    tid, task = interrupted("recorded", "sess-r")
+    seen = []
+    during = {}
+    def look(prompt, **kw):
+        kw["on_init"]("sess-r")
+        during.update(st.get(tid))
+        return types.SimpleNamespace(text="ok", cost_usd=0.0, duration_ms=1,
+                                     session_id="sess-r")
+    ex = _resume_harness(repo, st, sess, {"sess-r"}, seen)
+    ex.__globals__["run_turn"] = look
+    ex(task)
+    check("the checkpoint records the directory the session runs in",
+          (during.get("checkpoint") or {}).get("cwd") == str(W.path_for(repo, tid)),
+          str(during.get("checkpoint")))
+
+    # A fresh-context role resumes its *own* interrupted session too. Before,
+    # it always started over: fresh roles never resumed anything.
+    tid = st.create("look at it", driver="queue", source="ui", role="ideator",
+                    thread="C1:1.0", scope={"cwd": str(root)})["id"]
+    st.update(tid, checkpoint={"session_id": "sess-idea", "at": time.time(),
+                               "cwd": str(root)})
+    st.transition(tid, T.RUNNING, "claimed")
+    st.requeue_interrupted()
+    st.transition(tid, T.RUNNING, "claimed by the runner")
+    seen = []
+    _resume_harness(repo, st, sess, {"sess-idea"}, seen)(st.get(tid))
+    check("a fresh-context role resumes its own interrupted session",
+          seen and seen[0]["session_id"] == "sess-idea"
+          and seen[0]["prompt"] == T.RESUME_PROMPT, str(seen[:1]))
+
+    # Work sent back with new instructions must read them, not "carry on".
+    T_ = T
+    def stale(goal):
+        tid = st.create(goal, driver="queue", source="ui", role="implementor",
+                        thread="C1:1.0", scope={"cwd": str(repo)})["id"]
+        st.update(tid, checkpoint={"session_id": "sess-old", "at": 1.0})
+        st.transition(tid, T_.RUNNING, "claimed")
+        return tid
+    posted = []
+    client = types.SimpleNamespace(chat_postMessage=lambda **kw: posted.append(kw))
+    ns = {"task_store": st, "tasks": T, "app": types.SimpleNamespace(client=client),
+          "log": logging.getLogger("test"), "verify": __import__("verify"), "os": os,
+          "task_state": lambda tid, s_, d="": st.transition(tid, s_, d)}
+    _bot_fns({"send_back_uncommitted", "send_back_for_tests",
+              "MAX_COMMIT_ATTEMPTS", "MAX_VERIFY_ATTEMPTS"}, ns)
+    a = stale("loose")
+    ns["send_back_uncommitted"](st.get(a), ["x.txt"], "C1", "1.0")
+    b = stale("failing")
+    ns["send_back_for_tests"](st.get(b), {"output": "1 failed", "ok": False, "ran": True},
+                              "C1", "1.0")
+    c = stale("reviewed")
+    st.transition(c, T.AWAITING_APPROVAL, "review flagged it")
+    handle = _bot_func("handle_tasks", task_store=st, tasks=T,
+                       log=logging.getLogger("test"))
+    r = handle({"action": "rework", "id": c, "notes": "do it the other way"})
+    for tid, how in ((a, "for uncommitted work"), (b, "for failing tests"),
+                     (c, "from the dashboard")):
+        rec = st.get(tid)
+        check(f"sent back {how}: requeued without the stale checkpoint",
+              rec["state"] == T.QUEUED and not rec.get("checkpoint"),
+              str({k: rec.get(k) for k in ("state", "checkpoint")}))
 
 
 if __name__ == "__main__":

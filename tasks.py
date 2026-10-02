@@ -224,8 +224,8 @@ def make(goal: str, **fields) -> dict:
 #: session already holds the goal and everything done towards it; restating the
 #: goal reads as "start again", which is the cost this exists to avoid.
 RESUME_PROMPT = (
-    "Your previous turn on this task was interrupted by a Silkworm restart "
-    "before it finished. Carry on from where you were. Check the actual state "
+    "Your previous turn on this task was interrupted (by a Silkworm restart "
+    "or an outage) before it finished. Carry on from where you were. Check the actual state "
     "first (git status, git log, files you were editing) -- some of the work "
     "may already be done or committed -- then finish the task and report the "
     "outcome as you would have.")

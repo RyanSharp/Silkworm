@@ -210,6 +210,8 @@ RUNNER_HOLD = retry.Hold()
 #: deadline, so neither the restart nor an abandoned deploy can leave the queue
 #: stopped. See drain.py.
 DRAIN = drain.Drain()
+#: How long a task whose interrupted session is still running waits to resume.
+RESUME_WAIT_S = 60
 ACTIVE_SESSIONS: dict[str, tuple[str, str]] = {}  # session_id -> (channel, thread_ts)
 _seen_events: OrderedDict[str, None] = OrderedDict()
 _users_cache: dict[str, str] = {}
@@ -1276,7 +1278,7 @@ def handle_drain(payload: dict) -> dict:
     """
     action = payload.get("action") or "status"
     if action == "start":
-        DRAIN.start(payload.get("seconds") or drain.DEFAULT_S,
+        DRAIN.start(payload.get("seconds", drain.DEFAULT_S),
                     why=str(payload.get("why") or "deploy")[:120])
     elif action == "stop":
         DRAIN.stop()
@@ -1667,8 +1669,11 @@ def handle_tasks(payload: dict) -> dict:
             # the old reviewer's id there made a reworked task skip both and go
             # straight to done -- unproven and unreviewed, which is the exact
             # opposite of what sending it back is for.
+            # And no checkpoint: resuming would say "carry on" and the notes
+            # appended to the goal would never be read.
             task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
-                              driver="queue", blocked_on=[], verified=None)
+                              driver="queue", blocked_on=[], verified=None,
+                              checkpoint=None)
             return {"ok": True, "task": task_store.transition(
                 tid, tasks.QUEUED, "sent back for rework")}
         except tasks.InvalidTransition as e:
@@ -2623,7 +2628,6 @@ def execute_task(task: dict) -> None:
         return
 
     key = f"{channel}:{thread_ts}"
-    progress = ProgressMessage(app.client, channel, thread_ts)
 
     # A turn a restart killed is resumed, not redone. Its checkpoint names the
     # session it was running (written the moment that session began), and the
@@ -2633,16 +2637,33 @@ def execute_task(task: dict) -> None:
     # finally below) takes it off the record, so a failure is retried as
     # ordinary work; only another kill leaves one. Without a transcript there
     # is nothing to resume, and the run starts fresh as before.
-    resume_sid = (task.get("checkpoint") or {}).get("session_id") or ""
+    checkpoint = task.get("checkpoint") or {}
+    resume_sid = checkpoint.get("session_id") or ""
     lost_sid = ""
     if resume_sid and not harvester.find_transcript(resume_sid):
         log.warning("task %s: interrupted session %s has no transcript on disk; "
                     "starting it fresh", tid, resume_sid[:8])
         lost_sid, resume_sid = resume_sid, ""
-    if resume_sid:
-        log.info("task %s: resuming session %s after a restart", tid, resume_sid[:8])
-        progress.update(":arrows_counterclockwise: _Resuming where a restart "
-                        "interrupted this…_")
+    if resume_sid and procs.session_alive(resume_sid):
+        # The restart did not kill its child: children run in their own
+        # session, and outlive the bot. Resuming now would put a second
+        # process on the same session in the same checkout while the first is
+        # still writing to both. Wait for it -- recovery delivers its reply --
+        # and then resume whatever it left. Not an attempt, and not a false
+        # start either: those are capped, and a long turn would run the cap
+        # out and fail a task that was never even tried.
+        log.info("task %s: interrupted session %s is still running; "
+                 "resuming once it exits", tid, resume_sid[:8])
+        try:
+            task_store.update(tid, attempts=max(0, (task.get("attempts") or 1) - 1),
+                              retry_at=time.time() + RESUME_WAIT_S)
+            task_store.transition(tid, tasks.BLOCKED,
+                                  "waiting for its interrupted session to exit")
+        except Exception:
+            log.exception("could not park %s behind its live session", tid)
+        return
+
+    progress = ProgressMessage(app.client, channel, thread_ts)
 
     # Self-contained work in a repository gets its own checkout. It cannot then
     # leave your working tree dirty or on another branch, and it no longer
@@ -2708,6 +2729,19 @@ def execute_task(task: dict) -> None:
             cwd = worktree
             task_store.update(tid, scope={**scope, "worktree": str(worktree)})
 
+    # `--resume` finds a session by the directory it ran in. One that ran
+    # somewhere else -- the main checkout, because its worktree could not be
+    # made that time -- cannot be resumed from here, and the failure would not
+    # be transient: it would fail the task outright. Start it fresh instead.
+    if resume_sid and checkpoint.get("cwd") and Path(checkpoint["cwd"]) != Path(cwd):
+        log.warning("task %s: interrupted session %s ran in %s, not %s; "
+                    "starting it fresh", tid, resume_sid[:8], checkpoint["cwd"], cwd)
+        lost_sid, resume_sid = resume_sid, ""
+    if resume_sid:
+        log.info("task %s: resuming session %s after a restart", tid, resume_sid[:8])
+        progress.update(":arrows_counterclockwise: _Resuming where a restart "
+                        "interrupted this…_")
+
     outbox = OUTBOX_ROOT / key.replace(":", "__")
     system_note = (
         "You are completing a task; report the outcome concisely. "
@@ -2728,6 +2762,7 @@ def execute_task(task: dict) -> None:
     # a quota message, typically, three seconds in -- never started the work,
     # and must not be charged an attempt for it.
     worked = [False]
+    ended = [False]
     lock = _thread_lock(key)
     try:
         with lock, repo_guard(cwd, progress):
@@ -2772,10 +2807,12 @@ def execute_task(task: dict) -> None:
                     # is the only record of what to resume.
                     on_init=lambda sid: task_store.update(
                         tid, session_id=sid,
-                        checkpoint={"session_id": sid, "at": time.time()}),
+                        checkpoint={"session_id": sid, "at": time.time(),
+                                    "cwd": str(cwd)}),
                     on_activity=on_activity,
                     on_start=on_start,
                 )
+                ended[0] = True
                 RUNNER_HOLD.open()
                 # A fresh run must not repoint the thread at its throwaway
                 # session, or the next Slack message resumes the review.
@@ -2899,10 +2936,14 @@ def execute_task(task: dict) -> None:
                 log.exception("could not release worktree %s", worktree)
         # The turn ended here, in this process, so there is nothing to resume.
         # Only a turn killed outright -- by a restart -- leaves one behind.
-        try:
-            task_store.update(tid, checkpoint=None)
-        except Exception:
-            log.exception("could not clear the checkpoint on %s", tid)
+        # Except a resume that died before doing anything (a quota wall right
+        # after the restart, typically): that is a false start, retried later,
+        # and the retry should still resume rather than redo the work.
+        if ended[0] or worked[0] or not resume_sid:
+            try:
+                task_store.update(tid, checkpoint=None)
+            except Exception:
+                log.exception("could not clear the checkpoint on %s", tid)
         RUNNING.pop(key, None)
         RUNNING_TASKS.pop(tid, None)
         recovery.clear_pending(store, key)
@@ -2955,7 +2996,7 @@ def send_back_for_tests(task: dict, result: dict, channel: str, thread_ts: str) 
         text=f":arrows_counterclockwise: *Tests fail — sending it back* "
              f"(attempt {tried} of {MAX_VERIFY_ATTEMPTS}).")
     task_store.update(tid, goal=(task.get("goal", "") + "\n\n"
-                                 + verify.rework_note(result)))
+                                 + verify.rework_note(result)), checkpoint=None)
     task_state(tid, tasks.QUEUED, f"tests failed; sent back (attempt {tried})")
     return True
 
@@ -2997,7 +3038,7 @@ def send_back_uncommitted(task: dict, files: list[str], channel: str,
         "and landing only see what is committed on the branch, so as it stands "
         "none of it can be reviewed or merged. Commit what belongs to the task, "
         "and remove or ignore anything that does not (scratch files, build "
-        "output). Uncommitted:\n\n" + listing + more)))
+        "output). Uncommitted:\n\n" + listing + more)), checkpoint=None)
     task_state(tid, tasks.QUEUED, f"left work uncommitted; sent back (run {tried})")
     return True
 

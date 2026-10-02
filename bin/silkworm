@@ -908,6 +908,11 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
 
     mgr = manager or service_manager()
     if not mgr.restart():
+        # A restart can fail before stopping anything (a missing plist) or
+        # leave the old process holding its port. Either way the old bot may
+        # still be the one running, and it must not stay drained for hours.
+        if drained and call("/drain", {"action": "stop"}).get("ok"):
+            print(f"  {Y}·{N} the old bot is still answering — drain lifted")
         print(f"  {R}✘{N} restart failed — see above; silkworm logs")
         return 1
 
