@@ -5948,7 +5948,7 @@ def test_landing_is_visible():
 
     # --- the refusal has somewhere durable to live ----------------------------
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
-    rec_ns = {"task_store": store, "log": LOG}
+    rec_ns = {"task_store": store, "log": LOG, "time": time}
     _bot_fns({"record_landing"}, rec_ns)
     record_landing = rec_ns.get("record_landing")
 
@@ -6084,7 +6084,7 @@ def test_landing_is_visible():
     # unwinding. Its marker is durable and nothing else revisits it, so the row
     # would keep saying "landing…" about something that stopped days ago.
     import subprocess as _sp
-    sweep_ns = {"task_store": store, "log": LOG, "subprocess": _sp}
+    sweep_ns = {"task_store": store, "log": LOG, "subprocess": _sp, "time": time}
     _bot_fns({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY",
               "_interrupted_landing_detail"}, sweep_ns)
     sweep = sweep_ns.get("clear_interrupted_landings")
@@ -6167,7 +6167,7 @@ def test_landing_is_visible():
     release = _th.Event()
     threads_run = []
     start_ns = {"task_store": store, "tasks": T, "branches": B, "log": LOG,
-                "threading": _th,
+                "threading": _th, "time": time,
                 "landing_enabled": lambda task: True,
                 "land_and_record": lambda tid, c, t, **kw: (threads_run.append(tid),
                                                       holding.set(),
@@ -11885,6 +11885,282 @@ def test_two_turns_at_once_do_not_clobber_each_other():
     check("and still recoverable after a restart", seen.get("review's marker survived") is True, str(seen))
     check("its own cleanup still clears it",
           not RUNNING and not RUNNING_TASKS and not (sessions.get("C:5") or {}).get("pending"))
+
+
+# --- the daily digest -----------------------------------------------------------
+
+def _digest_store():
+    """A real TaskStore holding one of each thing the digest has to report,
+    with event times set relative to a fixed `now`."""
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "tasks.json")
+    now = 1_790_000_000.0
+    H = 3600
+
+    def rec(title, project="", state=None, events=(), **fields):
+        r = st.create(title, title=title, project=project, **fields)
+        if state:
+            # Straight to the state, the way a long-lived record reaches it;
+            # the events are what the digest reads, and they are set below.
+            with st._lock:
+                st._data[r["id"]]["state"] = state
+        st.update(r["id"], events=[{"at": now - ago * H, "kind": k, "detail": d}
+                                   for ago, k, d in events])
+        with st._lock:
+            st._data[r["id"]]["created"] = now - 100 * H
+        return r["id"]
+
+    ids = {}
+    ids["landed"] = rec("Fix the <halt> & marker", "trader", T.DONE,
+                        [(3, T.RUNNING, ""), (2, T.DONE, "")], attempts=1,
+                        result={"cost": 2.0, "landed": "a" * 40,
+                                "landing": {"landed": True, "stage": "landed",
+                                            "at": now - 2 * H}})
+    # Recorded before landings were dated: its last `done` says when.
+    ids["landed_undated"] = rec("Older-style landing", "trader", T.DONE,
+                                [(5, T.RUNNING, ""), (4, T.DONE, "")], attempts=1,
+                                result={"cost": 1.0, "landed": "b" * 40,
+                                        "landing": {"landed": True, "stage": "landed"}})
+    ids["landed_old"] = rec("Landed last week", "trader", T.DONE,
+                            [(170, T.RUNNING, ""), (169, T.DONE, "")], attempts=1,
+                            result={"cost": 9.0, "landed": "c" * 40,
+                                    "landing": {"landed": True, "stage": "landed",
+                                                "at": now - 169 * H}})
+    ids["refused"] = rec("Rebase me", "silkworm", T.DONE,
+                         [(6, T.RUNNING, ""), (5, T.DONE, "")], attempts=1,
+                         result={"cost": 0.5, "landing": {
+                             "landed": False, "stage": "rebase",
+                             "detail": "conflict in bot.py", "at": now - 5 * H}})
+    ids["dropped"] = rec("Dropped on purpose", "silkworm", T.DONE,
+                         [(6, T.RUNNING, ""), (5, T.DONE, "")], attempts=1,
+                         result={"cost": 0.25, "landing": {
+                             "landed": False, "stage": "dropped", "at": now - 5 * H}})
+    ids["held"] = rec("Add photo crop", "cadence", T.NEEDS_INPUT,
+                      [(1, T.NEEDS_INPUT, "not run: cadence needs a test command")])
+    ids["restart"] = rec("Killed by a restart", "silkworm", T.QUEUED,
+                         [(3, T.RUNNING, ""), (2, T.FAILED, "interrupted by restart"),
+                          (2, T.QUEUED, "requeued")], attempts=1,
+                         result={"cost": None})
+    impl = rec("Reviewed work", "cadence", T.AWAITING_APPROVAL,
+               [(9, T.RUNNING, ""), (8, T.BLOCKED, ""), (3, T.AWAITING_APPROVAL, "")],
+               attempts=1, result={"cost": 3.0})
+    ids["review"] = rec("Review: Reviewed work", "", T.FAILED,
+                        [(4, T.RUNNING, ""), (3, T.FAILED, "reviewer errored")],
+                        role="reviewer", parent=impl, attempts=1, result={"cost": 0.75})
+    ids["rerun"] = rec("Flaky thing", "trader", T.DONE,
+                       [(8, T.RUNNING, ""), (7, T.QUEUED, ""), (6.9, T.RUNNING, ""),
+                        (5, T.DONE, "")], attempts=3, result={"cost": 4.0})
+    ids["stuck"] = rec("Queued forever", "trader", T.QUEUED, [(20, T.QUEUED, "")])
+    ids["fresh"] = rec("Just queued", "trader", T.QUEUED, [(1, T.QUEUED, "")])
+    ids["sleeping"] = rec("Wakes tomorrow", "trader", T.BLOCKED, [(30, T.BLOCKED, "defer")],
+                          retry_at=now + 5 * H)
+    for i in range(2):
+        rec(f"Idea {i}", "cadence", T.PROPOSED)
+    rec("Chat in a DM", "", T.DONE, [(2, T.RUNNING, ""), (1, T.DONE, "")],
+        attempts=1, source="slack", result={"cost": 0.4})
+    rec("Quiet project", "odin", T.DONE, [(200, T.RUNNING, ""), (199, T.DONE, "")],
+        attempts=1, result={"cost": 1.0})
+    return st, now, ids
+
+
+def test_daily_digest_renders_from_a_real_store():
+    import digest
+    import tasks as T
+    st, now, ids = _digest_store()
+    rows = [{"project": "trader", "commits": 3, "title": "a"},
+            {"project": "trader", "commits": 2, "title": "b"}]
+    text = digest.render(st.all().values(), now, branch_rows=rows,
+                         released={"cadence": ["ios/v1.2.0"]})
+    print("\n".join("      " + l for l in text.splitlines()))
+    blocks, cur = {}, None
+    for line in text.splitlines()[1:]:
+        if line.startswith("*"):
+            cur = line.split("*")[1]
+            blocks[cur] = [line]
+        elif cur:
+            blocks[cur].append(line)
+    trader, cadence, silk = (("\n".join(blocks.get(p, []))) for p in ("trader", "cadence", "silkworm"))
+
+    check("digest: landed counts both landings in the window, titles escaped",
+          "landed 2: Fix the &lt;halt&gt; &amp; marker; Older-style landing" in trader, trader)
+    check("digest: a landing from last week is not today's news", "Landed last week" not in text)
+    check("digest: a refused landing names its stage and why",
+          "landing refused: Rebase me (rebase: conflict in bot.py)" in silk, silk)
+    check("digest: a branch dropped on purpose is not a refusal", "Dropped on purpose" not in text)
+    check("digest: a held task says why it was held",
+          "Add photo crop — held: not run: cadence needs a test command" in cadence, cadence)
+    check("digest: a restart kill says so, and what became of it",
+          "Killed by a restart — failed: interrupted by restart, now queued" in silk, silk)
+    check("digest: a reviewer's failure is filed under its parent's project",
+          "Review: Reviewed work — failed: reviewer errored" in cadence, cadence)
+    check("digest: tasks run more than once are named with their run count",
+          "ran more than once 1: Flaky thing (3 runs)" in trader, trader)
+    check("digest: a task queued far longer than usual is stuck",
+          "Queued forever — queued 20h" in trader, trader)
+    check("digest: one queued an hour, or blocked until a set wake-up, is not",
+          "Just queued" not in text and "Wakes tomorrow" not in text)
+    check("digest: 'stuck' scales with how long that state usually takes",
+          digest.stuck_limit(T.QUEUED, {T.QUEUED: 10 * 3600}) == 30 * 3600
+          and digest.stuck_limit(T.QUEUED, {T.QUEUED: 60}) == digest.STUCK_FLOOR_S[T.QUEUED])
+    check("digest: what is waiting on you is counted per project",
+          "waiting on you: 2 proposed · 1 awaiting approval · 1 needs input" in cadence, cadence)
+    check("digest: unmerged branches use branches.line",
+          "unmerged: 2 finished tasks on unmerged branches (5 commits)" in trader, trader)
+    check("digest: release tags are listed", "released: ios/v1.2.0" in cadence, cadence)
+    # Read by costs.by_project's rules: spend dated by when the run ended, and
+    # anything that ran with no cost recorded (the blocked wake-up, the held
+    # task, the restart kill) makes its project's figure a floor.
+    check("digest: cost per project, from the runs in the window",
+          trader.startswith("*trader* · $7.00+"), trader.splitlines()[:1])
+    check("digest: cost with a part unknown is a floor, not a total",
+          silk.startswith("*silkworm* · $0.75+"), silk.splitlines()[:1])
+    check("digest: a reviewer's cost counts under its parent's project",
+          cadence.startswith("*cadence* · $3.75+"), cadence.splitlines()[:1])
+    # 7 (trader) + 0.75 (silkworm) + 3.75 (cadence) + 0.4 (the unfiled DM chat).
+    check("digest: the total includes unfiled conversations, and is a floor",
+          "· $11.90+ total" in text.splitlines()[0], text.splitlines()[0])
+    check("digest: a week-old landing's cost is not today's spend", "$20" not in text)
+    check("digest: a project where nothing happened is left out", "odin" not in text)
+    check("digest: empty sections are left out, not printed empty",
+          "stuck" not in silk and "released" not in trader and "landed" not in cadence)
+    check("digest: nothing for an empty section header",
+          not any(l.rstrip().endswith(": ") or l.rstrip() == "•" for l in text.splitlines()))
+
+    quiet = digest.render([r for r in st.all().values() if r["title"] == "Quiet project"],
+                          now, when=datetime(2026, 10, 2, 8, 0))
+    check("digest: a day where nothing happened is one short line",
+          "\n" not in quiet and "nothing happened" in quiet, quiet)
+    check("digest: the empty day still names the date", "Fri 2 Oct" in quiet, quiet)
+
+
+def test_daily_digest_schedule_once_a_day_with_catch_up():
+    import digest
+    import jsonstore as J
+    D = datetime
+    check("digest due: not before the time", not digest.due(D(2026, 10, 2, 7, 59), "08:00", ""))
+    check("digest due: at the time", digest.due(D(2026, 10, 2, 8, 0), "08:00", ""))
+    check("digest due: caught up when the bot was down at 08:00",
+          digest.due(D(2026, 10, 2, 15, 30), "08:00", "2026-10-01"))
+    check("digest due: never twice a day",
+          not digest.due(D(2026, 10, 2, 23, 59), "08:00", "2026-10-02"))
+    check("digest due: tomorrow again", digest.due(D(2026, 10, 3, 8, 1), "08:00", "2026-10-02"))
+    check("digest due: off means never", not digest.due(D(2026, 10, 2, 12, 0), "", ""))
+
+    path = Path(tempfile.mkdtemp()) / "digest.json"
+    s = digest.Schedule(path, "08:00")
+    s.mark(D(2026, 10, 2, 8, 0))
+    check("digest schedule: once marked, not due again today", not s.due(D(2026, 10, 2, 8, 5)))
+    again = digest.Schedule(path, "08:00")          # a restart at 08:05
+    check("digest schedule: a restart remembers today's post",
+          not again.due(D(2026, 10, 2, 8, 5)), again.last_on)
+    check("digest schedule: and posts tomorrow", again.due(D(2026, 10, 3, 9, 0)))
+
+    # The post went out but the marker file could not be written: this process
+    # must still not post again.
+    s2 = digest.Schedule(Path(tempfile.mkdtemp()) / "d.json", "08:00")
+    real = J.save
+    J.save = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        try:
+            s2.mark(D(2026, 10, 2, 8, 0))
+        except OSError:
+            pass
+    finally:
+        J.save = real
+    check("digest schedule: a failed marker write still stops a second post",
+          not s2.due(D(2026, 10, 2, 9, 0)))
+
+
+def test_daily_digest_posts_to_the_dm_never_the_board():
+    import digest
+    import tasks as T
+
+    class Client:
+        def __init__(self):
+            self.posts = []
+
+        def chat_postMessage(self, **kw):
+            self.posts.append(kw)
+            return {"ok": True, "ts": "1.1"}
+
+    c = Client()
+    check("digest post: to the DM", digest.post(c, "D123", "hi", refuse=("G9", "silkworm-board"))["ok"]
+          and c.posts[-1]["channel"] == "D123")
+    check("digest post: refused at the board's id",
+          not digest.post(c, "G9", "hi", refuse=("G9", "silkworm-board"))["ok"])
+    check("digest post: refused at the board's name",
+          not digest.post(c, "#silkworm-board", "hi", refuse=("G9", "silkworm-board"))["ok"])
+    check("digest post: nothing sent to the board either way", len(c.posts) == 1)
+
+    # The bot's own send path, run for real against fakes.
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    client = Client()
+    board = types.SimpleNamespace(channel=lambda cl: "G9", channel_name="silkworm-board")
+    home = {"ch": "D777"}
+    import digest as digest_mod
+    ns = bot_functions("send_digest", digest=digest_mod, task_store=st,
+                       app=types.SimpleNamespace(client=client), BOARD=board,
+                       home_channel=lambda: home["ch"], datetime=datetime,
+                       digest_inputs=lambda recs: ([], {}))
+    sched = digest_mod.Schedule(Path(tempfile.mkdtemp()) / "d.json", "08:00")
+    ns["send_digest"](sched, datetime(2026, 10, 2, 8, 0))
+    check("send_digest: posted to the home DM", [p["channel"] for p in client.posts] == ["D777"],
+          str(client.posts))
+    check("send_digest: and marked the day", sched.last_on == "2026-10-02")
+    home["ch"] = "G9"
+    sched2 = digest_mod.Schedule(Path(tempfile.mkdtemp()) / "d.json", "08:00")
+    ns["send_digest"](sched2, datetime(2026, 10, 2, 8, 0))
+    check("send_digest: a home channel that is the board gets nothing",
+          len(client.posts) == 1, str(client.posts))
+    check("send_digest: and the day stays unmarked, so it is retried", sched2.last_on == "")
+
+    tree = ast.parse((BASE / "bot.py").read_text())
+    started = {n.args[0].id for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "start" and isinstance(n.func.value, ast.Name)
+               and n.func.value.id == "daemons" and n.args and isinstance(n.args[0], ast.Name)}
+    check("the digest scheduler is started as a daemon", "_digest_scheduler" in started)
+    sched_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "_digest_scheduler")
+    calls = {n.func.id for n in ast.walk(sched_fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    check("and it posts through send_digest, which uses home_channel", "send_digest" in calls)
+
+
+def test_release_tags_created_today():
+    import releases
+    repo = Path(tempfile.mkdtemp())
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    def git(*a, **extra):
+        subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
+                       env={**env, **extra})
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "one")
+    git("tag", "-a", "ios/v1.0.0", "-m", "old", GIT_COMMITTER_DATE="2026-01-01T00:00:00")
+    git("tag", "-a", "ios/v1.1.0", "-m", "new")
+    git("tag", "-a", "backend/v2.0.1", "-m", "new")
+    git("tag", "not-a-release")
+    got = releases.tagged_since(repo, time.time() - 86400)
+    check("tagged_since: today's release tags only",
+          sorted(got) == ["backend/v2.0.1", "ios/v1.1.0"], str(got))
+    check("tagged_since: nothing from the future", releases.tagged_since(repo, time.time() + 60) == [])
+    check("tagged_since: not a repo reads as none",
+          releases.tagged_since(tempfile.mkdtemp(), 0) == [])
+
+
+def test_a_landing_outcome_is_dated():
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    t = st.create("x", project="p")
+    ns = bot_functions("record_landing", task_store=st)
+    before = time.time()
+    ns["record_landing"](t, {"eligible": True, "landed": False, "stage": "rebase",
+                             "detail": "conflict"})
+    at = (st.get(t["id"])["result"]["landing"] or {}).get("at") or 0
+    check("record_landing: the outcome carries when it happened", at >= before, str(at))
+    check("and `at` survives compaction (it lives inside result.landing)",
+          "landing" in T.RESULT_KEEPS)
 
 
 if __name__ == "__main__":

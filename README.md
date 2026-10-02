@@ -147,6 +147,7 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `TASK_COMPACT_AFTER_DAYS` | `14` | Drop the reply text and event log from finished tasks after this long; the record, its cost and anything still needing you are kept |
 | `TASK_WORKERS` | `1` | How many queued tasks run at once (each is a Claude session). Reviews are not counted: they have their own lane |
 | `REVIEW_WORKERS` | `1` | How many reviews run at once, alongside the task workers; `0` hands reviews back to the task workers |
+| `DIGEST_AT` | `08:00` | Local time to post the daily digest (last 24h per project: landed, released, refused, failed or held, reran, stuck, waiting on you, unmerged, cost) to your DM; once a day, caught up after a restart; `off` to stop |
 | `MAX_OPEN_PROPOSALS` | `4` | Untriaged proposals a project may hold before its nightly review pauses |
 
 ## Authentication for headless turns

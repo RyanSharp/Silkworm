@@ -132,7 +132,7 @@ def total(rec: dict, reviews=()) -> dict | None:
 
 
 def by_project(records, now: float | None = None,
-               days: int = WEEK_DAYS) -> dict:
+               days: float = WEEK_DAYS, unfiled: str | None = None) -> dict:
     """{project: {"usd", "complete", "tasks"}} for the last `days`.
 
     Every record counts -- conversations cost money too -- and each is dated
@@ -140,7 +140,8 @@ def by_project(records, now: float | None = None,
     touched: approving or landing a month-old task is not a month of spend this
     week. A reviewer is filed under no project, so it is counted under its
     parent's. A record that ran in the window with no cost makes the total a
-    floor.
+    floor. Records under no project are left out, unless `unfiled` names a
+    row to count them under -- a total of everything spent needs them.
     """
     now = time.time() if now is None else now
     cutoff = now - days * 86400
@@ -151,7 +152,8 @@ def by_project(records, now: float | None = None,
         # Nothing touched since the cutoff spent anything in the window.
         if (rec.get("updated") or rec.get("created") or 0) < cutoff:
             continue
-        proj = rec.get("project") or project_of.get(rec.get("parent"), "") or ""
+        proj = (rec.get("project") or project_of.get(rec.get("parent"), "")
+                or unfiled or "")
         if not proj:
             continue
         usd = spent_since(rec, cutoff)

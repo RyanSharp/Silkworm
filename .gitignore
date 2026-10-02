@@ -14,6 +14,7 @@ tasks.json
 email_state.json
 projects.json
 board.json
+digest.json
 # Sidecars jsonstore.py keeps beside each of the above: the last good copy,
 # an unreadable one kept for inspection, and in-flight temp files.
 *.json.prev

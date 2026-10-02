@@ -36,6 +36,7 @@ import credentials
 import daemons
 import dedup
 import defer
+import digest
 import drain
 import email_ingest
 import harvester
@@ -1380,6 +1381,10 @@ HARVEST_STATE = BASE_DIR / "harvest_state.json"
 BOARD_CHANNEL = os.environ.get("SILKWORM_BOARD_CHANNEL", "silkworm-board")
 BOARD_STATE = BASE_DIR / "board.json"
 BOARD_POLL_S = 60
+# The daily digest goes to your DM at this local time ("off" to stop it); see
+# digest.py. Its once-a-day marker lives here.
+DIGEST_STATE = BASE_DIR / "digest.json"
+DIGEST_AT = os.environ.get("DIGEST_AT", digest.DEFAULT_AT).strip()
 _harvest_lock = threading.Lock()
 
 
@@ -3550,8 +3555,11 @@ def record_landing(task: dict, outcome: dict) -> None:
     current = task_store.get(task["id"]) or task
     keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base",
             "checkpointed", "base_before")
+    # Dated, so "what landed yesterday" is answerable from the record alone:
+    # `updated` moves on any later write and cannot say.
     result = {**(current.get("result") or {}),
-              "landing": {k: outcome[k] for k in keep if k in outcome}}
+              "landing": {**{k: outcome[k] for k in keep if k in outcome},
+                          "at": time.time()}}
     if outcome.get("landed"):
         result["landed"] = outcome.get("head")
     task_store.update(task["id"], result=result)
@@ -3994,6 +4002,74 @@ def _ideation_scheduler() -> None:
                 run_ideation(slug)
         except Exception:
             log.exception("ideation scheduler failed")
+        time.sleep(300)
+
+
+def digest_inputs(records) -> tuple[list, dict]:
+    """The git-backed parts of the digest: unmerged branches, and release
+    tags created in the window, per project. Each one that fails is left out
+    rather than costing the whole message."""
+    since = time.time() - digest.WINDOW_S
+    try:
+        rows = branches.survey(records)
+    except Exception:
+        log.exception("digest: branch survey failed")
+        rows = []
+    released = {}
+    for rec in project_store.all(include_archived=False):
+        repo = (rec.get("scope") or {}).get("cwd")
+        try:
+            if repo and worktrees.is_repo(repo):
+                tags = releases.tagged_since(repo, since)
+                if tags:
+                    released[rec["slug"]] = tags
+        except Exception:
+            log.exception("digest: reading release tags for %s failed", rec.get("slug"))
+    return rows, released
+
+
+def send_digest(schedule, now: datetime) -> dict:
+    """Post today's digest to the home DM -- never the board channel, where
+    any message pushes the board up the screen -- and mark the day only once
+    it has actually gone out, so a failure is retried on the next beat."""
+    records = list(task_store.all().values())
+    rows, released = digest_inputs(records)
+    text = digest.render(records, time.time(), branch_rows=rows, released=released,
+                         when=now)
+    try:
+        board_id = BOARD.channel(app.client)
+    except Exception:
+        board_id = ""
+    sent = digest.post(app.client, home_channel(), text,
+                       refuse=(board_id, BOARD.channel_name))
+    if sent.get("ok"):
+        schedule.mark(now)
+        log.info("posted the daily digest to %s", sent["channel"])
+    else:
+        log.warning("daily digest not sent: %s", sent.get("error"))
+    return sent
+
+
+def _digest_scheduler() -> None:
+    """Post the daily digest once a day, at DIGEST_AT or as soon after as the
+    bot is up -- the same wall-clock catch-up as nightly ideation."""
+    if DIGEST_AT.lower() in ("", "off", "0", "none"):
+        log.info("daily digest off (DIGEST_AT=%s)", DIGEST_AT or "\"\"")
+        return
+    try:
+        at = projects.parse_at(DIGEST_AT)
+    except ValueError as e:
+        log.error("daily digest off: DIGEST_AT %s", e)
+        return
+    schedule = digest.Schedule(DIGEST_STATE, at)
+    time.sleep(120)                     # let startup recovery settle first
+    while True:
+        try:
+            now = datetime.now()
+            if schedule.due(now):
+                send_digest(schedule, now)
+        except Exception:
+            log.exception("digest scheduler failed")
         time.sleep(300)
 
 
@@ -4505,6 +4581,8 @@ if __name__ == "__main__":
     daemons.start(_email_watcher, "email", forever=bool(GMAIL_USER and GMAIL_APP_PASSWORD))
     daemons.start(_credential_watcher, "creds")
     daemons.start(_ideation_scheduler, "ideate")
+    daemons.start(_digest_scheduler, "digest",
+                  forever=DIGEST_AT.lower() not in ("", "off", "0", "none"))
     daemons.start(_harvester, "harvester", forever=HARVEST_INTERVAL_H > 0)
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

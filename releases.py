@@ -146,6 +146,26 @@ def last_release(repo, target: dict) -> tuple[str, tuple] | tuple[None, None]:
     return best
 
 
+_RELEASE_TAG = re.compile(r"^[a-z][a-z0-9-]*/v\d+\.\d+\.\d+$")
+
+
+def tagged_since(repo, since: float) -> list[str]:
+    """Release tags (`<target>/vX.Y.Z`) created at or after `since`, oldest
+    first. Dated by the tag itself (its tagger date; the commit's for a
+    lightweight tag), so a release of an old commit still counts as today's.
+    Empty when git cannot say -- the digest omits what it cannot read."""
+    r = _git(repo, "for-each-ref", "--sort=creatordate",
+             "--format=%(creatordate:unix) %(refname:short)", "refs/tags", timeout=30)
+    if r.returncode != 0:
+        return []
+    out = []
+    for row in r.stdout.splitlines():
+        when, _, name = row.strip().partition(" ")
+        if when.isdigit() and int(when) >= since and _RELEASE_TAG.match(name):
+            out.append(name)
+    return out
+
+
 def file_version(repo, target: dict) -> tuple | None:
     """The version its version file declares, if it has one. Every occurrence
     of the key must agree -- an app and its extension shipping different
