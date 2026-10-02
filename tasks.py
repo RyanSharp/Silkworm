@@ -177,6 +177,13 @@ FIELDS: dict[str, tuple] = {
     "verified":        (None,  "True/False from the test command, None = not run"),
     "verify_attempts": (0,     "times it was sent back for failing tests"),
     "commit_attempts": (0,     "times it was sent back for leaving its work uncommitted"),
+    # Each once at most, and only on projects that take unsupervised work:
+    # see bot.MAX_REVIEW_REWORKS. A person's Send back with findings counts too.
+    "review_reworks":   (0,    "times it was sent back for a review's findings"),
+    "conflict_reworks": (0,    "times it was sent back to catch up with a moved base"),
+    # Kept apart from `result`, which each run's turn rewrites whole, so a
+    # second flagged review can still show what the first one asked for.
+    "reworked_findings": (list, "review findings it was already sent back for"),
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }

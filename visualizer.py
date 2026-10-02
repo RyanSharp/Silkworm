@@ -1442,7 +1442,7 @@ function review(t) {
         esc((rv.unverified || []).join("; "))}</span>` : "";
   return `<div class="rev ${rv.ok ? "ok" : ""}">
     <b>${rv.ok ? "Review passed" : "Review flagged"}</b> ${esc(rv.summary || "")}
-    ${list(rv.findings, "")}${list(rv.followups, "found alongside it:")}${filed}${unver}
+    ${list(rv.findings, "")}${list(rv.earlier, "flagged on the earlier pass, and sent back:")}${list(rv.followups, "found alongside it:")}${filed}${unver}
   </div>`;
 }
 function lastEvent(t) {

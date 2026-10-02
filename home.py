@@ -161,6 +161,10 @@ def _detail(task: dict) -> str:
         if len(findings) > 3:
             lines.append(f"_…and {len(findings) - 3} more finding"
                          f"{'s' if len(findings) - 3 != 1 else ''}_")
+        if review.get("earlier"):
+            lines.append(f"_…after being sent back for "
+                         f"{len(review['earlier'])} earlier finding"
+                         f"{'s' if len(review['earlier']) != 1 else ''}_")
         if task.get("verified") is True:
             lines.append(":test_tube: tests pass")
         elif task.get("verified") is False:
@@ -263,6 +267,9 @@ def full_detail(task: dict) -> str:
         if review.get("summary"):
             lines.append(f"*Review:* {esc(review['summary'])}")
         lines += [f"• {esc(clip(f, 600))}" for f in (review.get("findings") or [])[:20]]
+        if review.get("earlier"):
+            lines.append("_Flagged on the earlier pass, and sent back:_")
+            lines += [f"• {esc(clip(f, 600))}" for f in review["earlier"][:20]]
         if task.get("verified") is True:
             lines.append(":test_tube: tests pass")
         elif task.get("verified") is False:

@@ -1672,29 +1672,22 @@ def handle_tasks(payload: dict) -> dict:
         notes = (payload.get("notes") or "").strip()
         parts = []
         if findings:
-            parts.append("A review flagged this. Address the findings, then say "
-                         "what changed.")
-            parts.append("\n".join(f"- {f}" for f in findings))
+            parts.append(review_addendum(findings))
         if notes:
             # The user's own words carry more weight than the reviewer's, so
             # they go last and are labelled as coming from a person.
             parts.append(f"From {payload.get('by', 'the user')}:\n{notes}")
         if not parts:
             parts.append("Sent back for another pass.")
-        addendum = "\n\n".join(parts)
         try:
-            # Clear the previous cycle's review and verdict. Both the review
-            # gate and verification are guarded by `not blocked_on`, so leaving
-            # the old reviewer's id there made a reworked task skip both and go
-            # straight to done -- unproven and unreviewed, which is the exact
-            # opposite of what sending it back is for.
-            # And no checkpoint: resuming would say "carry on" and the notes
-            # appended to the goal would never be read.
-            task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
-                              driver="queue", blocked_on=[], verified=None,
-                              checkpoint=None)
-            return {"ok": True, "task": task_store.transition(
-                tid, tasks.QUEUED, "sent back for rework")}
+            # Counted when it carries findings, so the review gate does not
+            # send the same work back on its own after a person already has.
+            counts = ({"review_reworks": int(task.get("review_reworks") or 0) + 1,
+                       "reworked_findings": list(task.get("reworked_findings") or [])
+                       + list(findings)}
+                      if findings else {})
+            return {"ok": True, "task": send_back(tid, "\n\n".join(parts),
+                                                  "sent back for rework", **counts)}
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
     if action == "approve":
@@ -2748,13 +2741,15 @@ def execute_task(task: dict) -> None:
     elif (tasks.isolated(task) and worktrees.is_repo(cwd)
             and not roles.get(role_name).get("restricted")):
         progress.update(":deciduous_tree: _Setting up an isolated checkout…_")
-        # A resumed session goes back to the checkout it was working in: its
-        # edits are there, and so are its commits. The directory normally
-        # survives the restart (create() hands back one that exists); if it
-        # did not, the branch did, and is reattached -- create() would treat a
-        # leftover branch as half-made and start from the base without it.
-        worktree = ((worktrees.attach(cwd, tid, worktrees.BRANCH_PREFIX + tid, label="")
-                     if resume_sid else None)
+        # A rerun goes back to the branch it was working on: its commits are
+        # there. The directory normally survives a restart (create() hands
+        # back one that exists); if it did not, the branch did, and is
+        # reattached -- create() would treat a leftover branch as half-made,
+        # set it aside under discarded/ and start from the base without it.
+        # Not only on resume: work sent back for its review's findings, or to
+        # catch up with a base that moved, is told to fix *that* branch, and
+        # a fresh one off the base would hold none of what it is fixing.
+        worktree = (worktrees.attach(cwd, tid, worktrees.BRANCH_PREFIX + tid, label="")
                     or worktrees.create(cwd, tid, base=scope.get("branch") or ""))
         if worktree:
             cwd = worktree
@@ -3155,6 +3150,115 @@ def file_followups(task: dict, followups: list[str],
     return filed
 
 
+def review_addendum(findings: list) -> str:
+    """What a task sent back for its review's findings is told."""
+    return ("A review flagged this. Address the findings, then say what changed.\n\n"
+            + "\n".join(f"- {f}" for f in findings))
+
+
+def send_back(tid: str, addendum: str, why: str, **fields) -> dict:
+    """Requeue a task with `addendum` appended to its goal. The one way work
+    is sent back for another pass -- by the dashboard, or by the gates below.
+
+    Raises tasks.InvalidTransition, having changed nothing, if the task is
+    somewhere it cannot be requeued from (closed while its review ran, say).
+    Checked first because the goal is written before the move: the other order
+    lets the runner claim it in between and run it without the addendum.
+    """
+    task = task_store.get(tid) or {}
+    if not tasks.can(task.get("state", ""), tasks.QUEUED):
+        raise tasks.InvalidTransition(f"{task.get('state')} -> {tasks.QUEUED}")
+    # Clear the previous cycle's review and verdict. Both the review gate and
+    # verification are guarded by `not blocked_on`, so leaving the old
+    # reviewer's id there made a reworked task skip both and go straight to
+    # done -- unproven and unreviewed, the exact opposite of sending it back.
+    # And no checkpoint: resuming would say "carry on" and the addendum would
+    # never be read.
+    task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
+                      driver="queue", blocked_on=[], verified=None,
+                      checkpoint=None, **fields)
+    return task_store.transition(tid, tasks.QUEUED, why)
+
+
+#: How many times each kind of mechanical trouble is sent back on its own,
+#: on a project that takes unsupervised work, before it costs a person a look.
+#: Forty percent of reviews flagged their work, and every one of those -- and
+#: every landing that conflicted because overlapping work merged first -- went
+#: straight to the board, mostly with a fix the implementor could make itself.
+#: Once each: a second flag, or a second conflict, is not mechanical any more.
+MAX_REVIEW_REWORKS = 1
+MAX_CONFLICT_REWORKS = 1
+#: The landing refusals that mean "the base moved under this branch", which
+#: the implementor can fix by catching up. The rest (no test command, a base
+#: that cannot be read, a failed push...) are not its to fix.
+CONFLICT_STAGES = ("rebase", "tests-after-rebase")
+
+
+def _unsupervised(task: dict) -> bool:
+    """A project that takes unsupervised work, and a task still waiting on the
+    verdict in hand. Anything else -- one already rerun, failed or closed
+    since -- routes as it always did rather than being requeued by a review
+    that arrived late."""
+    return (task.get("state") == tasks.BLOCKED and
+            projects.unready(project_store.get(task.get("project") or "")) == "")
+
+
+def rework_flagged_review(parent: dict, verdict: dict, channel: str,
+                          thread_ts: str) -> bool:
+    """Send flagged work back once on its own. True if it was sent back."""
+    tried = int(parent.get("review_reworks") or 0)
+    if (verdict.get("ok") or not verdict.get("findings")
+            or not _unsupervised(parent) or tried >= MAX_REVIEW_REWORKS):
+        return False
+    try:
+        send_back(parent["id"], review_addendum(verdict["findings"]),
+                  "review flagged it; sent back automatically",
+                  review_reworks=tried + 1,
+                  reworked_findings=list(parent.get("reworked_findings") or [])
+                  + list(verdict["findings"]))
+    except tasks.InvalidTransition:
+        return False
+    tell_thread(f"{channel}:{thread_ts}",
+                ":arrows_counterclockwise: *Sent back automatically* to address the "
+                "review's findings — a second flag will come to you.")
+    return True
+
+
+def rework_conflict(task_id: str, outcome: dict, channel: str,
+                    thread_ts: str) -> bool:
+    """Send a branch that could not catch up with its base back once to do so.
+    True if it was sent back."""
+    task = task_store.get(task_id) or {}
+    tried = int(task.get("conflict_reworks") or 0)
+    stage = outcome.get("stage")
+    if (stage not in CONFLICT_STAGES or not task or not _unsupervised(task)
+            or tried >= MAX_CONFLICT_REWORKS):
+        return False
+    branch = outcome.get("branch") or branches.name_for(task)
+    base = (task.get("scope") or {}).get("branch") or "the base branch"
+    what = ("rebasing it onto the current base conflicts" if stage == "rebase"
+            else "its tests fail once it is rebased onto the current base")
+    addendum = (
+        f"This work passed review, but it could not land: {what}. Overlapping "
+        f"work merged after this branch started.\n\n"
+        f"```\n{(outcome.get('detail') or '')[-1500:]}\n```\n\n"
+        f"Bring `{branch}` up to date with the current {base} (rebase it onto "
+        f"the base's latest commit), resolve the conflicts or failures that "
+        f"causes while keeping what this task set out to do, run the tests, "
+        f"and commit the result on the branch.")
+    try:
+        send_back(task_id, addendum, f"landing refused ({stage}); sent back "
+                  "automatically to catch up with the base",
+                  conflict_reworks=tried + 1)
+    except tasks.InvalidTransition:
+        return False
+    tell_thread(f"{channel}:{thread_ts}",
+                f":arrows_counterclockwise: *Sent back automatically* to bring its "
+                f"branch up to date with the base ({stage}) — a second conflict "
+                f"will come to you.")
+    return True
+
+
 def resolve_review(task: dict, role_name: str, text: str,
                    channel: str, thread_ts: str) -> bool:
     """Apply the review gate. Returns True if the task's fate is already settled.
@@ -3252,6 +3356,15 @@ def resolve_review(task: dict, role_name: str, text: str,
                 f"• {d.rsplit(' — not filed', 1)[0]}" for d in duplicates)
     if verdict["unverified"]:
         note += "\n_The review could not check:_ " + "; ".join(verdict["unverified"])
+    # A second flag parks, and the person deciding should see what the first
+    # review asked for as well as what is still wrong. Read from its own field,
+    # not the previous `result.review`: the rerun's turn rewrites `result`
+    # whole, so that is gone by the time the second verdict arrives.
+    earlier = list((parent or {}).get("reworked_findings") or [])
+    if not verdict["ok"] and earlier:
+        verdict["earlier"] = earlier
+        note += "\n_Flagged on the earlier pass, and sent back:_\n" + "\n".join(
+            f"• {f}" for f in verdict["earlier"])
     try:
         app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=note)
     except Exception:
@@ -3278,6 +3391,13 @@ def resolve_review(task: dict, role_name: str, text: str,
                 # the board reads, so it does not become silent again.
                 stranded = f"review passed but the landing refused " \
                            f"({outcome.get('stage')})"
+            # A conflict with work that merged first is the implementor's to
+            # fix, once, before it is anybody else's.
+            if stranded and rework_conflict(parent_id, outcome, channel, thread_ts):
+                return False
+        elif rework_flagged_review(task_store.get(parent_id) or parent, verdict,
+                                   channel, thread_ts):
+            return False
         if stranded:
             task_state(parent_id, tasks.AWAITING_APPROVAL, stranded[:160])
         else:

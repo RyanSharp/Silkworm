@@ -58,9 +58,23 @@ def bot_functions(*names, **globals_):
               if isinstance(n, ast.FunctionDef) and n.name in names]
     missing = set(names) - {n.name for n in wanted}
     assert not missing, f"bot.py has no {', '.join(sorted(missing))}"
+    wanted += _shared_helpers(tree, wanted, set(names) | set(globals_))
     ns = {"log": logging.getLogger("test"), "time": time, **globals_}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), "bot.py", "exec"), ns)
     return ns
+
+
+#: Helpers other lifted functions call as part of their own behaviour, so a
+#: lifted caller gets the real one rather than a stub or a NameError. Sending
+#: work back is one mechanism shared by the dashboard and the review gate.
+SHARED_HELPERS = ("send_back", "review_addendum")
+
+
+def _shared_helpers(tree, nodes, supplied) -> list:
+    used = {n.id for f in nodes for n in ast.walk(f) if isinstance(n, ast.Name)}
+    return [n for n in tree.body if isinstance(n, ast.FunctionDef)
+            and n.name in SHARED_HELPERS and n.name in used
+            and n.name not in supplied]
 
 
 def discover():
@@ -651,6 +665,8 @@ def test_review_gate():
     check("cancelling the prompt does not send it back", "notes === null" in js)
     bot = (BASE / "bot.py").read_text()
     rework = bot[bot.index('if action == "rework":'):bot.index('if action in ("accept"')]
+    rework += bot[bot.index("def send_back("):bot.index("def rework_flagged_review(")]
+    rework += bot[bot.index("def review_addendum("):bot.index("def send_back(")]
     check("the original goal is kept, not replaced",
           "task.get('goal', '')" in rework)
     check("reviewer findings are appended for the rerun", "findings" in rework)
@@ -925,8 +941,8 @@ def test_review_sees_the_work():
     W.release(gwt)
     ns["resolve_review"](st.get(gone), "implementor", "did it", "C1", "1.0")
     orphan = [r for r in st.all().values() if r.get("parent") == gone][0]
-    # The branch goes: a send-back re-runs the implementor under the same id,
-    # and discard.drop clears the branch to get a fresh worktree.
+    # The branch goes -- dropped by hand, or set aside by a create() that
+    # could not make its worktree any other way.
     git(repo, "branch", "-D", f"{W.BRANCH_PREFIX}{gone}")
     st.transition(orphan["id"], T.RUNNING)
     review_turn(st.get(orphan["id"]),
@@ -1389,6 +1405,7 @@ def test_verification():
           ex.index("verify_work(task, cwd)") < ex.index("worktrees.release(worktree,"),
           "afterwards there is nothing left to test")
     rw = bot[bot.index('if action == "rework"'):bot.index('if action in ("accept"')]
+    rw += bot[bot.index("def send_back("):bot.index("def rework_flagged_review(")]
     check("sending work back clears the previous review",
           "blocked_on=[]" in rw,
           "both the gate and verification are guarded by `not blocked_on`, so a "
@@ -2874,7 +2891,8 @@ def _bot_func(name, **namespace):
         if real in free:
             mod.__dict__[real] = __import__(real)
     mod.__dict__.update(namespace)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{name}>", "exec"),
+    exec(compile(ast.Module(body=[node] + _shared_helpers(tree, [node], set(namespace)),
+                            type_ignores=[]), f"<{name}>", "exec"),
          mod.__dict__)
     return mod.__dict__[name]
 
@@ -5741,7 +5759,12 @@ def test_every_open_state_has_a_button():
         if (isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
                 and isinstance(n.test.comparators[0], ast.Constant)
                 and n.test.comparators[0].value == "rework"):
-            targets["rework"] = moves_to(n)
+            # It sends work back through the shared mechanism, which is
+            # where the transition lives.
+            calls = {c.func.id for c in ast.walk(n) if isinstance(c, ast.Call)
+                     and isinstance(c.func, ast.Name)}
+            targets["rework"] = moves_to(n) or (
+                moves_to(fns["send_back"]) if "send_back" in calls else None)
     check("and so were approve and rework",
           targets.get("approve") is T.DONE and targets.get("rework") is T.QUEUED,
           f"approve={targets.get('approve')} rework={targets.get('rework')}")
@@ -6014,8 +6037,15 @@ def test_landing_is_visible():
               "land_and_record": lambda tid, ch, ts: outcome,
               # What main calls. Kept so main reaches the state decision and
               # this measures that decision rather than a NameError.
-              "land_if_ready": lambda *a, **k: ":hand: _Not landed (rebase)._"}
-    _bot_fns({"resolve_review"}, rev_ns)
+              "land_if_ready": lambda *a, **k: ":hand: _Not landed (rebase)._",
+              # The real send-back gates, on a project that is not ready for
+              # unsupervised work: these cases must route exactly as before.
+              "projects": __import__("projects"), "branches": __import__("branches"),
+              "project_store": types.SimpleNamespace(get=lambda slug: None),
+              "tell_thread": lambda key, text: posted.append({"text": text})}
+    _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
+              "send_back", "review_addendum", "_unsupervised", "MAX_REVIEW_REWORKS",
+              "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, rev_ns)
     resolve_review = rev_ns.get("resolve_review")
     PASS = '```json\n{"ok": true, "summary": "fine", "findings": []}\n```'
 
@@ -7647,6 +7677,9 @@ def test_review_followups():
         "land_and_record": lambda tid, c, th: {"eligible": True, "landed": True,
                                                "stage": "done", "head": "abc1234"},
         "task_state": lambda tid, st, why="": store.transition(tid, st, why),
+        # Automatic send-backs have their own test; here nothing is sent back.
+        "rework_flagged_review": lambda *a: False,
+        "rework_conflict": lambda *a: False,
     })
     exec(compile(ast.Module(body=[gate_fn], type_ignores=[]), "<x>", "exec"), gns)
     resolve = gns["resolve_review"]
@@ -10826,6 +10859,289 @@ def test_resume_edge_cases():
               str({k: rec.get(k) for k in ("state", "checkpoint")}))
 
 
+def test_flagged_work_fixes_itself_once():
+    """A flagged review, or a landing that conflicts with work merged first,
+    is sent back once on its own before it reaches a person.
+
+    48 of 119 reviews in the fortnight to 2026-10-02 flagged their work and
+    went straight to awaiting_approval, and every landing refused at the
+    rebase parked there too -- each on the board even when the fix was
+    mechanical. Driven through resolve_review against a real TaskStore.
+    """
+    print("\nflagged reviews and conflicts are sent back once on their own")
+    import roles
+    import tasks as T
+
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    posted, said = [], []
+    outcome = {}
+    projects_ = {"ready": {"slug": "ready", "test_cmd": "make test", "auto_merge": True},
+                 "manual": {"slug": "manual", "test_cmd": "make test"}}
+
+    def task_state(tid, state, detail=""):
+        try:
+            store.transition(tid, state, detail)
+        except T.InvalidTransition:
+            pass
+    ns = {"task_store": store, "tasks": T, "roles": roles, "merge": __import__("merge"),
+          "projects": __import__("projects"), "branches": __import__("branches"),
+          "log": logging.getLogger("test"), "task_state": task_state,
+          "project_store": types.SimpleNamespace(get=lambda slug: projects_.get(slug)),
+          "app": types.SimpleNamespace(client=types.SimpleNamespace(
+              chat_postMessage=lambda **kw: posted.append(kw["text"]))),
+          "tell_thread": lambda key, text: said.append((key, text)),
+          "land_and_record": lambda tid, ch, ts: outcome,
+          "file_followups": lambda *a, **k: []}
+    got = _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
+                    "send_back", "review_addendum", "_unsupervised",
+                    "MAX_REVIEW_REWORKS", "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, ns)
+    check("the gate and its send-backs were lifted out of bot.py",
+          {"resolve_review", "rework_flagged_review", "rework_conflict",
+           "send_back"} <= got, str(sorted(got)))
+    resolve = ns["resolve_review"]
+
+    def parked(project):
+        t = store.create("Make the thing work", title="Thing", project=project,
+                         role="implementor", driver="queue",
+                         scope={"cwd": "/repo", "branch": "main"})
+        store.transition(t["id"], T.RUNNING, "claimed")
+        return t["id"]
+
+    def review(tid, ok, findings=(), landing=None):
+        """One review cycle: the implementor parks for it, the verdict lands."""
+        nonlocal outcome
+        outcome = landing or {"eligible": True, "landed": True, "stage": "done",
+                              "head": "abc1234"}
+        if store.get(tid)["state"] == T.QUEUED:          # the rerun
+            store.transition(tid, T.RUNNING, "claimed")
+            # What execute_task writes when the rerun's turn ends: `result`
+            # whole, so the previous review is gone from it.
+            store.update(tid, result={"text": "addressed it", "cost": 0.0})
+        store.update(tid, blocked_on=["rev"], verified=True)
+        store.transition(tid, T.BLOCKED, "awaiting review")
+        rev = store.create("review it", role="reviewer", parent=tid)
+        said.clear()
+        resolve(rev, "reviewer", "```json\n" + json.dumps(
+            {"ok": ok, "summary": "s", "findings": list(findings)}) + "\n```",
+            "C1", "1.0")
+        return store.get(tid)
+
+    # --- review: the first flag goes back, the second comes to you -----------
+    tid = parked("ready")
+    t = review(tid, False, ["the guard fails open"])
+    check("a first flagged review on a ready project is sent back, not parked",
+          t["state"] == T.QUEUED, f"state is {t['state']}")
+    check("and counted on the task", t.get("review_reworks") == 1,
+          str(t.get("review_reworks")))
+    check("with the findings appended to its goal",
+          t["goal"].startswith("Make the thing work")
+          and "- the guard fails open" in t["goal"], t["goal"])
+    check("the way Send back does: blocked_on and the verdict cleared",
+          t.get("blocked_on") == [] and t.get("verified") is None
+          and t.get("driver") == "queue", str({k: t.get(k) for k in
+                                               ("blocked_on", "verified", "driver")}))
+    check("and one line in its thread saying why",
+          len(said) == 1 and said[0][0] == "C1:1.0"
+          and "review" in said[0][1].lower() and "automatically" in said[0][1],
+          str(said))
+    t = review(tid, False, ["the guard still fails open on timeout"])
+    check("a second flagged review parks for a person",
+          t["state"] == T.AWAITING_APPROVAL, f"state is {t['state']}")
+    check("without being sent back again", t.get("review_reworks") == 1 and not said,
+          str((t.get("review_reworks"), said)))
+    rv = t["result"]["review"]
+    check("with both reviews' findings on the record",
+          rv["findings"] == ["the guard still fails open on timeout"]
+          and rv.get("earlier") == ["the guard fails open"], str(rv))
+    check("and both in the verdict posted to the thread",
+          "the guard fails open\n" in posted[-1] + "\n"
+          and "still fails open on timeout" in posted[-1], posted[-1])
+
+    # A flag with nothing to act on is not mechanical: it parks.
+    bare = review(parked("ready"), False, [])
+    check("a flag without findings is not sent back",
+          bare["state"] == T.AWAITING_APPROVAL and not bare.get("review_reworks"))
+
+    # --- landing: the first conflict goes back, the second comes to you ------
+    conflict = {"eligible": True, "landed": False, "stage": "rebase",
+                "detail": "CONFLICT (content): Merge conflict in bot.py",
+                "branch": "silkworm/tsk_x"}
+    lid = parked("ready")
+    t = review(lid, True, landing=conflict)
+    check("a first rebase conflict on a ready project is sent back, not parked",
+          t["state"] == T.QUEUED, f"state is {t['state']}")
+    check("counted apart from review send-backs",
+          t.get("conflict_reworks") == 1 and not t.get("review_reworks"),
+          str({k: t.get(k) for k in ("conflict_reworks", "review_reworks")}))
+    check("with the refusal and what to do about it in its goal",
+          "Merge conflict in bot.py" in t["goal"] and "up to date" in t["goal"]
+          and "silkworm/tsk_x" in t["goal"] and "main" in t["goal"], t["goal"])
+    check("and the gates reset so it is tested and reviewed again",
+          t.get("blocked_on") == [] and t.get("verified") is None)
+    check("and one line in its thread saying why",
+          len(said) == 1 and "rebase" in said[0][1] and "automatically" in said[0][1],
+          str(said))
+    # The rerun's review may still flag it: that budget was not spent.
+    t = review(lid, False, ["the conflict resolution dropped a branch"])
+    check("a conflict send-back does not spend the review's",
+          t["state"] == T.QUEUED and t.get("review_reworks") == 1, t["state"])
+    t = review(lid, True, landing=dict(conflict, stage="tests-after-rebase",
+                                        detail="1 failed"))
+    check("a second conflict parks for a person",
+          t["state"] == T.AWAITING_APPROVAL and t.get("conflict_reworks") == 1
+          and not said, f"state is {t['state']}, said {said}")
+    check("saying the landing refused",
+          "landing refused" in t["events"][-1]["detail"], t["events"][-1]["detail"])
+
+    t = review(parked("ready"), True,
+               landing=dict(conflict, stage="tests-after-rebase", detail="2 failed"))
+    check("failing tests after the rebase are sent back too",
+          t["state"] == T.QUEUED and t.get("conflict_reworks") == 1
+          and "2 failed" in t["goal"])
+    for stage in ("base-moved", "merge", "attach", "errored", "no-test-command"):
+        t = review(parked("ready"), True, landing=dict(conflict, stage=stage))
+        check(f"a {stage} refusal parks as before",
+              t["state"] == T.AWAITING_APPROVAL and not t.get("conflict_reworks")
+              and not said, t["state"])
+
+    # --- projects that are not ready: exactly as before ----------------------
+    for project in ("manual", "nobody-registered-this"):
+        t = review(parked(project), False, ["broken"])
+        check(f"a flagged review on {project!r} still parks",
+              t["state"] == T.AWAITING_APPROVAL and not t.get("review_reworks")
+              and "- broken" not in t["goal"] and not said, t["state"])
+        t = review(parked(project), True, landing=conflict)
+        check(f"a conflict on {project!r} still parks",
+              t["state"] == T.AWAITING_APPROVAL and not t.get("conflict_reworks")
+              and not said, t["state"])
+    t = review(parked("manual"), False, ["broken"])
+    check("and its record carries no earlier findings it never had",
+          "earlier" not in t["result"]["review"])
+
+    # Both reviews' findings are where the decision is made, not only stored.
+    import home
+    detail = home.full_detail(store.get(tid))
+    check("the board's detail shows both reviews' findings",
+          "still fails open on timeout" in detail and "the guard fails open" in detail
+          and "earlier pass" in detail, detail)
+    vz = (BASE / "visualizer.py").read_text()
+    rvjs = vz[vz.index("function review(t)"):vz.index("function lastEvent(")]
+    check("and so does the dashboard", "rv.earlier" in rvjs)
+    check("both counters, and the findings sent back for, are declared fields",
+          {"review_reworks", "conflict_reworks", "reworked_findings"} <= set(T.FIELDS))
+
+    # --- a task closed while its review ran is not reopened ------------------
+    gone = parked("ready")
+    store.update(gone, blocked_on=["rev"])
+    store.transition(gone, T.BLOCKED, "awaiting review")
+    store.transition(gone, T.CANCELLED, "dismissed")
+    rev = store.create("review it", role="reviewer", parent=gone)
+    said.clear()
+    resolve(rev, "reviewer", '```json\n{"ok": false, "summary": "s", '
+            '"findings": ["x"]}\n```', "C1", "1.0")
+    t = store.get(gone)
+    check("a task closed during its review is not sent back",
+          t["state"] == T.CANCELLED and not t.get("review_reworks")
+          and t["goal"] == "Make the thing work" and not said,
+          str({k: t.get(k) for k in ("state", "review_reworks")}))
+
+    # A verdict that arrives after its task was claimed again must not queue a
+    # second concurrent run of it.
+    late = parked("ready")
+    store.update(late, blocked_on=["rev"])
+    store.transition(late, T.BLOCKED, "awaiting review")
+    store.transition(late, T.QUEUED, "requeued")
+    store.transition(late, T.RUNNING, "claimed again")
+    said.clear()
+    resolve(store.create("review it", role="reviewer", parent=late), "reviewer",
+            '```json\n{"ok": false, "summary": "s", "findings": ["x"]}\n```',
+            "C1", "1.0")
+    t = store.get(late)
+    check("a late verdict does not send back a task that is running again",
+          t["state"] != T.QUEUED and not t.get("review_reworks") and not said,
+          str({k: t.get(k) for k in ("state", "review_reworks")}))
+
+    # --- the rerun stands on the branch it is told to fix ----------------------
+    # Sending work back is pointless if the rerun starts from the base: the
+    # findings, and the rebase instruction, are both about commits on the
+    # task's own branch. Driven through the real execute_task and git.
+    import worktrees as W
+    import contextlib
+    import threading
+    root = Path(tempfile.mkdtemp())
+    W.ROOT = root / "wts"
+    repo = root / "repo"; repo.mkdir()
+    def git(cwd, *a):
+        return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, text=True)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
+    (repo / "a.txt").write_text("a\n"); git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+    gt = store.create("Make the thing work", project="ready", role="implementor",
+                      driver="queue", isolate=True, scope={"cwd": str(repo)})["id"]
+    store.transition(gt, T.RUNNING, "claimed")
+    wt = W.create(repo, gt, fetch=False)
+    (wt / "fix.py").write_text("x = 1\n"); git(wt, "add", "-A"); git(wt, "commit", "-qm", "the work")
+    W.release(wt)
+    store.update(gt, blocked_on=["rev"], branch=W.BRANCH_PREFIX + gt)
+    store.transition(gt, T.BLOCKED, "awaiting review")
+    resolve(store.create("review it", role="reviewer", parent=gt), "reviewer",
+            '```json\n{"ok": false, "summary": "s", "findings": ["add a test"]}\n```',
+            "C1", "1.0")
+    check("(the work was sent back)", store.get(gt)["state"] == T.QUEUED)
+    store.transition(gt, T.RUNNING, "claimed by the runner")
+    seen = {}
+
+    def run_turn(goal, **kw):
+        here = Path(kw["cwd"])
+        seen.update(cwd=here, has_work=(here / "fix.py").exists(),
+                    head=git(here, "log", "--format=%s", "-1").stdout.strip())
+        return types.SimpleNamespace(text="added the test", cost_usd=0.0,
+                                     duration_ms=1, session_id="s")
+    _bot_func("execute_task", tasks=T, task_store=store, store=tmp_store(),
+              roles=roles, worktrees=W, Path=Path, run_turn=run_turn,
+              OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+              permission_args=lambda: [], log=logging.getLogger("test"),
+              task_thread=lambda t: ("C1", "1.0"),
+              task_state=lambda t_, s_, d="": task_state(t_, s_, d),
+              _thread_lock=lambda key: threading.Lock(),
+              repo_guard=lambda *a, **k: contextlib.nullcontext(),
+              render_block=lambda _: "", chunk=lambda text: [text],
+              to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+              upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+              ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+              # An implementor borrows no one's branch; a stub would read as one.
+              review_branch=lambda t_: "",
+              record_branch=lambda *a, **k: None,
+              )(store.get(gt))
+    check("a sent-back rerun works on the branch holding the work it is fixing",
+          seen.get("has_work") and seen.get("head") == "the work"
+          and seen.get("cwd") != repo,
+          f"ran in {seen.get('cwd')} at {seen.get('head')!r}: a fresh branch off "
+          "the base has none of what the findings are about")
+    check("and the branch was not set aside to make way for a fresh one",
+          not git(repo, "tag", "-l", "discarded/*").stdout.strip(),
+          git(repo, "tag", "-l").stdout)
+
+    # --- a person's Send back spends the same once -----------------------------
+    hand = parked("ready")
+    store.update(hand, blocked_on=["rev"])
+    store.transition(hand, T.BLOCKED, "awaiting review")
+    store.transition(hand, T.AWAITING_APPROVAL, "flagged")
+    store.update(hand, result={"review": {"ok": False, "findings": ["y"]}})
+    handle = _bot_func("handle_tasks", task_store=store, tasks=T,
+                       log=logging.getLogger("test"))
+    r = handle({"action": "rework", "id": hand, "notes": "try again"})
+    t = store.get(hand)
+    check("the dashboard's Send back still requeues with findings and notes",
+          r.get("ok") and t["state"] == T.QUEUED and "- y" in t["goal"]
+          and "try again" in t["goal"], str(r))
+    check("and counts as the review's one send-back",
+          t.get("review_reworks") == 1, str(t.get("review_reworks")))
+    t = review(hand, False, ["still y"])
+    check("so the next flag comes to the person who already sent it back",
+          t["state"] == T.AWAITING_APPROVAL, t["state"])
+
+
 def test_proposals_are_deduplicated():
     """A proposal the board already holds is refused, naming what it matched.
 
@@ -10982,6 +11298,8 @@ def test_proposals_are_deduplicated():
     resolve = _bot_func("resolve_review", task_store=store2, tasks=T,
                         roles=__import__("roles"), app=app,
                         file_followups=ns2["file_followups"],
+                        rework_flagged_review=lambda *a: False,
+                        rework_conflict=lambda *a: False,
                         log=logging.getLogger("t"))
     verdict = ('```json\n' + json.dumps({"ok": True, "summary": "fine",
                                          "followups": [b]}) + '\n```')
