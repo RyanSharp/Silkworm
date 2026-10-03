@@ -12,6 +12,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -108,6 +109,14 @@ def run_turn(
         cmd += ["--model", model]
     if session_id:
         cmd += ["--resume", session_id]
+    else:
+        # Name a fresh session ourselves rather than letting the CLI pick one.
+        # A child outlives a restart (it runs in its own session), and the
+        # only way to find it afterwards is its id on the command line
+        # (procs.session_alive). With --resume that is there already; without
+        # this, a first run's survivor is invisible, and the restarted task
+        # would put a second claude on the same session and checkout.
+        cmd += ["--session-id", str(uuid.uuid4())]
     if append_system_prompt:
         cmd += ["--append-system-prompt", append_system_prompt]
     cmd += list(extra_args)

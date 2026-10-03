@@ -3660,6 +3660,83 @@ def test_turn_deadline_is_idleness():
           "deriving a bound from a cap of 0 would reap orphans mid-work")
 
 
+
+# --- a first run's survivor can be found after a restart ------------------------
+# A restarted task waits for its interrupted child rather than resuming beside
+# it, and finds that child by the session id on its command line. A resumed
+# child carries `--resume <sid>`; a first run used to carry nothing, so if it
+# outlived the restart, the task resumed a second claude on the same session.
+
+def test_fresh_session_is_findable_while_it_runs():
+    import threading
+    import claude_runner as CR
+    print("\na fresh run names its session on its command line")
+
+    # procs only accepts a process whose executable is called `claude`;
+    # `exec -a` keeps that name while perl (which, unlike framework python,
+    # does not re-exec itself) does the work.
+    d = Path(tempfile.mkdtemp())
+    (d / "fake.pl").write_text(r"""
+undef $/; <STDIN>; $| = 1;
+my ($sid, $res) = ("", "");
+for my $i (0 .. $#ARGV - 1) {
+    $sid = $ARGV[$i + 1] if $ARGV[$i] eq "--session-id";
+    $res = $ARGV[$i + 1] if $ARGV[$i] eq "--resume";
+}
+my $id = $res || $sid;
+print "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$id\"}\n";
+sleep 1 while -e $ENV{HOLD};
+my $how = ($sid && $res) ? "both" : $res ? "resumed" : $sid ? "named" : "anonymous";
+print "{\"type\":\"result\",\"result\":\"$how\",\"session_id\":\"$id\"}\n";
+""")
+    fake = d / "claude"
+    fake.write_text('#!/bin/bash\nexec -a "$0" /usr/bin/perl "$(dirname "$0")/fake.pl" "$@"\n')
+    fake.chmod(0o755)
+
+    def run(session_id=None):
+        hold = d / "hold"
+        hold.write_text("")
+        seen, out = {}, {}
+
+        def init(sid):
+            seen["sid"] = sid
+            seen["alive"] = procs.session_alive(sid)   # the child is running now
+            hold.unlink()
+
+        def go():
+            try:
+                out["r"] = CR.run_turn("go", binary=str(fake), cwd=str(d),
+                                       permission_args=[], session_id=session_id,
+                                       env={**os.environ, "HOLD": str(hold)},
+                                       on_init=init, idle_timeout=30)
+            except Exception as e:  # surfaced through the checks below
+                out["e"] = e
+
+        t = threading.Thread(target=go)
+        t.start()
+        t.join(30)
+        if hold.exists():
+            hold.unlink()
+        return seen, out
+
+    seen, out = run()
+    r = out.get("r")
+    check("a fresh run is given a session id on its command line",
+          r is not None and r.text == "named", repr(out))
+    check("and procs.session_alive finds that child while it runs",
+          seen.get("alive") is True, repr(seen))
+    check("the id the stream reports is the one we named",
+          bool(seen.get("sid")) and r is not None and r.session_id == seen["sid"])
+    check("and it is not found once it has exited",
+          not procs.session_alive(seen.get("sid") or "no-such-session"))
+
+    seen2, out2 = run(session_id="11111111-2222-3333-4444-555555555555")
+    r2 = out2.get("r")
+    check("a resumed run passes --resume alone, never a second id",
+          r2 is not None and r2.text == "resumed", repr(out2))
+    check("and is found by the session it resumes",
+          seen2.get("alive") is True, repr(seen2))
+
 # --- "get back to me when it's done" --------------------------------------------
 # A turn is request/response: one prompt in, one reply out, and the session is
 # dormant either side of it. Held open, a watch hits the 15 minute cap, holds
