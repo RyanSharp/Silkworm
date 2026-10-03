@@ -491,6 +491,38 @@ def test_task_lifecycle():
     check("tasks survive a reload",
           TaskStore(st._path).get(t["id"])["state"] == T.DONE)
 
+    # A create whose disk write fails must not leave the task in memory, where
+    # the runner would claim it and the next unrelated save would persist it.
+    import jsonstore
+    real_save = jsonstore.save
+    def broken(*a, **k):
+        raise OSError("disk full")
+    jsonstore.save = broken
+    try:
+        try:
+            st.create("never filed", id="tsk_unsaved")
+            raised = False
+        except OSError:
+            raised = True
+    finally:
+        jsonstore.save = real_save
+    check("a create that cannot be saved raises", raised)
+    check("and leaves nothing behind in memory",
+          st.get("tsk_unsaved") is None and "tsk_unsaved" not in st._data)
+    st.update(t["id"], title="later save")
+    check("nor on disk after a later save",
+          TaskStore(st._path).get("tsk_unsaved") is None)
+    jsonstore.save = broken
+    try:
+        try:
+            st.create("overwrite", id=t["id"])
+        except OSError:
+            pass
+    finally:
+        jsonstore.save = real_save
+    check("a failed create over an existing id restores the record it replaced",
+          st.get(t["id"])["title"] == "later save" and st.get(t["id"])["state"] == T.DONE)
+
 
 # --- every turn is a task ------------------------------------------------------
 

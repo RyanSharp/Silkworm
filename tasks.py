@@ -291,8 +291,21 @@ class TaskStore:
     def create(self, goal: str, **fields) -> dict:
         task = make(goal, **fields)
         with self._lock:
+            prior = self._data.get(task["id"])
             self._data[task["id"]] = task
-            self._save()
+            try:
+                self._save()
+            except BaseException:
+                # The caller is told it failed, so it must not half-exist: left
+                # in memory it would be claimed by the queue runner and written
+                # to disk by the next unrelated save. rework_finished renames
+                # its branch back on this error -- a surviving task would then
+                # run against a branch that is no longer there.
+                if prior is None:
+                    del self._data[task["id"]]
+                else:
+                    self._data[task["id"]] = prior
+                raise
         log.info("task %s created in %s: %s", task["id"], task["state"], task["title"])
         return dict(task)
 
