@@ -274,19 +274,35 @@ def nothing_to_land(repo, branch: str, base: str) -> str:
     refuse with its own named stage rather than be waved through here.
     """
     found = existing(repo).get(branch)
-    gone = retired(repo)
-    refs = [ref for ref in (found or {}).get("refs", ())
-            if ref.startswith(_HEADS) or (branch, _tip(repo, ref)[:7]) not in gone]
+    refs = _live(repo, branch, found, retired(repo))
     if not refs:
         return "its branch is gone: it made no commits the base did not already have"
     if not base:
         return ""
-    bases = _both(base)
-    counts = [ahead(repo, bases, ref) if ref.startswith(_HEADS)
-              else _unlanded(repo, bases, ref) for ref in refs]
-    if all(n == 0 for n in counts):
+    if all(n == 0 for n in _waiting(repo, _both(base), refs).values()):
         return "everything on its branch is already on the base"
     return ""
+
+
+def _live(repo, branch: str, found, gone) -> list:
+    """The copies of `branch` that still count: all but remote ones discarded."""
+    return [ref for ref in (found or {}).get("refs", ())
+            if ref.startswith(_HEADS) or (branch, _tip(repo, ref)[:7]) not in gone]
+
+
+def _waiting(repo, bases, refs) -> dict:
+    """Per copy of a branch, the commits it holds that no base does.
+
+    The one measure behind both the unmerged panel and Land's "nothing to
+    land", so the row and the button cannot disagree about the same branch. A
+    local ref is counted by hash; a remote copy by patch (`_unlanded`), since
+    it is usually a push from before the landing rebased it, and its commits
+    sit in the base under other hashes. The panel counting remote copies by
+    hash showed a row and a Land button for work that had already landed,
+    which Land then refused. None for a copy git would not measure.
+    """
+    return {ref: (ahead(repo, bases, ref) if ref.startswith(_HEADS)
+                  else _unlanded(repo, bases, ref)) for ref in refs}
 
 
 def _both(base: str) -> list:
@@ -473,13 +489,25 @@ def survey(records) -> list:
         gone = retired(repo)
         for name, rec in present.items():
             found = live[name]
-            if (name, found["sha"][:7]) in gone:
-                # Discarded on purpose, and its tip kept by a tag rather than
-                # by a branch. Reading remotes brought these back from the
-                # dead: nothing prunes the remote-tracking copy, so without
-                # this the board could never reach empty again.
-                continue
-            count = ahead(repo, base, found["refs"])
+            # Only the copies holding work count towards the number. A remote
+            # copy discarded on purpose (`_live` drops it: nothing prunes the
+            # remote-tracking ref, so without that the board could never
+            # reach empty again) is not work, and nor is a stale remote copy
+            # of work already landed under other hashes -- counting that by
+            # hash is how such a branch kept a row and a Land button that Land
+            # then refused (see `_waiting`). The same copies, measured the
+            # same way, as `nothing_to_land`.
+            counts = _waiting(repo, base, _live(repo, name, found, gone))
+            # The number is what Land would land: the local copy's work when
+            # it has some, else the largest remote copy (`restore_from_remote`).
+            work = {ref: n for ref, n in counts.items() if n != 0}
+            local = [n for ref, n in work.items() if ref.startswith(_HEADS)]
+            if not work:
+                count = 0
+            elif local or None in work.values():
+                count = local[0] if local else None
+            else:
+                count = max(work.values())
             if count == 0:
                 # Everything on it is already in the base -- it was merged, by
                 # us or by hand -- or it never held anything. Either way there

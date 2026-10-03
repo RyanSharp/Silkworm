@@ -9624,6 +9624,13 @@ def test_remote_only_work_lands():
     check("nor would a direct restore recreate the branch from it",
           B.restore_from_remote(repo, "silkworm/tsk_landed", "origin/main") == ""
           and not B.exists(repo, "silkworm/tsk_landed"))
+    rows = {r["branch"]: r for r in B.survey([
+        {"id": "tsk_landed", "state": "done", "scope": {"cwd": str(repo)}},
+        {"id": "tsk_deleted", "state": "done", "scope": {"cwd": str(repo)}}])}
+    check("and the panel shows no row, so no Land button, for it",
+          "silkworm/tsk_landed" not in rows, str(rows))
+    check("while a remote-only branch with real work keeps its row and count",
+          rows.get("silkworm/tsk_deleted", {}).get("commits") == 1, str(rows))
 
     # A remote copy someone discarded on purpose is not work waiting.
     git(repo, "tag", f"discarded/2026-10-03/silkworm/tsk_gone-{sha('origin/silkworm/tsk_deleted')[:7]}",
