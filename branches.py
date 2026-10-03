@@ -451,6 +451,11 @@ def survey(records) -> list:
     for rec in records:
         if rec.get("state") in IN_FLIGHT:
             continue
+        # Its branch was renamed onto a task that took the work over (see
+        # bot.rework_finished), which is the record that answers for it now. A
+        # remote copy under the old name would otherwise list it twice.
+        if (((rec.get("result") or {}).get("landing")) or {}).get("reworked_by"):
+            continue
         repo = repo_for(rec)
         if not repo:
             continue

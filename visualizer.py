@@ -1486,6 +1486,10 @@ function landing(t) {
     return `<div class="land ok">nothing to land — ${esc(l.detail || "")}</div>`;
   if (!l.eligible)
     return `<div class="land">not landed — ${esc(l.detail || l.stage || "?")}</div>`;
+  // Its branch moved to a task catching it up with the base; that one has it.
+  if (l.reworked_by)
+    return `<div class="land">not landed (${esc(l.stage || "?")}) — handed to ${
+      esc(l.reworked_by)} to catch up with the base</div>`;
   return `<div class="land bad">not landed (${esc(l.stage || "?")}) — ${
     esc(l.branch || "the branch")} is waiting for you${d}</div>`;
 }

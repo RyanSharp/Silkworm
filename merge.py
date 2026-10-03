@@ -178,16 +178,30 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     # 1. bring the work up to date with the commit it will be merged into
     reb = _git(worktree, "rebase", before)
     if reb.returncode != 0:
+        # Read before the abort, which forgets them. Whoever catches the branch
+        # up -- the implementor it is sent back to, or a person -- starts from
+        # which files clashed and with what, not from "it conflicts". Only the
+        # commit the rebase stopped on: later ones may clash too, and the
+        # rebase they are told to run will say so.
+        conflicts = [f for f in _git(worktree, "diff", "--name-only",
+                                     "--diff-filter=U").stdout.splitlines() if f]
         _git(worktree, "rebase", "--abort")
-        return _fail("rebase", (reb.stderr or reb.stdout) +
-                     "\nrebase onto the base conflicts; it needs a person")
+        # Both streams: git writes the CONFLICT lines to stdout and its advice
+        # to stderr, so `stderr or stdout` kept the advice and lost the one
+        # thing worth reading. And without the advice (hint:) lines, which
+        # only take room in the detail's last 600 characters.
+        said = "\n".join(line for line in (reb.stderr + "\n" + reb.stdout).splitlines()
+                         if line.strip() and not line.startswith("hint:"))
+        return {**_fail("rebase", said + "\nrebase onto the base conflicts"),
+                "conflicts": conflicts, "base": base_name, "onto": before}
 
     # 2. prove it still works *after* being brought up to date
     after_rebase = run_tests(worktree)
     if not after_rebase.get("ok"):
-        return _fail("tests-after-rebase",
-                     "the change passes alone but not on top of the current base:\n"
-                     + str(after_rebase.get("output", "")))
+        return {**_fail("tests-after-rebase",
+                        "the change passes alone but not on top of the current base:\n"
+                        + str(after_rebase.get("output", ""))),
+                "base": base_name, "onto": before}
 
     # 3. the tested commit must be the commit that gets merged. Running the
     # suite takes minutes, and another landing (or a person) moving the base in

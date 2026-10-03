@@ -199,6 +199,8 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
         if result.get("landed") and at and at >= since:
             add(proj, "landed", _title(rec))
         elif (merge.needs_a_person(landing) and landing.get("stage") not in NOT_REFUSALS
+              # Handed to a task catching it up, which answers for it now.
+              and not landing.get("reworked_by")
               and at and at >= since):
             stage = _esc(landing.get("stage") or "?")
             detail = _esc((landing.get("detail") or "").strip()[:90])

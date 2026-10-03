@@ -1485,7 +1485,9 @@ def approve_task(payload: dict) -> dict:
     The task ends `done` whether or not the landing succeeds — approving is the
     user closing the item, and refusing to close it would only put the same
     task in front of them again. What happened to the branch is written to the
-    record instead, which is what the board reads.
+    record instead, which is what the board reads. A landing refused because
+    the base moved does not stop there: start_landing hands the branch to a new
+    implementor task to catch up (rework_finished), once.
     """
     tid = payload.get("id", "")
     task = task_store.get(tid)
@@ -1533,6 +1535,10 @@ def land_or_drop(action: str, payload: dict) -> dict:
     if task.get("state") not in (tasks.DONE, tasks.CANCELLED):
         return {"ok": False, "error": f"only finished work; this one is {task.get('state')}"}
     task = dict(task, id=tid)
+    taken = ((task.get("result") or {}).get("landing") or {}).get("reworked_by")
+    if taken:
+        return {"ok": False, "error": f"its branch was handed to {taken} to catch "
+                                      "up with the base; act on that task instead"}
     if action == "land":
         if not start_landing(tid, approved=True):
             return {"ok": False, "error": "a landing for it is already under way"}
@@ -3306,6 +3312,34 @@ def rework_flagged_review(parent: dict, verdict: dict, channel: str,
     return True
 
 
+def conflict_addendum(task: dict, outcome: dict, branch: str, why: str) -> str:
+    """What work sent back to catch up with its base is told: where the base
+    is, which files clashed, git's own words, and what to do about it."""
+    stage = outcome.get("stage")
+    base = (outcome.get("base") or (task.get("scope") or {}).get("branch")
+            or "the base branch")
+    onto = outcome.get("onto") or ""
+    at = f" (at `{onto[:12]}` when the landing tried)" if onto else ""
+    what = ("rebasing it onto the current base conflicts" if stage == "rebase"
+            else "its tests fail once it is rebased onto the current base")
+    files = outcome.get("conflicts") or []
+    clash = ("Files that conflicted where the rebase stopped (later commits may "
+             "conflict too):\n" + "\n".join(f"  {f}" for f in files[:30]) + "\n\n"
+             if files else "")
+    return (
+        f"This work {why}, but it could not land: {what}. Overlapping work "
+        f"merged after this branch started.\n\n{clash}"
+        f"```\n{(outcome.get('detail') or '')[-1500:]}\n```\n\n"
+        f"Bring `{branch}` up to date: rebase it onto `{base}`{at} -- "
+        f"`git rebase {base}` in your checkout -- and resolve the conflicts or "
+        f"failures that causes while keeping what this task set out to do. Take "
+        f"the base's side wherever it has since replaced something this branch "
+        f"also changed, and re-apply this task's change on top. Then run the "
+        f"full test suite and commit the result on the branch. Do not merge "
+        f"into, reset or push `{base}`: Silkworm lands it after verification "
+        f"and review.")
+
+
 def rework_conflict(task_id: str, outcome: dict, channel: str,
                     thread_ts: str) -> bool:
     """Send a branch that could not catch up with its base back once to do so.
@@ -3317,17 +3351,7 @@ def rework_conflict(task_id: str, outcome: dict, channel: str,
             or tried >= MAX_CONFLICT_REWORKS):
         return False
     branch = outcome.get("branch") or branches.name_for(task)
-    base = (task.get("scope") or {}).get("branch") or "the base branch"
-    what = ("rebasing it onto the current base conflicts" if stage == "rebase"
-            else "its tests fail once it is rebased onto the current base")
-    addendum = (
-        f"This work passed review, but it could not land: {what}. Overlapping "
-        f"work merged after this branch started.\n\n"
-        f"```\n{(outcome.get('detail') or '')[-1500:]}\n```\n\n"
-        f"Bring `{branch}` up to date with the current {base} (rebase it onto "
-        f"the base's latest commit), resolve the conflicts or failures that "
-        f"causes while keeping what this task set out to do, run the tests, "
-        f"and commit the result on the branch.")
+    addendum = conflict_addendum(task, outcome, branch, "passed review")
     try:
         send_back(task_id, addendum, f"landing refused ({stage}); sent back "
                   "automatically to catch up with the base",
@@ -3339,6 +3363,99 @@ def rework_conflict(task_id: str, outcome: dict, channel: str,
                 f"branch up to date with the base ({stage}) — a second conflict "
                 f"will come to you.")
     return True
+
+
+def rework_finished(task_id: str, outcome: dict, channel: str = "",
+                    thread_ts: str = "") -> str:
+    """Hand a finished task's branch that could not catch up with its base to
+    a new implementor task that will. Returns the new task's id, or "".
+
+    Approve and Land act on work that is already closed: Approve closes the
+    task before its landing starts, and Land is only offered on `done` or
+    `cancelled` work. Those states are terminal -- the sweepers, compaction,
+    branch pruning and the digest all rely on that -- so the task itself
+    cannot be requeued the way rework_conflict requeues one still waiting on
+    its review. Landing first and closing after would cover Approve, but not
+    Land, which is where the stranded backlog actually sits; one path for both
+    beats two.
+
+    So the work moves instead. The branch is renamed to the new task's own
+    `silkworm/<id>` -- the same commits and reflog, not a fresh branch off the
+    base -- because that is the one branch the git guard lets an implementor
+    move, and the name execute_task reattaches on its first run. The old task
+    records who took its branch over, and its row leaves the unmerged survey:
+    the work is the new task's now, and listed twice it would be offered for
+    landing twice.
+
+    Bounded by the same counter as rework_conflict, carried onto the new task:
+    once on its own, and a second refusal parks the new task for a person
+    through the ordinary review path. Only on projects that take unsupervised
+    work -- anywhere else the queue would hold the new task at its gate.
+    """
+    task = task_store.get(task_id) or {}
+    tried = int(task.get("conflict_reworks") or 0)
+    if (outcome.get("stage") not in CONFLICT_STAGES
+            or task.get("state") not in tasks.TERMINAL
+            or ((task.get("result") or {}).get("landing") or {}).get("reworked_by")
+            or projects.unready(project_store.get(task.get("project") or "")) != ""
+            or tried >= MAX_CONFLICT_REWORKS):
+        return ""
+    repo = branches.repo_for(task)
+    old = outcome.get("branch") or branches.name_for(task)
+    if not repo or not old:
+        return ""
+    sid = tasks.new_id()
+    new = worktrees.BRANCH_PREFIX + sid
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
+                              text=True, timeout=60)
+    scope = {k: v for k, v in (task.get("scope") or {}).items() if k != "worktree"}
+    try:
+        with repo_guard(str(repo)):
+            # Held by a checkout (an implementor's, kept because it was left
+            # dirty): renaming under it would move that checkout's branch too.
+            held = git("worktree", "list", "--porcelain").stdout.splitlines()
+            if f"branch refs/heads/{old}" in held:
+                log.info("not reworking %s: %s is checked out somewhere", task_id, old)
+                return ""
+            # Said before the branch moves, so no moment exists in which the
+            # work is on the new name while the old record still offers it:
+            # a remote copy under the old name would put it back in the survey,
+            # and Land there would restore it and hand it on a second time.
+            record_landing(task, {**outcome, "branch": old, "reworked_by": sid})
+            r = git("branch", "-m", old, new)
+            if r.returncode != 0:
+                log.warning("not reworking %s: could not take over %s: %s",
+                            task_id, old, (r.stderr or "").strip()[-200:])
+                record_landing(task, outcome)
+                return ""
+            try:
+                task_store.create(
+                    f"{task.get('goal', '')}\n\n" + conflict_addendum(
+                        task, outcome, new, "was approved"),
+                    id=sid, title=f"Catch up: {(task.get('title') or task_id)[:48]}",
+                    role="implementor", project=task.get("project") or "",
+                    state=tasks.QUEUED, driver="queue", isolate=True,
+                    source="rework", source_ref=task_id,
+                    root=task.get("root") or task_id, thread=task.get("thread") or "",
+                    scope=scope, branch=new, conflict_reworks=tried + 1,
+                    review_reworks=int(task.get("review_reworks") or 0),
+                    reworked_findings=list(task.get("reworked_findings") or []))
+            except Exception:
+                log.exception("could not file the rework of %s", task_id)
+                git("branch", "-m", new, old)
+                record_landing(task, outcome)
+                return ""
+    except Exception:
+        log.exception("reworking %s failed", task_id)
+        return ""
+    tell_thread(f"{channel}:{thread_ts}" if channel else task.get("thread", ""),
+                f":arrows_counterclockwise: *Sent back automatically* as `{sid}`, "
+                f"which takes over the branch (now `{new}`) to bring it up to date "
+                f"with the base ({outcome.get('stage')}) — a second conflict will "
+                f"come to you.")
+    return sid
 
 
 def resolve_review(task: dict, role_name: str, text: str,
@@ -3613,7 +3730,7 @@ def record_landing(task: dict, outcome: dict) -> None:
     # anything written in between -- the review verdict, most of all.
     current = task_store.get(task["id"]) or task
     keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base",
-            "checkpointed", "base_before")
+            "checkpointed", "base_before", "conflicts", "onto", "reworked_by")
     # Dated, so "what landed yesterday" is answerable from the record alone:
     # `updated` moves on any later write and cannot say.
     result = {**(current.get("result") or {}),
@@ -3714,7 +3831,15 @@ def start_landing(task_id: str, approved: bool = False) -> bool:
             # not get an anchor message posted for it hours after it finished.
             if task.get("thread") and ":" in task["thread"]:
                 channel, _, thread_ts = task["thread"].partition(":")
-            land_and_record(task_id, channel, thread_ts, approved=approved)
+            outcome = land_and_record(task_id, channel, thread_ts, approved=approved)
+            # Approve and Land close the task before (or long before) this
+            # point, so a conflict cannot send it back; the work moves to a new
+            # task instead. See rework_finished.
+            if merge.needs_a_person(outcome):
+                try:
+                    rework_finished(task_id, outcome, channel, thread_ts)
+                except Exception:
+                    log.exception("could not hand %s's branch on", task_id)
         except Exception:
             # land_and_record guards itself, so this is the thread dying before
             # it gets there. Leaving the marker would say "landing…" for ever.

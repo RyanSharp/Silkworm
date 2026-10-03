@@ -11124,7 +11124,7 @@ def test_flagged_work_fixes_itself_once():
           "land_and_record": lambda tid, ch, ts: outcome,
           "file_followups": lambda *a, **k: []}
     got = _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
-                    "send_back", "review_addendum", "_unsupervised",
+                    "conflict_addendum", "send_back", "review_addendum", "_unsupervised",
                     "MAX_REVIEW_REWORKS", "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, ns)
     check("the gate and its send-backs were lifted out of bot.py",
           {"resolve_review", "rework_flagged_review", "rework_conflict",
@@ -12762,6 +12762,288 @@ def test_guard_env_reaches_task_turns_only():
           "do not push" in p and "base branch" in p and "hook" in p)
     check("and that 'done when it is on main' is met by reporting it ready to land",
           "ready to land" in p and "on main" in p)
+
+
+def test_conflicting_landings_go_back_to_their_implementor():
+    """A branch that cannot catch up with its base goes back to the implementor
+    that wrote it, with the conflict attached -- by either door.
+
+    Of the nine Silkworm branches done but unmerged on 2026-10-02, four were
+    held up only or mainly by being 27-37 commits behind and conflicting; each
+    repair then came back as a separate proposal costing a decision, a session
+    and a reviewer. Driven against a real repository with an origin remote, in
+    which main and the task's branch genuinely conflict, through the real
+    resolve_review, approve_task, land_or_drop, start_landing, land_if_ready
+    and merge.land.
+    """
+    print("\nconflicting landings are sent back to their implementor")
+    import contextlib
+    import roles
+    import tasks as T
+    import worktrees as W
+    import branches as B
+
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "repo"
+    saved_root, W.ROOT = W.ROOT, root / "wts"
+
+    def git(cwd, *a):
+        return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                               *a], cwd=str(cwd), capture_output=True, text=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    git(root, "clone", "-q", str(origin), str(repo))
+    (repo / "shared.py").write_text("VALUE = 1\n")
+    (repo / "other.py").write_text("x = 1\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+    git(repo, "push", "-q", "origin", "main")
+
+    store = T.TaskStore(root / "t.json")
+    projects_ = {"ready": {"slug": "ready", "test_cmd": "true", "auto_merge": True},
+                 "manual": {"slug": "manual", "test_cmd": "true"}}
+    said, posted = [], []
+
+    def task_state(tid, state, detail=""):
+        try:
+            store.transition(tid, state, detail)
+        except T.InvalidTransition:
+            pass
+
+    class SyncThread:
+        """start() runs the landing in place, so its outcome can be read."""
+        def __init__(self, target, **kw):
+            self.target = target
+        def start(self):
+            self.target()
+    import threading as _th
+    ns = {"task_store": store, "tasks": T, "roles": roles, "merge": __import__("merge"),
+          "projects": __import__("projects"), "branches": B, "worktrees": W,
+          "verify": __import__("verify"), "discard": __import__("discard"),
+          "holding": __import__("holding"), "subprocess": subprocess, "time": time,
+          "log": logging.getLogger("test"), "task_state": task_state,
+          "threading": types.SimpleNamespace(Lock=_th.Lock, Thread=SyncThread),
+          "project_store": types.SimpleNamespace(get=lambda slug: projects_.get(slug)),
+          "app": types.SimpleNamespace(client=types.SimpleNamespace(
+              chat_postMessage=lambda **kw: posted.append(kw["text"]))),
+          "tell_thread": lambda key, text: said.append((key, text)),
+          "repo_guard": lambda *a, **k: contextlib.nullcontext(),
+          "file_followups": lambda *a, **k: [], "REVISION": {"sha": ""},
+          "BASE_DIR": root / "elsewhere", "Path": Path}
+    got = _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
+                    "rework_finished", "conflict_addendum", "send_back",
+                    "review_addendum", "_unsupervised", "MAX_REVIEW_REWORKS",
+                    "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES", "land_and_record",
+                    "land_if_ready", "landing_enabled", "record_landing",
+                    "_is_own_checkout", "start_landing", "approve_task",
+                    "land_or_drop", "LANDING_UNDERWAY", "_landing_now",
+                    "_landing_guard"}, ns)
+    check("the gate, both landing doors and the rework were lifted out of bot.py",
+          {"resolve_review", "rework_conflict", "rework_finished", "start_landing",
+           "approve_task", "land_or_drop"} <= got, str(sorted(got)))
+
+    def tip(ref):
+        return git(repo, "rev-parse", "--verify", "-q", ref).stdout.strip()
+
+    def worked(project, state=T.BLOCKED):
+        """An implementor's branch off main, then main moving under it in the
+        same lines -- a conflict nothing can resolve mechanically."""
+        t = store.create("Make VALUE two", title="Value", project=project,
+                         role="implementor", driver="queue", isolate=True,
+                         thread="C1:1.0", scope={"cwd": str(repo), "branch": "main"})
+        tid = t["id"]
+        store.transition(tid, T.RUNNING, "claimed")
+        wt = W.create(repo, tid, fetch=False, base="main")
+        (wt / "shared.py").write_text(f"VALUE = 2  # {tid}\n")
+        git(wt, "commit", "-qam", f"the work of {tid}")
+        W.release(wt)
+        n = len(store.all())
+        (repo / "shared.py").write_text(f"VALUE = {100 + n}  # main moved on\n")
+        git(repo, "commit", "-qam", f"main moves ({n})")
+        git(repo, "push", "-q", "origin", "main")
+        store.update(tid, branch=W.BRANCH_PREFIX + tid, verified=True, blocked_on=["rev"])
+        store.transition(tid, T.BLOCKED, "awaiting review")
+        if state != T.BLOCKED:
+            store.update(tid, blocked_on=[])
+            store.transition(tid, state, "parked")
+        return tid
+
+    def passing_review(tid):
+        said.clear()
+        rev = store.create("review it", role="reviewer", parent=tid)
+        ns["resolve_review"](rev, "reviewer", '```json\n{"ok": true, "summary": '
+                             '"fine", "findings": []}\n```', "C1", "1.0")
+        return store.get(tid)
+
+    try:
+        # --- (a) a passing review whose landing conflicts ----------------------
+        tid = worked("ready")
+        main_before, work_before = tip("main"), tip(W.BRANCH_PREFIX + tid)
+        t = passing_review(tid)
+        check("a passing review whose landing conflicts is sent back, not parked",
+              t["state"] == T.QUEUED and t.get("conflict_reworks") == 1,
+              f"state {t['state']}, reworks {t.get('conflict_reworks')}")
+        landing = (t.get("result") or {}).get("landing") or {}
+        check("the refusal on the record names the conflicting files and the base",
+              landing.get("stage") == "rebase" and landing.get("conflicts") == ["shared.py"]
+              and landing.get("base") == "main" and landing.get("onto") == main_before,
+              str(landing))
+        check("and the goal it is sent back with carries them",
+              "  shared.py" in t["goal"] and "git rebase main" in t["goal"]
+              and main_before[:12] in t["goal"] and "CONFLICT" in t["goal"]
+              and "run the full test suite" in t["goal"], t["goal"][-900:])
+        check("on its own branch, untouched, and main untouched",
+              tip(W.BRANCH_PREFIX + tid) == work_before and tip("main") == main_before)
+        check("with the gates reset, so it is verified and reviewed again",
+              t.get("blocked_on") == [] and t.get("verified") is None)
+
+        # The rerun does not manage it: the second refusal is for a person.
+        store.transition(tid, T.RUNNING, "claimed")
+        store.update(tid, verified=True, blocked_on=["rev"])
+        store.transition(tid, T.BLOCKED, "awaiting review")
+        t = passing_review(tid)
+        check("a second conflicting landing parks the task for a person",
+              t["state"] == T.AWAITING_APPROVAL and t.get("conflict_reworks") == 1
+              and not said, f"state {t['state']}, said {said}")
+
+        # --- (b) Approve: done is terminal, so the work moves to a new task -----
+        uid = worked("ready", T.AWAITING_APPROVAL)
+        old = W.BRANCH_PREFIX + uid
+        git(repo, "push", "-q", "origin", old)          # a remote copy, too
+        work_tip, main_before = tip(old), tip("main")
+        r = ns["approve_task"]({"id": uid, "by": "test"})
+        u = store.get(uid)
+        sid = ((u.get("result") or {}).get("landing") or {}).get("reworked_by") or ""
+        s = store.get(sid) or {}
+        check("approving closes the task, as it always has",
+              r.get("ok") and u["state"] == T.DONE, str(r))
+        check("and a conflicting landing is not stranded: a new task takes it over",
+              s.get("state") == T.QUEUED and s.get("role") == "implementor"
+              and s.get("driver") == "queue" and s.get("isolate") is True,
+              f"reworked_by {sid!r}: {s.get('state')}")
+        check("on the same commits, under the one name the guard lets it move",
+              tip(W.BRANCH_PREFIX + sid) == work_tip and not tip(old)
+              and s.get("branch") == W.BRANCH_PREFIX + sid,
+              f"{W.BRANCH_PREFIX + sid} at {tip(W.BRANCH_PREFIX + sid)[:8]}, "
+              f"{old} at {tip(old)[:8] or 'gone'}")
+        check("told the base, the conflicting file and git's output",
+              "  shared.py" in s.get("goal", "") and "git rebase main" in s["goal"]
+              and "CONFLICT" in s["goal"] and s["goal"].startswith("Make VALUE two"),
+              s.get("goal", "")[-600:])
+        check("counted, in its own thread, pointing back at the original",
+              s.get("conflict_reworks") == 1 and s.get("thread") == "C1:1.0"
+              and s.get("source_ref") == uid and s.get("root") == uid)
+        check("and the thread is told", any(sid in text for _, text in said), str(said))
+        check("the original leaves the unmerged survey, remote copy and all",
+              not [row for row in B.survey([store.get(uid)]) if row["id"] == uid],
+              str(B.survey([store.get(uid)])))
+        check("and Land on it refuses, naming who has the work",
+              sid in (ns["land_or_drop"]("land", {"id": uid}).get("error") or ""))
+        check("main untouched throughout", tip("main") == main_before)
+
+        # The new task catches up, as an implementor would, and lands normally.
+        here = W.attach(repo, sid, W.BRANCH_PREFIX + sid, label="")
+        check("(its first run reattaches the branch execute_task looks for)", bool(here))
+        store.transition(sid, T.RUNNING, "claimed")
+        git(here, "rebase", "main")
+        (here / "shared.py").write_text("VALUE = 2\n")
+        git(here, "add", "shared.py")
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "-c", "core.editor=true", "rebase", "--continue"],
+                       cwd=str(here), capture_output=True, text=True)
+        W.release(here)
+        store.update(sid, verified=True, blocked_on=["rev"])
+        store.transition(sid, T.BLOCKED, "awaiting review")
+        s = passing_review(sid)
+        check("once caught up, it lands through the ordinary review path",
+              s["state"] == T.DONE and (repo / "shared.py").read_text() == "VALUE = 2\n"
+              and (s.get("result") or {}).get("landed") == tip("main"),
+              f"{s['state']}: {((s.get('result') or {}).get('landing') or {})}")
+
+        # --- the new task's own second conflict parks; approving it stops ------
+        vid = worked("ready", T.AWAITING_APPROVAL)
+        ns["approve_task"]({"id": vid, "by": "test"})
+        wid = ((store.get(vid).get("result") or {}).get("landing") or {}).get("reworked_by")
+        store.transition(wid, T.RUNNING, "claimed")      # and does nothing useful
+        store.update(wid, verified=True, blocked_on=["rev"])
+        store.transition(wid, T.BLOCKED, "awaiting review")
+        w = passing_review(wid)
+        check("the taken-over work's second conflict parks it for a person",
+              w["state"] == T.AWAITING_APPROVAL, w["state"])
+        before = len(store.all())
+        ns["approve_task"]({"id": wid, "by": "test"})
+        w = store.get(wid)
+        check("and approving that is not sent round again",
+              w["state"] == T.DONE and len(store.all()) == before
+              and not ((w.get("result") or {}).get("landing") or {}).get("reworked_by")
+              and tip(W.BRANCH_PREFIX + wid),
+              f"{len(store.all()) - before} new task(s)")
+
+        # --- Land on finished work takes the same route -------------------------
+        xid = worked("ready", T.AWAITING_APPROVAL)
+        store.transition(xid, T.DONE, "closed without landing")
+        r = ns["land_or_drop"]("land", {"id": xid})
+        yid = ((store.get(xid).get("result") or {}).get("landing") or {}).get("reworked_by")
+        check("Land on a done task that conflicts hands it on too",
+              r.get("ok") and yid and store.get(yid)["state"] == T.QUEUED
+              and tip(W.BRANCH_PREFIX + yid), str(r))
+
+        # --- a branch that cannot be taken over stays where it is ---------------
+        real_run = subprocess.run
+        def refusing(cmd, *a, **k):
+            if cmd[:3] == ["git", "branch", "-m"]:
+                return types.SimpleNamespace(returncode=128, stdout="", stderr="no")
+            return real_run(cmd, *a, **k)
+        ns["subprocess"] = types.SimpleNamespace(run=refusing)
+        zid = worked("ready", T.AWAITING_APPROVAL)
+        before, ztip = len(store.all()), tip(W.BRANCH_PREFIX + zid)
+        try:
+            ns["approve_task"]({"id": zid, "by": "test"})
+        finally:
+            ns["subprocess"] = subprocess
+        zl = (store.get(zid).get("result") or {}).get("landing") or {}
+        check("a rename git refuses files nothing and takes back the hand-over",
+              len(store.all()) == before and tip(W.BRANCH_PREFIX + zid) == ztip
+              and zl.get("stage") == "rebase" and not zl.get("reworked_by"), str(zl))
+
+        # --- a project not taking unsupervised work: exactly as before -----------
+        mid = worked("manual", T.AWAITING_APPROVAL)
+        before, mtip = len(store.all()), tip(W.BRANCH_PREFIX + mid)
+        ns["approve_task"]({"id": mid, "by": "test"})
+        m = store.get(mid)
+        check("on a project that does not take unsupervised work, Approve parks as today",
+              m["state"] == T.DONE and len(store.all()) == before
+              and tip(W.BRANCH_PREFIX + mid) == mtip
+              and (m.get("result") or {}).get("landing", {}).get("stage") == "rebase")
+    finally:
+        W.ROOT = saved_root
+
+    # --- and nothing else still calls the original stuck -----------------------
+    import digest
+    vz = (BASE / "visualizer.py").read_text()
+    landjs = vz[vz.index("function landing(t)"):vz.index("function threadLink(")]
+    probe = (landjs + "\nconst esc = s => String(s);\nprocess.stdout.write(landing("
+             "{result: {landing: {eligible: true, landed: false, stage: 'rebase', "
+             "branch: 'silkworm/tsk_h', reworked_by: 'tsk_n'}}}))")
+    out = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
+    check("the dashboard says who has the work rather than 'waiting for you'",
+          "handed to tsk_n" in out.stdout and "waiting for you" not in out.stdout,
+          out.stdout or out.stderr[:300])
+    handed = {"id": "tsk_h", "title": "Handed", "project": "ready", "state": T.DONE,
+              "created": time.time(), "result": {"landing": {
+                  "eligible": True, "landed": False, "stage": "rebase",
+                  "reworked_by": "tsk_n", "at": time.time()}}}
+    def refused(rec):
+        return (digest.sections([rec], time.time()).get("ready") or {}).get("refused")
+    plain = dict(handed, result={"landing": {
+        k: v for k, v in handed["result"]["landing"].items() if k != "reworked_by"}})
+    check("and the digest does not list it as refused",
+          refused(plain) and not refused(handed), str((refused(plain), refused(handed))))
+
+    # --- the reviewer is told staleness is not a finding -----------------------
+    sysp = roles.REVIEWER_SYSTEM
+    check("the review prompt says being behind the base is not a finding on its own",
+          "behind the base branch is not a finding" in sysp
+          and "do not ask for a rebase" in sysp.lower()
+          and "clashes with what the base now does" in sysp, sysp[:400])
 
 
 if __name__ == "__main__":
