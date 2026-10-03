@@ -47,15 +47,26 @@ Y = "\033[33m"; G = "\033[32m"; R = "\033[31m"; N = "\033[0m"
 WORM = f"{Y}🪱 silkworm:{N}"
 
 
-def bot_port() -> str:
-    port = "8787"
+def env_file_value(name: str):
+    """What .env sets `name` to, or None if it doesn't. Takes the last
+    assignment and accepts `export NAME=...`, as python-dotenv (the bot's
+    reader) does -- otherwise a .env the bot obeys sends the CLI elsewhere."""
+    val = None
     try:
         for line in (REPO / ".env").read_text().splitlines():
-            if line.strip().startswith("APPROVAL_PORT="):
-                port = line.split("=", 1)[1].strip()
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, rest = line.partition("=")
+            if sep and key.strip() == name:
+                val = rest.strip().strip("\"'")
     except OSError:
         pass
-    return port
+    return val
+
+
+def bot_port() -> str:
+    return env_file_value("APPROVAL_PORT") or "8787"
 
 
 def viz_port() -> str:
@@ -66,13 +77,7 @@ DEFAULT_LEARNINGS = REPO / "learnings.json"
 
 
 def learnings_file() -> Path:
-    val = ""
-    try:
-        for line in (REPO / ".env").read_text().splitlines():
-            if line.strip().startswith("LEARNINGS_FILE="):
-                val = line.split("=", 1)[1].strip()
-    except OSError:
-        pass
+    val = env_file_value("LEARNINGS_FILE")
     return Path(val).expanduser() if val else DEFAULT_LEARNINGS
 
 
@@ -287,14 +292,7 @@ def env_setting(name: str) -> str:
     it as one more place to look, never the only one."""
     if os.environ.get(name, "").strip():
         return os.environ[name].strip()
-    val = ""
-    try:
-        for line in (REPO / ".env").read_text().splitlines():
-            if line.strip().startswith(f"{name}="):
-                val = line.split("=", 1)[1].strip()
-    except OSError:
-        pass
-    return val.strip("\"'")
+    return env_file_value(name) or ""
 
 
 def viz_hosts() -> list:
@@ -569,13 +567,7 @@ def check_git_guards(path: Path | None = None) -> list[tuple[str, bool, str]]:
 
 def env_has(name: str) -> bool:
     """Whether .env sets a variable, without reading its value."""
-    try:
-        for line in (REPO / ".env").read_text().splitlines():
-            if line.strip().startswith(f"{name}="):
-                return True
-    except OSError:
-        pass
-    return bool(os.environ.get(name))
+    return env_file_value(name) is not None or bool(os.environ.get(name))
 
 
 def creds_state() -> dict:

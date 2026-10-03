@@ -13155,6 +13155,41 @@ def test_conflicting_landings_go_back_to_their_implementor():
           and "clashes with what the base now does" in sysp, sysp[:400])
 
 
+# python-dotenv, which the bot loads .env with, accepts `export NAME=...`.
+# bin/silkworm read .env with a bare NAME= prefix match, so the same file set
+# a token or port for the bot that the CLI never saw.
+
+def test_cli_reads_exported_env_lines():
+    print("\nbin/silkworm reads .env the way the bot does, export lines included")
+    cli = _load_cli()
+    root = Path(tempfile.mkdtemp())
+    (root / ".env").write_text(
+        "# VIZ_TOKEN=commented-out\n"
+        "export VIZ_TOKEN='tok-1'\n"
+        "export  APPROVAL_PORT=9911\n"
+        "LEARNINGS_FILE=/tmp/first.json\n"
+        "export LEARNINGS_FILE=\"/tmp/last.json\"\n"
+        "EXPORTED_THING=x\n")
+    cli.REPO = root
+    names = ("VIZ_TOKEN", "APPROVAL_PORT", "LEARNINGS_FILE", "VIZ_BIND", "THING")
+    saved = {n: os.environ.pop(n) for n in names if n in os.environ}
+    try:
+        check("an exported VIZ_TOKEN is read, quotes stripped",
+              cli.env_setting("VIZ_TOKEN") == "tok-1", repr(cli.env_setting("VIZ_TOKEN")))
+        check("an exported APPROVAL_PORT is the bot port",
+              cli.bot_port() == "9911", cli.bot_port())
+        check("the last assignment wins, as with dotenv",
+              cli.learnings_file() == Path("/tmp/last.json"), str(cli.learnings_file()))
+        check("env_has sees an exported variable",
+              cli.env_has("APPROVAL_PORT"))
+        check("a name is matched whole, not as a suffix of another",
+              not cli.env_has("THING") and cli.env_file_value("THING") is None)
+        check("an unset name still falls back to the default",
+              cli.env_setting("VIZ_BIND") == "" and not cli.env_has("VIZ_BIND"))
+    finally:
+        os.environ.update(saved)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

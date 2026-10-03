@@ -29,7 +29,7 @@ def main() -> None:
     try:
         with open(env_file) as f:
             for line in f:
-                if line.strip().startswith("APPROVAL_PORT="):
+                if line.strip().removeprefix("export ").lstrip().startswith("APPROVAL_PORT="):
                     port = line.split("=", 1)[1].strip()
     except OSError:
         pass

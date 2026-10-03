@@ -49,7 +49,7 @@ def _bot_port() -> str:
     port = "8787"
     try:
         for line in (BASE_DIR / ".env").read_text().splitlines():
-            if line.strip().startswith("APPROVAL_PORT="):
+            if line.strip().removeprefix("export ").lstrip().startswith("APPROVAL_PORT="):
                 port = line.split("=", 1)[1].strip()
     except OSError:
         pass
