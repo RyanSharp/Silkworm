@@ -203,9 +203,10 @@ class LaunchdManager:
         the holder would answer for the new process while it crash-loops on
         bind, so the caller must report failure rather than probe."""
         deadline = time.monotonic() + timeout
-        hosts = {viz_port(): viz_host()}
+        hosts = {viz_port(): viz_hosts()}
         ports = [port for _, port in self._probes().values()]
-        while (held := [p for p in ports if port_listening(p, hosts.get(p, "127.0.0.1"))]) \
+        while (held := [p for p in ports
+                        if any(port_listening(p, h) for h in hosts.get(p, ["127.0.0.1"]))]) \
                 and time.monotonic() < deadline:
             time.sleep(0.5)
         return held
@@ -280,8 +281,10 @@ def port_listening(port: str, host: str = "127.0.0.1") -> bool:
 
 
 def env_setting(name: str) -> str:
-    """The visualizer reads VIZ_* from its environment; .env is where the
-    README tells you to put them, so fall back to it."""
+    """A VIZ_* setting from the environment, else .env (where the README says
+    to put it). Neither is proof the visualizer saw it: the launchd plist
+    passes only PATH and visualizer.py never loads .env -- so callers treat
+    it as one more place to look, never the only one."""
     if os.environ.get(name, "").strip():
         return os.environ[name].strip()
     val = ""
@@ -291,30 +294,43 @@ def env_setting(name: str) -> str:
                 val = line.split("=", 1)[1].strip()
     except OSError:
         pass
-    return val
+    return val.strip("\"'")
+
+
+def viz_hosts() -> list:
+    """Where the visualizer may be answering. Loopback first: it is the
+    default, and what the installed service binds whatever .env says. Then
+    a specific VIZ_BIND address, which refuses 127.0.0.1. A wildcard bind
+    answers on loopback, so it adds nothing."""
+    hosts = ["127.0.0.1"]
+    bind = env_setting("VIZ_BIND")
+    if bind not in ("", "0.0.0.0", "::", "localhost", "127.0.0.1"):
+        hosts.append(bind)
+    return hosts
 
 
 def viz_host() -> str:
-    """Where the visualizer answers. A wildcard bind still answers on
-    loopback; a specific address (VIZ_BIND=192.168.1.20) refuses it."""
-    bind = env_setting("VIZ_BIND")
-    if bind in ("", "0.0.0.0", "::", "localhost"):
-        return "127.0.0.1"
-    return bind
+    """The address to show a person: the configured one, if any."""
+    return viz_hosts()[-1]
 
 
 def viz_get(path: str, timeout: float = 2) -> bytes:
-    """GET from the visualizer the way a browser off loopback must: with
-    VIZ_TOKEN, which it demands on every route -- the favicon included --
-    once VIZ_BIND is anything but loopback."""
-    host = viz_host()
-    netloc = f"[{host}]" if ":" in host else host
-    req = urllib.request.Request(f"http://{netloc}:{viz_port()}{path}")
+    """GET from the visualizer, trying each address it may be on. Sends
+    VIZ_TOKEN when there is one: off loopback the visualizer demands it on
+    every route, the favicon included, and on loopback it is ignored."""
     token = env_setting("VIZ_TOKEN")
-    if token:
-        req.add_header("X-Silkworm-Token", token)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    err = None
+    for host in viz_hosts():
+        netloc = f"[{host}]" if ":" in host else host
+        req = urllib.request.Request(f"http://{netloc}:{viz_port()}{path}")
+        if token:
+            req.add_header("X-Silkworm-Token", token)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as e:
+            err = e
+    raise err
 
 
 def viz_serving() -> bool:

@@ -10372,20 +10372,37 @@ def test_viz_probe_off_loopback():
         check("a wrong token is not mistaken for up", cli.viz_serving() is False)
         os.environ["VIZ_TOKEN"] = "s3cret-token"
 
+        class Waiter(cli.LaunchdManager):
+            def _probes(self):
+                return {"com.silkworm.viz": (cli.viz_serving, cli.viz_port())}
+
         # A specific-address bind: only that address answers. ::1 stands in
         # for a LAN address -- a host whose 127.0.0.1 refuses the port.
         try:
             srv6 = serve(V6, "::1"); servers.append(srv6)
         except OSError:
             srv6 = None
+        check("the ::1 stand-in for a LAN address could bind", srv6 is not None)
         if srv6 is not None:
-            port6 = srv6.server_address[1]
-            os.environ["SILKWORM_VIZ_PORT"] = str(port6)
+            port6 = str(srv6.server_address[1])
+            os.environ["SILKWORM_VIZ_PORT"] = port6
             os.environ["VIZ_BIND"] = "::1"
-            check("the fixture refuses 127.0.0.1", not cli.port_listening(str(port6)))
+            check("the fixture refuses 127.0.0.1", not cli.port_listening(port6))
             check("viz_serving knocks on the bound address", cli.viz_serving() is True)
             check("the port-free wait sees the bound address held",
-                  cli.port_listening(str(port6), cli.viz_host()))
+                  Waiter()._wait_ports_free(timeout=1.0) == [port6])
+
+        # The installed service never sees VIZ_BIND (the plist passes only
+        # PATH; visualizer.py never loads .env), so a VIZ_BIND in .env or the
+        # shell must not stop the probe finding it on loopback.
+        V.LOOPBACK, V.TOKEN = True, ""
+        lo = serve(ThreadingHTTPServer, "127.0.0.1"); servers.append(lo)
+        os.environ["SILKWORM_VIZ_PORT"] = str(lo.server_address[1])
+        os.environ["VIZ_BIND"] = "::1"
+        check("a configured address the service never saw: still up on loopback",
+              cli.viz_serving() is True)
+        check("...and the port-free wait still sees loopback held",
+              Waiter()._wait_ports_free(timeout=1.0) == [str(lo.server_address[1])])
     finally:
         V.LOOPBACK, V.TOKEN = loopback, token
         for srv in servers:
