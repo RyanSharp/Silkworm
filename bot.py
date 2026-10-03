@@ -3559,6 +3559,15 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
                                         prefer=scope.get("branch") or "", fallback=""))
     if empty:
         return never("nothing-to-land", empty)
+    # Work that survives only on a remote copy -- the local ref reset to the
+    # base or deleted -- is counted above, so it must also be what lands: the
+    # checkout below takes the local branch.
+    stuck = branches.restore_from_remote(
+        cwd, branch, worktrees.base_ref(cwd, fetch=False,
+                                        prefer=scope.get("branch") or "", fallback=""))
+    if stuck:
+        return {"eligible": True, "landed": False, "stage": "restore",
+                "branch": branch, "detail": stuck}
 
     here = worktrees.attach(cwd, task["id"], branch)
     if not here:

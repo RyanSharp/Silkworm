@@ -9391,6 +9391,115 @@ def test_nothing_to_land_is_not_a_refusal():
           attached == ["silkworm/tsk_work"] and r.get("stage") == "attach", f"{attached} {r!r}")
 
 
+# --- a branch whose work survives only on origin can still land --------------
+# The unmerged panel counts every copy of a task branch, so a local ref reset
+# to the base while origin held the commits showed "N commits" and a Land
+# button -- and Land refused with "everything on its branch is already on the
+# base", having asked about the local ref alone.
+
+def test_remote_only_work_lands():
+    import logging
+    import merge as M
+    import worktrees as W
+    import branches as B
+    print("\na branch whose work survives only on origin can still land")
+
+    def git(where, *a):
+        return subprocess.run(["git", "-C", str(where), "-c", "user.email=t@t",
+                               "-c", "user.name=t", *a], capture_output=True, text=True)
+    origin = Path(tempfile.mkdtemp())
+    git(origin, "init", "-q", "--bare", "-b", "main")
+    repo = Path(tempfile.mkdtemp())
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+    git(repo, "push", "-q", "origin", "main")
+    for tid in ("tsk_reset", "tsk_deleted", "tsk_own", "tsk_split"):
+        git(repo, "checkout", "-q", "-b", f"silkworm/{tid}", "main")
+        (repo / f"{tid}.txt").write_text("pushed work\n")
+        git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", f"{tid} pushed")
+        git(repo, "push", "-q", "origin", f"silkworm/{tid}")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "branch", "-f", "silkworm/tsk_reset", "main")     # reset to the base
+    git(repo, "branch", "-D", "silkworm/tsk_deleted")          # local copy gone
+    # tsk_own: the local copy has work of its own, and origin a stale other version
+    git(repo, "branch", "-f", "silkworm/tsk_own", "main")
+    git(repo, "checkout", "-q", "silkworm/tsk_own")
+    (repo / "own.txt").write_text("local work\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "local work")
+    git(repo, "checkout", "-q", "main")
+    # tsk_split: two remotes disagree, the local copy has nothing
+    other = Path(tempfile.mkdtemp())
+    git(other, "init", "-q", "--bare", "-b", "main")
+    git(repo, "remote", "add", "fork", str(other))
+    git(repo, "checkout", "-q", "-b", "alt", "main")
+    (repo / "alt.txt").write_text("alt\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "alt")
+    git(repo, "push", "-q", "fork", "alt:silkworm/tsk_split")
+    git(repo, "checkout", "-q", "main"); git(repo, "branch", "-D", "alt")
+    git(repo, "fetch", "-q", "fork")
+    git(repo, "branch", "-f", "silkworm/tsk_split", "main")
+
+    sha = lambda ref: git(repo, "rev-parse", ref).stdout.strip()
+    pushed = sha("origin/silkworm/tsk_reset")
+    check("fixture: local reset to the base, origin ahead",
+          sha("silkworm/tsk_reset") == sha("main") and pushed != sha("main"))
+
+    rows = {r["branch"]: r for r in B.survey([
+        {"id": "tsk_reset", "state": "done", "scope": {"cwd": str(repo)}}])}
+    check("the panel counts the work origin holds",
+          rows.get("silkworm/tsk_reset", {}).get("commits") == 1, str(rows))
+    for tid in ("tsk_reset", "tsk_deleted"):
+        why = B.nothing_to_land(repo, f"silkworm/{tid}", "origin/main")
+        check(f"{tid}: Land agrees there is something to land", why == "", why)
+
+    class Projects:
+        def get(self, slug):
+            return {"auto_merge": True, "test_cmd": "true"}
+    attached = []
+    class Worktrees:
+        BRANCH_PREFIX = W.BRANCH_PREFIX
+        def __getattr__(self, name):
+            return getattr(W, name)
+        def attach(self, cwd, tid, branch):
+            attached.append((branch, sha(branch)))
+            return None                                # stop before git merges anything
+    ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
+          "branches": B, "log": logging.getLogger("test")}
+    _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    land = ns["land_if_ready"]
+    base = {"project": "p", "verified": True, "scope": {"cwd": str(repo)}}
+
+    r = land({**base, "id": "tsk_reset"})
+    check("reset branch: goes on to land, not 'nothing to land'",
+          r.get("stage") == "attach", repr(r))
+    check("and what it attaches is origin's work, not the empty local ref",
+          attached[-1] == ("silkworm/tsk_reset", pushed), str(attached))
+    r = land({**base, "id": "tsk_deleted"})
+    check("deleted local branch: recreated from origin and landed",
+          r.get("stage") == "attach" and attached[-1] == (
+              "silkworm/tsk_deleted", sha("origin/silkworm/tsk_deleted")), f"{attached} {r!r}")
+    check("without tracking origin", git(repo, "config", "branch.silkworm/tsk_deleted.remote").stdout == "")
+    own = sha("silkworm/tsk_own")
+    land({**base, "id": "tsk_own"})
+    check("a local copy with its own work is landed as itself, not replaced by origin's",
+          attached[-1] == ("silkworm/tsk_own", own), str(attached))
+    n = len(attached)
+    r = land({**base, "id": "tsk_split"})
+    check("remotes that disagree: refused for a person, nothing attached",
+          r.get("stage") == "restore" and M.needs_a_person(r) and len(attached) == n
+          and sha("silkworm/tsk_split") == sha("main"), repr(r))
+
+    # A remote copy someone discarded on purpose is not work waiting.
+    git(repo, "tag", f"discarded/2026-10-03/silkworm/tsk_gone-{sha('origin/silkworm/tsk_deleted')[:7]}",
+        "origin/silkworm/tsk_deleted")
+    git(repo, "push", "-q", "origin", "origin/silkworm/tsk_deleted:refs/heads/silkworm/tsk_gone")
+    git(repo, "fetch", "-q", "origin")
+    why = B.nothing_to_land(repo, "silkworm/tsk_gone", "origin/main")
+    check("a discarded remote-only copy has nothing to land", why != "", why)
+
+
 # --- work left uncommitted goes back before it reaches review ------------------
 # A Cadence implementor finished with three changes loose in its checkout. The
 # suite would have tested them, but the reviewer checks the branch out -- and

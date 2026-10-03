@@ -263,16 +263,95 @@ def nothing_to_land(repo, branch: str, base: str) -> str:
     absence of a branch used to reach the user as "not landed (attach)", a
     refusal asking for a person, seven times in one day.
 
+    Every copy of the branch counts, as it does in `survey`. Asking about the
+    local ref alone meant a branch reset to the base while origin still held
+    its commits showed N commits and a Land button on the unmerged panel, and
+    Land then answered "everything on its branch is already on the base" --
+    the panel and the button disagreeing about the same branch. A copy a human
+    discarded on purpose (`retired`) is not work waiting, here as there.
+
     An unresolvable base says nothing either way: "" lets the landing run and
     refuse with its own named stage rather than be waved through here.
     """
-    if not exists(repo, branch):
+    found = existing(repo).get(branch)
+    gone = retired(repo)
+    refs = [ref for ref in (found or {}).get("refs", ())
+            if ref.startswith(_HEADS) or (branch, _tip(repo, ref)[:7]) not in gone]
+    if not refs:
         return "its branch is gone: it made no commits the base did not already have"
     if not base:
         return ""
     local = base.split("/", 1)[1] if base.startswith("origin/") else base
-    if ahead(repo, [base, local], branch) == 0:
+    if ahead(repo, [base, local], refs) == 0:
         return "everything on its branch is already on the base"
+    return ""
+
+
+def _tip(repo, ref: str) -> str:
+    r = _git(repo, "rev-parse", "--verify", "--quiet", ref)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def restore_from_remote(repo, branch: str, base: str) -> str:
+    """Point the local branch at a remote copy's work when it has none of its own.
+
+    `nothing_to_land` counts every copy of a branch, so a local ref reset to
+    the base -- or deleted -- while origin still holds the commits is work to
+    land. But a landing checks out the *local* branch, and that one is empty:
+    it would rebase nothing, test nothing new and report a clean landing of
+    nothing. So before the landing attaches, the local ref is moved to the
+    remote copy that holds the work.
+
+    Only when the local copy has nothing of its own. A local branch with
+    commits the base lacks is the work, and is landed as it always was; a
+    stale remote copy beside it -- pushed before a rebase, say -- is ignored
+    rather than allowed to replace it. Moving an empty local ref loses nothing:
+    every commit on it is already in the base.
+
+    Returns "" when the local branch is ready to land (moved or already
+    right), else why it could not be made so -- which needs a person, since
+    the commits are there and git would not hand them over.
+    """
+    found = existing(repo).get(branch)
+    if not found:
+        return ""
+    bases = [base, base.split("/", 1)[1] if base.startswith("origin/") else base] if base else []
+    local = f"{_HEADS}{branch}"
+    if found["local"]:
+        mine = ahead(repo, bases, local) if bases else None
+        if mine != 0:
+            return ""                 # its own work, or git would not say: leave it
+    gone = retired(repo)
+    tips = {}
+    for ref in found["refs"]:
+        if ref == local:
+            continue
+        sha = _tip(repo, ref)
+        if not sha or (branch, sha[:7]) in gone:
+            continue
+        if bases and ahead(repo, bases, ref) == 0:
+            continue
+        tips.setdefault(sha, ref)
+    if not tips:
+        return ""
+    # Several remotes may hold it. One tip that contains every other is the
+    # whole of the work; anything else is copies that disagree, and choosing
+    # between them is not this function's call.
+    best = next((sha for sha in tips
+                 if all(_git(repo, "merge-base", "--is-ancestor", other, sha).returncode == 0
+                        for other in tips)), "")
+    if not best:
+        return (f"its remote copies disagree ({', '.join(sorted(tips.values()))}) "
+                "and the local branch has none of their work")
+    # `git branch -f` refuses a branch checked out in any worktree, which is
+    # the refusal wanted: moving a ref under someone's checkout would turn
+    # their clean tree into a pile of apparent edits.
+    r = _git(repo, "branch", "--no-track", *(["-f"] if found["local"] else []),
+             branch, best)
+    if r.returncode != 0:
+        return (f"could not point {branch} at {tips[best]}: "
+                + (r.stderr or "").strip()[-200:])
+    log.info("restored %s from %s (%s) before landing", branch, tips[best], best[:8])
     return ""
 
 
