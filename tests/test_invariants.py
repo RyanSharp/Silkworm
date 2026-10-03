@@ -9491,6 +9491,31 @@ def test_remote_only_work_lands():
           r.get("stage") == "restore" and M.needs_a_person(r) and len(attached) == n
           and sha("silkworm/tsk_split") == sha("main"), repr(r))
 
+    # A branch pushed, then landed by rebasing onto a moved base, then deleted
+    # as landed: origin's copy holds the same work under other hashes, and
+    # Land must not recreate it and land it twice.
+    git(repo, "checkout", "-q", "-b", "silkworm/tsk_landed", "main")
+    (repo / "landed.txt").write_text("landed work\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "landed work")
+    git(repo, "push", "-q", "origin", "silkworm/tsk_landed")
+    git(repo, "checkout", "-q", "main")
+    (repo / "moved.txt").write_text("base moved\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "base moved")
+    git(repo, "cherry-pick", "silkworm/tsk_landed")             # the landing's rebase
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "branch", "-D", "silkworm/tsk_landed")
+    git(repo, "fetch", "-q", "origin")
+    check("fixture: origin's copy is not in main by hash",
+          git(repo, "merge-base", "--is-ancestor", "origin/silkworm/tsk_landed", "main").returncode != 0)
+    n = len(attached)
+    r = land({**base, "id": "tsk_landed"})
+    check("a stale copy of already-landed work is nothing to land",
+          r.get("stage") == "nothing-to-land" and len(attached) == n
+          and not B.exists(repo, "silkworm/tsk_landed"), repr(r))
+    check("nor would a direct restore recreate the branch from it",
+          B.restore_from_remote(repo, "silkworm/tsk_landed", "origin/main") == ""
+          and not B.exists(repo, "silkworm/tsk_landed"))
+
     # A remote copy someone discarded on purpose is not work waiting.
     git(repo, "tag", f"discarded/2026-10-03/silkworm/tsk_gone-{sha('origin/silkworm/tsk_deleted')[:7]}",
         "origin/silkworm/tsk_deleted")

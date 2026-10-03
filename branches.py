@@ -281,15 +281,47 @@ def nothing_to_land(repo, branch: str, base: str) -> str:
         return "its branch is gone: it made no commits the base did not already have"
     if not base:
         return ""
-    local = base.split("/", 1)[1] if base.startswith("origin/") else base
-    if ahead(repo, [base, local], refs) == 0:
+    bases = _both(base)
+    counts = [ahead(repo, bases, ref) if ref.startswith(_HEADS)
+              else _unlanded(repo, bases, ref) for ref in refs]
+    if all(n == 0 for n in counts):
         return "everything on its branch is already on the base"
     return ""
+
+
+def _both(base: str) -> list:
+    """The base and its local name: either copy holding the work is enough."""
+    return [base, base.split("/", 1)[1] if base.startswith("origin/") else base]
 
 
 def _tip(repo, ref: str) -> str:
     r = _git(repo, "rev-parse", "--verify", "--quiet", ref)
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _unlanded(repo, bases, ref: str) -> int | None:
+    """Commits on a remote copy that no base holds, even as a rebased copy.
+
+    A remote copy is usually a push from before the landing rebased the
+    branch: its commits are in the base under other hashes, and `ahead`, which
+    compares hashes, counts every one of them. The local branch is then
+    deleted as landed, and the stale copy alone would make Land recreate the
+    branch from it and land the same work a second time -- a rebase that
+    either empties out into a "landed" record for nothing, or conflicts with
+    the very change it already is. Patch-equivalence is the question that
+    tells those commits apart from real work. None when git would not say.
+    """
+    counts = []
+    for b in bases:
+        r = _git(repo, "rev-list", "--count", "--cherry-pick", "--right-only",
+                 "--no-merges", f"{b}...{ref}")
+        if r.returncode != 0:
+            continue                  # a base copy that does not exist says nothing
+        try:
+            counts.append(int(r.stdout.strip()))
+        except ValueError:
+            return None
+    return min(counts) if counts else None
 
 
 def restore_from_remote(repo, branch: str, base: str) -> str:
@@ -315,7 +347,7 @@ def restore_from_remote(repo, branch: str, base: str) -> str:
     found = existing(repo).get(branch)
     if not found:
         return ""
-    bases = [base, base.split("/", 1)[1] if base.startswith("origin/") else base] if base else []
+    bases = _both(base) if base else []
     local = f"{_HEADS}{branch}"
     if found["local"]:
         mine = ahead(repo, bases, local) if bases else None
@@ -329,8 +361,12 @@ def restore_from_remote(repo, branch: str, base: str) -> str:
         sha = _tip(repo, ref)
         if not sha or (branch, sha[:7]) in gone:
             continue
-        if bases and ahead(repo, bases, ref) == 0:
-            continue
+        if bases:
+            n = _unlanded(repo, bases, ref)
+            if n is None:
+                return f"could not tell whether {ref} holds work the base lacks"
+            if n == 0:
+                continue              # already landed, if under other hashes
         tips.setdefault(sha, ref)
     if not tips:
         return ""
