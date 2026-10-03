@@ -10320,6 +10320,83 @@ def test_restart_waits_for_ports():
 
 
 
+# `silkworm restart` waits for the visualizer to answer its probe. Off
+# loopback the visualizer demands VIZ_TOKEN on every route, favicon included,
+# and a specific-address bind refuses 127.0.0.1 -- so a probe that knocked on
+# 127.0.0.1 without the token called a healthy visualizer down for 90s.
+def test_viz_probe_off_loopback():
+    import importlib.machinery
+    import importlib.util
+    import socket
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+    import visualizer as V
+    print("\nthe visualizer probe works when VIZ_BIND is not loopback")
+
+    loader = importlib.machinery.SourceFileLoader("silkworm_cli", str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("silkworm_cli", loader)
+    cli = importlib.util.module_from_spec(spec)
+    loader.exec_module(cli)
+
+    class V6(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    def serve(cls, host):
+        srv = cls((host, 0), V.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    saved = {k: os.environ.get(k) for k in ("VIZ_BIND", "VIZ_TOKEN", "SILKWORM_VIZ_PORT")}
+    loopback, token = V.LOOPBACK, V.TOKEN
+    servers = []
+    try:
+        V.LOOPBACK, V.TOKEN = False, "s3cret-token"
+        os.environ["VIZ_TOKEN"] = "s3cret-token"
+
+        # A wildcard-style bind: reachable on 127.0.0.1, but every route 401s.
+        srv = serve(ThreadingHTTPServer, "127.0.0.1"); servers.append(srv)
+        os.environ["SILKWORM_VIZ_PORT"] = str(srv.server_address[1])
+        os.environ["VIZ_BIND"] = "0.0.0.0"
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{srv.server_address[1]}/favicon.svg", timeout=2)
+            unauth = 200
+        except urllib.error.HTTPError as e:
+            unauth = e.code
+        check("the fixture really demands the token (bare GET is 401)", unauth == 401)
+        check("viz_serving sends the token and sees it up", cli.viz_serving() is True)
+        check("viz_up sends it too", cli.viz_up() is True)
+        os.environ["VIZ_TOKEN"] = "wrong"
+        check("a wrong token is not mistaken for up", cli.viz_serving() is False)
+        os.environ["VIZ_TOKEN"] = "s3cret-token"
+
+        # A specific-address bind: only that address answers. ::1 stands in
+        # for a LAN address -- a host whose 127.0.0.1 refuses the port.
+        try:
+            srv6 = serve(V6, "::1"); servers.append(srv6)
+        except OSError:
+            srv6 = None
+        if srv6 is not None:
+            port6 = srv6.server_address[1]
+            os.environ["SILKWORM_VIZ_PORT"] = str(port6)
+            os.environ["VIZ_BIND"] = "::1"
+            check("the fixture refuses 127.0.0.1", not cli.port_listening(str(port6)))
+            check("viz_serving knocks on the bound address", cli.viz_serving() is True)
+            check("the port-free wait sees the bound address held",
+                  cli.port_listening(str(port6), cli.viz_host()))
+    finally:
+        V.LOOPBACK, V.TOKEN = loopback, token
+        for srv in servers:
+            srv.shutdown(); srv.server_close()
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 # --- deploy drains instead of killing --------------------------------------------
 # The bot restarted 13 times in 10 days (2026-09-18..10-01) to load new code.
 # Every restart killed the turn running at the time -- nine runs ended exit

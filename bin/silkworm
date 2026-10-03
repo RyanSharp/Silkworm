@@ -203,8 +203,10 @@ class LaunchdManager:
         the holder would answer for the new process while it crash-loops on
         bind, so the caller must report failure rather than probe."""
         deadline = time.monotonic() + timeout
+        hosts = {viz_port(): viz_host()}
         ports = [port for _, port in self._probes().values()]
-        while (held := [p for p in ports if port_listening(p)]) and time.monotonic() < deadline:
+        while (held := [p for p in ports if port_listening(p, hosts.get(p, "127.0.0.1"))]) \
+                and time.monotonic() < deadline:
             time.sleep(0.5)
         return held
 
@@ -269,12 +271,50 @@ def hooks_installed() -> bool:
     return "session_hook.py" in json.dumps(settings.get("hooks", {}))
 
 
-def port_listening(port: str) -> bool:
+def port_listening(port: str, host: str = "127.0.0.1") -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=1):
+        with socket.create_connection((host, int(port)), timeout=1):
             return True
     except (OSError, ValueError):
         return False
+
+
+def env_setting(name: str) -> str:
+    """The visualizer reads VIZ_* from its environment; .env is where the
+    README tells you to put them, so fall back to it."""
+    if os.environ.get(name, "").strip():
+        return os.environ[name].strip()
+    val = ""
+    try:
+        for line in (REPO / ".env").read_text().splitlines():
+            if line.strip().startswith(f"{name}="):
+                val = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return val
+
+
+def viz_host() -> str:
+    """Where the visualizer answers. A wildcard bind still answers on
+    loopback; a specific address (VIZ_BIND=192.168.1.20) refuses it."""
+    bind = env_setting("VIZ_BIND")
+    if bind in ("", "0.0.0.0", "::", "localhost"):
+        return "127.0.0.1"
+    return bind
+
+
+def viz_get(path: str, timeout: float = 2) -> bytes:
+    """GET from the visualizer the way a browser off loopback must: with
+    VIZ_TOKEN, which it demands on every route -- the favicon included --
+    once VIZ_BIND is anything but loopback."""
+    host = viz_host()
+    netloc = f"[{host}]" if ":" in host else host
+    req = urllib.request.Request(f"http://{netloc}:{viz_port()}{path}")
+    token = env_setting("VIZ_TOKEN")
+    if token:
+        req.add_header("X-Silkworm-Token", token)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
 
 def viz_serving() -> bool:
@@ -282,7 +322,7 @@ def viz_serving() -> bool:
     every transcript and takes over a second on a real install, so as a
     readiness probe it timed out against a healthy server."""
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{viz_port()}/favicon.svg", timeout=2).read()
+        viz_get("/favicon.svg")
         return True
     except Exception:
         return False
@@ -290,7 +330,7 @@ def viz_serving() -> bool:
 
 def viz_up() -> bool:
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{viz_port()}/api/stats", timeout=2).read()
+        viz_get("/api/stats")
         return True
     except Exception:
         return False
@@ -368,7 +408,7 @@ def do_status() -> None:
         down = link.get("down_for") or 0
         check("connected to slack", bool(link.get("connected")),
               f"down for {int(down // 60)}m — it should self-restart; silkworm logs")
-    check(f"visualizer on http://127.0.0.1:{viz_port()}", viz_up())
+    check(f"visualizer on http://{viz_host()}:{viz_port()}", viz_up())
     check("session hooks installed", hooks_installed())
     check_git_guards()
 
