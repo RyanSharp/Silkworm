@@ -36,6 +36,19 @@ MAX_PER_THREAD = 5
 #: such hiccup used to cost the whole thread its replay.
 ATTEMPTS = 3
 
+#: Slack error codes worth another try. Any other code (missing_scope,
+#: channel_not_found, invalid_auth...) will say the same thing again.
+TRANSIENT_ERRORS = {"ratelimited", "internal_error", "fatal_error",
+                    "service_unavailable", "request_timeout"}
+
+
+def _permanent(e: Exception) -> bool:
+    """A Slack API refusal that a retry cannot change; transport errors are not."""
+    resp = getattr(e, "response", None)
+    code = resp.get("error") if hasattr(resp, "get") else None
+    return bool(code) and code not in TRANSIENT_ERRORS
+
+
 #: Messages asked for per page. Smaller pages are less to lose to a cut-off.
 PAGE = 100
 
@@ -53,6 +66,7 @@ def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = No
     `keep_last` holds only the newest n, for callers that want the tail.
     """
     out = collections.deque(maxlen=keep_last) if keep_last else []
+    seen = set()       # Slack repeats the parent at the top of every page
     cursor = None
     for n in range(max_pages):
         args = {"channel": channel, "ts": thread_ts, "limit": page}
@@ -66,12 +80,15 @@ def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = No
                 resp = client.conversations_replies(**args)
                 break
             except Exception as e:
-                if attempt == attempts:
+                if attempt == attempts or _permanent(e):
                     raise
                 log.warning("reading %s:%s page %d failed (%s); retrying",
                             channel, thread_ts, n + 1, e)
                 sleep(2 * attempt)
-        out.extend(resp.get("messages") or [])
+        for m in resp.get("messages") or []:
+            if m.get("ts") not in seen:
+                seen.add(m.get("ts"))
+                out.append(m)
         cursor = (resp.get("response_metadata") or {}).get("next_cursor")
         if not cursor:
             return list(out)

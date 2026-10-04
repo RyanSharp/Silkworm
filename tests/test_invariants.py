@@ -3985,13 +3985,14 @@ def test_backfill():
             if self.fail:
                 self.fail -= 1
                 raise IOError("IncompleteRead(74664 bytes read, 340397 more expected)")
-            pool = [m for m in self.msgs
+            pool = [m for m in self.msgs[1:]
                     if oldest is None or float(m["ts"]) > float(oldest)]
             start = int(cursor or 0)
-            page = pool[start:start + limit]
-            more = start + limit < len(pool)
+            # As Slack does: the parent heads every page, past the watermark or not.
+            page = [self.msgs[0]] + pool[start:start + limit - 1]
+            more = start + limit - 1 < len(pool)
             return {"messages": page,
-                    "response_metadata": {"next_cursor": str(start + limit) if more else ""}}
+                    "response_metadata": {"next_cursor": str(start + limit - 1) if more else ""}}
 
     long_mark = now - 3600
     thread = [{"ts": f"{long_mark - 200 + i:.6f}", "user": "U1", "text": f"old{i}"}
@@ -4019,6 +4020,27 @@ def test_backfill():
     full = B.read_thread(slack, "D", "1", page=100, sleep=nap)
     check("pages are followed to the end", len(full) == len(thread)
           and len(slack.calls) == 2)
+    check("the parent Slack repeats on each page is kept once, in place",
+          [m["ts"] for m in full] == [m["ts"] for m in thread])
+    tail = B.read_thread(FakeSlack(thread), "D", "1", page=100, keep_last=60, sleep=nap)
+    check("so a tail is in time order", [m["ts"] for m in tail]
+          == [m["ts"] for m in thread[-60:]],
+          "not the thread's opening wedged between recent messages")
+
+    class Refusal(Exception):
+        response = {"ok": False, "error": "missing_scope"}
+
+    class Refuses(FakeSlack):
+        def conversations_replies(self, **kw):
+            self.calls.append(kw)
+            raise Refusal()
+    slack = Refuses(thread)
+    try:
+        B.read_thread(slack, "D", "1", sleep=nap)
+    except Refusal:
+        pass
+    check("a permanent refusal is not retried", len(slack.calls) == 1,
+          "missing_scope says the same thing a second time")
     check("keep_last holds the newest",
           [m["text"] for m in B.read_thread(FakeSlack(thread), "D", "1",
                                             keep_last=2, sleep=nap)] == ["new0", "new1"],
