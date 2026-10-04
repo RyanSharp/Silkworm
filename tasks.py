@@ -11,6 +11,7 @@ a default and a meaning, so a reader never has to guess whether a missing value
 means "old record" or "nothing happened".
 """
 
+import copy
 import logging
 import threading
 import time
@@ -288,6 +289,19 @@ class TaskStore:
     def _save(self) -> None:
         jsonstore.save(self._path, self._data)
 
+    def _save_or_restore(self, tid: str, prior: dict) -> None:
+        """Save, or put `prior` (a deep copy taken before the edit) back.
+
+        Held under the lock. The caller is told the write failed, so the edit
+        must not survive in memory: left there, it would steer the runner and
+        be written to disk by the next unrelated save, as if it had worked.
+        """
+        try:
+            self._save()
+        except BaseException:
+            self._data[tid] = prior
+            raise
+
     def create(self, goal: str, **fields) -> dict:
         task = make(goal, **fields)
         with self._lock:
@@ -324,9 +338,10 @@ class TaskStore:
             rec = self._data.get(tid)
             if rec is None:
                 return None
+            prior = copy.deepcopy(rec)
             rec.update(fields)
             rec["updated"] = time.time()
-            self._save()
+            self._save_or_restore(tid, prior)
             return dict(rec)
 
     def transition(self, tid: str, to_state: str, detail: str = "",
@@ -352,6 +367,7 @@ class TaskStore:
                 return dict(rec)                     # idempotent
             if not can(current, to_state):
                 raise InvalidTransition(f"{tid}: {current} -> {to_state}")
+            prior = copy.deepcopy(rec)
             rec["state"] = to_state
             if _unblock:
                 # Forgetting an ended blocker happens in the same write as the
@@ -374,7 +390,7 @@ class TaskStore:
             del events[:-50]
             if to_state == RUNNING:
                 rec["attempts"] = (rec.get("attempts") or 0) + 1
-            self._save()
+            self._save_or_restore(tid, prior)
             log.info("task %s %s -> %s%s", tid, current, to_state,
                      f" ({detail})" if detail else "")
             moved = dict(rec)

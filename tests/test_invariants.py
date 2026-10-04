@@ -523,6 +523,49 @@ def test_task_lifecycle():
     check("a failed create over an existing id restores the record it replaced",
           st.get(t["id"])["title"] == "later save" and st.get(t["id"])["state"] == T.DONE)
 
+    # update and transition edit the record in place before saving; a failed
+    # save must put it back, or the next unrelated save writes the edit anyway.
+    def failing(fn):
+        jsonstore.save = broken
+        try:
+            fn()
+            return False
+        except OSError:
+            return True
+        finally:
+            jsonstore.save = real_save
+    import copy
+    u = st.create("rollback probe", id="tsk_rollback")
+    # get() copies only the top level; events would alias the live list.
+    before = copy.deepcopy(st.get(u["id"]))
+    check("an update that cannot be saved raises",
+          failing(lambda: st.update(u["id"], title="never written", result={"x": 1})))
+    check("and leaves the record as it was in memory", st.get(u["id"]) == before)
+    st.update(t["id"], title="unrelated save")
+    check("nor reaches disk on a later unrelated save",
+          TaskStore(st._path).get(u["id"])["title"] == "rollback probe")
+    before = copy.deepcopy(st.get(u["id"]))
+    check("a transition that cannot be saved raises",
+          failing(lambda: st.transition(u["id"], T.RUNNING, "started")))
+    after = st.get(u["id"])
+    check("and leaves state, events and attempts as they were",
+          after == before and after["state"] == T.QUEUED)
+    st.update(t["id"], title="another unrelated save")
+    check("nor reaches disk on a later unrelated save",
+          TaskStore(st._path).get(u["id"])["state"] == T.QUEUED)
+    # An ended blocker whose save failed has not ended: nothing waiting on it
+    # may be released.
+    st.transition(u["id"], T.RUNNING)
+    w = st.create("waits on the probe", id="tsk_rollback_waiter",
+                  state=T.BLOCKED, blocked_on=[u["id"]])
+    check("a failed ending raises",
+          failing(lambda: st.transition(u["id"], T.FAILED, "boom")))
+    check("and releases nobody",
+          st.get(u["id"])["state"] == T.RUNNING
+          and st.get(w["id"])["state"] == T.BLOCKED
+          and st.get(w["id"])["blocked_on"] == [u["id"]])
+    st.transition(u["id"], T.DONE)
+
 
 # --- every turn is a task ------------------------------------------------------
 
