@@ -799,13 +799,15 @@ def user_name(client, user_id: str) -> str:
 
 def thread_context(client, channel: str, thread_ts: str, exclude_ts: str) -> str | None:
     """Transcript of an existing thread, for 'summarize this thread' mentions."""
+    # The newest 50, not the first: replies come oldest-first, so a single page
+    # of a long thread is its opening, not what was just being discussed.
     try:
-        resp = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)
+        msgs = backfill.read_thread(client, channel, thread_ts, keep_last=50)
     except Exception as e:
         log.warning("could not fetch thread history (%s) — missing history scope?", e)
         return None
     lines = []
-    for m in resp.get("messages", []):
+    for m in msgs:
         if m.get("ts") == exclude_ts or m.get("subtype"):
             continue
         who = "claude (this bot)" if m.get("user") == BOT_USER_ID or m.get("bot_id") else user_name(client, m.get("user", "?"))
@@ -4036,9 +4038,8 @@ def run_backfill() -> dict:
     read it back and hand anything past the watermark to the ordinary path,
     which already refuses redeliveries.
     """
-    def replies(channel, thread_ts):
-        r = app.client.conversations_replies(channel=channel, ts=thread_ts, limit=100)
-        return r.get("messages", [])
+    def replies(channel, thread_ts, oldest):
+        return backfill.read_thread(app.client, channel, thread_ts, oldest=oldest)
 
     events = backfill.missed(store.all(), replies=replies,
                              bot_user_id=BOT_USER_ID,

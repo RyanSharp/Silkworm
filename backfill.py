@@ -18,6 +18,7 @@ ever said" is not a backlog. Old messages are skipped too: an unanswered
 question from last week has either been re-asked or stopped mattering.
 """
 
+import collections
 import logging
 import time
 
@@ -30,14 +31,63 @@ MAX_AGE_S = 3 * 24 * 3600
 #: dropped is logged rather than silently forgotten.
 MAX_PER_THREAD = 5
 
+#: Tries per page of thread history. A long thread's page can be cut off
+#: mid-download (2026-10-02: IncompleteRead, 74664 of 415061 bytes), and one
+#: such hiccup used to cost the whole thread its replay.
+ATTEMPTS = 3
+
+#: Messages asked for per page. Smaller pages are less to lose to a cut-off.
+PAGE = 100
+
+
+def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = None,
+                keep_last: int | None = None, max_pages: int = 50,
+                page: int = PAGE, attempts: int = ATTEMPTS,
+                sleep=time.sleep) -> list[dict]:
+    """Every message of a thread (past `oldest`, if given), oldest first.
+
+    conversations.replies returns a thread oldest-first, one page at a time, so
+    a single unpaginated call on a long thread sees only its beginning -- never
+    the recent end that a watermark or a fresh session actually needs. This
+    follows the cursor to the end, retrying each page before giving up.
+    `keep_last` holds only the newest n, for callers that want the tail.
+    """
+    out = collections.deque(maxlen=keep_last) if keep_last else []
+    cursor = None
+    for n in range(max_pages):
+        args = {"channel": channel, "ts": thread_ts, "limit": page}
+        if oldest:
+            args["oldest"] = oldest
+            args["inclusive"] = False
+        if cursor:
+            args["cursor"] = cursor
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = client.conversations_replies(**args)
+                break
+            except Exception as e:
+                if attempt == attempts:
+                    raise
+                log.warning("reading %s:%s page %d failed (%s); retrying",
+                            channel, thread_ts, n + 1, e)
+                sleep(2 * attempt)
+        out.extend(resp.get("messages") or [])
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            return list(out)
+    log.warning("%s:%s: stopped after %d pages; the thread goes on",
+                channel, thread_ts, max_pages)
+    return list(out)
+
 
 def missed(entries: dict, *, replies, bot_user_id: str, handled_subtypes,
            now: float | None = None, max_age_s: float = MAX_AGE_S,
            max_per_thread: int = MAX_PER_THREAD) -> list[dict]:
     """Message events past each thread's watermark, oldest first.
 
-    `replies(channel, thread_ts)` returns that thread's messages; it is injected
-    so this is testable without Slack.
+    `replies(channel, thread_ts, oldest)` returns that thread's messages after
+    `oldest` (the watermark) -- in practice `read_thread`, which pages and
+    retries. It is injected so this is testable without Slack.
     """
     now = time.time() if now is None else now
     out = []
@@ -51,9 +101,12 @@ def missed(entries: dict, *, replies, bot_user_id: str, handled_subtypes,
         except (TypeError, ValueError):
             continue
         try:
-            msgs = replies(channel, thread_ts)
+            msgs = replies(channel, thread_ts, last)
         except Exception:
-            log.exception("could not re-read %s", key)
+            # After read_thread's own retries: loudly, since a thread skipped
+            # here is a thread whose missed messages are never answered.
+            log.exception("could not re-read %s after retries; its missed "
+                          "messages, if any, will not be replayed", key)
             continue
         fresh = []
         for m in msgs or []:

@@ -3931,7 +3931,7 @@ def test_backfill():
         ],
         ("C", "200"): [{"ts": at(50), "user": "U1", "text": "no watermark here"}],
     }
-    got = B.missed(entries, replies=lambda c, t: msgs[(c, t)], bot_user_id="BOT",
+    got = B.missed(entries, replies=lambda c, t, o: msgs[(c, t)], bot_user_id="BOT",
                    handled_subtypes={"file_share"}, now=now)
     texts = [e["text"] for e in got]
     check("a message past the watermark is replayed", "is this working?" in texts,
@@ -3955,13 +3955,13 @@ def test_backfill():
     old = {"C:1": {"last_msg_ts": str(now - 7200)}}
     stale = {("C", "1"): [{"ts": str(now - B.MAX_AGE_S - 1), "user": "U1", "text": "last week"}]}
     check("a message older than the window is left alone",
-          B.missed(old, replies=lambda c, t: stale[(c, t)], bot_user_id="B",
+          B.missed(old, replies=lambda c, t, o: stale[(c, t)], bot_user_id="B",
                    handled_subtypes=set(), now=now) == [],
           "it was re-asked or stopped mattering")
 
     many = {("C", "1"): [{"ts": str(now - 60 + i), "user": "U1", "text": f"m{i}"}
                          for i in range(9)]}
-    capped = B.missed(old, replies=lambda c, t: many[(c, t)], bot_user_id="B",
+    capped = B.missed(old, replies=lambda c, t, o: many[(c, t)], bot_user_id="B",
                       handled_subtypes=set(), now=now, max_per_thread=3)
     check("a chatty gap is capped", len(capped) == 3)
     check("and the newest are kept", [e["text"] for e in capped] == ["m6", "m7", "m8"])
@@ -3970,10 +3970,80 @@ def test_backfill():
           "log.warning" in src and "skipping" in src)
 
     check("a thread Slack cannot return is skipped, not fatal",
-          B.missed(old, replies=lambda c, t: (_ for _ in ()).throw(RuntimeError("nope")),
+          B.missed(old, replies=lambda c, t, o: (_ for _ in ()).throw(RuntimeError("nope")),
                    bot_user_id="B", handled_subtypes=set(), now=now) == [])
 
+    # A long thread. Slack returns replies oldest-first, so one unpaginated
+    # call read only the first page and never reached the watermark at its end.
+    class FakeSlack:
+        def __init__(self, msgs, fail=0):
+            self.msgs, self.fail, self.calls = msgs, fail, []
+
+        def conversations_replies(self, *, channel, ts, limit, cursor=None,
+                                  oldest=None, inclusive=None):
+            self.calls.append({"cursor": cursor, "oldest": oldest})
+            if self.fail:
+                self.fail -= 1
+                raise IOError("IncompleteRead(74664 bytes read, 340397 more expected)")
+            pool = [m for m in self.msgs
+                    if oldest is None or float(m["ts"]) > float(oldest)]
+            start = int(cursor or 0)
+            page = pool[start:start + limit]
+            more = start + limit < len(pool)
+            return {"messages": page,
+                    "response_metadata": {"next_cursor": str(start + limit) if more else ""}}
+
+    long_mark = now - 3600
+    thread = [{"ts": f"{long_mark - 200 + i:.6f}", "user": "U1", "text": f"old{i}"}
+              for i in range(150)]
+    thread += [{"ts": f"{long_mark + 10 + i:.6f}", "user": "U1", "text": f"new{i}"}
+               for i in range(2)]
+    long_entries = {"D:1": {"last_msg_ts": f"{long_mark:.6f}"}}
+    nap = lambda s: None                                 # noqa: E731
+
+    def read(client, **kw):
+        return lambda c, t, o: B.read_thread(client, c, t, oldest=o, sleep=nap, **kw)
+
+    slack = FakeSlack(thread)
+    got = B.missed(long_entries, replies=read(slack), bot_user_id="B",
+                   handled_subtypes=set(), now=now)
+    check("a long thread's new messages are replayed",
+          [e["text"] for e in got] == ["new0", "new1"],
+          "they sit past message 100, beyond a first page")
+    check("the read starts at the watermark",
+          slack.calls and slack.calls[0]["oldest"] == f"{long_mark:.6f}",
+          "not the start of the thread, every boot")
+
+    # Without the watermark the same thread must still be read to its end.
+    slack = FakeSlack(thread)
+    full = B.read_thread(slack, "D", "1", page=100, sleep=nap)
+    check("pages are followed to the end", len(full) == len(thread)
+          and len(slack.calls) == 2)
+    check("keep_last holds the newest",
+          [m["text"] for m in B.read_thread(FakeSlack(thread), "D", "1",
+                                            keep_last=2, sleep=nap)] == ["new0", "new1"],
+          "a fresh session wants the recent end, not the opening")
+
+    slack = FakeSlack(thread, fail=1)
+    got = B.missed(long_entries, replies=read(slack), bot_user_id="B",
+                   handled_subtypes=set(), now=now)
+    check("a cut-off read is retried, not the thread skipped",
+          [e["text"] for e in got] == ["new0", "new1"],
+          "2026-10-02: IncompleteRead skipped the whole thread")
+    slack = FakeSlack(thread, fail=99)
+    check("a read that never succeeds still gives up",
+          B.missed(long_entries, replies=read(slack), bot_user_id="B",
+                   handled_subtypes=set(), now=now) == []
+          and len(slack.calls) == B.ATTEMPTS)
+
     bot = (BASE / "bot.py").read_text()
+    check("backfill reads through read_thread with the watermark",
+          "backfill.read_thread(app.client, channel, thread_ts, oldest=oldest)" in
+          bot[bot.index("def run_backfill"):bot.index("def _backfiller")])
+    ctx = bot[bot.index("def thread_context"):bot.index("# --- Per-channel working dirs")]
+    check("a fresh session's context is the thread's recent end",
+          "read_thread(" in ctx and "keep_last=" in ctx
+          and "conversations_replies" not in ctx)
     check("backfill goes through the ordinary prompt path",
           "handle_prompt(event, say, app.client)" in
           bot[bot.index("def run_backfill"):bot.index("def _backfiller")],
