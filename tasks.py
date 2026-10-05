@@ -464,8 +464,9 @@ class TaskStore:
                 return
             rest = [b for b in (rec.get("blocked_on") or []) if b not in dead]
             if rest != (rec.get("blocked_on") or []):
+                prior = copy.deepcopy(rec)
                 rec["blocked_on"] = rest
-                self._save()
+                self._save_or_restore(tid, prior)
 
     def _release_waiters(self, blocker_id: str, ended_state: str | None,
                          detail: str, seen: set) -> list[str]:
@@ -480,7 +481,10 @@ class TaskStore:
         freed = []
         for wid, to_state, why, dead in self._plan_release(blocker_id, ended_state, detail):
             if to_state is None:
-                self._drop_blockers(wid, dead)
+                try:
+                    self._drop_blockers(wid, dead)
+                except Exception:
+                    log.exception("could not drop ended blockers from %s", wid)
                 continue
             if wid in seen:
                 continue                        # a cycle, or already handled
@@ -585,13 +589,17 @@ class TaskStore:
             if not candidates:
                 return None
             rec = min(candidates, key=lambda r: r.get("created", 0))
+            prior = copy.deepcopy(rec)
             rec["state"] = RUNNING
             rec["attempts"] = (rec.get("attempts") or 0) + 1
             rec["updated"] = time.time()
             events = rec.setdefault("events", [])
             events.append({"at": time.time(), "kind": RUNNING, "detail": "claimed by the runner"})
             del events[:-50]
-            self._save()
+            # Left `running` in memory after a failed save, the task would be
+            # run by nobody -- the worker logs the raise and moves on -- and
+            # skipped by every later claim until a restart requeued it.
+            self._save_or_restore(rec["id"], prior)
             log.info("task %s claimed by the runner", rec["id"])
             return dict(rec)
 
@@ -607,10 +615,11 @@ class TaskStore:
             rec = self._data.get(tid)
             if rec is None:
                 return None
+            prior = copy.deepcopy(rec)
             rec["attempts"] = max(0, (rec.get("attempts") or 0) - 1)
             rec["false_starts"] = (rec.get("false_starts") or 0) + 1
             rec["updated"] = time.time()
-            self._save()
+            self._save_or_restore(tid, prior)
             return dict(rec)
 
     def requeue_interrupted(self) -> int:

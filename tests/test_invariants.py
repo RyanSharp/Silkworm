@@ -566,6 +566,50 @@ def test_task_lifecycle():
           and st.get(w["id"])["blocked_on"] == [u["id"]])
     st.transition(u["id"], T.DONE)
 
+    # claim, refund_attempt and _drop_blockers edit in place too.
+    cs = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    q = cs.create("claim probe", id="tsk_claim_probe", driver="queue")
+    before = copy.deepcopy(cs.get(q["id"]))
+    check("a claim that cannot be saved raises", failing(lambda: cs.claim()))
+    check("and leaves the task queued, attempts and events untouched",
+          cs.get(q["id"]) == before and cs.get(q["id"])["state"] == T.QUEUED)
+    check("so the next claim still finds it",
+          (cs.claim() or {}).get("id") == q["id"])
+    before = copy.deepcopy(cs.get(q["id"]))
+    check("a refund that cannot be saved raises",
+          failing(lambda: cs.refund_attempt(q["id"])))
+    check("and leaves attempts and false_starts as they were",
+          cs.get(q["id"]) == before and cs.get(q["id"])["attempts"] == 1)
+    other = cs.create("unrelated", id="tsk_claim_other")
+    cs.update(other["id"], title="unrelated save")
+    on_disk = TaskStore(cs._path).get(q["id"])
+    check("nor does a later unrelated save write the refund",
+          on_disk["attempts"] == 1 and not on_disk.get("false_starts"))
+
+    gone = cs.create("ended blocker", id="tsk_gone", state=T.DONE)
+    live = cs.create("live blocker", id="tsk_live")
+    wt = cs.create("waits on both", id="tsk_waits_both", state=T.BLOCKED,
+                   blocked_on=[gone["id"], live["id"]])
+    check("a drop that cannot be saved raises",
+          failing(lambda: cs._drop_blockers(wt["id"], (gone["id"],))))
+    check("and leaves blocked_on as it was",
+          cs.get(wt["id"])["blocked_on"] == [gone["id"], live["id"]])
+    # The release around somebody else's transition must not turn that
+    # failure into theirs.
+    jsonstore.save = broken
+    try:
+        try:
+            cs._release_waiters(gone["id"], T.DONE, "", {gone["id"]})
+            swallowed = True
+        except OSError:
+            swallowed = False
+    finally:
+        jsonstore.save = real_save
+    check("a release whose drop fails does not raise", swallowed)
+    check("and leaves the waiter as it was",
+          cs.get(wt["id"])["blocked_on"] == [gone["id"], live["id"]]
+          and cs.get(wt["id"])["state"] == T.BLOCKED)
+
 
 # --- every turn is a task ------------------------------------------------------
 
