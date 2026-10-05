@@ -801,8 +801,10 @@ def thread_context(client, channel: str, thread_ts: str, exclude_ts: str) -> str
     """Transcript of an existing thread, for 'summarize this thread' mentions."""
     # The newest 50, not the first: replies come oldest-first, so a single page
     # of a long thread is its opening, not what was just being discussed.
+    # read_tail looks at the last day first and keeps a partial read.
     try:
-        msgs = backfill.read_thread(client, channel, thread_ts, keep_last=50)
+        msgs = backfill.read_tail(client, channel, thread_ts, keep_last=50,
+                                  before=exclude_ts)
     except Exception as e:
         log.warning("could not fetch thread history (%s) — missing history scope?", e)
         return None

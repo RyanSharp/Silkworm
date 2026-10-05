@@ -55,7 +55,7 @@ PAGE = 100
 
 def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = None,
                 keep_last: int | None = None, max_pages: int = 50,
-                page: int = PAGE, attempts: int = ATTEMPTS,
+                page: int = PAGE, attempts: int = ATTEMPTS, partial: bool = False,
                 sleep=time.sleep) -> list[dict]:
     """Every message of a thread (past `oldest`, if given), oldest first.
 
@@ -64,6 +64,8 @@ def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = No
     the recent end that a watermark or a fresh session actually needs. This
     follows the cursor to the end, retrying each page before giving up.
     `keep_last` holds only the newest n, for callers that want the tail.
+    `partial` returns what was read when a later page still fails after its
+    retries, instead of raising and losing the pages already in hand.
     """
     out = collections.deque(maxlen=keep_last) if keep_last else []
     seen = set()       # Slack repeats the parent at the top of every page
@@ -81,6 +83,11 @@ def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = No
                 break
             except Exception as e:
                 if attempt == attempts or _permanent(e):
+                    if partial and out:
+                        log.warning("reading %s:%s stopped at page %d (%s); "
+                                    "keeping the %d messages already read",
+                                    channel, thread_ts, n + 1, e, len(out))
+                        return list(out)
                     raise
                 log.warning("reading %s:%s page %d failed (%s); retrying",
                             channel, thread_ts, n + 1, e)
@@ -95,6 +102,50 @@ def read_thread(client, channel: str, thread_ts: str, *, oldest: str | None = No
     log.warning("%s:%s: stopped after %d pages; the thread goes on",
                 channel, thread_ts, max_pages)
     return list(out)
+
+
+#: How far back a fresh session's context looks first. A long thread is read
+#: from here rather than from its opening, which is only reached if this
+#: window holds too few messages.
+TAIL_WINDOW_S = 24 * 3600
+
+
+def read_tail(client, channel: str, thread_ts: str, *, keep_last: int,
+              before: str | None = None, window_s: float = TAIL_WINDOW_S,
+              **kw) -> list[dict]:
+    """The newest `keep_last` messages of a thread, oldest first, cheaply.
+
+    Replies come oldest-first and there is no cursor to the end, so the tail of
+    a long thread otherwise costs the whole thread. A thread older than the
+    window is read from `before` minus the window first; only if that holds
+    fewer than `keep_last` replies is the full thread read. A read that fails
+    partway keeps what it got -- the recent window if there is one, else the
+    pages read so far -- since some context beats none.
+    """
+    recent = []
+    try:
+        start = (float(before) if before else time.time()) - window_s
+        older = float(thread_ts) < start
+    except (TypeError, ValueError):
+        older = False
+    if older:
+        try:
+            recent = read_thread(client, channel, thread_ts, oldest=f"{start:.6f}",
+                                 keep_last=keep_last, partial=True, **kw)
+        except Exception as e:
+            log.warning("reading the recent end of %s:%s failed (%s); "
+                        "trying the whole thread", channel, thread_ts, e)
+        if sum(1 for m in recent if m.get("ts") != thread_ts) >= keep_last:
+            return recent
+    try:
+        return read_thread(client, channel, thread_ts, keep_last=keep_last,
+                           partial=not recent, **kw)
+    except Exception as e:
+        if not recent:
+            raise
+        log.warning("reading all of %s:%s failed (%s); using only its last "
+                    "%.0fh", channel, thread_ts, e, window_s / 3600)
+        return recent
 
 
 def missed(entries: dict, *, replies, bot_user_id: str, handled_subtypes,

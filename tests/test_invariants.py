@@ -4133,6 +4133,65 @@ def test_backfill():
                                             keep_last=2, sleep=nap)] == ["new0", "new1"],
           "a fresh session wants the recent end, not the opening")
 
+    # A fresh session needs only the tail. Reading a long thread from its
+    # opening to keep 50 cost every page, and one failed page cost it all.
+    class FailsFrom(FakeSlack):
+        def __init__(self, msgs, from_call):
+            super().__init__(msgs)
+            self.from_call = from_call
+
+        def conversations_replies(self, **kw):
+            if len(self.calls) + 1 >= self.from_call:
+                self.calls.append(kw)
+                raise IOError("IncompleteRead")
+            return super().conversations_replies(**kw)
+
+    try:
+        B.read_thread(FailsFrom(thread, 2), "D", "1", page=100, sleep=nap)
+        raised = False
+    except IOError:
+        raised = True
+    check("without partial, a failed later page still raises", raised)
+    def tolerant(f, *a, **kw):              # a crash is a failed check, not a crashed test
+        try:
+            return f(*a, **kw)
+        except Exception as e:
+            return [{"ts": f"raised {e!r}", "text": f"raised {e!r}"}]
+    part = tolerant(B.read_thread, FailsFrom(thread, 2), "D", "1", page=100,
+                    partial=True, sleep=nap)
+    check("with partial, the pages already read are kept",
+          [m["ts"] for m in part] == [m["ts"] for m in thread[:100]], part[0]["ts"])
+
+    day = 24 * 3600
+    aged = [{"ts": f"{now - 10 * day:.6f}", "user": "U1", "text": "parent"}]
+    aged += [{"ts": f"{now - 5 * day + i:.6f}", "user": "U1", "text": f"a{i}"}
+             for i in range(300)]
+    aged += [{"ts": f"{now - 3600 + i:.6f}", "user": "U1", "text": f"r{i}"}
+             for i in range(60)]
+    slack = FakeSlack(aged)
+    tail = B.read_tail(slack, "D", aged[0]["ts"], keep_last=50, before=f"{now:.6f}",
+                       page=100, sleep=nap)
+    check("a long old thread's tail is read from the last day only",
+          [m["text"] for m in tail] == [f"r{i}" for i in range(10, 60)]
+          and len(slack.calls) == 1 and slack.calls[0]["oldest"] is not None,
+          f"{len(slack.calls)} calls")
+    slack = FakeSlack(aged)
+    tail = B.read_tail(slack, "D", aged[0]["ts"], keep_last=80, before=f"{now:.6f}",
+                       page=100, sleep=nap)
+    check("a window too thin falls back to the whole thread",
+          [m["ts"] for m in tail] == [m["ts"] for m in aged[-80:]])
+    tail = tolerant(B.read_tail, FailsFrom(aged, 3), "D", aged[0]["ts"], keep_last=80,
+                    before=f"{now:.6f}", page=100, sleep=nap)
+    check("a whole-thread read that fails keeps the recent window",
+          [m["text"] for m in tail] == ["parent"] + [f"r{i}" for i in range(60)],
+          "some recent context beats none")
+    slack = FailsFrom(thread, 2)
+    tail = tolerant(B.read_tail, slack, "D", thread[0]["ts"], keep_last=50,
+                    before=thread[-1]["ts"], page=100, sleep=nap)
+    check("a young thread is read whole, and a failed page keeps what was read",
+          [m["ts"] for m in tail] == [m["ts"] for m in thread[50:100]]
+          and slack.calls[0]["oldest"] is None)
+
     slack = FakeSlack(thread, fail=1)
     got = B.missed(long_entries, replies=read(slack), bot_user_id="B",
                    handled_subtypes=set(), now=now)
@@ -4151,7 +4210,7 @@ def test_backfill():
           bot[bot.index("def run_backfill"):bot.index("def _backfiller")])
     ctx = bot[bot.index("def thread_context"):bot.index("# --- Per-channel working dirs")]
     check("a fresh session's context is the thread's recent end",
-          "read_thread(" in ctx and "keep_last=" in ctx
+          "read_tail(" in ctx and "keep_last=" in ctx and "before=" in ctx
           and "conversations_replies" not in ctx)
     check("backfill goes through the ordinary prompt path",
           "handle_prompt(event, say, app.client)" in
