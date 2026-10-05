@@ -297,8 +297,10 @@ def viz_hosts() -> list:
 
 
 def viz_host() -> str:
-    """The address to show a person: the configured one, if any."""
-    return viz_hosts()[-1]
+    """The address to show a person: the configured one, if any --
+    bracketed if IPv6, since it goes into a URL."""
+    host = viz_hosts()[-1]
+    return f"[{host}]" if ":" in host else host
 
 
 def viz_get(path: str, timeout: float = 2) -> bytes:

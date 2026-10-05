@@ -11,6 +11,8 @@ messages/commands into threads. Stdlib only; binds 127.0.0.1 only.
 
 import json
 import os
+import socket
+import socketserver
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -341,6 +343,31 @@ def allowed_download(path_str: str) -> Path | None:
 
 
 # --- HTTP -----------------------------------------------------------------------
+
+def make_server(bind: str, port: int, handler=None) -> ThreadingHTTPServer:
+    """A server on VIZ_BIND. ThreadingHTTPServer is IPv4-only, so an IPv6
+    address (``::1``, ``::``, a LAN v6 address) would fail at startup with
+    gaierror; any bind containing ':' gets an AF_INET6 server instead. For
+    the ``::`` wildcard, IPV6_V6ONLY is cleared so it also answers IPv4 --
+    ``silkworm`` probes a wildcard bind on 127.0.0.1, and on Linux the
+    default would leave that refused.
+
+    HTTPServer.server_bind also reverse-resolves the bind address with
+    getfqdn, only to fill server_name (read by CGI, which this is not); on
+    a machine whose resolver stalls that took 35s, so it is skipped."""
+    v6 = ":" in bind
+
+    class Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if v6 else socket.AF_INET
+
+        def server_bind(self):
+            if bind == "::":
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = bind, self.server_address[1]
+
+    return Server((bind, port), handler or Handler)
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -1744,8 +1771,9 @@ if __name__ == "__main__":
             "authentication. Set VIZ_TOKEN to a secret, e.g.\n\n"
             "    VIZ_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')\n\n"
             "then open http://<host>:%d/?token=$VIZ_TOKEN once." % PORT)
-    server = ThreadingHTTPServer((BIND, PORT), Handler)
-    where = "127.0.0.1" if LOOPBACK else BIND
+    server = make_server(BIND, PORT)
+    # An IPv6 bind answers only on that address (::1 refuses 127.0.0.1).
+    where = f"[{BIND}]" if ":" in BIND else ("127.0.0.1" if LOOPBACK else BIND)
     print(f"Silkworm visualizer: http://{where}:{PORT} (bot bridge on :{BOT_PORT})"
           + ("" if LOOPBACK else "  [token required]"))
     server.serve_forever()

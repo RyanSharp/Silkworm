@@ -10776,6 +10776,80 @@ def test_viz_probe_off_loopback():
                 os.environ[k] = v
 
 
+# ThreadingHTTPServer is IPv4-only: VIZ_BIND=::1 -- which LOOPBACK counts as
+# loopback -- or any IPv6 address crashed the visualizer at startup with
+# gaierror, and a crashed visualizer is one launchd keeps respawning.
+def test_viz_binds_ipv6():
+    import socket
+    import threading
+    import urllib.request
+    import visualizer as V
+    print("\nthe visualizer can bind an IPv6 VIZ_BIND")
+
+    def answers(host, port):
+        netloc = f"[{host}]" if ":" in host else host
+        try:
+            with urllib.request.urlopen(f"http://{netloc}:{port}/favicon.svg", timeout=2) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    loopback, token, getfqdn = V.LOOPBACK, V.TOKEN, socket.getfqdn
+    servers, started = [], []
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        # HTTPServer.server_bind's getfqdn took 35s here on a stalled
+        # resolver; make_server must not wait on DNS to start.
+        def no_dns(*a):
+            raise AssertionError("make_server called getfqdn")
+        socket.getfqdn = no_dns
+        for bind in ("::1", "::"):
+            try:
+                srv = V.make_server(bind, 0); servers.append(srv)
+            except OSError as e:
+                check(f"make_server binds {bind}", False, repr(e))
+                continue
+            check(f"make_server binds {bind}", True)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            started.append(srv)
+            port = srv.server_address[1]
+            check(f"{bind}: answers on [::1]", answers("::1", port))
+            if bind == "::":
+                # bin/silkworm probes a wildcard bind on 127.0.0.1 only.
+                check(":: also answers IPv4 127.0.0.1 (V6ONLY cleared)",
+                      answers("127.0.0.1", port))
+                check(":: has IPV6_V6ONLY off",
+                      srv.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 0)
+            else:
+                check("::1 stays v6-only (refuses 127.0.0.1)",
+                      not answers("127.0.0.1", port))
+        srv = V.make_server("127.0.0.1", 0); servers.append(srv)
+        check("an IPv4 bind keeps a plain AF_INET server",
+              srv.address_family == socket.AF_INET)
+    except AssertionError as e:
+        check("make_server starts without a DNS lookup", False, str(e))
+    finally:
+        V.LOOPBACK, V.TOKEN, socket.getfqdn = loopback, token, getfqdn
+        for srv in started:
+            srv.shutdown()
+        for srv in servers:
+            srv.server_close()
+    cli = _load_cli()
+    saved = os.environ.get("VIZ_BIND")
+    try:
+        os.environ["VIZ_BIND"] = "::1"
+        check("silkworm shows an IPv6 VIZ_BIND bracketed", cli.viz_host() == "[::1]")
+        os.environ["VIZ_BIND"] = "10.0.0.5"
+        check("and an IPv4 one bare", cli.viz_host() == "10.0.0.5")
+    finally:
+        if saved is None:
+            os.environ.pop("VIZ_BIND", None)
+        else:
+            os.environ["VIZ_BIND"] = saved
+    check("__main__ builds its server through make_server",
+          "server = make_server(BIND, PORT)" in (BASE / "visualizer.py").read_text())
+
+
 # --- deploy drains instead of killing --------------------------------------------
 # The bot restarted 13 times in 10 days (2026-09-18..10-01) to load new code.
 # Every restart killed the turn running at the time -- nine runs ended exit
