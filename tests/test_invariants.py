@@ -13443,6 +13443,77 @@ def test_cli_reads_exported_env_lines():
         os.environ.update(saved)
 
 
+
+# session_hook.py and visualizer.py each hand-parsed APPROVAL_PORT from .env
+# with split("=")[1].strip(), keeping the quotes: APPROVAL_PORT="9911" (which
+# dotenv reads as 9911) gave them the port '"9911"', so the hook posted to a
+# URL that can't exist and the dashboard lost the bot. All three readers now
+# share envfile.value.
+
+def test_every_env_reader_strips_quotes_like_dotenv():
+    print("\n.env readers outside the bot agree with dotenv on quoted values")
+    import http.server
+    import shutil
+    import subprocess
+    import threading
+    import envfile
+    import visualizer as V
+    root = Path(tempfile.mkdtemp())
+    (root / ".env").write_text('export APPROVAL_PORT="9911"\nVIZ_TOKEN=\'tok\'\n')
+    check("envfile strips double quotes", envfile.value(root / ".env", "APPROVAL_PORT") == "9911")
+    check("envfile strips single quotes", envfile.value(root / ".env", "VIZ_TOKEN") == "tok")
+    check("envfile: a missing file is None", envfile.value(root / "nope", "X") is None)
+    saved = V.BASE_DIR
+    try:
+        V.BASE_DIR = root
+        check("visualizer's bot port drops the quotes", V._bot_port() == "9911", V._bot_port())
+    finally:
+        V.BASE_DIR = saved
+    cli = _load_cli()
+    cli.REPO = root
+    saved_env = os.environ.pop("APPROVAL_PORT", None)
+    try:
+        check("the CLI's bot port drops the quotes", cli.bot_port() == "9911", cli.bot_port())
+    finally:
+        if saved_env is not None:
+            os.environ["APPROVAL_PORT"] = saved_env
+
+    # The hook itself, run as Claude Code runs it: a script next to its .env,
+    # under the system python3 (3.9 on macOS), posting to the configured port.
+    got = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            got.append((self.path, self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    hook_dir = Path(tempfile.mkdtemp())
+    for f in ("session_hook.py", "envfile.py"):
+        shutil.copy(BASE / f, hook_dir / f)
+    (hook_dir / ".env").write_text(f'APPROVAL_PORT="{srv.server_address[1]}"\n')
+    py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
+    env = {k: v for k, v in os.environ.items() if k != "SILKWORM_BOT"}
+    r = subprocess.run([py, str(hook_dir / "session_hook.py")], env=env,
+                       input='{"hook_event_name": "SessionStart", "session_id": "s1"}',
+                       capture_output=True, text=True, timeout=10)
+    srv.server_close()
+    check("the hook runs cleanly under the system python", r.returncode == 0 and not r.stderr,
+          r.stderr[-400:])
+    check("the hook posts to the quoted port", [p for p, _ in got] == ["/session-event"], repr(got))
+
+    # One reader: nothing outside envfile hand-splits APPROVAL_PORT lines.
+    for f in ("session_hook.py", "visualizer.py", "bin/silkworm"):
+        src = (BASE / f).read_text()
+        check(f"{f} doesn't parse .env lines itself",
+              'startswith("APPROVAL_PORT=")' not in src and 'split("=", 1)' not in src)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

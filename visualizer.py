@@ -20,6 +20,7 @@ from urllib.parse import urlparse, parse_qs
 
 import secrets
 
+import envfile
 import jsonstore
 import procs
 import slacklinks
@@ -46,14 +47,7 @@ STALL_AFTER_S = max(int(os.environ.get("CLAUDE_TIMEOUT", "900")) * 2, 3600)
 
 
 def _bot_port() -> str:
-    port = "8787"
-    try:
-        for line in (BASE_DIR / ".env").read_text().splitlines():
-            if line.strip().removeprefix("export ").lstrip().startswith("APPROVAL_PORT="):
-                port = line.split("=", 1)[1].strip()
-    except OSError:
-        pass
-    return port
+    return envfile.value(BASE_DIR / ".env", "APPROVAL_PORT") or "8787"
 
 
 BOT_PORT = _bot_port()

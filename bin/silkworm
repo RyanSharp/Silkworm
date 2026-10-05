@@ -48,21 +48,10 @@ WORM = f"{Y}🪱 silkworm:{N}"
 
 
 def env_file_value(name: str):
-    """What .env sets `name` to, or None if it doesn't. Takes the last
-    assignment and accepts `export NAME=...`, as python-dotenv (the bot's
-    reader) does -- otherwise a .env the bot obeys sends the CLI elsewhere."""
-    val = None
-    try:
-        for line in (REPO / ".env").read_text().splitlines():
-            line = line.strip()
-            if line.startswith("export "):
-                line = line[len("export "):].lstrip()
-            key, sep, rest = line.partition("=")
-            if sep and key.strip() == name:
-                val = rest.strip().strip("\"'")
-    except OSError:
-        pass
-    return val
+    """What .env sets `name` to, or None if it doesn't -- read as python-dotenv
+    (the bot's reader) does, so a .env the bot obeys can't send the CLI
+    elsewhere. See envfile.value."""
+    return envfile.value(REPO / ".env", name)
 
 
 def bot_port() -> str:
@@ -536,6 +525,7 @@ def do_status() -> None:
 
 sys.path.insert(0, str(REPO))
 import credentials                                   # noqa: E402
+import envfile                                       # noqa: E402
 import git_guard                                     # noqa: E402
 import jsonstore                                     # noqa: E402
 

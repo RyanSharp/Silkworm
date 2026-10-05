@@ -14,6 +14,8 @@ import os
 import sys
 import urllib.request
 
+import envfile
+
 
 def main() -> None:
     # Silkworm's own headless runs set this — those aren't terminal sessions.
@@ -24,15 +26,8 @@ def main() -> None:
     except Exception:
         return
 
-    port = "8787"
     env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    try:
-        with open(env_file) as f:
-            for line in f:
-                if line.strip().removeprefix("export ").lstrip().startswith("APPROVAL_PORT="):
-                    port = line.split("=", 1)[1].strip()
-    except OSError:
-        pass
+    port = envfile.value(env_file, "APPROVAL_PORT") or "8787"
 
     body = json.dumps({
         "hook_event_name": payload.get("hook_event_name"),
