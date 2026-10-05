@@ -4185,6 +4185,14 @@ def test_backfill():
     check("a whole-thread read that fails keeps the recent window",
           [m["text"] for m in tail] == ["parent"] + [f"r{i}" for i in range(60)],
           "some recent context beats none")
+    busy = aged[:1] + [{"ts": f"{now - 7200 + i:.6f}", "user": "U1", "text": f"b{i}"}
+                       for i in range(150)]
+    slack = FailsFrom(busy, 2)
+    tail = tolerant(B.read_tail, slack, "D", busy[0]["ts"], keep_last=50,
+                    before=f"{now:.6f}", page=100, sleep=nap)
+    check("a busy day's window cut short is used as far as it got",
+          [m["text"] for m in tail] == [f"b{i}" for i in range(49, 99)]
+          and slack.calls[0]["oldest"] is not None, tail[0].get("text"))
     slack = FailsFrom(thread, 2)
     tail = tolerant(B.read_tail, slack, "D", thread[0]["ts"], keep_last=50,
                     before=thread[-1]["ts"], page=100, sleep=nap)

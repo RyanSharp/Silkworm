@@ -120,7 +120,9 @@ def read_tail(client, channel: str, thread_ts: str, *, keep_last: int,
     window is read from `before` minus the window first; only if that holds
     fewer than `keep_last` replies is the full thread read. A read that fails
     partway keeps what it got -- the recent window if there is one, else the
-    pages read so far -- since some context beats none.
+    pages read so far -- since some context beats none. A window cut short
+    is used as it stands: a whole-thread read would need those same later
+    pages, and read_thread has already logged the cut-off.
     """
     recent = []
     try:
