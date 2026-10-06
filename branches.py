@@ -81,6 +81,27 @@ def name_for(task: dict) -> str:
         f"{worktrees.BRANCH_PREFIX}{task.get('id') or ''}"
 
 
+def base_pref(task: dict, scope_for=None) -> str:
+    """The base branch a task's work is measured against, landed on, and
+    rerun from: its project's base *now*, not the one copied onto the task.
+
+    A task copies its project's scope when it is filed, and that copy is a
+    snapshot. trader named `research/point-in-time-universe` as its base until
+    that branch was merged and the setting cleared -- and every task filed
+    before then went on naming it: eleven reviewed tasks were refused landing
+    because "the checkout is on 'main'", and the survey measured thirty-nine
+    branches against the old base, five times the backlog `git cherry main`
+    reports. So a task with a project asks the project (`scope_for`, which is
+    `ProjectStore.scope_for`), and "" -- the default branch -- when the project
+    names none. Only a task with no project has nothing to ask and keeps the
+    value it was filed with.
+    """
+    project = (task.get("project") or "").strip()
+    if project and scope_for is not None:
+        return ((scope_for(project) or {}).get("branch") or "").strip()
+    return ((task.get("scope") or {}).get("branch") or "").strip()
+
+
 def repo_for(task: dict) -> Path | None:
     """The checkout this task's branch lives in, if it has one.
 
@@ -453,13 +474,15 @@ def ahead(repo, bases, branch) -> int | None:
         return None
 
 
-def survey(records) -> list:
+def survey(records, scope_for=None) -> list:
     """One row per stopped task whose branch still holds unmerged commits.
 
     Grouped by (repo, preferred base): the list of branches costs one call per
     group rather than one per task, and the base is resolved once. A project on
     a research branch and one on main are different groups, since "merged"
-    means a different thing in each.
+    means a different thing in each. The base is the project's current one
+    (`base_pref`), so pass `scope_for`; without it a task falls back to the
+    base it was filed with, which may have been cleared since.
 
     Rows are newest-first: the useful list is "what did last night leave?".
     """
@@ -475,7 +498,7 @@ def survey(records) -> list:
         repo = repo_for(rec)
         if not repo:
             continue
-        pref = ((rec.get("scope") or {}).get("branch") or "").strip()
+        pref = base_pref(rec, scope_for)
         groups.setdefault((str(repo), pref), []).append(rec)
 
     rows = []
@@ -559,7 +582,7 @@ def contained(repo, bases, branch: str) -> bool:
                for ref in refs)
 
 
-def prune_merged(records, skip=()) -> list:
+def prune_merged(records, skip=(), scope_for=None) -> list:
     """Delete the branches of finished tasks that are already in the base.
 
     Landing removes its own branch: once it is in the base, the release
@@ -578,6 +601,7 @@ def prune_merged(records, skip=()) -> list:
     somewhere is refused by git itself. And the delete goes through
     `discard.drop`, so if the containment check were ever wrong the tip is
     tagged before it goes rather than lost. Returns the branches deleted.
+    `scope_for` resolves each task's base as `survey` does.
     """
     groups: dict = {}
     for rec in records:
@@ -586,7 +610,7 @@ def prune_merged(records, skip=()) -> list:
         repo = repo_for(rec)
         if not repo:
             continue
-        pref = ((rec.get("scope") or {}).get("branch") or "").strip()
+        pref = base_pref(rec, scope_for)
         groups.setdefault((str(repo), pref), []).append(rec)
 
     pruned = []

@@ -68,7 +68,7 @@ def bot_functions(*names, **globals_):
 #: Helpers other lifted functions call as part of their own behaviour, so a
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
-SHARED_HELPERS = ("send_back", "review_addendum")
+SHARED_HELPERS = ("send_back", "review_addendum", "task_base")
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -838,6 +838,7 @@ def test_review_sees_the_work():
     ns = bot_functions("record_branch", "review_branch", "resolve_review",
                        roles=roles, tasks=T, task_store=st, worktrees=W,
                        branches=__import__("branches"),
+                       project_store=types.SimpleNamespace(scope_for=lambda slug: {}),
                        task_state=lambda tid, state, detail="": st.transition(
                            tid, state, detail))
 
@@ -852,7 +853,7 @@ def test_review_sees_the_work():
     impl = st.get(tid)
     (wt / "fix.py").write_text("def fixed(): return 1\n")
     git(wt, "add", "-A"); git(wt, "commit", "-qm", "the work")
-    ns["record_branch"](tid, wt, impl["scope"])
+    ns["record_branch"](tid, wt, "")
     W.release(wt)
     check("the implementor's own checkout is gone by review time",
           not wt.exists(), "which is why the reviewer cannot simply inherit it")
@@ -1057,7 +1058,7 @@ def test_review_sees_the_work():
     gwt = W.create(repo, gone, fetch=False)
     (gwt / "g.py").write_text("x\n")
     git(gwt, "add", "-A"); git(gwt, "commit", "-qm", "work that gets lost")
-    ns["record_branch"](gone, gwt, {"cwd": str(repo)})
+    ns["record_branch"](gone, gwt, "")
     W.release(gwt)
     ns["resolve_review"](st.get(gone), "implementor", "did it", "C1", "1.0")
     orphan = [r for r in st.all().values() if r.get("parent") == gone][0]
@@ -1211,6 +1212,7 @@ def _bot_fns(names, ns):
         return set()
 
     nodes = [n for n in tree.body if defines(n) & set(names)]
+    nodes += _shared_helpers(tree, nodes, set(names) | set(ns))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<bot>", "exec"), ns)
     return {name for n in nodes for name in defines(n)}
 
@@ -1318,8 +1320,8 @@ def test_parallel_tasks():
           'os.environ.get("TASK_WORKERS"' in bot)
     check("the count is logged at startup, like the other limits",
           "task workers: %d" in bot)
-    check("a task's base branch reaches the worktree",
-          'base=scope.get("branch")' in bot)
+    check("a task's base branch reaches the worktree -- its project's, as it is now",
+          "worktrees.create(cwd, tid, base=task_base(task))" in bot)
 
 
 # --- the dashboard has an icon ---------------------------------------------------
@@ -2429,7 +2431,7 @@ def _run_ideation_impl():
         scoping=S, tasks=T, task_store=ts, project_store=ps, datetime=datetime, projects=P,
         time=time,
         log=logging.getLogger("test"), CLAUDE_CWD=root, SILKWORM_BIN="silkworm",
-        branches=types.SimpleNamespace(survey=lambda _t: []))
+        branches=types.SimpleNamespace(survey=lambda _t, **_: []))
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<ideating>", "exec"),
          mod.__dict__)
     return mod.run_ideation, ts, ps
@@ -5018,9 +5020,15 @@ def test_the_sweeper_prunes_around_landings():
     lock = threading.Lock()
     seen = []
 
-    def prune(records, skip=()):
+    scopes = []
+
+    def prune(records, skip=(), scope_for=None):
         seen.append((sorted(r["id"] for r in records), set(skip), lock.locked()))
+        scopes.append(scope_for)
         return []
+
+    def current_scope(slug):
+        return {}
 
     board = {"tsk_live": {"id": "tsk_live", "state": "done"},
              "tsk_marked": {"id": "tsk_marked", "state": "done",
@@ -5031,6 +5039,7 @@ def test_the_sweeper_prunes_around_landings():
                    worktrees=types.SimpleNamespace(sweep=lambda keep: 0),
                    live_worktree_tasks=lambda: set(),
                    branches=types.SimpleNamespace(prune_merged=prune),
+                   project_store=types.SimpleNamespace(scope_for=current_scope),
                    task_store=types.SimpleNamespace(all=lambda: dict(board)),
                    _landing_guard=lock, _landing_now={"tsk_live"},
                    LANDING_UNDERWAY="in-progress", log=MagicMock(),
@@ -5041,6 +5050,8 @@ def test_the_sweeper_prunes_around_landings():
     except Stop:
         pass
     check("the sweeper prunes merged branches", len(seen) == 1)
+    check("against each project's current base, not the one its tasks recorded",
+          scopes == [current_scope], str(scopes))
     if seen:
         ids, skip, held = seen[0]
         check("with every task on the board", ids == ["tsk_idle", "tsk_live", "tsk_marked"])
@@ -5622,8 +5633,8 @@ def test_unmerged_branches():
     # Recorded as the checkout closes, because afterwards nothing knows.
     ex = bot[bot.index("def execute_task"):bot.index("MAX_VERIFY_ATTEMPTS")]
     check("the branch is written down before the checkout is released",
-          ex.count("record_branch(tid, worktree, scope)") == 2
-          and ex.index("record_branch(tid, worktree, scope)")
+          ex.count("record_branch(tid, worktree, task_base(task))") == 2
+          and ex.index("record_branch(tid, worktree, task_base(task))")
           < ex.index("worktrees.release(worktree,"),
           "released first, there is nothing left to ask which branch it was")
     # Behavioural rather than textual: the docstring says "raised", so grepping
@@ -6266,6 +6277,8 @@ def test_landing_is_visible():
 
     # --- the gate itself ------------------------------------------------------
     class Projects:
+        def scope_for(self, slug):
+            return {}
         def __init__(self, rec):
             self.rec = rec
         def get(self, slug):
@@ -6400,7 +6413,8 @@ def test_landing_is_visible():
               # The real send-back gates, on a project that is not ready for
               # unsupervised work: these cases must route exactly as before.
               "projects": __import__("projects"), "branches": __import__("branches"),
-              "project_store": types.SimpleNamespace(get=lambda slug: None),
+              "project_store": types.SimpleNamespace(get=lambda slug: None,
+                                                       scope_for=lambda slug: {}),
               "tell_thread": lambda key, text: posted.append({"text": text})}
     _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
               "send_back", "review_addendum", "_unsupervised", "MAX_REVIEW_REWORKS",
@@ -9723,6 +9737,8 @@ def test_nothing_to_land_is_not_a_refusal():
     g("checkout", "-q", "main")
 
     class Projects:
+        def scope_for(self, slug):
+            return {}
         def get(self, slug):
             return {"auto_merge": True, "test_cmd": "true"}
     attached = []
@@ -9816,6 +9832,8 @@ def test_remote_only_work_lands():
         check(f"{tid}: Land agrees there is something to land", why == "", why)
 
     class Projects:
+        def scope_for(self, slug):
+            return {}
         def get(self, slug):
             return {"auto_merge": True, "test_cmd": "true"}
     attached = []
@@ -9986,6 +10004,8 @@ def test_approval_lands_on_any_project():
     g("checkout", "-q", "main")
 
     class Projects:
+        def scope_for(self, slug):
+            return {}
         def get(self, slug):
             return {"auto_merge": False, "test_cmd": "true"}     # auto-merge OFF
     attached = []
@@ -11548,8 +11568,11 @@ def test_flagged_work_fixes_itself_once():
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     posted, said = [], []
     outcome = {}
-    projects_ = {"ready": {"slug": "ready", "test_cmd": "make test", "auto_merge": True},
-                 "manual": {"slug": "manual", "test_cmd": "make test"}}
+    # The base a conflict is told about is the project's, as it stands now.
+    projects_ = {"ready": {"slug": "ready", "test_cmd": "make test", "auto_merge": True,
+                           "scope": {"cwd": "/repo", "branch": "main"}},
+                 "manual": {"slug": "manual", "test_cmd": "make test",
+                            "scope": {"cwd": "/repo", "branch": "main"}}}
 
     def task_state(tid, state, detail=""):
         try:
@@ -11559,7 +11582,9 @@ def test_flagged_work_fixes_itself_once():
     ns = {"task_store": store, "tasks": T, "roles": roles, "merge": __import__("merge"),
           "projects": __import__("projects"), "branches": __import__("branches"),
           "log": logging.getLogger("test"), "task_state": task_state,
-          "project_store": types.SimpleNamespace(get=lambda slug: projects_.get(slug)),
+          "project_store": types.SimpleNamespace(
+              get=lambda slug: projects_.get(slug),
+              scope_for=lambda slug: dict((projects_.get(slug) or {}).get("scope") or {})),
           "app": types.SimpleNamespace(client=types.SimpleNamespace(
               chat_postMessage=lambda **kw: posted.append(kw["text"]))),
           "tell_thread": lambda key, text: said.append((key, text)),
@@ -13263,7 +13288,9 @@ def test_conflicting_landings_go_back_to_their_implementor():
           "holding": __import__("holding"), "subprocess": subprocess, "time": time,
           "log": logging.getLogger("test"), "task_state": task_state,
           "threading": types.SimpleNamespace(Lock=_th.Lock, Thread=SyncThread),
-          "project_store": types.SimpleNamespace(get=lambda slug: projects_.get(slug)),
+          "project_store": types.SimpleNamespace(
+              get=lambda slug: projects_.get(slug),
+              scope_for=lambda slug: dict((projects_.get(slug) or {}).get("scope") or {})),
           "app": types.SimpleNamespace(client=types.SimpleNamespace(
               chat_postMessage=lambda **kw: posted.append(kw["text"]))),
           "tell_thread": lambda key, text: said.append((key, text)),
@@ -14056,6 +14083,172 @@ def test_artifact_retention():
     check("the record is stamped even when it spells the path differently from the walk",
           [i["why"] for i in plan3] == ["expired"]
           and st3.get("C3:1.0")["files"][0].get("pruned"), str(plan3))
+
+
+# --- a task's base is its project's base now, not the one it was filed with ---
+# trader named research/point-in-time-universe as its base until 2026-10-01,
+# when the setting was cleared: that branch had long been merged into main. But
+# each task copied the project's scope when it was filed, and landing, the
+# unmerged survey and reruns all read the copy -- eleven reviewed tasks were
+# refused with "the checkout is on 'main', not 'research/...'", and the survey
+# reported 39 branches / 485 commits where `git cherry main` showed 33 / 103.
+
+def test_a_tasks_base_is_its_projects_current_base():
+    import contextlib
+    import merge as M
+    import verify as V
+    import worktrees as W
+    import branches as B
+    import projects as P
+    import tasks as T
+    print("\na task's base is its project's current base, not the one it recorded")
+
+    def git(where, *a):
+        return subprocess.run(["git", "-C", str(where), "-c", "user.email=t@t",
+                               "-c", "user.name=t", *a], capture_output=True, text=True)
+    sha = lambda ref: git(repo, "rev-parse", ref).stdout.strip()
+
+    def commit(name):
+        (repo / f"{name}.txt").write_text(name + "\n")
+        git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", name)
+
+    root = Path(tempfile.mkdtemp())
+    origin = root / "origin.git"
+    git(root, "init", "-q", "--bare", "-b", "main", str(origin))
+    repo = root / "trader"; repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "remote", "add", "origin", str(origin))
+    commit("base")
+    # The old base: a research branch, since merged into main, which moved on.
+    git(repo, "checkout", "-q", "-b", "research/old")
+    commit("research")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--ff-only", "research/old")
+    commit("m1")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    commit("m2")                       # landed locally, never pushed: origin lags
+
+    ts = T.TaskStore(root / "t.json")
+    ps = P.ProjectStore(root / "p.json")
+    ps.ensure("trader", scope={"cwd": str(repo)}, test_cmd="true", auto_merge=True)
+    stale = {"cwd": str(repo), "branch": "research/old"}   # what tasks copied
+
+    def task(name, project="trader", state=T.DONE, own=True):
+        rec = ts.create(name, project=project, scope=dict(stale), role="implementor",
+                        driver="queue", verified=True)
+        git(repo, "branch", f"silkworm/{rec['id']}", "main")
+        if own:
+            git(repo, "checkout", "-q", f"silkworm/{rec['id']}")
+            commit(name)
+            git(repo, "checkout", "-q", "main")
+        ts.transition(rec["id"], T.RUNNING)
+        ts.transition(rec["id"], state)
+        return ts.get(rec["id"])
+
+    work = task("work")                          # one commit of its own, off main
+    empty = task("empty", own=False)             # nothing of its own at all
+    loose = task("loose", project="")            # filed under no project
+
+    check("fixture: the task recorded the old base",
+          (work.get("scope") or {}).get("branch") == "research/old", str(work.get("scope")))
+    check("fixture: the project no longer names one", ps.scope_for("trader").get("branch") is None
+          or ps.scope_for("trader").get("branch") == "", str(ps.scope_for("trader")))
+    check("fixture: origin lags local main", sha("origin/main") != sha("main"))
+
+    # --- the resolver ---------------------------------------------------------
+    check("a task with a project takes the project's current base",
+          B.base_pref(work, ps.scope_for) == "")
+    check("a task with no project keeps the base it was filed with",
+          B.base_pref(loose, ps.scope_for) == "research/old")
+
+    # --- the survey agrees with git cherry --------------------------------------
+    def cherry(base, branch):
+        return sum(1 for l in git(repo, "cherry", base, branch).stdout.splitlines()
+                   if l.startswith("+"))
+    old_rows = {r["id"]: r for r in B.survey([work, empty])}
+    check("fixture: measured against the old base the two disagree with cherry",
+          old_rows.get(work["id"], {}).get("commits") == 3
+          and empty["id"] in old_rows, str(old_rows))
+    rows = {r["id"]: r for r in B.survey([work, empty, loose], scope_for=ps.scope_for)}
+    w = rows.get(work["id"], {})
+    check("the survey counts what git cherry against the current base counts",
+          w.get("commits") == cherry("main", f"silkworm/{work['id']}") == 1, str(w))
+    check("and names that base", w.get("base") == "main", str(w))
+    check("work already on the base is not listed at all",
+          empty["id"] not in rows and cherry("main", f"silkworm/{empty['id']}") == 0,
+          str(rows.get(empty["id"])))
+    check("a task with no project is still measured against its own base",
+          rows.get(loose["id"], {}).get("base") == "research/old"
+          and rows.get(loose["id"], {}).get("commits") == 3, str(rows.get(loose["id"])))
+
+    # --- pruning ------------------------------------------------------------------
+    pruned = B.prune_merged([empty, work], scope_for=ps.scope_for)
+    check("pruning measures against the current base too",
+          pruned == [f"silkworm/{empty['id']}"], str(pruned))
+
+    # --- landing --------------------------------------------------------------------
+    recorded = []
+    ns = {"project_store": ps, "worktrees": W, "merge": M, "branches": B, "verify": V,
+          "repo_guard": lambda cwd, progress=None: contextlib.nullcontext(),
+          "record_landing": lambda t, o: recorded.append(o),
+          "LANDING_UNDERWAY": "landing", "log": logging.getLogger("test")}
+    got = _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    check("the landing gate and its base resolver were lifted out of bot.py",
+          {"land_if_ready", "task_base"} <= got, str(sorted(got)))
+    land = ns["land_if_ready"]
+    r = land(work)
+    check("a task that recorded the old base lands on the current one",
+          r.get("landed") is True, f"{r!r}")
+    check("and its commit is now on main",
+          git(repo, "cat-file", "-e", "main:work.txt").returncode == 0)
+    check("and the old base was left alone", sha("research/old") != sha("main"))
+    again = task("again", own=False)
+    r = land(again)
+    check("nothing-to-land asks the current base too",
+          r.get("stage") == "nothing-to-land", f"{r!r}")
+
+    # --- reruns ------------------------------------------------------------------------
+    ns2 = {"project_store": ps, "branches": B}
+    _bot_fns({"task_base"}, ns2)
+    rerun = W.create(repo, "tsk_rerun", fetch=False, base=ns2["task_base"](work))
+    check("a rerun starts from the current base",
+          rerun and git(rerun, "rev-parse", "HEAD").stdout.strip() == sha("main"),
+          str(rerun))
+    if rerun:
+        W.release(rerun)
+    check("a rerun of a task with no project starts from its own",
+          ns2["task_base"](loose) == "research/old")
+    bot = (BASE / "bot.py").read_text()
+    check("execute_task cuts reruns from task_base",
+          "worktrees.create(cwd, tid, base=task_base(task))" in bot)
+
+    # Every other reader of the base goes through the one resolver. The only
+    # `scope.get("branch")` left in bot.py reads a *project's* scope.
+    tree = ast.parse(bot)
+    readers = sorted(
+        {f.name for f in tree.body if isinstance(f, ast.FunctionDef)
+         for n in ast.walk(f)
+         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+         and n.func.attr == "get" and n.args
+         and isinstance(n.args[0], ast.Constant) and n.args[0].value == "branch"
+         and "scope" in ast.unparse(n.func.value)})
+    check("no task's recorded base is read anywhere else",
+          readers == ["handle_command", "release_command"], str(readers))
+    for caller in ("handle_tasks", "digest_inputs", "run_ideation", "_worktree_sweeper"):
+        fn = next((f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == caller), None)
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr in ("survey", "prune_merged")
+                 and ast.unparse(n.func.value) == "branches"] if fn else []
+        check(f"{caller} surveys against current bases",
+              calls and all(any(k.arg == "scope_for"
+                                and ast.unparse(k.value) == "project_store.scope_for"
+                                for k in c.keywords) for c in calls), caller)
+    board = ast.unparse(next(n for n in tree.body if isinstance(n, ast.Assign)
+                             and any(getattr(t, "id", "") == "BOARD" for t in n.targets)))
+    check("so does the board's unmerged line",
+          "scope_for=project_store.scope_for" in board)
 
 
 if __name__ == "__main__":

@@ -1632,7 +1632,8 @@ def handle_tasks(payload: dict) -> dict:
         # seconds, and this asks git, so folding it in would run a survey
         # twice a minute to answer a question that only changes when you
         # merge something.
-        rows = branches.survey(_filter(list(task_store.all().values())))
+        rows = branches.survey(_filter(list(task_store.all().values())),
+                               scope_for=project_store.scope_for)
         return {"ok": True, "unmerged": rows, "summary": branches.line(rows)}
     if action == "roles":
         # What the form may offer, fetched rather than written into the page,
@@ -2229,7 +2230,8 @@ BOARD = home.Board(
     store=task_store, call=handle_tasks, allowed_users=ALLOWED_USERS,
     base_url=TEAM_URL,
     watching=lambda: handle_tasks({"action": "watching"}).get("watching", []),
-    unmerged=lambda: branches.line(branches.survey(list(task_store.all().values()))))
+    unmerged=lambda: branches.line(branches.survey(list(task_store.all().values()),
+                                                       scope_for=project_store.scope_for)))
 home.register(app, BOARD)
 
 server.start()
@@ -2636,7 +2638,14 @@ def tell_thread(key: str, text: str) -> None:
         log.exception("could not post to %s", key)
 
 
-def record_branch(tid: str, worktree, scope: dict) -> None:
+def task_base(task: dict) -> str:
+    """The base branch this task lands on, is measured against and reruns
+    from: its project's base as it stands now (see branches.base_pref), not
+    the copy of it the task took when filed."""
+    return branches.base_pref(task, project_store.scope_for)
+
+
+def record_branch(tid: str, worktree, base: str) -> None:
     """Write down what this task left in git, before its checkout goes away.
 
     The worktree is about to be released and it is the only thing that knows
@@ -2649,8 +2658,7 @@ def record_branch(tid: str, worktree, scope: dict) -> None:
     """
     try:
         repo = worktrees.main_repo(worktree)
-        base = worktrees.base_ref(repo, fetch=False,
-                                  prefer=(scope or {}).get("branch") or "") if repo else ""
+        base = worktrees.base_ref(repo, fetch=False, prefer=base) if repo else ""
         made = worktrees.commits_on(worktree, base)
         branch = worktrees.branch_of(worktree)
         if not made or not branch:
@@ -2857,7 +2865,7 @@ def execute_task(task: dict) -> None:
         # catch up with a base that moved, is told to fix *that* branch, and
         # a fresh one off the base would hold none of what it is fixing.
         worktree = (worktrees.attach(cwd, tid, worktrees.BRANCH_PREFIX + tid, label="")
-                    or worktrees.create(cwd, tid, base=scope.get("branch") or ""))
+                    or worktrees.create(cwd, tid, base=task_base(task)))
         if worktree:
             cwd = worktree
             task_store.update(tid, scope={**scope, "worktree": str(worktree)})
@@ -3010,7 +3018,7 @@ def execute_task(task: dict) -> None:
             # below: a passing verdict lands, and the landing reattaches this
             # same branch, which git refuses while another worktree holds it.
             if not borrowed:
-                record_branch(tid, worktree, scope)
+                record_branch(tid, worktree, task_base(task))
             removed, note = worktrees.release(worktree,
                                               delete_empty_branch=not borrowed)
             worktree = None                      # released; finally need not repeat it
@@ -3071,7 +3079,7 @@ def execute_task(task: dict) -> None:
             # a dirty tree, so a failed task's partial work survives.
             try:
                 if not borrowed:
-                    record_branch(tid, worktree, scope)
+                    record_branch(tid, worktree, task_base(task))
                 worktrees.release(worktree, delete_empty_branch=not borrowed)
             except Exception:
                 log.exception("could not release worktree %s", worktree)
@@ -3340,8 +3348,7 @@ def conflict_addendum(task: dict, outcome: dict, branch: str, why: str) -> str:
     """What work sent back to catch up with its base is told: where the base
     is, which files clashed, git's own words, and what to do about it."""
     stage = outcome.get("stage")
-    base = (outcome.get("base") or (task.get("scope") or {}).get("branch")
-            or "the base branch")
+    base = outcome.get("base") or task_base(task) or "the base branch"
     onto = outcome.get("onto") or ""
     at = f" (at `{onto[:12]}` when the landing tried)" if onto else ""
     what = ("rebasing it onto the current base conflicts" if stage == "rebase"
@@ -3526,7 +3533,7 @@ def resolve_review(task: dict, role_name: str, text: str,
         child = task_store.create(
             roles.review_goal(task, text, cwd=where, branch=branch,
                               base=worktrees.fork_point(
-                                  here, branch, scope.get("branch") or "")
+                                  here, branch, task_base(task))
                               if branch else ""),
             role="reviewer", driver="queue",
             # Not isolated in the ordinary sense: a fresh worktree off the base
@@ -3661,6 +3668,10 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     # task actually recorded as its checkout closed rather than assuming the
     # convention. Two ways of naming it would be two things to keep in step.
     branch = branches.name_for(task)
+    # The project's base now, not the one copied onto the task when it was
+    # filed: eleven trader tasks were refused landing on a research branch
+    # their project had stopped naming days before.
+    base = task_base(task)
 
     def never(stage: str, detail: str = "") -> dict:
         return {"eligible": False, "landed": False, "stage": stage,
@@ -3697,7 +3708,7 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     # as git refusing work that needs a person.
     empty = branches.nothing_to_land(
         cwd, branch, worktrees.base_ref(cwd, fetch=False,
-                                        prefer=scope.get("branch") or "", fallback=""))
+                                        prefer=base, fallback=""))
     if empty:
         return never("nothing-to-land", empty)
     # Work that survives only on a remote copy -- the local ref reset to the
@@ -3705,7 +3716,7 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     # checkout below takes the local branch.
     stuck = branches.restore_from_remote(
         cwd, branch, worktrees.base_ref(cwd, fetch=False,
-                                        prefer=scope.get("branch") or "", fallback=""))
+                                        prefer=base, fallback=""))
     if stuck:
         return {"eligible": True, "landed": False, "stage": "restore",
                 "branch": branch, "detail": stuck}
@@ -3736,7 +3747,7 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     try:
         # Landing touches the shared checkout, so take the guard a turn takes.
         with repo_guard(cwd):
-            result = merge.land(here, cwd, branch, scope.get("branch") or "",
+            result = merge.land(here, cwd, branch, base,
                                 run_tests, publish=bool(proj.get("publish")),
                                 on_merge=on_merge)
     finally:
@@ -4183,7 +4194,7 @@ def run_ideation(slug: str) -> dict:
     # is already fixed on an unmerged branch, and files it again -- which is how
     # one fix came to be implemented twice, at the cost of two sessions and two
     # reviewers each time. So the goal carries the list.
-    note = scoping.unmerged_note(branches.survey(board))
+    note = scoping.unmerged_note(branches.survey(board, scope_for=project_store.scope_for))
     if note:
         goal += "\n\n" + note
 
@@ -4223,7 +4234,7 @@ def digest_inputs(records) -> tuple[list, dict]:
     rather than costing the whole message."""
     since = time.time() - digest.WINDOW_S
     try:
-        rows = branches.survey(records)
+        rows = branches.survey(records, scope_for=project_store.scope_for)
     except Exception:
         log.exception("digest: branch survey failed")
         rows = []
@@ -4624,7 +4635,8 @@ def _worktree_sweeper() -> None:
                     r.get("id") for r in records
                     if ((r.get("result") or {}).get("landing") or {}).get("stage")
                     == LANDING_UNDERWAY}
-                branches.prune_merged(records, skip=busy)
+                branches.prune_merged(records, skip=busy,
+                                       scope_for=project_store.scope_for)
         except Exception:
             log.exception("merged-branch prune failed")
         time.sleep(1800)
