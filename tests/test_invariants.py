@@ -8099,6 +8099,30 @@ def test_review_followups():
           and review2.get("held") == [split[1]] and len(review2.get("filed") or []) == 1,
           posted[:500])
 
+    # Filing raises after one finding is filed: its id is lost, but the
+    # finding must still be said somewhere rather than under no heading.
+    def files_then_raises(task, followups, duplicates=None, held=None, fates=None):
+        fates[followups[0]] = "filed"
+        raise RuntimeError("dedup blew up")
+    boom = _bot_func("resolve_review", task_store=store, tasks=T,
+                     roles=__import__("roles"), app=app, time=__import__("time"),
+                     file_followups=files_then_raises,
+                     rework_flagged_review=lambda *a: False,
+                     rework_conflict=lambda *a: False,
+                     log=logging.getLogger("t"))
+    impl3 = store.create("a third backlogged job", title="Impl3",
+                         project="backlogged", role="implementor")
+    rev3 = store.create("review it", role="reviewer", parent=impl3["id"])
+    app.reset_mock()
+    lost = ["a finding filed just before the filing step raised"]
+    boom(dict(rev3), "reviewer",
+         '```json\n' + json.dumps({"ok": True, "summary": "fine",
+                                    "followups": lost}) + '\n```', "C1", "1.2")
+    posted = " ".join(str(c.kwargs.get("text", ""))
+                      for c in app.client.chat_postMessage.call_args_list)
+    check("a filing that raises midway still says every finding",
+          "Also noted" in posted and lost[0] in posted, posted[:400])
+
     # --- routing --------------------------------------------------------------
     bot = (BASE / "bot.py").read_text()
     gate = bot[bot.index("def resolve_review("):bot.index("def land_if_ready(")]

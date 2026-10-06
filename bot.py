@@ -3617,6 +3617,10 @@ def resolve_review(task: dict, role_name: str, text: str,
                                    held, fates)
         except Exception:
             log.exception("filing review followups for %s failed", parent_id)
+            # The ids it filed before raising are lost with its return value,
+            # so a "filed" fate here has no id to show: say it as noted
+            # rather than under no heading at all.
+            fates = {f: v for f, v in fates.items() if v != "filed"}
     verdict = {**verdict, "filed": filed}
     if duplicates:
         verdict["duplicates"] = duplicates
