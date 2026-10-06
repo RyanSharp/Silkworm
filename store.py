@@ -73,6 +73,23 @@ class SessionStore:
             del files[:-200]  # cap per thread
             self._save()
 
+    def mark_pruned(self, key: str, paths, at: float) -> int:
+        """Say on a thread's file records that their bytes were removed.
+
+        The record is the fact the file existed; only the weight goes. See
+        artifacts.py. Not activity, so `updated` is left alone.
+        """
+        paths = set(paths)
+        with self._lock:
+            n = 0
+            for rec in (self._data.get(key) or {}).get("files") or ():
+                if rec.get("path") in paths and not rec.get("pruned"):
+                    rec["pruned"] = at
+                    n += 1
+            if n:
+                self._save()
+            return n
+
     def add_cost(self, key: str, cost: float) -> None:
         with self._lock:
             entry = self._data.setdefault(key, {})

@@ -30,6 +30,7 @@ import recovery                                  # noqa: E402
 from claude_runner import (ClaudeError, ClaudeStopped,  # noqa: E402
                            ClaudeTimeout, RunHandle)
 from store import SessionStore                   # noqa: E402
+import artifacts                                 # noqa: E402
 
 BASE = Path(__file__).resolve().parent.parent
 PASSED, FAILED = [], []
@@ -9048,6 +9049,9 @@ def _sweeper_ns(outbox, *, forget=None, compact=None):
     ran = []
 
     class Store:
+        def all(self):
+            return {}
+
         def forget_empty(self, days, keep=()):
             ran.append("forget")
             if forget:
@@ -9065,7 +9069,9 @@ def _sweeper_ns(outbox, *, forget=None, compact=None):
 
     ns = bot_functions("_sweep_pass", "_sweeper", store=Store(), task_store=Tasks(),
                        OUTBOX_ROOT=outbox, shutil=_shutil,
-                       SESSION_MAX_AGE_DAYS=30, TASK_COMPACT_AFTER_DAYS=14)
+                       SESSION_MAX_AGE_DAYS=30, TASK_COMPACT_AFTER_DAYS=14,
+                       ARTIFACTS_ROOT=Path(tempfile.mkdtemp()), artifacts=artifacts,
+                       ARTIFACT_MAX_AGE_DAYS=30, ARTIFACT_PRUNE=True)
     ns["log"] = logging.getLogger("test.sweeper")
     ns["log"].disabled = True
     return ns, ran
@@ -13892,6 +13898,164 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
               not r["ok"] and counter.read_text() == "1", f"runs={counter.read_text()}")
     finally:
         W.ROOT = saved_root
+
+
+# --- artifacts/ has a retention rule, and a pending thread is exempt from it ---
+# upload_outbox() archived every file a turn sent into artifacts/ and nothing
+# ever removed one: 301MB by 2026-09-29, mostly video, 135MB of it named by no
+# record at all. The rule lives in artifacts.py; these pin each clause of it.
+
+def _artifact(root, key, name, age_days, sessions, *, uploaded=True, recorded=True):
+    d = root / key.replace(":", "__")
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_bytes(b"x" * 1000)
+    then = time.time() - age_days * 86400
+    os.utime(f, (then, then))
+    if recorded:
+        sessions.setdefault(key, {}).setdefault("files", []).append(
+            {"name": name, "path": str(f), "direction": "out", "ts": then,
+             "uploaded": uploaded})
+    return f
+
+
+def test_artifact_retention():
+    print("\nartifacts/ retention: old mirrors and orphans go, records and pending threads stay")
+    root = Path(tempfile.mkdtemp()) / "artifacts"
+    sessions: dict = {}
+    old = _artifact(root, "C1:1.0", "old.mp4", 45, sessions)
+    fresh = _artifact(root, "C1:1.0", "fresh.png", 3, sessions)
+    only_copy = _artifact(root, "C1:1.0", "failed-upload.mp4", 45, sessions, uploaded=False)
+    orphan = _artifact(root, "C1:1.0", "fell-off-the-cap.mp4", 45, sessions, recorded=False)
+    # A !reset thread: the directory is there, the record is not.
+    reset_orphan = _artifact(root, "C1:2.0", "reset.zip", 5, sessions, recorded=False)
+    # Unreferenced ctime is when it landed here, which a rename sets to now: the
+    # grace protects a file moved in just before upload_outbox records it.
+    young_orphan = _artifact(root, "C1:1.0", "being-archived.mp4", 0, sessions, recorded=False)
+    # A failed upload whose record has since gone: the name still says so.
+    unsent_orphan = _artifact(root, "C1:2.0", "1784000000" + artifacts.UNSENT + "clip.mp4",
+                              45, sessions, recorded=False)
+    held_old = _artifact(root, "C1:3.0", "held.mp4", 45, sessions)
+    held_orphan = _artifact(root, "C1:3.0", "held-orphan.mp4", 45, sessions, recorded=False)
+    sessions["C1:3.0"]["pending"] = {"msg_ts": "3.1", "started": "x"}
+    # Not a thread's directory: a plan's progress tracker, kept here by a turn.
+    foreign = root / "plan-2026-10-02" / "progress.txt"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("step 3: tsk_x")
+    os.utime(foreign, (time.time() - 45 * 86400,) * 2)
+
+    later = time.time() + 2 * 86400     # every orphan past its day of grace
+    doomed = {Path(i["path"]).name: i["why"] for i in artifacts.plan(root, sessions, 30, now=later)}
+    check("an uploaded file past the age limit is planned for removal",
+          doomed.get("old.mp4") == "expired", str(doomed))
+    check("a file inside the age limit is not", "fresh.png" not in doomed)
+    check("a file that never reached Slack is kept however old -- it is the only copy",
+          "failed-upload.mp4" not in doomed)
+    check("files no record names are removed (the cap, and !reset)",
+          doomed.get("fell-off-the-cap.mp4") == "unreferenced"
+          and doomed.get("reset.zip") == "unreferenced", str(doomed))
+    check("an unreferenced file marked unsent is kept -- the record is gone, the only copy is not",
+          not any(artifacts.UNSENT in n for n in doomed), str(doomed))
+    check("a pending thread's artifacts survive the rule, orphans included",
+          "held.mp4" not in doomed and "held-orphan.mp4" not in doomed, str(doomed))
+    check("an unreferenced file inside its day of grace is left alone",
+          not [i for i in artifacts.plan(root, sessions, 30) if i["why"] == "unreferenced"],
+          "just after landing every orphan here is inside its grace, whatever its mtime")
+    check("days=0 turns the age rule off but not the orphan rule",
+          {Path(i["path"]).name for i in artifacts.plan(root, sessions, 0, now=later)}
+          == {"fell-off-the-cap.mp4", "reset.zip", "being-archived.mp4"})
+    check("a directory upload_outbox did not make is not the rule's to sweep",
+          "progress.txt" not in doomed, str(doomed))
+    check("planning touched nothing", all(p.exists() for p in
+          (foreign, old, fresh, only_copy, orphan, reset_orphan, young_orphan, unsent_orphan,
+           held_old, held_orphan)))
+
+    # upload_outbox is where the mark is made; run it with an upload that fails.
+    ob = Path(tempfile.mkdtemp()) / "ob"
+    ob.mkdir()
+    (ob / "clip.mp4").write_bytes(b"v")
+    (ob / "shot.png").write_bytes(b"p")
+    arch = Path(tempfile.mkdtemp())
+
+    class Client:
+        def files_upload_v2(self, **kw):
+            if kw["title"] == "clip.mp4":
+                raise RuntimeError("upload refused")
+    ub = bot_functions("upload_outbox", ARTIFACTS_ROOT=arch, artifacts=artifacts, Path=Path,
+                       shutil=shutil, store=tmp_store())
+    ub["log"].disabled = True
+    ub["upload_outbox"](Client(), ob, "C1", "1.0", "C1:1.0")
+    names = sorted(p.name for p in (arch / "C1__1.0").iterdir())
+    ub["log"].disabled = False
+    check("upload_outbox marks a failed upload unsent in its archived name, and only that one",
+          len(names) == 2
+          and [artifacts.UNSENT in n for n in names if n.endswith("clip.mp4")] == [True]
+          and [artifacts.UNSENT in n for n in names if n.endswith("shot.png")] == [False],
+          str(names))
+
+    # Through the sweeper, against a real SessionStore: off logs, on removes.
+    st = tmp_store()
+    for key, entry in sessions.items():
+        st.update(key, **entry)
+    before = st.get("C1:1.0")["updated"]
+    ns = bot_functions("_sweep_pass", store=st, task_store=types.SimpleNamespace(
+                           all=lambda: {}, compact_older_than=lambda d: None),
+                       OUTBOX_ROOT=Path(tempfile.mkdtemp()), shutil=shutil,
+                       SESSION_MAX_AGE_DAYS=30, TASK_COMPACT_AFTER_DAYS=14,
+                       ARTIFACTS_ROOT=root, artifacts=artifacts,
+                       ARTIFACT_MAX_AGE_DAYS=30, ARTIFACT_PRUNE=False)
+    real_time = artifacts.time
+    artifacts.time = types.SimpleNamespace(time=lambda: later)
+    try:
+        ns["_sweep_pass"]()
+        check("with ARTIFACT_PRUNE off the sweeper removes nothing",
+              old.exists() and orphan.exists() and reset_orphan.exists())
+        ns["ARTIFACT_PRUNE"] = True
+        ns["_sweep_pass"]()
+    finally:
+        artifacts.time = real_time
+    check("with it on, the expired file and the old orphans are gone",
+          not old.exists() and not orphan.exists() and not reset_orphan.exists())
+    # (young_orphan went too: two days on, its grace is over.)
+    check("and the fresh, the only copy and the pending thread's are still there",
+          all(p.exists() for p in (fresh, only_copy, unsent_orphan, held_old, held_orphan,
+                                   foreign)))
+    recs = {r["name"]: r for r in st.get("C1:1.0")["files"]}
+    check("the removed file's record stays, stamped pruned",
+          "old.mp4" in recs and recs["old.mp4"].get("pruned"), str(recs.get("old.mp4")))
+    check("and only that record is stamped",
+          not any(r.get("pruned") for n, r in recs.items() if n != "old.mp4"))
+    check("pruning is not activity -- the thread's updated stamp is unchanged",
+          st.get("C1:1.0")["updated"] == before)
+    check("the pending thread's record is untouched",
+          not any(r.get("pruned") for r in st.get("C1:3.0")["files"]))
+
+    # A turn that starts between plan() and apply() still holds its thread.
+    root2 = Path(tempfile.mkdtemp()) / "artifacts"
+    s2: dict = {}
+    late = _artifact(root2, "C2:1.0", "late.mp4", 45, s2)
+    plan2 = artifacts.plan(root2, s2, 30)
+    st2 = tmp_store()
+    st2.update("C2:1.0", **s2["C2:1.0"])
+    st2.update("C2:1.0", pending={"msg_ts": "1.1", "started": "x"})
+    artifacts.apply(plan2, st2)
+    check("a thread whose turn began after planning is still exempt when removing",
+          plan2 and late.exists(), str(plan2))
+
+    # A record naming its file by another spelling of the same path (here a
+    # symlinked root) is still the one stamped.
+    real = Path(tempfile.mkdtemp())
+    link = Path(tempfile.mkdtemp()) / "via"
+    link.symlink_to(real)
+    s3: dict = {}
+    _artifact(link, "C3:1.0", "aliased.mp4", 45, s3)
+    plan3 = artifacts.plan(real, s3, 30)
+    st3 = tmp_store()
+    st3.update("C3:1.0", **s3["C3:1.0"])
+    artifacts.apply(plan3, st3)
+    check("the record is stamped even when it spells the path differently from the walk",
+          [i["why"] for i in plan3] == ["expired"]
+          and st3.get("C3:1.0")["files"][0].get("pruned"), str(plan3))
 
 
 if __name__ == "__main__":

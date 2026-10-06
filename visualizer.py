@@ -1171,7 +1171,7 @@ async function loadTranscript(scroll) {
   if (files.length) {
     h += `<div class="artifacts"><b>Files</b>` + files.map(f =>
       `<div class="f"><span>${f.direction === "in" ? "⬇" : "⬆"}</span>
-       ${f.exists ? `<a href="/download?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a>` : esc(f.name) + " (gone)"}
+       ${f.exists ? `<a href="/download?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a>` : esc(f.name) + (f.pruned ? " (pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack)" : " (gone)")}
        <span>${fmtTok(f.size)}B</span></div>`).join("") + "</div>";
   }
   el.innerHTML = h;

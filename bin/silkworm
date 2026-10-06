@@ -12,6 +12,7 @@
     silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
     silkworm discard <branch>...    delete task branches, keeping their tips
+    silkworm artifacts [--days N]   what artifacts/ retention would remove (removes nothing)
     silkworm learnings sync         commit/pull/push shared learnings via git
     silkworm learnings init [remote]  make the learnings dir a git repo for sharing
     silkworm setup                  first-run bootstrap: deps, hooks, services
@@ -1125,6 +1126,34 @@ def main() -> None:
             print(f"  {G}·{N} {line}")
         print(f"  recover any of them with: git checkout -b <branch> <tag>")
 
+    elif cmd == "artifacts":
+        # Read-only: the report behind ARTIFACT_PRUNE, so turning it on can be
+        # decided from numbers. The sweeper does the removing, not this.
+        sys.path.insert(0, str(REPO))
+        import artifacts as _artifacts
+        import jsonstore as _jsonstore
+        days = 30.0
+        if "--days" in args:
+            try:
+                days = float(args[args.index("--days") + 1])
+            except (IndexError, ValueError):
+                print("usage: silkworm artifacts [--days N]")
+                sys.exit(2)
+        try:
+            sessions = _jsonstore.load(REPO / "sessions.json", default={}, repair=False)
+        except _jsonstore.CorruptStore as exc:
+            # Without the records every file would read as unreferenced.
+            print(f"{WORM} cannot read sessions.json — {exc}")
+            sys.exit(1)
+        doomed = _artifacts.plan(REPO / "artifacts", sessions, days)
+        print(f"{WORM} artifacts retention at {days:g} days would remove "
+              f"{_artifacts.summary(doomed)}")
+        per: dict = {}
+        for item in doomed:
+            d = Path(item["path"]).parent.name
+            per[d] = per.get(d, 0) + item["size"]
+        for d, size in sorted(per.items(), key=lambda kv: -kv[1]):
+            print(f"  {size / 1e6:8.1f}MB  {d}")
     elif cmd == "titles":
         force = "--force" in args
         print(f"{WORM} naming threads{' (all)' if force else ' (untitled only)'}…")

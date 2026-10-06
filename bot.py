@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import artifacts
 import backfill
 import branches
 import costs
@@ -174,6 +175,15 @@ SESSION_MAX_AGE_DAYS = float(os.environ.get("SESSION_MAX_AGE_DAYS", "30"))
 # Finished tasks are kept forever -- they are the project's history -- but
 # past this the reply text and event log are dropped from them.
 TASK_COMPACT_AFTER_DAYS = float(os.environ.get("TASK_COMPACT_AFTER_DAYS", "14"))
+# Files a turn sent to Slack are kept locally, in artifacts/, for the
+# visualizer. Past this age an uploaded one loses its bytes but keeps its
+# record, and files no record names go after a day; see artifacts.py for the
+# rule and why it is age and not size. ARTIFACT_PRUNE is the switch: off, the
+# sweeper only logs what the rule would remove, so turning it on -- the first
+# pass reclaims the months of video already there -- is a decision, not a
+# side effect of deploying the code.
+ARTIFACT_MAX_AGE_DAYS = float(os.environ.get("ARTIFACT_MAX_AGE_DAYS", "30"))
+ARTIFACT_PRUNE = os.environ.get("ARTIFACT_PRUNE", "0") not in ("0", "false", "no", "")
 SLACK_MSG_LIMIT = 3800
 
 # When a thread is checked out to the terminal (!terminal), a Slack message
@@ -778,7 +788,10 @@ def upload_outbox(client, outbox: Path, channel: str, thread_ts: str, key: str) 
             log.exception("failed to upload %s", path)
         try:
             archive_dir.mkdir(parents=True, exist_ok=True)
-            dest = archive_dir / f"{int(time.time())}-{path.name}"
+            # Marked in the name, not only the record, so retention can still
+            # tell it is the only copy after the record is gone (artifacts.py).
+            tag = "-" if uploaded else artifacts.UNSENT
+            dest = archive_dir / f"{int(time.time())}{tag}{path.name}"
             shutil.move(str(path), dest)
             store.add_file(key, {"name": path.name, "path": str(dest),
                                  "direction": "out", "ts": time.time(),
@@ -4699,7 +4712,8 @@ def _watchdog() -> None:
 
 
 def _sweep_pass() -> None:
-    """Six-hourly tidy: empty session husks, finished tasks, yesterday's outboxes.
+    """Six-hourly tidy: empty session husks, finished tasks, yesterday's
+    outboxes, and artifacts past their retention (artifacts.py).
 
     Threads are retired by hiding them, not by being deleted out from under
     you -- so the first step only removes records with nothing in them and no
@@ -4737,6 +4751,16 @@ def _sweep_pass() -> None:
                 shutil.rmtree(orphan, ignore_errors=True)
     except Exception:
         log.exception("sweeping old outboxes failed")
+    try:
+        doomed = artifacts.plan(ARTIFACTS_ROOT, store.all(), ARTIFACT_MAX_AGE_DAYS)
+        if doomed and ARTIFACT_PRUNE:
+            n, freed = artifacts.apply(doomed, store)
+            log.info("pruned %d artifact(s), %.1fMB", n, freed / 1e6)
+        elif doomed:
+            log.info("artifact retention is off (ARTIFACT_PRUNE); it would remove %s",
+                     artifacts.summary(doomed))
+    except Exception:
+        log.exception("pruning artifacts failed")
 
 
 def _sweeper() -> None:
