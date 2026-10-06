@@ -2124,7 +2124,7 @@ def handle_file_task(payload: dict) -> dict:
     # conversation was agreed by the person this check exists to spare. Only
     # for a named project, for the same reason as the backlog count above.
     if propose and slug:
-        err = dedup.duplicate(goal, task_store.by_project(slug), branches.survey,
+        err = dedup.duplicate(goal, task_store.by_project(slug), unmerged_survey,
                               title=goal[:70])
         if err:
             log.info("refused a proposal from %s: %s", key, err)
@@ -2643,6 +2643,13 @@ def task_base(task: dict) -> str:
     from: its project's base as it stands now (see branches.base_pref), not
     the copy of it the task took when filed."""
     return branches.base_pref(task, project_store.scope_for)
+
+
+def unmerged_survey(records) -> list:
+    """branches.survey measured against each project's current base. Handed
+    to dedup by reference, where a bare branches.survey would measure every
+    task against the base it was filed with."""
+    return branches.survey(records, scope_for=project_store.scope_for)
 
 
 def record_branch(tid: str, worktree, base: str) -> None:
@@ -3245,7 +3252,7 @@ def file_followups(task: dict, followups: list[str],
         # Not against the task under review, or the job it belongs to: a
         # follow-up is found next to that work and shares its words, and is
         # by definition not part of it.
-        dup = (dedup.duplicate(goal, task_store.by_project(proj), branches.survey,
+        dup = (dedup.duplicate(goal, task_store.by_project(proj), unmerged_survey,
                                title=title,
                                exclude={task["id"], task.get("root") or task["id"]})
                if proj else "")

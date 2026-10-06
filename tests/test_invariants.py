@@ -68,7 +68,7 @@ def bot_functions(*names, **globals_):
 #: Helpers other lifted functions call as part of their own behaviour, so a
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
-SHARED_HELPERS = ("send_back", "review_addendum", "task_base")
+SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey")
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -2512,7 +2512,7 @@ def _file_task_impl():
     src = (BASE / "bot.py").read_text()
     tree = ast.parse(src)
     want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn",
-            "begin_turn")
+            "begin_turn", "unmerged_survey")
     def named(n):
         if isinstance(n, ast.FunctionDef):
             return n.name
@@ -14245,6 +14245,27 @@ def test_a_tasks_base_is_its_projects_current_base():
               calls and all(any(k.arg == "scope_for"
                                 and ast.unparse(k.value) == "project_store.scope_for"
                                 for k in c.keywords) for c in calls), caller)
+    # Not only calls: dedup is handed the survey by reference, and a bare
+    # `branches.survey` passed along measures against the recorded base.
+    called = {id(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)
+              and any(k.arg == "scope_for"
+                      and ast.unparse(k.value) == "project_store.scope_for"
+                      for k in c.keywords)}
+    bare = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+            and n.attr in ("survey", "prune_merged")
+            and ast.unparse(n.value) == "branches" and id(n) not in called]
+    check("every reference to the survey in bot.py passes the current bases",
+          not bare, f"bare at lines {bare}")
+    dups = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
+            and ast.unparse(c.func) == "dedup.duplicate"]
+    check("and the duplicate check is handed the survey that does",
+          len(dups) >= 2 and all(len(c.args) > 2 and ast.unparse(c.args[2]) == "unmerged_survey"
+                                 for c in dups), str([ast.unparse(c) for c in dups]))
+    ns3 = {"project_store": ps, "branches": B}
+    _bot_fns({"unmerged_survey"}, ns3)
+    check("which measures a stale-base task against the current base",
+          [r["id"] for r in ns3["unmerged_survey"]([again])] == []
+          and [r["id"] for r in B.survey([again])] == [again["id"]])
     board = ast.unparse(next(n for n in tree.body if isinstance(n, ast.Assign)
                              and any(getattr(t, "id", "") == "BOARD" for t in n.targets)))
     check("so does the board's unmerged line",
