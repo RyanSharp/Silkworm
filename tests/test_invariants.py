@@ -3012,8 +3012,21 @@ def _bot_func(name, **namespace):
     for real in ("costs", "dedup"):
         if real in free:
             mod.__dict__[real] = __import__(real)
+    # The shared helpers compiled in alongside it read globals of their own
+    # (task_base reads `branches` and `project_store`), which the caller has
+    # as little reason to supply as the function's own -- stub those too.
+    helpers = _shared_helpers(tree, [node], set(namespace))
+    for h in helpers:
+        own = {a.arg for a in h.args.args} | {
+            n.id for n in ast.walk(h)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))}
+        for free_name in ({n.id for n in ast.walk(h) if isinstance(n, ast.Name)
+                           and isinstance(n.ctx, ast.Load)}
+                          - own - set(dir(builtins)) - set(mod.__dict__)
+                          - {x.name for x in helpers}):
+            mod.__dict__[free_name] = MagicMock(name=free_name)
     mod.__dict__.update(namespace)
-    exec(compile(ast.Module(body=[node] + _shared_helpers(tree, [node], set(namespace)),
+    exec(compile(ast.Module(body=[node] + helpers,
                             type_ignores=[]), f"<{name}>", "exec"),
          mod.__dict__)
     return mod.__dict__[name]
@@ -7950,7 +7963,8 @@ def test_review_followups():
     ns = {"task_store": store, "scoping": scoping, "tasks": T, "log": logging.getLogger("t"),
           "dedup": __import__("dedup"), "branches": __import__("branches"),
           "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<x>", "exec"), ns)
+    exec(compile(ast.Module(body=[fn] + _shared_helpers(src, [fn], set(ns)),
+                            type_ignores=[]), "<x>", "exec"), ns)
     file_followups = ns["file_followups"]
 
     parent = store.create("do the thing", title="Do the thing", project="silkworm",
