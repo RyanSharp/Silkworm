@@ -13620,12 +13620,18 @@ LAUNCH = ('Testing failed:\n\tCadence encountered an error (Failed to install or
           'launch the test runner. (Underlying Error: Simulator device failed to '
           'launch com.rtsharp.Cadence. The request was denied by service delegate '
           '(SBMainWorkspace) for reason: Busy ("Application failed preflight checks")')
+if len(sys.argv) > 3:          # say when this attempt ran, for the lock check
+    import time
+    with open(sys.argv[3], "a") as f:
+        f.write(f"flaky-{n} ")
+    time.sleep(0.4)
 if mode == "launch-once" and n == 0 or mode == "launch-always":
     print(LAUNCH)
     print("x" * 5000)          # pushes the launch error out of the kept tail
     print("** TEST FAILED **")
     sys.exit(65)
 if mode == "test-fail":
+    print("com.apple.CoreSimulator.SimDevice: booted")   # noise beside a real failure
     print("XCTAssertEqual failed: (\"1\") is not equal to (\"2\")")
     print("** TEST FAILED **")
     sys.exit(65)
@@ -13809,6 +13815,27 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
     check("and nothing is retried unless the caller asks",
           not r["ok"] and n == 1, f"ok={r['ok']} runs={n}")
 
+    # The retry happens under the same hold as the first attempt: a run
+    # queued behind it must not take the simulator in between, which is the
+    # very collision the retry is there to ride out.
+    import threading
+    order = d / "order.log"
+    counter = d / "held"
+    first = threading.Thread(target=V.run, daemon=True, kwargs={
+        "command": f"{sys.executable} {flaky} {counter} launch-once {order}",
+        "cwd": d, "project": "cadence", "retry_launch": True})
+    first.start()
+    deadline = time.time() + 10
+    while not order.exists() and time.time() < deadline:
+        time.sleep(0.01)
+    other = threading.Thread(target=V.run, daemon=True, kwargs={
+        "command": f"{sys.executable} -c \"open('{order}', 'a').write('other ')\"",
+        "cwd": d, "project": "cadence"})
+    other.start(); first.join(20); other.join(20)
+    got = order.read_text().split()
+    check("a retry keeps the project's lock between its two attempts",
+          got == ["flaky-0", "flaky-1", "other"], f"got {got}")
+
     for said in ("Application failed preflight checks",
                  "Unable to boot the Simulator.",
                  "CoreSimulatorService connection became invalid",
@@ -13817,6 +13844,11 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
         check(f"recognised as a launch failure: {said!r}", V.launch_failure(r))
     r = V.run(f"{sys.executable} -c \"print('Unable to boot'); raise SystemExit(0)\"", d)
     check("a passing run is never a launch failure", not V.launch_failure(r))
+    r = V.run(f"{sys.executable} -c \"print('CoreSimulator: noise'); "
+              f"print(\\\"Test Case '-[T t]' failed (0.1 seconds).\\\"); "
+              f"raise SystemExit(65)\"", d)
+    check("a run in which a test failed is not a launch failure, whatever else it says",
+          r["ran"] and not r["ok"] and not V.launch_failure(r), r["output"][-200:])
 
     # Wired where it matters: the landing retries, verification does not.
     import merge as M

@@ -41,6 +41,11 @@ LAUNCH_FAILURES = re.compile(
     r"|Failed to install or launch the test runner",
     re.IGNORECASE)
 
+#: ...unless a test actually ran and failed. CoreSimulator in particular is
+#: printed beside ordinary failures too, and retrying one of those could land
+#: a flaky test on its second roll.
+TEST_FAILURES = re.compile(r"Test Case '[^']*' failed|XCTAssert\w* failed")
+
 #: One lock per project, around every run of that project's suite.
 _project_locks: dict[str, threading.Lock] = {}
 _project_locks_guard = threading.Lock()
@@ -128,7 +133,9 @@ def _run(command: str, cwd, timeout: int) -> dict:
     # sit above a long summary.
     return {"ran": True, "ok": proc.returncode == 0, "code": proc.returncode,
             "output": out[-OUTPUT_CHARS:],
-            "launch_failure": proc.returncode != 0 and bool(LAUNCH_FAILURES.search(out))}
+            "launch_failure": (proc.returncode != 0
+                               and bool(LAUNCH_FAILURES.search(out))
+                               and not TEST_FAILURES.search(out))}
 
 
 def summary(result: dict) -> str:
