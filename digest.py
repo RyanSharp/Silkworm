@@ -218,6 +218,14 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
             later = f", now {now_state.replace('_', ' ')}" if now_state != e["kind"] else ""
             add(proj, "failed", f"{_title(rec)} — {what}: {why}{later}")
 
+        # Review findings the proposal cap would not file. They are not
+        # re-filed when room opens, so this is where they are seen again.
+        review = result.get("review") if isinstance(result.get("review"), dict) else {}
+        if review.get("held") and (review.get("held_at") or 0) >= since:
+            for finding in review["held"]:
+                add(proj, "held", _esc(str(finding).strip().splitlines()[0][:70]
+                                       if str(finding).strip() else "?"))
+
         runs = [e for e in _events(rec) if e.get("kind") == tasks.RUNNING and e["at"] >= since]
         if runs and (rec.get("attempts") or 0) > 1:
             add(proj, "reran", f"{_title(rec)} ({rec['attempts']} runs)")
@@ -264,6 +272,7 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 ORDER = (("landed", "landed", True), ("released", "released", False),
          ("refused", "landing refused", False), ("failed", "failed or held", False),
          ("reran", "ran more than once", True), ("stuck", "stuck", False),
+         ("held", "review findings held at the proposal cap", True),
          ("waiting", "waiting on you", False), ("unmerged", "unmerged", False))
 
 

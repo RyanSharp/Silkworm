@@ -8014,10 +8014,13 @@ def test_review_followups():
         store.create("Padding the board out to its standing limit",
                      project="backlogged", state=T.PROPOSED, role="implementor")
     at_limit = len(store.all())
+    held: list = []
     check("a review files nothing onto a board already at its standing limit",
-          file_followups(deep, ["something genuinely worth a decision"]) == []
+          file_followups(deep, ["something genuinely worth a decision"], None, held) == []
           and len(store.all()) == at_limit,
           "the nightly pass stops here; the other producer of proposals must too")
+    check("and hands the refused finding back as held, not only to the log",
+          held == ["something genuinely worth a decision"], str(held))
     check("and a project with room is unaffected by another's backlog",
           len(file_followups(parent, ["a finding on a project with room"])) == 1,
           "the limit is per project, like the nightly pass it mirrors")
@@ -8026,13 +8029,75 @@ def test_review_followups():
     spare = next(t for t in store.by_project("backlogged")
                  if t["state"] == T.PROPOSED and t["goal"].startswith("Padding"))
     store.transition(spare["id"], T.CANCELLED, "dismissed")
-    got = file_followups(deep, list(_DISTINCT_WORDS[20:25]))
+    held, fates = [], {}
+    batch = list(_DISTINCT_WORDS[20:25])
+    got = file_followups(deep, batch, None, held, fates)
     check("and with one place left it files one, not the whole batch",
           len(got) == 1,
           "a count taken once for the batch would file all five past the limit")
     check("which leaves the board exactly full, never over",
           scoping.open_proposals(store.by_project("backlogged"))
           == scoping.max_open_proposals())
+    check("the four the cap refused are handed back as held, in order",
+          held == batch[1:], str(held))
+    check("and each finding's fate is told apart",
+          fates == {batch[0]: "filed", **{f: "held" for f in batch[1:]}}, str(fates))
+    held = []
+    file_followups(parent, ["x" * (scoping.MAX_GOAL_CHARS + 1)], None, held)
+    check("a finding refused for another reason is not called held",
+          held == [], "only the cap holds; an unfileable goal is a different thing")
+
+    # The gate, with the board full: nothing it says may claim a filing.
+    from unittest.mock import MagicMock
+    impl = store.create("the backlogged implementor's job", title="Impl",
+                        project="backlogged", role="implementor")
+    rev = store.create("review it", role="reviewer", parent=impl["id"])
+    app = MagicMock()
+    resolve = _bot_func("resolve_review", task_store=store, tasks=T,
+                        roles=__import__("roles"), app=app, time=__import__("time"),
+                        file_followups=file_followups,
+                        rework_flagged_review=lambda *a: False,
+                        rework_conflict=lambda *a: False,
+                        log=logging.getLogger("t"))
+    capped = ["the cap should hold this finding back for later",
+              "and this second one along with it, also for later"]
+    resolve(dict(rev), "reviewer",
+            '```json\n' + json.dumps({"ok": True, "summary": "fine",
+                                       "followups": capped}) + '\n```', "C1", "1.0")
+    review = (store.get(impl["id"]).get("result") or {}).get("review") or {}
+    check("the gate records what the cap held on the verdict",
+          review.get("held") == capped and review.get("filed") == []
+          and review.get("held_at"), str(review))
+    posted = " ".join(str(c.kwargs.get("text", ""))
+                      for c in app.client.chat_postMessage.call_args_list)
+    check("the thread says they were held by the cap, not filed or merely noted",
+          "held back by the proposal cap" in posted
+          and "Filed for you" not in posted and "Also noted" not in posted
+          and all(f in posted for f in capped), posted[:400])
+
+    # Partly filed: the "filed" heading must list only what was filed.
+    store.transition(next(t for t in store.by_project("backlogged")
+                          if t["state"] == T.PROPOSED
+                          and t["goal"].startswith("Padding"))["id"],
+                     T.CANCELLED, "dismissed")
+    impl2 = store.create("another backlogged job", title="Impl2",
+                         project="backlogged", role="implementor")
+    rev2 = store.create("review it", role="reviewer", parent=impl2["id"])
+    app.reset_mock()
+    split = ["the filed one: a bounded retry for the landing push step",
+             "the held one: rename the sweeper's keep set for clarity"]
+    resolve(dict(rev2), "reviewer",
+            '```json\n' + json.dumps({"ok": True, "summary": "fine",
+                                       "followups": split}) + '\n```', "C1", "1.1")
+    posted = " ".join(str(c.kwargs.get("text", ""))
+                      for c in app.client.chat_postMessage.call_args_list)
+    filed_part, _, held_part = posted.partition("held back by the proposal cap")
+    review2 = (store.get(impl2["id"]).get("result") or {}).get("review") or {}
+    check("partly filed: the filed heading lists only the filed finding",
+          "Filed for you" in filed_part and split[0] in filed_part
+          and split[1] not in filed_part and split[1] in held_part
+          and review2.get("held") == [split[1]] and len(review2.get("filed") or []) == 1,
+          posted[:500])
 
     # --- routing --------------------------------------------------------------
     bot = (BASE / "bot.py").read_text()
@@ -12693,6 +12758,13 @@ def _digest_store():
     ids["fresh"] = rec("Just queued", "trader", T.QUEUED, [(1, T.QUEUED, "")])
     ids["sleeping"] = rec("Wakes tomorrow", "trader", T.BLOCKED, [(30, T.BLOCKED, "defer")],
                           retry_at=now + 5 * H)
+    rec("Reviewed under a full board", "silkworm", T.DONE,
+        result={"review": {"ok": True, "held": ["Retry the push once on a timeout",
+                                                "Name the sweeper keep set"],
+                           "held_at": now - 3 * H}})
+    rec("Reviewed long ago", "silkworm", T.DONE,
+        result={"review": {"ok": True, "held": ["A finding held last week"],
+                           "held_at": now - 100 * H}})
     for i in range(2):
         rec(f"Idea {i}", "cadence", T.PROPOSED)
     rec("Chat in a DM", "", T.DONE, [(2, T.RUNNING, ""), (1, T.DONE, "")],
@@ -12723,6 +12795,11 @@ def test_daily_digest_renders_from_a_real_store():
     check("digest: landed counts both landings in the window, titles escaped",
           "landed 2: Fix the &lt;halt&gt; &amp; marker; Older-style landing" in trader, trader)
     check("digest: a landing from last week is not today's news", "Landed last week" not in text)
+    check("digest: review findings the cap held are counted and named",
+          "review findings held at the proposal cap 2: Retry the push once on a "
+          "timeout; Name the sweeper keep set" in silk, silk)
+    check("digest: a finding held last week is not today's news",
+          "A finding held last week" not in text)
     check("digest: a refused landing names its stage and why",
           "landing refused: Rebase me (rebase: conflict in bot.py)" in silk, silk)
     check("digest: a branch dropped on purpose is not a refusal", "Dropped on purpose" not in text)

@@ -3213,7 +3213,9 @@ def send_back_uncommitted(task: dict, files: list[str], channel: str,
 
 
 def file_followups(task: dict, followups: list[str],
-                   duplicates: list | None = None) -> list[str]:
+                   duplicates: list | None = None,
+                   held: list | None = None,
+                   fates: dict | None = None) -> list[str]:
     """File a passing review's non-blocking findings as proposals.
 
     A review that passes the work completes it silently, and that rule is what
@@ -3229,6 +3231,14 @@ def file_followups(task: dict, followups: list[str],
 
     Capped like any other unattended pass. A review that finds ten things has
     not prioritised either, and every proposal costs a decision.
+
+    What a cap refuses -- the project's standing limit on open proposals, or
+    the per-pass one -- is handed back in `held` rather than only logged: it
+    is not filed, and is not re-filed when room opens (the cap exists to limit
+    decisions), but it is said in the thread and the digest, so a full board
+    is not how it disappears. `fates` maps each finding to what became of it
+    ("filed", "duplicate", "held" or "unfileable"), so whoever reports on the
+    batch can put each under a heading that is true of it.
     """
     proj = task.get("project") or ""
     # Not the parent's scope verbatim: it carries the worktree that turn ran
@@ -3236,7 +3246,8 @@ def file_followups(task: dict, followups: list[str],
     scope = project_store.scope_for(proj) or {
         k: v for k, v in (task.get("scope") or {}).items() if k != "worktree"}
     filed = []
-    for finding in followups[:scoping.limit_for(propose=True)]:
+    limit = scoping.limit_for(propose=True)
+    for finding in followups[:limit]:
         goal = (f"A review of {task['id']} ({task.get('title') or 'untitled'}) "
                 f"found this alongside that task, rather than in it:\n\n"
                 f"{finding}\n\n"
@@ -3249,12 +3260,18 @@ def file_followups(task: dict, followups: list[str],
         # the ideator to touch keeps filling through this door instead, and
         # the panel reports it paused while it grows. Live, so the batch stops
         # at the limit rather than filing all five past it.
-        err = scoping.validate(
-            goal, propose=True, slug=proj,
-            open_now=(scoping.open_proposals(task_store.by_project(proj))
-                      if proj else 0))
+        open_now = (scoping.open_proposals(task_store.by_project(proj))
+                    if proj else 0)
+        err = scoping.validate(goal, propose=True, slug=proj, open_now=open_now)
         if err:
             log.warning("not filing a review followup on %s: %s", task["id"], err)
+            # Held only when the standing limit is the reason: a goal too
+            # long to file is refused on a full board too, and is not held.
+            capped = err == scoping.backlog_refusal(proj, open_now)
+            if held is not None and capped:
+                held.append(finding)
+            if fates is not None:
+                fates[finding] = "held" if capped else "unfileable"
             continue
         # The same refusal the nightly pass gets, and recorded the same way:
         # a review is the other unattended producer of proposals, and a
@@ -3272,6 +3289,8 @@ def file_followups(task: dict, followups: list[str],
             log.info("not filing a review followup on %s: %s", task["id"], dup)
             if duplicates is not None:
                 duplicates.append(dup)
+            if fates is not None:
+                fates[finding] = "duplicate"
             continue
         try:
             child = task_store.create(
@@ -3284,8 +3303,17 @@ def file_followups(task: dict, followups: list[str],
                 root=task.get("root") or task["id"], scope=scope)
         except ValueError:
             log.exception("could not file a review followup on %s", task["id"])
+            if fates is not None:
+                fates[finding] = "unfileable"
             continue
         filed.append(child["id"])
+        if fates is not None:
+            fates[finding] = "filed"
+    # Past the per-pass limit: never tried, and just as much held by a cap.
+    if held is not None:
+        held.extend(followups[limit:])
+    if fates is not None:
+        fates.update((f, "held") for f in followups[limit:])
     return filed
 
 
@@ -3581,28 +3609,49 @@ def resolve_review(task: dict, role_name: str, text: str,
     # built for things worth a decision but not an interruption.
     filed: list[str] = []
     duplicates: list[str] = []
+    held: list[str] = []
+    fates: dict = {}
     if parent and verdict["ok"] and verdict["followups"]:
         try:
-            filed = file_followups(parent, verdict["followups"], duplicates)
+            filed = file_followups(parent, verdict["followups"], duplicates,
+                                   held, fates)
         except Exception:
             log.exception("filing review followups for %s failed", parent_id)
     verdict = {**verdict, "filed": filed}
     if duplicates:
         verdict["duplicates"] = duplicates
+    if held:
+        # Dated so the digest can say it within its window; never re-filed.
+        verdict["held"] = held
+        verdict["held_at"] = time.time()
 
     note = (":white_check_mark: *Review passed* — " if verdict["ok"]
             else ":mag: *Review flagged this* — ") + (verdict["summary"] or "")
     if verdict["findings"]:
         note += "\n" + "\n".join(f"• {f}" for f in verdict["findings"])
     if verdict["followups"]:
-        note += ("\n_Filed for you to accept or dismiss:_" if filed
-                 else "\n_Also noted, alongside the task:_")
-        note += "\n" + "\n".join(f"• {f}" for f in verdict["followups"])
+        # One heading per outcome, each listing only what it says happened:
+        # a finding the cap held back is not "filed", and one that was filed
+        # is not merely "noted".
         if filed:
-            note += "\n" + "  ".join(f"`{i}`" for i in filed)
+            said = [f for f in verdict["followups"] if fates.get(f) == "filed"]
+            note += "\n_Filed for you to accept or dismiss:_\n" + "\n".join(
+                f"• {f} `{i}`" for f, i in zip(said, filed))
+            if len(said) != len(filed):     # the same words given twice
+                note += "\n" + "  ".join(f"`{i}`" for i in filed[len(said):])
         if duplicates:
             note += "\n_Not filed, already on the board:_\n" + "\n".join(
                 f"• {d.rsplit(' — not filed', 1)[0]}" for d in duplicates)
+        if held:
+            note += ("\n_Not filed, held back by the proposal cap"
+                     " (triage the board; these will not be re-filed):_\n"
+                     + "\n".join(f"• {f}" for f in held))
+        # Nothing filed it -- filing failed, or it would not make a valid goal.
+        rest = [f for f in verdict["followups"]
+                if fates.get(f) not in ("filed", "duplicate", "held")]
+        if rest:
+            note += "\n_Also noted, alongside the task:_\n" + "\n".join(
+                f"• {f}" for f in rest)
     if verdict["unverified"]:
         note += "\n_The review could not check:_ " + "; ".join(verdict["unverified"])
     # A second flag parks, and the person deciding should see what the first
