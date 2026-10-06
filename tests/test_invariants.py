@@ -13588,6 +13588,280 @@ def test_every_env_reader_strips_quotes_like_dotenv():
               'startswith("APPROVAL_PORT=")' not in src and 'split("=", 1)' not in src)
 
 
+# --- one run of a project's suite at a time -----------------------------------
+# 2026-10-05: a Cadence landing's post-merge suite failed "Application failed
+# preflight checks" (exit 65) while a Cadence implementor was being verified at
+# the same moment. Cadence's suite pins one simulator, two runs fought over it,
+# and the landing was refused and rolled back for a reason that had nothing to
+# do with the code. Driven with real threads, real subprocesses, the real
+# repo_guard and the real land_if_ready / verify_work / merge.land.
+
+_PROBE = r'''
+import os, sys, time
+log, sleep = sys.argv[1], float(sys.argv[2])
+if os.path.exists(".slow"):    # long enough to still be running when others start
+    sleep = 3
+with open(log, "a") as f:
+    f.write(f"start {time.time()}\n")
+time.sleep(sleep)
+with open(log, "a") as f:
+    f.write(f"end {time.time()}\n")
+'''
+
+_FLAKY = r'''
+import sys
+counter, mode = sys.argv[1], sys.argv[2]
+try:
+    n = int(open(counter).read())
+except Exception:
+    n = 0
+open(counter, "w").write(str(n + 1))
+LAUNCH = ('Testing failed:\n\tCadence encountered an error (Failed to install or '
+          'launch the test runner. (Underlying Error: Simulator device failed to '
+          'launch com.rtsharp.Cadence. The request was denied by service delegate '
+          '(SBMainWorkspace) for reason: Busy ("Application failed preflight checks")')
+if mode == "launch-once" and n == 0 or mode == "launch-always":
+    print(LAUNCH)
+    print("x" * 5000)          # pushes the launch error out of the kept tail
+    print("** TEST FAILED **")
+    sys.exit(65)
+if mode == "test-fail":
+    print("XCTAssertEqual failed: (\"1\") is not equal to (\"2\")")
+    print("** TEST FAILED **")
+    sys.exit(65)
+print("** TEST SUCCEEDED **")
+'''
+
+
+def _suite_events(log):
+    try:
+        lines = Path(log).read_text().split()
+    except FileNotFoundError:
+        return []
+    return [w for w in lines if w in ("start", "end")]
+
+
+def _never_overlapped(events):
+    return events and events == ["start", "end"] * (len(events) // 2)
+
+
+def test_one_suite_run_per_project_at_a_time():
+    import threading
+    import verify as V
+    print("\none run of a project's suite at a time")
+
+    d = Path(tempfile.mkdtemp())
+    probe = d / "probe.py"; probe.write_text(_PROBE)
+    py = sys.executable
+
+    def cmd(log, sleep=0.6):
+        return f"{py} {probe} {log} {sleep}"
+
+    waits = []
+    class Catch(logging.Handler):
+        def emit(self, rec):
+            waits.append(rec.getMessage())
+    vlog = logging.getLogger("silkworm.verify")
+    handler = Catch(); vlog.addHandler(handler)
+    saved_level = vlog.level; vlog.setLevel(logging.INFO)
+    try:
+        # Same project: the second run queues behind the first.
+        log = d / "same.log"
+        ts = [threading.Thread(target=V.run, args=(cmd(log), d),
+                               kwargs={"project": "cadence"}, daemon=True)
+              for _ in range(2)]
+        for t in ts: t.start()
+        for t in ts: t.join(20)
+        ev = _suite_events(log)
+        check("two runs of one project's suite never overlap",
+              len(ev) == 4 and _never_overlapped(ev), f"got {ev}")
+        check("and the one that waited says so in the log",
+              any("waiting on another run" in m and "cadence" in m for m in waits),
+              f"got {waits}")
+
+        # Different projects: nothing shared, so nothing queued.
+        log2 = d / "diff.log"
+        ts = [threading.Thread(target=V.run, args=(cmd(log2), d),
+                               kwargs={"project": p}, daemon=True)
+              for p in ("cadence", "trader")]
+        for t in ts: t.start()
+        for t in ts: t.join(20)
+        ev = _suite_events(log2)
+        check("two different projects' suites still run at once",
+              ev == ["start", "start", "end", "end"], f"got {ev}")
+    finally:
+        vlog.removeHandler(handler); vlog.setLevel(saved_level)
+
+    # --- and a landing, holding repo_guard, cannot deadlock against it ----------
+    # Three at once on one project: a verification in a task's own checkout,
+    # an unisolated turn that holds the shared checkout's repo_guard and then
+    # verifies, and a landing that takes repo_guard and runs the suite twice.
+    import merge as M
+    import worktrees as W
+    import branches as B
+    G = _repo_guard_impl()
+    root = Path(tempfile.mkdtemp())
+    saved_root, W.ROOT = W.ROOT, root / "wts"
+    try:
+        repo = root / "repo"; repo.mkdir()
+        def git(*a):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a],
+                                  capture_output=True, text=True)
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        git("checkout", "-q", "-b", "silkworm/tsk_lands")
+        (repo / "work.txt").write_text("work\n")
+        git("add", "-A"); git("commit", "-q", "-m", "the work")
+        git("checkout", "-q", "main")
+        elsewhere = root / "own-checkout"; elsewhere.mkdir()
+        (elsewhere / ".slow").write_text("")
+
+        log3 = root / "suite.log"
+        proj = {"auto_merge": True, "test_cmd": cmd(log3, 0.5)}
+        ns = {"project_store": types.SimpleNamespace(get=lambda slug: proj),
+              "worktrees": W, "merge": M, "branches": B, "verify": V,
+              "log": logging.getLogger("test"), "repo_guard": G.repo_guard,
+              "record_landing": lambda *a, **k: None}
+        got = _bot_fns({"land_if_ready", "landing_enabled", "verify_work",
+                        "LANDING_UNDERWAY"}, ns)
+        check("the landing and the verification were lifted out of bot.py",
+              {"land_if_ready", "verify_work"} <= got, str(sorted(got)))
+        task = {"id": "tsk_lands", "project": "cadence", "verified": True,
+                "scope": {"cwd": str(repo), "branch": "main"}}
+        out = {}
+
+        def verifying():
+            out["own"] = ns["verify_work"]({"id": "tsk_v", "project": "cadence"},
+                                           elsewhere)
+
+        def unisolated_turn():
+            with G.repo_guard(str(repo)):
+                out["turn"] = ns["verify_work"]({"id": "tsk_u", "project": "cadence"},
+                                                repo)
+
+        def landing():
+            out["land"] = ns["land_if_ready"](task)
+
+        first = threading.Thread(target=verifying, daemon=True)
+        first.start()
+        deadline = time.time() + 10
+        while not _suite_events(log3) and time.time() < deadline:
+            time.sleep(0.02)                     # the suite is now running
+        # The landing first, and only once it holds the checkout does the turn
+        # start: the landing then waits on the suite's lock while holding
+        # repo_guard, and the turn waits on repo_guard -- the shape a cycle
+        # would need.
+        rest = [threading.Thread(target=f, daemon=True)
+                for f in (landing, unisolated_turn)]
+        rest[0].start()
+        guard = G._repo_lock(str(repo))
+        while not guard.locked() and time.time() < deadline:
+            time.sleep(0.01)
+        rest[1].start()
+        for t in [first, *rest]: t.join(30)
+        stuck = [t for t in [first, *rest] if t.is_alive()]
+        check("a landing inside repo_guard does not deadlock with waiting runs",
+              not stuck, f"{len(stuck)} thread(s) still waiting after 30s")
+        ev = _suite_events(log3)
+        check("and none of the four runs for that project overlapped",
+              len(ev) == 8 and _never_overlapped(ev), f"got {ev}")
+        check("the landing still landed",
+              (out.get("land") or {}).get("landed") is True, f"got {out.get('land')!r}")
+    finally:
+        W.ROOT = saved_root
+
+    # The landing takes the lock only through verify.run, inside repo_guard.
+    # Holding it around repo_guard instead is the inverted order that would
+    # deadlock against an unisolated turn above.
+    takes = [n.lineno for n in ast.walk(ast.parse((BASE / "bot.py").read_text()))
+             if isinstance(n, ast.Call)
+             and "project_lock" in (getattr(n.func, "attr", None),
+                                    getattr(n.func, "id", None))]
+    check("bot.py never takes a project's test lock except through verify.run",
+          not takes, f"called at line(s) {takes}")
+
+
+def test_a_simulator_that_would_not_launch_gets_one_more_go():
+    import verify as V
+    print("\na landing retries a suite that failed to launch, once")
+
+    d = Path(tempfile.mkdtemp())
+    flaky = d / "flaky.py"; flaky.write_text(_FLAKY)
+    runs = iter(range(1000))
+
+    def attempt(mode, **kw):
+        counter = d / f"n{next(runs)}"
+        r = V.run(f"{sys.executable} {flaky} {counter} {mode}", d,
+                  project="cadence", **kw)
+        return r, int(counter.read_text())
+
+    r, n = attempt("launch-once", retry_launch=True)
+    check("a launch failure is run once more, and the second run counts",
+          r["ok"] and n == 2, f"ok={r['ok']} runs={n}")
+    r, n = attempt("launch-always", retry_launch=True)
+    check("but only once: a simulator that never comes up still refuses",
+          not r["ok"] and n == 2, f"ok={r['ok']} runs={n}")
+    r, n = attempt("test-fail", retry_launch=True)
+    check("a real test failure is never retried",
+          not r["ok"] and n == 1, f"ok={r['ok']} runs={n}")
+    r, n = attempt("launch-once")
+    check("and nothing is retried unless the caller asks",
+          not r["ok"] and n == 1, f"ok={r['ok']} runs={n}")
+
+    for said in ("Application failed preflight checks",
+                 "Unable to boot the Simulator.",
+                 "CoreSimulatorService connection became invalid",
+                 "Failed to install or launch the test runner"):
+        r = V.run(f"{sys.executable} -c \"print('{said}'); raise SystemExit(65)\"", d)
+        check(f"recognised as a launch failure: {said!r}", V.launch_failure(r))
+    r = V.run(f"{sys.executable} -c \"print('Unable to boot'); raise SystemExit(0)\"", d)
+    check("a passing run is never a launch failure", not V.launch_failure(r))
+
+    # Wired where it matters: the landing retries, verification does not.
+    import merge as M
+    import worktrees as W
+    import branches as B
+    root = Path(tempfile.mkdtemp())
+    saved_root, W.ROOT = W.ROOT, root / "wts"
+    try:
+        repo = root / "repo"; repo.mkdir()
+        def git(*a):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a],
+                                  capture_output=True, text=True)
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        git("checkout", "-q", "-b", "silkworm/tsk_flaky")
+        (repo / "work.txt").write_text("work\n")
+        git("add", "-A"); git("commit", "-q", "-m", "the work")
+        git("checkout", "-q", "main")
+        counter = root / "count"
+        proj = {"auto_merge": True,
+                "test_cmd": f"{sys.executable} {flaky} {counter} launch-once"}
+        ns = {"project_store": types.SimpleNamespace(get=lambda slug: proj),
+              "worktrees": W, "merge": M, "branches": B, "verify": V,
+              "log": logging.getLogger("test"),
+              "repo_guard": lambda *a, **k: contextlib.nullcontext(),
+              "record_landing": lambda *a, **k: None}
+        _bot_fns({"land_if_ready", "landing_enabled", "verify_work",
+                  "LANDING_UNDERWAY"}, ns)
+        r = ns["land_if_ready"]({"id": "tsk_flaky", "project": "cadence",
+                                 "verified": True,
+                                 "scope": {"cwd": str(repo), "branch": "main"}})
+        check("a landing whose simulator failed to launch once still lands",
+              r.get("landed") is True, f"got {r.get('stage')}: {r.get('detail', '')[-200:]}")
+        check("having run the suite three times: retry, then after the merge",
+              counter.read_text() == "3", f"runs={counter.read_text()}")
+
+        counter.unlink()
+        r = ns["verify_work"]({"id": "tsk_v", "project": "cadence"}, repo)
+        check("verifying an implementor's work does not retry",
+              not r["ok"] and counter.read_text() == "1", f"runs={counter.read_text()}")
+    finally:
+        W.ROOT = saved_root
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:
@@ -13605,4 +13879,5 @@ if __name__ == "__main__":
     for f in FAILED:
         print(f"  FAILED: {f}")
     sys.exit(1 if FAILED else 0)
+
 

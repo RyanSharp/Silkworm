@@ -280,6 +280,10 @@ def repo_guard(cwd, progress=None):
     all and holds it for two full suite runs, which is the point -- a live turn
     in the same checkout waits rather than editing under a rebase -- and it
     never goes on to want a thread lock, so there is still no cycle.
+
+    A landing's test runs also take verify.project_lock, inside this one. That
+    lock is innermost everywhere -- nothing is acquired while it is held -- so a
+    verification waiting on it never comes back for a checkout.
     """
     lock = _repo_lock(cwd)
     if lock is None:
@@ -3091,7 +3095,10 @@ def verify_work(task: dict, cwd) -> dict:
         return {"ran": False, "ok": False, "code": None,
                 "output": "no test command is configured for this project"}
     log.info("verifying %s with %r in %s", task["id"], cmd, cwd)
-    return verify.run(cmd, cwd)
+    # Queued behind any other run of this project's suite -- a landing's,
+    # most often. Not retried on a launch failure: a failure here sends the
+    # work back for another attempt rather than rolling anything back.
+    return verify.run(cmd, cwd, project=task.get("project"))
 
 
 def send_back_for_tests(task: dict, result: dict, channel: str, thread_ts: str) -> bool:
@@ -3696,7 +3703,12 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
                 "branch": branch, "detail": f"could not check out {branch}"}
 
     def run_tests(where):
-        return verify.run(proj["test_cmd"], where)
+        # One run of a project's suite at a time, and a launch failure -- the
+        # simulator, not the code -- gets one more go before it refuses and
+        # rolls the landing back. Taken inside repo_guard below; see
+        # verify.project_lock for why that order cannot deadlock.
+        return verify.run(proj["test_cmd"], where, project=task.get("project"),
+                          retry_launch=True)
 
     def on_merge(base_name, before):
         # What clear_interrupted_landings needs if a restart lands between the
