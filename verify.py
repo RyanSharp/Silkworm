@@ -43,8 +43,17 @@ LAUNCH_FAILURES = re.compile(
 
 #: ...unless a test actually ran and failed. CoreSimulator in particular is
 #: printed beside ordinary failures too, and retrying one of those could land
-#: a flaky test on its second roll.
-TEST_FAILURES = re.compile(r"Test Case '[^']*' failed|XCTAssert\w* failed")
+#: a flaky test on its second roll. Both frameworks: XCTest ("Test Case '-[T t]'
+#: failed", "XCTAssertEqual failed"), and Swift Testing, which xcodebuild
+#: reports as "Test case 'T/t()' failed" and `swift test` as "Test t() recorded
+#: an issue" / "Test t() failed after 0.1 seconds". The run summary ("Test run
+#: with 3 tests failed after") is left out: it says nothing about whether any
+#: test got as far as running.
+TEST_FAILURES = re.compile(
+    r"Test Case '[^']*' failed"
+    r"|XCTAssert\w* failed"
+    r"|\bTest (?!run with )\S.*? (?:recorded an issue|failed after)",
+    re.IGNORECASE)
 
 #: One lock per project, around every run of that project's suite.
 _project_locks: dict[str, threading.Lock] = {}

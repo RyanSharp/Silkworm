@@ -14003,6 +14003,23 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
               f"raise SystemExit(65)\"", d)
     check("a run in which a test failed is not a launch failure, whatever else it says",
           r["ran"] and not r["ok"] and not V.launch_failure(r), r["output"][-200:])
+    # The same for Swift Testing, whose failures read differently from
+    # XCTest's: under xcodebuild, and under `swift test`.
+    for said in ("Test case 'Suite/foo()' failed on 'iPhone 17' (0.1 seconds)",
+                 "\u2718 Test foo() recorded an issue at T.swift:3:5: Expectation failed",
+                 "\u2718 Test foo() failed after 0.002 seconds with 1 issue."):
+        out = d / "swift-testing.txt"
+        out.write_text(f"CoreSimulator: noise\n{said}\n", encoding="utf-8")
+        r = V.run(f"{sys.executable} -c \"import sys; "
+                  f"sys.stdout.write(open(sys.argv[1], encoding='utf-8').read()); "
+                  f"raise SystemExit(65)\" {out}", d)
+        check(f"a Swift Testing failure is not a launch failure: {said!r}",
+              r["ran"] and not r["ok"] and not V.launch_failure(r), r["output"][-200:])
+    # ...but a run summary alone is not evidence that any test ran.
+    check("a bare run summary does not count as a test failing",
+          not V.TEST_FAILURES.search("Test run with 0 tests failed after 0.001 seconds"))
+    check("nor does xcodebuild's own 'Testing failed:' header",
+          not V.TEST_FAILURES.search("Testing failed:\n\tApplication failed preflight checks"))
 
     # Wired where it matters: the landing retries, verification does not.
     import merge as M
