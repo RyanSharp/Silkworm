@@ -13772,7 +13772,9 @@ def test_one_suite_run_per_project_at_a_time():
 
         log3 = root / "suite.log"
         proj = {"auto_merge": True, "test_cmd": cmd(log3, 0.5)}
-        ns = {"project_store": types.SimpleNamespace(get=lambda slug: proj),
+        proj["scope"] = {"cwd": str(repo), "branch": "main"}
+        ns = {"project_store": types.SimpleNamespace(
+                  get=lambda slug: proj, scope_for=lambda slug: dict(proj["scope"])),
               "worktrees": W, "merge": M, "branches": B, "verify": V,
               "log": logging.getLogger("test"), "repo_guard": G.repo_guard,
               "record_landing": lambda *a, **k: None}
@@ -13918,7 +13920,9 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
         counter = root / "count"
         proj = {"auto_merge": True,
                 "test_cmd": f"{sys.executable} {flaky} {counter} launch-once"}
-        ns = {"project_store": types.SimpleNamespace(get=lambda slug: proj),
+        proj["scope"] = {"cwd": str(repo), "branch": "main"}
+        ns = {"project_store": types.SimpleNamespace(
+                  get=lambda slug: proj, scope_for=lambda slug: dict(proj["scope"])),
               "worktrees": W, "merge": M, "branches": B, "verify": V,
               "log": logging.getLogger("test"),
               "repo_guard": lambda *a, **k: contextlib.nullcontext(),
