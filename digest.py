@@ -277,12 +277,12 @@ def render(records, now: float, *, branch_rows=(), released=None,
     spent = {"usd": round(sum(f["usd"] for f in total.values()), 4),
              "complete": all(f["complete"] for f in total.values())}
     if not any(k != "cost" for s in data.values() for k in s):
-        tail = f" (spent {costs.fmt(spent)})" if total else ""
+        tail = f" (spent {costs.fmt(spent)} {costs.NOTE})" if total else ""
         return f":seedling: *Silkworm daily* · {day} — nothing happened in the last 24h{tail}."
 
     head = f":seedling: *Silkworm daily* · {day} · last 24h"
     if total:
-        head += f" · {costs.fmt(spent)} total"
+        head += f" · {costs.fmt(spent)} total {costs.NOTE}"
     lines = [head]
     for proj in sorted(data, key=lambda p: (p == UNFILED, p.lower())):
         sec = data[proj]

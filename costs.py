@@ -6,6 +6,9 @@ had spent this week without opening tasks.json. Fourteen days to 2026-10-01
 came to $5,602 of task turns, and the board that decides what runs next showed
 none of it.
 
+Every figure is an API-list-price equivalent (see NOTE), and a resumed turn's
+is the increase in its session's running total, not the total (turncost.py).
+
 A missing cost is unknown, never zero. A turn killed by a restart, or one
 recorded before costs were, did cost something; adding it as $0 would make a
 total read as complete when it is a floor. So every figure here travels with
@@ -15,6 +18,10 @@ whether it is complete, and is rendered with a `+` when it is not.
 import time
 
 import tasks
+
+#: Said wherever a total is shown: the bot runs on a subscription token, so
+#: these are what the API would have charged at list price, not a bill.
+NOTE = "at API list price, not billed"
 
 #: The window a project's total covers.
 WEEK_DAYS = 7
@@ -52,7 +59,13 @@ def add_run(rec: dict | None, usd, now: float | None = None) -> dict:
         # Spent before runs were dated: dated now by when the previous run
         # ended -- the last thing that happened before this run was claimed.
         runs = [[_previous_end(rec), prior]]
-    return {"cost": prior + usd, "cost_runs": runs + [[now, usd]]}
+    out = {"cost": prior + usd, "cost_runs": runs + [[now, usd]]}
+    # A rerun rewrites `result` whole; what the startup correction kept of
+    # the earlier runs (turncost.py) must survive it, or it is lost.
+    for kept in ("cost_uncorrected", "cost_runs_uncorrected"):
+        if kept in result:
+            out[kept] = result[kept]
+    return out
 
 
 def _previous_end(rec: dict):
@@ -192,4 +205,4 @@ def week_line(rows: dict, limit: int = 8) -> str:
     parts = [f"{p} {fmt(r)}" for p, r in ranked[:limit]]
     if len(ranked) > limit:
         parts.append(f"+{len(ranked) - limit} more")
-    return f"last {WEEK_DAYS}d: " + " · ".join(parts)
+    return f"last {WEEK_DAYS}d: " + " · ".join(parts) + f" ({NOTE})"

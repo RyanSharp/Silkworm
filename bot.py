@@ -61,6 +61,7 @@ import releases
 import retry
 import merge
 import summaries
+import turncost
 import verify
 import worktrees
 from approvals import ApprovalManager, describe_tool
@@ -212,6 +213,11 @@ UPLOADS_ROOT.mkdir(exist_ok=True)
 store = SessionStore(BASE_DIR / "sessions.json")
 task_store = tasks.TaskStore(BASE_DIR / "tasks.json")
 project_store = projects.ProjectStore(BASE_DIR / "projects.json")
+#: Written once the startup cost correction has run; see correct_costs_once.
+COST_CORRECTION_FILE = BASE_DIR / "cost_correction.json"
+#: Every cost Silkworm shows is what the API would have charged at list price.
+#: The bot runs on a subscription token, so none of it is a billed amount.
+COST_NOTE = "(API list-price equiv.)"
 # Created here, not beside its watchdog: /status reads it and the local server
 # starts long before the watchdog thread does.
 slack = slack_health.Health()
@@ -1254,7 +1260,7 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             say(text=(f"*Session* `{entry.get('session_id', '?')[:8]}…`\n"
                       f"model: `{entry.get('model') or CLAUDE_MODEL or 'default'}` · "
                       f"cwd: `{entry.get('cwd', CLAUDE_CWD)}`\n"
-                      f"turns: {entry.get('turns', 0)} · total cost: ${entry.get('cost', 0):.4f} · "
+                      f"turns: {entry.get('turns', 0)} · total cost: ${entry.get('cost', 0):.4f} {COST_NOTE} · "
                       f"last used {fmt_age(entry.get('updated', time.time()))}"),
                 thread_ts=thread_ts)
     elif lower == "!sessions":
@@ -1268,7 +1274,8 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                 name = v.get("title") or "thread"
                 link = f"<{slacklinks.thread_link(ch, ts)}|{name}>"
                 lines.append(f"• {link} — {v.get('turns', 0)} turns, ${v.get('cost', 0):.2f}, {fmt_age(v.get('updated', 0))}")
-            say(text=f"*Active sessions ({len(entries)}):*\n" + "\n".join(lines), thread_ts=thread_ts)
+            say(text=f"*Active sessions ({len(entries)}):* _costs {COST_NOTE}_\n"
+                     + "\n".join(lines), thread_ts=thread_ts)
     else:
         return False
     return True
@@ -2438,7 +2445,9 @@ def handle_prompt(event: dict, say, client) -> None:
 
                 RUNNER_HOLD.open()
                 store.update(key, session_id=result.session_id, model=entry.get("model"), cwd=str(cwd))
-                store.add_cost(key, result.cost_usd)
+                # The result reports the session's running total; what this
+                # turn cost is the increase since its last one (turncost.py).
+                turn_cost = store.add_cost(key, result.cost_usd, result.session_id)
                 if session_id is None and not entry.get("title"):
                     threading.Thread(target=name_thread, args=(key, text, result.text),
                                      daemon=True, name="namer").start()
@@ -2450,7 +2459,7 @@ def handle_prompt(event: dict, say, client) -> None:
 
         total = (store.get(key) or {}).get("cost", 0.0)
         footer = (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
-                  f"${result.cost_usd:.4f} · thread total ${total:.2f}_")
+                  f"${turn_cost:.4f} · thread total ${total:.2f} {COST_NOTE}_")
         parts = chunk(to_mrkdwn(result.text))
         parts[-1] += footer
         progress.finalize(parts[0])
@@ -2466,7 +2475,8 @@ def handle_prompt(event: dict, say, client) -> None:
                       f"Asked: {text[:500]}\n\nAnswered: {result.text[:1500]}")
         task_store.update(task_id, session_id=result.session_id,
                           result={"text": result.text[:4000],
-                                  "cost": result.cost_usd,
+                                  "cost": turn_cost,
+                                  "cost_reported_total": result.cost_usd,
                                   "files_uploaded": uploaded})
         task_state(task_id, tasks.DONE)
         refresh_summary(key)
@@ -2971,7 +2981,7 @@ def execute_task(task: dict) -> None:
                 if not fresh:
                     store.update(key, session_id=result.session_id,
                                  cwd=str(home_cwd))
-                store.add_cost(key, result.cost_usd)
+                turn_cost = store.add_cost(key, result.cost_usd, result.session_id)
                 uploaded = upload_outbox(app.client, outbox, channel, thread_ts, key)
             finally:
                 shutil.rmtree(outbox, ignore_errors=True)
@@ -2984,7 +2994,8 @@ def execute_task(task: dict) -> None:
             # is the exact silence this whole mechanism exists to prevent.
             task_store.update(tid, session_id=result.session_id,
                               result={"text": defer.QUIET,
-                                      **costs.add_run(task_store.get(tid), result.cost_usd)})
+                                      **costs.add_run(task_store.get(tid), turn_cost),
+                                      "cost_reported_total": result.cost_usd})
             if task_store.has_pending_wakeup(key):
                 progress.delete()
                 task_state(tid, tasks.DONE, "nothing to report yet")
@@ -3048,7 +3059,7 @@ def execute_task(task: dict) -> None:
         verdict = ("\n\n" + verify.summary(checked)) if checked else ""
         parts = chunk(to_mrkdwn(result.text + wt_note + verdict))
         parts[-1] += (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
-                      f"${result.cost_usd:.4f} · thread total ${total:.2f}_")
+                      f"${turn_cost:.4f} · thread total ${total:.2f} {COST_NOTE}_")
         progress.finalize(parts[0])
         for part in parts[1:]:
             app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
@@ -3056,7 +3067,8 @@ def execute_task(task: dict) -> None:
         # the same id, and overwriting would report only its last run.
         task_store.update(tid, session_id=result.session_id,
                           result={"text": result.text[:4000],
-                                  **costs.add_run(task_store.get(tid), result.cost_usd),
+                                  **costs.add_run(task_store.get(tid), turn_cost),
+                                  "cost_reported_total": result.cost_usd,
                                   "files_uploaded": uploaded})
         if loose and send_back_uncommitted(task, loose, channel, thread_ts):
             return
@@ -4730,6 +4742,34 @@ def _watchdog() -> None:
             log.exception("watchdog sweep failed")
 
 
+def correct_costs_once(marker: Path | None = None) -> dict | None:
+    """Correct the costs recorded while resumed turns reported running totals.
+
+    Once: the marker file says it has run, and what it did. It is idempotent
+    anyway -- see turncost.plan -- so a lost marker repeats a no-op, never a
+    second correction. Through the stores, never by editing their files: the
+    stores hold the state in memory and would write the edit back over.
+    Runs before anything that could record a turn, so no new figure is
+    measured from a session total the correction has not yet recorded.
+    Never raises: a failure here must not keep the bot from starting.
+    """
+    marker = marker or COST_CORRECTION_FILE
+    if marker.exists():
+        return None
+    try:
+        summary = turncost.correct(task_store, store)
+        log.info("cost correction: %d task(s) changed; tasks $%.2f -> $%.2f, "
+                 "threads $%.2f -> $%.2f", summary["tasks_changed"],
+                 summary["tasks_before"], summary["tasks_after"],
+                 summary["threads_before"], summary["threads_after"])
+        jsonstore.save(marker, dict(summary, at=time.time(),
+                                    cutoff=turncost.CUTOFF))
+        return summary
+    except Exception:
+        log.exception("cost correction failed; it will be tried at next start")
+        return None
+
+
 def _sweep_pass() -> None:
     """Six-hourly tidy: empty session husks, finished tasks, yesterday's
     outboxes, and artifacts past their retention (artifacts.py).
@@ -4807,6 +4847,7 @@ def _harvester() -> None:
 
 
 if __name__ == "__main__":
+    correct_costs_once()
     reconcile_checkouts()
     install_git_guards()
     # Every long-lived loop is started through daemons.start, so /status can

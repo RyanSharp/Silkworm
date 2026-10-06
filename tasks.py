@@ -66,8 +66,13 @@ DRIVERS = ("inline", "queue")
 #: what stops a finished task with unmerged commits reading as plainly done, so
 #: throwing it away at fourteen days would only defer that silence rather than
 #: end it, and a refusal is worth keeping more than a success is. The reply text
-#: is the bulk, and once the work has landed nobody opens that again.
-RESULT_KEEPS = ("cost", "review", "landed", "landing")
+#: is the bulk, and once the work has landed nobody opens that again. The cost_*
+#: keys are the figure's provenance (turncost.py): when each run's money went,
+#: the session total it was differenced from, and the original a correction
+#: replaced -- dropping those would lose exactly what "nothing is lost" kept.
+RESULT_KEEPS = ("cost", "review", "landed", "landing",
+                "cost_runs", "cost_reported_total", "cost_uncorrected",
+                "cost_runs_uncorrected")
 
 #: States a blocker never comes back from on its own. A task waiting on one of
 #: these will never be released by it, so the store releases it instead; see
@@ -728,6 +733,34 @@ class TaskStore:
         if ids:
             log.info("compacted %d finished task(s) older than %sd", len(ids), days)
         return ids
+
+    def correct_costs(self, fields_by_id: dict) -> int:
+        """Merge recorded-cost corrections into tasks' `result`s. Returns how
+        many records changed.
+
+        For turncost.correct, once, at startup. `updated` is left alone: a
+        corrected figure is not activity, and cost windows date a record's
+        spend by it when nothing better is recorded.
+        """
+        with self._lock:
+            changed = []
+            for tid, fields in fields_by_id.items():
+                rec = self._data.get(tid)
+                result = rec.get("result") if rec else None
+                if not isinstance(result, dict):
+                    continue
+                if all(result.get(k) == v for k, v in fields.items()):
+                    continue
+                changed.append((tid, copy.deepcopy(result)))
+                result.update(copy.deepcopy(fields))
+            if changed:
+                try:
+                    self._save()
+                except BaseException:
+                    for tid, prior in changed:
+                        self._data[tid]["result"] = prior
+                    raise
+            return len(changed)
 
     def due_retries(self, now: float) -> list[str]:
         """Ids of blocked tasks whose retry time has arrived.

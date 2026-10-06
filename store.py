@@ -90,18 +90,104 @@ class SessionStore:
                 self._save()
             return n
 
-    def add_cost(self, key: str, cost: float) -> None:
+    def add_cost(self, key: str, reported: float, session_id: str | None = None) -> float:
+        """Record one turn on `key`, given the cost its result event reported.
+
+        That figure is the session's running total once a session is resumed
+        (turncost.py), so the turn's own cost is the increase since this
+        session's last turn -- found on this thread, or on whichever thread
+        last ran it. Returns the turn's cost, which is what is added here and
+        what the caller should record and show.
+        """
+        import turncost
         with self._lock:
             entry = self._data.setdefault(key, {})
-            entry["cost"] = round(entry.get("cost", 0.0) + (cost or 0.0), 6)
+            previous = None
+            if session_id:
+                previous = (entry.get("session_totals") or {}).get(session_id)
+                if previous is None:
+                    # The most recently written thread that knows it: one
+                    # handed between threads has its newest total there.
+                    for other in sorted(self._data.values(),
+                                        key=lambda e: -(e.get("updated") or 0)):
+                        seen = (other.get("session_totals") or {}).get(session_id)
+                        if seen is not None:
+                            previous = seen
+                            break
+            cost = turncost.per_turn(reported, previous)
+            if session_id:
+                totals = entry.setdefault("session_totals", {})
+                totals.pop(session_id, None)          # newest last
+                totals[session_id] = float(reported or 0.0)
+                # Never the thread's own session: reviewers run a fresh one on
+                # their parent's thread every round, and evicting the session
+                # it resumes would charge its whole running total again.
+                for old in list(totals)[:-turncost.KEEP_SESSIONS]:
+                    if old not in (session_id, entry.get("session_id")):
+                        del totals[old]
+            entry["cost"] = round(entry.get("cost", 0.0) + cost, 6)
             entry["turns"] = entry.get("turns", 0) + 1
             # Per-turn history, so a turn that costs wildly more than this
             # thread's norm can be spotted (a cache regression looks like this).
             costs = entry.setdefault("costs", [])
-            costs.append(round(cost or 0.0, 6))
+            costs.append(round(cost, 6))
             del costs[:-50]
             entry["updated"] = time.time()
             self._save()
+            return cost
+
+    def correct_costs(self, key: str, targets: dict, pairs=(), seeds=None) -> bool:
+        """Apply turncost.correct's correction to one thread. Returns whether
+        anything changed.
+
+        `targets` is {task id: how far the correction moves that task's cost
+        from its original}. What has been applied is kept per task
+        (`cost_corrections`), so the thread moves by the difference: a second
+        pass, or one retried after a failure part-way, moves it by nothing.
+        `pairs` are (recorded, corrected) per-turn figures, oldest first,
+        replaced in the 50-turn history where they are still found; `seeds`
+        are each session's last reported total, kept only where none is
+        recorded yet -- a newer one is from a turn this correction never saw.
+        Not activity, so `updated` is left alone.
+        """
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False
+            changed = False
+            applied = entry.setdefault("cost_corrections", {})
+            delta = round(sum(t - applied.get(tid, 0.0) for tid, t in targets.items()), 6)
+            for tid, t in targets.items():
+                if applied.get(tid) != t:
+                    applied[tid] = t
+                    changed = True
+            if delta:
+                total = round(entry.get("cost", 0.0) + delta, 6)
+                if total < 0:
+                    log.warning("%s: corrected cost went below zero (%.4f); "
+                                "its record predates some of its turns", key, total)
+                    total = 0.0
+                entry["cost"] = total
+                changed = True
+            costs = entry.get("costs") or []
+            i = len(costs) - 1
+            for cur, new in reversed(list(pairs)):
+                j = i
+                while j >= 0 and abs(costs[j] - round(cur, 6)) > 1e-9:
+                    j -= 1
+                if j < 0:
+                    continue                   # aged out of the history
+                costs[j] = round(new, 6)
+                changed = True
+                i = j - 1
+            totals = entry.setdefault("session_totals", {})
+            for sid, total in (seeds or {}).items():
+                if sid not in totals:
+                    totals[sid] = float(total)
+                    changed = True
+            if changed:
+                self._save()
+            return changed
 
     def add_event(self, key: str, kind: str, detail: str = "") -> None:
         """Record something notable that happened to this thread.
@@ -171,6 +257,7 @@ class SessionStore:
     #: resume, a terminal holding it, a binding you set, a redelivery guard, a
     #: decision to put it away. Between them, anything left is a husk.
     KEEPS = ("title", "summary", "cost", "turns", "costs", "files", "events",
+             "session_totals", "cost_corrections",
              "session_id", "previous_sessions", "pending", "checked_out",
              "terminal_live", "project", "last_msg_ts", "hidden")
 

@@ -621,7 +621,11 @@ def test_turn_is_a_task():
     check("task moves to running when Claude is invoked",
           "task_state(task_id, tasks.RUNNING)" in src)
     check("success records a result and completes",
-          "task_state(task_id, tasks.DONE)" in src and '"cost": result.cost_usd' in src)
+          "task_state(task_id, tasks.DONE)" in src and '"cost": turn_cost' in src)
+    # The reported figure is the session's running total (turncost.py), so
+    # the turn's own cost is what add_cost differenced it to.
+    check("and the turn's own cost, not the session's total",
+          '"cost": result.cost_usd' not in src)
     check("stop cancels rather than fails", "tasks.CANCELLED, \"stopped by the user\"" in src)
     # The OUTER handlers are the ones that end a turn; the inner ClaudeError
     # handler retries and must not mark anything failed.
@@ -14288,6 +14292,361 @@ def test_a_tasks_base_is_its_projects_current_base():
                              and any(getattr(t, "id", "") == "BOARD" for t in n.targets)))
     check("so does the board's unmerged line",
           "scope_for=project_store.scope_for" in board)
+
+
+# --- a turn costs its own increase, not the session's running total ---------------
+
+def test_a_resumed_turn_records_its_own_cost():
+    """`claude -p --resume` reports the session's running total since 2.1.277.
+
+    Measured 2026-10-06 on haiku: $0.016031 fresh, $0.018464 resumed (that
+    turn cost 0.002433), $0.020879 next (0.002415). Each figure was recorded
+    as the turn's cost and added to the thread, so every resumed turn
+    re-counted all earlier ones: $12,234 recorded in a week against ~$912.
+    """
+    print("\na resumed turn records its own cost")
+    st = tmp_store()
+    got = [st.add_cost("C:1", r, "s1") for r in (0.016031, 0.018464, 0.020879)]
+    check("a new session's turn costs what it reported",
+          abs(got[0] - 0.016031) < 1e-9, str(got))
+    check("each resumed turn costs the increase in the session's total",
+          abs(got[1] - 0.002433) < 1e-9 and abs(got[2] - 0.002415) < 1e-9, str(got))
+    entry = st.get("C:1")
+    check("so the thread's total is the session's total, not their sum",
+          abs(entry["cost"] - 0.020879) < 1e-9 and entry["turns"] == 3, str(entry["cost"]))
+    check("and its per-turn history holds per-turn figures",
+          entry["costs"] == [0.016031, 0.002433, 0.002415], str(entry["costs"]))
+    check("the session's last reported total is kept on the thread",
+          entry.get("session_totals") == {"s1": 0.020879}, str(entry.get("session_totals")))
+    # A new session on the same thread (a reset, a lost transcript, a fresh
+    # reviewer) is never differenced against the old one.
+    check("a different session on the same thread is not differenced",
+          st.add_cost("C:1", 0.5, "s2") == 0.5)
+    check("nor is a session whose total went down",
+          st.add_cost("C:1", 0.001, "s1") == 0.001)
+    check("nor a turn with no session id",
+          st.add_cost("C:1", 0.25) == 0.25)
+    # Durable: the previous total survives a restart.
+    again = SessionStore(st._path)
+    check("the difference survives a restart",
+          abs(again.add_cost("C:1", 0.004, "s1") - 0.003) < 1e-9)
+    check("and a session resumed from another thread is measured from where it was",
+          abs(again.add_cost("C:other", 0.010, "s1") - 0.006) < 1e-9)
+    for i in range(60):
+        again.add_cost("C:1", 1.0, f"x{i}")
+    check("the remembered sessions are bounded, newest kept",
+          len(again.get("C:1")["session_totals"]) == 50
+          and "x59" in again.get("C:1")["session_totals"])
+    # Reviewers run a fresh session on their parent's thread every round:
+    # however many, the session the thread resumes must not be forgotten.
+    busy = tmp_store()
+    busy.update("C:busy", session_id="main")
+    busy.add_cost("C:busy", 1.0, "main")
+    for i in range(80):
+        busy.add_cost("C:busy", 0.1, f"review{i}")
+    check("the thread's own session outlives any number of fresh ones",
+          abs(busy.add_cost("C:busy", 1.25, "main") - 0.25) < 1e-9,
+          str(sorted(busy.get("C:busy")["session_totals"])[:3]))
+
+
+def test_execute_task_records_a_runs_own_cost():
+    """A task sent back resumes its session; its second run reported the
+    session's total, and that total was added to the first run's."""
+    print("\na task's rerun records its own cost")
+    import threading
+    import roles
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    sessions = tmp_store()
+    root = Path(tempfile.mkdtemp())
+    rec = st.create("answer twice", role="assistant", project="p", thread="C1:1.0",
+                    driver="queue", isolate=False, scope={"cwd": str(root)})
+    reported = iter([1.5, 3.5])
+    footers = []
+
+    def run_turn(goal, **kw):
+        return types.SimpleNamespace(text="done", cost_usd=next(reported),
+                                     duration_ms=1, session_id="s")
+    fn = _bot_func("execute_task", tasks=T, task_store=st, store=sessions,
+                   roles=roles, Path=Path, run_turn=run_turn,
+                   review_branch=lambda t: "", worktrees=__import__("worktrees"),
+                   OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+                   permission_args=lambda: [], log=logging.getLogger("test"),
+                   task_thread=lambda t: ("C1", "1.0"), task_key=lambda t: "C1:1.0",
+                   task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+                   _thread_lock=lambda key: threading.Lock(),
+                   repo_guard=lambda *a, **k: contextlib.nullcontext(),
+                   render_block=lambda _: "", chunk=lambda text: [text],
+                   to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+                   upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+                   COST_NOTE="(list)", ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError)
+    progress = fn.__globals__["ProgressMessage"]
+    for _ in range(2):
+        st.transition(rec["id"], T.RUNNING, "claimed")
+        fn(st.get(rec["id"]))
+        if st.get(rec["id"])["state"] != T.DONE:
+            break
+        with st._lock:               # sent back: done is terminal, so by hand
+            st._data[rec["id"]]["state"] = T.QUEUED
+    for c in progress.return_value.finalize.call_args_list:
+        footers.append(c.args[0])
+    got = (st.get(rec["id"]).get("result") or {})
+    check("the second run adds its increase, not the session total",
+          got.get("cost") == 3.5 and [r[1] for r in got.get("cost_runs") or []] == [1.5, 2.0],
+          str(got))
+    check("and the reported total is kept beside it",
+          got.get("cost_reported_total") == 3.5, str(got))
+    check("the footer shows the run's own cost",
+          any("$2.0000 · thread total $3.50 (list)" in f for f in footers), str(footers))
+
+
+def test_every_reported_cost_goes_through_the_session_difference():
+    """`result.cost_usd` is a session total; anywhere it is used as a turn's
+    cost re-counts every earlier turn. It may only be handed to add_cost --
+    which differences it -- or kept as the raw `cost_reported_total`."""
+    print("\nevery reported cost is differenced")
+    tree = ast.parse((BASE / "bot.py").read_text())
+    ok_ids, uses = set(), []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == "store.add_cost":
+            if len(n.args) >= 3 and ast.unparse(n.args[2]) == "result.session_id":
+                ok_ids.add(id(n.args[1]))
+        if isinstance(n, ast.Dict):
+            for k, v in zip(n.keys, n.values):
+                if isinstance(k, ast.Constant) and k.value == "cost_reported_total":
+                    ok_ids.add(id(v))
+        if isinstance(n, ast.Attribute) and n.attr == "cost_usd":
+            uses.append(n)
+    stray = [n.lineno for n in uses if id(n) not in ok_ids]
+    check("a reported cost is only differenced or kept raw", uses and not stray,
+          f"used directly at lines {stray}")
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and ast.unparse(n.func) == "store.add_cost"]
+    check("every turn's add_cost names its session",
+          calls and all(len(c.args) >= 3 for c in calls), str([ast.unparse(c) for c in calls]))
+    footers = [n for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)
+               and "thread total" in ast.unparse(n)]
+    check("every footer says the figure is a list-price equivalent",
+          len(footers) == 2 and all("COST_NOTE" in ast.unparse(f) for f in footers),
+          str(len(footers)))
+
+
+def _cost_fixture(cut):
+    """A thread with a long conversation across the CLI change, a reworked
+    implementor, a reviewer run twice, and a turn recorded by the fixed code."""
+    def rec(tid, sid, at, cost, role="assistant", runs=None, **extra):
+        r = {"id": tid, "session_id": sid, "thread": "C:1", "role": role,
+             "state": "done", "created": at - 100, "updated": at,
+             "events": [{"kind": "running", "at": at - 50}, {"kind": "done", "at": at}],
+             "result": {"text": "x", "cost": cost}}
+        if runs:
+            r["result"]["cost_runs"] = runs
+        r["result"].update(extra)
+        return r
+    recs = [
+        rec("t1", "conv", cut - 100, 2.0),      # before the change: own costs
+        rec("t2", "conv", cut - 50, 3.0),
+        rec("t3", "conv", cut + 100, 1.0),      # after: running totals
+        rec("t4", "conv", cut + 200, 1.5),
+        rec("t5", "conv", cut + 300, 2.5),
+        rec("t6", "conv", cut + 400, 0.4),      # total went down: reset
+        rec("t7", "other", cut + 250, 0.7),     # a new session, same thread
+        rec("i1", "impl", cut + 600, 4.369, role="implementor",
+            runs=[[cut + 500, 1.7], [cut + 600, 2.669]]),
+        rec("r1", "rev2", cut + 600, 1.1, role="reviewer",
+            runs=[[cut + 500, 0.5], [cut + 600, 0.6]]),
+        # Its own 0.5, the session then at 0.9: differencing it again would
+        # make it 0.1.
+        rec("n1", "conv", cut + 900, 0.5, cost_reported_total=0.9),
+    ]
+    return recs
+
+
+def test_recorded_costs_are_corrected_once():
+    """The records written while resumed turns reported running totals are
+    corrected at startup: each post-change turn becomes its increase over the
+    session's previous post-change turn. Turns before the change reported
+    their own cost and are left alone; originals are kept."""
+    print("\nrecorded costs are corrected once")
+    import copy
+    import tasks as T
+    import turncost
+    cut = 1_000_000.0
+    d = Path(tempfile.mkdtemp())
+    raw = {r["id"]: r for r in _cost_fixture(cut)}
+    jsonstore = __import__("jsonstore")
+    jsonstore.save(d / "t.json", raw)
+    ts = T.TaskStore(d / "t.json")
+    ss = SessionStore(d / "s.json")
+    # The thread's history has one figure per turn, so a reworked task's
+    # runs are there separately.
+    recorded = [usd for r in sorted(raw.values(), key=lambda r: r["updated"])
+                for _, usd in (r["result"].get("cost_runs") or [(0, r["result"]["cost"])])]
+    ss.update("C:1", title="a thread", turns=len(recorded))
+    with ss._lock:
+        ss._data["C:1"].update(cost=round(sum(recorded), 6) + 10.0,  # +10 before tasks existed
+                               costs=[round(c, 6) for c in recorded],
+                               # n1 was recorded by the fixed code, which kept
+                               # its session's total: newer than any in the records.
+                               session_totals={"conv": 0.9})
+        ss._save()
+    before = copy.deepcopy(ts.all())
+    s = turncost.correct(ts, ss, cutoff=cut)
+    get = lambda tid: ts.get(tid)["result"]
+    check("turns before the change keep their own cost",
+          get("t1")["cost"] == 2.0 and get("t2")["cost"] == 3.0
+          and "cost_uncorrected" not in get("t1"), str(get("t1")))
+    check("the first turn after it keeps what it reported",
+          get("t3")["cost"] == 1.0, str(get("t3")))
+    check("later turns become the increase over the previous one",
+          get("t4")["cost"] == 0.5 and get("t5")["cost"] == 1.0,
+          str([get(t)["cost"] for t in ("t4", "t5")]))
+    check("a total that went down is not differenced",
+          get("t6")["cost"] == 0.4, str(get("t6")))
+    check("nor is another session in the same thread",
+          get("t7")["cost"] == 0.7, str(get("t7")))
+    check("a reworked task's runs are corrected run by run",
+          get("i1")["cost_runs"] == [[cut + 500, 1.7], [cut + 600, 0.969]]
+          and get("i1")["cost"] == 2.669, str(get("i1")))
+    check("a fresh role's earlier run was another session and is left alone",
+          get("r1")["cost"] == 1.1 and "cost_uncorrected" not in get("r1"), str(get("r1")))
+    check("a turn the fixed code recorded is not touched",
+          get("n1") == before["n1"]["result"], str(get("n1")))
+    check("originals are kept beside the corrections",
+          get("t5")["cost_uncorrected"] == 2.5
+          and get("i1")["cost_runs_uncorrected"] == [[cut + 500, 1.7], [cut + 600, 2.669]]
+          and get("i1")["cost_uncorrected"] == 4.369, str(get("i1")))
+    check("correcting a figure is not activity",
+          all(ts.get(t)["updated"] == before[t]["updated"] for t in before))
+    thread = ss.get("C:1")
+    task_sum = sum(r["result"]["cost"] for r in ts.all().values())
+    check("the thread's total is recomputed from its corrected turns",
+          abs(thread["cost"] - (task_sum + 10.0)) < 1e-6, f"{thread['cost']} vs {task_sum + 10}")
+    check("its per-turn history carries the corrected figures",
+          thread["costs"] == [2.0, 3.0, 1.0, 0.5, 0.7, 1.0, 0.4, 1.7, 0.969, 0.5, 0.6, 0.5],
+          str(thread["costs"]))
+    check("the summary logs the before and after",
+          s["tasks_changed"] == 3 and s["tasks_before"] > s["tasks_after"], str(s))
+    check("and each session's last total is recorded for the next turn, "
+          "never over a newer one",
+          thread["session_totals"] == {"conv": 0.9, "impl": 2.669, "rev2": 0.6, "other": 0.7},
+          str(thread.get("session_totals")))
+    # The next resumed turn of the conversation is measured from there.
+    check("so the next resumed turn is its own increase",
+          abs(ss.add_cost("C:1", 1.1, "conv") - 0.2) < 1e-9)
+    # Run again: nothing moves.
+    snap_t, snap_s = copy.deepcopy(ts.all()), copy.deepcopy(ss.all())
+    again = turncost.correct(ts, ss, cutoff=cut)
+    check("a second correction changes nothing", again["tasks_changed"] == 0
+          and ts.all() == snap_t and ss.all() == snap_s, str(again))
+    # A corrected turn sent back for another run: the rerun rewrites its
+    # result, and what the correction kept must survive -- or a later pass
+    # loses that turn from its session and re-measures the next one.
+    import costs as C
+    rerun = C.add_run(ts.get("t4"), 0.2, now=cut + 950)
+    ts.update("t4", result={"text": "again", **rerun, "cost_reported_total": 2.7})
+    check("a rerun keeps what the correction preserved",
+          get("t4")["cost_uncorrected"] == 1.5 and get("t4")["cost"] == 0.7, str(get("t4")))
+    snap_t, snap_s = copy.deepcopy(ts.all()), copy.deepcopy(ss.all())
+    third = turncost.correct(ts, ss, cutoff=cut)
+    check("and correcting again after it still changes nothing",
+          third["tasks_changed"] == 0 and ts.all() == snap_t and ss.all() == snap_s,
+          f"{third} t5={get('t5')}")
+    ts.update("t4", result=dict(get("t4"), cost=0.5, cost_runs=None))
+    # Costs read the same everywhere: the week's total is the tasks'.
+    import costs
+    recs = [dict(r, id=k) for k, r in ts.all().items()]
+    week = costs.by_project(recs, cut + 1000, days=1000 / 86400, unfiled="all")
+    post = sum(get(t)["cost"] for t in ("t3", "t4", "t5", "t6", "t7", "n1")) + 0.969 + 1.7 + 0.5 + 0.6
+    check("the week's spend reads the corrected figures",
+          abs(week["all"]["usd"] - post) < 1e-6, f"{week} vs {post}")
+
+
+def test_a_correction_interrupted_part_way_finishes_on_retry():
+    """tasks.json is saved before the threads are; a failure between them must
+    leave the retry with the threads still to move, not with nothing left."""
+    print("\na correction interrupted part-way finishes on retry")
+    import tasks as T
+    import turncost
+    cut = 1_000_000.0
+    d = Path(tempfile.mkdtemp())
+    raw = {r["id"]: r for r in _cost_fixture(cut)}
+    __import__("jsonstore").save(d / "t.json", raw)
+    ts = T.TaskStore(d / "t.json")
+    ss = SessionStore(d / "s.json")
+    original = round(sum(r["result"]["cost"] for r in raw.values()), 6)
+    ss.update("C:1", cost=original)
+    real = ss.correct_costs
+    ss.correct_costs = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        turncost.correct(ts, ss, cutoff=cut)
+    except OSError:
+        pass
+    ss.correct_costs = real
+    check("the tasks were corrected and the thread was not",
+          ts.get("t5")["result"]["cost"] == 1.0 and ss.get("C:1")["cost"] == original)
+    turncost.correct(ts, ss, cutoff=cut)
+    total = round(sum(r["result"]["cost"] for r in ts.all().values()), 6)
+    check("the retry moves the thread to agree with its tasks",
+          abs(ss.get("C:1")["cost"] - total) < 1e-6, f"{ss.get('C:1')['cost']} vs {total}")
+    turncost.correct(ts, ss, cutoff=cut)
+    check("and once there it stays", abs(ss.get("C:1")["cost"] - total) < 1e-6)
+
+
+def test_the_correction_runs_once_at_startup():
+    """Through the stores, before anything records a turn, and marked."""
+    print("\nthe cost correction runs once at startup")
+    import tasks as T
+    import turncost
+    cut = turncost.CUTOFF
+    d = Path(tempfile.mkdtemp())
+    __import__("jsonstore").save(d / "t.json", {r["id"]: r for r in _cost_fixture(cut)})
+    ts = T.TaskStore(d / "t.json")
+    ss = SessionStore(d / "s.json")
+    ns = {"task_store": ts, "store": ss, "turncost": turncost,
+          "jsonstore": __import__("jsonstore"), "COST_CORRECTION_FILE": d / "marker.json",
+          "log": logging.getLogger("test"), "time": time, "Path": Path}
+    _bot_fns({"correct_costs_once"}, ns)
+    first = ns["correct_costs_once"]()
+    check("the first start corrects", first and first["tasks_changed"] == 3, str(first))
+    check("and marks that it has", (d / "marker.json").exists())
+    ts.update("t5", result=dict(ts.get("t5")["result"], cost=99.0))
+    check("a later start does not run it again",
+          ns["correct_costs_once"]() is None and ts.get("t5")["result"]["cost"] == 99.0)
+    tree = ast.parse((BASE / "bot.py").read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.If)
+                and "__main__" in ast.unparse(n.test))
+    first_call = ast.unparse(main.body[0])
+    check("it is the first thing the bot does", first_call == "correct_costs_once()", first_call)
+    broken = dict(ns, turncost=types.SimpleNamespace(
+        correct=lambda *a: (_ for _ in ()).throw(OSError("disk")), CUTOFF=0))
+    broken["COST_CORRECTION_FILE"] = d / "other.json"
+    broken["log"] = logging.getLogger("test.expected-failure")
+    broken["log"].disabled = True
+    _bot_fns({"correct_costs_once"}, broken)
+    check("a failure does not stop the bot, and is retried next start",
+          broken["correct_costs_once"]() is None and not (d / "other.json").exists())
+
+
+def test_costs_say_they_are_list_price():
+    """The bot runs on a subscription token: its costs are what the API would
+    charge at list price, not a bill, and every place showing one says so."""
+    print("\ncosts say they are list price")
+    import costs
+    import digest
+    line = costs.week_line({"p": {"usd": 3.0, "complete": True, "tasks": 1}})
+    check("the board's week says so", "API list price" in line, line)
+    rec = {"id": "a", "project": "p", "state": "done", "created": 100, "updated": 200,
+           "result": {"cost": 1.0}}
+    text = digest.render([rec], 300)
+    check("the digest says so", "API list price" in text, text)
+    src = (BASE / "digest.py").read_text()
+    check("on a busy day as well as a quiet one",
+          src.count("{costs.NOTE}") == 2, str(src.count("{costs.NOTE}")))
+    viz = (BASE / "visualizer.py").read_text()
+    check("the dashboard's total and task costs say so",
+          "total spend (API list price)" in viz
+          and "(API list-price equivalent, not billed)" in viz)
 
 
 if __name__ == "__main__":

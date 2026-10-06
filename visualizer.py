@@ -947,7 +947,7 @@ function renderDash() {
   const s = statsCache; if (!s) return;
   const tiles = `
     <div class="tiles">
-      <div class="tile"><div class="n">$${s.total_cost.toFixed(2)}</div><div class="l">total spend</div></div>
+      <div class="tile"><div class="n">$${s.total_cost.toFixed(2)}</div><div class="l" title="what the API would charge at list price; this bot runs on a subscription token">total spend (API list price)</div></div>
       <div class="tile"><div class="n">${fmtTok(s.days.reduce((a,d)=>a+d.cache_read+d.fresh_in+d.out,0))}</div><div class="l">tokens · 14d</div></div>
       <div class="tile"><div class="n">${s.cache_rate == null ? "—" : s.cache_rate + "%"}</div><div class="l">cache hit rate</div></div>
       <div class="tile"><div class="n">${s.threads}</div><div class="l">threads</div></div>
@@ -1088,7 +1088,7 @@ async function loadList() {
       <div class="subkey">${esc(s.key)}</div>
       ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
       <div class="meta"><span><b>${s.turns}</b> turns</span>
-      <span><b>$${(s.cost||0).toFixed(2)}</b></span>
+      <span title="API list-price equivalent, not billed"><b>$${(s.cost||0).toFixed(2)}</b></span>
       <span>${esc(s.model || "default")}</span>
       <span>${age(s.updated)}</span>
       ${s.files ? `<span>📎 ${s.files}</span>` : ""}</div>`;
@@ -1538,7 +1538,7 @@ function costText(t) {
   if (!usd && !c.complete) return ` · <span title="cost not recorded">$?</span>`;
   const s = usd >= 100 ? `$${Math.round(usd).toLocaleString("en-US")}` : `$${usd.toFixed(2)}`;
   return ` · <span title="${c.complete ? "this task and its reviews"
-    : "a lower bound: some runs recorded no cost"}">${s}${c.complete ? "" : "+"}</span>`;
+    : "a lower bound: some runs recorded no cost"} (API list-price equivalent, not billed)">${s}${c.complete ? "" : "+"}</span>`;
 }
 function taskButtons(t) {
   const b = [];

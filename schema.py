@@ -36,8 +36,12 @@ FIELDS: dict[str, tuple] = {
     "summary_ts":        ("",    "transcript timestamp the summary was written from"),
     "summary_turns":     (None,  "turn count when summarised; None = unknown, not 0"),
     "turns":             (0,     "completed turns"),
-    "cost":              (0.0,   "total USD spent on this thread"),
+    "cost":              (0.0,   "total USD spent on this thread (API list-price equivalent)"),
     "costs":             (list,  "per-turn USD, newest last, capped at 50"),
+    # A resumed session reports its running total, not the turn's cost
+    # (turncost.py); the last total per session is what a turn is measured from.
+    "session_totals":    (dict,  "{session id: last reported running total USD}"),
+    "cost_corrections":  (dict,  "{task id: USD the one-off cost correction moved it by}"),
     "files":             (list,  "files exchanged with this thread"),
     "events":            (list,  "notable occurrences (recovered, reaped, ...), capped at 50"),
     "updated":           (0.0,   "unix time of the last write"),
