@@ -4981,7 +4981,9 @@ def correct_costs_once(marker: Path | None = None) -> dict | None:
     stores hold the state in memory and would write the edit back over.
     Runs before anything that could record a turn, so no new figure is
     measured from a session total the correction has not yet recorded.
-    Never raises: a failure here must not keep the bot from starting.
+    Never raises: a failure here must not keep the bot from starting. If the
+    correction fails, the session totals it would have seeded are still
+    recorded (turncost.seed), so new turns are measured right meanwhile.
     """
     marker = marker or COST_CORRECTION_FILE
     if marker.exists():
@@ -4997,7 +4999,15 @@ def correct_costs_once(marker: Path | None = None) -> dict | None:
         return summary
     except Exception:
         log.exception("cost correction failed; it will be tried at next start")
-        return None
+    # Without each session's last total, every thread's first resumed turn
+    # would be charged that session's whole running total until a restart
+    # retried. Seeding never overwrites a newer total, so it is safe alone.
+    try:
+        n = turncost.seed(task_store, store)
+        log.info("cost correction failed; seeded the session totals of %d thread(s)", n)
+    except Exception:
+        log.exception("seeding session totals failed too")
+    return None
 
 
 def _sweep_pass() -> None:

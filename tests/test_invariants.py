@@ -14867,6 +14867,58 @@ def test_the_correction_runs_once_at_startup():
           broken["correct_costs_once"]() is None and not (d / "other.json").exists())
 
 
+def test_a_failed_correction_still_seeds_session_totals():
+    """If the correction fails at startup the bot runs on; each session's last
+    total must still be recorded, or every thread's first resumed turn is
+    charged that session's whole running total until the next restart."""
+    print("\na failed correction still seeds session totals")
+    import tasks as T
+    import turncost
+    cut = turncost.CUTOFF
+    d = Path(tempfile.mkdtemp())
+    raw = {r["id"]: r for r in _cost_fixture(cut)}
+    __import__("jsonstore").save(d / "t.json", raw)
+    ts = T.TaskStore(d / "t.json")
+    ss = SessionStore(d / "s.json")
+    ss.update("C:1", title="a thread", cost=5.0)
+    with ss._lock:
+        ss._data["C:1"]["session_totals"] = {"conv": 0.9}   # newer, from the fixed code
+        ss._save()
+    check("the seeds are the ones the correction plans",
+          turncost.seeds(ts.all(), cut)
+          == {k: th["seeds"] for k, th in turncost.plan(ts.all(), cut)["threads"].items()},
+          str(turncost.seeds(ts.all(), cut)))
+    failing = types.SimpleNamespace(
+        correct=lambda *a: (_ for _ in ()).throw(OSError("disk")),
+        seed=turncost.seed, CUTOFF=cut)
+    ns = {"task_store": ts, "store": ss, "turncost": failing,
+          "jsonstore": __import__("jsonstore"), "COST_CORRECTION_FILE": d / "marker.json",
+          "log": logging.getLogger("test.expected-failure"), "time": time, "Path": Path}
+    ns["log"].disabled = True
+    _bot_fns({"correct_costs_once"}, ns)
+    check("the failure is not marked as done",
+          ns["correct_costs_once"]() is None and not (d / "marker.json").exists())
+    thread = ss.get("C:1")
+    check("each session's last total is recorded, never over a newer one",
+          thread["session_totals"] == {"conv": 0.9, "impl": 2.669, "rev2": 0.6, "other": 0.7},
+          str(thread.get("session_totals")))
+    check("no cost was moved",
+          thread["cost"] == 5.0 and not thread.get("cost_corrections"), str(thread))
+    check("so the next resumed turn is its own increase",
+          abs(ss.add_cost("C:1", 2.9, "impl") - 0.231) < 1e-9)
+    bad = dict(raw, junk={"id": "junk", "session_id": "x", "thread": "C:1",
+                          "result": {"cost": 1.0, "cost_runs": [[1, 2.0]],
+                                     "cost_uncorrected": 1.0, "cost_runs_uncorrected": 7}})
+    try:
+        turncost.plan(bad, cut)
+        planned_raises = False
+    except Exception:
+        planned_raises = True
+    check("(the bad record really is one the correction cannot read)", planned_raises)
+    check("one unreadable record does not cost the others their seeds",
+          "conv" in turncost.seeds(bad, cut).get("C:1", {}))
+
+
 def test_costs_say_they_are_list_price():
     """The bot runs on a subscription token: its costs are what the API would
     charge at list price, not a bill, and every place showing one says so."""

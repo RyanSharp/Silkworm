@@ -126,15 +126,12 @@ def plan(records: dict, cutoff: float = CUTOFF, fresh=None) -> dict:
             by_session.setdefault(key, []).append((at, tid, i, raw))
 
     new_runs = {tid: [raw for _, raw in runs] for tid, (runs, _) in planned.items()}
-    last_total: dict = {}               # session id -> (ended, tid, i, raw)
     for key, turns in by_session.items():
         turns.sort(key=lambda t: (t[0], t[1], t[2]))
         prev = None
         for at, tid, i, raw in turns:
             new_runs[tid][i] = round(per_turn(raw, prev), 6)
             prev = raw
-        if isinstance(key, str):
-            last_total[key] = turns[-1]
 
     out_tasks: dict = {}
     threads: dict = {}
@@ -177,13 +174,69 @@ def plan(records: dict, cutoff: float = CUTOFF, fresh=None) -> dict:
             cur = float(cur[1]) if _num(cur[1]) else raw
             if abs(cur - new) > 1e-9:
                 th["pairs"].append((at or 0, cur, new))
-    for sid, (_, tid, _, raw) in last_total.items():
-        key = records[tid].get("thread")
-        if key:
-            thread(key)["seeds"][sid] = raw
+    for key, found in seeds(records, cutoff, fresh).items():
+        thread(key)["seeds"].update(found)
     for th in threads.values():
         th["pairs"] = [(cur, new) for _, cur, new in sorted(th["pairs"])]
     return {"tasks": out_tasks, "threads": threads}
+
+
+def seeds(records: dict, cutoff: float = CUTOFF, fresh=None) -> dict:
+    """Each session's last reported total, by the thread of the task that
+    reported it: {thread key: {session id: total}}.
+
+    What the next resumed turn of that session is differenced against. Only
+    runs ended at or after `cutoff` reported running totals; a fresh role's
+    earlier runs were other sessions (see plan). Each record is read on its
+    own, so one malformed record costs only its own session's seed.
+    """
+    if fresh is None:
+        import roles
+        fresh = roles.is_fresh
+    last: dict = {}                     # session id -> (ended, tid, i, raw)
+    for tid, rec in records.items():
+        try:
+            sid = rec.get("session_id")
+            got = _runs(rec)
+            if not sid or not got:
+                continue
+            runs, extra = got
+            final = len(runs) - 1 + len(extra)
+            for i, (at, raw) in enumerate(runs):
+                if at is None or at < cutoff:
+                    continue
+                if i != final and fresh(rec.get("role") or ""):
+                    continue
+                turn = (at, tid, i, raw)
+                if sid not in last or turn[:3] > last[sid][:3]:
+                    last[sid] = turn
+        except Exception:
+            log.warning("cost seeds: skipping unreadable task record %s", tid,
+                        exc_info=True)
+    out: dict = {}
+    for sid, (_, tid, _, raw) in last.items():
+        key = records[tid].get("thread")
+        if key:
+            out.setdefault(key, {})[sid] = raw
+    return out
+
+
+def seed(task_store, session_store, cutoff: float = CUTOFF, fresh=None) -> int:
+    """Record only `seeds` -- the fallback when the correction fails.
+
+    Without them each thread's first resumed turn after the restart is
+    charged its session's whole running total, the overcount this module
+    exists to stop. Never over a total already recorded, never moving a cost,
+    each thread separately. Returns how many threads were seeded.
+    """
+    n = 0
+    for key, found in seeds(task_store.all(), cutoff, fresh).items():
+        try:
+            if session_store.correct_costs(key, {}, (), found):
+                n += 1
+        except Exception:
+            log.warning("cost seeds: could not record %s", key, exc_info=True)
+    return n
 
 
 def correct(task_store, session_store, cutoff: float = CUTOFF, fresh=None) -> dict:
