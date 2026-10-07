@@ -1838,7 +1838,10 @@ def handle_tasks(payload: dict) -> dict:
         rec = task_store.get(payload.get("id", ""))
         if not rec:
             return {"ok": False, "error": "unknown task"}
-        return {"ok": True, "task": board.detail(rec, task_store.all().values())}
+        # The cached survey, as the board uses: without its row a stranded
+        # done task's detail would never offer the Land and Drop its card does.
+        return {"ok": True, "task": board.detail(rec, task_store.all().values(),
+                                                 unmerged_rows=board_survey())}
     if action == "roles":
         # What the form may offer, fetched rather than written into the page,
         # so the choices and the rule that enforces them cannot drift apart.

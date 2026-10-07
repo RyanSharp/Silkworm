@@ -15682,6 +15682,16 @@ def test_board_routes_through_handle_tasks():
     d = ht({"action": "task", "id": ids["awaiting"]})
     check("task answers the full record", d["ok"] and d["task"]["goal"] == "Awaits you")
     check("and refuses an unknown id", not ht({"action": "task", "id": "tsk_nope"})["ok"])
+    n = len(surveyed)
+    sd = ht({"action": "task", "id": ids["stranded"]})["task"]
+    sc = next(c for cs in ht({"action": "board", "project": "alpha"})["columns"].values()
+              for c in cs if c["id"] == ids["stranded"])
+    check("a stranded task's detail carries the same survey row as its card",
+          sd.get("unmerged") and sd["unmerged"] == sc["unmerged"], sd.get("unmerged"))
+    check("and the detail reads the cached survey rather than asking git again",
+          len(surveyed) == n, len(surveyed))
+    check("a task with no unmerged branch has none in its detail",
+          d["task"].get("unmerged") is None)
 
     # The actions on a card are handle_tasks' own; drive them and watch the
     # board follow.

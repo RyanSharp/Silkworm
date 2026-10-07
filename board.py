@@ -212,6 +212,15 @@ def in_project(rec: dict, project: str) -> bool:
     return not have if project == UNFILED else have == project
 
 
+def unmerged_of(row: dict | None) -> dict | None:
+    """A survey row cut to what a card (and its detail) shows; one shape for
+    both, so the detail panel offers Land and Drop exactly when the card does."""
+    if not row:
+        return None
+    return {"commits": row.get("commits"), "branch": row.get("branch"),
+            "local": row.get("local"), "remote": row.get("remote")}
+
+
 def board(records, project: str = "", *, role: str = "", state: str = "",
           q: str = "", unmerged_rows=(), now: float | None = None,
           done_days: float = DONE_DAYS) -> dict:
@@ -238,11 +247,7 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
         if not matches(rec, role, state, q):
             continue
         tid = rec.get("id")
-        row = by_id.get(tid)
-        cols[col].append(card(rec, reviews.get(tid, ()),
-                              {"commits": row.get("commits"), "branch": row.get("branch"),
-                               "local": row.get("local"), "remote": row.get("remote")}
-                              if row else None))
+        cols[col].append(card(rec, reviews.get(tid, ()), unmerged_of(by_id.get(tid))))
     for name, items in cols.items():
         if name == "done":
             items.sort(key=lambda c: -(c["finished"] or 0))
@@ -252,15 +257,18 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
             "roles": sorted(r for r in roles_seen if r)}
 
 
-def detail(rec: dict, records=()) -> dict:
+def detail(rec: dict, records=(), unmerged_rows=()) -> dict:
     """One task in full, for the card's detail view: the whole goal, its
-    events, the review and the landing as recorded, and its reviewers."""
+    events, the review and the landing as recorded, and its reviewers --
+    plus the same cached survey row its card carries."""
     records = list(records)
     reviews = [r for r in records if r.get("role") == "reviewer"
                and r.get("parent") == rec.get("id")]
     out = dict(rec)
     out["cost_total"] = costs.total(rec, reviews)
     out["thread_link"] = slacklinks.for_key(rec.get("thread") or "")
+    out["unmerged"] = unmerged_of(next(
+        (r for r in unmerged_rows if r.get("id") == rec.get("id")), None))
     out["reviews"] = [{"id": r.get("id"), "state": r.get("state"),
                        "created": r.get("created") or 0} for r in reviews]
     # The reply text can run to tens of kilobytes; the detail shows its tail.
