@@ -1781,6 +1781,94 @@ def board_release(slug: str):
     return _board_releases.get(slug, compute)
 
 
+def _task_title(raw, goal: str) -> tuple[str, str]:
+    """(title, error) for a title typed into a form. Blank means "from the
+    goal", which is what tasks.make does with no title at all."""
+    title = " ".join((raw or "").split())
+    if len(title) > scoping.MAX_TITLE_CHARS:
+        return "", (f"a title is at most {scoping.MAX_TITLE_CHARS} characters; "
+                    "put the rest in the goal")
+    return title or (goal.strip().splitlines()[0][:60] if goal.strip() else ""), ""
+
+
+def held_reason(task: dict) -> str:
+    """Why the runner would hold this task rather than run it, or "".
+
+    The same rule hold_unsupervised applies at claim time, asked up front, so
+    a form can say so before the task is filed rather than after it has sat
+    in Needs you."""
+    if task.get("role") != "implementor":
+        return ""
+    why = projects.unready(project_store.get(task.get("project") or ""))
+    if not why:
+        return ""
+    return (f"{task.get('project') or 'a task with no project'} {why}: the runner "
+            "would move it to Needs you instead of running it")
+
+
+def edit_task(payload: dict) -> dict:
+    """Change a task that has not run yet: title, goal, project, role.
+
+    The store refuses anything past queued, under the claim's own lock (see
+    TaskStore.edit); this checks what the values may be, with the same rules
+    as filing it. A new project brings that project's scope with it -- the
+    directory a task acts in is its project's, and keeping the old one would
+    run work for one project in another's checkout.
+    """
+    tid = payload.get("id", "")
+    rec = task_store.get(tid)
+    if not rec:
+        return {"ok": False, "error": "unknown task"}
+    # Asked again under the lock by the store; asked here as well so a refused
+    # edit does not first make the new project's home directory.
+    why = tasks.not_editable(rec.get("state"))
+    if why:
+        return {"ok": False, "error": f"not edited: {why}"}
+    changes = {}
+    if "goal" in payload:
+        goal = (payload.get("goal") or "").strip()
+        err = scoping.validate(goal)
+        if err:
+            return {"ok": False, "error": err}
+        changes["goal"] = goal
+        # A title that was only ever the old goal's first line follows the
+        # goal, rather than naming work the task no longer describes.
+        if "title" not in payload and rec.get("title") == _task_title("", rec.get("goal") or "")[0]:
+            changes["title"] = _task_title("", goal)[0]
+    if "title" in payload:
+        title, err = _task_title(payload.get("title"),
+                                 changes.get("goal", rec.get("goal") or ""))
+        if err:
+            return {"ok": False, "error": err}
+        changes["title"] = title
+    if "role" in payload:
+        role = (payload.get("role") or "").strip()
+        if role != rec.get("role"):
+            err = roles.validate_filed(role)
+            if err:
+                return {"ok": False, "error": err}
+            changes["role"] = role
+    if "project" in payload:
+        proj = (payload.get("project") or "").strip()
+        if proj != (rec.get("project") or ""):
+            if proj:
+                prec = project_store.get(proj)
+                if not prec:
+                    return {"ok": False, "error": f"unknown project {proj!r}"}
+                if prec.get("archived"):
+                    return {"ok": False, "error": f"{proj} is archived; unarchive it first"}
+                project_store.home(proj, create=True)
+            changes["project"] = proj
+            changes["scope"] = project_store.scope_for(proj) or {"cwd": str(CLAUDE_CWD)}
+    try:
+        t = task_store.edit(tid, changes, by=payload.get("by") or "the dashboard")
+    except KeyError:
+        return {"ok": False, "error": "unknown task"}
+    except (tasks.NotEditable, ValueError) as e:
+        return {"ok": False, "error": f"not edited: {e}"}
+    return {"ok": True, "task": t, "held": held_reason(t)}
+
+
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
@@ -1824,16 +1912,23 @@ def handle_tasks(payload: dict) -> dict:
     if action == "overview":
         # One card per active project. Read-only; git is asked through the
         # caches above, not once per poll.
-        live = project_store.all(include_archived=False)
+        everyone = project_store.all()
+        live = [p for p in everyone if not p.get("archived")]
         return {"ok": True, **board.overview(
-            live, list(task_store.all().values()), unmerged_rows=board_survey(),
+            everyone, list(task_store.all().values()), unmerged_rows=board_survey(),
             releases_by_slug={p["slug"]: board_release(p["slug"]) for p in live})}
     if action == "board":
         # One project's columns -- or every project's, or board.UNFILED's.
+        prec = project_store.get(project) if project and project != board.UNFILED else None
         return {"ok": True, "project": project, **board.board(
             list(task_store.all().values()), project,
             role=payload.get("role") or "", state=payload.get("state") or "",
-            q=payload.get("q") or "", unmerged_rows=board_survey())}
+            q=payload.get("q") or "", unmerged_rows=board_survey()),
+            # For the header and the new-task form: what the project is called
+            # and whether an implementor filed here would run or be held.
+            "info": {"slug": prec["slug"], "title": prec.get("title") or prec["slug"],
+                     "archived": bool(prec.get("archived")),
+                     "unready": projects.unready(prec)} if prec else None}
     if action == "task":
         rec = task_store.get(payload.get("id", ""))
         if not rec:
@@ -1846,7 +1941,14 @@ def handle_tasks(payload: dict) -> dict:
         # What the form may offer, fetched rather than written into the page,
         # so the choices and the rule that enforces them cannot drift apart.
         return {"ok": True, "default": roles.DEFAULT_FILED,
-                "roles": [{"name": n, "hint": h, "default": n == roles.DEFAULT_FILED}
+                # scoping.validate's bounds, so the form can say a goal is too
+                # short as it is typed; the route still decides.
+                "goal_min": scoping.MIN_GOAL_CHARS, "goal_max": scoping.MAX_GOAL_CHARS,
+                "roles": [{"name": n, "hint": h, "default": n == roles.DEFAULT_FILED,
+                           # Whether the runner holds it on a project that is
+                           # not ready -- asked of the rule itself, with no
+                           # project, where every project rule says unready.
+                           "held_if_unready": bool(held_reason({"role": n}))}
                           for n, h in roles.FILEABLE.items()]}
     if action == "holding":
         # Checkouts still holding uncommitted work. Its own action for the same
@@ -1889,6 +1991,15 @@ def handle_tasks(payload: dict) -> dict:
             state = payload.get("state") or tasks.QUEUED
             if state not in (tasks.QUEUED, tasks.PROPOSED):
                 return {"ok": False, "error": f"cannot file a task as {state!r}"}
+            # The same length rules as filing from a conversation: whoever
+            # picks it up has only this to go on.
+            goal = (payload.get("goal") or "").strip()
+            err = scoping.validate(goal)
+            if err:
+                return {"ok": False, "error": err}
+            title, err = _task_title(payload.get("title"), goal)
+            if err:
+                return {"ok": False, "error": err}
             proj = (payload.get("project") or "").strip()
             if proj:
                 proj = project_store.ensure(proj)["slug"]
@@ -1903,7 +2014,8 @@ def handle_tasks(payload: dict) -> dict:
                 # Work aimed at a project's directory belongs to that project.
                 proj = workspaces.project_for(scope.get("cwd"), project_store.all(),
                                               scratch=CLAUDE_CWD)
-            t = task_store.create(payload.get("goal", ""),
+            t = task_store.create(goal,
+                                  title=title,
                                   role=role,
                                   project=proj,
                                   # Not "ui": a message typed into the web
@@ -1925,9 +2037,22 @@ def handle_tasks(payload: dict) -> dict:
                                   isolate=True,
                                   thread=payload.get("thread", ""),
                                   scope=scope)
-            return {"ok": True, "task": t}
+            # Filed anyway -- it is a real request -- but said, so it does not
+            # look queued and then quietly turn up in Needs you.
+            return {"ok": True, "task": t, "held": held_reason(t)}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
+    if action == "edit":
+        return edit_task(payload)
+    if action == "run-next":
+        try:
+            t = task_store.run_next(payload.get("id", ""), on=payload.get("on", True) is not False,
+                                    by=payload.get("by") or "the dashboard")
+        except KeyError:
+            return {"ok": False, "error": "unknown task"}
+        except tasks.NotEditable as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "task": t}
     if action == "rework":
         # Send flagged work back with the reviewer's findings attached, so the
         # rerun addresses them rather than repeating the same thing.
@@ -2021,9 +2146,70 @@ def handle_projects(payload: dict) -> dict:
                 # than merely quiet: the limit lives in one place and the page
                 # compares against it instead of hard-coding a number.
                 "proposal_limit": scoping.max_open_proposals(),
-                "projects": projects.summarise(
+                # `unready` so a form can say an implementor filed there would
+                # be held, using the rule that holds it rather than a copy.
+                "projects": [dict(p, unready=projects.unready(project_store.get(p["slug"])))
+                             for p in projects.summarise(
                     project_store.all(include_archived=bool(payload.get("archived"))),
-                    list(task_store.all().values()), tasks.NEEDS_ATTENTION)}
+                    list(task_store.all().values()), tasks.NEEDS_ATTENTION,
+                    hidden=() if payload.get("archived") else
+                    [p["slug"] for p in project_store.all() if p.get("archived")])]}
+    if action == "get":
+        # Everything the settings panel edits, as stored, and what follows
+        # from it -- readiness is derived, never stored, so it cannot go stale.
+        rec = project_store.get((payload.get("slug") or "").strip())
+        if not rec:
+            return {"ok": False, "error": "unknown project"}
+        cwd = (rec.get("scope") or {}).get("cwd") or ""
+        return {"ok": True, "project": rec, "unready": projects.unready(rec),
+                "base": (rec.get("scope") or {}).get("branch") or "",
+                "repo": bool(cwd and worktrees.is_repo(cwd))}
+    if action == "title":
+        slug = (payload.get("slug") or "").strip()
+        if not project_store.get(slug):
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        title = " ".join((payload.get("title") or "").split())
+        if not title:
+            return {"ok": False, "error": "a project needs a name"}
+        if len(title) > scoping.MAX_NAME_CHARS:
+            return {"ok": False, "error": f"a name is at most {scoping.MAX_NAME_CHARS} characters"}
+        # Renamed, not re-keyed: the slug is what every task is filed under.
+        return {"ok": True, "project": project_store.ensure(slug, title=title)}
+    if action == "base":
+        # Which branch this project's tasks build on and land onto -- the
+        # dashboard's `!project base`. Checked against the repository: a name
+        # that is not there would have every task cut from a fallback nobody
+        # chose, and one already merged into the default branch is how
+        # trader's research/point-in-time-universe broke landings for weeks.
+        # That one is a warning, not a refusal, so the caller must say
+        # `force` after seeing it; `check` asks without writing.
+        slug = (payload.get("slug") or "").strip()
+        rec = project_store.get(slug)
+        if not rec:
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        want = (payload.get("branch") or "").strip()
+        sc = dict(rec.get("scope") or {})
+        if want.lower() in ("", "none", "default", "clear"):
+            if payload.get("check"):
+                return {"ok": True, "warning": "", "branch": ""}
+            sc["branch"] = ""
+            return {"ok": True, "warning": "", "branch": "",
+                    "project": project_store.ensure(slug, scope=sc)}
+        cwd = sc.get("cwd") or ""
+        if not (cwd and worktrees.is_repo(cwd)):
+            return {"ok": False, "error": f"{slug} has no repository to branch in"}
+        got = branches.check_base(cwd, want)
+        if not got["ok"]:
+            return {"ok": False, "error": got["error"]}
+        if payload.get("check"):
+            return {"ok": True, "warning": got["warning"], "branch": want,
+                    "default": got["default"]}
+        if got["warning"] and not payload.get("force"):
+            return {"ok": False, "error": got["warning"], "warning": got["warning"],
+                    "needs_force": True}
+        sc["branch"] = want
+        return {"ok": True, "warning": got["warning"], "branch": want,
+                "project": project_store.ensure(slug, scope=sc)}
     if action == "ensure":
         name = (payload.get("name") or "").strip()
         if not name:
@@ -2116,8 +2302,11 @@ def handle_projects(payload: dict) -> dict:
                     "error": "" if rec else "unknown project"}
         return {"ok": True, "brief": project_store.brief_for(slug)}
     if action in ("archive", "unarchive"):
+        # Hidden from the overview and the pickers; nothing is deleted, its
+        # tasks keep their label, and unarchiving brings it all back.
         ok = project_store.set_archived(payload.get("slug", ""), action == "archive")
-        return {"ok": ok, "error": "" if ok else "unknown project"}
+        return {"ok": ok, "error": "" if ok else "unknown project",
+                "project": project_store.get(payload.get("slug", "")) if ok else None}
     return {"ok": False, "error": f"unknown action {action!r}"}
 
 

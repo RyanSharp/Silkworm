@@ -362,8 +362,13 @@ nothing durable changed, return the current brief unchanged."""
 
 
 def summarise(projects: list[dict], tasks: list[dict],
-              needs_attention: tuple) -> list[dict]:
-    """Projects with their task counts, so a picker shows where the work is."""
+              needs_attention: tuple, hidden=()) -> list[dict]:
+    """Projects with their task counts, so a picker shows where the work is.
+
+    `hidden` is slugs left out on purpose -- archived ones, when the caller
+    listed only the live projects. Without it their tasks brought them back
+    as if they had never been registered, and archiving hid nothing.
+    """
     by_slug: dict[str, dict] = {}
     for t in tasks:
         slug = t.get("project") or ""
@@ -389,7 +394,7 @@ def summarise(projects: list[dict], tasks: list[dict],
         out.append({**p, **counts})
     # Anything filed under a project that was never registered still shows up,
     # rather than vanishing because its record is missing.
-    known = {p["slug"] for p in projects}
+    known = {p["slug"] for p in projects} | set(hidden)
     for slug, counts in by_slug.items():
         if slug not in known:
             out.append({"slug": slug, "title": slug, "scope": {},

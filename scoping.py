@@ -79,6 +79,8 @@ def max_open_proposals() -> int:
 #: Long enough to act on without the implementor guessing what you meant.
 MIN_GOAL_CHARS = 15
 MAX_GOAL_CHARS = 4000
+#: A title is a card's label; the goal is where the detail goes.
+MAX_TITLE_CHARS = 120
 
 #: A ceiling on a pathological list, not a budget for a real one, and one
 #: ceiling for every list the nightly pass is shown: the unmerged branches

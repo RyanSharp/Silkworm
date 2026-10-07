@@ -365,6 +365,28 @@ holds tasks and conversations under no project. The branch survey and release
 plans behind it are cached for a minute (`board.py`), so polling does not walk
 git. 📋 Tasks still opens on what needs you.
 
+The board also edits, through one kind of modal — labelled fields, Cancel or
+Esc to back out with nothing sent, and the route's own reason shown inside it
+when something is refused. **+ New task** in a project's board header files work
+in that project (the project decides the directory): an optional title, what it
+should do (the same length rules as filing from a conversation, said as you
+type), Implementor or Assistant, and Queue now or Propose for later; it says up
+front when an implementor task would be held because the project is not ready.
+**+ New project** in the overview header (and in 📋 Tasks) makes one: name, what
+it is for, `~/workspace/<slug>` or an existing folder, and optionally a private
+GitHub repo, then opens its board. **Edit…** changes a task's title, goal,
+project or role while it is still proposed or queued — a new project brings its
+scope with it, and the change is recorded as an event; once work has run, Send
+back with notes is the edit. **Run next** pins a queued task so the runner
+claims it before older work (spent by that claim; reviews keep their own lane),
+and Backlog lists the queue in the order it will run. **⚙ Settings** covers a
+project's name, test command, auto-merge, publish, nightly review time and base
+branch — which must exist, and is flagged if it is already merged into the
+default branch — and archiving, which hides it from the overview and pickers
+without deleting anything; archived projects sit in a collapsed **Archived**
+section to be brought back. Anything destructive or that changes unattended
+behaviour asks first.
+
 A project is **what a task belongs to**; `scope` is **where it may act**. They
 are separate deliberately — two projects can share a repo, one project can span
 several, and plenty ("plan the trip") have no repo at all. A project may carry a

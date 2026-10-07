@@ -171,6 +171,8 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None) -> dict:
         "project": rec.get("project") or "",
         "source": rec.get("source") or "",
         "attempts": rec.get("attempts") or 0,
+        "priority": rec.get("priority") or 0,
+        "driver": rec.get("driver") or "",
         "created": rec.get("created") or 0,
         "updated": rec.get("updated") or 0,
         "thread": rec.get("thread") or "",
@@ -251,10 +253,33 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
     for name, items in cols.items():
         if name == "done":
             items.sort(key=lambda c: -(c["finished"] or 0))
+        elif name == "backlog":
+            items.sort(key=backlog_order)
         else:
             items.sort(key=lambda c: c["created"])
+    # Where each queued card stands in the runner's queue, counted over the
+    # whole queue rather than this board, so "next" on one project's board
+    # is not a claim about a queue that also holds other projects' work.
+    queue = sorted((r for r in records if _in_queue(r)), key=tasks.claim_order)
+    pos = {r.get("id"): i + 1 for i, r in enumerate(queue)}
+    for c in cols["backlog"]:
+        c["queue_pos"] = pos.get(c["id"])
     return {"columns": cols, "counts": {c: len(v) for c, v in cols.items()},
             "roles": sorted(r for r in roles_seen if r)}
+
+
+def _in_queue(rec: dict) -> bool:
+    """Whether the task lane's claim will consider this task at all."""
+    return (rec.get("state") == tasks.QUEUED and rec.get("driver") == "queue"
+            and rec.get("role") != "reviewer")
+
+
+def backlog_order(c: dict) -> tuple:
+    """Backlog top to bottom: the queue in the order it will be claimed
+    (tasks.claim_order), then what is waiting to go round again, then the
+    proposals nothing runs until you accept them."""
+    rank = {tasks.QUEUED: 0, tasks.BLOCKED: 1, tasks.PROPOSED: 2}.get(c.get("state"), 3)
+    return (rank,) + tasks.claim_order(c)
 
 
 def detail(rec: dict, records=(), unmerged_rows=()) -> dict:
@@ -379,4 +404,10 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
         out.append(row)
     out.sort(key=lambda r: (-r["needs"], -len(r["running"]), r["title"].lower()))
     unfiled = _summary(UNFILED, "Unfiled", by_slug.get(UNFILED, []), spend, unmerged_rows)
-    return {"projects": out, "unfiled": unfiled, "note": costs.NOTE}
+    # Archived projects are off the overview but not gone: listed, small, so
+    # they can be brought back from the same page they were archived on.
+    archived = sorted(({"slug": p["slug"], "title": p.get("title") or p["slug"],
+                        "tasks": len(by_slug.get(p["slug"], []))}
+                       for p in project_records if p.get("archived")),
+                      key=lambda r: r["title"].lower())
+    return {"projects": out, "unfiled": unfiled, "archived": archived, "note": costs.NOTE}

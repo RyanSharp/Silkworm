@@ -730,6 +730,43 @@ def base_for(repo, prefer: str = "") -> tuple[tuple, str]:
     return tuple(refs) or (ref,), name
 
 
+
+def check_base(repo, branch: str) -> dict:
+    """Whether `branch` can be a project's base: {ok, error, warning, default}.
+
+    Refused when it names no branch here or on origin -- tasks would be cut
+    from a fallback nobody chose. Allowed with a warning when everything on it
+    is already on the default branch: that is a research branch that has been
+    merged and left named, which is what trader's
+    `research/point-in-time-universe` was for weeks, and every landing in
+    between was refused because the checkout was on main. Read-only.
+    """
+    branch = (branch or "").strip()
+    out = {"ok": False, "error": "", "warning": "", "default": ""}
+    if not branch:
+        out["error"] = "name a branch, or clear it to use the default"
+        return out
+    fmt = _git(repo, "check-ref-format", "--branch", branch)
+    if fmt.returncode != 0:
+        out["error"] = f"{branch!r} is not a valid branch name"
+        return out
+    have = [ref for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}")
+            if _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0]
+    if not have:
+        out["error"] = f"there is no branch {branch!r} in {repo}, locally or on origin"
+        return out
+    refs, default = base_for(repo)
+    out.update(ok=True, default=default)
+    if branch == default:
+        return out
+    if any(_git(repo, "merge-base", "--is-ancestor", have[0], ref).returncode == 0
+           for ref in refs if ref not in have):
+        out["warning"] = (f"{branch} is already merged into {default} -- it holds "
+                          f"nothing {default} lacks, so tasks would build on and land "
+                          f"onto a branch that has stopped moving instead of {default}. "
+                          f"Clear the base to use {default}.")
+    return out
+
 def line(rows) -> str:
     """One line for `silkworm status` and the Slack-facing summary.
 

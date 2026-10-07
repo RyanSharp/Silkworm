@@ -150,8 +150,8 @@ ROLES: dict[str, dict] = {
 #: -- and therefore nothing that could ever land, while typed into Slack it
 #: filed `implementor` and got the whole gate. Nothing said which you had got.
 FILEABLE: dict[str, str] = {
-    "implementor": "reviewed, verified, then landed",
-    "assistant":   "runs unreviewed, lands nothing",
+    "implementor": "changes code, is tested, reviewed and merged",
+    "assistant":   "investigates or answers, nothing is merged",
 }
 
 #: What you get when you do not say. Matches handle_file_task: filing work is

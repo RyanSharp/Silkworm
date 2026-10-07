@@ -845,6 +845,34 @@ PAGE = r"""<!doctype html>
   #bdetail .rev ul { margin: 4px 0 0; padding-left: 16px; }
   #bdetail .rev .lbl { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
   #bdetail .land .d { white-space: pre-wrap; font-size: 10.5px; margin-top: 3px; }
+  .bhead { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+  .bhead h3 { margin: 0; font-size: 15px; }
+  .bhead .warn, .tform .warn { color: var(--gold); font-size: 12px; }
+  .bcol > h4 button { float: right; font-size: 11px; padding: 0 6px; }
+  .bcard .qpos { color: var(--gold); }
+  .pcard h3 .gear { margin-left: auto; font-size: 12px; padding: 0 6px; }
+  .parch { margin-top: 12px; color: var(--muted); font-size: 13px; }
+  .parch summary { cursor: pointer; }
+  .parch .arow { display: flex; gap: 8px; align-items: center; margin: 4px 0 0 14px; }
+  #fmodal { position: fixed; inset: 0; background: #14041699; z-index: 50; display: none;
+            align-items: flex-start; justify-content: center; padding: 60px 20px; }
+  #fmodal .fbox { background: var(--bg); border: 1px solid var(--gold); border-radius: 14px;
+                  width: 600px; max-width: 100%; max-height: 84vh; overflow-y: auto; padding: 18px 22px; }
+  #fmodal h3 { margin: 0 0 4px; font-size: 17px; }
+  .tform .choice { display: flex; gap: 8px; align-items: flex-start; margin-top: 6px;
+                   color: var(--ink); font-size: 13px; }
+  .tform .choice input { margin-top: 3px; }
+  .tform .fixed { margin-top: 4px; font-weight: 600; }
+  .tform label { display: block; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .tform input[type=text], .tform select, .tform textarea {
+        width: 100%; background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+        border-radius: 8px; padding: 7px 9px; font: inherit; font-size: 13px; }
+  .tform textarea { min-height: 150px; font-family: var(--mono); font-size: 12px; }
+  .tform .line { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .tform .line input[type=text] { flex: 1; }
+  .tform .note { color: var(--muted); font-size: 11px; margin-top: 3px; }
+  .tform .err { color: #D8517F; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  .tform .acts { margin-top: 14px; display: flex; gap: 8px; }
   #bdetail .sect { margin-top: 14px; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
                    text-transform: uppercase; letter-spacing: .06em; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
@@ -930,23 +958,9 @@ PAGE = r"""<!doctype html>
     <div id="spend" class="hint"></div>
     <div id="unmerged"></div>
     <div id="holding"></div>
-    <div class="lform">
-      <input class="text" id="tgoal" placeholder="what should it do?"
-             onkeydown="if(event.key==='Enter')addTask()">
-      <select id="trole" title="how this runs"></select>
-      <input class="scope" id="tnewproj" placeholder="project (optional)">
-      <input class="scope" id="tcwd" placeholder="working dir (blank = default)">
-      <button class="act" onclick="addTask()">Queue it</button>
-    </div>
-    <div class="lform" id="newproj">
-      <input class="scope" id="npname" placeholder="new project name">
-      <input class="text" id="nppurpose" placeholder="one line: what is it for?">
-      <input class="scope" id="nppath" placeholder="path (blank = ~/workspace/<name>)">
-      <label title="the directory already exists and should become this project"
-        ><input type="checkbox" id="npadopt"> adopt existing</label>
-      <label title="also create a PRIVATE GitHub repository and push to it"
-        ><input type="checkbox" id="npgithub"> private GitHub repo</label>
-      <button class="act" onclick="newProject()">New project</button>
+    <div class="lform" id="taskadd">
+      <button class="act" onclick="newProjectForm()">+ New project</button>
+      <span class="hint" style="margin:0">New tasks are filed from a project's board — 🗂 Projects, open one, + New task.</span>
     </div>
     <div id="unregistered" class="hint"></div>
     <div id="tlist"></div>
@@ -971,6 +985,7 @@ PAGE = r"""<!doctype html>
   </div>
 </div>
 <div id="bdetail"></div>
+<div id="fmodal" onclick="if(event.target.id==='fmodal')closeModal()"><div class="fbox" id="fbox"></div></div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
     <h2 style="display:flex;align-items:center;gap:12px">🧠 Learnings
@@ -1417,7 +1432,7 @@ function toggleTasks() {
   const m = document.getElementById("taskmodal");
   const open = m.style.display !== "flex";
   m.style.display = open ? "flex" : "none";
-  if (open) { renderRoles(); renderProjects().then(renderTasks); renderUnregistered(); }
+  if (open) { renderProjects().then(renderTasks); renderUnregistered(); }
 }
 function setTaskView(v) {
   taskView = v;
@@ -1467,31 +1482,8 @@ function renderNightly(rows, limit) {
     }).join("");
 }
 
-// One step: directory, git, CLAUDE.md and registration. The GitHub box is
-// the only way a repository gets published from here -- never by default.
-async function newProject() {
-  const name = document.getElementById("npname").value.trim();
-  if (!name) { toast("Give the project a name"); return; }
-  const r = await (await fetch("/api/projects", {method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({action: "new", name,
-      purpose: document.getElementById("nppurpose").value.trim(),
-      path: document.getElementById("nppath").value.trim(),
-      adopt: document.getElementById("npadopt").checked,
-      github: document.getElementById("npgithub").checked})})).json();
-  if (!r.ok) { toast(r.error || "Could not create it"); return; }
-  const done = r.created || {};
-  for (const id of ["npname", "nppurpose", "nppath"]) document.getElementById(id).value = "";
-  for (const id of ["npadopt", "npgithub"]) document.getElementById(id).checked = false;
-  toast(`${done.title || name} registered at ${done.cwd || "?"}`
-        + (done.github_url ? ` · ${done.github_url}` : "")
-        + ((done.notes || []).length ? ` · ${done.notes.join("; ")}` : ""));
-  await renderProjects();
-  renderUnregistered();
-}
-
-// Repositories in the workspace no project covers. Clicking one fills the
-// form to adopt it, rather than registering anything by itself.
+// Repositories in the workspace no project covers. Clicking one opens the
+// new-project form to adopt it, rather than registering anything by itself.
 async function renderUnregistered() {
   const el = document.getElementById("unregistered");
   if (!el) return;
@@ -1510,10 +1502,7 @@ async function renderUnregistered() {
 }
 
 function adoptRepo(path) {
-  document.getElementById("npname").value = path.split("/").pop();
-  document.getElementById("nppath").value = path;
-  document.getElementById("npadopt").checked = true;
-  document.getElementById("nppurpose").focus();
+  newProjectForm({name: path.split("/").pop(), path});
 }
 
 async function renderProjects() {
@@ -1529,38 +1518,6 @@ async function renderProjects() {
     `<option value="${esc(p.slug)}">${esc(p.title)}${
       p.needs ? ` (${p.needs})` : p.open ? ` · ${p.open}` : ""}</option>`).join("");
   sel.value = keep;
-}
-// The choices come from roles.FILEABLE, the same list the route that accepts
-// the filing checks against, so the form cannot offer something that will be
-// refused -- or quietly file a different kind of task than a conversation does.
-async function renderRoles() {
-  const sel = document.getElementById("trole");
-  if (sel.options.length) return;               // a fixed list; ask once
-  const r = await taskCall({action: "roles"});
-  sel.innerHTML = (r.roles || []).map(x =>
-    `<option value="${esc(x.name)}"${x.default ? " selected" : ""}
-     >${esc(x.name)} — ${esc(x.hint)}</option>`).join("");
-}
-async function addTask() {
-  const goal = document.getElementById("tgoal").value.trim();
-  if (!goal) return;
-  const cwd = document.getElementById("tcwd").value.trim();
-  // an explicit project wins; otherwise inherit whatever is being filtered on
-  const proj = document.getElementById("tnewproj").value.trim()
-            || document.getElementById("tproj").value;
-  // Left off if the list never loaded, so the route's own default applies
-  // rather than an empty string standing in for a choice.
-  const role = document.getElementById("trole").value;
-  const r = await taskCall({action: "create", goal, project: proj || undefined,
-                            role: role || undefined,
-                            scope: cwd ? {cwd} : undefined});
-  if (r.ok) {
-    document.getElementById("tgoal").value = "";
-    document.getElementById("tnewproj").value = "";
-    toast("Task queued");
-    await renderProjects();
-    renderTasks();
-  } else toast(r.error || "Could not create it");
 }
 async function sendBack(id, needsAnswer) {
   // Ask before returning work, so the rerun knows why. Cancelling the prompt
@@ -1917,6 +1874,11 @@ let boardRows = [];                       // the overview's projects, for the pi
 let lastSessions = [];                    // from loadList, for the unfiled threads
 let boardTimer = null;
 let boardAsk = 0;                         // newest board request; older answers are dropped
+let boardForm = null;                     // the open modal form: {kind, ...}; null when closed
+let boardInfo = null;                     // the open project's name and readiness, from `board`
+let formProjects = [];                    // /projects list, with each one's `unready`
+let formRoles = [];                       // /tasks roles: name, hint, default, held_if_unready
+let goalBounds = {min: 0, max: 0};        // scoping.validate's, from the roles route
 
 function boardIsOpen() {
   return document.getElementById("boardmodal").style.display === "flex";
@@ -1999,7 +1961,18 @@ async function renderBoard() {
   fillSelect("brole", r.roles || [], "any role");
   fillSelect("bstate", ["proposed", "queued", "running", "blocked", "awaiting_approval",
                         "needs_input", "failed", "done"], "any state");
-  el.innerHTML = renderColumns(r) + (boardProject === UNFILED ? unfiledThreads() : "");
+  boardInfo = r.info || null;
+  el.innerHTML = boardHead(boardInfo) + renderColumns(r)
+    + (boardProject === UNFILED ? unfiledThreads() : "");
+}
+// The open project's name, whether it can take unsupervised work, and its
+// settings. Only on a project's own board: "all" and "unfiled" have none.
+function boardHead(info) {
+  if (!info) return "";
+  return `<div class="bhead"><h3>${esc(info.title)}</h3>${
+    info.unready ? `<span class="warn" title="work the runner would take on its own is held in Needs you instead">⚠ ${
+      esc(info.unready)}</span>` : ""}<button class="act" onclick="newTaskForm()">+ New task</button><button class="ghost" onclick="projectSettings('${
+    esc(info.slug)}')">⚙ Settings</button></div>`;
 }
 function renderColumns(r) {
   return `<div class="bcols">` + BOARD_COLUMNS.map(([k, label]) => {
@@ -2029,6 +2002,13 @@ function cardButtons(t) {
   // taskButtons() is the task panel's; its Thread button closes that panel,
   // so here it closes this one instead.
   let b = taskButtons(t).split("toggleTasks();jumpTo(").join("closeBoard();jumpTo(");
+  // Only before it has run: after that, Send back with notes is the edit.
+  if ((t.state === "proposed" || t.state === "queued") && t.role !== "reviewer")
+    b += `<button class="ghost" onclick="editTaskForm('${esc(t.id)}')">Edit…</button>`;
+  if (t.state === "queued" && t.role !== "reviewer")
+    b += t.priority
+      ? `<button class="ghost" title="back to its place, oldest first" onclick="runNext('${esc(t.id)}',false)">Unpin</button>`
+      : `<button class="ghost" title="the runner claims this before older queued work" onclick="runNext('${esc(t.id)}',true)">Run next</button>`;
   // Land and Drop, for finished work the survey says never reached the base --
   // the unmerged strip's buttons, offered only on a local branch for the same
   // reason as there.
@@ -2050,7 +2030,9 @@ function boardCard(t) {
         || t.state === "needs_input" || t.state === "awaiting_approval"
         ? ` · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>` : ""} · ${
       age(t.created)}${cost ? ` · <span title="API list-price equivalent, not billed">${cost}</span>` : ""}${
-      t.attempts > 1 ? ` · attempt ${t.attempts}` : ""}</div>
+      t.attempts > 1 ? ` · attempt ${t.attempts}` : ""}${
+      t.queue_pos ? ` · <span class="qpos" title="its place in the runner's queue, all projects">${
+        t.priority ? "📌 " : ""}#${t.queue_pos} in queue</span>` : ""}</div>
     ${t.why ? `<div class="why">${esc(t.why)}</div>` : ""}${cardReview(t)}${cardLanding(t)}
     <div class="acts" onclick="event.stopPropagation()">${cardButtons(t)}</div></div>`;
 }
@@ -2078,8 +2060,18 @@ function renderOverview(r) {
   const u = r.unfiled;
   const threads = lastSessions.filter(s => !s.project && !s.hidden && (s.kind || "thread") !== "task").length;
   if (u) cards.push(projectCard(u, threads));
-  return `<div class="pcards">${cards.join("") || `<div class="hint">No projects yet.</div>`}</div>`
+  return `<div class="bhead"><h3>Projects</h3><button class="act" onclick="newProjectForm()">+ New project</button></div>`
+    + `<div class="pcards">${cards.join("") || `<div class="hint">No projects yet.</div>`}</div>`
+    + archivedSection(r.archived || [])
     + (r.note ? `<div class="hint" style="margin-top:8px">Costs are ${esc(r.note)}.</div>` : "");
+}
+// Archived projects, collapsed, so one can be brought back from where it went.
+function archivedSection(rows) {
+  if (!rows.length) return "";
+  return `<details class="parch"><summary>Archived · ${rows.length}</summary>${rows.map(p =>
+    `<div class="arow" data-slug="${esc(p.slug)}">${esc(p.title)} <span class="slug">${esc(p.slug)}</span>
+      · ${p.tasks} task${p.tasks === 1 ? "" : "s"}
+      <button class="ghost" onclick="archiveProject('${esc(p.slug)}',false)">Unarchive</button></div>`).join("")}</details>`;
 }
 function releaseText(rel) {
   if (!rel) return "";
@@ -2103,7 +2095,8 @@ function projectCard(p, threads) {
   const slug = p.slug === UNFILED ? UNFILED : p.slug;
   return `<div class="pcard" data-slug="${esc(slug)}" onclick="setBoardProject('${esc(slug)}')">
     <h3>${esc(p.title)}${p.slug !== UNFILED ? ` <span class="slug">${esc(p.slug)}</span>` : ""}${
-      p.needs ? ` <span class="st st-failed">${p.needs} need you</span>` : ""}</h3>
+      p.needs ? ` <span class="st st-failed">${p.needs} need you</span>` : ""}${
+      p.slug !== UNFILED ? `<button class="ghost gear" title="settings" onclick="event.stopPropagation();projectSettings('${esc(p.slug)}')">⚙</button>` : ""}</h3>
     <div class="row chips">${chips || `<span class="off">no tasks</span>`}</div>
     <div class="row"><span class="lbl">running</span>${running || `<span class="off">nothing</span>`}</div>
     <div class="row"><span class="lbl">last landed</span>${last
@@ -2157,6 +2150,325 @@ function renderDetail(t) {
       esc(l.stage || "")}${l.base ? ` · onto ${esc(l.base)}` : ""}${l.at ? ` · ${age(l.at)}` : ""}${
       l.detail && l.landed ? `<div>${esc(String(l.detail))}</div>` : ""}</div>` : ""}` : ""}
     <div class="sect">events · ${(t.events || []).length}</div>${events || `<div class="hint">none</div>`}`;
+}
+
+// --- creating and editing tasks and projects, in one modal ---
+// New task, edit, project settings and new project all open the same modal:
+// labelled fields, Cancel and Save, the route's error shown inside it.
+// Cancel, Esc and a click outside close it and send nothing. Everything goes
+// through the bot's own routes -- /tasks create, edit, run-next and /projects.
+async function projectCall(payload) {
+  return (await (await fetch("/api/projects", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)})).json());
+}
+function modalIsOpen() {
+  return document.getElementById("fmodal").style.display === "flex";
+}
+function openModal(html, form) {
+  boardForm = form;
+  document.getElementById("fbox").innerHTML = html;
+  document.getElementById("fmodal").style.display = "flex";
+}
+function closeModal() {
+  boardForm = null;
+  document.getElementById("fmodal").style.display = "none";
+  document.getElementById("fbox").innerHTML = "";
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && modalIsOpen()) closeModal();
+});
+function formError(msg) {
+  document.getElementById("tferr").textContent = msg || "";
+}
+function modalButtons(save, label) {
+  return `<div class="err" id="tferr"></div>
+    <div class="acts"><button class="act" onclick="${save}()">${label}</button>
+      <button class="ghost" onclick="closeModal()">Cancel</button></div>`;
+}
+async function loadFormChoices() {
+  const [pr, rr] = await Promise.all([projectCall({action: "list"}), taskCall({action: "roles"})]);
+  formProjects = (pr.projects || []).filter(p => !p.archived);
+  formRoles = rr.roles || [];
+  goalBounds = {min: rr.goal_min || 0, max: rr.goal_max || 0};
+  return formRoles.map(x => x.name);
+}
+const titleCase = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+// The two roles as described choices. Names and descriptions both come from
+// the roles route (roles.FILEABLE), so the page holds no copy of the list.
+function roleChoices(current) {
+  const extra = current && !formRoles.find(x => x.name === current)
+    ? [{name: current, hint: "internal"}] : [];
+  return formRoles.concat(extra).map(x =>
+    `<label class="choice"><input type="radio" name="tfrole" value="${esc(x.name)}"${
+      x.name === current ? " checked" : ""} onchange="taskFormWarn()">
+      <span><b>${esc(titleCase(x.name))}</b>: ${esc(x.hint || "")}</span></label>`).join("");
+}
+function pickedRole() {
+  const box = [...document.querySelectorAll('input[name="tfrole"]')].find(x => x.checked);
+  return box ? box.value : (boardForm && boardForm.role) || "";
+}
+function pickRole(name) {
+  if (boardForm) boardForm.role = name;
+  for (const x of document.querySelectorAll('input[name="tfrole"]')) x.checked = x.value === name;
+}
+function projectTitle(slug) {
+  const p = formProjects.find(x => x.slug === slug);
+  return p ? p.title : slug;
+}
+// The goal's length, said as it is typed: the same bounds as the route.
+function goalCheck() {
+  const n = document.getElementById("tfgoal").value.trim().length;
+  const why = !goalBounds.min ? ""
+    : n < goalBounds.min ? `${goalBounds.min - n} more character${goalBounds.min - n === 1 ? "" : "s"} needed `
+      + `— a task needs at least ${goalBounds.min}; whoever picks it up has only this to go on`
+    : goalBounds.max && n > goalBounds.max ? `${n - goalBounds.max} characters over the ${goalBounds.max} limit — split it`
+    : "";
+  document.getElementById("tfgoalwhy").textContent = why;
+  return why;
+}
+function taskFormHtml(t, fixedProject) {
+  const projField = fixedProject
+    ? `<label>project</label><div class="fixed">${esc(projectTitle(t.project))}</div>`
+    : `<label>project</label><select id="tfproj" onchange="taskFormWarn()"><option value="">(no project)</option>${
+        formProjects.map(p => `<option value="${esc(p.slug)}"${p.slug === (t.project || "") ? " selected" : ""}>${
+          esc(p.title)}</option>`).join("")}</select>`;
+  return `<div class="tform">
+    <h3>${t.id ? `Edit ${esc(t.title || t.id)}` : `New task in ${esc(projectTitle(t.project))}`}</h3>
+    ${t.id ? `<div class="sub">${esc(t.id)} · ${esc(t.state)} — editable until it runs; the change is recorded on the task.</div>` : ""}
+    ${projField}
+    <label>title <span class="note">(optional — the goal's first line otherwise)</span></label>
+    <input type="text" id="tftitle" value="${esc(t.title || "")}">
+    <label>What should it do?</label>
+    <textarea id="tfgoal" oninput="goalCheck()" placeholder="whoever picks it up has only this to go on">${esc(t.goal || "")}</textarea>
+    <div class="err" id="tfgoalwhy"></div>
+    <label>role</label>${roleChoices(t.role)}
+    <div class="warn" id="tfwarn"></div>
+    ${t.id ? "" : `<label>when</label>
+      <label class="choice"><input type="radio" name="tfstate" id="tfqueue" checked> <span><b>Queue now</b>: the runner picks it up in turn</span></label>
+      <label class="choice"><input type="radio" name="tfstate" id="tfpropose"> <span><b>Propose for later</b>: waits on the board until you accept it</span></label>`}
+    ${modalButtons("submitTaskForm", t.id ? "Save" : "Create task")}</div>`;
+}
+// Said before filing, from the rule the runner applies (projects.unready via
+// /projects list), so work for a project that cannot take unsupervised work
+// does not look queued and then turn up in Needs you.
+function taskFormWarn() {
+  const role = pickedRole();
+  if (boardForm) boardForm.role = role;
+  const sel = document.getElementById("tfproj");
+  const slug = boardForm && boardForm.kind === "new" ? boardForm.project : (sel ? sel.value : "");
+  const p = formProjects.find(x => x.slug === slug);
+  const held = (formRoles.find(x => x.name === role) || {}).held_if_unready;
+  const why = !held ? ""
+    : p ? (p.unready || "") : "is not a registered project and cannot take unsupervised work";
+  document.getElementById("tfwarn").textContent = why
+    ? `⚠ ${slug || "a task with no project"} ${why}. The runner would hold this task in Needs you `
+      + "instead of running it — propose it, pick a role it does not hold, or set the project up first."
+    : "";
+}
+async function newTaskForm() {
+  // Only from a project's own board: the project decides where it runs.
+  const slug = boardProject && boardProject !== UNFILED ? boardProject : "";
+  if (!slug) { toast("Open a project's board to add a task to it"); return; }
+  await loadFormChoices();
+  const role = (formRoles.find(x => x.default) || formRoles[0] || {}).name || "";
+  openModal(taskFormHtml({project: slug, role}, true), {kind: "new", project: slug, role});
+  taskFormWarn();
+}
+async function editTaskForm(id) {
+  const [, r] = await Promise.all([loadFormChoices(), taskCall({action: "task", id})]);
+  if (!r.ok) { toast(r.error || "bot offline"); return; }
+  const t = r.task;
+  // A task under an archived or unregistered project still shows where it is.
+  if (t.project && !formProjects.find(p => p.slug === t.project))
+    formProjects.push({slug: t.project, title: t.project, unready: ""});
+  openModal(taskFormHtml(t, false), {kind: "edit", id, was: t, role: t.role});
+  taskFormWarn();
+}
+async function submitTaskForm() {
+  const f = boardForm || {};
+  const fields = {role: pickedRole(),
+                  title: document.getElementById("tftitle").value.trim(),
+                  goal: document.getElementById("tfgoal").value.trim()};
+  if (f.kind === "new") fields.project = f.project;
+  else fields.project = document.getElementById("tfproj").value;
+  if (goalCheck()) return;              // said inline already; the route would agree
+  let r;
+  if (f.kind === "edit") {
+    // Only what changed, compared the way the route stores them, so an
+    // unchanged field is not re-validated and stray spaces are no edit.
+    const was = f.was || {};
+    const norm = (k, v) => k === "title" ? (v || "").split(/\s+/).filter(Boolean).join(" ")
+                                         : (v || "").trim();
+    const payload = {action: "edit", id: f.id, by: "you"};
+    for (const k of ["project", "role", "title", "goal"])
+      if (norm(k, fields[k]) !== norm(k, was[k])) payload[k] = fields[k];
+    r = await taskCall(payload);
+  } else {
+    r = await taskCall({action: "create", ...fields, by: "you",
+      title: fields.title || undefined,
+      state: document.getElementById("tfpropose").checked ? "proposed" : "queued"});
+  }
+  if (!r.ok) { formError(r.error || "refused"); return; }
+  toast((f.kind === "edit" ? "Saved" : (r.task || {}).state === "proposed" ? "Proposed" : "Queued")
+        + (r.held ? ` — ${r.held}` : ""));
+  closeModal();
+  if (boardIsOpen()) refreshBoard();
+  refreshTaskBadge();
+}
+async function runNext(id, on) {
+  const r = await taskCall({action: "run-next", id, on, by: "you"});
+  toast(r.ok ? (on ? "Runs next" : "Back in its turn") : (r.error || "Not allowed"));
+  if (boardIsOpen()) refreshBoard();
+}
+
+// --- a new project: directory, git, CLAUDE.md and registration in one step.
+// The GitHub box is the only way a repository gets published from here.
+// Mirrors projects.slugify, for the live location line only; the route makes
+// the real slug.
+function slugify(name) {
+  const s = (name || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return s.slice(0, 40) || "untitled";
+}
+function newProjectForm(pre) {
+  pre = pre || {};
+  const existing = !!pre.path;
+  openModal(`<div class="tform"><h3>New project</h3>
+    <label>name</label><input type="text" id="npname" value="${esc(pre.name || "")}" oninput="projectFormWhere()">
+    <label>What is it for? <span class="note">(one line; it goes into the project's CLAUDE.md)</span></label>
+    <input type="text" id="nppurpose" value="">
+    <label>location</label><div class="fixed" id="npwhere"></div>
+    <label class="choice"><input type="checkbox" id="npexisting"${existing ? " checked" : ""} onchange="projectFormWhere()">
+      <span>Use an existing folder instead</span></label>
+    <div id="nppathrow" style="display:${existing ? "block" : "none"}"><input type="text" id="nppath" value="${esc(pre.path || "")}" placeholder="~/workspace/… or a full path"></div>
+    <label class="choice"><input type="checkbox" id="npgithub">
+      <span><b>Create a private GitHub repo</b>: makes a private repository and pushes this folder to it</span></label>
+    ${modalButtons("submitProjectForm", "Create project")}</div>`, {kind: "project"});
+  projectFormWhere();
+}
+function projectFormWhere() {
+  const existing = document.getElementById("npexisting").checked;
+  document.getElementById("nppathrow").style.display = existing ? "block" : "none";
+  document.getElementById("npwhere").textContent = existing
+    ? "the folder below, adopted as it is"
+    : `~/workspace/${slugify(document.getElementById("npname").value)}`;
+}
+async function submitProjectForm() {
+  const name = document.getElementById("npname").value.trim();
+  if (!name) { formError("a project needs a name"); return; }
+  const existing = document.getElementById("npexisting").checked;
+  const path = existing ? document.getElementById("nppath").value.trim() : "";
+  if (existing && !path) { formError("say which folder to use, or untick the box"); return; }
+  const r = await projectCall({action: "new", name,
+    purpose: document.getElementById("nppurpose").value.trim(),
+    path, adopt: existing, github: document.getElementById("npgithub").checked});
+  if (!r.ok) { formError(r.error || "Could not create it"); return; }
+  const done = r.created || {};
+  closeModal();
+  toast(`${done.title || name} registered at ${done.cwd || "?"}`
+        + (done.github_url ? ` · ${done.github_url}` : "")
+        + ((done.notes || []).length ? ` · ${done.notes.join("; ")}` : ""));
+  renderUnregistered();
+  if (document.getElementById("taskmodal").style.display === "flex") toggleTasks();
+  if (!boardIsOpen()) toggleBoard();
+  setBoardProject(done.slug || slugify(name));
+}
+
+// --- project settings
+async function projectSettings(slug) {
+  const r = await projectCall({action: "get", slug});
+  if (!r.ok) { toast(r.error || "bot offline"); return; }
+  const p = r.project, sc = p.scope || {};
+  const save = fn => `<button class="ghost" onclick="${fn}('${esc(slug)}')">Save</button></div>`;
+  openModal(`<div class="tform" data-slug="${esc(slug)}"><h3>⚙ ${esc(p.title)} <span class="sub">${esc(slug)}</span></h3>
+    <div class="sub">${esc(sc.cwd || "no directory")}${r.repo ? "" : " · not a git repository"}</div>
+    ${r.unready ? `<div class="warn">⚠ ${esc(slug)} ${esc(r.unready)}</div>` : `<div class="note">ready: queued work and nightly review run unattended</div>`}
+    <label>name</label><div class="line"><input type="text" id="pstitle" value="${esc(p.title || "")}">${save("saveProjectTitle")}
+    <label>test command</label><div class="line"><input type="text" id="pstest" value="${esc(p.test_cmd || "")}" placeholder="e.g. ./bin/test">${save("saveTestCmd")}
+    <div class="note">How work here is proven. Readiness needs it: without one nothing is verified, so nothing auto-merges and no unattended work runs.</div>
+    <label>landing</label>
+    <div class="line"><label style="margin:0"><input type="checkbox" id="psauto"${p.auto_merge ? " checked" : ""}
+      onchange="setAutoMerge('${esc(slug)}',this.checked)"> auto-merge</label><span class="note">land reviewed, verified work without asking</span></div>
+    <div class="line"><label style="margin:0"><input type="checkbox" id="pspublish"${p.publish ? " checked" : ""}
+      onchange="setPublish('${esc(slug)}',this.checked)"> publish</label><span class="note">push the base to origin after each landing</span></div>
+    <label>nightly review</label><div class="line"><input type="text" id="psideate" value="${esc(p.ideate_at || "")}" placeholder="off — or 02:00, 2am">${save("saveIdeate")}
+    <label>base branch</label><div class="line"><input type="text" id="psbase" value="${esc(r.base || "")}" placeholder="the default branch">${save("saveBase")}
+    <div class="note">What its tasks build on and land onto. Blank is the repository's default branch.</div>
+    <div class="err" id="tferr"></div>
+    <div class="acts">${p.archived
+      ? `<button class="ghost" onclick="archiveProject('${esc(slug)}',false)">Unarchive</button>`
+      : `<button class="ghost" onclick="archiveProject('${esc(slug)}',true)">Archive…</button>`}
+      <button class="ghost" onclick="closeModal()">Close</button></div></div>`,
+    {kind: "settings", slug});
+}
+// One settings write: the route's answer is shown, and the panel and board
+// redrawn from what was stored rather than from what was typed.
+async function settingsCall(payload, done) {
+  const r = await projectCall(payload);
+  if (!r.ok) {
+    // Redrawn from what is stored (a refused toggle unticks itself), and the
+    // reason written after that, or the redraw would wipe it.
+    if (boardForm && boardForm.slug === payload.slug) await projectSettings(payload.slug);
+    formError(r.error || "refused");
+    return r;
+  }
+  toast(done);
+  if (boardIsOpen()) renderBoard();
+  if (boardForm && boardForm.kind === "settings") await projectSettings(payload.slug);
+  return r;
+}
+async function saveProjectTitle(slug) {
+  await settingsCall({action: "title", slug, title: document.getElementById("pstitle").value}, "Renamed");
+}
+async function saveTestCmd(slug) {
+  const cmd = document.getElementById("pstest").value.trim();
+  if (!cmd && !confirm(`Clear ${slug}'s test command?\n\nIts work is then never verified, so nothing `
+                       + "auto-merges and it stops taking unattended work.")) return;
+  await settingsCall({action: "test-cmd", slug, cmd: cmd || "off"}, cmd ? "Test command saved" : "Test command cleared");
+}
+async function setAutoMerge(slug, on) {
+  if (on && !confirm(`Turn auto-merge on for ${slug}?\n\nReviewed work that passes its tests then lands `
+                     + "on the base branch with nobody approving it, and queued work there runs unattended.")) {
+    document.getElementById("psauto").checked = false; return;
+  }
+  await settingsCall({action: "auto-merge", slug, on}, on ? "Auto-merge on" : "Auto-merge off");
+}
+async function setPublish(slug, on) {
+  if (on && !confirm(`Turn publishing on for ${slug}?\n\nEvery landing is then pushed to origin — `
+                     + "an outward change to the shared remote that is not quietly undone.")) {
+    document.getElementById("pspublish").checked = false; return;
+  }
+  await settingsCall({action: "publish", slug, on}, on ? "Publishing on" : "Publishing off");
+}
+async function saveIdeate(slug) {
+  const at = document.getElementById("psideate").value.trim();
+  const off = !at || ["off", "none", "clear"].includes(at.toLowerCase());
+  if (!off && !confirm(`Review ${slug} every night at ${at}?\n\nAn agent reads the project unattended `
+                       + "and files proposals for you to accept.")) return;
+  await settingsCall({action: "ideate", slug, at: off ? "off" : at}, off ? "Nightly review off" : "Nightly review set");
+}
+async function saveBase(slug) {
+  const branch = document.getElementById("psbase").value.trim();
+  // Asked first without writing, so the confirmation can carry the warning.
+  const c = await projectCall({action: "base", slug, branch, check: true});
+  if (!c.ok) { formError(c.error || "refused"); return; }
+  if (!confirm((branch ? `Build ${slug}'s tasks on ${branch}?` : `Build ${slug}'s tasks on the default branch?`)
+               + "\n\nNew tasks are cut from it and land onto it."
+               + (c.warning ? `\n\n⚠ ${c.warning}` : ""))) return;
+  await settingsCall({action: "base", slug, branch, force: !!c.warning},
+                     branch ? `Base: ${branch}` : "Base: the default branch");
+}
+async function archiveProject(slug, on) {
+  if (on && !confirm(`Archive ${slug}?\n\nIt is hidden from the overview and from project pickers. `
+                     + "Nothing is deleted: its tasks keep their label and its settings stay as they are, "
+                     + "and it can be brought back from Archived."))
+    return;
+  const r = await projectCall({action: on ? "archive" : "unarchive", slug});
+  if (!r.ok) { if (modalIsOpen()) formError(r.error || "refused"); else toast(r.error || "refused"); return; }
+  toast(on ? `${slug} archived` : `${slug} is back`);
+  if (on && boardProject === slug) { closeModal(); setBoardProject(null); return; }
+  if (boardForm && boardForm.kind === "settings") await projectSettings(slug);
+  if (boardIsOpen()) renderBoard();
 }
 
 // --- polling ---

@@ -113,6 +113,29 @@ class InvalidTransition(Exception):
     pass
 
 
+class NotEditable(Exception):
+    """An edit or a reorder refused because of where the task is."""
+
+
+#: Where a task's goal, project and role can still change: it has not run.
+EDITABLE = (PROPOSED, QUEUED)
+
+
+def not_editable(state: str) -> str:
+    """Why a task in `state` cannot be edited, or "" if it can."""
+    if state in EDITABLE:
+        return ""
+    return (f"it is {state}; only proposed or queued work can be edited"
+            + ("" if state in TERMINAL else
+               " -- for work that already ran, send it back with notes"))
+
+
+def claim_order(rec: dict) -> tuple:
+    """The queue's order: run-next pins first, then oldest first. One key
+    for claim() and for the board, so the order shown is the order run."""
+    return (-(rec.get("priority") or 0), rec.get("created") or 0)
+
+
 # --- record -------------------------------------------------------------------
 
 FIELDS: dict[str, tuple] = {
@@ -190,6 +213,12 @@ FIELDS: dict[str, tuple] = {
     # Kept apart from `result`, which each run's turn rewrites whole, so a
     # second flagged review can still show what the first one asked for.
     "reworked_findings": (list, "review findings it was already sent back for"),
+    # "Run next" from the dashboard. claim() takes the highest first and the
+    # oldest among equals, so zero -- every task nobody pinned -- is the plain
+    # oldest-first queue it always was. Spent by the claim it asked for: it
+    # means "the next run", not "always jump the queue", so a task sent back
+    # after running does not go round again ahead of everything.
+    "priority":    (0,     "run-next order: higher is claimed first; 0 = oldest-first"),
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }
@@ -374,6 +403,10 @@ class TaskStore:
                 raise InvalidTransition(f"{tid}: {current} -> {to_state}")
             prior = copy.deepcopy(rec)
             rec["state"] = to_state
+            if current == QUEUED:
+                # A run-next pin is for the queue it was set in; leaving the
+                # queue any other way than a claim spends it too.
+                rec["priority"] = 0
             if _unblock:
                 # Forgetting an ended blocker happens in the same write as the
                 # state change, never before it. Persisting the strip first and
@@ -571,11 +604,112 @@ class TaskStore:
         return self.by_state(*NEEDS_ATTENTION)
 
     def next_queued(self) -> dict | None:
-        pending = self.by_state(QUEUED)
+        pending = sorted(self.by_state(QUEUED), key=claim_order)
         return pending[0] if pending else None
 
+    def run_next(self, tid: str, on: bool = True, by: str = "") -> dict:
+        """Pin a queued task to be claimed before the rest, or unpin it.
+
+        Pinned above every task already pinned, so the one you asked for most
+        recently is the one that runs next. Queued tasks only: a proposal is
+        not in the queue until you accept it, and anything else is already
+        running or finished. Reviews are refused because they have a lane of
+        their own, which this must not reorder. Raises NotEditable.
+        """
+        with self._lock:
+            rec = self._data.get(tid)
+            if rec is None:
+                raise KeyError(tid)
+            if rec.get("state") != QUEUED:
+                raise NotEditable(f"only a queued task can be run next; "
+                                  f"this one is {rec.get('state')}")
+            if rec.get("role") == "reviewer":
+                raise NotEditable("reviews run in their own lane, in their own order")
+            top = max((r.get("priority") or 0 for r in self._data.values()
+                       if r.get("state") == QUEUED and r is not rec), default=0)
+            prior = copy.deepcopy(rec)
+            rec["priority"] = top + 1 if on else 0
+            rec["updated"] = time.time()
+            events = rec.setdefault("events", [])
+            events.append({"at": time.time(), "kind": "priority",
+                           "detail": (f"{'run next' if on else 'back in turn'}"
+                                      f"{f' via {by}' if by else ''}")[:200]})
+            del events[:-50]
+            self._save_or_restore(tid, prior)
+            return dict(rec)
+
+    def edit(self, tid: str, changes: dict, by: str = "") -> dict:
+        """Change what a task that has not run yet is: title, goal, project,
+        role, and the scope that follows its project. Raises NotEditable.
+
+        Only while it is proposed or queued, checked under the lock the claim
+        takes, so an edit can never land on a task the runner picked up a
+        moment earlier. Work that already ran is edited by sending it back
+        with notes, which keeps what it did; rewriting its goal in place
+        would leave the record describing work nobody did.
+
+        Two queued shapes are refused too. One with a checkpoint resumes an
+        interrupted session that already holds the old goal, and would carry
+        on regardless of what this says. One that already has a branch keeps
+        it in its project's repository, so moving it to another project, or
+        handing it to another role, would separate the task from its work.
+
+        The change is recorded as an event naming who made it and what moved.
+        Returns the record; an edit that changes nothing writes nothing.
+        """
+        allowed = ("title", "goal", "project", "role", "scope")
+        stray = [k for k in changes if k not in allowed]
+        if stray:
+            raise ValueError(f"cannot edit {', '.join(stray)}")
+        with self._lock:
+            rec = self._data.get(tid)
+            if rec is None:
+                raise KeyError(tid)
+            why = not_editable(rec.get("state"))
+            if why:
+                raise NotEditable(why)
+            # A review is the board's own machinery, generated for one branch
+            # and awaited by its parent: edited, it would never return the
+            # verdict the parent is blocked on.
+            if rec.get("role") == "reviewer":
+                raise NotEditable("reviews are generated and awaited by the task they "
+                                  "review; they are not edited")
+            diff = {k: v for k, v in changes.items() if rec.get(k) != v}
+            if not diff:
+                return dict(rec)
+            if rec.get("checkpoint") and ("goal" in diff or "project" in diff
+                                          or "role" in diff):
+                raise NotEditable("it is waiting to resume an interrupted run, "
+                                  "which already holds the old goal")
+            moves = [k for k in ("project", "role") if k in diff]
+            if moves and (rec.get("branch") or rec.get("commits")
+                          or (rec.get("scope") or {}).get("worktree")):
+                raise NotEditable(
+                    f"it already has work on its branch {rec.get('branch') or ''}".rstrip()
+                    + "; "
+                    f"changing its {' and '.join(moves)} would separate it from that")
+            if "role" in diff and not roles.known(diff["role"]):
+                raise ValueError(f"unknown role {diff['role']!r}")
+            what = []
+            for k in ("title", "goal"):
+                if k in diff:
+                    what.append(k)
+            for k in moves:
+                what.append(f"{k} {rec.get(k) or '(none)'} → {diff[k] or '(none)'}")
+            prior = copy.deepcopy(rec)
+            rec.update(diff)
+            rec["updated"] = time.time()
+            events = rec.setdefault("events", [])
+            events.append({"at": time.time(), "kind": "edited",
+                           "detail": f"by {by or 'someone'}: {', '.join(what)}"[:200]})
+            del events[:-50]
+            self._save_or_restore(tid, prior)
+            log.info("task %s edited by %s: %s", tid, by or "?", ", ".join(what))
+            return dict(rec)
+
     def claim(self, *, only_roles=None, except_roles=None) -> dict | None:
-        """Take the oldest queued task the runner is allowed to execute.
+        """Take the next queued task the runner is allowed to execute: the
+        highest `priority` (see run_next), the oldest among equals.
 
         The claim (queued -> running) happens under the same lock that selects
         it, so two runners -- or a runner and a restart -- can never both pick
@@ -618,9 +752,10 @@ class TaskStore:
                           and fits(r)]
             if not candidates:
                 return None
-            rec = min(candidates, key=lambda r: r.get("created", 0))
+            rec = min(candidates, key=claim_order)
             prior = copy.deepcopy(rec)
             rec["state"] = RUNNING
+            rec["priority"] = 0                  # spent: it asked for this run
             rec["attempts"] = (rec.get("attempts") or 0) + 1
             rec["updated"] = time.time()
             events = rec.setdefault("events", [])

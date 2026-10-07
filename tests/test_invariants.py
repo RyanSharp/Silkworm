@@ -68,7 +68,8 @@ def bot_functions(*names, **globals_):
 #: Helpers other lifted functions call as part of their own behaviour, so a
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
-SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey")
+SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
+                  "held_reason", "edit_task", "_task_title")
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -6066,7 +6067,7 @@ def test_dashboard_js_is_whole():
 
     for name in ("renderKindFilter", "setKind", "matchesKind",
                  "loadList", "loadStats", "loadTranscript", "renderAlerts", "jumpTo",
-                 "taskCall", "toggleTasks", "setTaskView", "renderProjects", "addTask",
+                 "taskCall", "toggleTasks", "setTaskView", "renderProjects", "newProjectForm",
                  "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
                  "refreshTaskBadge", "taskDetail", "lastEvent", "landing",
                  "releaseThread", "retitle", "nameAllThreads",
@@ -8860,7 +8861,8 @@ def _dashboard_create_impl():
     import roles as R, tasks as T
     from tasks import TaskStore
 
-    fn = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fn = next(n for n in tree.body
               if isinstance(n, ast.FunctionDef) and n.name == "handle_tasks")
     ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     made: list = []
@@ -8868,13 +8870,16 @@ def _dashboard_create_impl():
     mod.__dict__.update(
         roles=R, tasks=T, task_store=ts, time=time,
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
-        workspaces=__import__("workspaces"),
+        workspaces=__import__("workspaces"), scoping=__import__("scoping"),
+        projects=__import__("projects"),
         project_store=types.SimpleNamespace(
             ensure=lambda n, **kw: (made.append(n), {"slug": n})[1],
             home=lambda n, create=False: made.append(n),
+            get=lambda n: None,
             scope_for=lambda n: None, all=lambda: []),
     )
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<dashboard>", "exec"),
+    body = [fn] + _shared_helpers(tree, [fn], set())
+    exec(compile(ast.Module(body=body, type_ignores=[]), "<dashboard>", "exec"),
          mod.__dict__)
     return mod.handle_tasks, ts, made
 
@@ -8994,9 +8999,9 @@ def test_front_doors_agree():
 
     viz = (BASE / "visualizer.py").read_text()
     js = re.search(r"<script>(.*?)</script>", viz, re.S).group(1)
-    check("the form offers the choice at all", 'id="trole"' in viz)
+    check("the form offers the choice at all", 'name="tfrole"' in js)
     check("it asks the route what the choices are", 'action: "roles"' in js)
-    check("and sends back what was picked", "role: role || undefined" in js)
+    check("and sends back what was picked", "role: pickedRole()" in js)
     check("the page names no role of its own",
           not any(name in js for name in R.FILEABLE),
           "a second copy of the list is a second thing to drift")
@@ -14507,8 +14512,9 @@ def test_a_tasks_base_is_its_projects_current_base():
          and n.func.attr == "get" and n.args
          and isinstance(n.args[0], ast.Constant) and n.args[0].value == "branch"
          and "scope" in ast.unparse(n.func.value)})
+    # handle_projects reads it to show and set a project's base (`get`, `base`).
     check("no task's recorded base is read anywhere else",
-          readers == ["handle_command", "release_command"], str(readers))
+          readers == ["handle_command", "handle_projects", "release_command"], str(readers))
     for caller in ("handle_tasks", "digest_inputs", "run_ideation", "_worktree_sweeper"):
         fn = next((f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == caller), None)
         calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
@@ -15460,8 +15466,13 @@ def test_board_columns():
           tuple(b["columns"]) == ("backlog", "running", "review", "needs", "done"))
     check("proposed and queued are backlog",
           where.get(ids["proposed"]) == "backlog" and where.get(ids["queued"]) == "backlog")
-    check("backlog is oldest first",
-          [c["id"] for c in b["columns"]["backlog"]][:2] == [ids["proposed"], ids["queued"]])
+    # In the order the runner will take it: the queue first (oldest first
+    # while nothing is pinned), then what waits to go round again, then the
+    # proposals nothing runs until they are accepted.
+    check("backlog is the queue first, then what waits, then proposals",
+          [c["id"] for c in b["columns"]["backlog"]]
+          == [ids["queued"], ids["waiting"], ids["proposed"]],
+          [c["id"] for c in b["columns"]["backlog"]])
     check("running is running", where.get(ids["running"]) == "running")
     check("a task blocked on its reviewer is in review", where.get(ids["review"]) == "review")
     check("one blocked on anything else waits in the backlog",
@@ -15651,6 +15662,7 @@ def test_board_routes_through_handle_tasks():
     surveyed = []
     ns = {"task_store": ts, "project_store": ps, "board": B, "tasks": T, "costs": costs,
           "branches": branches, "worktrees": worktrees, "holding": holding, "roles": roles,
+          "projects": __import__("projects"), "scoping": __import__("scoping"),
           "unmerged_survey": lambda recs: surveyed.append(1) or survey,
           "tell_thread": lambda *a: None, "stop_task": lambda tid: True,
           "log": logging.getLogger("test"), "time": time}
@@ -15926,6 +15938,761 @@ def test_board_renders_in_the_page():
           out["backToOverview"] == {"project": None, "q": "", "shown": True},
           out["backToOverview"])
 
+
+
+# --- tasks and projects are edited from the boards ----------------------------
+# The boards could read everything and change almost nothing: a task could be
+# filed only from the old panel's form, never edited, never moved up the
+# queue, and of a project's settings only auto-merge, publish and the nightly
+# time were reachable. These drive the shipped routes with real stores.
+
+def _edit_routes(tmp=None):
+    """handle_tasks and handle_projects out of bot.py, over a real TaskStore
+    and ProjectStore in a temp dir. Alpha is ready, beta is not, gone is
+    archived."""
+    import board as B, tasks as T, projects as P, costs, branches, worktrees
+    import holding, roles, scoping
+    d = Path(tmp or tempfile.mkdtemp())
+    ts = T.TaskStore(d / "tasks.json")
+    ps = P.ProjectStore(d / "projects.json")
+    ps.ensure("Alpha", test_cmd="./bin/test", auto_merge=True, scope={"cwd": str(d / "alpha")})
+    ps.ensure("Beta", scope={"cwd": str(d / "beta")})
+    ps.ensure("Gone")
+    ps.set_archived("gone", True)
+    guards = []
+    ns = {"task_store": ts, "project_store": ps, "board": B, "tasks": T, "costs": costs,
+          "branches": branches, "worktrees": worktrees, "holding": holding, "roles": roles,
+          "projects": P, "scoping": scoping, "workspaces": __import__("workspaces"),
+          "unmerged_survey": lambda recs: [], "tell_thread": lambda *a: None,
+          "stop_task": lambda tid: True, "install_git_guards": guards.append,
+          "unregistered_repos": lambda: [], "GITHUB_OWNER": "",
+          "CLAUDE_CWD": d / "scratch", "log": logging.getLogger("test"), "time": time}
+    found = _bot_fns({"handle_tasks", "handle_projects", "edit_task", "held_reason",
+                      "_task_title", "board_survey", "board_release", "_board_survey",
+                      "_board_releases", "_with_costs", "_spend"}, ns)
+    return ns, ts, ps, found
+
+
+def test_run_next_is_honoured_by_claim():
+    import tasks as T
+    print("\nrun next: claim takes a pinned task first, ties oldest first")
+    ts = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    mk = lambda goal, **kw: ts.create(goal, driver="queue", state=T.QUEUED,
+                                      role=kw.pop("role", "implementor"), **kw)
+    a, b, c = mk("oldest"), mk("middle"), mk("newest")
+    for i, t in enumerate((a, b, c)):               # created stamps a < b < c
+        ts._data[t["id"]]["created"] = 1000 + i
+    check("unpinned, the oldest is claimed first", ts.next_queued()["id"] == a["id"])
+    pinned = ts.run_next(c["id"], by="you")
+    check("run next pins it above everything", pinned["priority"] == 1)
+    ev = (pinned["events"] or [{}])[-1]
+    check("and records who asked",
+          ev.get("kind") == "priority" and "you" in ev.get("detail", ""))
+    ts.run_next(b["id"])
+    check("the most recent run next is the next run",
+          ts.get(b["id"])["priority"] == 2 and ts.next_queued()["id"] == b["id"])
+    got = ts.claim()
+    check("claim honours it", got["id"] == b["id"])
+    check("and spends it: it asked for this run, not every run",
+          got["priority"] == 0 and ts.get(b["id"])["priority"] == 0)
+    ts.transition(b["id"], T.DONE)
+    check("then the next pinned", ts.claim()["id"] == c["id"])
+    ts.transition(c["id"], T.DONE)
+    d_, e_ = mk("tie old"), mk("tie new")
+    ts._data[d_["id"]]["created"] = 2000; ts._data[e_["id"]]["created"] = 2001
+    for t in (e_, d_, a):
+        ts._data[t["id"]]["priority"] = 5 if t is not a else 0
+    check("equal priorities go oldest first", ts.claim()["id"] == d_["id"])
+    ts.transition(d_["id"], T.DONE)
+    check("and unpinned work still runs after", [ts.claim()["id"], ts.claim()["id"]]
+          == [e_["id"], a["id"]])
+
+    # Unpin, and the refusals.
+    f = mk("unpin me"); g = mk("plain")
+    ts._data[f["id"]]["created"] = 3001; ts._data[g["id"]]["created"] = 3000
+    ts.run_next(f["id"]); ts.run_next(f["id"], on=False)
+    check("unpin puts it back in its turn",
+          ts.get(f["id"])["priority"] == 0 and ts.next_queued()["id"] == g["id"])
+    for state in (T.PROPOSED, T.RUNNING, T.DONE):
+        t = ts.create("not in the queue", state=state, driver="queue", role="implementor")
+        try:
+            ts.run_next(t["id"])
+            check(f"run next refuses a {state} task", False, "it was pinned")
+        except T.NotEditable as e:
+            check(f"run next refuses a {state} task", state in str(e), str(e))
+
+    h = mk("pinned then parked")
+    ts.run_next(h["id"]); ts.transition(h["id"], T.BLOCKED); ts.transition(h["id"], T.QUEUED)
+    check("a pin is spent by leaving the queue any other way too",
+          ts.get(h["id"])["priority"] == 0)
+    ts.transition(h["id"], T.CANCELLED)
+
+    # The review lane is not reordered by it.
+    rv_old = mk("Review: old", role="reviewer"); rv_new = mk("Review: new", role="reviewer")
+    ts._data[rv_old["id"]]["created"] = 4000; ts._data[rv_new["id"]]["created"] = 4001
+    try:
+        ts.run_next(rv_new["id"])
+        check("a review cannot be pinned", False)
+    except T.NotEditable:
+        check("a review cannot be pinned", True)
+    ts.run_next(g["id"])
+    check("a pinned task does not jump the review lane",
+          ts.claim(only_roles={"reviewer"})["id"] == rv_old["id"])
+    check("nor does the task lane take a review",
+          ts.claim(except_roles={"reviewer"})["id"] == g["id"])
+
+
+def test_tasks_are_filed_and_edited_from_the_board():
+    import tasks as T, scoping
+    print("\nfiling and editing a task from the board")
+    ns, ts, ps, found = _edit_routes()
+    check("the routes are in bot.py", {"edit_task", "held_reason", "_task_title"} <= found)
+    ht = ns["handle_tasks"]
+
+    r = ht({"action": "create", "goal": "too short", "project": "alpha"})
+    check("a goal under the filing minimum is refused like a conversation's",
+          not r["ok"] and str(scoping.MIN_GOAL_CHARS) in r["error"], r)
+    check("and leaves nothing behind", ts.all() == {})
+    r = ht({"action": "create", "goal": "x" * (scoping.MAX_GOAL_CHARS + 1), "project": "alpha"})
+    check("so is one over the maximum", not r["ok"] and "split" in r["error"])
+    r = ht({"action": "create", "goal": "Build the importer for the new feed format",
+            "project": "alpha", "role": "implementor", "title": "  Importer  ", "by": "you"})
+    check("a board filing is queued under its project with its title",
+          r["ok"] and r["task"]["state"] == T.QUEUED and r["task"]["project"] == "alpha"
+          and r["task"]["title"] == "Importer", r)
+    check("on a ready project it is not held", r["held"] == "")
+    alpha_task = r["task"]["id"]
+    r = ht({"action": "create", "goal": "Build the importer for the beta feed",
+            "project": "beta", "role": "implementor"})
+    check("an implementor on a project that is not ready is filed, and said to be held",
+          r["ok"] and "beta" in r["held"] and "Needs you" in r["held"], r.get("held"))
+    r = ht({"action": "create", "goal": "Summarise what the beta feed contains",
+            "project": "beta", "role": "assistant", "state": "proposed"})
+    check("an assistant there is not held, and a proposal waits",
+          r["ok"] and r["held"] == "" and r["task"]["state"] == T.PROPOSED)
+    proposal = r["task"]["id"]
+    check("the roles route says which roles are held",
+          {x["name"]: x["held_if_unready"] for x in ht({"action": "roles"})["roles"]}
+          == {"implementor": True, "assistant": False})
+    r = ht({"action": "create", "goal": "Build the importer for the new feed format",
+            "project": "alpha", "title": "t" * (scoping.MAX_TITLE_CHARS + 1)})
+    check("an overlong title is refused", not r["ok"] and "title" in r["error"])
+
+    # --- edit ---
+    r = ht({"action": "edit", "id": alpha_task, "goal": "Build the importer for the v2 feed format",
+            "title": "Importer v2", "by": "you"})
+    rec = ts.get(alpha_task)
+    check("a queued task's goal and title can be edited",
+          r["ok"] and rec["goal"].endswith("v2 feed format") and rec["title"] == "Importer v2", r)
+    ev = (rec["events"] or [{}])[-1]
+    check("recorded as an event naming who and what",
+          ev.get("kind") == "edited" and "you" in ev.get("detail", "")
+          and "title" in ev.get("detail", "") and "goal" in ev.get("detail", ""), ev)
+    n = len(ts.get(alpha_task)["events"])
+    r = ht({"action": "edit", "id": alpha_task, "title": "Importer v2"})
+    check("an edit that changes nothing writes no event",
+          r["ok"] and len(ts.get(alpha_task)["events"]) == n)
+    r = ht({"action": "edit", "id": alpha_task, "goal": "short"})
+    check("an edited goal keeps the filing rules", not r["ok"] and "at least" in r["error"])
+    r = ht({"action": "edit", "id": alpha_task, "role": "admin"})
+    check("so does an edited role", not r["ok"] and "admin" in r["error"])
+    r = ht({"action": "edit", "id": alpha_task, "role": "reviewer"})
+    check("an internal role cannot be edited in", not r["ok"])
+
+    r = ht({"action": "edit", "id": proposal, "project": "alpha", "role": "implementor", "by": "you"})
+    rec = ts.get(proposal)
+    check("a proposal can move project; its scope follows the new project",
+          r["ok"] and rec["project"] == "alpha" and rec["role"] == "implementor"
+          and rec["scope"] == ps.scope_for("alpha"), rec["scope"])
+    check("the move is in the event",
+          "project beta → alpha" in (rec["events"] or [{}])[-1].get("detail", ""))
+    r = ht({"action": "edit", "id": proposal, "project": "gone"})
+    check("not into an archived project", not r["ok"] and "archived" in r["error"])
+    r = ht({"action": "edit", "id": proposal, "project": "nowhere"})
+    check("nor an unknown one", not r["ok"] and "unknown project" in r["error"])
+    r = ht({"action": "edit", "id": proposal, "project": ""})
+    check("unfiling it gives it the scratch directory",
+          r["ok"] and ts.get(proposal)["project"] == ""
+          and ts.get(proposal)["scope"] == {"cwd": str(ns["CLAUDE_CWD"])})
+
+    # Refused past queued, and racing the claim.
+    got = ts.claim()
+    check("(the runner claimed the queued one)", got["id"] == alpha_task)
+    r = ht({"action": "edit", "id": alpha_task, "goal": "Build the importer for the v3 feed format"})
+    check("an edit is refused while it runs",
+          not r["ok"] and "running" in r["error"] and "send it back" in r["error"], r)
+    check("and changed nothing", ts.get(alpha_task)["goal"].endswith("v2 feed format"))
+    for state in (T.BLOCKED, T.AWAITING_APPROVAL, T.DONE):
+        t = ts.create("Some work that is past editing", state=state, driver="queue",
+                      role="implementor", project="alpha")
+        r = ht({"action": "edit", "id": t["id"], "title": "new"})
+        check(f"refused while {state}", not r["ok"] and state in r["error"], r)
+    homes = []
+    real_home = ps.home
+    ps.home = lambda slug, create=False: homes.append(slug) or real_home(slug, create=create)
+    r = ht({"action": "edit", "id": alpha_task, "project": "beta"})
+    ps.home = real_home
+    check("a refused move makes nothing for the project it named",
+          not r["ok"] and homes == [], homes)
+    rv = ts.create("Review: the branch silkworm/tsk_x", state=T.QUEUED, driver="queue",
+                   role="reviewer", parent=alpha_task)
+    for change in ({"role": "implementor"}, {"goal": "Review something else entirely"},
+                   {"title": "renamed"}):
+        r = ht({"action": "edit", "id": rv["id"], **change})
+        check(f"a queued review cannot be edited ({', '.join(change)})",
+              not r["ok"] and "review" in r["error"], r)
+    check("and is unchanged", ts.get(rv["id"])["role"] == "reviewer"
+          and ts.get(rv["id"])["goal"] == "Review: the branch silkworm/tsk_x")
+    derived = ts.create("Derive my title from this goal line\nmore", state=T.QUEUED,
+                        driver="queue", role="implementor", project="alpha")
+    ht({"action": "edit", "id": derived["id"], "goal": "A different first line now\nmore"})
+    check("a title taken from the goal follows an edited goal",
+          ts.get(derived["id"])["title"] == "A different first line now")
+    ht({"action": "edit", "id": derived["id"], "title": "Chosen"})
+    ht({"action": "edit", "id": derived["id"], "goal": "Yet another first line here"})
+    check("a chosen title does not", ts.get(derived["id"])["title"] == "Chosen")
+    r = ht({"action": "edit", "id": "tsk_nope", "title": "x"})
+    check("an unknown task is refused", not r["ok"] and "unknown" in r["error"])
+
+    # Queued shapes that already have something behind them.
+    resumed = ts.create("Resume this interrupted piece of work", state=T.QUEUED,
+                        driver="queue", role="implementor", project="alpha")
+    ts.update(resumed["id"], checkpoint={"session_id": "abc", "at": time.time()})
+    r = ht({"action": "edit", "id": resumed["id"], "goal": "Something else entirely now"})
+    check("a task waiting to resume a session cannot have its goal changed",
+          not r["ok"] and "resume" in r["error"], r)
+    reworked = ts.create("Reworked work that has a branch already", state=T.QUEUED,
+                         driver="queue", role="implementor", project="alpha")
+    ts.update(reworked["id"], branch="silkworm/" + reworked["id"], commits=2)
+    r = ht({"action": "edit", "id": reworked["id"], "project": "beta"})
+    check("one with a branch cannot change project", not r["ok"] and "branch" in r["error"], r)
+    r = ht({"action": "edit", "id": reworked["id"], "goal": "Reworked work, with more detail on it"})
+    check("but its goal can still be clarified", r["ok"])
+
+    # --- run next through the route ---
+    q1 = ts.create("First queued work for the queue", state=T.QUEUED, driver="queue",
+                   role="implementor", project="alpha")
+    q2 = ts.create("Second queued work for the queue", state=T.QUEUED, driver="queue",
+                   role="implementor", project="alpha")
+    r = ht({"action": "run-next", "id": q2["id"], "by": "you"})
+    check("run next through the route", r["ok"] and r["task"]["priority"] > 0)
+    b = ht({"action": "board", "project": "alpha"})
+    backlog = [c for c in b["columns"]["backlog"] if c["state"] == T.QUEUED]
+    # Positions count the whole queue -- beta's queued work is in it too --
+    # so they rise down the column without being consecutive.
+    pos = [c["queue_pos"] for c in backlog]
+    check("the board's backlog shows the queue in claim order",
+          backlog[0]["id"] == q2["id"] and pos[0] == 1 and pos == sorted(pos)
+          and len(set(pos)) == len(pos) and q1["id"] in [c["id"] for c in backlog],
+          [(c["id"], c["queue_pos"]) for c in backlog])
+    check("and the claim agrees with it", ts.claim()["id"] == q2["id"])
+    r = ht({"action": "run-next", "id": q2["id"]})
+    check("run next on a running task is refused", not r["ok"] and "queued" in r["error"])
+    check("the board names the project and whether it is ready",
+          b["info"]["title"] == "Alpha" and b["info"]["unready"] == ""
+          and "auto-merge" in ht({"action": "board", "project": "beta"})["info"]["unready"])
+
+
+def _base_repo():
+    """main, plus `feature` (a commit main lacks) and `merged` (already in main)."""
+    d = Path(tempfile.mkdtemp())
+    g = lambda *a: subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True,
+                                  check=True)
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (d / "a").write_text("a"); g("add", "-A"); g("commit", "-qm", "one")
+    g("branch", "merged")
+    (d / "b").write_text("b"); g("add", "-A"); g("commit", "-qm", "two")
+    g("checkout", "-qb", "feature")
+    (d / "c").write_text("c"); g("add", "-A"); g("commit", "-qm", "feature work")
+    g("checkout", "-q", "main")
+    return d
+
+
+def test_project_settings_from_the_board():
+    import branches
+    print("\nproject settings and archiving, through /projects")
+    ns, ts, ps, found = _edit_routes()
+    hp, ht = ns["handle_projects"], ns["handle_tasks"]
+    repo = _base_repo()
+    ps.ensure("alpha", scope={**ps.scope_for("alpha"), "cwd": str(repo)})
+
+    g = hp({"action": "get", "slug": "alpha"})
+    check("get answers the record, its base and its readiness",
+          g["ok"] and g["project"]["test_cmd"] == "./bin/test" and g["base"] == ""
+          and g["unready"] == "" and g["repo"] is True, g)
+    check("and refuses an unknown project", not hp({"action": "get", "slug": "nope"})["ok"])
+    lst = {p["slug"]: p for p in hp({"action": "list"})["projects"]}
+    check("the list says which projects would hold unattended work",
+          lst["alpha"]["unready"] == "" and "test command" in lst["beta"]["unready"])
+
+    r = hp({"action": "title", "slug": "alpha", "title": "  Alpha  Feed "})
+    check("a project is renamed, not re-keyed",
+          r["ok"] and ps.get("alpha")["title"] == "Alpha Feed" and ps.get("alpha-feed") is None)
+    check("a blank name is refused", not hp({"action": "title", "slug": "alpha", "title": " "})["ok"])
+
+    # The base branch, checked against the repository.
+    r = hp({"action": "base", "slug": "alpha", "branch": "no-such-branch"})
+    check("a base that does not exist is refused",
+          not r["ok"] and "no branch" in r["error"] and not ps.scope_for("alpha").get("branch"), r)
+    r = hp({"action": "base", "slug": "alpha", "branch": "bad..name"})
+    check("so is one that is not a branch name", not r["ok"] and "valid" in r["error"])
+    r = hp({"action": "base", "slug": "alpha", "branch": "feature"})
+    check("a branch with its own work is set without a warning",
+          r["ok"] and r["warning"] == "" and ps.scope_for("alpha")["branch"] == "feature", r)
+    check("and the rest of the scope is kept", ps.scope_for("alpha")["cwd"] == str(repo))
+    c = hp({"action": "base", "slug": "alpha", "branch": "merged", "check": True})
+    check("a branch already merged into the default branch is warned about",
+          c["ok"] and "already merged into main" in c["warning"], c)
+    check("asking does not write", ps.scope_for("alpha")["branch"] == "feature")
+    r = hp({"action": "base", "slug": "alpha", "branch": "merged"})
+    check("and not set without saying so after seeing the warning",
+          not r["ok"] and r.get("needs_force") and ps.scope_for("alpha")["branch"] == "feature", r)
+    r = hp({"action": "base", "slug": "alpha", "branch": "merged", "force": True})
+    check("set when it is", r["ok"] and ps.scope_for("alpha")["branch"] == "merged"
+          and r["warning"])
+    r = hp({"action": "base", "slug": "alpha", "branch": "main"})
+    check("the default branch itself is no warning", r["ok"] and r["warning"] == "")
+    r = hp({"action": "base", "slug": "alpha", "branch": ""})
+    check("clearing it goes back to the default",
+          r["ok"] and ps.scope_for("alpha")["branch"] == "")
+    r = hp({"action": "base", "slug": "beta", "branch": "feature"})
+    check("a project with no repository has no branch to choose",
+          not r["ok"] and "no repository" in r["error"])
+    check("check_base agrees from the helper itself",
+          branches.check_base(repo, "merged")["warning"]
+          and not branches.check_base(repo, "feature")["warning"]
+          and not branches.check_base(repo, "nope")["ok"])
+
+    # Archive hides, unarchive restores; nothing is deleted.
+    t = ts.create("Work filed under alpha before archiving", project="alpha", state="queued",
+                  driver="queue", role="implementor")
+    ov = ht({"action": "overview"})
+    check("an active project is on the overview", "alpha" in {p["slug"] for p in ov["projects"]})
+    check("an archived one is listed apart", [a["slug"] for a in ov["archived"]] == ["gone"])
+    r = hp({"action": "archive", "slug": "alpha"})
+    ov = ht({"action": "overview"})
+    check("archiving takes it off the overview",
+          r["ok"] and "alpha" not in {p["slug"] for p in ov["projects"]}
+          and "alpha" in [a["slug"] for a in ov["archived"]], ov.get("archived"))
+    check("and out of the pickers",
+          "alpha" not in {p["slug"] for p in hp({"action": "list"})["projects"]})
+    check("its tasks keep their label", ts.get(t["id"])["project"] == "alpha")
+    check("its settings stay", ps.get("alpha")["test_cmd"] == "./bin/test")
+    r = hp({"action": "unarchive", "slug": "alpha"})
+    ov = ht({"action": "overview"})
+    check("unarchiving brings it back",
+          r["ok"] and "alpha" in {p["slug"] for p in ov["projects"]}
+          and "alpha" not in [a["slug"] for a in ov["archived"]])
+    check("archiving an unknown project is refused",
+          not hp({"action": "archive", "slug": "nope"})["ok"])
+
+
+BOARD_EDIT_DRIVER = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+function el(id) {
+  return {id, innerHTML: "", textContent: "", value: "", title: "", className: "",
+          style: {}, disabled: false, checked: false, dataset: {}, children: [],
+          classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+          appendChild() {}, removeChild() {}, remove() {}, addEventListener() {},
+          insertAdjacentHTML(_, h) { this.innerHTML += h; }, focus() {}, scrollIntoView() {},
+          querySelector() { return null; }, querySelectorAll() { return []; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+// Redrawing the modal replaces the elements inside it, as a browser would:
+// whatever was written into the old ones (an error message) is gone.
+const box = el("fbox");
+let boxHtml = "";
+Object.defineProperty(box, "innerHTML", {
+  get() { return boxHtml; },
+  set(h) { boxHtml = h; for (const m of h.matchAll(/id="([^"]+)"/g)) delete els[m[1]]; }});
+els.fbox = box;
+const keyHandlers = [];
+globalThis.document = {getElementById: byId, createElement: () => el("new"),
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener(kind, fn) { if (kind === "keydown") keyHandlers.push(fn); },
+                       body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.localStorage = {getItem: () => null, setItem() {}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+const confirms = [];
+let answer = true;
+globalThis.confirm = msg => { confirms.push(msg); return answer; };
+globalThis.prompt = () => null;
+const toasts = [];
+const calls = [];
+const replies = {};
+globalThis.fetch = async (url, opts) => {
+  const body = opts && opts.body ? JSON.parse(opts.body) : {};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions: [], slack: {}};
+  else if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  else {
+    calls.push({url, ...body});
+    const key = `${url}:${body.action}`;
+    if (replies[key]) out = replies[key](body);
+    else if (body.action === "list") out = {ok: true, projects: [
+      {slug: "alpha", title: "Alpha", unready: ""},
+      {slug: "beta", title: "Beta", unready: "needs a test command and auto-merge before it can take unsupervised work"}]};
+    else if (body.action === "roles") out = {ok: true, goal_min: 15, goal_max: 4000, roles: [
+      {name: "implementor", hint: "changes code, is tested, reviewed and merged", default: true, held_if_unready: true},
+      {name: "assistant", hint: "investigates or answers, nothing is merged", default: false, held_if_unready: false}]};
+    else if (body.action === "create") out = {ok: true, task: {id: "tsk_new", state: body.state}, held: ""};
+    else if (body.action === "new") out = {ok: true, created: {slug: "my-thing", title: body.name, cwd: "/w/my-thing"}};
+    else if (body.action === "board") out = {ok: true, columns: {backlog: []}, roles: [],
+      info: {slug: body.project, title: body.project === "beta" ? "Beta" : "Alpha", unready: ""}};
+    else if (body.action === "overview") out = {ok: true, projects: [], archived: []};
+  }
+  return {json: async () => out, text: async () => ""};
+};
+(0, eval)(src + `
+;toast = m => globalThis.__toasts.push(m);
+globalThis.__b = {newTaskForm, editTaskForm, submitTaskForm, taskFormWarn, pickRole, goalCheck,
+  runNext, closeModal, modalIsOpen, newProjectForm, projectFormWhere, submitProjectForm, adoptRepo,
+  projectSettings, saveBase, setAutoMerge, setPublish, archiveProject, saveTestCmd,
+  saveIdeate, setBoardProject, renderBoard, cardButtons, boardCard, renderOverview,
+  set project(p) { boardProject = p; }, get project() { return boardProject; },
+  get form() { return boardForm; }};`);
+const tick = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setImmediate(r)); };
+const last = (action) => calls.filter(c => c.action === action).slice(-1)[0];
+const count = (action) => calls.filter(c => c.action === action).length;
+const shown = () => byId("fmodal").style.display === "flex";
+(async () => {
+  const B = globalThis.__b, out = {};
+  globalThis.__toasts = toasts;
+  byId("boardmodal").style.display = "flex";
+  B.project = "alpha";
+  await B.renderBoard(); await tick();
+  out.boardHtml = byId("bboard").innerHTML;
+  out.overviewHtml = B.renderOverview({projects: [], archived: []});
+
+  // New task: a modal on the open project.
+  await B.newTaskForm();
+  out.opened = shown();
+  out.newForm = byId("fbox").innerHTML;
+  B.taskFormWarn(); out.warnReady = byId("tfwarn").textContent;
+  byId("tfgoal").value = "too short";
+  await B.submitTaskForm(); await tick();
+  out.shortWhy = byId("tfgoalwhy").textContent;
+  out.shortCalls = count("create");
+  byId("tfgoal").value = "  Build the importer for the feed  ";
+  byId("tftitle").value = ""; byId("tfpropose").checked = true;
+  B.pickRole("assistant");
+  await B.submitTaskForm(); await tick();
+  out.create = last("create");
+  out.closedAfter = {form: B.form, shown: shown(), toast: toasts.slice(-1)[0]};
+
+  // A refusal stays in the form, in the route's words.
+  await B.newTaskForm();
+  replies["/api/tasks:create"] = () => ({ok: false, error: "that goal is over 4000 characters; split it"});
+  byId("tfgoal").value = "A goal long enough to be sent"; byId("tfpropose").checked = false;
+  await B.submitTaskForm(); await tick();
+  out.refused = byId("tferr").textContent;
+  out.stillOpen = shown() && !!B.form;
+  delete replies["/api/tasks:create"];
+
+  // Cancel, Esc: nothing sent.
+  const before = calls.length;
+  B.closeModal();
+  out.cancel = {shown: shown(), sent: calls.length - before};
+  await B.newTaskForm();
+  const opened = calls.length;
+  for (const h of keyHandlers) h({key: "Escape", target: el("body"), preventDefault() {}});
+  out.esc = {shown: shown(), sent: calls.length - opened, handlers: keyHandlers.length};
+
+  // Unready project: the warning.
+  B.project = "beta";
+  await B.newTaskForm();
+  B.pickRole("implementor"); B.taskFormWarn(); out.warnBeta = byId("tfwarn").textContent;
+  B.pickRole("assistant"); B.taskFormWarn(); out.warnAssistant = byId("tfwarn").textContent;
+  B.closeModal();
+  B.project = "alpha";
+
+  // Edit sends only what changed.
+  replies["/api/tasks:task"] = () => ({ok: true, task: {id: "tsk_1", state: "queued",
+    title: "Old", goal: "Old goal text here", project: "alpha", role: "implementor"}});
+  await B.editTaskForm("tsk_1");
+  out.editForm = byId("fbox").innerHTML;
+  byId("tfproj").value = "alpha";
+  byId("tftitle").value = " New   title "; byId("tfgoal").value = "Old goal text here  ";
+  await B.submitTaskForm(); await tick();
+  out.edit = last("edit");
+  replies["/api/tasks:task"] = () => ({ok: true, task: {id: "tsk_2", state: "queued",
+    title: "Two words", goal: "Old goal text here", project: "alpha", role: "implementor"}});
+  await B.editTaskForm("tsk_2");
+  byId("tfproj").value = "alpha";
+  byId("tftitle").value = "Two    words"; byId("tfgoal").value = "Old goal text here";
+  await B.submitTaskForm(); await tick();
+  out.spacesEdit = last("edit");
+  B.closeModal();
+
+  // Card buttons.
+  out.queuedButtons = B.cardButtons({id: "tsk_q", state: "queued", role: "implementor", priority: 0});
+  out.pinnedButtons = B.cardButtons({id: "tsk_p", state: "queued", role: "implementor", priority: 3});
+  out.runningButtons = B.cardButtons({id: "tsk_r", state: "running", role: "implementor"});
+  out.reviewButtons = B.cardButtons({id: "tsk_v", state: "queued", role: "reviewer"});
+  out.proposedButtons = B.cardButtons({id: "tsk_o", state: "proposed", role: "implementor"});
+  out.card = B.boardCard({id: "tsk_p", title: "T", state: "queued", role: "implementor",
+    priority: 3, queue_pos: 1, created: Date.now() / 1000, attempts: 0});
+  await B.runNext("tsk_q", true); out.runNext = last("run-next");
+
+  // New project.
+  B.newProjectForm();
+  out.projectForm = byId("fbox").innerHTML;
+  byId("npname").value = "My Thing!"; B.projectFormWhere();
+  out.where = byId("npwhere").textContent;
+  out.pathHidden = byId("nppathrow").style.display;
+  byId("npexisting").checked = true; B.projectFormWhere();
+  out.pathShown = byId("nppathrow").style.display;
+  await B.submitProjectForm(); await tick();
+  out.noPath = {err: byId("tferr").textContent, sent: count("new")};
+  byId("npexisting").checked = false; B.projectFormWhere();
+  byId("nppurpose").value = " Track the things "; byId("npgithub").checked = true;
+  replies["/api/projects:new"] = () => ({ok: false, error: "there is already a project `my-thing`"});
+  await B.submitProjectForm(); await tick();
+  out.projectRefused = {err: byId("tferr").textContent, open: shown()};
+  delete replies["/api/projects:new"];
+  await B.submitProjectForm(); await tick();
+  out.newProject = last("new");
+  out.afterProject = {shown: shown(), project: B.project};
+  B.adoptRepo("/w/old-repo");
+  out.adopt = {html: byId("fbox").innerHTML, existing: byId("npexisting").checked,
+               path: byId("nppath").value};
+  byId("npexisting").checked = true; byId("npname").value = "old-repo"; byId("nppath").value = "/w/old-repo";
+  await B.submitProjectForm(); await tick();
+  out.adoptSent = last("new");
+  B.closeModal();
+
+  // Settings.
+  replies["/api/projects:get"] = () => ({ok: true, project: {slug: "alpha", title: "Alpha",
+    test_cmd: "./t", auto_merge: false, publish: false, ideate_at: "", scope: {cwd: "/x"}},
+    unready: "", base: "", repo: true});
+  await B.projectSettings("alpha");
+  out.settings = byId("fbox").innerHTML;
+  out.settingsInModal = shown();
+
+  answer = false; confirms.length = 0;
+  byId("psauto").checked = true;
+  await B.setAutoMerge("alpha", true); await tick();
+  out.autoCancelled = {asked: confirms.length, called: count("auto-merge"), box: byId("psauto").checked};
+  answer = true;
+  await B.setAutoMerge("alpha", true); await tick();
+  out.autoOn = last("auto-merge");
+  await B.setAutoMerge("alpha", false); await tick();
+  out.autoOffConfirms = confirms.length;
+  confirms.length = 0;
+  await B.setPublish("alpha", true); await tick();
+  out.publish = {call: last("publish"), asked: confirms.length};
+  replies["/api/projects:publish"] = () => ({ok: false, error: "turn auto-merge on first — there is nothing to publish"});
+  await B.setPublish("alpha", true); await tick();
+  out.publishRefused = byId("tferr").textContent;
+  delete replies["/api/projects:publish"];
+
+  replies["/api/projects:base"] = b => b.check
+    ? {ok: true, warning: "merged is already merged into main", branch: b.branch}
+    : {ok: true, warning: "merged is already merged into main", project: {}};
+  confirms.length = 0;
+  byId("psbase").value = "merged";
+  await B.saveBase("alpha"); await tick();
+  out.base = {calls: calls.filter(c => c.action === "base").slice(-2), confirm: confirms.slice(-1)[0]};
+  replies["/api/projects:base"] = b => ({ok: false, error: "there is no branch 'nope'"});
+  await B.saveBase("alpha"); await tick();
+  out.baseRefused = byId("tferr").textContent;
+
+  confirms.length = 0; answer = false;
+  await B.archiveProject("alpha", true); await tick();
+  out.archiveCancelled = {asked: confirms.length, called: count("archive")};
+  answer = true;
+  await B.archiveProject("alpha", true); await tick();
+  out.archive = {call: last("archive"), confirm: confirms.slice(-1)[0]};
+  confirms.length = 0;
+  await B.archiveProject("gone", false); await tick();
+  out.unarchive = {call: last("unarchive"), asked: confirms.length};
+  out.overview = B.renderOverview({projects: [{slug: "alpha", title: "Alpha", counts: {}}],
+                                   archived: [{slug: "gone", title: "Gone", tasks: 2}]});
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_board_edits_in_the_page():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe board's modal forms, driven through the page's own javascript")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    defined = set(re.findall(r"(?:async\s+)?function\s+([A-Za-z_]\w*)", js))
+    for name in ("newTaskForm", "editTaskForm", "submitTaskForm", "taskFormWarn", "runNext",
+                 "projectSettings", "settingsCall", "saveProjectTitle", "saveTestCmd",
+                 "setAutoMerge", "setPublish", "saveIdeate", "saveBase", "archiveProject",
+                 "archivedSection", "boardHead", "projectCall", "openModal", "closeModal",
+                 "modalIsOpen", "formError", "goalCheck", "roleChoices", "pickedRole",
+                 "newProjectForm", "projectFormWhere", "submitProjectForm", "adoptRepo"):
+        check(f"{name}() is defined", name in defined)
+    handlers = set(re.findall(r'on(?:click|change|input)="(?:event\.stopPropagation\(\);)?([a-zA-Z_]\w*)\(', js))
+    missing = sorted(h for h in handlers if h not in defined
+                     and h not in {"if", "confirm", "prompt", "alert", "event"})
+    check("every onclick, onchange and oninput handler is defined", not missing, f"missing: {missing}")
+
+    # One way to do each thing: the Tasks panel's inline rows are gone.
+    panel = V.PAGE[V.PAGE.index('<div id="taskmodal"'):V.PAGE.index('<div id="boardmodal"')]
+    for gone in ('id="tgoal"', 'id="tcwd"', 'id="tnewproj"', 'id="trole"', "working dir",
+                 'onclick="addTask()"', 'onclick="newProject()"'):
+        check(f"the Tasks panel no longer has {gone}", gone not in V.PAGE, gone)
+    check("it has a + New project button that opens the modal",
+          'onclick="newProjectForm()">+ New project' in panel)
+    check("the modal closes on a click outside it",
+          "<div id=\"fmodal\" onclick=\"if(event.target.id==='fmodal')closeModal()\">" in V.PAGE)
+
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(BOARD_EDIT_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the board's form javascript runs", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+
+    bh = o["boardHtml"]
+    cols_at = bh.find('<div class="bcols">')
+    check("the board header offers + New task and Settings",
+          '<div class="bhead">' in bh and 'newTaskForm()">+ New task' in bh
+          and 0 <= bh.find("newTaskForm()") < cols_at and "projectSettings('alpha')" in bh)
+    check("and the columns do not repeat it", cols_at >= 0 and "newTaskForm()" not in bh[cols_at:])
+    ov = o["overviewHtml"]
+    check("the overview header offers + New project",
+          'newProjectForm()">+ New project' in ov
+          and 0 <= ov.find("New project") < ov.find('class="pcards"'))
+
+    f = o["newForm"]
+    check("+ New task opens a modal titled with the project", o["opened"] and "New task in Alpha" in f)
+    check("the project is shown, not typed, and there is no directory field",
+          'id="tfproj"' not in f and '<div class="fixed">Alpha</div>' in f
+          and "directory" not in f.lower() and "cwd" not in f.lower())
+    check("labelled fields: title, what should it do, role, when",
+          all(x in f for x in ("title <span", "What should it do?", "<label>role</label>",
+                                "<label>when</label>")))
+    check("the two roles are described choices from the route",
+          "<b>Implementor</b>: changes code, is tested, reviewed and merged" in f
+          and "<b>Assistant</b>: investigates or answers, nothing is merged" in f)
+    check("queue now or propose for later",
+          "<b>Queue now</b>" in f and "<b>Propose for later</b>" in f and 'id="tfqueue" checked' in f)
+    check("Create task and Cancel",
+          ">Create task</button>" in f and 'onclick="closeModal()">Cancel' in f)
+    check("no warning for a ready project", o["warnReady"] == "")
+    check("a short goal is explained inline and nothing is sent",
+          "6 more characters needed" in o["shortWhy"] and o["shortCalls"] == 0, o["shortWhy"])
+    c = o["create"]
+    check("the form files exactly the payload the route reads",
+          c == {"url": "/api/tasks", "action": "create", "role": "assistant",
+                "goal": "Build the importer for the feed", "project": "alpha", "by": "you",
+                "state": "proposed"}, c)
+    check("success closes the modal and confirms",
+          o["closedAfter"]["form"] is None and o["closedAfter"]["shown"] is False
+          and o["closedAfter"]["toast"] == "Proposed", o["closedAfter"])
+    check("a refusal is shown in the form, which stays open",
+          "split it" in o["refused"] and o["stillOpen"])
+    check("Cancel closes it and sends nothing", o["cancel"] == {"shown": False, "sent": 0})
+    check("so does Esc", o["esc"]["shown"] is False and o["esc"]["sent"] == 0
+          and o["esc"]["handlers"] >= 1, o["esc"])
+    check("an implementor for an unready project is said to be held",
+          "beta" in o["warnBeta"] and "Needs you" in o["warnBeta"], o["warnBeta"])
+    check("an assistant there is not", o["warnAssistant"] == "")
+
+    check("the edit modal is prefilled, with the project changeable",
+          'value="Old"' in o["editForm"] and "Old goal text here" in o["editForm"]
+          and 'id="tfproj"' in o["editForm"] and ">Save</button>" in o["editForm"])
+    check("an edit sends only what changed",
+          o["edit"] == {"url": "/api/tasks", "action": "edit", "id": "tsk_1", "by": "you",
+                        "title": "New   title"}, o["edit"])
+    check("spacing the route would collapse is not an edit",
+          o["spacesEdit"] == {"url": "/api/tasks", "action": "edit", "id": "tsk_2", "by": "you"},
+          o["spacesEdit"])
+    check("a queued card offers Edit and Run next",
+          "editTaskForm('tsk_q')" in o["queuedButtons"] and "runNext('tsk_q',true)" in o["queuedButtons"])
+    check("a pinned one offers Unpin", "runNext('tsk_p',false)" in o["pinnedButtons"])
+    check("a proposal can be edited but not run next",
+          "editTaskForm(" in o["proposedButtons"] and "runNext(" not in o["proposedButtons"])
+    check("a running card offers neither",
+          "editTaskForm(" not in o["runningButtons"] and "runNext(" not in o["runningButtons"])
+    check("a queued review offers neither",
+          "editTaskForm(" not in o["reviewButtons"] and "runNext(" not in o["reviewButtons"])
+    check("a queued card shows its place in the queue", "📌 #1 in queue" in o["card"])
+    check("run next sends the right payload",
+          o["runNext"] == {"url": "/api/tasks", "action": "run-next", "id": "tsk_q", "on": True,
+                           "by": "you"}, o["runNext"])
+
+    pf = o["projectForm"]
+    check("the new-project modal has name, purpose, location, folder and GitHub",
+          all(f'id="{i}"' in pf for i in ("npname", "nppurpose", "npwhere", "npexisting",
+                                         "nppath", "npgithub"))
+          and "What is it for?" in pf and "CLAUDE.md" in pf
+          and "Use an existing folder instead" in pf and "Create a private GitHub repo" in pf
+          and ">Create project</button>" in pf)
+    check("the location is shown live from the name", o["where"] == "~/workspace/my-thing", o["where"])
+    check("the folder field appears only when asked for",
+          o["pathHidden"] == "none" and o["pathShown"] == "block")
+    check("an existing folder with no path is refused in the form, unsent",
+          "which folder" in o["noPath"]["err"] and o["noPath"]["sent"] == 0)
+    check("a refused project keeps the form open with the route's words",
+          "already a project" in o["projectRefused"]["err"] and o["projectRefused"]["open"])
+    check("it sends exactly what the route reads",
+          o["newProject"] == {"url": "/api/projects", "action": "new", "name": "My Thing!",
+                              "purpose": "Track the things", "path": "", "adopt": False,
+                              "github": True}, o["newProject"])
+    check("and then opens the new project's board",
+          o["afterProject"] == {"shown": False, "project": "my-thing"}, o["afterProject"])
+    check("an unregistered repo opens the same form, adopting it",
+          'id="npexisting" checked' in o["adopt"]["html"]
+          and 'value="/w/old-repo"' in o["adopt"]["html"]
+          and 'value="old-repo"' in o["adopt"]["html"], o["adopt"]["html"][:600])
+
+    check("submitted, it adopts that folder",
+          o["adoptSent"] == {"url": "/api/projects", "action": "new", "name": "old-repo",
+                             "purpose": "", "path": "/w/old-repo", "adopt": True,
+                             "github": False}, o["adoptSent"])
+
+    st = o["settings"]
+    check("settings open in the same modal",
+          o["settingsInModal"] and all(f'id="{i}"' in st for i in
+                                       ("pstitle", "pstest", "psauto", "pspublish", "psideate", "psbase")))
+    check("with a note that readiness needs the test command", "Readiness needs it" in st)
+    check("and Archive", "archiveProject('alpha',true)" in st)
+    check("cancelling auto-merge's confirmation changes nothing and unticks the box",
+          o["autoCancelled"] == {"asked": 1, "called": 0, "box": False}, o["autoCancelled"])
+    check("confirmed, it is sent",
+          (o["autoOn"] or {}).get("on") is True and (o["autoOn"] or {}).get("url") == "/api/projects")
+    check("turning it off does not ask", o["autoOffConfirms"] == 2, o["autoOffConfirms"])
+    check("publishing on asks first", o["publish"]["asked"] == 1
+          and (o["publish"]["call"] or {}).get("on") is True)
+    check("a refused toggle keeps the route's reason on screen after the redraw",
+          "turn auto-merge on first" in o["publishRefused"], o["publishRefused"])
+    b = o["base"]
+    second = (b["calls"] + [{}, {}])[1]
+    check("a base branch is checked, then confirmed with the warning, then forced",
+          [x.get("check") for x in b["calls"]] == [True, None]
+          and second.get("force") is True and second.get("branch") == "merged"
+          and "already merged" in (b.get("confirm") or ""), b)
+    check("a refused base shows the route's error", "no branch 'nope'" in o["baseRefused"])
+    check("archiving asks, and cancelling sends nothing",
+          o["archiveCancelled"] == {"asked": 1, "called": 0})
+    check("the confirmation says what archiving does",
+          "hidden from the overview" in (o["archive"]["confirm"] or "")
+          and "Nothing is deleted" in (o["archive"]["confirm"] or "")
+          and (o["archive"]["call"] or {}).get("slug") == "alpha")
+    check("unarchiving does not ask", o["unarchive"]["asked"] == 0
+          and (o["unarchive"]["call"] or {}).get("slug") == "gone")
+    check("archived projects are a collapsed section with Unarchive",
+          '<details class="parch"><summary>Archived · 1</summary>' in o["overview"]
+          and "archiveProject('gone',false)" in o["overview"])
 
 if __name__ == "__main__":
     tests = discover()
