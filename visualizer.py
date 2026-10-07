@@ -144,6 +144,8 @@ def load_sessions() -> dict:
             "hidden": bool(entry.get("hidden")),
             "title": entry.get("title") or "",
             "kind": entry.get("kind") or "thread",
+            # So the projects board can list threads filed under none.
+            "project": entry.get("project") or "",
             "summary": entry.get("summary") or "",
             "session_id": sid,
             "model": entry.get("model"),
@@ -780,6 +782,71 @@ PAGE = r"""<!doctype html>
                    white-space: pre-wrap; margin-top: 3px; }
   #tproj { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
            border-radius: 8px; font: inherit; font-size: 12px; padding: 3px 8px; }
+  /* projects overview and per-project boards */
+  #boardmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
+                display: none; align-items: flex-start; justify-content: center; padding: 30px 16px; }
+  #boardmodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+                     width: min(1560px, 100%); max-height: 90vh; overflow: auto; padding: 18px 20px; }
+  #boardmodal h2 { margin: 0 0 4px; font-size: 18px; display: flex; align-items: center;
+                   gap: 10px; flex-wrap: wrap; }
+  #boardmodal .hint { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .bfilters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .bfilters select, .bfilters input { background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 12.5px;
+    padding: 4px 8px; }
+  .bfilters input { width: 240px; }
+  .pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .pcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 11px 13px; font-size: 12.5px; cursor: pointer; }
+  .pcard:hover { border-color: var(--gold); }
+  .pcard h3 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 8px; align-items: baseline; }
+  .pcard h3 .slug { font-family: var(--mono); font-size: 10.5px; color: var(--muted); font-weight: 400; }
+  .pcard .row { margin: 4px 0; color: var(--ink); }
+  .pcard .lbl { font-family: var(--mono); font-size: 10px; color: var(--muted);
+                text-transform: uppercase; letter-spacing: .06em; margin-right: 6px; }
+  .pcard .chips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .pcard .on { color: #2EB67D; } .pcard .off { color: var(--muted); }
+  .pcard .warn { color: var(--gold); }
+  .bcols { display: grid; grid-template-columns: repeat(5, minmax(210px, 1fr)); gap: 10px;
+           align-items: start; overflow-x: auto; }
+  .bcol { background: #00000018; border: 1px solid var(--line2); border-radius: 10px;
+          padding: 8px; min-height: 80px; }
+  .bcol > h4 { margin: 0 0 8px; font-size: 12px; font-family: var(--mono); color: var(--muted);
+               text-transform: uppercase; letter-spacing: .06em; }
+  .bcard { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+           padding: 8px 9px; margin-bottom: 7px; font-size: 12.5px; cursor: pointer; }
+  .bcard:hover { border-color: var(--gold); }
+  .bcard .tt { font-weight: 600; word-break: break-word; }
+  .bcard .sub { color: var(--muted); font-size: 10.5px; font-family: var(--mono); margin-top: 3px; }
+  .bcard .proj { color: var(--gold); }
+  .bcard .rv { margin-top: 4px; font-size: 11px; }
+  .bcard .rv.ok { color: #2EB67D; } .bcard .rv.bad { color: #D8517F; }
+  .bcard .acts { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; cursor: default; }
+  .bcard .acts button { font-size: 11px; padding: 2px 8px; }
+  .bcard .land, #bdetail .land { margin-top: 4px; font-size: 11px; font-family: var(--mono);
+                                 color: var(--muted); }
+  .bcard .land.ok, #bdetail .land.ok { color: #2EB67D; }
+  .bcard .land.bad, #bdetail .land.bad { color: #D8517F; }
+  .bcard .land .d { display: none; }
+  .bcard .why { margin-top: 4px; font-size: 11px; color: #D8517F; }
+  .bthreads { margin-top: 14px; }
+  .bthreads .b { display: inline-block; font-size: 12px; margin: 0 6px 6px 0; }
+  #bdetail { position: fixed; top: 0; right: 0; bottom: 0; width: min(680px, 96vw);
+             background: var(--bg); border-left: 1px solid var(--gold); z-index: 45;
+             overflow-y: auto; padding: 18px 20px; display: none; font-size: 13px; }
+  #bdetail h3 { margin: 0 0 6px; font-size: 16px; }
+  #bdetail .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  #bdetail .goal { margin: 8px 0; padding: 8px 10px; white-space: pre-wrap; word-break: break-word;
+                   font-family: var(--mono); font-size: 11.5px; background: #8881; border-radius: 6px;
+                   max-height: 360px; overflow-y: auto; }
+  #bdetail .rev { margin-top: 6px; font-size: 12px; line-height: 1.45; background: #D8517F14;
+                  border-left: 2px solid #D8517F; border-radius: 0 5px 5px 0; padding: 6px 9px; }
+  #bdetail .rev.ok { background: #2EB67D14; border-left-color: #2EB67D; }
+  #bdetail .rev ul { margin: 4px 0 0; padding-left: 16px; }
+  #bdetail .rev .lbl { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+  #bdetail .land .d { white-space: pre-wrap; font-size: 10.5px; margin-top: 3px; }
+  #bdetail .sect { margin-top: 14px; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+                   text-transform: uppercase; letter-spacing: .06em; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
                 display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; }
   #learnmodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
@@ -822,6 +889,7 @@ PAGE = r"""<!doctype html>
   <h1>Silkworm sessions</h1>
   <span id="botdot" title="bot status"></span>
   <button class="ghost" style="margin-left:16px" onclick="toggleTasks()">📋 Tasks<span id="taskbadge"></span></button>
+  <button class="ghost" onclick="toggleBoard()" title="per-project boards and backlogs">🗂 Projects</button>
   <button class="ghost" onclick="toggleLearn()">🧠 Learnings</button>
   <button class="ghost" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
@@ -884,6 +952,25 @@ PAGE = r"""<!doctype html>
     <div id="tlist"></div>
   </div>
 </div>
+<div id="boardmodal" onclick="if(event.target.id==='boardmodal')toggleBoard()">
+  <div class="box">
+    <h2>🗂 Projects
+      <span class="seg"><button id="bvover" class="on" onclick="setBoardProject(null)">Overview</button><button id="bvall" onclick="setBoardProject('')">All work</button><button id="bvunfiled" onclick="setBoardProject(UNFILED)">Unfiled</button></span></h2>
+    <div class="hint">One card per project: what is open, running, landed and unmerged,
+      whether it can take unsupervised work, what it spent this week and what is ready
+      to release. Open one for its board. Every button here is the task panel's own
+      action; "Needs you" stays in 📋 Tasks.</div>
+    <div class="bfilters">
+      <select id="bproj" onchange="setBoardProject(this.value === '*' ? null : this.value)" title="project"></select>
+      <select id="brole" onchange="renderBoard()" title="role"></select>
+      <select id="bstate" onchange="renderBoard()" title="state"></select>
+      <input id="bq" placeholder="search title or goal…" autocomplete="off" oninput="boardSearch()">
+    </div>
+    <div id="bover"></div>
+    <div id="bboard"></div>
+  </div>
+</div>
+<div id="bdetail"></div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
     <h2 style="display:flex;align-items:center;gap:12px">🧠 Learnings
@@ -1076,6 +1163,7 @@ async function loadList() {
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
   renderAlerts(data.sessions, data.slack, data.revision);
   refreshTaskBadge();
+  lastSessions = data.sessions;
   renderKindFilter(data.sessions);
   const nav = document.getElementById("list");
   nav.innerHTML = "";
@@ -1507,6 +1595,7 @@ async function taskAction(id, action, notes) {
              : (r.error || "Not allowed"));
   renderTasks();
   refreshTaskBadge();
+  if (boardIsOpen()) refreshBoard();
 }
 function review(t) {
   // Show why it is waiting, so approving is an informed click rather than a leap.
@@ -1814,11 +1903,264 @@ async function delLearning(id) {
   if (r.ok) renderLearnings();
 }
 
+// --- projects overview and per-project boards ---
+// The task panel answers "what needs me"; this answers "where is each project".
+// Read through the bot's /tasks route (overview, board, task), which reuses a
+// cached branch survey and release plan rather than asking git per poll. Every
+// button is one the task panel already offers, through taskAction.
+const UNFILED = "__unfiled__";            // board.UNFILED: work under no project
+const BOARD_COLUMNS = [["backlog", "Backlog"], ["running", "Running"],
+  ["review", "In review"], ["needs", "Needs you"], ["done", "Done · 14d"]];
+let boardProject = null;                  // null: overview; "": all; UNFILED; a slug
+let boardDetailId = null;
+let boardRows = [];                       // the overview's projects, for the picker
+let lastSessions = [];                    // from loadList, for the unfiled threads
+let boardTimer = null;
+
+function boardIsOpen() {
+  return document.getElementById("boardmodal").style.display === "flex";
+}
+function toggleBoard() {
+  const m = document.getElementById("boardmodal");
+  const open = !boardIsOpen();
+  m.style.display = open ? "flex" : "none";
+  if (open) refreshBoard(); else closeDetail();
+}
+function closeBoard() {
+  document.getElementById("boardmodal").style.display = "none";
+  closeDetail();
+}
+function setBoardProject(p) {
+  boardProject = p;
+  // Back to the overview is back to all of it: a filter left set would only
+  // turn it straight back into a board.
+  if (p === null) for (const id of ["brole", "bstate", "bq"]) document.getElementById(id).value = "";
+  closeDetail();
+  refreshBoard();
+}
+function boardSearch() {
+  clearTimeout(boardTimer);
+  boardTimer = setTimeout(renderBoard, 250);
+}
+function refreshBoard() {
+  renderBoard();
+  if (boardDetailId) openCard(boardDetailId);
+}
+// Mirrors costs.fmt: unknown is "$?", a floor is "+", never a silent zero.
+function fmtCost(c) {
+  if (!c) return "";
+  const usd = c.usd || 0;
+  if (!usd && !c.complete) return "$?";
+  return (usd >= 100 ? `$${Math.round(usd).toLocaleString("en-US")}` : `$${usd.toFixed(2)}`)
+    + (c.complete ? "" : "+");
+}
+function boardFilters() {
+  const proj = document.getElementById("bproj");
+  const keep = boardProject === null ? "*" : boardProject;
+  proj.innerHTML = `<option value="*">overview</option><option value="">all projects</option>`
+    + boardRows.map(p => `<option value="${esc(p.slug)}">${esc(p.title)}</option>`).join("")
+    + `<option value="${UNFILED}">unfiled</option>`;
+  proj.value = keep;
+  if (proj.value !== keep) {             // a slug the overview has not listed yet
+    proj.insertAdjacentHTML("beforeend", `<option value="${esc(keep)}">${esc(keep)}</option>`);
+    proj.value = keep;
+  }
+  document.getElementById("bvover").className = boardProject === null ? "on" : "";
+  document.getElementById("bvall").className = boardProject === "" ? "on" : "";
+  document.getElementById("bvunfiled").className = boardProject === UNFILED ? "on" : "";
+}
+function fillSelect(id, values, label) {
+  const sel = document.getElementById(id);
+  const keep = sel.value;
+  sel.innerHTML = `<option value="">${label}</option>` + values.map(v =>
+    `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  sel.value = values.includes(keep) ? keep : "";
+}
+async function renderBoard() {
+  const role = document.getElementById("brole").value;
+  const state = document.getElementById("bstate").value;
+  const q = document.getElementById("bq").value.trim();
+  // A filter typed on the overview means "find it", which is a board.
+  if (boardProject === null && (role || state || q)) boardProject = "";
+  if (boardProject === null) {
+    document.getElementById("bboard").innerHTML = "";
+    return loadOverview();
+  }
+  document.getElementById("bover").innerHTML = "";
+  boardFilters();
+  const asked = boardProject;
+  const r = await taskCall({action: "board", project: asked, role, state, q});
+  if (boardProject !== asked) return;    // the view changed while this was out
+  const el = document.getElementById("bboard");
+  if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  fillSelect("brole", r.roles || [], "any role");
+  fillSelect("bstate", ["proposed", "queued", "running", "blocked", "awaiting_approval",
+                        "needs_input", "failed", "done"], "any state");
+  el.innerHTML = renderColumns(r) + (boardProject === UNFILED ? unfiledThreads() : "");
+}
+function renderColumns(r) {
+  return `<div class="bcols">` + BOARD_COLUMNS.map(([k, label]) => {
+    const items = (r.columns || {})[k] || [];
+    return `<div class="bcol" data-col="${k}"><h4>${label} · ${items.length}</h4>${
+      items.map(boardCard).join("") || `<div class="hint">—</div>`}</div>`;
+  }).join("") + `</div>`;
+}
+function cardReview(t) {
+  const rv = t.review;
+  if (!rv) return "";
+  const n = rv.findings + rv.followups;
+  return `<div class="rv ${rv.ok ? "ok" : "bad"}" title="${esc(rv.summary || "")}">${
+    rv.ok ? "✓ review passed" : "⚑ review flagged"}${n ? ` · ${rv.findings} finding${
+    rv.findings === 1 ? "" : "s"}${rv.followups ? `, ${rv.followups} follow-up${
+    rv.followups === 1 ? "" : "s"}` : ""}` : ""}</div>`;
+}
+function cardLanding(t) {
+  // The same words as the task panel's landing(); a card only drops the detail.
+  if (t.landing) return landing({result: {landing: t.landing}});
+  if (t.state === "done" && t.unmerged)
+    return `<div class="land bad">not landed — ${esc(t.unmerged.branch || "its branch")} holds ${
+      t.unmerged.commits === null ? "?" : t.unmerged.commits} commit(s)</div>`;
+  return "";
+}
+function cardButtons(t) {
+  // taskButtons() is the task panel's; its Thread button closes that panel,
+  // so here it closes this one instead.
+  let b = taskButtons(t).split("toggleTasks();jumpTo(").join("closeBoard();jumpTo(");
+  // Land and Drop, for finished work the survey says never reached the base --
+  // the unmerged strip's buttons, offered only on a local branch for the same
+  // reason as there.
+  if (t.state === "done" && t.unmerged && t.unmerged.local !== false
+      && !(t.landing && t.landing.reworked_by)) {
+    b += `<button class="ghost" title="rebase onto the base, test, merge, test" `
+      + `onclick="taskAction('${esc(t.id)}','land')">Land</button>`
+      + `<button class="ghost" title="delete the branch; its commits are kept under a tag" `
+      + `onclick="if(confirm('Drop ${esc(t.unmerged.branch || t.id)}? Its commits are kept under a discarded/ tag.'))taskAction('${esc(t.id)}','drop')">Drop</button>`;
+  }
+  return b;
+}
+function boardCard(t) {
+  const cost = fmtCost(t.cost_total);
+  return `<div class="bcard" data-id="${esc(t.id)}" onclick="openCard('${esc(t.id)}')">
+    <div class="tt">${esc(t.title || t.id)}</div>
+    <div class="sub">${t.project && boardProject === "" ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
+      esc(t.role)}${t.state === "blocked" || t.state === "proposed" || t.state === "failed"
+        || t.state === "needs_input" || t.state === "awaiting_approval"
+        ? ` · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>` : ""} · ${
+      age(t.created)}${cost ? ` · <span title="API list-price equivalent, not billed">${cost}</span>` : ""}${
+      t.attempts > 1 ? ` · attempt ${t.attempts}` : ""}</div>
+    ${t.why ? `<div class="why">${esc(t.why)}</div>` : ""}${cardReview(t)}${cardLanding(t)}
+    <div class="acts" onclick="event.stopPropagation()">${cardButtons(t)}</div></div>`;
+}
+function unfiledThreads() {
+  // Conversations filed under no project. Task-run threads are left out: the
+  // tasks they narrate are on the board above.
+  const rows = lastSessions.filter(s => !s.project && !s.hidden && (s.kind || "thread") !== "task");
+  return `<div class="bthreads"><div class="hint">💬 ${rows.length} thread${
+    rows.length === 1 ? "" : "s"} with no project</div>` + rows.map(s =>
+    `<button class="ghost b" title="${esc(s.key)}" onclick="closeBoard();jumpTo('${esc(s.key)}')">${
+      esc(s.title || s.key)} · ${age(s.updated)}</button>`).join("") + `</div>`;
+}
+async function loadOverview() {
+  const r = await taskCall({action: "overview"});
+  if (boardProject !== null) return;     // a board was opened meanwhile
+  const el = document.getElementById("bover");
+  if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  boardRows = r.projects || [];
+  boardFilters();
+  el.innerHTML = renderOverview(r);
+}
+function renderOverview(r) {
+  const cards = (r.projects || []).map(projectCard);
+  const u = r.unfiled;
+  const threads = lastSessions.filter(s => !s.project && !s.hidden && (s.kind || "thread") !== "task").length;
+  if (u) cards.push(projectCard(u, threads));
+  return `<div class="pcards">${cards.join("") || `<div class="hint">No projects yet.</div>`}</div>`
+    + (r.note ? `<div class="hint" style="margin-top:8px">Costs are ${esc(r.note)}.</div>` : "");
+}
+function releaseText(rel) {
+  if (!rel) return "";
+  if (rel.error) return `<div class="row warn"><span class="lbl">release</span>release.toml: ${esc(rel.error)}</div>`;
+  const parts = (rel.targets || []).map(t => t.commits
+    ? `<b>${esc(t.target)}</b> ${t.commits} commit${t.commits === 1 ? "" : "s"} → ${esc(t.version || "?")}`
+    : `<span class="off">${esc(t.target)} nothing pending</span>`);
+  return `<div class="row"><span class="lbl">release</span>${parts.join(" · ") || "no targets"}</div>`;
+}
+function projectCard(p, threads) {
+  const c = p.counts || {};
+  const order = ["proposed", "queued", "running", "blocked", "awaiting_approval",
+                 "needs_input", "failed", "done", "cancelled"];
+  const chips = order.filter(k => c[k]).map(k =>
+    `<span class="st st-${k}">${k} ${c[k]}</span>`).join("");
+  const running = (p.running || []).map(t => esc(t.title || t.id)).join(" · ");
+  const last = p.last_landed;
+  const um = p.unmerged || {};
+  const rd = p.readiness;
+  const yes = (on, label, tip) => `<span class="${on ? "on" : "off"}" title="${esc(tip || "")}">${on ? "✓" : "✗"} ${label}</span>`;
+  const slug = p.slug === UNFILED ? UNFILED : p.slug;
+  return `<div class="pcard" data-slug="${esc(slug)}" onclick="setBoardProject('${esc(slug)}')">
+    <h3>${esc(p.title)}${p.slug !== UNFILED ? ` <span class="slug">${esc(p.slug)}</span>` : ""}${
+      p.needs ? ` <span class="st st-failed">${p.needs} need you</span>` : ""}</h3>
+    <div class="row chips">${chips || `<span class="off">no tasks</span>`}</div>
+    <div class="row"><span class="lbl">running</span>${running || `<span class="off">nothing</span>`}</div>
+    <div class="row"><span class="lbl">last landed</span>${last
+      ? `<code>${esc(last.head)}</code> ${esc(last.title)} · ${age(last.at)}` : `<span class="off">nothing recorded</span>`}</div>
+    <div class="row"><span class="lbl">unmerged</span>${um.branches
+      ? `<span class="warn">${um.branches} branch${um.branches === 1 ? "" : "es"} · ${um.commits}${um.unknown ? "+?" : ""} commit${um.commits === 1 ? "" : "s"}</span>`
+      : `<span class="off">none</span>`}</div>
+    ${rd ? `<div class="row"><span class="lbl">ready</span>${
+      yes(rd.test_cmd, "tests", rd.test_cmd || "no test command")} · ${
+      yes(rd.auto_merge, "auto-merge")} · ${yes(rd.publish, "publish")}${
+      rd.unready ? `<div class="off" style="font-size:11px">${esc(rd.unready)}</div>` : ""}</div>` : ""}
+    <div class="row"><span class="lbl">this week</span>${fmtCost(p.cost_week) || `<span class="off">$0</span>`}</div>
+    ${releaseText(p.release)}
+    ${threads !== undefined ? `<div class="row"><span class="lbl">threads</span>${threads} with no project</div>` : ""}
+  </div>`;
+}
+function closeDetail() {
+  boardDetailId = null;
+  const el = document.getElementById("bdetail");
+  el.style.display = "none";
+  el.innerHTML = "";
+}
+async function openCard(id) {
+  boardDetailId = id;
+  const r = await taskCall({action: "task", id});
+  if (boardDetailId !== id) return;      // another card was opened meanwhile
+  const el = document.getElementById("bdetail");
+  if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; el.style.display = "block"; return; }
+  el.innerHTML = renderDetail(r.task);
+  el.style.display = "block";
+}
+function renderDetail(t) {
+  const events = (t.events || []).slice().reverse().map(e =>
+    `<div class="ev"><span class="k k-${esc(e.kind || "")}">${esc(e.kind || "")}</span>
+     <span class="t">${e.at ? age(e.at) : ""}</span>
+     <span class="d">${esc(e.detail || "")}</span></div>`).join("");
+  const reviews = (t.reviews || []).map(x => `${esc(x.id)} (${esc(x.state || "")})`).join(", ");
+  const l = (t.result || {}).landing;
+  return `<button class="ghost" style="float:right" onclick="closeDetail()">✕</button>
+    <h3>${esc(t.title || t.id)}</h3>
+    <div class="sub">${esc(t.id)} · ${esc(t.role || "")} · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>${
+      t.project ? ` · ${esc(t.project)}` : " · unfiled"} · ${esc(t.source || "")} · ${age(t.created)}${costText(t)}${
+      t.branch ? ` · ${esc(t.branch)}${t.commits ? ` (${t.commits})` : ""}` : ""}</div>
+    <div class="acts" style="margin-top:8px">${cardButtons(t)}${t.thread_link
+      ? `<a class="ghost" href="${esc(t.thread_link)}" target="_blank">Slack thread ↗</a>` : ""}</div>
+    <div class="sect">goal</div><pre class="goal">${esc(t.goal || "")}</pre>
+    ${t.state === "failed" ? `<div class="sect">why it stopped</div><div class="rev">${esc(lastEvent(t))}</div>` : ""}
+    ${(t.result || {}).review ? `<div class="sect">review</div>${review(t)}` : ""}
+    ${reviews ? `<div class="sub">reviewed by ${reviews}</div>` : ""}
+    ${l || (t.result || {}).landed ? `<div class="sect">landing</div>${landing(t)}${l ? `<div class="sub">${
+      esc(l.stage || "")}${l.base ? ` · onto ${esc(l.base)}` : ""}${l.at ? ` · ${age(l.at)}` : ""}${
+      l.detail && l.landed ? `<div>${esc(String(l.detail))}</div>` : ""}</div>` : ""}` : ""}
+    <div class="sect">events · ${(t.events || []).length}</div>${events || `<div class="hint">none</div>`}`;
+}
+
 // --- polling ---
 loadList(); loadStats();
 setInterval(loadList, 5000);
 setInterval(loadStats, 30000);
 setInterval(() => { if (active) loadTranscript(false); }, 4000);
+setInterval(() => { if (boardIsOpen()) refreshBoard(); }, 5000);
 </script>
 </body>
 </html>

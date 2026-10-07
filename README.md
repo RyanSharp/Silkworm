@@ -353,6 +353,18 @@ a registered remote) are listed in `silkworm status`, the daily digest and the
 dashboard's task panel, so a new one never goes unnoticed. `.archive`,
 `.worktrees` and other hidden directories are not scanned.
 
+**Projects board.** The dashboard's 🗂 **Projects** button opens one card per
+active project — tasks by state, what is running, the last landing, unmerged
+branches, readiness (test command, auto-merge, publish), this week's cost at API
+list price, and, with a `.silkworm/release.toml`, what each target has ready to
+release (read only; no preview runs). A card opens the project's board:
+Backlog, Running, In review, Needs you and Done (14 days), each card carrying the
+task panel's own actions and opening to the full goal, events, review and
+landing record. Filters cover project, role, state and text; an **Unfiled** lane
+holds tasks and conversations under no project. The branch survey and release
+plans behind it are cached for a minute (`board.py`), so polling does not walk
+git. 📋 Tasks still opens on what needs you.
+
 A project is **what a task belongs to**; `scope` is **where it may act**. They
 are separate deliberately — two projects can share a repo, one project can span
 several, and plenty ("plan the trip") have no repo at all. A project may carry a

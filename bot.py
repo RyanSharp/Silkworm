@@ -31,6 +31,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import artifacts
 import backfill
+import board
 import branches
 import costs
 import credentials
@@ -1750,6 +1751,36 @@ def _spend(project: str = "") -> dict:
     return {"spend": rows, "spend_line": costs.week_line(rows)}
 
 
+#: The dashboard's boards poll every few seconds; the branch survey and the
+#: release plans both ask git, so they are reused for a minute rather than
+#: recomputed per render. Stale by up to that much is the price, and the
+#: task panel's own "unmerged" action still asks fresh.
+_board_survey = board.TTLCache()
+_board_releases = board.TTLCache()
+
+
+def board_survey() -> list:
+    """The unmerged-branch survey over every task, cached (see above).
+
+    Keyed by the finished records as they stand, so a landing or a drop --
+    each writes its outcome onto the task -- is seen on the next poll rather
+    than a minute later, when Land would still be offered on a merged branch.
+    The minute only covers what happens outside Silkworm, like a manual merge.
+    """
+    recs = list(task_store.all().values())
+    return _board_survey.get(board.survey_key(recs),
+                             lambda: unmerged_survey(recs))
+
+
+def board_release(slug: str):
+    """A project's release plan per target, cached; None without a
+    release.toml. Read-only: never runs a preview or ship command."""
+    def compute():
+        cwd = (project_store.scope_for(slug) or {}).get("cwd")
+        return board.release_status(cwd) if cwd and worktrees.is_repo(cwd) else None
+    return _board_releases.get(slug, compute)
+
+
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
@@ -1790,6 +1821,24 @@ def handle_tasks(payload: dict) -> dict:
         rows = branches.survey(_filter(list(task_store.all().values())),
                                scope_for=project_store.scope_for)
         return {"ok": True, "unmerged": rows, "summary": branches.line(rows)}
+    if action == "overview":
+        # One card per active project. Read-only; git is asked through the
+        # caches above, not once per poll.
+        live = project_store.all(include_archived=False)
+        return {"ok": True, **board.overview(
+            live, list(task_store.all().values()), unmerged_rows=board_survey(),
+            releases_by_slug={p["slug"]: board_release(p["slug"]) for p in live})}
+    if action == "board":
+        # One project's columns -- or every project's, or board.UNFILED's.
+        return {"ok": True, "project": project, **board.board(
+            list(task_store.all().values()), project,
+            role=payload.get("role") or "", state=payload.get("state") or "",
+            q=payload.get("q") or "", unmerged_rows=board_survey())}
+    if action == "task":
+        rec = task_store.get(payload.get("id", ""))
+        if not rec:
+            return {"ok": False, "error": "unknown task"}
+        return {"ok": True, "task": board.detail(rec, task_store.all().values())}
     if action == "roles":
         # What the form may offer, fetched rather than written into the page,
         # so the choices and the rule that enforces them cannot drift apart.

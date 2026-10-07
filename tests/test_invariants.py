@@ -6070,7 +6070,12 @@ def test_dashboard_js_is_whole():
                  "taskAction", "taskButtons", "renderTasks", "updateTaskBadge",
                  "refreshTaskBadge", "taskDetail", "lastEvent", "landing",
                  "releaseThread", "retitle", "nameAllThreads",
-                 "resummarize", "toggleLearn", "renderLearnings", "renderUnmerged"):
+                 "resummarize", "toggleLearn", "renderLearnings", "renderUnmerged",
+                 "toggleBoard", "closeBoard", "setBoardProject", "renderBoard",
+                 "refreshBoard", "boardSearch", "loadOverview", "renderOverview",
+                 "projectCard", "renderColumns", "boardCard", "cardButtons",
+                 "cardReview", "cardLanding", "unfiledThreads", "openCard",
+                 "closeDetail", "renderDetail", "fmtCost", "boardFilters"):
         check(f"{name}() is defined", name in defined)
 
     # Anything wired to an onclick must exist, or the click is a dead button.
@@ -15367,6 +15372,527 @@ def test_unregistered_repos_are_reported():
               for n in ast.walk(status_fn)))
     src = (BASE / "bot.py").read_text()
     check("the digest is handed them", "unregistered=found)" in src)
+
+
+# --- per-project boards and the projects overview ------------------------------
+# The task panel answers "what needs me"; nothing answered "where is this
+# project". board.py builds both views from the records, with the slow inputs
+# (branch survey, release plan) cached; handle_tasks serves them; the page
+# renders them. Driven here against real stores, real git and the page's own
+# javascript under node.
+
+def _board_fixture():
+    """A TaskStore and ProjectStore in a temp dir, one task in every column."""
+    import tasks as T
+    import projects as P
+    d = Path(tempfile.mkdtemp())
+    ts = T.TaskStore(d / "tasks.json")
+    ps = P.ProjectStore(d / "projects.json")
+    ps.ensure("Alpha", test_cmd="./bin/test", auto_merge=True, scope={"cwd": str(d / "alpha")})
+    ps.ensure("Beta")
+    ps.ensure("Gone")
+    ps.set_archived("gone", True)
+    now = time.time()
+    mk = lambda goal, **kw: ts.create(goal, driver="queue", **kw)
+    ids = {}
+    ids["proposed"] = mk("Propose a thing\n\nwith a long case about <b>it</b>",
+                         project="alpha", state=T.PROPOSED, role="implementor")["id"]
+    ids["queued"] = mk("Queue a thing", project="alpha", state=T.QUEUED,
+                       role="implementor")["id"]
+    ids["running"] = mk("Run a thing", project="alpha", state=T.RUNNING,
+                        role="implementor", thread="C1:1.2")["id"]
+    impl = mk("Under review", project="alpha", state=T.BLOCKED, role="implementor")
+    rev = mk("Review: Under review", state=T.RUNNING, role="reviewer", parent=impl["id"])
+    ts.update(impl["id"], blocked_on=[rev["id"]])
+    ts.update(rev["id"], result={"cost": 1.5})
+    ids["review"], ids["reviewer"] = impl["id"], rev["id"]
+    ids["waiting"] = mk("Quota wait", project="alpha", state=T.BLOCKED,
+                        role="implementor")["id"]
+    ids["awaiting"] = mk("Awaits you", project="alpha", state=T.AWAITING_APPROVAL,
+                         role="implementor")["id"]
+    ts.update(ids["awaiting"], result={"cost": 2.0, "cost_runs": [[now, 2.0]],
+              "review": {"ok": False, "summary": "two problems",
+                         "findings": ["first finding", "second finding"],
+                         "followups": ["a followup"]}})
+    ids["failed"] = mk("Broke", project="alpha", state=T.FAILED, role="implementor")
+    ts.update(ids["failed"]["id"], events=[{"at": now, "kind": "failed",
+                                            "detail": "claude exited 1: NO WORKTREE"}])
+    ids["failed"] = ids["failed"]["id"]
+    ids["landed"] = mk("Landed it", project="alpha", state=T.DONE, role="implementor")["id"]
+    ts.update(ids["landed"], result={"landed": "abcdef1234567890",
+              "landing": {"landed": True, "stage": "done", "head": "abcdef1234567890",
+                          "at": now - 3600}})
+    ids["refused"] = mk("Refused", project="alpha", state=T.DONE, role="implementor")["id"]
+    ts.update(ids["refused"], result={"landing": {"eligible": True, "landed": False,
+              "stage": "rebase", "branch": "silkworm/" + ids["refused"],
+              "detail": "CONFLICT in x.py", "at": now - 7200}})
+    ids["stranded"] = mk("Stranded", project="alpha", state=T.DONE, role="implementor")["id"]
+    ids["old"] = mk("Old work", project="alpha", state=T.DONE, role="implementor")["id"]
+    ts.update(ids["old"], result={"landed": "0123456789",
+              "landing": {"landed": True, "head": "0123456789", "at": now - 20 * 86400}})
+    ids["cancelled"] = mk("Dropped", project="alpha", state=T.CANCELLED)["id"]
+    ids["beta"] = mk("Beta work", project="beta", state=T.QUEUED, role="assistant")["id"]
+    ids["unfiled"] = mk("Nobody's work", state=T.QUEUED, role="implementor")["id"]
+    survey = [{"id": ids["stranded"], "project": "alpha", "branch": "silkworm/" + ids["stranded"],
+               "commits": 3, "local": True, "remote": ""},
+              {"id": ids["refused"], "project": "alpha", "branch": "silkworm/" + ids["refused"],
+               "commits": None, "local": True, "remote": ""}]
+    return ts, ps, ids, survey, d
+
+
+def test_board_columns():
+    import board as B
+    print("\nthe per-project board")
+    ts, ps, ids, survey, _ = _board_fixture()
+    recs = list(ts.all().values())
+    b = B.board(recs, "alpha", unmerged_rows=survey)
+    where = {c["id"]: col for col, cards in b["columns"].items() for c in cards}
+
+    check("the columns are the five asked for, in order",
+          tuple(b["columns"]) == ("backlog", "running", "review", "needs", "done"))
+    check("proposed and queued are backlog",
+          where.get(ids["proposed"]) == "backlog" and where.get(ids["queued"]) == "backlog")
+    check("backlog is oldest first",
+          [c["id"] for c in b["columns"]["backlog"]][:2] == [ids["proposed"], ids["queued"]])
+    check("running is running", where.get(ids["running"]) == "running")
+    check("a task blocked on its reviewer is in review", where.get(ids["review"]) == "review")
+    check("one blocked on anything else waits in the backlog",
+          where.get(ids["waiting"]) == "backlog")
+    check("the reviewer itself is never a card", ids["reviewer"] not in where)
+    check("awaiting approval and failed need you",
+          where.get(ids["awaiting"]) == "needs" and where.get(ids["failed"]) == "needs")
+    check("recently finished work is done",
+          all(where.get(ids[k]) == "done" for k in ("landed", "refused", "stranded")))
+    check("work finished over fourteen days ago has left the board", ids["old"] not in where)
+    check("cancelled work is not on it", ids["cancelled"] not in where)
+    check("another project's work is not on it",
+          ids["beta"] not in where and ids["unfiled"] not in where)
+    check("done is newest first",
+          [c["id"] for c in b["columns"]["done"]][:2] == [ids["stranded"], ids["landed"]]
+          or [c["id"] for c in b["columns"]["done"]][0] == ids["stranded"],
+          [c["title"] for c in b["columns"]["done"]])
+
+    cards = {c["id"]: c for cs in b["columns"].values() for c in cs}
+    rv = cards[ids["awaiting"]]["review"]
+    check("a card carries its review verdict, summarised",
+          rv == {"ok": False, "summary": "two problems", "findings": 2, "followups": 1}, rv)
+    check("and its cost, its reviews' included",
+          cards[ids["review"]]["cost_total"] == {"usd": 1.5, "complete": False},
+          cards[ids["review"]]["cost_total"])
+    check("a landed card names its commit",
+          cards[ids["landed"]]["landing"]["head"].startswith("abcdef12"))
+    check("a refused one its stage",
+          cards[ids["refused"]]["landing"]["stage"] == "rebase")
+    check("stranded work carries what the cached survey said, unknown kept unknown",
+          cards[ids["stranded"]]["unmerged"]["commits"] == 3
+          and cards[ids["refused"]]["unmerged"]["commits"] is None)
+    check("a failed card says why", "NO WORKTREE" in cards[ids["failed"]]["why"])
+    check("a card is small: the goal is a snippet",
+          all(len(c["goal"]) <= B.GOAL_SNIPPET for c in cards.values()))
+
+    # Filters
+    only = lambda **kw: {c["id"] for cs in B.board(recs, **kw)["columns"].values() for c in cs}
+    check("all projects is every project's work, unfiled included",
+          {ids["beta"], ids["unfiled"], ids["queued"]} <= only(project=""))
+    check("the unfiled lane is work under no project",
+          only(project=B.UNFILED) == {ids["unfiled"]}, only(project=B.UNFILED))
+    check("filter by role", only(project="", role="assistant") == {ids["beta"]})
+    check("filter by state", only(project="alpha", state="failed") == {ids["failed"]})
+    check("search reads the goal, not only the title",
+          only(project="", q="LONG CASE") == {ids["proposed"]})
+    check("search reads the title", ids["running"] in only(project="", q="run a"))
+    check("the role filter offers the roles on the board",
+          B.board(recs, "")["roles"] == ["assistant", "implementor"],
+          B.board(recs, "")["roles"])
+
+    d = B.detail(ts.get(ids["awaiting"]), recs)
+    check("the detail has the whole goal and the full review",
+          d["goal"] == "Awaits you" and d["result"]["review"]["findings"][1] == "second finding")
+    d = B.detail(ts.get(ids["running"]), recs)
+    check("and a thread link built by slacklinks",
+          d["thread_link"] == __import__("slacklinks").for_key("C1:1.2"))
+    d = B.detail(ts.get(ids["review"]), recs)
+    check("and names its reviewers", [r["id"] for r in d["reviews"]] == [ids["reviewer"]])
+
+
+def _release_repo():
+    d = Path(tempfile.mkdtemp())
+    g = lambda *a: subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True,
+                                  check=True)
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (d / ".silkworm").mkdir()
+    (d / ".silkworm" / "release.toml").write_text(
+        '[targets.backend]\nship = "command"\npaths = ["db/"]\n'
+        'commands = ["touch SHIPPED"]\npreview = ["touch PREVIEWED"]\n\n'
+        '[targets.app]\nship = "tag"\npaths = ["app/"]\nafter = ["backend"]\n')
+    (d / "db").mkdir(); (d / "db" / "a.sql").write_text("x")
+    g("add", "-A"); g("commit", "-qm", "db")
+    g("tag", "backend/v1.0.0")
+    (d / "app").mkdir(); (d / "app" / "a.swift").write_text("y")
+    g("add", "-A"); g("commit", "-qm", "app one")
+    (d / "app" / "b.swift").write_text("z")
+    g("add", "-A"); g("commit", "-qm", "app two")
+    return d
+
+
+def test_projects_overview():
+    import board as B
+    print("\nthe projects overview")
+    ts, ps, ids, survey, _ = _board_fixture()
+    repo = _release_repo()
+    rel = B.release_status(repo)
+    ov = B.overview(ps.all(include_archived=False), ts.all().values(), unmerged_rows=survey,
+                    releases_by_slug={"alpha": rel})
+    rows = {p["slug"]: p for p in ov["projects"]}
+    check("one card per active project, archived ones left out",
+          set(rows) == {"alpha", "beta"}, sorted(rows))
+    a = rows["alpha"]
+    check("counts by state, reviewers not counted as work",
+          a["counts"].get("running") == 1 and a["counts"].get("done") == 4
+          and a["counts"].get("blocked") == 2, a["counts"])
+    check("needs is what is waiting on you", a["needs"] == 3, a["needs"])
+    check("what is running now", [r["id"] for r in a["running"]] == [ids["running"]])
+    check("the last landing is the newest one",
+          a["last_landed"]["id"] == ids["landed"] and a["last_landed"]["head"] == "abcdef12")
+    check("unmerged branches from the survey, an uncountable one flagged",
+          a["unmerged"] == {"branches": 2, "commits": 3, "unknown": 1}, a["unmerged"])
+    check("readiness: test command, auto-merge, publish",
+          a["readiness"]["test_cmd"] == "./bin/test" and a["readiness"]["auto_merge"]
+          and not a["readiness"]["publish"] and a["readiness"]["unready"] == "")
+    check("a project that is not ready says why",
+          "test command" in rows["beta"]["readiness"]["unready"])
+    check("this week's cost, the reviewer counted under its parent's project",
+          a["cost_week"] and a["cost_week"]["usd"] == 3.5, a["cost_week"])
+    check("costs are labelled as list-price equivalents", "list price" in ov["note"])
+    check("the unfiled lane has its own card",
+          ov["unfiled"]["slug"] == B.UNFILED and ov["unfiled"]["counts"].get("queued") == 1,
+          ov["unfiled"])
+
+    tg = {t["target"]: t for t in (rel or {}).get("targets", [])}
+    check("release: per target, in dependency order",
+          [t["target"] for t in rel["targets"]] == ["backend", "app"], rel)
+    check("what is pending, and the version it would become",
+          tg["app"]["commits"] == 2 and tg["app"]["version"]
+          and tg["backend"]["commits"] == 0 and tg["backend"]["version"] is None, tg)
+    check("and reading it ran no preview and shipped nothing",
+          not (repo / "PREVIEWED").exists() and not (repo / "SHIPPED").exists())
+    check("a project without release.toml has no release row",
+          B.release_status(Path(tempfile.mkdtemp())) is None)
+    (repo / ".silkworm" / "release.toml").write_text("[targets.bad]\nship = 'boat'\n")
+    check("a broken release.toml is reported, not raised",
+          "ship" in (B.release_status(repo) or {}).get("error", ""))
+
+    src = (BASE / "board.py").read_text()
+    calls = {f"{n.func.value.id}.{n.func.attr}" for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name)}
+    check("board.py never calls a releases function that runs anything",
+          not calls & {"releases.preview", "releases.release", "releases.ready",
+                       "releases._run"}, sorted(calls))
+
+
+def test_board_cache():
+    import board as B
+    print("\nthe board's cache")
+    clock = [1000.0]
+    c = B.TTLCache(ttl=60, clock=lambda: clock[0])
+    n = []
+    compute = lambda: n.append(1) or len(n)
+    c.get("k", compute); c.get("k", compute)
+    check("a second read inside the window asks nothing", len(n) == 1)
+    clock[0] += 61
+    c.get("k", compute)
+    check("past it, it asks again", len(n) == 2)
+    def boom():
+        raise RuntimeError("git timed out")
+    try:
+        c.get("j", boom)
+    except RuntimeError:
+        pass
+    check("a failure is not cached", c.get("j", compute) == 3)
+
+    recs = [{"id": "a", "state": "done", "updated": 1}, {"id": "b", "state": "running",
+                                                          "updated": 1}]
+    k1 = B.survey_key(recs)
+    recs[1]["updated"] = 2
+    check("a running task rewriting itself does not invalidate the survey",
+          B.survey_key(recs) == k1)
+    recs[0]["updated"] = 2
+    check("a finished one changing (landed, dropped) does", B.survey_key(recs) != k1)
+
+
+def test_board_routes_through_handle_tasks():
+    import board as B, tasks as T, costs, branches, worktrees, holding, roles
+    print("\nthe board's routes, and its actions, through handle_tasks")
+    ts, ps, ids, survey, _ = _board_fixture()
+    surveyed = []
+    ns = {"task_store": ts, "project_store": ps, "board": B, "tasks": T, "costs": costs,
+          "branches": branches, "worktrees": worktrees, "holding": holding, "roles": roles,
+          "unmerged_survey": lambda recs: surveyed.append(1) or survey,
+          "tell_thread": lambda *a: None, "stop_task": lambda tid: True,
+          "log": logging.getLogger("test"), "time": time}
+    found = _bot_fns({"handle_tasks", "board_survey", "board_release", "_board_survey",
+                      "_board_releases", "_with_costs", "_spend"}, ns)
+    check("the routes and their caches are in bot.py",
+          {"board_survey", "board_release", "_board_survey", "_board_releases"} <= found)
+    ht = ns["handle_tasks"]
+
+    r = ht({"action": "board", "project": "alpha"})
+    where = {c["id"]: col for col, cs in r["columns"].items() for c in cs}
+    check("board answers with the project's columns",
+          r["ok"] and where.get(ids["awaiting"]) == "needs" and where.get(ids["review"]) == "review")
+    ht({"action": "board", "project": "alpha", "q": "thing"})
+    check("polling does not re-survey git while nothing finished", len(surveyed) == 1,
+          len(surveyed))
+    r = ht({"action": "board", "project": "alpha", "role": "implementor", "state": "queued"})
+    check("filters reach the board",
+          [c["id"] for cs in r["columns"].values() for c in cs] == [ids["queued"]])
+    r = ht({"action": "board", "project": B.UNFILED})
+    check("and the unfiled lane",
+          [c["id"] for cs in r["columns"].values() for c in cs] == [ids["unfiled"]])
+
+    ov = ht({"action": "overview"})
+    check("overview answers one card per active project",
+          ov["ok"] and {p["slug"] for p in ov["projects"]} == {"alpha", "beta"})
+    check("a project whose directory is not a repository has no release row",
+          all(p["release"] is None for p in ov["projects"]))
+    d = ht({"action": "task", "id": ids["awaiting"]})
+    check("task answers the full record", d["ok"] and d["task"]["goal"] == "Awaits you")
+    check("and refuses an unknown id", not ht({"action": "task", "id": "tsk_nope"})["ok"])
+
+    # The actions on a card are handle_tasks' own; drive them and watch the
+    # board follow.
+    check("retry moves a failed card out of Needs you",
+          ht({"action": "retry", "id": ids["failed"]})["ok"])
+    check("accept keeps a proposal in the backlog, now queued",
+          ht({"action": "accept", "id": ids["proposed"]})["ok"])
+    check("cancel takes a queued card off", ht({"action": "cancel", "id": ids["queued"]})["ok"])
+    r = ht({"action": "board", "project": "alpha"})
+    where = {c["id"]: (col, c["state"]) for col, cs in r["columns"].items() for c in cs}
+    check("and the board shows it",
+          where.get(ids["failed"]) == ("backlog", "queued")
+          and where.get(ids["proposed"]) == ("backlog", "queued")
+          and ids["queued"] not in where, where)
+    check("an illegal action is still refused",
+          not ht({"action": "accept", "id": ids["landed"]})["ok"])
+    before = len(surveyed)
+    ts.update(ids["stranded"], result={"landing": {"stage": "dropped", "landed": False}})
+    ht({"action": "board", "project": "alpha"})
+    check("a finished task changing (a drop, a landing) refreshes the survey",
+          len(surveyed) == before + 1)
+
+    # A project with a release.toml gets its plan, cached.
+    repo = _release_repo()
+    ps.ensure("Rel", scope={"cwd": str(repo)})
+    ov = ht({"action": "overview"})
+    rel = next(p for p in ov["projects"] if p["slug"] == "rel")["release"]
+    check("a project with release.toml shows what is ready per target",
+          rel and [t["target"] for t in rel["targets"]] == ["backend", "app"], rel)
+    (repo / "app" / "c.swift").write_text("w")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "app three"], check=True)
+    ov = ht({"action": "overview"})
+    rel2 = next(p for p in ov["projects"] if p["slug"] == "rel")["release"]
+    check("and reuses it inside the window rather than asking git every poll",
+          rel2 == rel)
+
+
+BOARD_DRIVER = r"""
+const fs = require("fs");
+const [src, fixture] = [fs.readFileSync(process.argv[2], "utf8"),
+                        JSON.parse(fs.readFileSync(process.argv[3], "utf8"))];
+function el(id) {
+  return {id, innerHTML: "", textContent: "", value: "", title: "", className: "",
+          style: {}, disabled: false, dataset: {}, children: [],
+          classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+          appendChild() {}, removeChild() {}, remove() {}, addEventListener() {},
+          insertAdjacentHTML(_, h) { this.innerHTML += h; }, focus() {}, scrollIntoView() {},
+          querySelector() { return null; }, querySelectorAll() { return []; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+globalThis.document = {getElementById: byId, createElement: () => el("new"),
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.localStorage = {getItem: () => null, setItem() {}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+const calls = [];
+globalThis.fetch = async (url, opts) => {
+  const body = opts && opts.body ? JSON.parse(opts.body) : {};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions: fixture.sessions, slack: {}};
+  else if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  else if (url.startsWith("/api/projects")) out = {ok: true, projects: []};
+  else if (url.startsWith("/api/tasks")) {
+    calls.push(body);
+    if (body.action === "board") out = fixture.boards[body.project] || {ok: true, columns: {}};
+    else if (body.action === "overview") out = fixture.overview;
+    else if (body.action === "task") out = {ok: true, task: fixture.detail};
+    else if (body.action === "list") out = {ok: true, tasks: [], counts: {}};
+    else if (body.action === "roles") out = {ok: true, roles: []};
+  }
+  return {json: async () => out, text: async () => ""};
+};
+(0, eval)(src + `
+;globalThis.__b = {setBoardProject, renderBoard, openCard, toggleBoard, loadList,
+                   get project() { return boardProject; }};`);
+(async () => {
+  const B = globalThis.__b, out = {};
+  await B.loadList();
+  byId("boardmodal").style.display = "none";
+  B.toggleBoard();
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  out.open = byId("boardmodal").style.display;
+  out.overview = byId("bover").innerHTML;
+  out.picker = byId("bproj").innerHTML;
+  B.setBoardProject("alpha");
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  out.board = byId("bboard").innerHTML;
+  out.overviewAfter = byId("bover").innerHTML;
+  out.roles = byId("brole").innerHTML;
+  B.setBoardProject(fixture.unfiled);
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  out.unfiled = byId("bboard").innerHTML;
+  await B.openCard(fixture.detail.id);
+  out.detail = byId("bdetail").innerHTML;
+  out.detailShown = byId("bdetail").style.display;
+  B.setBoardProject(null);
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  byId("bq").value = "needle";
+  B.renderBoard();
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  out.searchCall = calls.filter(c => c.action === "board").slice(-1)[0];
+  out.searchProject = B.project;
+  B.setBoardProject(null);
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  out.backToOverview = {project: B.project, q: byId("bq").value,
+                        shown: byId("bover").innerHTML.includes('data-slug="alpha"')};
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_board_renders_in_the_page():
+    import re
+    import board as B
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe projects view and the board, rendered by the page's own javascript")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    check("the page's unfiled lane is board.UNFILED",
+          f'const UNFILED = "{B.UNFILED}";' in js)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        check("the board renders cards through taskButtons()",
+              "taskButtons(t)" in js[js.index("function cardButtons"):])
+        return
+    ts, ps, ids, survey, _ = _board_fixture()
+    recs = list(ts.all().values())
+    repo = _release_repo()
+    ov = B.overview(ps.all(include_archived=False), recs, unmerged_rows=survey,
+                    releases_by_slug={"alpha": B.release_status(repo)})
+    # A title the page must escape, not render.
+    ts.update(ids["queued"], title="<img src=x onerror=alert(1)>")
+    recs = list(ts.all().values())
+    fixture = {
+        "unfiled": B.UNFILED,
+        "overview": {"ok": True, **ov},
+        "boards": {"alpha": {"ok": True, **B.board(recs, "alpha", unmerged_rows=survey)},
+                   B.UNFILED: {"ok": True, **B.board(recs, B.UNFILED)},
+                   "": {"ok": True, **B.board(recs, "", q="needle")}},
+        "detail": B.detail(ts.get(ids["awaiting"]), recs),
+        "sessions": [{"key": "D1:1.1", "title": "A loose conversation", "kind": "thread",
+                      "project": "", "updated": time.time(), "turns": 1},
+                     {"key": "D1:2.2", "title": "Filed conversation", "kind": "thread",
+                      "project": "alpha", "updated": time.time(), "turns": 1},
+                     {"key": "D1:3.3", "title": "A task run", "kind": "task",
+                      "project": "", "updated": time.time(), "turns": 1}],
+    }
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "fx.json").write_text(json.dumps(fixture))
+    (d / "drive.js").write_text(BOARD_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(d / "fx.json")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the board's javascript runs", False, p.stderr.strip()[-600:])
+        return
+    out = json.loads(p.stdout)
+
+    o = out["overview"]
+    check("the board opens on the projects overview", out["open"] == "flex"
+          and 'data-slug="alpha"' in o and 'data-slug="beta"' in o)
+    check("an overview card shows counts, running, last landed and unmerged",
+          "running 1" in o and "Run a thing" in o and "abcdef12" in o
+          and "2 branches · 3+? commits" in o, o[:1500])
+    check("readiness and this week's cost",
+          "✓ tests" in o and "✓ auto-merge" in o and "✗ publish" in o and "$3.50" in o)
+    check("what is ready to release per target",
+          "<b>app</b> 2 commits" in o and "backend nothing pending" in o)
+    check("the unfiled lane has a card, counting threads with no project",
+          f'data-slug="{B.UNFILED}"' in o and "1 with no project" in o)
+    check("the picker lists the projects and the unfiled lane",
+          'value="alpha"' in out["picker"] and f'value="{B.UNFILED}"' in out["picker"])
+
+    b = out["board"]
+    cols = {m.group(1): m.group(2) for m in re.finditer(
+        r'<div class="bcol" data-col="(\w+)">(.*?)(?=<div class="bcol"|$)', b, re.S)}
+    check("opening a project draws its five columns",
+          list(cols) == ["backlog", "running", "review", "needs", "done"], list(cols))
+    check("the overview gives way to the board", out["overviewAfter"] == "")
+    inside = lambda col, tid: f'data-id="{tid}"' in cols.get(col, "")
+    check("each card is in its column",
+          inside("backlog", ids["proposed"]) and inside("running", ids["running"])
+          and inside("review", ids["review"]) and inside("needs", ids["awaiting"])
+          and inside("needs", ids["failed"]) and inside("done", ids["landed"]))
+    card = lambda tid: next((c for c in b.split('<div class="bcard"') if f'"{tid}"' in c), "")
+    check("a proposal offers Accept and Dismiss",
+          "'accept')" in card(ids["proposed"]) and "'dismiss')" in card(ids["proposed"]))
+    check("awaiting approval offers Approve and Send back",
+          "'approve')" in card(ids["awaiting"]) and "sendBack(" in card(ids["awaiting"]))
+    check("failed offers Retry", "'retry')" in card(ids["failed"]))
+    check("running offers Stop", "stopTask(" in card(ids["running"]))
+    check("its Thread button closes the board, not the task panel",
+          "closeBoard();jumpTo('C1:1.2')" in card(ids["running"])
+          and "toggleTasks()" not in b)
+    check("stranded finished work offers Land and Drop",
+          "'land')" in card(ids["stranded"]) and "'drop')" in card(ids["stranded"]))
+    check("work that landed offers neither",
+          "'land')" not in card(ids["landed"]) and "landed abcdef12" in card(ids["landed"]))
+    check("a refusal names its stage", "not landed (rebase)" in card(ids["refused"]))
+    check("a card shows its review verdict",
+          "review flagged · 2 findings, 1 follow-up" in card(ids["awaiting"]))
+    check("its role, age and cost",
+          "implementor" in card(ids["awaiting"]) and "ago" in card(ids["awaiting"])
+          and "$2.00" in card(ids["awaiting"]))
+    check("a failed card says why", "NO WORKTREE" in card(ids["failed"]))
+    check("titles are escaped", "&lt;img src=x" in b and "<img src=x" not in b)
+    check("the card's buttons do not also open its detail",
+          b.count('class="acts" onclick="event.stopPropagation()"') == b.count('<div class="bcard"'))
+    check("the role filter is filled from the board", 'value="implementor"' in out["roles"])
+
+    u = out["unfiled"]
+    check("the unfiled lane has work under no project",
+          f'data-id="{ids["unfiled"]}"' in u and f'data-id="{ids["queued"]}"' not in u)
+    check("and conversations under no project, but not filed ones or task runs",
+          "A loose conversation" in u and "Filed conversation" not in u and "A task run" not in u)
+
+    dt = out["detail"]
+    check("clicking a card opens its detail", out["detailShown"] == "block")
+    check("with the full goal, review findings and followups",
+          "Awaits you" in dt and "second finding" in dt and "a followup" in dt)
+    check("its events and its actions",
+          "events ·" in dt and "'approve')" in dt)
+    check("a search typed on the overview searches every project",
+          out["searchCall"].get("q") == "needle" and out["searchCall"].get("project") == ""
+          and out["searchProject"] == "", out["searchCall"])
+    check("and Overview clears the search and goes back to the cards",
+          out["backToOverview"] == {"project": None, "q": "", "shown": True},
+          out["backToOverview"])
 
 
 if __name__ == "__main__":
