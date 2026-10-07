@@ -6273,6 +6273,117 @@ def test_every_open_state_has_a_button():
 # board to say so. Two of them were the same fix, proposed on two different
 # nights, because the first never landed and the gap was still there to find.
 
+# A landing refused at tests-after-merge kept the last 600 characters of the
+# suite's output. That output is stdout then stderr, so the tail was the
+# suite's own logging -- a deliberate traceback, fixture chatter -- and seven
+# refusals in four days never said which test failed. The refusal leads with
+# the failing checks, read off the whole output, then the tail.
+def test_a_refused_landing_names_the_failing_test():
+    import merge as M, verify as V
+    print("\na landing refused over failing tests says which ones")
+
+    root = Path(tempfile.mkdtemp())
+    repo = root / "repo"; repo.mkdir()
+    def g(cwd, *a): return subprocess.run(["git", *a], cwd=str(cwd),
+                                          capture_output=True, text=True)
+    g(repo, "init", "-q", "-b", "main")
+    g(repo, "config", "user.email", "t@t"); g(repo, "config", "user.name", "t")
+    (repo / "v.txt").write_text("1\n")
+    g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+    names = iter(range(100))
+
+    def branch():
+        name = f"b{next(names)}"
+        wt = root / name
+        g(repo, "worktree", "add", "-q", "-b", name, str(wt), "main")
+        (wt / f"{name}.txt").write_text("x\n")
+        g(wt, "add", "-A")
+        g(wt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name)
+        return wt, name
+
+    noise = ("cost seeds: skipping unreadable task record junk\n"
+             "Traceback (most recent call last):\n"
+             + "  File \"turncost.py\", line 83, in _runs\n" * 30
+             + "TypeError: 'int' object is not iterable\n")
+    check("the fixture's noise alone overflows the old 600-character tail",
+          len(noise) > 600, f"{len(noise)} chars")
+    said = ("  ✔ something that passed\n"
+            "  ✔ a check quoting '✘ not a failure' mid-line\n"
+            "  ✔ quoting \"Test case 'Suite/foo()' failed on 'iPhone 17'\"\n"
+            "  ✔ quoting 'XCTAssertEqual failed'\n"
+            "Failed to install or launch the test runner\n"
+            "  ✘ viz_up sends it too\n"
+            "  ✔ something else\n\n"
+            "2280 passed, 1 failed\n"
+            "  FAILED: viz_up sends it too\n" + noise)
+
+    before = g(repo, "rev-parse", "HEAD").stdout.strip()
+    wt, name = branch()
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: {"ran": True, "ok": str(cwd) != str(repo),
+                            "code": 1, "output": said})
+    d = r.get("detail", "")
+    check("refused after the merge, and put back",
+          r["stage"] == "tests-after-merge"
+          and g(repo, "rev-parse", "HEAD").stdout.strip() == before, r["stage"])
+    check("the refusal names the failing check", "✘ viz_up sends it too" in d, d[:300])
+    check("and the suite's summary", "2280 passed, 1 failed" in d, d[:300])
+    check("ahead of the trailing output",
+          0 <= d.find("viz_up sends it too") < d.find("not iterable"), d[:300])
+    named = d.split("--- output tail ---")[0]
+    check("a passing check that quotes a failure is not listed as one",
+          "✔" not in named, named)
+    check("nor is a launch error's 'Failed to install'",
+          "Failed to install" not in named, named)
+    shown = M.summary(r, name)
+    check("the Slack summary keeps the reason and the failing check",
+          "merging broke the base" in shown and "✘ viz_up sends it too" in shown,
+          shown[:300])
+
+    # The same before the merge, against the rebased branch.
+    wt, name = branch()
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: {"ran": True, "ok": False, "code": 1, "output": said})
+    check("tests-after-rebase names it too",
+          r["stage"] == "tests-after-rebase" and "✘ viz_up sends it too" in r["detail"],
+          r.get("detail", "")[:300])
+
+    # Through verify.run itself, whose output keeps only a tail: the failure is
+    # on stdout and a long stderr follows it, so it is gone from `output`.
+    script = root / "suite.py"
+    script.write_text(
+        "import sys\n"
+        "print('  ✔ fine')\nprint('  ✘ the one that broke')\n"
+        "print('\\n1 passed, 1 failed')\n"
+        f"sys.stderr.write('noise line\\n' * {V.OUTPUT_CHARS})\n"
+        "sys.exit(1)\n", encoding="utf-8")
+    run = V.run(f"{sys.executable} {script}", root)
+    check("verify.run's own tail has lost the failure",
+          "the one that broke" not in run["output"])
+    check("but it reads the failures off the whole output",
+          "✘ the one that broke" in run.get("failures", "")
+          and "1 passed, 1 failed" in run.get("failures", ""), run.get("failures"))
+    wt, name = branch()
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: run if str(cwd) == str(repo) else {"ran": True, "ok": True})
+    check("and a landing refused on that run names it",
+          "✘ the one that broke" in r.get("detail", ""), r.get("detail", "")[:300])
+    check("so does the note sent back to the implementor",
+          "✘ the one that broke" in V.rework_note(run))
+    ok = V.run(f"{sys.executable} -c \"print('  ✘ quoted, but the run passed')\"", root)
+    check("a passing run lists no failures", ok["ok"] and not ok.get("failures"))
+
+    # A suite that never ran a test names nothing, and keeps saying why.
+    wt, name = branch()
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: {"ran": True, "ok": str(cwd) != str(repo), "code": 65,
+                            "launch_failure": True,
+                            "output": "Application failed preflight checks"})
+    check("a launch failure still says what it was",
+          r["stage"] == "tests-after-merge"
+          and "failed preflight checks" in r["detail"], r.get("detail"))
+
+
 def test_landing_is_visible():
     import logging
     import types
@@ -10844,10 +10955,18 @@ def test_viz_probe_off_loopback():
         return srv
 
     saved = {k: os.environ.get(k) for k in ("VIZ_BIND", "VIZ_TOKEN", "SILKWORM_VIZ_PORT")}
-    loopback, token = V.LOOPBACK, V.TOKEN
+    loopback, token, sessions = V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE
     servers = []
     try:
         V.LOOPBACK, V.TOKEN = False, "s3cret-token"
+        # No threads. /api/stats reads every thread's transcript, and run from
+        # the main checkout that meant the live sessions.json: about two
+        # seconds, against viz_up's two-second probe. It passed in a task's
+        # worktree, which has no sessions.json, and failed the same commit in
+        # the main checkout -- refusing landings at tests-after-merge.
+        empty = Path(tempfile.mkdtemp()) / "sessions.json"
+        empty.write_text("{}")
+        V.SESSIONS_FILE = empty
         os.environ["VIZ_TOKEN"] = "s3cret-token"
 
         # A wildcard-style bind: reachable on 127.0.0.1, but every route 401s.
@@ -10899,7 +11018,7 @@ def test_viz_probe_off_loopback():
         check("...and the port-free wait still sees loopback held",
               Waiter()._wait_ports_free(timeout=1.0) == [str(lo.server_address[1])])
     finally:
-        V.LOOPBACK, V.TOKEN = loopback, token
+        V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE = loopback, token, sessions
         for srv in servers:
             srv.shutdown(); srv.server_close()
         for k, v in saved.items():

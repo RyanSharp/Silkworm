@@ -33,6 +33,7 @@ import logging
 import subprocess
 
 import branches
+import verify
 import worktrees
 
 log = logging.getLogger("silkworm.merge")
@@ -45,6 +46,27 @@ def _git(cwd, *args, timeout: int = 300):
 
 def _fail(stage: str, detail: str) -> dict:
     return {"landed": False, "stage": stage, "detail": detail.strip()[-600:]}
+
+
+def _tests_failed(stage: str, why: str, result: dict) -> dict:
+    """A refusal over a failing suite, leading with which checks failed.
+
+    The tail alone named nothing: the output is stdout then stderr, so its last
+    600 characters were the suite's own logging. Seven landings were refused
+    at tests-after-merge on that and not one record said which test. The
+    failures are read off the whole output -- verify.run does it before
+    trimming, a caller's own run_tests may not -- and the tail follows, for a
+    run that failed without naming a check (a launch failure, a timeout).
+    """
+    output = str(result.get("output", ""))
+    named = (result.get("failures") or verify.failures(output)).strip()
+    if not named:
+        return _fail(stage, f"{why}:\n{output}")
+    # Under 800 in all: summary() quotes the detail's last 800 characters, and
+    # a longer one would lose its head -- the reason and the failures -- there.
+    return {"landed": False, "stage": stage,
+            "detail": f"{why}:\n{named[:450]}\n--- output tail ---\n"
+                      + output.strip()[-250:]}
 
 
 def _on_origin(repo, base_name: str) -> str:
@@ -198,9 +220,9 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     # 2. prove it still works *after* being brought up to date
     after_rebase = run_tests(worktree)
     if not after_rebase.get("ok"):
-        return {**_fail("tests-after-rebase",
-                        "the change passes alone but not on top of the current base:\n"
-                        + str(after_rebase.get("output", ""))),
+        return {**_tests_failed("tests-after-rebase",
+                                "the change passes alone but not on top of the current base",
+                                after_rebase),
                 "base": base_name, "onto": before}
 
     # 3. the tested commit must be the commit that gets merged. Running the
@@ -237,9 +259,9 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     if not after_merge.get("ok"):
         _git(repo, "reset", "--hard", before)
         log.error("landing %s broke %s; reset back to %s", branch, base_name, before[:8])
-        return _fail("tests-after-merge",
-                     "merging broke the base, so it was put back:\n"
-                     + str(after_merge.get("output", "")))
+        return _tests_failed("tests-after-merge",
+                             "merging broke the base, so it was put back",
+                             after_merge)
 
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
 

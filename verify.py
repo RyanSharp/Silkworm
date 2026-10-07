@@ -55,6 +55,43 @@ TEST_FAILURES = re.compile(
     r"|\bTest (?!run with )\S.*? (?:recorded an issue|failed after)",
     re.IGNORECASE)
 
+#: The lines that say *what* failed, wherever they sit in the output. The
+#: tail kept below is not enough: the output is stdout then stderr, so its end
+#: is whatever the suite logged -- a landing refused at tests-after-merge kept
+#: exactly that, a deliberate traceback and some fixture chatter, and never
+#: named the failing test. A passing check can quote a failure ("✔ ... is not a
+#: launch failure: '✘ Test foo() ...'"), so a line marked passing never counts,
+#: and Silkworm's markers count only at the start of a line. Silkworm's own
+#: runner ("✘ name", "FAILED: name", "N passed, M failed"), pytest ("FAILED
+#: t.py::x", "== 1 failed, 2 passed =="), xcodebuild, and TEST_FAILURES.
+#: FAILED is upper-case only: "Failed to install or launch the test runner" is
+#: a launch failure, not a test.
+FAILURE_LINE = re.compile(
+    r"^\s*(?:✘|✗|(?-i:FAILED)\b|=+ .*\bfailed\b"
+    r"|\d+ passed, \d+ failed"
+    r"|\*\* TEST FAILED \*\*"
+    r"|Executed \d+ tests?, with [1-9]\d* failures?)"
+    r"|" + TEST_FAILURES.pattern,
+    re.IGNORECASE)
+
+#: How a line says its check passed, whatever it goes on to quote.
+PASSED_MARKS = ("✔", "✓")
+
+#: Enough of them to name the failures without becoming the whole output.
+FAILURE_LINES = 20
+
+
+def failures(output: str) -> str:
+    """The failing checks and the pass/fail summary in `output`, in order, or
+    "" when it names none (a launch failure, a timeout, a crash)."""
+    found = [line.rstrip() for line in (output or "").splitlines()
+             if not line.lstrip().startswith(PASSED_MARKS)
+             and FAILURE_LINE.search(line)]
+    if len(found) > FAILURE_LINES:
+        found = found[:FAILURE_LINES] + [f"  … and {len(found) - FAILURE_LINES} more"]
+    return "\n".join(found)
+
+
 #: One lock per project, around every run of that project's suite.
 _project_locks: dict[str, threading.Lock] = {}
 _project_locks_guard = threading.Lock()
@@ -142,6 +179,7 @@ def _run(command: str, cwd, timeout: int) -> dict:
     # sit above a long summary.
     return {"ran": True, "ok": proc.returncode == 0, "code": proc.returncode,
             "output": out[-OUTPUT_CHARS:],
+            "failures": failures(out) if proc.returncode != 0 else "",
             "launch_failure": (proc.returncode != 0
                                and bool(LAUNCH_FAILURES.search(out))
                                and not TEST_FAILURES.search(out))}
@@ -161,5 +199,8 @@ def rework_note(result: dict) -> str:
     return ("Your change does not pass this project's tests. Fix it rather than "
             "adjusting the tests to suit it, unless a test is genuinely wrong -- "
             "and say so explicitly if you conclude that.\n\n"
-            f"Exit status {result.get('code')}. Output tail:\n\n"
+            f"Exit status {result.get('code')}."
+            + (f" What failed:\n\n```\n{result['failures']}\n```\n\n"
+               if result.get("failures") else " ")
+            + "Output tail:\n\n"
             f"```\n{result.get('output', '')}\n```")
