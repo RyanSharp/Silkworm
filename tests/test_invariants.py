@@ -10909,6 +10909,19 @@ def test_restart_waits_for_ports():
           probes["com.silkworm.viz"][0] is cli.viz_serving
           and "/favicon.svg" in (BASE / "bin" / "silkworm").read_text()
           .split("def viz_serving", 1)[1].split("def ", 1)[0])
+    # `silkworm status` probes the same way: /api/stats takes about two
+    # seconds on the live sessions.json, against a two-second timeout, so a
+    # status check on it reported a healthy dashboard down.
+    import ast
+    status = next(n for n in ast.walk(ast.parse((BASE / "bin" / "silkworm").read_text()))
+                  if isinstance(n, ast.FunctionDef) and n.name == "do_status")
+    probed = {a.func.id for c in ast.walk(status) if isinstance(c, ast.Call)
+              and getattr(c.func, "id", None) == "check" and len(c.args) > 1
+              for a in [c.args[1]] if isinstance(a, ast.Call) and isinstance(a.func, ast.Name)}
+    check("silkworm status probes the visualizer with viz_serving",
+          "viz_serving" in probed, sorted(probed))
+    check("nothing probes /api/stats for liveness any more",
+          '"/api/stats"' not in (BASE / "bin" / "silkworm").read_text())
 
     # And the CLI's exit status carries the result, so scripts can trust it.
     class Stub:
@@ -10966,11 +10979,7 @@ def test_viz_probe_off_loopback():
     servers = []
     try:
         V.LOOPBACK, V.TOKEN = False, "s3cret-token"
-        # No threads. /api/stats reads every thread's transcript, and run from
-        # the main checkout that meant the live sessions.json: about two
-        # seconds, against viz_up's two-second probe. It passed in a task's
-        # worktree, which has no sessions.json, and failed the same commit in
-        # the main checkout -- refusing landings at tests-after-merge.
+        # No threads, so nothing here reads the live sessions.json.
         empty = Path(tempfile.mkdtemp()) / "sessions.json"
         empty.write_text("{}")
         V.SESSIONS_FILE = empty
@@ -10988,7 +10997,6 @@ def test_viz_probe_off_loopback():
             unauth = e.code
         check("the fixture really demands the token (bare GET is 401)", unauth == 401)
         check("viz_serving sends the token and sees it up", cli.viz_serving() is True)
-        check("viz_up sends it too", cli.viz_up() is True)
         os.environ["VIZ_TOKEN"] = "wrong"
         check("a wrong token is not mistaken for up", cli.viz_serving() is False)
         os.environ["VIZ_TOKEN"] = "s3cret-token"

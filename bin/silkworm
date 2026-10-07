@@ -334,14 +334,6 @@ def viz_serving() -> bool:
         return False
 
 
-def viz_up() -> bool:
-    try:
-        viz_get("/api/stats")
-        return True
-    except Exception:
-        return False
-
-
 def do_doctor() -> bool:
     print(f"{WORM} checking prerequisites…")
     ok = True
@@ -414,7 +406,9 @@ def do_status() -> None:
         down = link.get("down_for") or 0
         check("connected to slack", bool(link.get("connected")),
               f"down for {int(down // 60)}m — it should self-restart; silkworm logs")
-    check(f"visualizer on http://{viz_host()}:{viz_port()}", viz_up())
+    # The same cheap probe restart uses: /api/stats takes about two seconds
+    # with a real sessions.json, so probing it called a healthy dashboard down.
+    check(f"visualizer on http://{viz_host()}:{viz_port()}", viz_serving())
     check("session hooks installed", hooks_installed())
     check_git_guards()
     check_unregistered()
