@@ -38,6 +38,11 @@ UNFILED = "__unfiled__"
 #: lands or a branch is dropped, and the page polls every five seconds.
 CACHE_TTL_S = 60
 
+#: What the board's "Needs you" column holds, and so what a project card's
+#: count means. Not tasks.NEEDS_ATTENTION: that includes `proposed`, which the
+#: board keeps in Backlog, and the card must agree with the column it opens.
+NEEDS_YOU = (tasks.AWAITING_APPROVAL, tasks.NEEDS_INPUT, tasks.FAILED)
+
 #: Characters of goal a card carries for the search to match against. The
 #: detail view fetches the whole record.
 GOAL_SNIPPET = 240
@@ -65,6 +70,10 @@ class TTLCache:
                 return hit[1]
         value = compute()
         with self._lock:
+            # Expired entries go as new ones arrive: the survey's key changes
+            # with every finished task's write, so without this the cache
+            # would keep one survey per write for the life of the bot.
+            self._data = {k: v for k, v in self._data.items() if now - v[0] < self.ttl}
             self._data[key] = (now, value)
         return value
 
@@ -84,7 +93,11 @@ def survey_key(records) -> tuple:
 # --- columns -------------------------------------------------------------------
 
 def _reviewer_ids(records) -> set:
-    return {r.get("id") for r in records if r.get("role") == "reviewer"}
+    """Reviewers still open. `blocked_on` outlives the review it named (see
+    TaskStore._waiting_on_open), so a finished reviewer there is history, not
+    a wait: a reviewed task later blocked on a quota retry is backlog."""
+    return {r.get("id") for r in records if r.get("role") == "reviewer"
+            and r.get("state") not in tasks.TERMINAL}
 
 
 def finished_at(rec: dict) -> float:
@@ -118,7 +131,7 @@ def column(rec: dict, reviewers: set, now: float, done_days: float = DONE_DAYS):
     if state == tasks.BLOCKED:
         return ("review" if any(b in reviewers for b in rec.get("blocked_on") or [])
                 else "backlog")
-    if state in (tasks.AWAITING_APPROVAL, tasks.NEEDS_INPUT, tasks.FAILED):
+    if state in NEEDS_YOU:
         return "needs"
     if state == tasks.DONE:
         return "done" if finished_at(rec) >= now - done_days * 86400 else None
@@ -310,7 +323,7 @@ def _summary(slug: str, title: str, recs: list, spend: dict, unmerged_rows) -> d
         "" if slug == UNFILED else slug)]
     return {
         "slug": slug, "title": title, "counts": counts,
-        "needs": sum(counts.get(s, 0) for s in tasks.NEEDS_ATTENTION),
+        "needs": sum(counts.get(s, 0) for s in NEEDS_YOU),
         "running": running,
         "last_landed": _last_landed(recs),
         "unmerged": {"branches": len(branches_),

@@ -1916,6 +1916,7 @@ let boardDetailId = null;
 let boardRows = [];                       // the overview's projects, for the picker
 let lastSessions = [];                    // from loadList, for the unfiled threads
 let boardTimer = null;
+let boardAsk = 0;                         // newest board request; older answers are dropped
 
 function boardIsOpen() {
   return document.getElementById("boardmodal").style.display === "flex";
@@ -1988,9 +1989,11 @@ async function renderBoard() {
   }
   document.getElementById("bover").innerHTML = "";
   boardFilters();
-  const asked = boardProject;
-  const r = await taskCall({action: "board", project: asked, role, state, q});
-  if (boardProject !== asked) return;    // the view changed while this was out
+  // A poll in flight when a filter changes must not land on top of the
+  // filtered answer: only the newest request draws.
+  const ask = ++boardAsk;
+  const r = await taskCall({action: "board", project: boardProject, role, state, q});
+  if (ask !== boardAsk) return;
   const el = document.getElementById("bboard");
   if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
   fillSelect("brole", r.roles || [], "any role");
@@ -2061,8 +2064,9 @@ function unfiledThreads() {
       esc(s.title || s.key)} · ${age(s.updated)}</button>`).join("") + `</div>`;
 }
 async function loadOverview() {
+  const ask = ++boardAsk;
   const r = await taskCall({action: "overview"});
-  if (boardProject !== null) return;     // a board was opened meanwhile
+  if (ask !== boardAsk || boardProject !== null) return;   // superseded meanwhile
   const el = document.getElementById("bover");
   if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
   boardRows = r.projects || [];

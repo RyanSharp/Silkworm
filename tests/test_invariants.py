@@ -15458,6 +15458,12 @@ def test_board_columns():
     check("a task blocked on its reviewer is in review", where.get(ids["review"]) == "review")
     check("one blocked on anything else waits in the backlog",
           where.get(ids["waiting"]) == "backlog")
+    # blocked_on outlives the review it named; a finished reviewer is not a wait.
+    old = ts.create("Old review", state="done", role="reviewer", parent=ids["waiting"])
+    ts.update(ids["waiting"], blocked_on=[old["id"]])
+    b2 = B.board(list(ts.all().values()), "alpha", unmerged_rows=survey)
+    check("blocked on a reviewer that already finished is backlog, not in review",
+          ids["waiting"] in {c["id"] for c in b2["columns"]["backlog"]})
     check("the reviewer itself is never a card", ids["reviewer"] not in where)
     check("awaiting approval and failed need you",
           where.get(ids["awaiting"]) == "needs" and where.get(ids["failed"]) == "needs")
@@ -15551,7 +15557,10 @@ def test_projects_overview():
     check("counts by state, reviewers not counted as work",
           a["counts"].get("running") == 1 and a["counts"].get("done") == 4
           and a["counts"].get("blocked") == 2, a["counts"])
-    check("needs is what is waiting on you", a["needs"] == 3, a["needs"])
+    check("needs is what is waiting on you", a["needs"] == 2, a["needs"])
+    bd = B.board(ts.all().values(), "alpha", unmerged_rows=survey)
+    check("and agrees with the board's Needs you column",
+          a["needs"] == bd["counts"]["needs"], (a["needs"], bd["counts"]))
     check("what is running now", [r["id"] for r in a["running"]] == [ids["running"]])
     check("the last landing is the newest one",
           a["last_landed"]["id"] == ids["landed"] and a["last_landed"]["head"] == "abcdef12")
@@ -15611,6 +15620,11 @@ def test_board_cache():
     except RuntimeError:
         pass
     check("a failure is not cached", c.get("j", compute) == 3)
+    for i in range(5):
+        clock[0] += 61
+        c.get(("survey", i), compute)
+    check("expired entries are dropped, so changing keys cannot grow it",
+          len(c._data) == 1, len(c._data))
 
     recs = [{"id": "a", "state": "done", "updated": 1}, {"id": "b", "state": "running",
                                                           "updated": 1}]
