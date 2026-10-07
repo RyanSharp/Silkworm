@@ -536,6 +536,31 @@ class TaskStore:
             out = [dict(v) for v in self._data.values() if v.get("state") in states]
         return sorted(out, key=lambda t: t.get("created", 0))
 
+    def file_under(self, mapping: dict) -> list[str]:
+        """File tasks under projects: {task id: slug}. Returns the ids filed.
+
+        Only a task with no project is touched, so it is idempotent and never
+        moves work from one project to another. One save for the whole batch
+        -- tasks.json is rewritten whole on every save -- and `updated` is
+        left alone: filing is not something happening to the task, and
+        stamping it would make weeks-old work look fresh to compaction.
+        """
+        with self._lock:
+            prior = {}
+            for tid, slug in mapping.items():
+                rec = self._data.get(tid)
+                if rec is None or not slug or rec.get("project"):
+                    continue
+                prior[tid] = copy.deepcopy(rec)
+                rec["project"] = slug
+            if prior:
+                try:
+                    self._save()
+                except BaseException:
+                    self._data.update(prior)
+                    raise
+            return list(prior)
+
     def by_project(self, slug: str) -> list[dict]:
         with self._lock:
             out = [dict(v) for v in self._data.values() if (v.get("project") or "") == slug]

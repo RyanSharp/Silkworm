@@ -56,6 +56,7 @@ import slacklinks
 import tasks
 import procs
 import projects
+import workspaces
 import recovery
 import releases
 import retry
@@ -92,6 +93,9 @@ REVISION = revision.of(BASE_DIR)
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_CWD = Path(os.environ.get("CLAUDE_CWD", BASE_DIR / "workspace"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
+#: Whose account `!project new --github` creates the private repository under.
+#: Blank lets `gh` use the account it is logged in as.
+GITHUB_OWNER = os.environ.get("SILKWORM_GITHUB_OWNER", "").strip()
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 # A turn may run as long as it is still working. The old 900s wall clock cut
 # off real work -- a strategy backtest, a long refactor -- because elapsed
@@ -871,6 +875,132 @@ def resolve_cwd(client, channel: str) -> Path:
     return CLAUDE_CWD
 
 
+# --- Projects by directory -----------------------------------------------------
+
+def file_by_directory(key: str, cwd) -> str:
+    """The project this thread belongs to, filing it by directory if needed.
+
+    A thread already filed keeps its project, and one unfiled on purpose
+    (`!project none`) stays unfiled. Otherwise, a thread working inside a
+    registered project's directory is that project's -- most specific wins,
+    and Silkworm's scratch folder does not count as Silkworm (workspaces.py).
+    Never raises: a lookup that fails files nothing rather than costing the turn.
+    """
+    entry = store.get(key) or {}
+    if entry.get("project") or entry.get("unfiled"):
+        return entry.get("project") or ""
+    try:
+        slug = workspaces.project_for(cwd, project_store.all(), scratch=CLAUDE_CWD)
+        if slug:
+            store.update(key, project=slug)
+            log.info("filed thread %s under %s by its directory %s", key, slug, cwd)
+        return slug
+    except Exception:
+        log.exception("filing %s by directory failed", key)
+        return ""
+
+
+def file_existing_by_directory() -> dict:
+    """Once at startup: file every unfiled thread, and every unfiled task,
+    whose directory is a registered project's. Through the stores, one save
+    each, touching only records with no project -- so it is safe to repeat,
+    and a second run files nothing."""
+    records = project_store.all()
+    threads = store.all()
+    t = store.file_under(workspaces.threads_to_file(threads, records, scratch=CLAUDE_CWD))
+    threads = store.all()                       # tasks follow their thread's new project
+    k = task_store.file_under(workspaces.tasks_to_file(task_store.all(), threads, records,
+                                                       scratch=CLAUDE_CWD))
+    if t or k:
+        log.info("filed %d thread(s) and %d task(s) under projects by directory", len(t), len(k))
+    return {"threads": t, "tasks": k}
+
+
+#: Where unregistered repositories are looked for: the workspace you keep
+#: projects in, and Silkworm's own scratch folder, where six of them once
+#: lived for weeks with nothing filed against them.
+def discovery_roots() -> list:
+    return [workspaces.ROOT, CLAUDE_CWD]
+
+
+def unregistered_repos() -> list[str]:
+    return workspaces.unregistered(discovery_roots(), project_store.all())
+
+
+def _project_filer() -> None:
+    """Startup pass: file existing threads and tasks by directory, and say
+    which repositories in the workspace no project covers."""
+    try:
+        file_existing_by_directory()
+    except Exception:
+        log.exception("filing existing threads by directory failed")
+    try:
+        found = unregistered_repos()
+        if found:
+            log.warning("unregistered repos (no project covers them): %s", ", ".join(found))
+    except Exception:
+        log.exception("looking for unregistered repos failed")
+
+
+def new_project_from_thread(key: str, arg: str) -> str:
+    """`!project new ...`: make or adopt the project, register it, and move
+    this thread into it. Returns the reply."""
+    try:
+        want = workspaces.parse_new(arg)
+    except ValueError as e:
+        return f":warning: {e}"
+    # A turn in flight writes the directory it started in back when it ends,
+    # which would quietly undo the move below. Commands take no thread lock,
+    # so the check is here.
+    if key in RUNNING or (store.get(key) or {}).get("pending"):
+        return (":hourglass_flowing_sand: This thread has a turn running. Send "
+                "`!project new` again once it has finished, so the move sticks.")
+    try:
+        done = workspaces.create(want["name"], project_store, path=want["path"],
+                                 purpose=want["purpose"], github=want["github"],
+                                 adopt=want["adopt"], owner=GITHUB_OWNER)
+    except workspaces.Refused as e:
+        return f":warning: Not created: {e}"
+    except Exception as e:
+        log.exception("creating project %r failed", want["name"])
+        return f":warning: Creating it failed: {e}"
+    entry = store.get(key) or {}
+    moved = {"project": done["slug"], "cwd": done["cwd"], "unfiled": False}
+    if entry.get("session_id") and entry.get("cwd") != done["cwd"]:
+        # A session lives with the directory it ran in, and --resume from
+        # another one cannot find it. Retired the way a lost one is -- the id
+        # kept -- so the next turn starts there fresh, with the thread's
+        # recent messages as its context.
+        moved.update(session_id=None, previous_sessions=(
+            (entry.get("previous_sessions") or []) + [entry["session_id"]])[-10:])
+        store.add_event(key, "moved", f"into project {done['slug']} at {done['cwd']}")
+    store.update(key, **moved)
+    text = workspaces.describe(done) + "\nThis thread is filed under it and now works there."
+    if not want["github"] and not done["repo"]:
+        text += ("\nIt has no GitHub repository. `!project github create` makes a "
+                 "private one and pushes to it, if you want that.")
+    return text
+
+
+def github_for_thread_project(key: str) -> str:
+    """`!project github`: a private GitHub repository for this thread's
+    project, made only because it was asked for. Returns the reply."""
+    slug = (store.get(key) or {}).get("project") or ""
+    rec = project_store.get(slug) if slug else None
+    if not rec:
+        return "File this thread under a project first: `!project <name>`."
+    cwd = (rec.get("scope") or {}).get("cwd") or ""
+    if not cwd or not Path(cwd).is_dir():
+        return f"*{slug}* has no directory to publish."
+    url, note = workspaces.github_repo(cwd, rec["title"], owner=GITHUB_OWNER)
+    if not url:
+        return f":warning: {note}"
+    ident = repos.identity(cwd)
+    if ident.startswith("github.com/"):
+        project_store.ensure(slug, scope={**project_store.scope_for(slug), "repo": ident})
+    return f":octocat: Private repository for *{rec['title']}*: {url}"
+
+
 # --- Commands -----------------------------------------------------------------
 
 HELP = """*Commands* (send inside a thread):
@@ -887,6 +1017,8 @@ HELP = """*Commands* (send inside a thread):
 • `!sessions` — list all active thread sessions
 • `!help` — this message
 • `!project <name>` — file this thread's tasks under a project
+• `!project github create` — make a private GitHub repo for this thread's project and push it
+• `!project new <Name> [path] [--github] [--adopt] -- <purpose>` — make (or adopt) a project's directory, git repo and CLAUDE.md, register it, and move this thread there; `--github` also creates a private GitHub repo
 • `!release <project>` — what is ready to release, per target (nothing ships)
 • `!release <project> <target|all> [patch|minor|major|x.y.z]` — release it, dependencies first
 Attach files to a message and Claude can read them; files Claude produces get uploaded back here.
@@ -1043,9 +1175,25 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                        "`!project <name>` to file it here, `!project none` to unfile.",
                 thread_ts=thread_ts)
         elif arg.lower() in ("none", "off", "clear"):
-            store.update(key, project="")
+            # Remembered, so the thread's directory does not file it straight
+            # back under the project it was taken out of.
+            store.update(key, project="", unfiled=True)
             say(text="Unfiled — new tasks from this thread won't belong to a project.",
                 thread_ts=thread_ts)
+        elif (arg.lower() == "new" or arg.lower().startswith("new ")) \
+                and not project_store.get(projects.slugify(arg)):
+            # A project already called "New Something" is still filed under
+            # by name; only an unknown "new ..." is a request to make one.
+            say(text=new_project_from_thread(key, arg[3:].strip()), thread_ts=thread_ts)
+        elif arg.lower() == "github" or arg.lower().startswith("github "):
+            # Publishing is the one thing here that cannot be quietly undone,
+            # so the bare word only explains; `github create` does it.
+            if arg.lower().split()[1:] == ["create"]:
+                say(text=github_for_thread_project(key), thread_ts=thread_ts)
+            else:
+                say(text="`!project github create` makes a *private* GitHub repository "
+                         "for this thread's project and pushes to it.",
+                    thread_ts=thread_ts)
         elif arg.lower().startswith("ideate"):
             slug = entry.get("project") or ""
             when = arg[6:].strip()
@@ -1145,7 +1293,7 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             # A repo-less project keeps its context in its own CLAUDE.md, which
             # only loads if the thread actually runs there.
             home = project_store.home(proj["slug"], create=True)
-            store.update(key, project=proj["slug"],
+            store.update(key, project=proj["slug"], unfiled=False,
                          **({"cwd": str(home)} if home else {}))
             say(text=f":card_index_dividers: Filed under *{proj['title']}* "
                      f"(`{proj['slug']}`). Tasks from this thread inherit it.",
@@ -1699,6 +1847,10 @@ def handle_tasks(payload: dict) -> dict:
             # every task filed under it.
             scope = payload.get("scope") or project_store.scope_for(proj) \
                 or {"cwd": str(CLAUDE_CWD)}
+            if not proj:
+                # Work aimed at a project's directory belongs to that project.
+                proj = workspaces.project_for(scope.get("cwd"), project_store.all(),
+                                              scratch=CLAUDE_CWD)
             t = task_store.create(payload.get("goal", ""),
                                   role=role,
                                   project=proj,
@@ -1827,6 +1979,25 @@ def handle_projects(payload: dict) -> dict:
         scope = payload.get("scope")
         return {"ok": True, "project": project_store.ensure(
             name, **({"scope": scope} if scope else {}))}
+    if action == "new":
+        # One step: directory, git, CLAUDE.md, registration -- and a private
+        # GitHub repository only when the form's box says so.
+        try:
+            done = workspaces.create(
+                payload.get("name") or "", project_store,
+                path=(payload.get("path") or "").strip(),
+                purpose=(payload.get("purpose") or "").strip(),
+                github=payload.get("github") is True,
+                adopt=payload.get("adopt") is True,
+                owner=GITHUB_OWNER)
+        except workspaces.Refused as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            log.exception("creating project %r failed", payload.get("name"))
+            return {"ok": False, "error": f"failed: {e}"}
+        return {"ok": True, "created": done, "message": workspaces.describe(done)}
+    if action == "unregistered":
+        return {"ok": True, "repos": unregistered_repos()}
     if action == "test-cmd":
         # How a project proves its own work. Set here as well as from Slack so
         # the dashboard can configure it; empty means unverified, which blocks
@@ -2349,8 +2520,9 @@ def handle_prompt(event: dict, say, client) -> None:
         source="ui" if event.get("_web") else "slack",
         source_ref=msg_ts,
         thread=key,
-        # Bound once with !project, inherited by every turn after.
-        project=(store.get(key) or {}).get("project", ""),
+        # Bound once with !project, inherited by every turn after -- or, for
+        # a thread nobody filed, read off the directory it works in.
+        project=file_by_directory(key, cwd),
         # A conversation is never isolated -- it runs where your uncommitted
         # edits are. Recorded rather than inferred, because a restart may hand
         # this very task to the queue runner (close_out_orphans) so the message
@@ -4329,8 +4501,13 @@ def send_digest(schedule, now: datetime) -> dict:
     it has actually gone out, so a failure is retried on the next beat."""
     records = list(task_store.all().values())
     rows, released = digest_inputs(records)
+    try:
+        found = unregistered_repos()
+    except Exception:
+        log.exception("digest: looking for unregistered repos failed")
+        found = []
     text = digest.render(records, time.time(), branch_rows=rows, released=released,
-                         when=now)
+                         when=now, unregistered=found)
     try:
         board_id = BOARD.channel(app.client)
     except Exception:
@@ -4914,6 +5091,7 @@ if __name__ == "__main__":
     daemons.start(_sweeper, "sweeper")
     daemons.start(_watchdog, "watchdog")
     daemons.start(_backfiller, "backfill", forever=False)
+    daemons.start(_project_filer, "filer", forever=False)
     daemons.start(_task_scheduler, "tsched")
     daemons.start(_board_loop, "board")
     for _i in range(max(1, TASK_WORKERS)):

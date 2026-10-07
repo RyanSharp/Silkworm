@@ -32,6 +32,9 @@ FIELDS: dict[str, tuple] = {
     # Bind a thread to a project and its tasks inherit it, so you say it once
     # rather than on every message.
     "project":           ("",    "project slug this thread's tasks belong to"),
+    # Set by `!project none`: a thread you took out of its project stays out,
+    # rather than being filed straight back by its directory (workspaces.py).
+    "unfiled":           (False, "unfiled on purpose; not refiled by directory"),
     "summary":           ("",    "1-3 sentence description of the conversation"),
     "summary_ts":        ("",    "transcript timestamp the summary was written from"),
     "summary_turns":     (None,  "turn count when summarised; None = unknown, not 0"),

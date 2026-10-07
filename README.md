@@ -323,6 +323,36 @@ setup step.
 !project               # what this thread is filed under, and what exists
 ```
 
+A project that is a codebase starts in one step:
+
+```
+!project new Widget -- makes widgets             # ~/workspace/widget
+!project new "Silk Swing" ~/code/swing --adopt   # an existing directory
+!project new Widget --github -- makes widgets    # ...and a PRIVATE GitHub repo
+!project github create                           # that repo, later, for this thread's project
+```
+
+It makes (or, when you name its path or say `--adopt`, adopts) the directory,
+`git init`s it with a first commit if it is not a repo, starts a CLAUDE.md
+holding the title and the purpose, registers it, and files the thread under it
+and moves the thread there. A GitHub repository is only created when asked —
+`--github`, the dashboard form's box, or `!project github create` — and its URL is
+reported. A name that is already a project, a directory that already exists
+(without `--adopt`), or a path inside another repository's working tree is
+refused. `SILKWORM_GITHUB_OWNER` picks the account; blank means `gh`'s own.
+
+**Filed by directory.** A thread or task working inside a registered project's
+directory is filed under that project without being told: on each new turn,
+and once at startup for existing threads and tasks. The most specific project
+wins (`~/workspace/x` over `~/workspace`), Silkworm's scratch folder does not
+count as Silkworm's, and a thread you unfiled with `!project none` stays unfiled.
+
+**Unregistered repos.** Git repositories directly under `~/workspace` and
+Silkworm's scratch folder that no project covers (by directory, or by sharing
+a registered remote) are listed in `silkworm status`, the daily digest and the
+dashboard's task panel, so a new one never goes unnoticed. `.archive`,
+`.worktrees` and other hidden directories are not scanned.
+
 A project is **what a task belongs to**; `scope` is **where it may act**. They
 are separate deliberately — two projects can share a repo, one project can span
 several, and plenty ("plan the trip") have no repo at all. A project may carry a

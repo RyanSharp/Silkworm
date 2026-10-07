@@ -221,6 +221,26 @@ class SessionStore:
                     return key
             return None
 
+    def file_under(self, mapping: dict) -> list[str]:
+        """File threads under projects: {key: slug}. Returns the keys filed.
+
+        Only a thread with no project, and not one unfiled on purpose, is
+        touched -- so a thread you filed by hand keeps its project, and running
+        this twice changes nothing the second time. One save for the batch,
+        and not activity, so `updated` is left alone.
+        """
+        with self._lock:
+            done = []
+            for key, slug in mapping.items():
+                rec = self._data.get(key)
+                if rec is None or not slug or rec.get("project") or rec.get("unfiled"):
+                    continue
+                rec["project"] = slug
+                done.append(key)
+            if done:
+                self._save()
+            return done
+
     def set_hidden(self, key: str, hidden: bool) -> bool:
         """Hide or unhide one thread. Nothing is discarded either way."""
         with self._lock:
@@ -259,7 +279,7 @@ class SessionStore:
     KEEPS = ("title", "summary", "cost", "turns", "costs", "files", "events",
              "session_totals", "cost_corrections",
              "session_id", "previous_sessions", "pending", "checked_out",
-             "terminal_live", "project", "last_msg_ts", "hidden")
+             "terminal_live", "project", "unfiled", "last_msg_ts", "hidden")
 
     def forget_empty(self, days: float, keep=()) -> list[str]:
         """Drop only records older than `days` that hold nothing. Returns the keys.

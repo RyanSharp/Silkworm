@@ -276,9 +276,31 @@ ORDER = (("landed", "landed", True), ("released", "released", False),
          ("waiting", "waiting on you", False), ("unmerged", "unmerged", False))
 
 
+def unregistered_line(repos) -> str:
+    """Repositories in the workspace that no project covers, or "".
+
+    Said every day until each is registered or moved, so a new one never sits
+    unnoticed the way six once did in Silkworm's scratch folder.
+    """
+    repos = list(repos or ())
+    if not repos:
+        return ""
+    shown = ", ".join(f"`{_esc(str(r))}`" for r in repos[:LIST_LIMIT])
+    more = f" +{len(repos) - LIST_LIMIT} more" if len(repos) > LIST_LIMIT else ""
+    return (f"• unregistered repos {len(repos)}: {shown}{more} — "
+            "`!project new <Name> <path>` registers one")
+
+
 def render(records, now: float, *, branch_rows=(), released=None,
-           when: datetime | None = None) -> str:
+           when: datetime | None = None, unregistered=()) -> str:
     """The digest as one compact Slack message."""
+    text = _render(records, now, branch_rows=branch_rows, released=released, when=when)
+    line = unregistered_line(unregistered)
+    return f"{text}\n{line}" if line else text
+
+
+def _render(records, now: float, *, branch_rows=(), released=None,
+            when: datetime | None = None) -> str:
     records = list(records)
     data = sections(records, now, branch_rows=branch_rows, released=released)
     day = (when or datetime.fromtimestamp(now)).strftime("%a %-d %b")

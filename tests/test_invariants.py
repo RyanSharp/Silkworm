@@ -4632,7 +4632,8 @@ def test_projects():
     check("completing a task folds the outcome back in",
           "refresh_brief(task.get(" in bot)
     check("a thread's project is inherited by its tasks",
-          'project=(store.get(key) or {}).get("project", "")' in bot)
+          "project=file_by_directory(key, cwd)," in bot
+          and 'return entry.get("project") or ""' in bot)
     check("!project files a thread", 'elif lower.startswith("!project")' in bot)
 
 
@@ -8862,10 +8863,11 @@ def _dashboard_create_impl():
     mod.__dict__.update(
         roles=R, tasks=T, task_store=ts, time=time,
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
+        workspaces=__import__("workspaces"),
         project_store=types.SimpleNamespace(
             ensure=lambda n, **kw: (made.append(n), {"slug": n})[1],
             home=lambda n, create=False: made.append(n),
-            scope_for=lambda n: None),
+            scope_for=lambda n: None, all=lambda: []),
     )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<dashboard>", "exec"),
          mod.__dict__)
@@ -14884,6 +14886,435 @@ def test_costs_say_they_are_list_price():
     check("the dashboard's total and task costs say so",
           "total spend (API list price)" in viz
           and "(API list-price equivalent, not billed)" in viz)
+
+
+# --- projects by directory ---------------------------------------------------
+
+def _run_git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+
+
+def _git_repo(path, remote=""):
+    path.mkdir(parents=True, exist_ok=True)
+    _run_git(path, "init", "-q")
+    if remote:
+        _run_git(path, "remote", "add", "origin", remote)
+    return path
+
+
+class _FakeGh:
+    """Stands in for `gh`: records every call, and on `repo create` does what
+    the real one does to the checkout -- adds origin -- without any network."""
+
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def __call__(self, cmd, cwd, timeout=60):
+        self.calls.append(list(cmd))
+        if self.fail:
+            return subprocess.CompletedProcess(cmd, 1, "", "HTTP 422: name already exists")
+        name = cmd[3].split("/")[-1]
+        owner = cmd[3].split("/")[0] if "/" in cmd[3] else "someone"
+        _run_git(cwd, "remote", "add", "origin", f"git@github.com:{owner}/{name}.git")
+        return subprocess.CompletedProcess(
+            cmd, 0, f"✓ Created repository {owner}/{name} on GitHub\n"
+                    f"  https://github.com/{owner}/{name}\n", "")
+
+
+def test_project_for_most_specific_directory_wins():
+    print("\nprojects: a directory belongs to its most specific project")
+    import workspaces
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    for d in ("ws/x/sub", "ws/xy", "ws/Silkworm/workspace/scratchy", "ws/old"):
+        (root / d).mkdir(parents=True)
+    recs = [{"slug": "ws", "scope": {"cwd": str(root / "ws")}},
+            {"slug": "x", "scope": {"cwd": str(root / "ws/x")}},
+            {"slug": "silkworm", "scope": {"cwd": str(root / "ws/Silkworm")}},
+            {"slug": "scr", "scope": {"cwd": str(root / "ws/Silkworm/workspace/scratchy")}},
+            {"slug": "old", "archived": True, "scope": {"cwd": str(root / "ws/old")}},
+            {"slug": "nodir", "scope": {}}]
+    pf = workspaces.project_for
+    scratch = root / "ws/Silkworm/workspace"
+    check("a project at ws/x beats one at ws, either way round",
+          pf(root / "ws/x/sub", recs) == "x" and pf(root / "ws/x/sub", recs[::-1]) == "x",
+          f"{pf(root / 'ws/x/sub', recs)} / {pf(root / 'ws/x/sub', recs[::-1])}")
+    check("the directory itself counts", pf(root / "ws/x", recs) == "x")
+    check("a sibling that only shares a prefix is not inside (xy is not x)",
+          pf(root / "ws/xy", recs) == "ws", pf(root / "ws/xy", recs))
+    check("a directory in no project's stays unfiled",
+          pf(root, recs) == "" and pf("", recs) == "" and pf(None, recs) == "")
+    check("an archived project takes no new work; its parent does",
+          pf(root / "ws/old", recs) == "ws", pf(root / "ws/old", recs))
+    check("the scratch folder is not Silkworm's",
+          pf(scratch, recs, scratch=scratch) == "", pf(scratch, recs, scratch=scratch))
+    check("but a project living inside the scratch folder is still found",
+          pf(scratch / "scratchy", recs, scratch=scratch) == "scr")
+    at_scratch = recs + [{"slug": "groceries", "scope": {"cwd": str(scratch)}}]
+    check("a project registered AT the scratch folder does not absorb it",
+          pf(scratch, at_scratch, scratch=scratch) == ""
+          and pf(scratch / "scratchy", at_scratch, scratch=scratch) == "scr",
+          pf(scratch, at_scratch, scratch=scratch))
+    check("Silkworm's own checkout outside the scratch folder is Silkworm's",
+          pf(root / "ws/Silkworm", recs, scratch=scratch) == "silkworm")
+    # A symlinked path is the directory it points at.
+    (root / "link").symlink_to(root / "ws/x/sub")
+    check("a symlink resolves to where it points", pf(root / "link", recs) == "x")
+
+
+def test_project_new_parses_its_command():
+    print("\nprojects: `!project new` reads name, path, flags and purpose")
+    import workspaces
+    p = workspaces.parse_new('Widget ~/code/widget --github -- a thing that does widgets')
+    check("name, path, github and purpose",
+          p == {"name": "Widget", "path": "~/code/widget", "github": True, "adopt": False,
+                "purpose": "a thing that does widgets"}, str(p))
+    p = workspaces.parse_new('"Silk Swing" --adopt — the rope game')
+    check("a quoted name, an em dash, adopt; github is off unless named",
+          p["name"] == "Silk Swing" and p["adopt"] and not p["github"]
+          and p["purpose"] == "the rope game" and p["path"] == "", str(p))
+    p = workspaces.parse_new("“Silk Swing” —github — the rope game")
+    check("a phone's curly quotes and em-dash flag read as meant",
+          p["name"] == "Silk Swing" and p["github"] and p["path"] == ""
+          and p["purpose"] == "the rope game", str(p))
+    check("a purpose may itself contain double dashes",
+          workspaces.parse_new("W -- uses --flags inside")["purpose"] == "uses --flags inside")
+    for bad in ("", "--github", "a b c", "W --gihtub"):
+        try:
+            workspaces.parse_new(bad)
+            ok = False
+        except ValueError:
+            ok = True
+        check(f"refused: {bad!r}", ok)
+
+
+def test_project_new_creates_in_one_step():
+    print("\nprojects: one step makes the directory, repo, CLAUDE.md and record")
+    import projects
+    import workspaces
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    ws = root / "workspace"
+    ws.mkdir()
+    ps = projects.ProjectStore(root / "projects.json")
+    gh = _FakeGh()
+
+    done = workspaces.create("Widget", ps, purpose="Makes widgets.", root=ws, gh=gh)
+    d = ws / "widget"
+    log_ = _run_git(d, "log", "--format=%s").stdout.split("\n")
+    check("made ~/workspace/<slug> and a git repo in it",
+          d.is_dir() and (d / ".git").exists() and done["made_dir"] and done["initialised"])
+    check("CLAUDE.md is the title and the one-line purpose",
+          (d / "CLAUDE.md").read_text() == "# Widget\n\nMakes widgets.\n",
+          (d / "CLAUDE.md").read_text())
+    check("with a first commit holding it",
+          done["committed"] and log_[0] == "Start Widget"
+          and _run_git(d, "status", "--porcelain").stdout == "", str(log_))
+    rec = ps.get("widget")
+    check("registered with its directory, and no repo without a GitHub remote",
+          rec and rec["title"] == "Widget" and rec["scope"] == {"cwd": str(d)}, str(rec))
+    check("and GitHub never heard about it", gh.calls == [], str(gh.calls))
+    check("what it did is said", "registered" in workspaces.describe(done)
+          and str(d) in workspaces.describe(done))
+
+    # --- refusals: before anything is touched --------------------------------
+    def refused(**kw):
+        name = kw.pop("name")
+        try:
+            workspaces.create(name, ps, root=ws, gh=gh, **kw)
+        except workspaces.Refused as e:
+            return str(e)
+        return ""
+    check("a name that is already a project is refused", "already a project" in refused(name="widget"))
+    (ws / "taken").mkdir()
+    (ws / "taken" / "notes.txt").write_text("mine")
+    why = refused(name="Taken")
+    check("an existing directory is not adopted on a bare name",
+          "--adopt" in why and not (ws / "taken" / ".git").exists()
+          and not ps.get("taken"), why)
+    check("nor is a directory another project already lives in",
+          "already project" in refused(name="Other", path=str(d)))
+    outer = _git_repo(root / "outer")
+    why = refused(name="Nested", path=str(outer / "inner"))
+    check("a repository nested in another one's working tree is refused, leaving nothing",
+          "inside the git repository" in why and not (outer / "inner").exists()
+          and not ps.get("nested"), why)
+    (outer / ".gitignore").write_text("inner/\n")
+    check("unless that repository ignores the spot",
+          workspaces.create("Nested", ps, path=str(outer / "inner"), gh=gh)["initialised"])
+
+    done = workspaces.create("Rel", ps, path="sub/rel", root=ws, gh=gh)
+    check("a relative path is relative to the workspace",
+          done["cwd"] == str(ws / "sub" / "rel") and (ws / "sub" / "rel" / ".git").exists(),
+          done["cwd"])
+
+    def failing_commit(cmd, cwd, timeout=60):
+        if cmd[:2] == ["git", "commit"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "Please tell me who you are")
+        return workspaces._run(cmd, cwd, timeout=timeout)
+    why = ""
+    try:
+        workspaces.create("Broken", ps, root=ws, run=failing_commit, gh=gh)
+    except workspaces.Refused as e:
+        why = str(e)
+    check("a git step failing part way leaves nothing behind, and says why",
+          "who you are" in why and not (ws / "broken").exists() and not ps.get("broken"), why)
+    (ws / "keepme").mkdir()
+    (ws / "keepme" / "data.txt").write_text("x")
+    try:
+        workspaces.create("Keepme", ps, root=ws, adopt=True, run=failing_commit, gh=gh)
+    except workspaces.Refused:
+        pass
+    check("and undoing an adoption removes only what it added",
+          sorted(p.name for p in (ws / "keepme").iterdir()) == ["data.txt"],
+          str(sorted(p.name for p in (ws / "keepme").iterdir())))
+
+    # --- adopting --------------------------------------------------------------
+    done = workspaces.create("Taken", ps, root=ws, adopt=True, gh=gh)
+    tracked = _run_git(ws / "taken", "ls-files").stdout.split()
+    check("adopting an existing directory commits what was there",
+          not done["made_dir"] and done["committed"]
+          and sorted(tracked) == ["CLAUDE.md", "notes.txt"], str(tracked))
+    old = _git_repo(ws / "oldrepo", remote="https://github.com/me/OldRepo.git")
+    (old / "a.txt").write_text("a")
+    _run_git(old, "add", "-A")
+    _run_git(old, "commit", "-qm", "first")
+    done = workspaces.create("OldRepo", ps, path=str(old), gh=gh)
+    check("naming the path of an existing repo adopts it: no init, no commit of ours",
+          not done["initialised"] and not done["committed"]
+          and _run_git(old, "log", "--format=%s").stdout.strip() == "first")
+    check("its GitHub remote is the record's repo",
+          ps.get("oldrepo")["scope"] == {"cwd": str(old), "repo": "github.com/me/OldRepo"},
+          str(ps.get("oldrepo")))
+    check("and a CLAUDE.md it lacked is started but left for you to commit",
+          (old / "CLAUDE.md").exists() and any("not committed" in n for n in done["notes"]))
+    check("still nothing sent to GitHub", gh.calls == [], str(gh.calls))
+
+    # --- GitHub, only when asked -------------------------------------------------
+    done = workspaces.create("Gadget Two", ps, root=ws, github=True, owner="me", gh=gh)
+    check("asked for, it is a PRIVATE repo pushed from the new directory",
+          len(gh.calls) == 1 and gh.calls[0][:4] == ["gh", "repo", "create", "me/Gadget-Two"]
+          and "--private" in gh.calls[0] and "--push" in gh.calls[0]
+          and f"--source={ws / 'gadget-two'}" in gh.calls[0], str(gh.calls))
+    check("and the URL is reported and the repo recorded",
+          done["github_url"] == "https://github.com/me/Gadget-Two"
+          and ps.get("gadget-two")["scope"]["repo"] == "github.com/me/Gadget-Two",
+          str(done))
+    gh.calls.clear()
+    done = workspaces.create("Has Remote", ps, path=str(_git_repo(
+        ws / "hr", remote="git@github.com:me/HR.git")), github=True, gh=gh)
+    check("a repo that already has a remote gets no second one",
+          gh.calls == [] and any("already has a remote" in n for n in done["notes"]))
+    bad = _FakeGh(fail=True)
+    done = workspaces.create("Fails", ps, root=ws, github=True, gh=bad)
+    check("a failed gh is reported, and the project is still registered locally",
+          ps.get("fails") and not done["github_url"]
+          and any("422" in n for n in done["notes"]), str(done["notes"]))
+
+
+def test_project_new_from_slack_and_dashboard():
+    print("\nprojects: `!project new` files and moves the thread; the form never publishes by itself")
+    import functools
+    import projects
+    import workspaces
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    ps = projects.ProjectStore(root / "projects.json")
+    st = SessionStore(root / "s.json")
+    gh = _FakeGh()
+    fake_ws = types.SimpleNamespace(**{k: getattr(workspaces, k) for k in dir(workspaces)
+                                       if not k.startswith("__")})
+    fake_ws.create = functools.partial(workspaces.create, gh=gh, root=root / "workspace")
+    fake_ws.github_repo = functools.partial(workspaces.github_repo, gh=gh)
+    ns = bot_functions("new_project_from_thread", "github_for_thread_project",
+                       "handle_projects",
+                       store=st, project_store=ps, workspaces=fake_ws, GITHUB_OWNER="me",
+                       repos=__import__("repos"), Path=Path, projects=projects,
+                       install_git_guards=lambda *a: None, RUNNING={"C:busy": object()})
+    st.update("C:busy", cwd=str(root))
+    st.update("C:pend", cwd=str(root), pending={"ts": "1"})
+    busy = [ns["new_project_from_thread"](k, f"Busy{i}") for i, k in
+            enumerate(("C:busy", "C:pend"))]
+    check("a thread with a turn in flight is asked to wait, and nothing is made",
+          all("turn running" in r for r in busy) and not ps.get("busy0")
+          and not ps.get("busy1") and not (root / "workspace").exists(), str(busy))
+    st.update("C:1", session_id="sess-old", cwd=str(root), project="", unfiled=True)
+    reply = ns["new_project_from_thread"]("C:1", "Thing -- a thing")
+    e = st.get("C:1")
+    d = root / "workspace" / "thing"
+    check("the thread is filed under it and works in its directory",
+          e["project"] == "thing" and e["cwd"] == str(d) and e["unfiled"] is False, str(e))
+    check("its old session is retired, kept, not resumed from the wrong place",
+          e["session_id"] is None and e["previous_sessions"] == ["sess-old"], str(e))
+    check("the reply says what happened, and offers GitHub instead of doing it",
+          "registered" in reply and "`!project github create`" in reply and gh.calls == [], reply)
+    reply = ns["github_for_thread_project"]("C:1")
+    check("`!project github` makes the private repo and records it",
+          "https://github.com/me/Thing" in reply
+          and ps.get("thing")["scope"].get("repo") == "github.com/me/Thing", reply)
+    check("a refused name says why and changes nothing",
+          ":warning:" in ns["new_project_from_thread"]("C:2", "Thing")
+          and st.get("C:2") is None)
+
+    gh.calls.clear()
+    r = ns["handle_projects"]({"action": "new", "name": "Formed", "purpose": "p",
+                               "github": "yes"})
+    check("the form's GitHub box must actually be ticked (true), not merely truthy",
+          r["ok"] and gh.calls == [] and not r["created"]["github_url"], str(r))
+    r = ns["handle_projects"]({"action": "new", "name": "Boxed", "github": True})
+    check("ticked, it creates the private repo and says where",
+          r["ok"] and len(gh.calls) == 1 and "--private" in gh.calls[0]
+          and r["created"]["github_url"].endswith("/me/Boxed"), str(r))
+    r = ns["handle_projects"]({"action": "new", "name": "Formed"})
+    check("and refuses a collision with a reason", not r["ok"] and "already" in r["error"])
+
+
+def test_threads_and_tasks_filed_by_directory():
+    print("\nprojects: threads and tasks are filed by directory, once, idempotently")
+    import projects
+    import tasks as T
+    import workspaces
+    from tasks import TaskStore
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    for d in ("ws/a/deep", "ws/b", "ws/Silkworm/workspace", "elsewhere"):
+        (root / d).mkdir(parents=True)
+    ps = projects.ProjectStore(root / "projects.json")
+    ps.ensure("ws", scope={"cwd": str(root / "ws")})
+    ps.ensure("a", scope={"cwd": str(root / "ws/a")})
+    ps.ensure("b", scope={"cwd": str(root / "ws/b")})
+    ps.ensure("silkworm", scope={"cwd": str(root / "ws/Silkworm")})
+    st = SessionStore(root / "s.json")
+    ts = TaskStore(root / "t.json")
+    st.update("deep", cwd=str(root / "ws/a/deep"))
+    st.update("bee", cwd=str(root / "ws/b"))
+    st.update("hand", cwd=str(root / "ws/b"), project="a")          # filed by hand
+    st.update("out", cwd=str(root / "ws/b"), unfiled=True)          # unfiled on purpose
+    st.update("scratch", cwd=str(root / "ws/Silkworm/workspace"))
+    st.update("nowhere", cwd=str(root / "elsewhere"))
+    st.update("nocwd", title="x")
+    stamp = {k: v["updated"] for k, v in st.all().items()}
+    t_deep = ts.create("x", role="assistant", thread="deep",
+                       scope={"cwd": str(root / "ws/a/deep")})
+    t_hand = ts.create("x", state="done", thread="hand", scope={"cwd": str(root / "ws/b")})
+    t_out = ts.create("x", state="done", thread="out", scope={"cwd": str(root / "ws/b")})
+    t_free = ts.create("x", state="done", scope={"cwd": str(root / "ws/b")})
+    t_rev = ts.create("x", state="done", role="reviewer", scope={"cwd": str(root / "ws/b")})
+    t_kept = ts.create("x", state="done", project="b", thread="deep",
+                       scope={"cwd": str(root / "ws/a")})
+    t_none = ts.create("x", state="done", scope={"cwd": str(root / "elsewhere")})
+    # Open work waiting on a person: filing it under a ready project would
+    # let it run, or land, unsupervised.
+    t_open = ts.create("x", role="implementor", state="queued", scope={"cwd": str(root / "ws/b")})
+    t_prop = ts.create("x", role="implementor", state="proposed",
+                       scope={"cwd": str(root / "ws/b")})
+    tstamp = {k: v["updated"] for k, v in ts.all().items()}
+    ns = bot_functions("file_existing_by_directory", "file_by_directory",
+                       store=st, task_store=ts, project_store=ps, workspaces=workspaces,
+                       CLAUDE_CWD=root / "ws/Silkworm/workspace")
+    first = ns["file_existing_by_directory"]()
+    got = {k: v.get("project", "") for k, v in st.all().items()}
+    check("threads: most specific project, hand-filed kept, unfiled and scratch left alone",
+          got == {"deep": "a", "bee": "b", "hand": "a", "out": "", "scratch": "",
+                  "nowhere": "", "nocwd": ""}, str(got))
+    tp = {t["id"]: t.get("project") for t in ts.all().values()}
+    check("tasks: by their thread's project, else their own directory",
+          tp[t_deep["id"]] == "a" and tp[t_hand["id"]] == "a" and tp[t_free["id"]] == "b",
+          str(tp))
+    check("tasks: a reviewer, an unfiled thread's task, a filed one and a homeless one untouched",
+          tp[t_rev["id"]] == "" and tp[t_out["id"]] == "" and tp[t_kept["id"]] == "b"
+          and tp[t_none["id"]] == "", str(tp))
+    check("open implementor work is not given a project after the fact",
+          tp[t_open["id"]] == "" and tp[t_prop["id"]] == "", str(tp))
+    check("filing is not activity: nothing's `updated` moved",
+          {k: v["updated"] for k, v in st.all().items()} == stamp
+          and {k: v["updated"] for k, v in ts.all().items()} == tstamp)
+    check("it went through the stores, so it is on disk",
+          SessionStore(root / "s.json").get("bee")["project"] == "b"
+          and TaskStore(root / "t.json").get(t_free["id"])["project"] == "b")
+    before = ((root / "s.json").read_bytes(), (root / "t.json").read_bytes())
+    second = ns["file_existing_by_directory"]()
+    check("a second run files nothing and writes nothing",
+          second == {"threads": [], "tasks": []}
+          and ((root / "s.json").read_bytes(), (root / "t.json").read_bytes()) == before,
+          str(second))
+    check("the first run said what it filed",
+          sorted(first["threads"]) == ["bee", "deep"] and len(first["tasks"]) == 3, str(first))
+
+    # Each layer holds the rule on its own, so neither leans on the other.
+    recs = ps.all()
+    plan = workspaces.threads_to_file(st.all(), recs)
+    check("the planner never proposes refiling a filed or unfiled-on-purpose thread",
+          "hand" not in plan and "out" not in plan and "deep" not in plan, str(plan))
+    check("the session store refuses to refile one even when asked",
+          st.file_under({"hand": "b", "out": "b", "bee": "a"}) == []
+          and st.get("hand")["project"] == "a" and not st.get("out").get("project")
+          and st.get("bee")["project"] == "b")
+    check("the task store refuses to move filed work to another project",
+          ts.file_under({t_kept["id"]: "a", t_free["id"]: "a"}) == []
+          and ts.get(t_kept["id"])["project"] == "b"
+          and ts.get(t_free["id"])["project"] == "b")
+    tplan = workspaces.tasks_to_file(ts.all(), st.all(), recs)
+    check("and the task planner proposes nothing already filed", tplan == {}, str(tplan))
+
+    # --- a new turn ---------------------------------------------------------------
+    fbd = ns["file_by_directory"]
+    check("a new thread in a project's directory is filed at its first turn",
+          fbd("new", root / "ws/a/deep") == "a" and st.get("new")["project"] == "a")
+    check("an unfiled-on-purpose thread stays out", fbd("out", root / "ws/b") == ""
+          and not st.get("out").get("project"))
+    check("a filed thread keeps its project wherever it runs",
+          fbd("hand", root / "ws/b") == "a")
+    check("a scratch-folder thread stays unfiled",
+          fbd("scr2", root / "ws/Silkworm/workspace") == "" and st.get("scr2") is None)
+    # The turn's task is created with whatever this returns.
+    src = (BASE / "bot.py").read_text()
+    check("handle_prompt files its task through it",
+          "project=file_by_directory(key, cwd)," in src)
+    check("startup runs the backfill", 'daemons.start(_project_filer, "filer", forever=False)' in src)
+
+
+def test_unregistered_repos_are_reported():
+    print("\nprojects: repos in the workspace that no project covers are named")
+    import digest
+    import workspaces
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    ws, scratch = root / "workspace", root / "workspace/Silkworm/workspace"
+    _git_repo(ws / "known")
+    _git_repo(ws / "fresh")
+    _git_repo(ws / "clone", remote="git@github.com:me/Known.git")
+    _git_repo(ws / ".archive" / "gone")
+    _git_repo(ws / ".worktrees")
+    _git_repo(ws / ".hidden")
+    (ws / "plain").mkdir()
+    _git_repo(ws / "mono")
+    (ws / "mono" / "app").mkdir()
+    _git_repo(ws / "Silkworm")
+    _git_repo(scratch / "lostgame")
+    _git_repo(scratch / "nested" / "deeper")          # not *directly* under a root
+    recs = [{"slug": "known", "scope": {"cwd": str(ws / "known"), "repo": "github.com/me/Known"}},
+            {"slug": "app", "archived": True, "scope": {"cwd": str(ws / "mono" / "app")}},
+            {"slug": "silkworm", "scope": {"cwd": str(ws / "Silkworm")}}]
+    found = workspaces.unregistered([ws, scratch, root / "missing"], recs)
+    check("only repos no project covers, from both roots, sorted",
+          found == sorted([str(ws / "fresh"), str(scratch / "lostgame")]), str(found))
+    check("Silkworm's project does not hide repos in its scratch folder",
+          str(scratch / "lostgame") in found)
+    line = digest.render([], 1e9, unregistered=found)
+    check("the daily digest lists them, even on a quiet day",
+          "unregistered repos 2" in line and "fresh" in line and "lostgame" in line, line)
+    check("and says nothing when there are none",
+          "unregistered" not in digest.render([], 1e9, unregistered=[]))
+    pj = root / "projects.json"
+    pj.write_text(json.dumps({r["slug"]: r for r in recs}))
+    cli = _load_cli()
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        rows = cli.check_unregistered(pj, roots=[ws, scratch])
+    check("`silkworm status` lists them", rows == found and "fresh" in out.getvalue()
+          and "✘" in out.getvalue(), out.getvalue())
+    status_fn = next(n for n in ast.parse((BASE / "bin" / "silkworm").read_text()).body
+                     if isinstance(n, ast.FunctionDef) and n.name == "do_status")
+    check("and do_status runs that check",
+          any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "check_unregistered"
+              for n in ast.walk(status_fn)))
+    src = (BASE / "bot.py").read_text()
+    check("the digest is handed them", "unregistered=found)" in src)
 
 
 if __name__ == "__main__":

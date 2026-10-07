@@ -464,7 +464,9 @@ class Handler(BaseHTTPRequestHandler):
             answer = bot_call("/learnings", payload, timeout=3)
             self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/projects":
-            answer = bot_call("/projects", payload, timeout=10)
+            # Making a project with a GitHub repository waits on a push.
+            answer = bot_call("/projects", payload,
+                              timeout=200 if payload.get("action") == "new" else 10)
             self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/tasks":
             answer = bot_call("/tasks", payload, timeout=15)
@@ -868,6 +870,17 @@ PAGE = r"""<!doctype html>
       <input class="scope" id="tcwd" placeholder="working dir (blank = default)">
       <button class="act" onclick="addTask()">Queue it</button>
     </div>
+    <div class="lform" id="newproj">
+      <input class="scope" id="npname" placeholder="new project name">
+      <input class="text" id="nppurpose" placeholder="one line: what is it for?">
+      <input class="scope" id="nppath" placeholder="path (blank = ~/workspace/<name>)">
+      <label title="the directory already exists and should become this project"
+        ><input type="checkbox" id="npadopt"> adopt existing</label>
+      <label title="also create a PRIVATE GitHub repository and push to it"
+        ><input type="checkbox" id="npgithub"> private GitHub repo</label>
+      <button class="act" onclick="newProject()">New project</button>
+    </div>
+    <div id="unregistered" class="hint"></div>
     <div id="tlist"></div>
   </div>
 </div>
@@ -1316,7 +1329,7 @@ function toggleTasks() {
   const m = document.getElementById("taskmodal");
   const open = m.style.display !== "flex";
   m.style.display = open ? "flex" : "none";
-  if (open) { renderRoles(); renderProjects().then(renderTasks); }
+  if (open) { renderRoles(); renderProjects().then(renderTasks); renderUnregistered(); }
 }
 function setTaskView(v) {
   taskView = v;
@@ -1364,6 +1377,55 @@ function renderNightly(rows, limit) {
            : "off — click to schedule a nightly look"}"
        >${esc(p.title)}${p.ideate_at ? ` <b>${paused ? "paused" : p.ideate_at}</b>` : ""}</button>`;
     }).join("");
+}
+
+// One step: directory, git, CLAUDE.md and registration. The GitHub box is
+// the only way a repository gets published from here -- never by default.
+async function newProject() {
+  const name = document.getElementById("npname").value.trim();
+  if (!name) { toast("Give the project a name"); return; }
+  const r = await (await fetch("/api/projects", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "new", name,
+      purpose: document.getElementById("nppurpose").value.trim(),
+      path: document.getElementById("nppath").value.trim(),
+      adopt: document.getElementById("npadopt").checked,
+      github: document.getElementById("npgithub").checked})})).json();
+  if (!r.ok) { toast(r.error || "Could not create it"); return; }
+  const done = r.created || {};
+  for (const id of ["npname", "nppurpose", "nppath"]) document.getElementById(id).value = "";
+  for (const id of ["npadopt", "npgithub"]) document.getElementById(id).checked = false;
+  toast(`${done.title || name} registered at ${done.cwd || "?"}`
+        + (done.github_url ? ` · ${done.github_url}` : "")
+        + ((done.notes || []).length ? ` · ${done.notes.join("; ")}` : ""));
+  await renderProjects();
+  renderUnregistered();
+}
+
+// Repositories in the workspace no project covers. Clicking one fills the
+// form to adopt it, rather than registering anything by itself.
+async function renderUnregistered() {
+  const el = document.getElementById("unregistered");
+  if (!el) return;
+  let r;
+  try {
+    r = await (await fetch("/api/projects", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "unregistered"})})).json();
+  } catch (e) { el.textContent = ""; return; }
+  const rows = (r && r.ok && r.repos) || [];
+  el.innerHTML = rows.length
+    ? "📂 unregistered repos: " + rows.map(p =>
+        `<a href="#" data-path="${esc(p)}" onclick="adoptRepo(this.dataset.path);return false"
+          >${esc(p.split("/").pop())}</a>`).join(", ")
+    : "";
+}
+
+function adoptRepo(path) {
+  document.getElementById("npname").value = path.split("/").pop();
+  document.getElementById("nppath").value = path;
+  document.getElementById("npadopt").checked = true;
+  document.getElementById("nppurpose").focus();
 }
 
 async function renderProjects() {
