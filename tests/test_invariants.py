@@ -10424,6 +10424,51 @@ def test_review_does_not_take_the_branch():
 # so every task that landed would have been a build. Merging and releasing are
 # separate events, and a repo holds several things that ship separately.
 
+def test_release_effects_count_things_not_files():
+    # A confirmation that says "6 in supabase/functions" when one function
+    # changed six files overstates what reaches production. An edge function
+    # is its folder, a migration its file; elsewhere it is files, said so.
+    import releases as R
+    print("\nreleases: a confirmation counts functions and migrations, not files")
+    root = Path(tempfile.mkdtemp())
+    repo = root / "work"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a], capture_output=True, text=True)
+    def commit(*paths):
+        for path in paths:
+            p = repo / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(path)
+        g("add", "-A"); g("commit", "-q", "-m", "c")
+    (repo / ".silkworm").mkdir()
+    (repo / ".silkworm" / "release.toml").write_text(
+        '[targets.backend]\npaths = ["supabase/"]\nship = "command"\ncommands = ["true"]\n'
+        '[targets.ios]\npaths = ["ios/"]\nship = "tag"\n')
+    commit("supabase/functions/a/index.ts", "supabase/functions/a/deno.json",
+           "supabase/functions/a/lib/x.ts", "supabase/functions/b/index.ts",
+           "supabase/functions/_shared/jws.ts", "supabase/functions/_shared/apple.ts",
+           "supabase/migrations/0001.sql", "supabase/migrations/0002.sql",
+           "ios/App/A.swift", "ios/App/Views/B.swift", "ios/App/Views/C.swift")
+    targets = R.load(repo)
+    got = R.changed(repo, targets["backend"])
+    words = [R.describe(d, t) for d, t in got.items()]
+    check("four files over two functions are two edge functions, the shared folder named",
+          "2 edge functions and shared code (_shared) in supabase/functions" in words, words)
+    check("migrations are counted one per file", "2 migrations in supabase/migrations" in words, words)
+    check("one function, one migration: singular",
+          R.describe("supabase/functions", {"a"}) == "1 edge function in supabase/functions"
+          and R.describe("supabase/migrations", {"1.sql"}) == "1 migration in supabase/migrations")
+    check("only shared code changed: no function counted",
+          R.describe("supabase/functions", {"_shared"}) == "shared code (_shared) in supabase/functions")
+    ios = [R.describe(d, t) for d, t in R.changed(repo, targets["ios"]).items()]
+    check("a directory of no known kind counts files, and says files",
+          ios == ["3 files in ios/App"], ios)
+    step = {"commits": ["x c"], "version": (1, 0, 0), "tag": "backend/v1.0.0"}
+    eff = R.effects(repo, targets["backend"], step, "main")
+    check("the confirmation's first line reads in things",
+          eff and "(2 edge functions and shared code (_shared) in supabase/functions, "
+                  "2 migrations in supabase/migrations)" in eff[0], eff)
+
+
 def test_releases():
     import releases as R
     print("\nreleases: merged is not released")
@@ -17297,7 +17342,8 @@ def test_release_route():
           f"backend: runs `echo deployed >> {fx.log}`" in p["effects"]
           and "web: runs `exit 3`" in p["effects"], eff)
     check("and how much of what ships, by directory",
-          "2 in supabase/migrations" in eff and "1 in supabase/functions" in eff, eff)
+          "2 migrations in supabase/migrations" in eff
+          and "1 edge function in supabase/functions" in eff, eff)
     check("and every ref pushed, with the project's own description",
           "ios: pushes tag ios/v1.1.1 to origin — the push is the release" in p["effects"]
           and "CFBundleShortVersionString to 1.1.1 in ios/project.yml" in eff

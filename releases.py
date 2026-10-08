@@ -237,10 +237,21 @@ def pending(repo, target: dict, base: str = "HEAD") -> list[str]:
     return [line for line in r.stdout.splitlines() if line.strip()]
 
 
-def changed_files(repo, target: dict, base: str = "HEAD") -> dict:
-    """{directory: files changed} since the target's last release, a level
-    below each of its paths (`supabase/migrations`, `supabase/functions`), so
-    a confirmation can say how much of what is about to ship."""
+#: What a directory holds, by its last name, for saying how many of them a
+#: release ships: an edge function is a folder under `supabase/functions`
+#: however many of its files changed, a migration is a file. Anything else is
+#: counted in files, and says so.
+KINDS = {"functions": ("edge function", "edge functions"),
+         "migrations": ("migration", "migrations")}
+
+
+def changed(repo, target: dict, base: str = "HEAD") -> dict:
+    """{directory: the things in it that changed} since the target's last
+    release, a level below each of its paths (`supabase/migrations`,
+    `supabase/functions`), so a confirmation can say how much of what is
+    about to ship. A thing is what sits directly in the directory -- a
+    migration file, an edge function's folder -- except in a directory
+    KINDS does not know, where every changed file is one."""
     tag, _ = last_release(repo, target)
     if tag:
         r = _git(repo, "diff", "--name-only", f"{tag}..{base}", "--", *target["paths"])
@@ -253,8 +264,25 @@ def changed_files(repo, target: dict, base: str = "HEAD") -> dict:
     for f in r.stdout.splitlines():
         parts = f.split("/")
         key = "/".join(parts[:2]) if len(parts) > 2 else (parts[0] if len(parts) > 1 else f)
-        out[key] = out.get(key, 0) + 1
+        thing = parts[2] if len(parts) > 2 and parts[1] in KINDS else f
+        out.setdefault(key, set()).add(thing)
     return dict(sorted(out.items()))
+
+
+def describe(directory: str, things) -> str:
+    """'6 edge functions in supabase/functions', '1 migration in
+    supabase/migrations', '4 files in ios/Cadence'. A folder beginning with
+    an underscore (`_shared`) is code the functions share, not a function:
+    it is named rather than counted."""
+    kind = KINDS.get(directory.rsplit("/", 1)[-1])
+    if not kind:
+        n = len(things)
+        return f"{n} file{'s' if n != 1 else ''} in {directory}"
+    own = sorted(t for t in things if t.startswith("_"))
+    n = len(things) - len(own)
+    parts = [f"{n} {kind[0] if n == 1 else kind[1]}"] if n else []
+    parts += [f"shared code ({t})" for t in own]
+    return " and ".join(parts) + f" in {directory}"
 
 
 def effects(repo, target: dict, step: dict, base: str) -> list[str]:
@@ -264,8 +292,7 @@ def effects(repo, target: dict, step: dict, base: str) -> list[str]:
     name, v = target["name"], step.get("version")
     if not step.get("commits") or not v:
         return []
-    files = changed_files(repo, target)
-    what = ", ".join(f"{n} in {d}" for d, n in files.items()) if files else ""
+    what = ", ".join(describe(d, t) for d, t in changed(repo, target).items())
     out = [f"{name}: {len(step['commits'])} change{'s' if len(step['commits']) != 1 else ''}"
            + (f" ({what})" if what else "") + f" ships as {step['tag']}"]
     if target["ship"] == "command":
