@@ -479,6 +479,12 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/hide":
             answer = bot_call("/hide", payload, timeout=10)
             self._json(answer or {"ok": False, "error": "bot is offline"})
+        elif url.path == "/api/releases":
+            # A preview runs the target's dry run (a migration diff); a plan
+            # fetches origin. Neither ships anything.
+            answer = bot_call("/releases", payload,
+                              timeout=900 if payload.get("action") == "preview" else 90)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/release":
             answer = bot_call("/release", payload, timeout=30)
             self._json(answer or {"ok": False, "error": "bot is offline"})
@@ -878,6 +884,11 @@ PAGE = r"""<!doctype html>
   .tform .note { color: var(--muted); font-size: 11px; margin-top: 3px; }
   .tform .err { color: #D8517F; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
   .tform .acts { margin-top: 14px; display: flex; gap: 8px; }
+  .tform .rtarget { border-top: 1px solid var(--line2); margin-top: 10px; padding-top: 6px; }
+  .tform .reffects { margin: 8px 0; padding-left: 18px; font-size: 13px; }
+  .tform .on { color: #2EB67D; }
+  .spin { display: inline-block; animation: spin 1.2s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   #bdetail .sect { margin-top: 14px; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
                    text-transform: uppercase; letter-spacing: .06em; }
   #learnmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
@@ -2003,7 +2014,8 @@ function boardHead(info) {
   if (!info) return "";
   return `<div class="bhead"><h3>${esc(info.title)}</h3>${
     info.unready ? `<span class="warn" title="work the runner would take on its own is held in Needs you instead">⚠ ${
-      esc(info.unready)}</span>` : ""}<button class="act" onclick="newTaskForm()">+ New task</button><button class="ghost" onclick="projectSettings('${
+      esc(info.unready)}</span>` : ""}<button class="act" onclick="newTaskForm()">+ New task</button>${
+    info.release ? `<button class="ghost" onclick="releaseForm('${esc(info.slug)}')">Release…</button>` : ""}<button class="ghost" onclick="projectSettings('${
     esc(info.slug)}')">⚙ Settings</button></div>`;
 }
 function renderColumns(r) {
@@ -2141,7 +2153,8 @@ function projectCard(p, threads) {
       yes(rd.auto_merge, "auto-merge")} · ${yes(rd.publish, "publish")}${
       rd.unready ? `<div class="off" style="font-size:11px">${esc(rd.unready)}</div>` : ""}</div>` : ""}
     <div class="row"><span class="lbl">this week</span>${fmtCost(p.cost_week) || `<span class="off">$0</span>`}</div>
-    ${releaseText(p.release)}
+    ${releaseText(p.release)}${p.slug !== UNFILED && releaseButton(p.slug, p.release)
+      ? `<div class="row">${releaseButton(p.slug, p.release)}</div>` : ""}
     ${threads !== undefined ? `<div class="row"><span class="lbl">threads</span>${threads} with no project</div>` : ""}
   </div>`;
 }
@@ -2183,6 +2196,207 @@ function renderDetail(t) {
       esc(l.stage || "")}${l.base ? ` · onto ${esc(l.base)}` : ""}${l.at ? ` · ${age(l.at)}` : ""}${
       l.detail && l.landed ? `<div>${esc(String(l.detail))}</div>` : ""}</div>` : ""}` : ""}
     <div class="sect">events · ${(t.events || []).length}</div>${events || `<div class="hint">none</div>`}`;
+}
+
+// --- releasing a project, from its card or its board -----------------------------
+// One modal, three stages: the plan (what is pending per target, a level for
+// each, the dependency order, and each target's preview run as it opens), the
+// confirmation (exactly what will reach production), and the release's own
+// progress, polled. Every step asks the bot's /releases route; the page holds
+// no rule of its own. A start carries the fingerprint of the plan the
+// confirmation showed, and the route refuses one that no longer matches.
+async function releaseCall(payload) {
+  return (await (await fetch("/api/releases", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)})).json());
+}
+function releaseButton(slug, rel) {
+  if (!rel || rel.error || !(rel.targets || []).length) return "";
+  return `<button class="act" title="what is pending, its previews, then a confirmation" onclick="event.stopPropagation();releaseForm('${esc(slug)}')">Release…</button>`;
+}
+// The targets ticked, and the level chosen for each.
+function releaseSelection() {
+  const f = boardForm || {};
+  const offer = f.offer || {targets: []};
+  const names = offer.targets.filter(t => {
+    const box = document.getElementById(`rsel-${t.target}`);
+    return box ? box.checked : t.pending > 0;
+  }).map(t => t.target);
+  const levels = {};
+  for (const n of names) {
+    const sel = document.getElementById(`rlvl-${n}`);
+    let lvl = sel ? sel.value : (f.levels || {})[n] || "patch";
+    if (lvl === "version") {
+      // Chosen, not yet typed: kept as the choice, so the box appears.
+      const v = (document.getElementById(`rver-${n}`) || {}).value || "";
+      lvl = v.trim() || "version";
+    }
+    levels[n] = lvl;
+  }
+  return {targets: names, levels};
+}
+async function releaseForm(slug) {
+  openModal(`<div class="tform"><h3>Release ${esc(slug)}</h3>
+    <div class="hint">⏳ working out what is pending…</div></div>`,
+    {kind: "release", slug, stage: "plan", previews: {}, levels: {}});
+  const r = await releaseCall({action: "plan", slug});
+  const f = boardForm;
+  if (!f || f.kind !== "release" || f.slug !== slug) return;   // closed meanwhile
+  if (!r.ok) { document.getElementById("fbox").innerHTML = `<div class="tform"><h3>Release ${
+    esc(slug)}</h3><div class="err">${esc(r.error || "bot offline")}</div>${modalButtons("closeModal", "Close")}</div>`; return; }
+  f.offer = r;
+  // Releasing everything pending is one plan; the levels start where the
+  // route put them, a patch each.
+  if (r.running) {
+    // Its progress only if it is the dashboard's or the board's own, still
+    // going; one started by `!release` is told in its thread, and the plan
+    // below says a release is running.
+    const st = await releaseCall({action: "status", slug});
+    if (boardForm !== f) return;
+    if (st.run && !st.run.finished) return releaseProgress(slug);
+  }
+  drawReleasePlan();
+  if (r.blocked) return;                 // nothing to confirm; no previews either
+  for (const t of r.targets) if (t.pending && (t.preview || []).length) runPreview(slug, t.target);
+}
+async function runPreview(slug, target) {
+  const f = boardForm;
+  f.previews[target] = {running: true};
+  drawPreview(target);
+  const r = await releaseCall({action: "preview", slug, target});
+  if (boardForm !== f) return;
+  f.previews[target] = r;
+  drawPreview(target);
+}
+function previewHtml(target) {
+  const p = ((boardForm || {}).previews || {})[target];
+  if (!p) return "";
+  if (p.running) return `<div class="note"><span class="spin">⏳</span> running ${esc(target)}'s preview…</div>`;
+  if (!p.ok) return `<div class="err">preview: ${esc(p.error || "failed")}</div>`;
+  return (p.steps || []).map(s => `<div class="note">preview <code>${esc(s.command)}</code>${
+    s.ok ? "" : ` <span class="err">exit ${esc(String(s.code))}</span>`}</div><pre class="goal">${
+    esc((s.output || "").trim() || "(no output)")}</pre>`).join("");
+}
+function drawPreview(target) {
+  const el = document.getElementById(`rpv-${target}`);
+  if (el) el.innerHTML = previewHtml(target);
+}
+function releaseLevels(t, single) {
+  const v = t.versions || {};
+  const opts = [["patch", `patch → ${v.patch || "?"}`], ["minor", `minor → ${v.minor || "?"}`]];
+  // Major and an explicit version are for one target on its own, as !release has it.
+  if (single) opts.push(["major", `major → ${v.major || "?"}`], ["version", "exact version…"]);
+  const want = (boardForm.levels || {})[t.target] || "patch";
+  const cur = opts.find(o => o[0] === want) ? want : (single && /^\d/.test(want) ? "version" : "patch");
+  return `<select id="rlvl-${esc(t.target)}" onchange="releaseChanged()">${opts.map(o =>
+    `<option value="${o[0]}"${o[0] === cur ? " selected" : ""}>${esc(o[1])}</option>`).join("")}</select>${
+    cur === "version" ? `<input type="text" id="rver-${esc(t.target)}" placeholder="x.y.z" value="${
+      esc(/^\d/.test(want) ? want : "")}" onchange="releaseChanged()">` : ""}`;
+}
+function drawReleasePlan() {
+  const f = boardForm, r = f.offer;
+  const chosen = f.chosen || r.targets.filter(t => t.pending).map(t => t.target);
+  const single = chosen.length === 1;
+  const rows = r.targets.map(t => `<div class="rtarget">
+    <label class="choice"><input type="checkbox" id="rsel-${esc(t.target)}"${
+      chosen.includes(t.target) ? " checked" : ""}${t.pending ? "" : " disabled"} onchange="releaseChanged()">
+      <span><b>${esc(t.target)}</b> · ${t.pending ? `${t.pending} change${t.pending === 1 ? "" : "s"}` : "nothing pending"} since ${
+        esc(t.last || "the start")} · ${t.ship === "tag" ? "the tag is the release" : "deploys from here"}${
+        (t.after || []).length ? ` · after ${esc(t.after.join(", "))}` : ""}</span></label>
+    ${t.pending ? `<div class="line">${releaseLevels(t, single)}</div>` : ""}
+    ${(t.commits || []).map(c => `<div class="note"><code>${esc(c)}</code></div>`).join("")}${
+      t.pending > (t.commits || []).length ? `<div class="note">…and ${t.pending - t.commits.length} more</div>` : ""}
+    <div id="rpv-${esc(t.target)}">${previewHtml(t.target)}</div></div>`).join("");
+  document.getElementById("fbox").innerHTML = `<div class="tform"><h3>Release ${esc(f.slug)}</h3>
+    <div class="sub">from ${esc(r.base)} — nothing ships until you confirm</div>${rows}
+    <label>order</label><div id="rorder">${releaseOrder(r)}</div>
+    <div class="err" id="tferr">${esc(r.blocked ? `Can't release: ${r.blocked}` : "")}</div>
+    <div class="acts"><button class="act" id="rgo" onclick="confirmRelease()"${
+      r.blocked || !r.confirm ? " disabled" : ""}>Release…</button>
+      <button class="ghost" onclick="closeModal()">Cancel</button></div></div>`;
+}
+function releaseOrder(r) {
+  const steps = (r.steps || []).filter(s => s.commits);
+  return steps.length ? steps.map((s, i) => `${i + 1}. <b>${esc(s.target)}</b> → <code>${
+    esc(s.tag || "")}</code> (${esc(s.level)})`).join("<br>") : `<span class="off">nothing</span>`;
+}
+// A changed tick or level is a new plan, from the route: its order, its
+// versions, its refusals and a new fingerprint.
+async function releaseChanged() {
+  const f = boardForm;
+  if (!f || f.kind !== "release") return;
+  const sel = releaseSelection();
+  if (sel.targets.length !== 1)          // major/exact only for one target alone
+    for (const n of sel.targets)
+      if (["major", "version"].includes(sel.levels[n]) || /^\d/.test(sel.levels[n])) sel.levels[n] = "patch";
+  f.chosen = sel.targets; f.levels = sel.levels;
+  f.offer = Object.assign({}, f.offer, {confirm: ""});
+  drawReleasePlan();
+  if (!sel.targets.length) { formError("Tick a target to release."); return; }
+  if (Object.values(sel.levels).includes("version")) {
+    formError("Type the exact version, x.y.z."); return;   // nothing to confirm until then
+  }
+  const r = await releaseCall({action: "plan", slug: f.slug, ...sel});
+  if (boardForm !== f) return;
+  if (!r.ok) { formError(r.error || "bot offline"); document.getElementById("rgo").disabled = true; return; }
+  f.offer = r;
+  drawReleasePlan();
+}
+// The last look: exactly what reaches production, from the route's own words.
+function confirmRelease() {
+  const f = boardForm;
+  if (!f || !f.offer || !f.offer.confirm || f.offer.blocked) return;
+  f.stage = "confirm";
+  document.getElementById("fbox").innerHTML = `<div class="tform"><h3>Release ${esc(f.slug)}?</h3>
+    <div class="warn">This reaches production and cannot be undone from here:</div>
+    <ul class="reffects">${(f.offer.effects || []).map(e => `<li>${esc(e)}</li>`).join("")}</ul>
+    <div class="err" id="tferr"></div>
+    <div class="acts"><button class="act" onclick="startRelease()">Yes, release</button>
+      <button class="ghost" onclick="drawReleasePlan()">Back</button>
+      <button class="ghost" onclick="closeModal()">Cancel</button></div></div>`;
+}
+async function startRelease() {
+  const f = boardForm;
+  if (!f || f.stage !== "confirm") return;
+  // Exactly what the confirmed plan was asked with: no targets is "everything
+  // pending", which the route orders differently from the same names listed.
+  const sel = f.chosen ? {targets: f.chosen, levels: f.levels || {}} : {};
+  const r = await releaseCall({action: "start", slug: f.slug, confirm: f.offer.confirm,
+                               by: "dashboard", ...sel});
+  if (boardForm !== f) return;
+  if (!r.ok) {
+    // The plan moved under the confirmation: show the new one to read again.
+    if (r.offer) { f.offer = r.offer; drawReleasePlan(); }
+    formError(r.error || "bot offline");
+    return;
+  }
+  releaseProgress(f.slug);
+}
+function releaseProgress(slug) {
+  const f = boardForm;
+  f.stage = "running";
+  document.getElementById("fbox").innerHTML = `<div class="tform"><h3>Releasing ${esc(slug)}</h3>
+    <div id="rprog"><span class="spin">⏳</span> starting…</div>
+    <div class="note">Also posted to its Slack thread.</div>
+    <div class="acts"><button class="ghost" onclick="closeModal()">Close</button></div></div>`;
+  pollRelease(slug);
+}
+async function pollRelease(slug) {
+  const f = boardForm;
+  if (!f || f.kind !== "release" || f.stage !== "running") return;
+  const r = await releaseCall({action: "status", slug});
+  if (boardForm !== f) return;
+  const run = r.run;
+  const el = document.getElementById("rprog");
+  if (!run) { el.textContent = "no release recorded"; return; }
+  const done = !!run.finished;
+  el.innerHTML = (run.lines || []).map(l => `<pre class="goal">${esc(l)}</pre>`).join("")
+    + (done ? `<div class="${run.ok ? "on" : "err"}">${run.ok ? "✓ released " + esc((run.released || []).join(", "))
+      : "✗ stopped" + ((run.released || []).length ? " after " + esc(run.released.join(", ")) : "")}</div>`
+      : `<div><span class="spin">⏳</span> running…</div>`);
+  f.finished = done;
+  if (!done) setTimeout(() => pollRelease(slug), 2000);
+  else loadOverview();
 }
 
 // --- creating and editing tasks and projects, in one modal ---

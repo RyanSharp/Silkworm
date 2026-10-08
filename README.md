@@ -365,6 +365,24 @@ holds tasks and conversations under no project. The branch survey and release
 plans behind it are cached for a minute (`board.py`), so polling does not walk
 git. 📋 Tasks still opens on what needs you.
 
+**Releasing in one click.** A project with release targets has a
+**Release…** button on its card and its board header: per target what is
+pending and its first commits, a patch/minor choice each (major or an exact
+version only when one target is released on its own, as `!release` has it),
+the dependency order, and each target's `preview` commands run as it opens (a
+migration dry run — never a deploy command). **Release…** then shows exactly
+what will reach production — every command that runs, every ref and tag that
+is pushed, and the target's optional `describe` line from `release.toml` — and
+only **Yes, release** starts it, through the same `run_release` as `!release`;
+progress is shown in the modal and posted to a thread in your DM. On the Slack
+board, a project with something ready gets a menu with **Release…** (the same
+plan and previews in a Slack window, everything pending at a patch) and
+**Preview only…**. A release is refused, with the reason, from a dirty
+checkout, behind or ahead of origin, with nothing pending, while another
+release of that project runs, or for someone off the allowlist; and the start
+carries a fingerprint of the plan that was confirmed, so if anything lands in
+between, nothing ships and the plan is shown again.
+
 The board also edits, through one kind of modal — labelled fields, Cancel or
 Esc to back out with nothing sent, and the route's own reason shown inside it
 when something is refused. **+ New task** in a project's board header files work

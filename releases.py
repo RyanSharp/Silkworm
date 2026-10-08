@@ -22,6 +22,7 @@ So a project describes its release targets in its own repository, in
     ship    = "tag"                   # pushing the tag is the release; CI builds it
     version = { file = "ios/project.yml", key = "CFBundleShortVersionString" }
     after   = ["backend"]             # released first when it has anything pending
+    describe = "Xcode Cloud builds the tag for TestFlight"   # optional; shown on confirming
 
 What is ready to release is what landed since the target's last release tag
 and touches its paths. A release is recorded as a tag, `<target>/v<version>`,
@@ -34,6 +35,8 @@ Deliberately not here: a release that happens on its own. Every release is a
 person asking for one; see `bot.handle_release`.
 """
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -100,6 +103,10 @@ def load(repo) -> dict:
             "env_files": list(t.get("env_files") or []),
             "version": version or None,
             "after": list(t.get("after") or []),
+            # What shipping it sets off beyond the commands themselves, in the
+            # project's words ("Xcode Cloud builds it for TestFlight"), for the
+            # confirmation that lists what will reach production.
+            "describe": str(t.get("describe") or "").strip(),
         }
     for name, t in targets.items():
         for dep in t["after"]:
@@ -230,6 +237,49 @@ def pending(repo, target: dict, base: str = "HEAD") -> list[str]:
     return [line for line in r.stdout.splitlines() if line.strip()]
 
 
+def changed_files(repo, target: dict, base: str = "HEAD") -> dict:
+    """{directory: files changed} since the target's last release, a level
+    below each of its paths (`supabase/migrations`, `supabase/functions`), so
+    a confirmation can say how much of what is about to ship."""
+    tag, _ = last_release(repo, target)
+    if tag:
+        r = _git(repo, "diff", "--name-only", f"{tag}..{base}", "--", *target["paths"])
+    else:
+        # Never released: everything under its paths is new.
+        r = _git(repo, "ls-tree", "-r", "--name-only", base, "--", *target["paths"])
+    if r.returncode != 0:
+        return {}
+    out: dict = {}
+    for f in r.stdout.splitlines():
+        parts = f.split("/")
+        key = "/".join(parts[:2]) if len(parts) > 2 else (parts[0] if len(parts) > 1 else f)
+        out[key] = out.get(key, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def effects(repo, target: dict, step: dict, base: str) -> list[str]:
+    """What releasing this step does to the world, said exactly: every command
+    that runs, every ref that is pushed. Plain text, one line each; the
+    confirmation shows nothing else as the reason to say yes."""
+    name, v = target["name"], step.get("version")
+    if not step.get("commits") or not v:
+        return []
+    files = changed_files(repo, target)
+    what = ", ".join(f"{n} in {d}" for d, n in files.items()) if files else ""
+    out = [f"{name}: {len(step['commits'])} change{'s' if len(step['commits']) != 1 else ''}"
+           + (f" ({what})" if what else "") + f" ships as {step['tag']}"]
+    if target["ship"] == "command":
+        out += [f"{name}: runs `{c}`" for c in target["commands"]]
+    if target["version"]:
+        out.append(f"{name}: sets {target['version']['key']} to {v} in "
+                   f"{target['version']['file']}, commits it and pushes {base}")
+    out.append(f"{name}: pushes tag {step['tag']} to origin"
+               + (" — the push is the release" if target["ship"] == "tag" else ""))
+    if target.get("describe"):
+        out.append(f"{name}: {target['describe']}")
+    return out
+
+
 def order(targets: dict, names: list[str]) -> list[str]:
     """`names` plus whatever they come after, dependencies first. Raises on a
     cycle, which load() checks so a bad file fails on reading, not releasing."""
@@ -281,6 +331,19 @@ def plan(repo, names: list[str] | None = None, level: str = "patch") -> list[dic
                       "level": mine, "version": v,
                       "tag": f"{tag_prefix(t)}{v}" if v else None})
     return steps
+
+
+def fingerprint(slug: str, repo, base: str, steps: list[dict]) -> str:
+    """A short digest of exactly what a release would ship: the base's commit,
+    and per step its target, level, version, tag and commits. A confirmation
+    carries the one it was shown, and a release goes ahead only while it still
+    matches -- so anything landing, or a level changing, between reading the
+    confirmation and saying yes means reading it again, not shipping the
+    difference unseen."""
+    head = _git(repo, "rev-parse", "--verify", "-q", f"{base}^{{commit}}").stdout.strip()
+    blob = json.dumps([slug, base, head, [[s.get("target"), s.get("level"), s.get("version"),
+                                           s.get("tag"), s.get("commits")] for s in steps]])
+    return hashlib.sha256(blob.encode()).hexdigest()[:20]
 
 
 # --- doing it ------------------------------------------------------------------

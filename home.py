@@ -74,6 +74,9 @@ STEP_BUTTONS = [("Release", "release", "primary", None),
 DIRECT = ("accept", "dismiss", "approve", "retry", "cancel", "release", "resolve")
 MODAL_CALLBACK = "home_rework"
 CONFIRM_CALLBACK = "home_confirm"
+RELEASE_CALLBACK = "home_release"
+#: Projects listed under "Ready to release"; the rest are counted.
+MAX_RELEASES = 5
 STATE_ICON = {tasks.AWAITING_APPROVAL: ":eyes:", tasks.NEEDS_INPUT: ":speech_balloon:",
               tasks.FAILED: ":x:", tasks.PROPOSED: ":bulb:"}
 
@@ -356,7 +359,7 @@ def confirm_modal(task: dict, action: str) -> dict:
 def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
            base_url: str = "", notice: str = "", allowed: bool = True,
            max_blocks: int = MAX_BLOCKS, max_attention: int = MAX_ATTENTION,
-           compact: bool = False) -> dict:
+           compact: bool = False, releasable=()) -> dict:
     """The Home view for one user.
 
     `allowed=False` renders nothing of the board: task goals and reviewer
@@ -394,6 +397,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     if notice:
         blocks.insert(1, {"type": "section", "block_id": "home:notice", "text": _text(notice)})
 
+    shipping = release_blocks(releasable)
     # Needs you, grouped by state. Built into a separate list first so the
     # overflow line can say exactly how many did not fit.
     board, shown = [], 0
@@ -409,7 +413,8 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
         chunk += ([_task_line(t, now, base_url, cost_of(t))] if compact
                   else _task_blocks(t, now, base_url, cost_of(t)))
         # Room kept for the tail sections (running, watching, unmerged).
-        if shown >= max_attention or len(blocks) + len(board) + len(chunk) > max_blocks - 12:
+        if shown >= max_attention or (len(blocks) + len(board) + len(chunk)
+                                      > max_blocks - 12 - len(shipping)):
             break
         board += chunk
         shown += 1
@@ -421,6 +426,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
         blocks.append({"type": "context", "elements": [_text(
             f"…and {len(attention) - shown} more waiting — "
             "the rest are on the dashboard.")]})
+    blocks += shipping
 
     def listing(title, rows):
         if not rows:
@@ -456,6 +462,93 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
         blocks = [b for b in blocks if b not in moved]
         blocks += [{"type": "divider"}] + moved
     return {"type": "home", "blocks": blocks[:max_blocks]}
+
+
+def release_blocks(releasable) -> list[dict]:
+    """Projects with something ready to release, one line each, with a menu
+    whose Release… opens the confirmation (release_modal). Nothing ships
+    from the board without that window being read and confirmed."""
+    rows = list(releasable or ())
+    if not rows:
+        return []
+    out = [{"type": "divider"}, {"type": "section", "text": _text(
+        f"*:rocket: Ready to release* ({len(rows)})")}]
+    for p in rows[:MAX_RELEASES]:
+        slug = p.get("slug", "")
+        what = " · ".join(f"{esc(t.get('target'))} {t.get('commits')} → {esc(t.get('version') or '?')}"
+                          for t in p.get("targets") or [])
+        out.append({"type": "section", "block_id": f"r:{slug}",
+                    "text": _text(f"*{esc(clip(p.get('title') or slug, 60))}* `{esc(slug)}`"
+                                  + (f" — {what}" if what else "")),
+                    "accessory": {"type": "overflow", "action_id": "home_menu", "options": [
+                        {"text": {"type": "plain_text", "text": "Release…"},
+                         "value": f"release|{slug}|"},
+                        {"text": {"type": "plain_text", "text": "Preview only…"},
+                         "value": f"preview|{slug}|"}]}})
+    if len(rows) > MAX_RELEASES:
+        out.append({"type": "context", "elements": [_text(
+            f"…and {len(rows) - MAX_RELEASES} more — on the dashboard.")]})
+    return out
+
+
+def release_modal(slug: str, offer: dict | None, previews: dict | None = None,
+                  confirmable: bool = True) -> dict:
+    """The release confirmation: what ships, in order; exactly what reaches
+    production; each target's preview; and why it cannot go, if it cannot.
+
+    `offer` None is the window while that is worked out -- Slack wants a
+    window within three seconds of the click, and a migration dry run takes
+    longer. Only a ready plan has a submit button, and the fingerprint it
+    carries (`confirm`) is what the release checks against, so confirming
+    releases what this window showed or nothing. `confirmable` False is the
+    preview: the same window, nothing to submit.
+    """
+    view = {"type": "modal", "callback_id": RELEASE_CALLBACK,
+            "title": {"type": "plain_text", "text": "Release" if confirmable else "Release preview"},
+            "close": {"type": "plain_text", "text": "Cancel" if confirmable else "Close"}}
+    if offer is None:
+        view["blocks"] = [{"type": "section", "text": _text(
+            f":hourglass_flowing_sand: Working out what `{esc(slug)}` would release, "
+            "and running its previews…")}]
+        return view
+    if not offer.get("ok"):
+        view["blocks"] = [{"type": "section", "text": _text(
+            f":warning: {esc(offer.get('error') or 'could not work out the release')}")}]
+        return view
+    rows = {t["target"]: t for t in offer.get("targets") or []}
+    steps = [s for s in offer.get("steps") or [] if s.get("commits")]
+    lines = [f"*Release `{esc(slug)}`* from `{esc(offer.get('base') or 'main')}`, in this order:"]
+    for st in steps:
+        lines.append(f"• *{esc(st['target'])}* — {st['commits']} change"
+                     f"{'s' if st['commits'] != 1 else ''} → `{esc(st['tag'])}` ({esc(st['level'])})")
+        lines += [f"    `{esc(clip(c, 80))}`" for c in (rows.get(st["target"]) or {}).get("commits", [])[:3]]
+    if not steps:
+        lines.append("_Nothing is pending._")
+    blocks = [{"type": "section", "text": _text("\n".join(lines))}]
+    if offer.get("blocked"):
+        blocks.append({"type": "section", "text": _text(
+            f":no_entry: *Can't release:* {esc(offer['blocked'])}")})
+    if offer.get("effects"):
+        blocks.append({"type": "section", "text": _text(
+            "*What will reach production*\n" + "\n".join(f"• {esc(e)}" for e in offer["effects"]))})
+    for name, pv in (previews or {}).items():
+        if not pv.get("ok"):
+            blocks.append({"type": "section", "text": _text(
+                f"*Preview of {esc(name)}:* :warning: {esc(pv.get('error') or 'failed')}")})
+            continue
+        for step in pv.get("steps") or []:
+            out = (step.get("output") or "").strip()[-700:] or "(no output)"
+            mark = "" if step.get("ok") else f" :x: exit {step.get('code')}"
+            blocks.append({"type": "section", "text": _text(
+                f"*Preview of {esc(name)}* `{esc(step.get('command'))}`{mark}\n```{esc(out)}```")})
+    blocks.append({"type": "context", "elements": [_text(
+        "Everything pending, each at a patch. For minor, major or one target on its "
+        f"own, use the dashboard or `!release {esc(slug)} <target> <level>`.")]})
+    view["blocks"] = blocks[:100]
+    if confirmable and offer.get("confirm") and not offer.get("blocked"):
+        view["submit"] = {"type": "plain_text", "text": "Release"}
+        view["private_metadata"] = json.dumps({"slug": slug, "confirm": offer["confirm"]})
+    return view
 
 
 def seen_state(value: str) -> tuple[str, str]:
@@ -511,9 +604,12 @@ class Home:
     UNMERGED_S = 300   # the survey asks git about every branch; cache it
 
     def __init__(self, *, store, call, allowed_users, base_url="",
-                 watching=None, unmerged=None):
+                 watching=None, unmerged=None, releasable=None, release_call=None):
         self.store = store
         self.call = call
+        #: bot.handle_releases, and the projects with something to release.
+        self.release_call = release_call
+        self._releasable = releasable or (lambda: [])
         self.allowed_users = set(allowed_users or ())
         self.base_url = base_url
         self._watching = watching or (lambda: [])
@@ -521,6 +617,18 @@ class Home:
         self._notices: dict[str, tuple[str, float]] = {}
         self._cache = ("", 0.0)
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _spawn(fn) -> None:
+        """Run off the Slack handler (a preview outlasts its three seconds)."""
+        threading.Thread(target=fn, daemon=True, name="release-window").start()
+
+    def releasable(self) -> list:
+        try:
+            return list(self._releasable() or [])
+        except Exception:
+            log.exception("release list failed")
+            return []
 
     def allowed(self, user: str) -> bool:
         return not self.allowed_users or user in self.allowed_users
@@ -559,7 +667,7 @@ class Home:
             watching = []
         items = [dict(r, id=tid) for tid, r in self.store.all().items()]
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
-                      base_url=self.base_url, notice=text)
+                      base_url=self.base_url, notice=text, releasable=self.releasable())
 
     def publish(self, client, user: str) -> None:
         try:
@@ -657,6 +765,8 @@ class Home:
             return                                  # a link; Slack opened it
         if not self.allowed(user):
             return self.publish(client, user)
+        if action in ("release", "preview"):
+            return self.open_release(client, body, user, tid, action == "release")
         task = self.store.get(tid)
         if not task:
             self.note(user, ":warning: That task no longer exists.")
@@ -674,6 +784,63 @@ class Home:
             client.views_open(trigger_id=body["trigger_id"], view=view)
         except Exception:
             log.exception("could not open the %s window", action)
+
+    def open_release(self, client, body, user: str, slug: str, confirmable: bool) -> None:
+        """The release window: open it at once, then fill it in with the plan
+        and the previews once they have run."""
+        if not self.release_call or not slug:
+            return
+        try:
+            r = client.views_open(trigger_id=body["trigger_id"],
+                                  view=release_modal(slug, None, confirmable=confirmable))
+        except Exception:
+            log.exception("could not open the release window")
+            return
+        view_id = ((r or {}).get("view") or {}).get("id")
+
+        def fill():
+            try:
+                offer = self.release_call({"action": "plan", "slug": slug,
+                                           "by": f"slack:{user}"})
+                previews = {}
+                if offer.get("ok") and not offer.get("blocked"):
+                    rows = {t["target"]: t for t in offer.get("targets") or []}
+                    for st in offer.get("steps") or []:
+                        if st.get("commits") and (rows.get(st["target"]) or {}).get("preview"):
+                            previews[st["target"]] = self.release_call(
+                                {"action": "preview", "slug": slug, "target": st["target"]})
+                view = release_modal(slug, offer, previews, confirmable)
+            except Exception as e:
+                log.exception("release window for %s failed", slug)
+                view = release_modal(slug, {"ok": False, "error": str(e)}, confirmable=confirmable)
+            try:
+                client.views_update(view_id=view_id, view=view)
+            except Exception:
+                log.exception("could not fill in the release window")
+        self._spawn(fill)
+
+    def on_release(self, ack, body, client, view):
+        """Release confirmed in the window. The fingerprint it carries is the
+        plan the window showed; the route refuses anything else."""
+        ack()
+        user = body["user"]["id"]
+        if not self.allowed(user):
+            return self.publish(client, user)
+        meta = json.loads(view.get("private_metadata") or "{}")
+        slug = meta.get("slug", "")
+        if not self.release_call or not slug:
+            return
+        try:
+            r = self.release_call({"action": "start", "slug": slug,
+                                   "confirm": meta.get("confirm", ""),
+                                   "by": f"slack:{user}"})
+        except Exception as e:
+            log.exception("release of %s failed to start", slug)
+            r = {"ok": False, "error": str(e)}
+        self.note(user, f":rocket: Releasing `{esc(slug)}` — progress in its thread"
+                  if r.get("ok") else
+                  f":warning: Couldn't release `{esc(slug)}`: {esc(r.get('error') or 'refused')}")
+        self.publish(client, user)
 
     def on_confirm(self, ack, body, client, view):
         ack()
@@ -810,7 +977,8 @@ class Board(Home):
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
                       max_attention=self.MAX_ATTENTION, compact=True,
-                      notice=self.current_notice())["blocks"]
+                      notice=self.current_notice(),
+                      releasable=self.releasable())["blocks"]
 
     def current_notice(self) -> str:
         """The latest click's result, while it is fresh. On the board itself,
@@ -836,7 +1004,8 @@ class Board(Home):
             watching = []
         # The notice too, so that its expiry is a change and the next pass
         # redraws without it rather than leaving it up until something else moves.
-        return json.dumps([rows, watching, self.unmerged(), self.current_notice()], default=str)
+        return json.dumps([rows, watching, self.unmerged(), self.current_notice(),
+                           self.releasable()], default=str)
 
     def sync(self, client, force: bool = False) -> str:
         """Bring the board message up to date. Returns what it did, for the
@@ -972,3 +1141,4 @@ def register(app, home: Home) -> None:
     app.view(MODAL_CALLBACK)(home.on_submit)
     app.action("home_menu")(home.on_menu)
     app.view(CONFIRM_CALLBACK)(home.on_confirm)
+    app.view(RELEASE_CALLBACK)(home.on_release)

@@ -1035,6 +1035,18 @@ _releasing_guard = threading.Lock()
 RELEASE_STARTED = ":rocket:"
 
 
+def release_checkout(slug: str) -> tuple[str, str]:
+    """(repo, base) a project releases from: its own checkout, on its base
+    branch (the project's, as it stands now; "main" when it names none). An
+    empty repo when it has none to release from. The one reader of a project's
+    base for every way of releasing -- `!release`, the dashboard, the board."""
+    scope = project_store.scope_for(slug) or {}
+    repo = scope.get("cwd") or ""
+    if not repo or not worktrees.is_repo(repo):
+        repo = ""
+    return repo, scope.get("branch") or "main"
+
+
 def release_command(arg: str, post, then=None) -> str:
     """`!release <project> [<target|all> [level]]`. Returns the immediate
     reply; the plan or the release itself runs off the Slack handler (a
@@ -1046,9 +1058,8 @@ def release_command(arg: str, post, then=None) -> str:
         return ("Usage: `!release <project>` to see what is ready, or "
                 "`!release <project> <target|all> [patch|minor|major|x.y.z]` to release it.")
     slug = parts[0].lower()
-    scope = project_store.scope_for(slug) or {}
-    repo = scope.get("cwd")
-    if not repo or not worktrees.is_repo(repo):
+    repo, base = release_checkout(slug)
+    if not repo:
         return f"`{slug}` has no repository to release from."
     try:
         targets = releases.load(repo)
@@ -1057,7 +1068,6 @@ def release_command(arg: str, post, then=None) -> str:
     if not targets:
         return (f"`{slug}` has no release targets. Merging is its release; add "
                 f"`.silkworm/release.toml` to its repo to give it some.")
-    base = scope.get("branch") or "main"
     if len(parts) == 1:
         threading.Thread(target=release_plan, args=(slug, repo, post),
                          daemon=True, name=f"plan-{slug}").start()
@@ -1107,18 +1117,29 @@ def release_plan(slug: str, repo, post) -> None:
 
 
 def run_release(slug: str, repo, base: str, names, level: str, post,
-                then=None) -> list[dict]:
+                then=None, levels=None, expect: str = "") -> list[dict]:
     """Release in dependency order, stopping at the first failure. Holds the
     repo guard throughout, so a landing cannot move the base mid-release.
 
     `then(ok)` is told at the end whether it shipped: True only if something
     was released and nothing failed. "Nothing to release" is not success --
-    whoever asked for a release did not get one, and should look."""
+    whoever asked for a release did not get one, and should look.
+
+    `levels` is a per-target choice ({target: level}) over `level`, from the
+    dashboard; `expect` is the fingerprint of the plan a person confirmed, and
+    the release only goes ahead if what it is about to ship still matches it
+    -- checked here, under the guard, rather than only when it was asked for.
+    """
     done = []
     ok = False
     try:
         with repo_guard(str(repo)):
-            steps = releases.plan(repo, names, level)
+            steps = release_steps(repo, names, level, levels)
+            if expect and releases.fingerprint(slug, repo, base, steps) != expect:
+                post(f":warning: What `{slug}` would ship changed after it was confirmed "
+                     "(something landed, or a version moved). Nothing was released; "
+                     "look at the plan again.")
+                return done
             if not steps:
                 post(f"`{slug}` has nothing to release.")
                 return done
@@ -1149,12 +1170,256 @@ def run_release(slug: str, repo, base: str, names, level: str, post,
     finally:
         with _releasing_guard:
             _releasing.discard(slug)
+        # What is ready to release just changed; the board's cached plans
+        # would otherwise offer Release… on it for another minute.
+        _board_releases.clear()
         if then:
             try:
                 then(ok)
             except Exception:
                 log.exception("after releasing %s", slug)
     return done
+
+
+def release_steps(repo, names, level: str = "patch", levels=None) -> list[dict]:
+    """The release plan with each step's level resolved: `level` for the whole
+    release, overridden per target by `levels` ({target: level}).
+
+    Major and explicit versions are for one target named on its own, the rule
+    `releases.plan` applies to `!release all major`: it is a decision about one
+    thing, and the targets pulled in to go first stay at what they were given.
+    """
+    levels = {k: str(v).strip() for k, v in (levels or {}).items() if str(v or "").strip()}
+    for name, lvl in levels.items():
+        if lvl not in releases.LEVELS and not releases.parse(lvl):
+            raise releases.ReleaseError(
+                f"`{lvl}` is not patch, minor, major or a version like 1.2.0")
+        if (lvl == "major" or releases.parse(lvl)) and list(names or []) != [name]:
+            raise releases.ReleaseError(
+                f"{lvl} is for releasing {name} on its own, not alongside other targets")
+    targets = releases.load(repo)
+    steps = releases.plan(repo, names, level)
+    for step in steps:
+        lvl = levels.get(step["target"])
+        if lvl and step["commits"]:
+            t = targets[step["target"]]
+            v = releases.fmt(releases.next_version(repo, t, lvl))
+            step.update(level=lvl, version=v, tag=f"{releases.tag_prefix(t)}{v}")
+    return steps
+
+
+#: The last release started from the dashboard or the board, per project: what
+#: it has said so far, for the dashboard to poll. In memory on purpose -- a
+#: restart kills a release with it, and the release's thread keeps the record.
+_release_runs: dict[str, dict] = {}
+
+
+def release_allowed(by: str) -> bool:
+    """Whether `by` may release. A click on the Slack board names its user,
+    who must be on the allowlist, as for every other command; the dashboard
+    is loopback-only and trusted like the rest of these routes."""
+    if (by or "").startswith("slack:"):
+        return not ALLOWED_USERS or by.split(":", 1)[1] in ALLOWED_USERS
+    return True
+
+
+def _release_names(raw) -> list[str] | None:
+    """Targets as a route receives them: a list, or nothing / "all" for
+    everything pending."""
+    if isinstance(raw, str):
+        raw = [] if raw.strip().lower() in ("", "all") else [raw]
+    names = [str(n).strip() for n in (raw or []) if str(n).strip()]
+    return names or None
+
+
+def release_offer(slug: str, names=None, levels=None) -> dict:
+    """What a release of `slug` would do, for a person to confirm: per target
+    what is pending and the versions it could take; the steps of this
+    release in order; the exact effects on production; why it cannot go
+    ahead, if it cannot; and `confirm`, the fingerprint a start must carry.
+
+    Runs nothing but git (ready() fetches origin). Never a preview or a ship
+    command -- those are the `preview` action and the release itself.
+    """
+    repo, base = release_checkout(slug)
+    if not repo:
+        return {"ok": False, "error": f"{slug} has no repository to release from"}
+    try:
+        targets = releases.load(repo)
+        if not targets:
+            return {"ok": False, "error": f"{slug} has no release targets"}
+        steps = release_steps(repo, names, "patch", levels)
+        rows = []
+        for name in releases.order(targets, list(targets)):
+            t = targets[name]
+            commits = releases.pending(repo, t)
+            versions = {}
+            for lvl in releases.LEVELS:
+                try:
+                    versions[lvl] = releases.fmt(releases.next_version(repo, t, lvl))
+                except releases.ReleaseError:
+                    versions[lvl] = None
+            rows.append({"target": name, "ship": t["ship"], "after": t["after"],
+                         "last": releases.last_release(repo, t)[0] or "",
+                         "pending": len(commits), "commits": commits[:5],
+                         "versions": versions, "preview": t["preview"],
+                         "describe": t.get("describe") or ""})
+    except releases.ReleaseError as e:
+        return {"ok": False, "error": str(e)}
+    with _releasing_guard:
+        running = slug in _releasing
+    shipping = [s for s in steps if s["commits"]]
+    blocked = (f"a release of {slug} is already running" if running
+               else releases.ready(repo, base)
+               or ("" if shipping else "nothing is pending for "
+                   + (", ".join(names) if names else "any target"))
+               or "")
+    effects = [line for s in shipping
+               for line in releases.effects(repo, targets[s["target"]], s, base)]
+    return {"ok": True, "slug": slug, "base": base, "targets": rows,
+            "steps": [{"target": s["target"], "level": s["level"], "version": s["version"],
+                       "tag": s["tag"], "commits": len(s["commits"])} for s in steps],
+            "effects": effects, "blocked": blocked, "running": running,
+            "confirm": "" if blocked else releases.fingerprint(slug, repo, base, steps)}
+
+
+def release_thread(slug: str, by: str):
+    """A post function for a release started away from a thread: the first
+    line opens a thread in the home channel, the rest go under it, so the
+    release has the same record `!release` leaves where it was typed."""
+    where = {}
+
+    def post(text: str) -> None:
+        channel = home_channel()
+        if not channel:
+            return
+        if not where:
+            r = app.client.chat_postMessage(
+                channel=channel, text=f":rocket: *Release* — `{slug}` (from {by or 'the dashboard'})")
+            where["ts"] = r["ts"]
+        app.client.chat_postMessage(channel=channel, thread_ts=where["ts"], text=text)
+    return post
+
+
+def start_release(slug: str, names, levels, confirm: str, by: str, post=None) -> dict:
+    """Start a release a person confirmed. The same run_release `!release`
+    uses, under the same one-at-a-time rule, after the same refusals --
+    and only with the fingerprint of the plan that was shown (release_offer),
+    so a release is never started without its confirmation, nor with one for
+    something other than what would now ship."""
+    if not release_allowed(by):
+        return {"ok": False, "error": "only people on the bot's allowlist can release"}
+    offer = release_offer(slug, names, levels)
+    if not offer["ok"]:
+        return offer
+    if offer["blocked"]:
+        return {"ok": False, "error": offer["blocked"], "offer": offer}
+    if not confirm:
+        return {"ok": False, "error": "a release needs its confirmation: read what "
+                                      "will reach production, then confirm it"}
+    if confirm != offer["confirm"]:
+        return {"ok": False, "offer": offer,
+                "error": "what would ship has changed since it was confirmed; look again"}
+    repo, base = release_checkout(slug)
+    with _releasing_guard:
+        if slug in _releasing:
+            return {"ok": False, "error": f"a release of {slug} is already running"}
+        _releasing.add(slug)
+    run = {"slug": slug, "by": by, "started": time.time(), "finished": None,
+           "effects": offer["effects"], "lines": [], "released": [], "ok": None}
+    _release_runs[slug] = run
+    tell = post or release_thread(slug, by)
+    shipping = sum(1 for s in offer["steps"] if s["commits"])
+
+    def say(text: str) -> None:
+        run["lines"].append(text)
+        try:
+            tell(text)
+        except Exception:
+            log.exception("could not post the release of %s to its thread", slug)
+
+    def go() -> None:
+        try:
+            say(f":rocket: Releasing `{slug}`, confirmed by {by or 'the dashboard'}:\n"
+                + "\n".join(f"• {e}" for e in offer["effects"]))
+            done = run_release(slug, repo, base, names, "patch", say,
+                               levels=levels, expect=confirm)
+            run["released"] = [r["tag"] for r in done if r.get("released")]
+            run["ok"] = len(run["released"]) == shipping
+        except Exception as e:                  # run_release reports its own
+            log.exception("release of %s failed to run", slug)
+            run["ok"] = False
+            run["lines"].append(f":warning: {e}")
+        finally:
+            # Not _releasing: run_release frees it in its own finally, and a
+            # second discard here could free a release started in between.
+            run["finished"] = time.time()
+    try:
+        threading.Thread(target=go, daemon=True, name=f"release-{slug}").start()
+    except Exception as e:
+        with _releasing_guard:
+            _releasing.discard(slug)
+        return {"ok": False, "error": f"could not start: {e}"}
+    return {"ok": True, "run": dict(run, lines=list(run["lines"]))}
+
+
+def releasable_projects() -> list[dict]:
+    """Projects with something ready to release, from the board's cached plans
+    (git only, no fetch): what the Slack board offers a Release… on."""
+    out = []
+    for p in project_store.all():
+        if p.get("archived"):
+            continue
+        rel = board_release(p["slug"]) or {}
+        ready_ = [t for t in rel.get("targets") or [] if t.get("commits")]
+        if ready_ and not rel.get("error"):
+            out.append({"slug": p["slug"], "title": p.get("title") or p["slug"],
+                        "targets": ready_})
+    return out
+
+
+def handle_releases(payload: dict) -> dict:
+    """Route for /releases — releasing from the dashboard and the Slack board
+    (localhost-trusted; a Slack click names its user, see release_allowed).
+
+    `plan` says what would ship and returns the confirmation fingerprint;
+    `preview` runs one target's preview commands (a migration dry run) and
+    nothing else; `start` releases, given that fingerprint; `status` is the
+    last started release's progress, for polling. Not /release: that route
+    frees a wedged thread.
+    """
+    action = payload.get("action", "plan")
+    slug = (payload.get("slug") or "").strip().lower()
+    if action == "list":
+        return {"ok": True, "projects": releasable_projects()}
+    if not project_store.get(slug):
+        return {"ok": False, "error": f"unknown project {slug!r}"}
+    names = _release_names(payload.get("targets"))
+    levels = payload.get("levels") if isinstance(payload.get("levels"), dict) else None
+    if action == "plan":
+        return release_offer(slug, names, levels)
+    if action == "preview":
+        target = (payload.get("target") or "").strip()
+        repo, _ = release_checkout(slug)
+        try:
+            if not repo or target not in releases.load(repo):
+                return {"ok": False, "error": f"{slug} has no target {target!r}"}
+            with _releasing_guard:
+                if slug in _releasing:
+                    return {"ok": False, "error": f"a release of {slug} is running"}
+            return {"ok": True, "target": target, "steps": releases.preview(repo, target)}
+        except releases.ReleaseError as e:
+            return {"ok": False, "error": str(e)}
+    if action == "start":
+        return start_release(slug, names, levels, (payload.get("confirm") or "").strip(),
+                             str(payload.get("by") or "dashboard"))
+    if action == "status":
+        run = _release_runs.get(slug)
+        with _releasing_guard:
+            running = slug in _releasing
+        return {"ok": True, "running": running,
+                "run": dict(run, lines=list(run["lines"])) if run else None}
+    return {"ok": False, "error": f"unknown action {action!r}"}
 
 
 def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
@@ -2024,7 +2289,10 @@ def handle_tasks(payload: dict) -> dict:
             # and whether an implementor filed here would run or be held.
             "info": {"slug": prec["slug"], "title": prec.get("title") or prec["slug"],
                      "archived": bool(prec.get("archived")),
-                     "unready": projects.unready(prec)} if prec else None}
+                     "unready": projects.unready(prec),
+                     # Whether it has release targets, for the header's Release…
+                     "release": bool((board_release(prec["slug"]) or {}).get("targets"))}
+            if prec else None}
     if action == "task":
         rec = task_store.get(payload.get("id", ""))
         if not rec:
@@ -2720,6 +2988,7 @@ server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
 server.route("/summaries", handle_summaries)
 server.route("/release", handle_release)
+server.route("/releases", handle_releases)
 server.route("/titles", handle_titles)
 server.route("/tasks", handle_tasks)
 server.route("/projects", handle_projects)
@@ -2756,7 +3025,8 @@ BOARD = home.Board(
     base_url=TEAM_URL,
     watching=lambda: handle_tasks({"action": "watching"}).get("watching", []),
     unmerged=lambda: branches.line(branches.survey(list(task_store.all().values()),
-                                                       scope_for=project_store.scope_for)))
+                                                       scope_for=project_store.scope_for)),
+    releasable=releasable_projects, release_call=handle_releases)
 home.register(app, BOARD)
 
 server.start()

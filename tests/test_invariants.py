@@ -69,7 +69,7 @@ def bot_functions(*names, **globals_):
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
-                  "held_reason", "edit_task", "_task_title", "take_step")
+                  "held_reason", "edit_task", "_task_title", "take_step", "release_steps")
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -10577,7 +10577,9 @@ after = ["backend"]
     ns = {"releases": R, "project_store": Projects(), "worktrees": W, "threading": threading,
           "log": logging.getLogger("test"),
           "repo_guard": lambda cwd: contextlib.nullcontext()}
-    _bot_fns({"release_command", "release_plan", "run_release", "_releasing", "_releasing_guard"}, ns)
+    ns["board"] = __import__("board")
+    _bot_fns({"release_command", "release_plan", "run_release", "_releasing", "_releasing_guard",
+              "_board_releases", "release_checkout"}, ns)
     cmd = ns["release_command"]
     check("no arguments: usage", "Usage" in cmd("", print))
     check("an unknown project is named", "no repository" in cmd("nope", print))
@@ -14520,7 +14522,7 @@ def test_a_tasks_base_is_its_projects_current_base():
          and "scope" in ast.unparse(n.func.value)})
     # handle_projects reads it to show and set a project's base (`get`, `base`).
     check("no task's recorded base is read anywhere else",
-          readers == ["handle_command", "handle_projects", "release_command"], str(readers))
+          readers == ["handle_command", "handle_projects", "release_checkout"], str(readers))
     for caller in ("handle_tasks", "digest_inputs", "run_ideation", "_worktree_sweeper"):
         fn = next((f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == caller), None)
         calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
@@ -17164,6 +17166,589 @@ def test_a_running_task_refuses_a_persons_send_back():
         pass                        # reported by the check below, not raised
     check("and send_back itself, unmarked, still requeues a running task",
           st.get(own)["state"] == T.QUEUED and "the runner's own note" in st.get(own)["goal"])
+
+
+# --- releasing from the dashboard and the Slack board -----------------------------
+# `!release` was the only way to ship, typed. These are the same release behind
+# one confirmed click: a plan with its previews, the exact production effects,
+# and a start that carries the fingerprint of what was confirmed.
+
+def _release_fixture():
+    """A project repo with a bare origin and fake targets: backend deploys by
+    appending to a log outside the checkout and previews with an echo; ios is
+    a versioned tag target after backend; web fails with exit 3."""
+    import threading as _th
+    import releases as R, projects as P, worktrees as W, board as B
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "work"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], capture_output=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a], capture_output=True, text=True)
+    def commit(path, text, msg, push=True):
+        p = repo / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+        g("add", path); g("commit", "-q", "-m", msg)
+        if push:
+            g("push", "-q", "origin", "main")
+    log_ = root / "deploy.log"
+    commit(".silkworm/release.toml", f'''
+[targets.backend]
+paths = ["supabase/"]
+ship = "command"
+commands = ["echo deployed >> {log_}"]
+preview = ["echo would-apply-0002"]
+
+[targets.ios]
+paths = ["ios/"]
+ship = "tag"
+version = {{ file = "ios/project.yml", key = "CFBundleShortVersionString" }}
+after = ["backend"]
+describe = "CI builds the tag for TestFlight"
+
+[targets.web]
+paths = ["web/"]
+ship = "command"
+commands = ["exit 3"]
+''', "config", push=False)
+    commit("ios/project.yml", 'CFBundleShortVersionString: "1.1.0"\n', "ios", push=False)
+    commit("supabase/migrations/0001.sql", "x\n", "migration one", push=False)
+    commit("supabase/migrations/0002.sql", "x\n", "migration two", push=False)
+    commit("supabase/functions/f/index.ts", "x\n", "a function", push=False)
+    commit("web/index.html", "x\n", "site")
+    ps = P.ProjectStore(root / "projects.json")
+    ps.ensure("Alpha", scope={"cwd": str(repo)})
+    posts = []
+
+    class Client:
+        def chat_postMessage(self, channel, text, thread_ts=None, **kw):
+            posts.append((channel, thread_ts, text))
+            return {"ts": f"9.{len(posts)}"}
+    ns = {"releases": R, "project_store": ps, "worktrees": W, "threading": _th,
+          "log": logging.getLogger("test"), "time": time, "json": json,
+          "repo_guard": lambda cwd: contextlib.nullcontext(),
+          "ALLOWED_USERS": {"U_ME"}, "home_channel": lambda: "D1", "board": B,
+          "app": types.SimpleNamespace(client=Client()),
+          "board_release": lambda slug: B.release_status(ps.scope_for(slug).get("cwd"))}
+    _bot_fns({"release_command", "release_plan", "run_release", "_releasing",
+              "_releasing_guard", "release_steps", "_release_runs", "release_allowed",
+              "_release_names", "release_offer", "start_release", "release_thread",
+              "releasable_projects", "handle_releases", "_board_releases",
+              "release_checkout"}, ns)
+    return types.SimpleNamespace(ns=ns, repo=repo, origin=origin, root=root, g=g,
+                                 commit=commit, log=log_, posts=posts, ps=ps)
+
+
+def _wait_release(hr, slug, secs=60):
+    end = time.time() + secs
+    while time.time() < end:
+        st = hr({"action": "status", "slug": slug})
+        if st["run"] and st["run"]["finished"] and not st["running"]:
+            return st
+        time.sleep(0.05)
+    return hr({"action": "status", "slug": slug})
+
+
+def test_release_route():
+    print("\n/releases: plan, preview, a confirmed start, and every refusal")
+    fx = _release_fixture()
+    hr, g = fx.ns["handle_releases"], fx.g
+    tags = lambda: sorted(g("tag", "-l").stdout.split())
+
+    p = hr({"action": "plan", "slug": "alpha"})
+    check("the plan answers", p["ok"], p.get("error"))
+    check("every target, in dependency order",
+          [t["target"] for t in p["targets"]] == ["backend", "ios", "web"], p.get("targets"))
+    rows = {t["target"]: t for t in p["targets"]}
+    check("with what is pending and its first commits",
+          rows["backend"]["pending"] == 3 and rows["backend"]["commits"][0].endswith("a function")
+          and rows["ios"]["pending"] == 1)
+    check("and the version each level would give",
+          rows["ios"]["versions"] == {"patch": "1.1.1", "minor": "1.2.0", "major": "2.0.0"}
+          and rows["backend"]["versions"]["patch"] == "1.0.0", rows["ios"]["versions"])
+    check("everything pending, dependencies first",
+          [s["target"] for s in p["steps"]] == ["backend", "ios", "web"])
+    eff = "\n".join(p["effects"])
+    check("the effects name every command that will run",
+          f"backend: runs `echo deployed >> {fx.log}`" in p["effects"]
+          and "web: runs `exit 3`" in p["effects"], eff)
+    check("and how much of what ships, by directory",
+          "2 in supabase/migrations" in eff and "1 in supabase/functions" in eff, eff)
+    check("and every ref pushed, with the project's own description",
+          "ios: pushes tag ios/v1.1.1 to origin — the push is the release" in p["effects"]
+          and "CFBundleShortVersionString to 1.1.1 in ios/project.yml" in eff
+          and "ios: CI builds the tag for TestFlight" in p["effects"], eff)
+    check("a ready plan carries a fingerprint and no refusal", p["confirm"] and p["blocked"] == "")
+    check("planning ran nothing", not fx.log.exists() and tags() == [])
+
+    pv = hr({"action": "preview", "slug": "alpha", "target": "backend"})
+    check("a preview runs the target's preview",
+          pv["ok"] and pv["steps"][0]["output"].strip() == "would-apply-0002", pv)
+    check("and never its deploy", not fx.log.exists())
+    check("a target it does not have is refused",
+          not hr({"action": "preview", "slug": "alpha", "target": "nope"})["ok"])
+    check("an unknown project is refused", not hr({"action": "plan", "slug": "nope"})["ok"])
+
+    # Levels: major and exact versions are for one target on its own.
+    two = hr({"action": "plan", "slug": "alpha", "targets": ["backend", "ios"],
+              "levels": {"ios": "major"}})
+    check("major alongside another target is refused", not two["ok"] and "on its own" in two["error"],
+          two)
+    check("so is an exact version", not hr({"action": "plan", "slug": "alpha",
+          "levels": {"ios": "3.0.0"}})["ok"])
+    check("a bad level is refused", not hr({"action": "plan", "slug": "alpha", "targets": ["ios"],
+          "levels": {"ios": "sideways"}})["ok"])
+    one = hr({"action": "plan", "slug": "alpha", "targets": ["ios"], "levels": {"ios": "major"}})
+    st = {s["target"]: s for s in one.get("steps", [])}
+    check("major for one target: it gets it, its dependency a patch",
+          one["ok"] and st["ios"]["version"] == "2.0.0" and st["backend"]["level"] == "patch"
+          and "web" not in st, one)
+    check("a different choice is a different fingerprint", one["confirm"] != p["confirm"])
+
+    # The confirmation is required, and it must be the plan's own.
+    r = hr({"action": "start", "slug": "alpha"})
+    check("no confirmation, no release", not r["ok"] and "confirmation" in r["error"], r)
+    r = hr({"action": "start", "slug": "alpha", "confirm": "0" * 20})
+    check("a confirmation of something else, no release", not r["ok"] and "changed" in r["error"], r)
+    r = hr({"action": "start", "slug": "alpha", "confirm": one["confirm"]})
+    check("the confirmation of another selection, no release", not r["ok"], r)
+    r = hr({"action": "start", "slug": "alpha", "confirm": p["confirm"], "by": "slack:U_STEPH"})
+    check("off the allowlist, no release", not r["ok"] and "allowlist" in r["error"], r)
+    check("and none of those ran or tagged anything", not fx.log.exists() and tags() == []
+          and not fx.ns["_releasing"] and not fx.ns["_release_runs"])
+
+    # Refusals, with the reason.
+    (fx.repo / "supabase/stray.sql").write_text("drop table x;\n")
+    b = hr({"action": "plan", "slug": "alpha"})
+    check("a dirty checkout is refused, with the reason",
+          "untracked" in b["blocked"] and not b["confirm"], b.get("blocked"))
+    r = hr({"action": "start", "slug": "alpha", "confirm": p["confirm"]})
+    check("and cannot be started", not r["ok"] and "untracked" in r["error"])
+    (fx.repo / "supabase/stray.sql").unlink()
+    fx.commit("ios/local.swift", "x\n", "not pushed", push=False)
+    b = hr({"action": "plan", "slug": "alpha"})
+    check("ahead of origin is refused", "origin does not" in b["blocked"], b.get("blocked"))
+    g("push", "-q", "origin", "main")
+    other = fx.root / "other"
+    subprocess.run(["git", "clone", "-q", str(fx.origin), str(other)], capture_output=True)
+    (other / "README").write_text("x\n")
+    for a in (["add", "README"], ["commit", "-qm", "elsewhere"], ["push", "-q", "origin", "main"]):
+        subprocess.run(["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                       capture_output=True)
+    b = hr({"action": "plan", "slug": "alpha"})
+    check("behind origin is refused", "behind origin" in b["blocked"], b.get("blocked"))
+    g("pull", "-q", "--ff-only", "origin", "main")
+    fresh = hr({"action": "plan", "slug": "alpha"})
+    check("ready again once level with origin", fresh["blocked"] == "" and fresh["confirm"])
+    r = hr({"action": "start", "slug": "alpha", "confirm": p["confirm"]})
+    check("work landing after a confirmation voids it",
+          not r["ok"] and "changed" in r["error"] and r["offer"]["confirm"] == fresh["confirm"], r)
+    fx.ns["_releasing"].add("alpha")
+    b = hr({"action": "plan", "slug": "alpha"})
+    check("one release per project at a time",
+          "already running" in b["blocked"] and not hr({"action": "start", "slug": "alpha",
+                                                        "confirm": fresh["confirm"]})["ok"])
+    check("and no preview while it runs",
+          not hr({"action": "preview", "slug": "alpha", "target": "backend"})["ok"])
+    fx.ns["_releasing"].discard("alpha")
+    check("list offers it while something is ready",
+          [x["slug"] for x in hr({"action": "list"})["projects"]] == ["alpha"])
+
+    # A confirmed release: backend, then ios, then web fails and stops it.
+    fx.ns["_board_releases"].get("alpha", lambda: "cached before the release")
+    r = hr({"action": "start", "slug": "alpha", "confirm": fresh["confirm"], "by": "slack:U_ME"})
+    check("confirmed, it starts", r["ok"], r)
+    st = _wait_release(hr, "alpha")
+    run = st["run"]
+    check("it finishes", run and run["finished"], st)
+    check("in order, stopping at the failure",
+          run["released"] == ["backend/v1.0.0", "ios/v1.1.1"] and run["ok"] is False
+          and any("web" in l and "Stopping" in l for l in run["lines"]), run["lines"])
+    check("the deploy ran once", fx.log.read_text().count("deployed") == 1)
+    check("the tags are on origin", {"backend/v1.0.0", "ios/v1.1.1"} <= set(
+        subprocess.run(["git", "-C", str(fx.origin), "tag"], capture_output=True, text=True).stdout.split()))
+    check("progress opened a thread and posted under it",
+          fx.posts[0][1] is None and "Release" in fx.posts[0][2]
+          and all(t == "9.1" for _, t, _ in fx.posts[1:]) and len(fx.posts) >= 4, fx.posts)
+    check("starting with exactly what it confirmed",
+          "confirmed by slack:U_ME" in fx.posts[1][2] and "ios: pushes tag ios/v1.1.1" in fx.posts[1][2])
+    check("and is free again afterwards", not fx.ns["_releasing"])
+    check("and the board's cached plans are dropped, so it stops offering Release…",
+          fx.ns["_board_releases"].get("alpha", lambda: "fresh") == "fresh")
+    tree = ast.parse((BASE / "bot.py").read_text())
+    sr = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "start_release")
+    go = next(n for n in ast.walk(sr) if isinstance(n, ast.FunctionDef) and n.name == "go")
+    frees = [c for c in ast.walk(go) if isinstance(c, ast.Call)
+             and isinstance(c.func, ast.Attribute) and c.func.attr == "discard"]
+    check("the running release is freed once, by run_release, never again by its starter "
+          "(a second discard would free a release begun in between)", not frees)
+    nothing = hr({"action": "plan", "slug": "alpha", "targets": ["backend"]})
+    check("nothing pending is refused, with the reason",
+          "nothing is pending for backend" in nothing["blocked"], nothing.get("blocked"))
+
+    # The confirmation is checked again under the guard, at the moment it ships.
+    fx.commit("supabase/migrations/0003.sql", "x\n", "migration three")
+    posted = []
+    fx.ns["run_release"]("alpha", fx.repo, "main", ["backend"], "patch", posted.append,
+                         expect="not-the-plan")
+    check("a release whose plan moved under it ships nothing",
+          "backend/v1.0.1" not in tags() and any("changed after it was confirmed" in x for x in posted),
+          posted)
+
+
+def test_release_from_the_slack_board():
+    import home
+    print("\nthe Slack board: Release… opens the confirmation, confirming runs it")
+    fx = _release_fixture()
+    hr = fx.ns["handle_releases"]
+
+    class Slack:
+        def __init__(self):
+            self.calls = []
+        def views_open(self, trigger_id, view):
+            self.calls.append(("open", view)); return {"view": {"id": "V1"}}
+        def views_update(self, view_id, view):
+            self.calls.append(("update", view_id, view))
+        def chat_postEphemeral(self, **kw):
+            self.calls.append(("ephemeral", kw))
+        def views_publish(self, **kw):
+            self.calls.append(("publish", kw))
+
+    import tasks as T
+    store = T.TaskStore(fx.root / "t.json")
+    hub = home.Home(store=store, call=lambda p: {"ok": True}, allowed_users={"U_ME"},
+                    releasable=lambda: hr({"action": "list"})["projects"], release_call=hr)
+    hub._spawn = lambda fn: fn()
+    view = hub.view_for("U_ME")
+    dumped = json.dumps(view)
+    check("a project with something to release is on the board",
+          "Ready to release" in dumped and '"release|alpha|"' in dumped
+          and "backend 3" in dumped, dumped[-600:])
+    rb = home.release_blocks([{"slug": f"p{i}", "title": "P", "targets": []} for i in range(9)])
+    check("with a menu entry Release…, the rest counted",
+          sum(1 for x in rb if x.get("accessory")) == home.MAX_RELEASES
+          and "4 more" in json.dumps(rb))
+    big = home.render([store.create(f"t{i}", state=T.PROPOSED) for i in range(60)], now=time.time(),
+                      compact=True, max_blocks=50, max_attention=40,
+                      releasable=[{"slug": f"p{i}", "title": "P", "targets": []} for i in range(9)])
+    check("and the board still fits a message", len(big["blocks"]) <= 50
+          and "Ready to release" in json.dumps(big), len(big["blocks"]))
+
+    menu = lambda user, value: {"user": {"id": user}, "trigger_id": "T1",
+                                "actions": [{"selected_option": {"value": value}}]}
+    s = Slack()
+    hub.on_menu(lambda **k: None, menu("U_STEPH", "release|alpha|"), s)
+    check("off the allowlist, no window and no plan", not [c for c in s.calls if c[0] in ("open", "update")])
+    s = Slack()
+    hub.on_menu(lambda **k: None, menu("U_ME", "release|alpha|"), s)
+    opened, updated = s.calls[0], s.calls[1]
+    check("a window opens at once, with nothing to submit yet",
+          opened[0] == "open" and "submit" not in opened[1] and "Working out" in json.dumps(opened[1]))
+    v = updated[2]
+    text = json.dumps(v)
+    check("then the plan fills it, in order",
+          updated[:2] == ("update", "V1") and text.find("*backend*") < text.find("*ios*") < text.find("*web*"))
+    check("with what reaches production", "What will reach production" in text
+          and "pushes tag ios/v1.1.1" in text and "echo deployed" in text, text[:400])
+    check("and the preview's output", "would-apply-0002" in text)
+    meta = json.loads(v["private_metadata"])
+    check("and a Release button carrying the plan's fingerprint",
+          v["submit"]["text"] == "Release" and meta == {"slug": "alpha",
+          "confirm": hr({"action": "plan", "slug": "alpha"})["confirm"]})
+    check("nothing ran in showing it", not fx.log.exists() and not fx.g("tag", "-l").stdout.strip())
+    s = Slack()
+    hub.on_menu(lambda **k: None, menu("U_ME", "preview|alpha|"), s)
+    check("Preview only… is the same window with nothing to submit",
+          "would-apply-0002" in json.dumps(s.calls[-1]) and "submit" not in s.calls[-1][2])
+
+    body = lambda user: {"user": {"id": user}}
+    view_ = lambda m: {"private_metadata": json.dumps(m)}
+    s = Slack()
+    hub.on_release(lambda **k: None, body("U_STEPH"), s, view_(meta))
+    check("confirmed by someone off the allowlist, nothing is released",
+          not fx.log.exists() and not fx.ns["_release_runs"])
+    # The board's own check, not only the route's: with a route that would
+    # accept anything, an outsider's click still never reaches it.
+    asked = []
+    lax = home.Home(store=store, call=lambda p: {"ok": True}, allowed_users={"U_ME"},
+                    release_call=lambda p: asked.append(p) or {"ok": True})
+    lax._spawn = lambda fn: fn()
+    lax.on_release(lambda **k: None, body("U_STEPH"), Slack(), view_(meta))
+    lax.on_menu(lambda **k: None, menu("U_STEPH", "release|alpha|"), Slack())
+    check("the board itself refuses an outsider before asking the route", asked == [], asked)
+    hub.on_release(lambda **k: None, body("U_ME"), s, view_({"slug": "alpha", "confirm": ""}))
+    check("a window without the plan's fingerprint releases nothing",
+          not fx.log.exists() and "Couldn't release" in hub._notices["U_ME"][0], hub._notices)
+    (fx.repo / "stray").write_text("x")
+    s = Slack()
+    hub.on_menu(lambda **k: None, menu("U_ME", "release|alpha|"), s)
+    blocked = s.calls[-1][2]
+    check("a checkout that cannot release says why and offers no Release",
+          "Can't release" in json.dumps(blocked) and "untracked" in json.dumps(blocked)
+          and "submit" not in blocked)
+    (fx.repo / "stray").unlink()
+    hub.on_release(lambda **k: None, body("U_ME"), s, view_(meta))
+    check("confirmed, it releases", "Releasing" in hub._notices["U_ME"][0], hub._notices)
+    st = _wait_release(hr, "alpha")
+    check("and runs to the end", st["run"]["released"] == ["backend/v1.0.0", "ios/v1.1.1"]
+          and st["run"]["by"] == "slack:U_ME", st["run"])
+    check("the board registers the window's submit", "app.view(RELEASE_CALLBACK)(home.on_release)"
+          in (BASE / "home.py").read_text())
+    bot = (BASE / "bot.py").read_text()
+    check("the bot wires the board to the route",
+          "releasable=releasable_projects, release_call=handle_releases" in bot
+          and 'server.route("/releases", handle_releases)' in bot)
+
+
+RELEASE_DRIVER = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+function el(id) {
+  return {id, innerHTML: "", textContent: "", value: "", title: "", className: "",
+          style: {}, disabled: false, checked: false, dataset: {}, children: [],
+          classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+          appendChild() {}, removeChild() {}, remove() {}, addEventListener() {},
+          insertAdjacentHTML(_, h) { this.innerHTML += h; }, focus() {}, scrollIntoView() {},
+          querySelector() { return null; }, querySelectorAll() { return []; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+// Redrawing replaces the elements inside, as a browser would.
+const box = el("fbox");
+let boxHtml = "";
+Object.defineProperty(box, "innerHTML", {
+  get() { return boxHtml; },
+  set(h) { boxHtml = h; for (const m of h.matchAll(/id="([^"]+)"/g)) delete els[m[1]]; }});
+els.fbox = box;
+globalThis.document = {getElementById: byId, createElement: () => el("new"),
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.localStorage = {getItem: () => null, setItem() {}};
+globalThis.setInterval = () => 0;
+const timers = [];
+globalThis.setTimeout = (fn) => { timers.push(fn); return 0; };
+globalThis.confirm = () => true;
+globalThis.prompt = () => null;
+const calls = [];
+const replies = {};
+const PLAN = {ok: true, slug: "alpha", base: "main", blocked: "", running: false, confirm: "fp-all",
+  targets: [
+    {target: "backend", ship: "command", after: [], last: "", pending: 2, preview: ["sb db push --dry-run"],
+     commits: ["a1 migration two", "a0 migration one"], versions: {patch: "1.0.0", minor: "1.0.0", major: "1.0.0"}},
+    {target: "ios", ship: "tag", after: ["backend"], last: "ios/v1.1.0", pending: 1, preview: [],
+     commits: ["b1 app change"], versions: {patch: "1.1.1", minor: "1.2.0", major: "2.0.0"}},
+    {target: "web", ship: "command", after: [], last: "web/v1.0.0", pending: 0, preview: [],
+     commits: [], versions: {patch: "1.0.1", minor: "1.1.0", major: "2.0.0"}}],
+  steps: [{target: "backend", level: "patch", version: "1.0.0", tag: "backend/v1.0.0", commits: 2},
+          {target: "ios", level: "patch", version: "1.1.1", tag: "ios/v1.1.1", commits: 1}],
+  effects: ["backend: runs `sb db push --yes`", "ios: pushes tag ios/v1.1.1 to origin — the push is the release"]};
+globalThis.fetch = async (url, opts) => {
+  const body = opts && opts.body ? JSON.parse(opts.body) : {};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions: [], slack: {}};
+  else if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  else {
+    calls.push({url, ...body});
+    const key = `${url}:${body.action}`;
+    if (replies[key]) out = replies[key](body);
+    else if (key === "/api/releases:plan") out = PLAN;
+    else if (key === "/api/releases:preview") out = {ok: true, target: body.target,
+      steps: [{command: "sb db push --dry-run", ok: true, code: 0, output: "Would push 0002_x.sql"}]};
+    else if (key === "/api/releases:start") out = {ok: true, run: {lines: []}};
+    else if (key === "/api/releases:status") out = {ok: true, running: false, run: {finished: 1, ok: true,
+      released: ["backend/v1.0.0", "ios/v1.1.1"], lines: [":white_check_mark: *backend* released"]}};
+    else if (body.action === "overview") out = {ok: true, projects: [], archived: []};
+  }
+  return {json: async () => out, text: async () => ""};
+};
+(0, eval)(src + `
+;toast = m => {};
+globalThis.__b = {releaseForm, releaseChanged, confirmRelease, startRelease, closeModal, modalIsOpen,
+  projectCard, boardHead, pollRelease, drawReleasePlan, get form() { return boardForm; }};`);
+const tick = async () => { for (let i = 0; i < 6; i++) await new Promise(r => setImmediate(r)); };
+const of = (action) => calls.filter(c => c.url === "/api/releases" && c.action === action);
+(async () => {
+  const B = globalThis.__b, out = {};
+  out.card = B.projectCard({slug: "alpha", title: "Alpha", counts: {},
+    release: {targets: [{target: "ios", commits: 1, version: "1.1.1"}]}});
+  out.cardNone = B.projectCard({slug: "beta", title: "Beta", counts: {}, release: null});
+  out.cardBroken = B.projectCard({slug: "gamma", title: "G", counts: {}, release: {error: "bad", targets: []}});
+  out.head = B.boardHead({slug: "alpha", title: "Alpha", unready: "", release: true});
+  out.headNone = B.boardHead({slug: "beta", title: "Beta", unready: "", release: false});
+
+  const opening = B.releaseForm("alpha");
+  out.loading = byId("fbox").innerHTML;
+  await opening; await tick();
+  out.plan = byId("fbox").innerHTML;
+  out.previews = of("preview").map(c => c.target);
+  out.previewShown = byId("fbox").innerHTML.includes("Would push 0002_x.sql")
+    || (els["rpv-backend"] || {}).innerHTML;
+
+  // Release… asks; nothing has started yet.
+  out.startedEarly = (await B.startRelease(), of("start").length);
+  B.confirmRelease();
+  out.confirm = byId("fbox").innerHTML;
+  out.startsBeforeYes = of("start").length;
+  // Untouched, Yes asks for what the first plan was asked for: everything pending.
+  await B.startRelease(); await tick();
+  out.firstStart = of("start").slice(-1)[0];
+  await B.releaseForm("alpha"); await tick();
+  B.confirmRelease();
+
+  // Back, choose ios alone at major: a new plan from the route.
+  B.drawReleasePlan();
+  byId("rsel-backend").checked = false; byId("rsel-ios").checked = true;
+  byId("rlvl-ios").value = "major";
+  replies["/api/releases:plan"] = b => Object.assign({}, PLAN, {confirm: "fp-ios-major",
+    steps: [{target: "backend", level: "patch", version: "1.0.0", tag: "backend/v1.0.0", commits: 2},
+            {target: "ios", level: "major", version: "2.0.0", tag: "ios/v2.0.0", commits: 1}]});
+  await B.releaseChanged(); await tick();
+  out.singlePlan = of("plan").slice(-1)[0];
+  out.singleHtml = byId("fbox").innerHTML;
+  // An exact version: the box appears, and nothing is confirmable until it is typed.
+  const plansBefore = of("plan").length;
+  byId("rsel-backend").checked = false; byId("rsel-ios").checked = true;
+  byId("rlvl-ios").value = "version";
+  await B.releaseChanged(); await tick();
+  out.versionBox = {html: byId("fbox").innerHTML, err: byId("tferr").textContent,
+                    asked: of("plan").length - plansBefore, confirm: B.form.offer.confirm};
+  byId("rsel-backend").checked = false; byId("rsel-ios").checked = true;
+  byId("rlvl-ios").value = "version"; byId("rver-ios").value = "3.0.0";
+  await B.releaseChanged(); await tick();
+  out.versionPlan = of("plan").slice(-1)[0];
+  // Two targets with major: coerced to patch before asking.
+  byId("rsel-backend").checked = true; byId("rsel-ios").checked = true;
+  byId("rlvl-ios").value = "major"; byId("rlvl-backend").value = "patch";
+  delete replies["/api/releases:plan"];
+  await B.releaseChanged(); await tick();
+  out.twoPlan = of("plan").slice(-1)[0];
+  out.twoHtml = byId("fbox").innerHTML;
+
+  B.confirmRelease();
+  await B.startRelease(); await tick();
+  out.start = of("start").slice(-1)[0];
+  out.running = byId("fbox").innerHTML + byId("rprog").innerHTML;
+  out.status = of("status").length;
+
+  // A start refused because the plan moved: back to the new plan, with the reason.
+  await B.releaseForm("alpha"); await tick();
+  replies["/api/releases:start"] = () => ({ok: false, error: "what would ship has changed since it was confirmed; look again",
+    offer: Object.assign({}, PLAN, {confirm: "fp-new"})});
+  B.confirmRelease(); await B.startRelease(); await tick();
+  out.moved = {html: byId("fbox").innerHTML, err: byId("tferr").textContent, confirm: B.form.offer.confirm};
+  delete replies["/api/releases:start"];
+
+  // Blocked: the reason, and no way forward.
+  replies["/api/releases:plan"] = () => Object.assign({}, PLAN, {blocked: "the checkout has uncommitted or untracked files: x", confirm: ""});
+  await B.releaseForm("alpha"); await tick();
+  out.blocked = byId("fbox").innerHTML;
+  const before = of("start").length;
+  B.confirmRelease(); await B.startRelease();
+  out.blockedStarts = of("start").length - before;
+  // Running, but started by !release: the plan says so; no stale progress.
+  replies["/api/releases:plan"] = () => Object.assign({}, PLAN, {running: true, confirm: "",
+    blocked: "a release of alpha is already running"});
+  replies["/api/releases:status"] = () => ({ok: true, running: true,
+    run: {finished: 5, ok: true, released: ["old/v1.0.0"], lines: ["days ago"]}});
+  const pv = of("preview").length;
+  await B.releaseForm("alpha"); await tick();
+  out.elsewhere = {html: byId("fbox").innerHTML, previews: of("preview").length - pv};
+  replies["/api/releases:status"] = () => ({ok: true, running: true, run: {finished: null, lines: ["going"]}});
+  await B.releaseForm("alpha"); await tick();
+  out.ownRunning = byId("fbox").innerHTML + (els["rprog"] || {innerHTML: ""}).innerHTML;
+  delete replies["/api/releases:status"];
+  B.closeModal();
+  out.closed = B.modalIsOpen();
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_release_modal_in_the_page():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe dashboard's Release… modal, driven through the page's own javascript")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    defined = set(re.findall(r"(?:async\s+)?function\s+([A-Za-z_]\w*)", js))
+    for name in ("releaseForm", "releaseChanged", "confirmRelease", "startRelease",
+                 "pollRelease", "runPreview", "releaseCall", "releaseButton"):
+        check(f"{name}() is defined", name in defined)
+    vis = (BASE / "visualizer.py").read_text()
+    check("the page's /api/releases reaches the bot's /releases",
+          'url.path == "/api/releases"' in vis and 'bot_call("/releases"' in vis)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(RELEASE_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the release modal's javascript runs", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    check("a project card with release targets offers Release…",
+          "releaseForm('alpha')" in o["card"] and "releaseForm" not in o["cardNone"]
+          and "releaseForm" not in o["cardBroken"])
+    check("so does its board header", "releaseForm('alpha')" in o["head"]
+          and "releaseForm" not in o["headNone"])
+    check("it opens with a spinner while the plan is worked out", "working out" in o["loading"])
+    pl = o["plan"]
+    check("the plan: per target what is pending, and its first commits",
+          "<b>backend</b> · 2 changes" in pl and "a1 migration two" in pl
+          and "<b>web</b> · nothing pending" in pl, pl[:600])
+    check("a level per target, with the version each gives",
+          'id="rlvl-backend"' in pl and "minor → 1.2.0" in pl)
+    check("no major while releasing more than one target",
+          "major →" not in pl and "exact version" not in pl)
+    check("the dependency order", "1. <b>backend</b>" in pl and "2. <b>ios</b>" in pl)
+    check("previews run on opening, only for targets that have one",
+          o["previews"] == ["backend"] and o["previewShown"], o["previews"])
+    check("Release… asks first: nothing starts before the confirmation",
+          o["startedEarly"] == 0 and o["startsBeforeYes"] == 0)
+    c = o["confirm"]
+    check("the confirmation lists exactly what reaches production",
+          "runs `sb db push --yes`" in c and "pushes tag ios/v1.1.1" in c
+          and ">Yes, release</button>" in c)
+    check("one target alone asks the route for its plan at major",
+          o["singlePlan"] == {"url": "/api/releases", "action": "plan", "slug": "alpha",
+                              "targets": ["ios"], "levels": {"ios": "major"}}, o["singlePlan"])
+    check("and may offer major", "major → 2.0.0" in o["singleHtml"] and "ios/v2.0.0" in o["singleHtml"])
+    check("major is dropped to a patch when another target joins",
+          o["twoPlan"]["levels"] == {"backend": "patch", "ios": "patch"}, o["twoPlan"])
+    s = o["start"]
+    check("Yes sends the plan's fingerprint and the selection",
+          s == {"url": "/api/releases", "action": "start", "slug": "alpha", "confirm": "fp-all",
+                "by": "dashboard", "targets": ["backend", "ios"],
+                "levels": {"backend": "patch", "ios": "patch"}}, s)
+    check("then progress is polled and shown",
+          o["status"] >= 1 and "✓ released backend/v1.0.0, ios/v1.1.1" in o["running"], o["running"][-300:])
+    check("a plan that moved goes back to the plan with the reason",
+          "has changed" in o["moved"]["err"] and o["moved"]["confirm"] == "fp-new"
+          and 'id="rgo"' in o["moved"]["html"])
+    check("a blocked plan says why and cannot be released",
+          "Can&#39;t release" in o["blocked"] or "Can't release" in o["blocked"])
+    check("its Release… is disabled, and nothing can start",
+          'onclick="confirmRelease()" disabled' in o["blocked"] and o["blockedStarts"] == 0)
+    check("untouched, Yes starts what the first plan was asked for (no targets: all pending)",
+          o["firstStart"] == {"url": "/api/releases", "action": "start", "slug": "alpha",
+                              "confirm": "fp-all", "by": "dashboard"}, o["firstStart"])
+    vb = o["versionBox"]
+    check("exact version keeps its choice and shows the box",
+          'id="rver-ios"' in vb["html"] and 'value="version" selected' in vb["html"], vb["html"][-500:])
+    check("and nothing is confirmable until a version is typed",
+          vb["asked"] == 0 and not vb["confirm"] and "exact version" in vb["err"], vb)
+    check("typed, the route is asked for it",
+          o["versionPlan"]["levels"] == {"ios": "3.0.0"} and o["versionPlan"]["targets"] == ["ios"],
+          o["versionPlan"])
+    check("a release started elsewhere shows the plan saying so, not stale progress",
+          "already running" in o["elsewhere"]["html"] and "days ago" not in o["elsewhere"]["html"]
+          and o["elsewhere"]["previews"] == 0, o["elsewhere"]["html"][-300:])
+    check("its own release still running reopens on its progress", "going" in o["ownRunning"])
+    check("Cancel closes it", o["closed"] is False)
 
 
 if __name__ == "__main__":
