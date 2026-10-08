@@ -17476,9 +17476,55 @@ def test_release_from_the_slack_board():
           and "pushes tag ios/v1.1.1" in text and "echo deployed" in text, text[:400])
     check("and the preview's output", "would-apply-0002" in text)
     meta = json.loads(v["private_metadata"])
-    check("and a Release button carrying the plan's fingerprint",
-          v["submit"]["text"] == "Release" and meta == {"slug": "alpha",
+    check("and a Release button carrying the plan's fingerprint and level",
+          v["submit"]["text"] == "Release" and meta == {"slug": "alpha", "level": "patch",
           "confirm": hr({"action": "plan", "slug": "alpha"})["confirm"]})
+    picker = [e for b in v["blocks"] if b.get("block_id") == "release_level"
+              for e in b["elements"]]
+    check("with a level picker: patch or minor for everything, patch chosen",
+          len(picker) == 1 and picker[0]["action_id"] == home.RELEASE_LEVEL_ACTION
+          and [o["value"] for o in picker[0]["options"]] == ["patch", "minor"]
+          and picker[0]["initial_option"]["value"] == "patch", picker)
+    check("the board registers the picker",
+          "app.action(RELEASE_LEVEL_ACTION)(home.on_release_level)" in (BASE / "home.py").read_text())
+
+    # Picking minor re-plans the window at minor, without re-running previews.
+    asked = []
+    spy = lambda p: asked.append(p) or hr(p)
+    hub.release_call = spy
+    pick = lambda user, lvl: {"user": {"id": user}, "view": {"id": "V1", "private_metadata": v["private_metadata"]},
+                              "actions": [{"selected_option": {"value": lvl}}]}
+    s = Slack()
+    hub.on_release_level(lambda **k: None, pick("U_STEPH", "minor"), s)
+    check("off the allowlist, picking a level does nothing", not s.calls and not asked)
+    hub.on_release_level(lambda **k: None, pick("U_ME", "major"), s)
+    check("major is not offered for everything, and is ignored", not s.calls and not asked)
+    hub.on_release_level(lambda **k: None, pick("U_ME", "minor"), s)
+    hub.release_call = hr
+    mv = s.calls[-1][2] if s.calls else {}
+    mtext = json.dumps(mv)
+    mmeta = json.loads(mv.get("private_metadata") or "{}")
+    minor_plan = hr({"action": "plan", "slug": "alpha", "level": "minor"})
+    check("picking minor redraws the same window at minor",
+          s.calls and s.calls[-1][:2] == ("update", "V1") and "ios/v1.2.0" in mtext
+          and "(minor)" in mtext and "ios/v1.1.1" not in mtext, mtext[:500])
+    check("its Release carries the minor plan's fingerprint, not patch's",
+          mmeta == {"slug": "alpha", "level": "minor", "confirm": minor_plan["confirm"]}
+          and minor_plan["confirm"] != meta["confirm"], mmeta)
+    check("the previews are kept, not run again",
+          [p["action"] for p in asked] == ["plan"] and "would-apply-0002" in mtext, asked)
+    check("and the picker now shows minor",
+          any(e.get("initial_option", {}).get("value") == "minor"
+              for b in mv.get("blocks", []) if b.get("block_id") == "release_level"
+              for e in b["elements"]))
+    stale = hr({"action": "start", "slug": "alpha", "level": "minor", "confirm": meta["confirm"],
+                "by": "slack:U_ME"})
+    check("a patch window's fingerprint cannot start a minor release",
+          not stale["ok"] and "changed" in stale["error"] and not fx.log.exists(), stale)
+    check("the route refuses a level it does not know",
+          not hr({"action": "plan", "slug": "alpha", "level": "huge"})["ok"])
+    check("and major for everything at once",
+          not hr({"action": "plan", "slug": "alpha", "level": "major"})["ok"])
     check("nothing ran in showing it", not fx.log.exists() and not fx.g("tag", "-l").stdout.strip())
     s = Slack()
     hub.on_menu(lambda **k: None, menu("U_ME", "preview|alpha|"), s)
@@ -17511,10 +17557,27 @@ def test_release_from_the_slack_board():
           "Can't release" in json.dumps(blocked) and "untracked" in json.dumps(blocked)
           and "submit" not in blocked)
     (fx.repo / "stray").unlink()
-    hub.on_release(lambda **k: None, body("U_ME"), s, view_(meta))
+    racing = {"private_metadata": json.dumps(meta), "state": {"values": {"release_level": {
+        home.RELEASE_LEVEL_ACTION: {"selected_option": {"value": "minor"}}}}}}
+    hub.on_release(lambda **k: None, body("U_ME"), Slack(), racing)
+    check("released while the picker reads minor but the plan is still patch's, nothing ships",
+          not fx.log.exists() and not fx.ns["_release_runs"]
+          and "still working out the minor" in hub._notices["U_ME"][0], hub._notices)
+    # A preview is reused only while its target's pending commits are the same.
+    ran = []
+    hub.release_call = lambda p: ran.append(p["action"]) or hr(p)
+    hub.fill_release(Slack(), "V9", "U_ME", "alpha", True, "minor",
+                     {"backend": (("old", ()), {"ok": True, "steps": []})})
+    check("a preview of what was pending before runs again", ran == ["plan", "preview"], ran)
+    ran.clear()
+    hub.fill_release(Slack(), "V9", "U_ME", "alpha", True, "patch", hub._previews["V9"])
+    check("one of what is still pending is reused", ran == ["plan"], ran)
+    hub.release_call = hr
+    hub.on_release(lambda **k: None, body("U_ME"), s, view_(mmeta))
     check("confirmed, it releases", "Releasing" in hub._notices["U_ME"][0], hub._notices)
     st = _wait_release(hr, "alpha")
-    check("and runs to the end", st["run"]["released"] == ["backend/v1.0.0", "ios/v1.1.1"]
+    check("and runs to the end, at the level the window showed",
+          st["run"]["released"] == ["backend/v1.0.0", "ios/v1.2.0"]
           and st["run"]["by"] == "slack:U_ME", st["run"])
     check("the board registers the window's submit", "app.view(RELEASE_CALLBACK)(home.on_release)"
           in (BASE / "home.py").read_text())

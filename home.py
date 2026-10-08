@@ -75,6 +75,11 @@ DIRECT = ("accept", "dismiss", "approve", "retry", "cancel", "release", "resolve
 MODAL_CALLBACK = "home_rework"
 CONFIRM_CALLBACK = "home_confirm"
 RELEASE_CALLBACK = "home_release"
+#: The release window's level picker, and what it offers: everything pending
+#: at once takes a patch or a minor, as `!release <project> all minor` does.
+#: Major and exact versions are about one target, so stay on the dashboard.
+RELEASE_LEVEL_ACTION = "home_release_level"
+RELEASE_LEVELS = ("patch", "minor")
 #: Projects listed under "Ready to release"; the rest are counted.
 MAX_RELEASES = 5
 STATE_ICON = {tasks.AWAITING_APPROVAL: ":eyes:", tasks.NEEDS_INPUT: ":speech_balloon:",
@@ -492,7 +497,7 @@ def release_blocks(releasable) -> list[dict]:
 
 
 def release_modal(slug: str, offer: dict | None, previews: dict | None = None,
-                  confirmable: bool = True) -> dict:
+                  confirmable: bool = True, level: str = "patch") -> dict:
     """The release confirmation: what ships, in order; exactly what reaches
     production; each target's preview; and why it cannot go, if it cannot.
 
@@ -502,6 +507,10 @@ def release_modal(slug: str, offer: dict | None, previews: dict | None = None,
     carries (`confirm`) is what the release checks against, so confirming
     releases what this window showed or nothing. `confirmable` False is the
     preview: the same window, nothing to submit.
+
+    `level` is the whole release's; a confirmable window offers patch or
+    minor, and picking one re-plans the window (Home.on_release_level), so
+    the versions, tags and fingerprint shown are always the level's own.
     """
     view = {"type": "modal", "callback_id": RELEASE_CALLBACK,
             "title": {"type": "plain_text", "text": "Release" if confirmable else "Release preview"},
@@ -525,6 +534,15 @@ def release_modal(slug: str, offer: dict | None, previews: dict | None = None,
     if not steps:
         lines.append("_Nothing is pending._")
     blocks = [{"type": "section", "text": _text("\n".join(lines))}]
+    level = offer.get("level") or level
+    if confirmable and steps:
+        opt = lambda lvl: {"text": {"type": "plain_text", "text": f"Everything at a {lvl}"},
+                           "value": lvl}
+        picker = {"type": "static_select", "action_id": RELEASE_LEVEL_ACTION,
+                  "options": [opt(lvl) for lvl in RELEASE_LEVELS]}
+        if level in RELEASE_LEVELS:
+            picker["initial_option"] = opt(level)
+        blocks.append({"type": "actions", "block_id": "release_level", "elements": [picker]})
     if offer.get("blocked"):
         blocks.append({"type": "section", "text": _text(
             f":no_entry: *Can't release:* {esc(offer['blocked'])}")})
@@ -542,12 +560,17 @@ def release_modal(slug: str, offer: dict | None, previews: dict | None = None,
             blocks.append({"type": "section", "text": _text(
                 f"*Preview of {esc(name)}* `{esc(step.get('command'))}`{mark}\n```{esc(out)}```")})
     blocks.append({"type": "context", "elements": [_text(
-        "Everything pending, each at a patch. For minor, major or one target on its "
+        f"Everything pending, each at a {esc(level)}. For major or one target on its "
         f"own, use the dashboard or `!release {esc(slug)} <target> <level>`.")]})
     view["blocks"] = blocks[:100]
+    # Kept even when there is nothing to submit: the level picker reads the
+    # slug and level back from here to re-plan.
+    meta = {"slug": slug, "level": level}
     if confirmable and offer.get("confirm") and not offer.get("blocked"):
         view["submit"] = {"type": "plain_text", "text": "Release"}
-        view["private_metadata"] = json.dumps({"slug": slug, "confirm": offer["confirm"]})
+        meta["confirm"] = offer["confirm"]
+    if confirmable:
+        view["private_metadata"] = json.dumps(meta)
     return view
 
 
@@ -615,6 +638,9 @@ class Home:
         self._watching = watching or (lambda: [])
         self._unmerged = unmerged or (lambda: "")
         self._notices: dict[str, tuple[str, float]] = {}
+        #: A release window's previews, by view id, so picking a level
+        #: re-plans without running the migration dry runs again.
+        self._previews: dict[str, dict] = {}
         self._cache = ("", 0.0)
         self._lock = threading.Lock()
 
@@ -797,27 +823,63 @@ class Home:
             log.exception("could not open the release window")
             return
         view_id = ((r or {}).get("view") or {}).get("id")
+        self._spawn(lambda: self.fill_release(client, view_id, user, slug, confirmable))
 
-        def fill():
-            try:
-                offer = self.release_call({"action": "plan", "slug": slug,
-                                           "by": f"slack:{user}"})
-                previews = {}
-                if offer.get("ok") and not offer.get("blocked"):
-                    rows = {t["target"]: t for t in offer.get("targets") or []}
-                    for st in offer.get("steps") or []:
-                        if st.get("commits") and (rows.get(st["target"]) or {}).get("preview"):
-                            previews[st["target"]] = self.release_call(
-                                {"action": "preview", "slug": slug, "target": st["target"]})
-                view = release_modal(slug, offer, previews, confirmable)
-            except Exception as e:
-                log.exception("release window for %s failed", slug)
-                view = release_modal(slug, {"ok": False, "error": str(e)}, confirmable=confirmable)
-            try:
-                client.views_update(view_id=view_id, view=view)
-            except Exception:
-                log.exception("could not fill in the release window")
-        self._spawn(fill)
+    def fill_release(self, client, view_id, user: str, slug: str, confirmable: bool,
+                     level: str = "patch", previews: dict | None = None) -> None:
+        """Plan the release at `level` and put it in the window, with each
+        shipping target's preview. A preview from `previews` ({target:
+        (what was pending, result)}) is reused only while that target's
+        pending commits are the same; anything else runs again."""
+        try:
+            offer = self.release_call({"action": "plan", "slug": slug, "level": level,
+                                       "by": f"slack:{user}"})
+            kept, shown = dict(previews or {}), {}
+            if offer.get("ok") and not offer.get("blocked"):
+                rows = {t["target"]: t for t in offer.get("targets") or []}
+                for st in offer.get("steps") or []:
+                    row = rows.get(st["target"]) or {}
+                    if not (st.get("commits") and row.get("preview")):
+                        continue
+                    pending = (row.get("pending"), tuple(row.get("commits") or ()))
+                    seen = kept.get(st["target"])
+                    if not seen or seen[0] != pending:
+                        seen = kept[st["target"]] = (pending, self.release_call(
+                            {"action": "preview", "slug": slug, "target": st["target"]}))
+                    shown[st["target"]] = seen[1]
+                if view_id:
+                    with self._lock:
+                        self._previews[view_id] = kept
+                        while len(self._previews) > 20:
+                            self._previews.pop(next(iter(self._previews)))
+            view = release_modal(slug, offer, shown, confirmable, level)
+        except Exception as e:
+            log.exception("release window for %s failed", slug)
+            view = release_modal(slug, {"ok": False, "error": str(e)}, confirmable=confirmable)
+        try:
+            client.views_update(view_id=view_id, view=view)
+        except Exception:
+            log.exception("could not fill in the release window")
+
+    def on_release_level(self, ack, body, client):
+        """A level picked in the release window: re-plan at it. Until the
+        window is redrawn its Release still carries the old level's plan;
+        on_release refuses that while the picker shows the new one."""
+        ack()
+        user = body["user"]["id"]
+        if not self.allowed(user) or not self.release_call:
+            return
+        view = body.get("view") or {}
+        meta = json.loads(view.get("private_metadata") or "{}")
+        slug = meta.get("slug", "")
+        level = ((body.get("actions") or [{}])[0].get("selected_option") or {}).get("value", "")
+        if not slug or level not in RELEASE_LEVELS:
+            return
+        view_id = view.get("id")
+        with self._lock:
+            previews = self._previews.get(view_id)
+        self._spawn(lambda: self.fill_release(client, view_id, user, slug, True,
+                                              level, previews))
 
     def on_release(self, ack, body, client, view):
         """Release confirmed in the window. The fingerprint it carries is the
@@ -830,8 +892,18 @@ class Home:
         slug = meta.get("slug", "")
         if not self.release_call or not slug:
             return
+        # Slack shows a picked level at once; the plan for it arrives
+        # seconds later. Released in between, the window would ship the
+        # level it was drawn at while its picker reads another.
+        picked = ((((view.get("state") or {}).get("values") or {}).get("release_level") or {})
+                  .get(RELEASE_LEVEL_ACTION) or {}).get("selected_option") or {}
+        if picked.get("value") and picked["value"] != (meta.get("level") or "patch"):
+            self.note(user, f":warning: Nothing released: `{esc(slug)}`'s window was still "
+                      f"working out the {esc(picked['value'])} release. Open it again.")
+            return self.publish(client, user)
         try:
             r = self.release_call({"action": "start", "slug": slug,
+                                   "level": meta.get("level") or "patch",
                                    "confirm": meta.get("confirm", ""),
                                    "by": f"slack:{user}"})
         except Exception as e:
@@ -1142,3 +1214,4 @@ def register(app, home: Home) -> None:
     app.action("home_menu")(home.on_menu)
     app.view(CONFIRM_CALLBACK)(home.on_confirm)
     app.view(RELEASE_CALLBACK)(home.on_release)
+    app.action(RELEASE_LEVEL_ACTION)(home.on_release_level)

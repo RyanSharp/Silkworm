@@ -1232,7 +1232,7 @@ def _release_names(raw) -> list[str] | None:
     return names or None
 
 
-def release_offer(slug: str, names=None, levels=None) -> dict:
+def release_offer(slug: str, names=None, levels=None, level: str = "patch") -> dict:
     """What a release of `slug` would do, for a person to confirm: per target
     what is pending and the versions it could take; the steps of this
     release in order; the exact effects on production; why it cannot go
@@ -1240,6 +1240,9 @@ def release_offer(slug: str, names=None, levels=None) -> dict:
 
     Runs nothing but git (ready() fetches origin). Never a preview or a ship
     command -- those are the `preview` action and the release itself.
+
+    `level` is for the whole release, as `!release <project> all <level>`;
+    `levels` overrides it per target (see release_steps).
     """
     repo, base = release_checkout(slug)
     if not repo:
@@ -1248,7 +1251,7 @@ def release_offer(slug: str, names=None, levels=None) -> dict:
         targets = releases.load(repo)
         if not targets:
             return {"ok": False, "error": f"{slug} has no release targets"}
-        steps = release_steps(repo, names, "patch", levels)
+        steps = release_steps(repo, names, level, levels)
         rows = []
         for name in releases.order(targets, list(targets)):
             t = targets[name]
@@ -1276,7 +1279,7 @@ def release_offer(slug: str, names=None, levels=None) -> dict:
                or "")
     effects = [line for s in shipping
                for line in releases.effects(repo, targets[s["target"]], s, base)]
-    return {"ok": True, "slug": slug, "base": base, "targets": rows,
+    return {"ok": True, "slug": slug, "base": base, "level": level, "targets": rows,
             "steps": [{"target": s["target"], "level": s["level"], "version": s["version"],
                        "tag": s["tag"], "commits": len(s["commits"])} for s in steps],
             "effects": effects, "blocked": blocked, "running": running,
@@ -1301,7 +1304,8 @@ def release_thread(slug: str, by: str):
     return post
 
 
-def start_release(slug: str, names, levels, confirm: str, by: str, post=None) -> dict:
+def start_release(slug: str, names, levels, confirm: str, by: str, post=None,
+                  level: str = "patch") -> dict:
     """Start a release a person confirmed. The same run_release `!release`
     uses, under the same one-at-a-time rule, after the same refusals --
     and only with the fingerprint of the plan that was shown (release_offer),
@@ -1309,7 +1313,7 @@ def start_release(slug: str, names, levels, confirm: str, by: str, post=None) ->
     something other than what would now ship."""
     if not release_allowed(by):
         return {"ok": False, "error": "only people on the bot's allowlist can release"}
-    offer = release_offer(slug, names, levels)
+    offer = release_offer(slug, names, levels, level)
     if not offer["ok"]:
         return offer
     if offer["blocked"]:
@@ -1342,7 +1346,7 @@ def start_release(slug: str, names, levels, confirm: str, by: str, post=None) ->
         try:
             say(f":rocket: Releasing `{slug}`, confirmed by {by or 'the dashboard'}:\n"
                 + "\n".join(f"• {e}" for e in offer["effects"]))
-            done = run_release(slug, repo, base, names, "patch", say,
+            done = run_release(slug, repo, base, names, level, say,
                                levels=levels, expect=confirm)
             run["released"] = [r["tag"] for r in done if r.get("released")]
             run["ok"] = len(run["released"]) == shipping
@@ -1385,7 +1389,10 @@ def handle_releases(payload: dict) -> dict:
     `plan` says what would ship and returns the confirmation fingerprint;
     `preview` runs one target's preview commands (a migration dry run) and
     nothing else; `start` releases, given that fingerprint; `status` is the
-    last started release's progress, for polling. Not /release: that route
+    last started release's progress, for polling. `level` (patch, minor or
+    major; default patch) is the whole release's, as `!release <project> all
+    <level>`, and a start must carry the one its plan was shown at -- the
+    fingerprint covers it. Not /release: that route
     frees a wedged thread.
     """
     action = payload.get("action", "plan")
@@ -1396,8 +1403,11 @@ def handle_releases(payload: dict) -> dict:
         return {"ok": False, "error": f"unknown project {slug!r}"}
     names = _release_names(payload.get("targets"))
     levels = payload.get("levels") if isinstance(payload.get("levels"), dict) else None
+    level = str(payload.get("level") or "patch").strip().lower()
+    if level not in releases.LEVELS:
+        return {"ok": False, "error": f"`{level}` is not patch, minor or major"}
     if action == "plan":
-        return release_offer(slug, names, levels)
+        return release_offer(slug, names, levels, level)
     if action == "preview":
         target = (payload.get("target") or "").strip()
         repo, _ = release_checkout(slug)
@@ -1412,7 +1422,7 @@ def handle_releases(payload: dict) -> dict:
             return {"ok": False, "error": str(e)}
     if action == "start":
         return start_release(slug, names, levels, (payload.get("confirm") or "").strip(),
-                             str(payload.get("by") or "dashboard"))
+                             str(payload.get("by") or "dashboard"), level=level)
     if action == "status":
         run = _release_runs.get(slug)
         with _releasing_guard:
