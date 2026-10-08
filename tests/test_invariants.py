@@ -10460,6 +10460,17 @@ def test_release_effects_count_things_not_files():
           and R.describe("supabase/migrations", {"1.sql"}) == "1 migration in supabase/migrations")
     check("only shared code changed: no function counted",
           R.describe("supabase/functions", {"_shared"}) == "shared code (_shared) in supabase/functions")
+    # A file loose in supabase/functions is config beside the functions, not
+    # one of them: named, never counted.
+    commit("supabase/functions/import_map.json", "supabase/functions/deno.json")
+    loose = [R.describe(d, t) for d, t in R.changed(repo, targets["backend"]).items()]
+    check("a loose file beside the functions is named, not counted as a function",
+          "2 edge functions and shared code (_shared) and deno.json and import_map.json"
+          " in supabase/functions" in loose, loose)
+    check("only a loose file changed: no function counted",
+          R.describe("supabase/functions", {R.LOOSE + "deno.json"})
+          == "deno.json in supabase/functions")
+    g("reset", "-q", "--hard", "HEAD~1")
     ios = [R.describe(d, t) for d, t in R.changed(repo, targets["ios"]).items()]
     check("a directory of no known kind counts files, and says files",
           ios == ["3 files in ios/App"], ios)

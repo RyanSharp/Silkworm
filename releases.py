@@ -243,6 +243,11 @@ def pending(repo, target: dict, base: str = "HEAD") -> list[str]:
 #: counted in files, and says so.
 KINDS = {"functions": ("edge function", "edge functions"),
          "migrations": ("migration", "migrations")}
+#: The kinds whose things are folders. A file sitting loose in one of them
+#: (`supabase/functions/import_map.json`) is not one of its things; it is
+#: recorded as LOOSE + its name, which no folder name can be, and named.
+FOLDERS = {"functions"}
+LOOSE = "./"
 
 
 def changed(repo, target: dict, base: str = "HEAD") -> dict:
@@ -264,7 +269,11 @@ def changed(repo, target: dict, base: str = "HEAD") -> dict:
     for f in r.stdout.splitlines():
         parts = f.split("/")
         key = "/".join(parts[:2]) if len(parts) > 2 else (parts[0] if len(parts) > 1 else f)
-        thing = parts[2] if len(parts) > 2 and parts[1] in KINDS else f
+        if len(parts) > 2 and parts[1] in KINDS:
+            loose = parts[1] in FOLDERS and len(parts) == 3
+            thing = LOOSE + parts[2] if loose else parts[2]
+        else:
+            thing = f
         out.setdefault(key, set()).add(thing)
     return dict(sorted(out.items()))
 
@@ -273,15 +282,18 @@ def describe(directory: str, things) -> str:
     """'6 edge functions in supabase/functions', '1 migration in
     supabase/migrations', '4 files in ios/Cadence'. A folder beginning with
     an underscore (`_shared`) is code the functions share, not a function:
-    it is named rather than counted."""
+    it is named rather than counted, as is a file loose beside the functions
+    (`import_map.json`)."""
     kind = KINDS.get(directory.rsplit("/", 1)[-1])
     if not kind:
         n = len(things)
         return f"{n} file{'s' if n != 1 else ''} in {directory}"
     own = sorted(t for t in things if t.startswith("_"))
-    n = len(things) - len(own)
+    loose = sorted(t for t in things if t.startswith(LOOSE))
+    n = len(things) - len(own) - len(loose)
     parts = [f"{n} {kind[0] if n == 1 else kind[1]}"] if n else []
     parts += [f"shared code ({t})" for t in own]
+    parts += [t[len(LOOSE):] for t in loose]
     return " and ".join(parts) + f" in {directory}"
 
 
