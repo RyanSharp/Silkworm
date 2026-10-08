@@ -208,8 +208,11 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
         # Failed or held: the latest such event in the window, with its reason.
         # Held covers needs_input -- "not run: <project> needs a test command".
+        # A step handed to you is not a hold of the system's own; it is listed
+        # under "yours to do" below for as long as it is still yours.
         bad = [e for e in _events(rec) if e["at"] >= since
-               and e.get("kind") in (tasks.FAILED, tasks.NEEDS_INPUT)]
+               and e.get("kind") in (tasks.FAILED, tasks.NEEDS_INPUT)
+               and not str(e.get("detail") or "").startswith(tasks.NEEDS_USER_PREFIX)]
         if bad:
             e = bad[-1]
             what = "failed" if e["kind"] == tasks.FAILED else "held"
@@ -243,6 +246,16 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
             if not excused and dwell > stuck_limit(state, usual):
                 add(proj, "stuck", f"{_title(rec)} — {state} {_age(dwell)}")
 
+    # Every day it is still yours, not only the day it was handed over: the
+    # step is the whole outcome of the task, and done is how it was missed.
+    for rec in records:
+        asks = rec.get("needs_user") if isinstance(rec.get("needs_user"), dict) else {}
+        if rec.get("state") == tasks.NEEDS_INPUT and asks.get("action"):
+            why = _esc(str(asks.get("why") or "").strip()[:90])
+            add(_project_of(rec, by_id), "todo",
+                f"{_title(rec)} — `{_esc(str(asks['action'])[:120])}`"
+                + (f" ({why})" if why else ""))
+
     waiting: dict = {}
     for rec in records:
         if rec.get("state") in dict(WAITING):
@@ -269,7 +282,8 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
 #: Section, its label, and whether its lines are titles to be listed on one
 #: line (with a count) rather than shown one per bullet.
-ORDER = (("landed", "landed", True), ("released", "released", False),
+ORDER = (("todo", "yours to do", False),
+         ("landed", "landed", True), ("released", "released", False),
          ("refused", "landing refused", False), ("failed", "failed or held", False),
          ("reran", "ran more than once", True), ("stuck", "stuck", False),
          ("held", "review findings held at the proposal cap", True),

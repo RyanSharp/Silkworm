@@ -48,11 +48,28 @@ reduces attention spent, not work produced.
 |---|---|
 | `proposed` | auto-ingested; accept or dismiss before it becomes work |
 | `awaiting_approval` | mid-flight, needs a yes/no |
-| `needs_input` | asked a question and stopped |
+| `needs_input` | asked a question and stopped, or finished all it could and left you a step |
 | `failed` | ended badly; retry or dismiss |
 
 Everything else (`queued`, `running`, `blocked`, `done`, `cancelled`) is the
 system's business and is not surfaced by default.
+
+A run whose last step is yours — a `!release`, approving a cost, supplying a
+credential, choosing between options — ends its reply with a
+`{"needs_user": "<the exact action>", "why": "…"}` json block
+(`roles.parse_needs_user`). The task then ends in `needs_input` rather than
+`done`, even after its review passes and its branch lands, with the step on its
+dashboard card, its Slack board line and the daily digest. A `!release` step
+gets a Release button that runs exactly the recorded command and closes the
+task only if the release goes out; any step can be closed with Done once you
+have taken it. A reply without the block, or with one that does not parse,
+ends `done` as before. (tsk_fd122a33d3 said "run `!release cadence all minor`"
+in prose and closed as done; TestFlight never got the build.)
+
+A person cannot send back, retry, accept or approve a task that is `running`
+— `running → queued` exists for the runner's own send-backs (failing tests, a
+landing conflict), not for the dashboard. The refusal is checked under the
+store's lock and says to send it back when it finishes, or cancel it.
 
 A turn that dies on **quota exhaustion or API overload** is not a failure a
 person can act on — there is nothing to fix, only a time to wait. Those are

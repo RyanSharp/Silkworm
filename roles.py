@@ -45,6 +45,14 @@ REVIEWER_SYSTEM = (
     "it calls code the base has since removed or changed, it undoes or "
     "duplicates work that has since landed, or it rests on an assumption the "
     "base no longer holds. Name the commit or code it clashes with.\n\n"
+    # tsk_fd122a33d3 was reviewed, passed, and closed as done with its release
+    # -- the whole point of the goal -- left as a sentence in the reply.
+    "One thing to check that is easy to read past: if the goal was not "
+    "achieved and the implementor's reply hands a remaining step to the user "
+    "(run a release, approve a cost, supply a credential, choose between "
+    "options) without ending in a ```json {\"needs_user\": ...}``` block, "
+    "that is a finding. Without the block the task closes as done and nobody "
+    "is asked to take that step.\n\n"
     "Finish your reply with a fenced json block, and nothing after it:\n"
     "```json\n"
     '{"ok": true|false, "summary": "one line", "findings": ["..."], '
@@ -105,17 +113,42 @@ IMPLEMENTOR_SYSTEM = (
     "locally, and reporting that it is ready to land -- not by landing it."
 )
 
+#: Asked of every queued task that does work, appended by execute_task. A run
+#: that stops short because the last step is yours used to say so in prose and
+#: then close as `done`: tsk_fd122a33d3 ("Cut new test flight build") correctly
+#: did not release -- releasing is yours -- said exactly what to type, passed
+#: review, and the board showed it finished while TestFlight never got a build.
+#: The marker turns that sentence into a state the board can hold.
+NEEDS_USER_NOTE = (
+    "If the goal cannot be finished without the user doing something only they "
+    "can -- running a release (`!release <project> <target|all> [level]`), "
+    "approving a cost, supplying a credential, deciding between options -- do "
+    "everything up to that point, then end your reply with a fenced json block "
+    "naming that step, and nothing after it:\n"
+    "```json\n"
+    '{"needs_user": "<the exact action, e.g. !release cadence all minor>", '
+    '"why": "<one line>"}\n'
+    "```\n"
+    "The task then waits for them instead of closing as done. Leave the block "
+    "out when the work is genuinely finished: an optional next step or a "
+    "suggestion is not something the user must do."
+)
+
 ROLES: dict[str, dict] = {
     "assistant": {
         "system": "",
         "review": False,
         "restricted": False,
+        # Queued runs only: a Slack turn never reaches execute_task, so this
+        # leaves a DM exactly as it was.
+        "asks_user": True,
         "model": None,
     },
     "implementor": {
         "system": IMPLEMENTOR_SYSTEM,
         "review": True,          # its output goes to a reviewer before completing
         "restricted": False,
+        "asks_user": True,       # may end waiting on you; see NEEDS_USER_NOTE
         "model": None,
     },
     "ideator": {
@@ -249,6 +282,11 @@ def system_prompt(name: str) -> str:
     return get(name).get("system", "")
 
 
+def asks_user(name: str) -> bool:
+    """True if this role's queued runs may end by handing you a step."""
+    return bool(get(name).get("asks_user"))
+
+
 def review_goal(task: dict, result_text: str, cwd: str = "",
                 branch: str = "", base: str = "") -> str:
     """The prompt handed to a reviewer, with fresh context.
@@ -359,3 +397,60 @@ def no_verdict(summary: str) -> dict:
     """
     return {"ok": False, "summary": summary[:300], "findings": [],
             "followups": [], "unverified": [], "parsed": False}
+
+
+#: What a needs_user block may say, at most. It is shown on a card and a board
+#: line, not read as a report.
+MAX_NEEDS_USER = 300
+
+#: A `!release` the board can run for you: a project, a target or `all`, and
+#: optionally a level. Tokens only -- nothing a shell or a second command could
+#: hide in -- and anything else stays text to copy.
+_RELEASE = re.compile(r"!release\s+([a-z0-9][a-z0-9_-]*)\s+([A-Za-z0-9_.-]+)"
+                      r"(?:\s+([A-Za-z0-9_.-]+))?")
+
+
+def over_to_you(asks: dict) -> str:
+    """What the task's thread is told when it parks on a step of yours."""
+    asks = asks or {}
+    return (f":raising_hand: *Over to you:* `{asks.get('action', '')}`"
+            + (f" — {asks['why']}" if asks.get("why") else "")
+            + "\n_It waits in Needs you until that is done"
+            + (" — the board has a Release button for it" if asks.get("release") else "")
+            + "._")
+
+
+def parse_needs_user(text: str) -> dict | None:
+    """The step a run handed to you, or None if it handed you nothing.
+
+    Read the way parse_verdict reads a verdict, but failing closed the other
+    way: what is at stake here is a task closing as done, which is the
+    behaviour before this existed, so anything unreadable -- no block, bad
+    json, a block about something else, an empty or non-string action -- is
+    None and the task ends as it always did. Only the reply's last fenced
+    block counts: one quoted earlier is an example, not a request.
+
+    Returns {"action", "why", "release"}. `release` is the argument string
+    for `!release` when the action is exactly one release command the board
+    can offer as a button, else "".
+    """
+    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text or "", re.S)
+    if not blocks:                       # tolerate a bare object
+        m = re.search(r"\{[^{}]*\"needs_user\"\s*:[^{}]*\}", text or "", re.S)
+        blocks = [m.group(0)] if m else []
+    if not blocks:
+        return None
+    try:
+        v = json.loads(blocks[-1])
+    except json.JSONDecodeError:
+        log.warning("a needs_user block that is not json; ignoring it")
+        return None
+    action = v.get("needs_user") if isinstance(v, dict) else None
+    if not isinstance(action, str) or not action.strip():
+        return None
+    action = " ".join(action.split())[:MAX_NEEDS_USER]
+    why = v.get("why")
+    why = " ".join(why.split())[:MAX_NEEDS_USER] if isinstance(why, str) else ""
+    m = _RELEASE.fullmatch(action.strip("`").strip())
+    release = " ".join(g for g in m.groups() if g) if m else ""
+    return {"action": action, "why": why, "release": release}

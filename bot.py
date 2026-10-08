@@ -1031,11 +1031,16 @@ _releasing: set[str] = set()
 _releasing_guard = threading.Lock()
 
 
-def release_command(arg: str, post) -> str:
+#: The start of release_command's reply when it did start a release.
+RELEASE_STARTED = ":rocket:"
+
+
+def release_command(arg: str, post, then=None) -> str:
     """`!release <project> [<target|all> [level]]`. Returns the immediate
     reply; the plan or the release itself runs off the Slack handler (a
     migration dry run or a deploy takes longer than Slack will wait) and
-    reports through `post`."""
+    reports through `post`. `then(ok)` is called when a release it started
+    ends -- see run_release -- and never if it started none."""
     parts = arg.split()
     if not parts:
         return ("Usage: `!release <project>` to see what is ready, or "
@@ -1066,8 +1071,8 @@ def release_command(arg: str, post) -> str:
             return f"A release of `{slug}` is already running."
         _releasing.add(slug)
     threading.Thread(target=run_release, args=(slug, repo, base, names, level, post),
-                     daemon=True, name=f"release-{slug}").start()
-    return f":rocket: Releasing `{slug}` ({'everything pending' if names is None else names[0]}, {level})…"
+                     kwargs={"then": then}, daemon=True, name=f"release-{slug}").start()
+    return f"{RELEASE_STARTED} Releasing `{slug}` ({'everything pending' if names is None else names[0]}, {level})…"
 
 
 def release_plan(slug: str, repo, post) -> None:
@@ -1101,10 +1106,16 @@ def release_plan(slug: str, repo, post) -> None:
         post(f":warning: Could not work out the release plan: {e}")
 
 
-def run_release(slug: str, repo, base: str, names, level: str, post) -> list[dict]:
+def run_release(slug: str, repo, base: str, names, level: str, post,
+                then=None) -> list[dict]:
     """Release in dependency order, stopping at the first failure. Holds the
-    repo guard throughout, so a landing cannot move the base mid-release."""
+    repo guard throughout, so a landing cannot move the base mid-release.
+
+    `then(ok)` is told at the end whether it shipped: True only if something
+    was released and nothing failed. "Nothing to release" is not success --
+    whoever asked for a release did not get one, and should look."""
     done = []
+    ok = False
     try:
         with repo_guard(str(repo)):
             steps = releases.plan(repo, names, level)
@@ -1131,12 +1142,18 @@ def run_release(slug: str, repo, base: str, names, level: str, post) -> list[dic
                     return done
                 post(f":white_check_mark: *{name}* released as `{r['tag']}` "
                      f"({len(r['commits'])} change{'s' if len(r['commits']) != 1 else ''}).")
+            ok = bool(done)
     except Exception as e:
         log.exception("release of %s failed", slug)
         post(f":warning: The release of `{slug}` errored: {e}")
     finally:
         with _releasing_guard:
             _releasing.discard(slug)
+        if then:
+            try:
+                then(ok)
+            except Exception:
+                log.exception("after releasing %s", slug)
     return done
 
 
@@ -1671,14 +1688,32 @@ def approve_task(payload: dict) -> dict:
     if not task:
         return {"ok": False, "error": "unknown task"}
     reviewed = task.get("state") == tasks.AWAITING_APPROVAL
+    if task.get("state") == tasks.NEEDS_INPUT:
+        # Refused as it always was. needs_input -> done is legal now (Done,
+        # Release), so without this a second click on Approve would close a
+        # task it had just parked on your step.
+        return {"ok": False, "error": "it is waiting on you: answer it, or "
+                                      "take its step and mark it Done"}
     # Approving is one of the two moments a held checkout becomes unreachable;
     # see the note on dismiss in handle_tasks, which this mirrors.
     held = holding.for_task(task)
     note = holding.short(held) if held else ""
+    said = f"approve via {payload.get('by', 'ui')}" + (f" ({note})" if note else "")
+    asks = task.get("needs_user") if reviewed else None
     try:
-        done = task_store.transition(
-            tid, tasks.DONE, f"approve via {payload.get('by', 'ui')}"
-            + (f" ({note})" if note else ""))
+        # Approving says the work is fine. It does not take the step the run
+        # left for you, so a task carrying one waits for that instead of
+        # closing -- closing it is how tsk_fd122a33d3's release was lost.
+        if not asks:
+            done = task_store.transition(tid, tasks.DONE, said,
+                                         refuse_running=tasks.RUNNING_BUSY)
+        else:
+            done = task_store.transition(tid, tasks.NEEDS_INPUT,
+                                         f"{tasks.needs_user_detail(asks)} ({said})",
+                                         refuse_running=tasks.RUNNING_BUSY,
+                                         expect=tasks.AWAITING_APPROVAL)
+    except tasks.NotEditable as e:
+        return {"ok": False, "error": str(e)}
     except tasks.InvalidTransition as e:
         return {"ok": False, "error": f"not allowed: {e}"}
     if held:
@@ -1694,6 +1729,67 @@ def approve_task(payload: dict) -> dict:
         except Exception:
             log.exception("could not start the landing for %s", tid)
     return {"ok": True, "note": note, "task": task_store.get(tid) or done}
+
+
+def take_step(action: str, payload: dict) -> dict:
+    """The step a run left for you (`needs_user`), taken from the board.
+
+    `resolve` is you saying you took it: the task is done. `release` takes it
+    for you when it is a `!release` -- the same command, run the same way as
+    typing it, posting into the task's thread -- and the task is done only if
+    the release goes out. One that fails or finds nothing to ship leaves it in
+    Needs you, with the reason in its thread: closing it then would be the
+    original silence again. Only the command the run recorded can be run;
+    nothing in the request names what to release.
+    """
+    tid = payload.get("id", "")
+    task = task_store.get(tid)
+    if not task:
+        return {"ok": False, "error": "unknown task"}
+    if task.get("state") != tasks.NEEDS_INPUT:
+        return {"ok": False, "error": f"only work waiting on you; this one is {task.get('state')}"}
+    asks = task.get("needs_user") or {}
+    by = payload.get("by", "ui")
+    # Every close is "only if it is still waiting on you", asked under the
+    # store's lock: a release can take minutes, and a task sent back meanwhile
+    # may be running again -- from where `done` is also legal.
+    if action == "resolve":
+        try:
+            moved = task_store.transition(tid, tasks.DONE, f"done via {by}",
+                                          expect=tasks.NEEDS_INPUT)
+        except tasks.InvalidTransition as e:
+            return {"ok": False, "error": f"not allowed: {e}"}
+        return {"ok": True, "task": moved}
+    if not asks.get("release"):
+        return {"ok": False, "error": "it did not leave a release to run"}
+    # Approving parks a task with a step here and starts its landing. Shipping
+    # the base while that branch is mid-landing, or after it was refused,
+    # would release without the work and then close the task as if it had.
+    landing = (task.get("result") or {}).get("landing") or {}
+    if landing.get("stage") == LANDING_UNDERWAY or merge.needs_a_person(landing):
+        return {"ok": False, "error": f"its branch has not landed ({landing.get('stage')}); "
+                                      "land it first -- mark this Done, then Land it "
+                                      "from its card -- and release after"}
+    thread = task.get("thread", "")
+
+    def post(text):
+        tell_thread(thread, text)
+
+    def then(ok):
+        if not ok:
+            return
+        try:
+            task_store.transition(tid, tasks.DONE,
+                                  f"released via {by}: {asks['action']}"[:200],
+                                  expect=tasks.NEEDS_INPUT)
+        except (tasks.InvalidTransition, KeyError):
+            log.info("%s moved on while its release ran; leaving it be", tid)
+
+    msg = release_command(asks["release"], post, then=then)
+    post(f"`!release {asks['release']}` via {by}: {msg}")
+    if not msg.startswith(RELEASE_STARTED):
+        return {"ok": False, "error": msg}
+    return {"ok": True, "note": "release under way; the result is posted to its thread"}
 
 
 def land_or_drop(action: str, payload: dict) -> dict:
@@ -2080,11 +2176,16 @@ def handle_tasks(payload: dict) -> dict:
                        + list(findings)}
                       if findings else {})
             return {"ok": True, "task": send_back(tid, "\n\n".join(parts),
-                                                  "sent back for rework", **counts)}
+                                                  "sent back for rework",
+                                                  by_user=True, **counts)}
+        except tasks.NotEditable as e:
+            return {"ok": False, "error": str(e)}
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
     if action == "approve":
         return approve_task(payload)
+    if action in ("release", "resolve"):
+        return take_step(action, payload)
     if action in ("land", "drop"):
         return land_or_drop(action, payload)
     if action in ("accept", "dismiss", "retry", "cancel"):
@@ -2126,10 +2227,15 @@ def handle_tasks(payload: dict) -> dict:
         try:
             moved = task_store.transition(
                 tid, target, f"{action} via {payload.get('by', 'ui')}"
-                + (f" ({note})" if note else ""))
+                + (f" ({note})" if note else ""),
+                # Cancelling a running task is what stops it; requeueing one
+                # would put a second run beside the first.
+                refuse_running=tasks.RUNNING_BUSY if target == tasks.QUEUED else "")
             if held:
                 tell_thread(rec.get("thread", ""), holding.note(held))
             return {"ok": True, "note": note, "task": moved}
+        except tasks.NotEditable as e:
+            return {"ok": False, "error": str(e)}
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
         except KeyError:
@@ -3325,6 +3431,11 @@ def execute_task(task: dict) -> None:
     role_system = roles.system_prompt(role_name)
     if role_system:
         system_note += "\n\n" + role_system
+    # Not on a wake-up: a watch already has its own way to say "over to you"
+    # (defer.STOPPED), and its quiet replies are matched exactly.
+    asks_user = roles.asks_user(role_name) and task.get("source") != "defer"
+    if asks_user:
+        system_note += "\n\n" + roles.NEEDS_USER_NOTE
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
@@ -3478,18 +3589,27 @@ def execute_task(task: dict) -> None:
             app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
         # Added to, not replaced: a task sent back for rework runs again under
         # the same id, and overwriting would report only its last run.
+        # Written on every run, None included: a rerun that finishes the job
+        # must not still be carrying the last run's request.
         task_store.update(tid, session_id=result.session_id,
                           result={"text": result.text[:4000],
                                   **costs.add_run(task_store.get(tid), turn_cost),
                                   "cost_reported_total": result.cost_usd,
-                                  "files_uploaded": uploaded})
+                                  "files_uploaded": uploaded},
+                          needs_user=(roles.parse_needs_user(result.text)
+                                      if asks_user else None))
         if loose and send_back_uncommitted(task, loose, channel, thread_ts):
             return
         if checked and not checked["ok"] and checked["ran"]:
             if send_back_for_tests(task, checked, channel, thread_ts):
                 return
         if not resolve_review(task, role_name, result.text, channel, thread_ts):
-            task_state(tid, tasks.DONE)
+            # Done -- or, if this run said the rest is yours, waiting on you.
+            ending, why = tasks.ending(task_store.get(tid))
+            task_state(tid, ending, why)
+            parked = task_store.get(tid) or {}
+            if ending == tasks.NEEDS_INPUT and parked.get("state") == tasks.NEEDS_INPUT:
+                tell_thread(key, roles.over_to_you(parked.get("needs_user")))
         refresh_summary(key)
         refresh_brief(task.get("project", ""),
                       f"Task: {task.get('goal', '')[:500]}\n\n"
@@ -3736,16 +3856,27 @@ def review_addendum(findings: list) -> str:
             + "\n".join(f"- {f}" for f in findings))
 
 
-def send_back(tid: str, addendum: str, why: str, **fields) -> dict:
+def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
+              **fields) -> dict:
     """Requeue a task with `addendum` appended to its goal. The one way work
     is sent back for another pass -- by the dashboard, or by the gates below.
 
     Raises tasks.InvalidTransition, having changed nothing, if the task is
     somewhere it cannot be requeued from (closed while its review ran, say).
-    Checked first because the goal is written before the move: the other order
-    lets the runner claim it in between and run it without the addendum.
+    The goal and the move are one write, so the runner can never claim the
+    task between them and run it without the addendum.
+
+    `by_user` is a person's send-back, and a person may not send back a task
+    that is running: raises tasks.NotEditable. `running -> queued` is legal --
+    it is how the runner sends back its own work when the tests fail, and that
+    must keep working -- so the lifecycle alone let the dashboard requeue
+    tsk_3172171f8b a minute after the runner claimed it. The run in flight
+    never read the notes, and its end then raced the requeued copy.
     """
     task = task_store.get(tid) or {}
+    # Running is refused by the move itself, under the store's lock: asked
+    # here first, the runner could claim the task between the asking and the
+    # moving. can() would not catch it -- running -> queued is legal.
     if not tasks.can(task.get("state", ""), tasks.QUEUED):
         raise tasks.InvalidTransition(f"{task.get('state')} -> {tasks.QUEUED}")
     # Clear the previous cycle's review and verdict. Both the review gate and
@@ -3754,10 +3885,15 @@ def send_back(tid: str, addendum: str, why: str, **fields) -> dict:
     # done -- unproven and unreviewed, the exact opposite of sending it back.
     # And no checkpoint: resuming would say "carry on" and the addendum would
     # never be read.
-    task_store.update(tid, goal=f"{task.get('goal', '')}\n\n{addendum}",
-                      driver="queue", blocked_on=[], verified=None,
-                      checkpoint=None, **fields)
-    return task_store.transition(tid, tasks.QUEUED, why)
+    return task_store.transition(
+        tid, tasks.QUEUED, why,
+        refuse_running=tasks.RUNNING_REFUSAL if by_user else "",
+        # And no step left for you: that was the last run's, and a rerun that
+        # never gets to the end -- held at the gate, failed -- would otherwise
+        # still offer it, and Release or Done would close unreworked work.
+        fields=dict(goal=f"{task.get('goal', '')}\n\n{addendum}",
+                    driver="queue", blocked_on=[], verified=None,
+                    checkpoint=None, needs_user=None, **fields))
 
 
 #: How many times each kind of mechanical trouble is sent back on its own,
@@ -4115,9 +4251,21 @@ def resolve_review(task: dict, role_name: str, text: str,
             return False
         if stranded:
             task_state(parent_id, tasks.AWAITING_APPROVAL, stranded[:160])
+        elif verdict["ok"]:
+            # Reviewed and landed, and still possibly not finished: a run that
+            # left you the release waits for it rather than reading as done.
+            # Read off the record: the run that asked was hours ago.
+            ending, why = tasks.ending(task_store.get(parent_id))
+            task_state(parent_id, ending, why or verdict["summary"][:160])
+            parked = task_store.get(parent_id) or {}
+            # Only if it did park there: a parent closed while its review ran
+            # stays closed (task_state swallows the refusal), and the thread
+            # must not be told it is waiting.
+            if ending == tasks.NEEDS_INPUT and parked.get("state") == tasks.NEEDS_INPUT:
+                tell_thread(f"{channel}:{thread_ts}",
+                            roles.over_to_you(parked.get("needs_user")))
         else:
-            task_state(parent_id, tasks.DONE if verdict["ok"] else tasks.AWAITING_APPROVAL,
-                       verdict["summary"][:160])
+            task_state(parent_id, tasks.AWAITING_APPROVAL, verdict["summary"][:160])
     return False
 
 

@@ -94,11 +94,16 @@ TRANSITIONS: dict[str, tuple] = {
                         CANCELLED, QUEUED),
     # DONE: you looked and it's fine. QUEUED: send it back to be reworked.
     # Without those two, a task could enter this state and have no way out.
-    AWAITING_APPROVAL: (RUNNING, QUEUED, DONE, CANCELLED, FAILED),
-    NEEDS_INPUT:       (RUNNING, QUEUED, CANCELLED, FAILED),
+    # NEEDS_INPUT: approved, but the run handed you a step still to take.
+    AWAITING_APPROVAL: (RUNNING, QUEUED, DONE, CANCELLED, FAILED, NEEDS_INPUT),
+    # DONE: the step a run handed you (`needs_user`) has been taken -- the
+    # release its button started went out, or you said you did it.
+    NEEDS_INPUT:       (RUNNING, QUEUED, CANCELLED, FAILED, DONE),
     # DONE/AWAITING_APPROVAL: a task blocked on its review is resolved by the
-    # reviewer's verdict, not by going round the queue again.
-    BLOCKED:           (QUEUED, DONE, AWAITING_APPROVAL, CANCELLED, FAILED),
+    # reviewer's verdict, not by going round the queue again. NEEDS_INPUT is
+    # a passing verdict on work that still ends with a step only you can take.
+    BLOCKED:           (QUEUED, DONE, AWAITING_APPROVAL, CANCELLED, FAILED,
+                        NEEDS_INPUT),
     # DONE because recovery can arrive after the failure was recorded: a
     # restart marks an in-flight turn failed, and a later sweep finds the
     # child finished and delivers its reply. Refusing that leaves a false
@@ -115,6 +120,20 @@ class InvalidTransition(Exception):
 
 class NotEditable(Exception):
     """An edit or a reorder refused because of where the task is."""
+
+
+#: Why a person's send-back is refused while the task runs. `running` may move
+#: to `queued` -- the runner sends its own work back when the tests fail -- so
+#: the lifecycle alone let the dashboard requeue tsk_3172171f8b a minute after
+#: the runner claimed it, and the run in flight never saw the notes.
+RUNNING_REFUSAL = "it is running; send it back when it finishes, or cancel it"
+
+#: The same, for a person's other moves (accept, retry, approve).
+RUNNING_BUSY = "it is running; wait for it to finish, or cancel it"
+
+#: How a step handed to you is said in the event that parks the task, so the
+#: digest can tell it from a task held for a reason of the system's own.
+NEEDS_USER_PREFIX = "yours to do: "
 
 
 #: Where a task's goal, project and role can still change: it has not run.
@@ -213,6 +232,11 @@ FIELDS: dict[str, tuple] = {
     # Kept apart from `result`, which each run's turn rewrites whole, so a
     # second flagged review can still show what the first one asked for.
     "reworked_findings": (list, "review findings it was already sent back for"),
+    # Written by every run of a role that may ask (roles.asks_user), cleared
+    # when it asks nothing, so a rerun never inherits the last run's request.
+    # Its own field rather than inside `result`, which the reviewer's verdict
+    # and compaction both rewrite. See roles.parse_needs_user.
+    "needs_user":  (None,  "{action, why, release} a step the run left for you"),
     # "Run next" from the dashboard. claim() takes the highest first and the
     # oldest among equals, so zero -- every task nobody pinned -- is the plain
     # oldest-first queue it always was. Spent by the claim it asked for: it
@@ -287,6 +311,22 @@ def isolated(rec: dict) -> bool:
     where it may run.
     """
     return bool(rec.get("isolate"))
+
+
+def needs_user_detail(asks: dict) -> str:
+    """The event detail a task parks with when its run handed you a step."""
+    return f"{NEEDS_USER_PREFIX}{(asks or {}).get('action', '')}"[:200]
+
+
+def ending(rec: dict | None) -> tuple[str, str]:
+    """(state, detail) for a task whose work completed: `done`, or
+    `needs_input` if its last run said the rest is yours (`needs_user`, see
+    roles.parse_needs_user). A run that asked nothing ends as it always did.
+    """
+    asks = (rec or {}).get("needs_user")
+    if isinstance(asks, dict) and asks.get("action"):
+        return NEEDS_INPUT, needs_user_detail(asks)
+    return DONE, ""
 
 
 def can(from_state: str, to_state: str) -> bool:
@@ -380,7 +420,8 @@ class TaskStore:
 
     def transition(self, tid: str, to_state: str, detail: str = "",
                    _release: bool = True, _seen: set | None = None,
-                   _unblock: tuple = ()) -> dict:
+                   _unblock: tuple = (), refuse_running: str = "",
+                   fields: dict | None = None, expect: str = "") -> dict:
         """Move a task's state, refusing anything the lifecycle disallows.
 
         Ending a task also releases whatever was waiting on it. That happens
@@ -389,6 +430,16 @@ class TaskStore:
         one of them ever remembered to look. `_release=False` is for the one
         case where the ending is not real: a task marked failed by a restart
         and requeued in the same breath has not lost anybody their blocker.
+
+        `refuse_running` is for moves a person makes: if the task is running
+        it raises NotEditable with that text, under the same lock the runner's
+        claim takes, so there is no window between asking and moving. `fields`
+        are written in the same save as the move, and only if it happens;
+        with them a move to the state it is already in is refused rather than
+        treated as idempotent, since it would drop them unsaid. `expect`
+        refuses the move (InvalidTransition) unless the task is in that state
+        when the lock is held -- for an action decided on what it was a moment
+        ago, which may since have moved on to somewhere the move is also legal.
         """
         if to_state not in STATES:
             raise ValueError(f"unknown state {to_state!r}")
@@ -397,11 +448,21 @@ class TaskStore:
             if rec is None:
                 raise KeyError(tid)
             current = rec["state"]
-            if current == to_state:
+            if refuse_running and current == RUNNING:
+                raise NotEditable(refuse_running)
+            if expect and current != expect:
+                raise InvalidTransition(f"{tid}: {current} -> {to_state} "
+                                        f"(only from {expect})")
+            if current == to_state and not fields:
                 return dict(rec)                     # idempotent
             if not can(current, to_state):
                 raise InvalidTransition(f"{tid}: {current} -> {to_state}")
             prior = copy.deepcopy(rec)
+            if fields:
+                stray = [f for f in fields if f not in FIELDS or f == "state"]
+                if stray:
+                    raise ValueError(f"cannot write {', '.join(stray)} with a move")
+                rec.update(copy.deepcopy(fields))
             rec["state"] = to_state
             if current == QUEUED:
                 # A run-next pin is for the queue it was set in; leaving the

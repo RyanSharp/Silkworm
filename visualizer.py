@@ -829,6 +829,11 @@ PAGE = r"""<!doctype html>
   .bcard .land.bad, #bdetail .land.bad { color: #D8517F; }
   .bcard .land .d { display: none; }
   .bcard .why { margin-top: 4px; font-size: 11px; color: #D8517F; }
+  /* A step a run left for you: the colour of the state that holds it. */
+  .todo { margin-top: 5px; font-size: 11.5px; line-height: 1.45; color: var(--ink);
+          background: #2D9FD014; border-left: 2px solid #2D9FD0;
+          border-radius: 0 5px 5px 0; padding: 5px 9px; word-break: break-word; }
+  .todo code { font-family: var(--mono); }
   .bthreads { margin-top: 14px; }
   .bthreads .b { display: inline-block; font-size: 12px; margin: 0 6px 6px 0; }
   #bdetail { position: fixed; top: 0; right: 0; bottom: 0; width: min(680px, 96vw);
@@ -1547,7 +1552,10 @@ async function taskAction(id, action, notes) {
   // stopped, which is the only part of it you cannot see from the board.
   // Land only starts a landing; "Task landed" would claim a merge that has
   // not happened. Those two say what they did in their own words.
-  toast(r.ok ? ((action === "land" || action === "drop") && r.note ? r.note
+  // Release likewise only starts one; Done is not a verb to add -ed to.
+  toast(r.ok ? ((action === "land" || action === "drop" || action === "release") && r.note
+                 ? r.note
+               : action === "resolve" ? "Marked done"
                : `Task ${action}ed${r.note ? ` — ${r.note}` : ""}`)
              : (r.error || "Not allowed"));
   renderTasks();
@@ -1573,6 +1581,23 @@ function review(t) {
     <b>${rv.ok ? "Review passed" : "Review flagged"}</b> ${esc(rv.summary || "")}
     ${list(rv.findings, "")}${list(rv.earlier, "flagged on the earlier pass, and sent back:")}${list(rv.followups, "found alongside it:")}${filed}${list(rv.held, "held at the proposal cap, not filed:")}${unver}
   </div>`;
+}
+function yoursToDo(t) {
+  // The step a run left for you (needs_user). Without it on the card, a task
+  // that stopped short because the release was yours read as finished.
+  const n = t.needs_user;
+  // Only while it can still be acted on: waiting on you, or on approval first.
+  if (!n || !n.action || (t.state !== "needs_input" && t.state !== "awaiting_approval")) return "";
+  return `<div class="todo">🙋 <b>yours to do:</b> <code>${esc(n.action)}</code>${
+    n.why ? ` — ${esc(n.why)}` : ""}</div>`;
+}
+async function releaseStep(id) {
+  // Runs only the !release the task recorded; the request names nothing else.
+  if (!confirm("Run the release this task left for you?\n\n"
+             + "It is the same as typing the !release shown on the card. The "
+             + "result is posted to the task's thread, and the task is done "
+             + "only if the release goes out.")) return;
+  await taskAction(id, "release");
 }
 function lastEvent(t) {
   // Why a task stopped is already on the record -- transition() writes the
@@ -1658,6 +1683,13 @@ function taskButtons(t) {
     b.push(`<button class="ghost" onclick="sendBack('${t.id}',false)">Send back…</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "needs_input") {
+    // A step the run left for you: run it from here when it is a release, or
+    // say you took it. Answer still sends it back with something to go on.
+    const n = t.needs_user || {};
+    if (n.release)
+      b.push(`<button class="act" title="!release ${esc(n.release)}" onclick="releaseStep('${t.id}')">Release</button>`);
+    if (n.action)
+      b.push(`<button class="ghost" title="you took the step; close it" onclick="taskAction('${t.id}','resolve')">Done</button>`);
     b.push(`<button class="ghost" onclick="sendBack('${t.id}',true)">Answer…</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "failed") {
@@ -1706,7 +1738,7 @@ async function renderTasks() {
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
-          age(t.created)}${costText(t)}${held(t)}</div>${review(t)}${landing(t)}</span>
+          age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
   }).join("");
 }
@@ -2033,7 +2065,7 @@ function boardCard(t) {
       t.attempts > 1 ? ` · attempt ${t.attempts}` : ""}${
       t.queue_pos ? ` · <span class="qpos" title="its place in the runner's queue, all projects">${
         t.priority ? "📌 " : ""}#${t.queue_pos} in queue</span>` : ""}</div>
-    ${t.why ? `<div class="why">${esc(t.why)}</div>` : ""}${cardReview(t)}${cardLanding(t)}
+    ${t.why ? `<div class="why">${esc(t.why)}</div>` : ""}${yoursToDo(t)}${cardReview(t)}${cardLanding(t)}
     <div class="acts" onclick="event.stopPropagation()">${cardButtons(t)}</div></div>`;
 }
 function unfiledThreads() {
@@ -2142,6 +2174,7 @@ function renderDetail(t) {
       t.branch ? ` · ${esc(t.branch)}${t.commits ? ` (${t.commits})` : ""}` : ""}</div>
     <div class="acts" style="margin-top:8px">${cardButtons(t)}${t.thread_link
       ? `<a class="ghost" href="${esc(t.thread_link)}" target="_blank">Slack thread ↗</a>` : ""}</div>
+    ${yoursToDo(t)}
     <div class="sect">goal</div><pre class="goal">${esc(t.goal || "")}</pre>
     ${t.state === "failed" ? `<div class="sect">why it stopped</div><div class="rev">${esc(lastEvent(t))}</div>` : ""}
     ${(t.result || {}).review ? `<div class="sect">review</div>${review(t)}` : ""}

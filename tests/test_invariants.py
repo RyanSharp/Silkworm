@@ -69,7 +69,7 @@ def bot_functions(*names, **globals_):
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
-                  "held_reason", "edit_task", "_task_title")
+                  "held_reason", "edit_task", "_task_title", "take_step")
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -804,7 +804,9 @@ def test_review_gate():
     gate = src[src.index("def resolve_review("):src.index("def _task_scheduler(")]
     check("a review task is titled readably, not by its prompt",
           'title=f"Review: ' in gate)
-    check("passing review completes the parent", "tasks.DONE if verdict" in gate)
+    # Completes it -- or parks it on a step its run left for you; see
+    # test_a_passing_review_still_leaves_the_step_with_you for the behaviour.
+    check("passing review completes the parent", "tasks.ending(task_store.get(parent_id))" in gate)
     check("a flagged review asks the user", "tasks.AWAITING_APPROVAL" in gate)
     check("the implementor waits rather than self-certifying", "tasks.BLOCKED" in gate)
     exe = src[src.index("def execute_task("):src.index("def resolve_review(")]
@@ -8588,13 +8590,17 @@ def test_home_tab():
     dash = {}
     for cond, body in _re.findall(r'(?:if|else if) \(([^)]*)\) \{(.*?)\n  \}', fn, _re.S):
         acts = _re.findall(r"taskAction\('\$\{t\.id\}','(\w+)'\)", body)
+        acts += ["release" for _ in _re.findall(r"releaseStep\('\$\{t\.id\}'\)", body)]
         acts += ["answer" if flag == "true" else "rework"
                  for flag in _re.findall(r"sendBack\('\$\{t\.id\}',(true|false)\)", body)]
         for st in _re.findall(r't\.state === "(\w+)"', cond):
             dash[st] = set(acts)
     check("the dashboard's buttons were read", len(dash) >= 5, str(dash))
     for st, acts in dash.items():
-        mine = {a for _, a, _, _ in home.BUTTONS.get(st, [])}
+        # A task carrying a step (needs_user) is offered Release and Done as
+        # well, on both surfaces; the dashboard's branch shows every button.
+        mine = {a for _, a, _, _ in home.BUTTONS.get(st, [])
+                + (home.STEP_BUTTONS if st == T.NEEDS_INPUT else [])}
         check(f"{st}: same actions as the dashboard", mine == acts,
               f"home {sorted(mine)} vs dashboard {sorted(acts)}")
 
@@ -16693,6 +16699,472 @@ def test_board_edits_in_the_page():
     check("archived projects are a collapsed section with Unarchive",
           '<details class="parch"><summary>Archived · 1</summary>' in o["overview"]
           and "archiveProject('gone',false)" in o["overview"])
+
+# --- a run that hands you the last step must not close as done ----------------
+# tsk_fd122a33d3 ("Cut new test flight build") rightly did not release --
+# releasing is yours, and implementors cannot tag or push -- and said exactly
+# what to type: `!release cadence all minor`. Review agreed, landing found
+# nothing to land, and it closed as `done`. The board read as finished and
+# TestFlight never got a build. A run now says so in a block the record keeps,
+# and the task waits in needs_input with that step on every surface.
+
+_ASKS = ('Nothing to change in the repo: the build is cut by a release, '
+         'which is yours.\n\n```json\n'
+         '{"needs_user": "!release cadence all minor", '
+         '"why": "releasing is user-triggered"}\n```')
+
+
+def test_needs_user_block_is_read_and_fails_closed():
+    import roles
+    print("\nthe needs_user block is read, and anything else is ignored")
+    got = roles.parse_needs_user(_ASKS)
+    check("a release step is read with its reason",
+          got == {"action": "!release cadence all minor",
+                  "why": "releasing is user-triggered",
+                  "release": "cadence all minor"}, str(got))
+    other = roles.parse_needs_user('ok\n```json\n{"needs_user": "add STRIPE_KEY to .env"}\n```')
+    check("any other step is kept as text, with no release to run",
+          other == {"action": "add STRIPE_KEY to .env", "why": "", "release": ""}, str(other))
+    check("a bare object is tolerated, as a verdict's is",
+          (roles.parse_needs_user('{"needs_user": "approve the $40 plan"}') or {})
+          .get("action") == "approve the $40 plan")
+    sneaky = roles.parse_needs_user(
+        '```json\n{"needs_user": "!release cadence all minor; rm -rf ~"}\n```')
+    check("a release with anything after it is not offered as a button",
+          sneaky and sneaky["release"] == "", str(sneaky))
+    check("a release in backticks still is",
+          (roles.parse_needs_user('```json\n{"needs_user": "`!release saga app 1.2.0`"}\n```')
+           or {}).get("release") == "saga app 1.2.0")
+    for name, text in (
+            ("no block", "All done: tests pass, committed on my branch."),
+            ("json that does not parse", '```json\n{"needs_user": "x",}\n```'),
+            ("a block about something else", '```json\n{"ok": true}\n```'),
+            ("an empty action", '```json\n{"needs_user": "   "}\n```'),
+            ("an action that is not a string", '```json\n{"needs_user": ["a", "b"]}\n```'),
+            ("a block that is not an object", '```json\n["needs_user"]\n```'),
+            ("an example quoted earlier, then a final block without it",
+             'I could have said ```json\n{"needs_user": "x"}\n``` but it is done.\n'
+             '```json\n{"summary": "done"}\n```'),
+            ("nothing at all", None)):
+        check(f"{name} reads as no step (the task ends as it always did)",
+              roles.parse_needs_user(text) is None)
+    check("the note is asked of implementors and queued assistants, nobody else",
+          roles.asks_user("implementor") and roles.asks_user("assistant")
+          and not roles.asks_user("reviewer") and not roles.asks_user("ideator")
+          and not roles.asks_user("no-such-role"))
+    check("the reviewer is told an unmarked hand-off is a finding",
+          "needs_user" in roles.REVIEWER_SYSTEM and "finding" in
+          roles.REVIEWER_SYSTEM[roles.REVIEWER_SYSTEM.index("needs_user"):][:300])
+
+
+def _task_state_for(st):
+    """task_state as shipped, against a real store."""
+    import tasks as T
+    return _bot_func("task_state", task_store=st, tasks=T, log=logging.getLogger("t"))
+
+
+def test_a_run_that_hands_you_a_step_waits_for_you():
+    print("\na run that hands you a step ends in needs_input, not done")
+    import threading
+    import roles
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    root = Path(tempfile.mkdtemp())
+    told, prompts = [], []
+    state = _task_state_for(st)
+    replies = iter([_ASKS, "Released nothing; the build is cut and committed.",
+                    '```json\n{"needs_user": 7}\n```', _ASKS])
+
+    def run_turn(goal, **kw):
+        prompts.append(kw.get("append_system_prompt") or "")
+        return types.SimpleNamespace(text=next(replies), cost_usd=0.1,
+                                     duration_ms=1, session_id="s")
+    fn = _bot_func("execute_task", tasks=T, task_store=st, store=tmp_store(),
+                   roles=roles, Path=Path, run_turn=run_turn,
+                   review_branch=lambda t: "", worktrees=__import__("worktrees"),
+                   OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+                   permission_args=lambda: [], log=logging.getLogger("test"),
+                   task_thread=lambda t: ("C1", "1.0"), task_key=lambda t: "C1:1.0",
+                   task_state=state, tell_thread=lambda key, text: told.append((key, text)),
+                   defer=__import__("defer"),
+                   _thread_lock=lambda key: threading.Lock(),
+                   repo_guard=lambda *a, **k: contextlib.nullcontext(),
+                   render_block=lambda _: "", chunk=lambda text: [text],
+                   to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+                   upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+                   COST_NOTE="(list)", ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError)
+
+    def run(**fields):
+        rec = st.create("Cut new test flight build", role="assistant", project="cadence",
+                        thread="C1:1.0", driver="queue", isolate=False,
+                        scope={"cwd": str(root)}, **fields)
+        st.transition(rec["id"], T.RUNNING, "claimed")
+        fn(st.get(rec["id"]))
+        return st.get(rec["id"])
+
+    asked = run()
+    check("the run was asked to mark a step that is yours",
+          roles.NEEDS_USER_NOTE in prompts[-1])
+    check("a reply ending in a needs_user block ends in needs_input, not done",
+          asked["state"] == T.NEEDS_INPUT, asked["state"])
+    check("with the step recorded on the task",
+          (asked.get("needs_user") or {}).get("action") == "!release cadence all minor"
+          and asked["needs_user"].get("release") == "cadence all minor", str(asked.get("needs_user")))
+    check("and said in the event that parked it",
+          asked["events"][-1]["detail"] == T.NEEDS_USER_PREFIX + "!release cadence all minor",
+          asked["events"][-1]["detail"])
+    check("and in its thread, once", sum("!release cadence all minor" in t for _, t in told) == 1
+          and told[-1][0] == "C1:1.0", str(told))
+    check("it is in front of you", asked["id"] in [t["id"] for t in st.needs_attention()])
+    plain = run()
+    check("a reply without one ends done, as before",
+          plain["state"] == T.DONE and plain.get("needs_user") is None, plain["state"])
+    bad = run()
+    check("a malformed block fails closed to done",
+          bad["state"] == T.DONE and bad.get("needs_user") is None, bad["state"])
+    watch = run(source="defer")
+    check("a scheduled wake-up is neither asked nor read for one",
+          watch["state"] == T.DONE and watch.get("needs_user") is None
+          and roles.NEEDS_USER_NOTE not in prompts[-1], watch["state"])
+
+
+def test_a_passing_review_still_leaves_the_step_with_you():
+    print("\nreview passing does not close a task that left you a step")
+    from unittest.mock import MagicMock
+    import roles
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    state = _task_state_for(st)
+    told = []
+    resolve = _bot_func("resolve_review", task_store=st, tasks=T, roles=roles,
+                        app=MagicMock(), time=time, task_state=state,
+                        tell_thread=lambda key, text: told.append((key, text)),
+                        merge=__import__("merge"),
+                        # What land_if_ready's never() returns for a task
+                        # whose job was already done: nothing to land.
+                        land_and_record=lambda *a: {"eligible": False, "landed": False,
+                                                    "stage": "nothing-to-land"},
+                        file_followups=lambda *a, **k: [],
+                        rework_flagged_review=lambda *a: False,
+                        rework_conflict=lambda *a: False, log=logging.getLogger("t"))
+
+    def reviewed(ok, asks):
+        impl = st.create("Cut new test flight build", role="implementor", project="cadence")
+        st.transition(impl["id"], T.RUNNING)
+        st.update(impl["id"], needs_user=asks)
+        st.transition(impl["id"], T.BLOCKED, "awaiting review")
+        rev = st.create("review it", role="reviewer", parent=impl["id"])
+        resolve(dict(rev), "reviewer", '```json\n' + json.dumps(
+            {"ok": ok, "summary": "fine" if ok else "wrong",
+             "findings": [] if ok else ["it is wrong"]}) + '\n```', "C1", "1.0")
+        return st.get(impl["id"])
+
+    step = roles.parse_needs_user(_ASKS)
+    t = reviewed(True, step)
+    check("passed review, nothing to land, a step left: needs_input",
+          t["state"] == T.NEEDS_INPUT and t["needs_user"] == step, t["state"])
+    check("and its thread is told the step is now over to you",
+          any("!release cadence all minor" in text for _, text in told), str(told))
+    check("the verdict is still recorded on it",
+          ((t.get("result") or {}).get("review") or {}).get("ok") is True)
+    check("without a step, the same verdict closes it", reviewed(True, None)["state"] == T.DONE)
+    check("a flagged review still goes to approval, step and all",
+          reviewed(False, step)["state"] == T.AWAITING_APPROVAL)
+    # Closed by you while its review ran: it stays closed, and says nothing.
+    impl = st.create("closed meanwhile", role="implementor", project="cadence")
+    st.transition(impl["id"], T.RUNNING)
+    st.update(impl["id"], needs_user=step)
+    st.transition(impl["id"], T.BLOCKED, "awaiting review")
+    st.transition(impl["id"], T.DONE, "approve via you")
+    before = len(told)
+    rev = st.create("review it", role="reviewer", parent=impl["id"])
+    resolve(dict(rev), "reviewer", '```json\n{"ok": true, "summary": "fine"}\n```', "C1", "1.0")
+    check("a parent closed during its review is not told it waits on you",
+          st.get(impl["id"])["state"] == T.DONE and len(told) == before, str(told[before:]))
+
+
+def test_the_step_is_on_every_surface():
+    print("\nthe step shows on the board, the Slack board and the digest")
+    import board
+    import digest
+    import home
+    import roles
+    import tasks as T
+    sys.argv = ["x"]
+    import visualizer as V
+    now = time.time()
+    step = roles.parse_needs_user(_ASKS)
+    rec = {"id": "tsk_rel", "title": "Cut new test flight build", "project": "cadence",
+           "state": T.NEEDS_INPUT, "role": "implementor", "needs_user": step,
+           "created": now - 600, "updated": now - 60, "thread": "C1:1.0",
+           "events": [{"at": now - 60, "kind": T.NEEDS_INPUT,
+                       "detail": T.NEEDS_USER_PREFIX + step["action"]}]}
+    other = dict(rec, id="tsk_key", needs_user={"action": "add the APNs key", "why": "",
+                                                 "release": ""})
+    held = dict(rec, id="tsk_held", needs_user=None, title="Held task",
+                events=[{"at": now - 60, "kind": T.NEEDS_INPUT,
+                         "detail": "not run: cadence needs a test command"}])
+
+    check("a board card carries the step", board.card(rec).get("needs_user") == step)
+
+    line = json.dumps(home.render([rec], now=now, compact=True), ensure_ascii=False)
+    # With its reason: the parking event says the command too, so the command
+    # alone would pass on a line that read the event and not the step.
+    check("the Slack board line names the step, and why",
+          "yours to do: !release cadence all minor \u2014 releasing is user-triggered" in line,
+          line[:300])
+    acts = [b[1] for b in home.buttons_for(rec)]
+    check("and offers Release and Done ahead of Answer and Dismiss",
+          acts == ["release", "resolve", "answer", "dismiss"], str(acts))
+    check("a step that is not a release offers Done, not Release",
+          [b[1] for b in home.buttons_for(other)] == ["resolve", "answer", "dismiss"])
+    check("a task held for another reason is offered what it always was",
+          home.buttons_for(held) == home.BUTTONS[T.NEEDS_INPUT])
+    check("the Release confirmation names the exact command",
+          "!release cadence all minor" in json.dumps(home.confirm_modal(rec, "release")))
+    check("both are actions the Slack board relays", {"release", "resolve"} <= set(home.DIRECT))
+
+    text = digest.render([rec, held], now)
+    check("the digest lists it under yours to do, with the command",
+          "yours to do" in text and "!release cadence all minor" in text, text)
+    check("and not also as held, which is for the system's own holds",
+          "held: yours to do" not in text and "held: not run" in text, text)
+
+    js = _re.search(r"<script>(.*?)</script>", V.PAGE, _re.S).group(1)
+    esc = _re.search(r"const esc = .*", js).group(0)
+    fns = "".join(js[js.index(f"function {n}("):js.index("\n}\n", js.index(f"function {n}(")) + 3]
+                  for n in ("taskButtons", "yoursToDo"))
+    harness = (esc + "\n" + fns + "\nprocess.stdout.write(JSON.stringify({"
+               "rel: taskButtons(JSON.parse(process.env.REL)) + yoursToDo(JSON.parse(process.env.REL)),"
+               "key: taskButtons(JSON.parse(process.env.KEY)),"
+               "held: taskButtons(JSON.parse(process.env.HELD)) + yoursToDo(JSON.parse(process.env.HELD)),"
+               "done: yoursToDo(Object.assign(JSON.parse(process.env.REL), {state: 'done'})),"
+               "failed: yoursToDo(Object.assign(JSON.parse(process.env.REL), {state: 'failed'}))}));")
+    try:
+        out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=30,
+                             env={**os.environ, "REL": json.dumps(rec), "KEY": json.dumps(other),
+                                  "HELD": json.dumps(held)})
+        got = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError):
+        print("    (node unavailable — the dashboard is checked by the board payload only)")
+        return
+    except ValueError:
+        check("the dashboard's renderers run", False, out.stderr[-300:])
+        return
+    check("the dashboard shows the step on the card",
+          "yours to do" in got["rel"] and "!release cadence all minor" in got["rel"], got["rel"])
+    check("with a Release button for a release",
+          "releaseStep('tsk_rel')" in got["rel"] and "taskAction('tsk_rel','resolve')" in got["rel"])
+    check("and only Done for anything else",
+          "releaseStep" not in got["key"] and "taskAction('tsk_key','resolve')" in got["key"])
+    check("a task held for another reason has neither",
+          "releaseStep" not in got["held"] and "resolve" not in got["held"]
+          and "yours to do" not in got["held"])
+    check("a finished or failed task no longer shows it", got["done"] == got["failed"] == "")
+    rs = js[js.index("async function releaseStep("):js.index("\n}\n", js.index("async function releaseStep("))]
+    check("the Release button confirms, then sends only the task id",
+          "confirm(" in rs and 'taskAction(id, "release")' in rs)
+
+
+def test_taking_the_step_from_the_board():
+    print("\nRelease and Done close a task only when the step is taken")
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    said, ran, landings = [], [], []
+    state = _task_state_for(st)
+    started = {"ok": None}
+
+    def release_command(arg, post, then=None):
+        ran.append(arg)
+        if arg.startswith("busy"):
+            return "A release of `busy` is already running."
+        started["then"] = then
+        return ":rocket: Releasing `cadence` (everything pending, minor)…"
+    ns = bot_functions("handle_tasks", "approve_task", task_store=st, tasks=T,
+                       holding=__import__("holding"), task_state=state,
+                       release_command=release_command, RELEASE_STARTED=":rocket:",
+                       LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
+                       tell_thread=lambda key, text: said.append(text),
+                       stop_task=lambda tid: False,
+                       start_landing=lambda tid, **k: landings.append((tid, k)))
+    route = ns["handle_tasks"]
+
+    def parked(asks):
+        t = st.create("Cut new test flight build", role="implementor", project="cadence",
+                      thread="C1:1.0")
+        st.transition(t["id"], T.RUNNING)
+        st.update(t["id"], needs_user=asks)
+        st.transition(t["id"], T.NEEDS_INPUT, "yours")
+        return t["id"]
+
+    rel = {"action": "!release cadence all minor", "why": "", "release": "cadence all minor"}
+    a = parked(rel)
+    r = route({"action": "release", "id": a, "by": "you"})
+    check("Release runs the recorded command, nothing else",
+          r["ok"] and ran == ["cadence all minor"], str(r))
+    check("the task waits while the release is going", st.get(a)["state"] == T.NEEDS_INPUT)
+    started["then"](False)
+    check("a release that does not go out leaves it waiting on you",
+          st.get(a)["state"] == T.NEEDS_INPUT)
+    started["then"](True)
+    check("one that does closes it as done, saying how",
+          st.get(a)["state"] == T.DONE and "released via you" in st.get(a)["events"][-1]["detail"])
+    check("and its thread is told what was run", any("!release cadence all minor" in x for x in said))
+
+    b = parked(dict(rel, release="busy all minor"))
+    r = route({"action": "release", "id": b})
+    check("a release that could not start is refused with its reason",
+          not r["ok"] and "already running" in r["error"] and st.get(b)["state"] == T.NEEDS_INPUT)
+    c = parked({"action": "add the APNs key", "why": "", "release": ""})
+    r = route({"action": "release", "id": c})
+    check("a step that is not a release cannot be run", not r["ok"] and ran[-1] == "busy all minor")
+    r = route({"action": "resolve", "id": c, "by": "you"})
+    check("Done closes it, attributed",
+          r["ok"] and st.get(c)["state"] == T.DONE and "done via you" in st.get(c)["events"][-1]["detail"])
+    q = st.create("queued work")["id"]
+    check("neither acts on a task that is not waiting on you",
+          not route({"action": "resolve", "id": q})["ok"]
+          and not route({"action": "release", "id": q})["ok"] and st.get(q)["state"] == T.QUEUED)
+
+    # Approving flagged work does not take the step for you either.
+    d = st.create("flagged, with a step", role="implementor", thread="C1:1.0")["id"]
+    st.transition(d, T.RUNNING); st.update(d, needs_user=rel)
+    st.transition(d, T.AWAITING_APPROVAL, "flagged")
+    r = route({"action": "approve", "id": d})
+    check("approving work that left you a step parks it on that step",
+          r["ok"] and st.get(d)["state"] == T.NEEDS_INPUT
+          and st.get(d)["events"][-1]["detail"].startswith(T.NEEDS_USER_PREFIX),
+          str(st.get(d)["state"]))
+    check("and still lands it, as approving always does",
+          landings == [(d, {"approved": True})], str(landings))
+    r = route({"action": "approve", "id": d})
+    check("a second Approve does not close it past its step",
+          not r["ok"] and st.get(d)["state"] == T.NEEDS_INPUT, str(r))
+
+    # Not while the branch it approved is still landing, or was refused.
+    for stage, eligible, landed in (("in-progress", False, False), ("rebase", True, False)):
+        e = parked(rel)
+        st.update(e, result={"landing": {"stage": stage, "eligible": eligible,
+                                         "landed": landed}})
+        before = len(ran)
+        r = route({"action": "release", "id": e})
+        check(f"Release waits for a landing that is {stage}",
+              not r["ok"] and "has not landed" in r["error"] and len(ran) == before, str(r))
+    e = parked(rel)
+    st.update(e, result={"landing": {"stage": "merged", "eligible": True, "landed": True}})
+    check("and runs once the branch has landed", route({"action": "release", "id": e})["ok"])
+
+    # A release outlives the click: the task may have moved on by its end.
+    f = parked(rel)
+    route({"action": "release", "id": f})
+    late = started["then"]
+    r = route({"action": "rework", "id": f, "notes": "actually, bump it to major"})
+    check("sending it back clears the step it was waiting on",
+          r["ok"] and st.get(f)["state"] == T.QUEUED and st.get(f).get("needs_user") is None,
+          str(st.get(f).get("needs_user")))
+    st.transition(f, T.RUNNING, "claimed")
+    late(True)
+    check("a release finishing after that does not close the rerun",
+          st.get(f)["state"] == T.RUNNING, st.get(f)["state"])
+    g = parked(rel)
+    st.transition(g, T.QUEUED, "answered")
+    check("nor does Done on a task no longer waiting on you",
+          not route({"action": "resolve", "id": g})["ok"] and st.get(g)["state"] == T.QUEUED)
+
+
+# --- a person may not send back, requeue or close a task mid-run -------------
+# On 2026-10-07 Send back with notes reached tsk_3172171f8b a minute after the
+# runner claimed it. running -> queued is legal -- it is how the runner sends
+# back its own failing work -- so the route requeued a task mid-run, and that
+# run never saw the notes.
+
+def test_a_running_task_refuses_a_persons_send_back():
+    print("\na running task refuses a person's send-back, the runner's still work")
+    from unittest.mock import MagicMock
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    state = _bot_func("task_state", task_store=st, tasks=T, log=logging.getLogger("t"))
+    ns = bot_functions("handle_tasks", "approve_task", task_store=st, tasks=T,
+                       holding=__import__("holding"), stop_task=lambda tid: True,
+                       start_landing=lambda tid: None, tell_thread=lambda *a: None)
+    route = ns["handle_tasks"]
+
+    def running(goal="the job"):
+        t = st.create(goal, driver="queue")
+        st.transition(t["id"], T.RUNNING, "claimed")
+        return t["id"]
+
+    tid = running()
+    r = route({"action": "rework", "id": tid, "notes": "also fix the footer", "by": "you"})
+    check("Send back on a running task is refused, saying what to do instead",
+          not r["ok"] and r["error"] == T.RUNNING_REFUSAL, str(r))
+    t = st.get(tid)
+    check("and changes nothing: still running, goal untouched, no event",
+          t["state"] == T.RUNNING and t["goal"] == "the job"
+          and t["events"][-1]["kind"] == T.RUNNING, str(t["state"]))
+    for action in ("retry", "accept", "approve"):
+        r = route({"action": action, "id": tid})
+        check(f"{action} on a running task is refused too",
+              not r["ok"] and "it is running" in r["error"]
+              and st.get(tid)["state"] == T.RUNNING, str(r))
+    r = route({"action": "cancel", "id": tid})
+    check("Stop still works on a running task",
+          r["ok"] and st.get(tid)["state"] == T.CANCELLED, str(r))
+
+    # The same refusal is asked under the store's lock, not only before it.
+    racing = running()
+    try:
+        st.transition(racing, T.QUEUED, "x", refuse_running=T.RUNNING_REFUSAL,
+                      fields={"goal": "changed"})
+        refused = False
+    except T.NotEditable:
+        refused = True
+    check("the store refuses the move itself, writing none of its fields",
+          refused and st.get(racing)["goal"] == "the job" and st.get(racing)["state"] == T.RUNNING)
+    try:
+        st.transition(racing, T.NEEDS_INPUT, "approved", expect=T.AWAITING_APPROVAL)
+        moved = True
+    except T.InvalidTransition:
+        moved = False
+    check("and a move decided on a state it has since left is refused under the lock",
+          not moved and st.get(racing)["state"] == T.RUNNING)
+
+    # After it finishes, the send-back goes through with the notes attached.
+    st.transition(racing, T.AWAITING_APPROVAL, "flagged")
+    r = route({"action": "rework", "id": racing, "notes": "also fix the footer"})
+    check("sent back once it has finished, the notes are on the goal",
+          r["ok"] and st.get(racing)["state"] == T.QUEUED
+          and "also fix the footer" in st.get(racing)["goal"], str(r))
+
+    # The runner's own send-backs, from running and from a review, still requeue.
+    app = MagicMock()
+    for_tests = _bot_func("send_back_for_tests", task_store=st, tasks=T, task_state=state,
+                          app=app, verify=__import__("verify"), MAX_VERIFY_ATTEMPTS=2)
+    mid = running()
+    for_tests(st.get(mid), {"ok": False, "ran": True, "output": "1 failed"}, "C1", "1.0")
+    check("failing tests still send a running task back",
+          st.get(mid)["state"] == T.QUEUED and "1 failed" in st.get(mid)["goal"],
+          st.get(mid)["state"])
+    send_back = _bot_func("send_back", task_store=st, tasks=T)
+    conflict = _bot_func("rework_conflict", task_store=st, tasks=T, send_back=send_back,
+                         _unsupervised=lambda t: True, CONFLICT_STAGES=("rebase",),
+                         MAX_CONFLICT_REWORKS=1,
+                         conflict_addendum=lambda *a: "catch up with main",
+                         tell_thread=lambda *a: None)
+    parked = running()
+    st.transition(parked, T.BLOCKED, "awaiting review")
+    sent = conflict(parked, {"stage": "rebase", "branch": "silkworm/x"}, "C1", "1.0")
+    check("a landing conflict still sends its task back",
+          sent and st.get(parked)["state"] == T.QUEUED
+          and "catch up with main" in st.get(parked)["goal"], st.get(parked)["state"])
+    own = running()
+    try:
+        send_back(own, "the runner's own note", "sent back")
+    except (T.NotEditable, T.InvalidTransition):
+        pass                        # reported by the check below, not raised
+    check("and send_back itself, unmarked, still requeues a running task",
+          st.get(own)["state"] == T.QUEUED and "the runner's own note" in st.get(own)["goal"])
+
 
 if __name__ == "__main__":
     tests = discover()

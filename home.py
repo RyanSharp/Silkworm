@@ -63,8 +63,15 @@ BUTTONS = {
     tasks.BLOCKED: [("Cancel", "cancel", None, "Cancel this task?")],
 }
 
+#: Offered ahead of BUTTONS[needs_input] when the run left you a step
+#: (`needs_user`), as the dashboard does: Release only when that step is a
+#: `!release` the board can run, Done always. See buttons_for().
+STEP_BUTTONS = [("Release", "release", "primary", None),
+                ("Done", "resolve", None,
+                 "Mark this done? Only if you have taken the step yourself.")]
+
 #: Actions that are a plain call to handle_tasks; the others open a modal.
-DIRECT = ("accept", "dismiss", "approve", "retry", "cancel")
+DIRECT = ("accept", "dismiss", "approve", "retry", "cancel", "release", "resolve")
 MODAL_CALLBACK = "home_rework"
 CONFIRM_CALLBACK = "home_confirm"
 STATE_ICON = {tasks.AWAITING_APPROVAL: ":eyes:", tasks.NEEDS_INPUT: ":speech_balloon:",
@@ -72,6 +79,31 @@ STATE_ICON = {tasks.AWAITING_APPROVAL: ":eyes:", tasks.NEEDS_INPUT: ":speech_bal
 
 
 # --- rendering (pure) ---------------------------------------------------------
+
+def buttons_for(task: dict) -> list:
+    """BUTTONS for the task's state, plus the step buttons if it has one."""
+    state = task.get("state")
+    base = BUTTONS.get(state, [])
+    asks = task.get("needs_user") or {}
+    if state != tasks.NEEDS_INPUT or not asks.get("action"):
+        return base
+    step = []
+    for label_, action, style, confirm in STEP_BUTTONS:
+        if action == "release":
+            if not asks.get("release"):
+                continue
+            confirm = (f"Run `!release {asks['release']}` now? The result goes to "
+                       "the task's thread, and it is done only if the release goes out.")
+        step.append((label_, action, style, confirm))
+    return step + base
+
+
+def _yours(task: dict) -> str:
+    """The step a run left for you, as one line, or ""."""
+    asks = task.get("needs_user") or {}
+    if task.get("state") in tasks.TERMINAL or not asks.get("action"):
+        return ""
+    return f"yours to do: {asks['action']}" + (f" — {asks['why']}" if asks.get("why") else "")
 
 def esc(text) -> str:
     """Escape for Slack mrkdwn. A goal is arbitrary text; `<` in one would
@@ -170,6 +202,9 @@ def _detail(task: dict) -> str:
         elif task.get("verified") is False:
             lines.append(":x: tests failed")
         return "\n".join(lines)
+    yours = _yours(task)
+    if state == tasks.NEEDS_INPUT and yours:
+        return f":raising_hand: {esc(clip(yours, 400))}"
     events = task.get("events") or []
     if state in (tasks.FAILED, tasks.NEEDS_INPUT) and events:
         detail = (events[-1] or {}).get("detail") or ""
@@ -201,7 +236,7 @@ def _task_blocks(task: dict, now: float, base_url: str,
     # The value carries the state the button was drawn for; see seen_state().
     stamp = f"{tid}|{task.get('state', '')}"
     buttons = [_button(*b[:2], stamp, style=b[2], confirm=b[3])
-               for b in BUTTONS.get(task.get("state"), [])]
+               for b in buttons_for(task)]
     url = thread_url(task.get("thread", ""), base_url)
     if url:
         buttons.append(_button("Thread", "thread", tid, url=url))
@@ -218,6 +253,8 @@ def _summary_line(task: dict) -> str:
         n = len(review.get("findings") or [])
         head = review.get("summary") or ""
         return (f"{n} finding{'s' if n != 1 else ''}: " if n else "") + head
+    if task.get("state") == tasks.NEEDS_INPUT and _yours(task):
+        return _yours(task)
     events = task.get("events") or []
     if task.get("state") in (tasks.FAILED, tasks.NEEDS_INPUT) and events:
         return (events[-1] or {}).get("detail") or ""
@@ -246,7 +283,7 @@ def _task_line(task: dict, now: float, base_url: str, cost: str = "") -> dict:
     text = f"*{esc(clip(label(task), 90))}*\n{' · '.join(m for m in meta if m)}" + \
         (f" — _{line}_" if line else "")
     options = [{"text": {"type": "plain_text", "text": b[0].rstrip("…")[:75]},
-                "value": f"{b[1]}|{tid}|{state}"} for b in BUTTONS.get(state, [])]
+                "value": f"{b[1]}|{tid}|{state}"} for b in buttons_for(task)]
     url = thread_url(task.get("thread", ""), base_url)
     if url:
         options.append({"text": {"type": "plain_text", "text": "Open thread"},
@@ -274,6 +311,8 @@ def full_detail(task: dict) -> str:
             lines.append(":test_tube: tests pass")
         elif task.get("verified") is False:
             lines.append(":x: tests failed")
+    elif state == tasks.NEEDS_INPUT and _yours(task):
+        lines.append(f":raising_hand: *{esc(_yours(task))}*")
     elif state in (tasks.FAILED, tasks.NEEDS_INPUT):
         detail = ((task.get("events") or [{}])[-1] or {}).get("detail") or ""
         if detail:
@@ -286,7 +325,8 @@ def full_detail(task: dict) -> str:
 
 #: What the confirm button says for each action.
 VERB = {"accept": "Accept", "dismiss": "Dismiss", "approve": "Approve",
-        "retry": "Retry", "cancel": "Cancel task"}
+        "retry": "Retry", "cancel": "Cancel task", "release": "Release",
+        "resolve": "Mark done"}
 
 
 def confirm_modal(task: dict, action: str) -> dict:
@@ -306,7 +346,10 @@ def confirm_modal(task: dict, action: str) -> dict:
             {"type": "section", "text": _text(full_detail(task))},
         ] + ([{"type": "context", "elements": [_text(
             "Approving lands the branch: rebase, tests, merge, tests.")]}]
-             if action == "approve" else []),
+             if action == "approve" else []) + ([{"type": "context", "elements": [_text(
+            f"Runs `!release {esc((task.get('needs_user') or {}).get('release', ''))}`; "
+            "the result goes to the task's thread.")]}]
+             if action == "release" else []),
     }
 
 
@@ -667,7 +710,8 @@ class Home:
             return f":warning: Couldn't {action} `{tid}`: {esc(r.get('error') or 'refused')}"
         done = {"accept": "Accepted", "dismiss": "Dismissed", "approve": "Approved",
                 "retry": "Requeued", "cancel": "Cancelled", "rework": "Sent back",
-                "answer": "Answered"}.get(action, action)
+                "answer": "Answered", "release": "Releasing",
+                "resolve": "Marked done"}.get(action, action)
         note = f" — {esc(r['note'])}" if r.get("note") else ""
         return f":white_check_mark: {done} `{tid}`{note}"
 

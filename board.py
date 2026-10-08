@@ -184,6 +184,8 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None) -> dict:
         "unmerged": unmerged,
         # Why a failed task stopped -- the event that put it there.
         "why": _why(rec) if rec.get("state") == tasks.FAILED else "",
+        # The step its run left for you, which keeps it in Needs you.
+        "needs_user": rec.get("needs_user") or None,
     }
 
 
