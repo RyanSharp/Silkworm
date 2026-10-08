@@ -1035,6 +1035,23 @@ _releasing_guard = threading.Lock()
 RELEASE_STARTED = ":rocket:"
 
 
+def release_drain_refusal() -> str:
+    """Why no release may start now, or "" if one may.
+
+    A deploy drains before it restarts, and the restart kills a release's
+    daemon thread wherever it is: migrations pushed and functions not
+    deployed, or a tag pushed and the targets after it never run. So while a
+    drain is in force no release starts -- asked under `_releasing_guard`, so
+    a release either was refused or is in `_releasing`, which the drain waits
+    on (drain.busy)."""
+    if DRAIN.remaining() <= 0:
+        return ""
+    why = DRAIN.reason()
+    return (f"a deploy is draining the bot{f' ({why})' if why else ''}, and a restart "
+            "would cut a release off part-way; nothing was released -- retry once "
+            "the deploy has restarted it")
+
+
 def release_checkout(slug: str) -> tuple[str, str]:
     """(repo, base) a project releases from: its own checkout, on its base
     branch (the project's, as it stands now; "main" when it names none). An
@@ -1079,6 +1096,9 @@ def release_command(arg: str, post, then=None) -> str:
     with _releasing_guard:
         if slug in _releasing:
             return f"A release of `{slug}` is already running."
+        refused = release_drain_refusal()
+        if refused:
+            return f":hourglass: Not releasing `{slug}`: {refused}."
         _releasing.add(slug)
     threading.Thread(target=run_release, args=(slug, repo, base, names, level, post),
                      kwargs={"then": then}, daemon=True, name=f"release-{slug}").start()
@@ -1328,6 +1348,9 @@ def start_release(slug: str, names, levels, confirm: str, by: str, post=None,
     with _releasing_guard:
         if slug in _releasing:
             return {"ok": False, "error": f"a release of {slug} is already running"}
+        refused = release_drain_refusal()
+        if refused:
+            return {"ok": False, "error": refused}
         _releasing.add(slug)
     run = {"slug": slug, "by": by, "started": time.time(), "finished": None,
            "effects": offer["effects"], "lines": [], "released": [], "ok": None}
@@ -1784,7 +1807,8 @@ def handle_drain(payload: dict) -> dict:
             "seconds": round(DRAIN.remaining()),
             "running": drain.busy(list(task_store.all().values()),
                                   landing=set(_landing_now),
-                                  live=set(RUNNING_TASKS)),
+                                  live=set(RUNNING_TASKS),
+                                  releasing=set(_releasing)),
             "revision": REVISION.get("sha") or ""}
 
 

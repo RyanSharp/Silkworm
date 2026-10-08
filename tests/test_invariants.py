@@ -69,7 +69,8 @@ def bot_functions(*names, **globals_):
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
-                  "held_reason", "edit_task", "_task_title", "take_step", "release_steps")
+                  "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
+                  "release_drain_refusal")
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -10621,7 +10622,7 @@ after = ["backend"]
     import worktrees as W
     ns = {"releases": R, "project_store": Projects(), "worktrees": W, "threading": threading,
           "log": logging.getLogger("test"),
-          "repo_guard": lambda cwd: contextlib.nullcontext()}
+          "repo_guard": lambda cwd: contextlib.nullcontext(), "DRAIN": __import__("drain").Drain()}
     ns["board"] = __import__("board")
     _bot_fns({"release_command", "release_plan", "run_release", "_releasing", "_releasing_guard",
               "_board_releases", "release_checkout"}, ns)
@@ -17298,12 +17299,13 @@ commands = ["exit 3"]
           "repo_guard": lambda cwd: contextlib.nullcontext(),
           "ALLOWED_USERS": {"U_ME"}, "home_channel": lambda: "D1", "board": B,
           "app": types.SimpleNamespace(client=Client()),
-          "board_release": lambda slug: B.release_status(ps.scope_for(slug).get("cwd"))}
+          "board_release": lambda slug: B.release_status(ps.scope_for(slug).get("cwd")),
+          "DRAIN": __import__("drain").Drain()}
     _bot_fns({"release_command", "release_plan", "run_release", "_releasing",
               "_releasing_guard", "release_steps", "_release_runs", "release_allowed",
               "_release_names", "release_offer", "start_release", "release_thread",
               "releasable_projects", "handle_releases", "_board_releases",
-              "release_checkout"}, ns)
+              "release_checkout", "RELEASE_STARTED"}, ns)
     return types.SimpleNamespace(ns=ns, repo=repo, origin=origin, root=root, g=g,
                                  commit=commit, log=log_, posts=posts, ps=ps)
 
@@ -17464,6 +17466,107 @@ def test_release_route():
     check("a release whose plan moved under it ships nothing",
           "backend/v1.0.1" not in tags() and any("changed after it was confirmed" in x for x in posted),
           posted)
+
+
+def test_no_release_starts_while_a_deploy_drains():
+    import drain as D
+    import home
+    import tasks as T
+    print("\na deploy waits for a release in flight, and no release starts while it drains")
+
+    # A release in flight is something a restart would kill.
+    rows = D.busy([], releasing={"alpha"})
+    check("drain.busy reports a release in flight",
+          [(r["id"], r["kind"]) for r in rows] == [("alpha", "release")], str(rows))
+    handle = _bot_func("handle_drain", DRAIN=D.Drain(), drain=D,
+                       task_store=types.SimpleNamespace(all=lambda: {}),
+                       _landing_now=set(), RUNNING_TASKS={}, _releasing={"alpha"},
+                       REVISION={"sha": "abc"})
+    r = handle({"action": "status"})
+    check("the /drain answer names it, so deploy and idle restart wait on it",
+          any(row["kind"] == "release" and row["id"] == "alpha" for row in r["running"]), str(r))
+
+    def settle(fx):
+        end = time.time() + 60
+        while fx.ns["_releasing"] and time.time() < end:
+            time.sleep(0.05)
+
+    # !release
+    fx = _release_fixture()
+    fx.ns["DRAIN"].start(600, why="deploy")
+    said = []
+    reply = fx.ns["release_command"]("alpha ios", said.append)
+    check("!release is refused while a deploy drains",
+          "draining" in reply and not reply.startswith(":rocket:")
+          and not fx.ns["_releasing"] and not fx.g("tag", "-l").stdout.strip(), reply)
+    fx.ns["DRAIN"].stop()
+    reply = fx.ns["release_command"]("alpha ios", said.append)
+    settle(fx)
+    check("!release starts once the drain is lifted",
+          reply.startswith(":rocket:") and "ios/v1.1.1" in fx.g("tag", "-l").stdout, reply)
+
+    # The dashboard's Release: handle_releases start
+    fx = _release_fixture()
+    hr = fx.ns["handle_releases"]
+    confirm = hr({"action": "plan", "slug": "alpha", "targets": ["ios"]})["confirm"]
+    fx.ns["DRAIN"].start(600, why="deploy")
+    r = hr({"action": "start", "slug": "alpha", "targets": ["ios"], "confirm": confirm})
+    check("the dashboard's release is refused while a deploy drains",
+          not r["ok"] and "draining" in r["error"] and not fx.ns["_releasing"]
+          and not fx.ns["_release_runs"], r)
+    fx.ns["DRAIN"].stop()
+    r = hr({"action": "start", "slug": "alpha", "targets": ["ios"], "confirm": confirm})
+    st = _wait_release(hr, "alpha")
+    check("the dashboard's release starts once the drain is lifted",
+          r["ok"] and st["run"]["released"] == ["backend/v1.0.0", "ios/v1.1.1"], (r, st))
+
+    # The Slack board's Release
+    fx = _release_fixture()
+    hr = fx.ns["handle_releases"]
+    hub = home.Home(store=T.TaskStore(fx.root / "t.json"), call=lambda p: {"ok": True},
+                    allowed_users={"U_ME"}, release_call=hr)
+    hub._spawn = lambda fn: fn()
+    hub.publish = lambda *a, **k: None
+    meta = {"slug": "alpha", "level": "patch",
+            "confirm": hr({"action": "plan", "slug": "alpha"})["confirm"]}
+    view = {"private_metadata": json.dumps(meta)}
+    fx.ns["DRAIN"].start(600, why="deploy")
+    hub.on_release(lambda **k: None, {"user": {"id": "U_ME"}}, None, view)
+    check("the board's release is refused while a deploy drains",
+          "Couldn't release" in hub._notices["U_ME"][0] and "draining" in hub._notices["U_ME"][0]
+          and not fx.ns["_release_runs"] and not fx.log.exists(), hub._notices)
+    fx.ns["DRAIN"].stop()
+    hub.on_release(lambda **k: None, {"user": {"id": "U_ME"}}, None, view)
+    _wait_release(hr, "alpha")
+    check("the board's release starts once the drain is lifted",
+          "Releasing" in hub._notices["U_ME"][0] and fx.log.exists(), hub._notices)
+
+    # A run's needs_user Release step
+    fx = _release_fixture()
+    st = T.TaskStore(fx.root / "t.json")
+    told = []
+    ns = bot_functions("handle_tasks", task_store=st, tasks=T,
+                       holding=__import__("holding"), task_state=_task_state_for(st),
+                       release_command=fx.ns["release_command"], RELEASE_STARTED=":rocket:",
+                       LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
+                       roles=__import__("roles"),
+                       tell_thread=lambda key, text: told.append(text),
+                       stop_task=lambda tid: False, start_landing=lambda tid, **k: None)
+    t = st.create("Ship it", role="implementor", project="alpha", thread="C1:1.0")
+    st.transition(t["id"], T.RUNNING)
+    st.update(t["id"], needs_user={"action": "!release alpha ios", "why": "",
+                                   "release": "alpha ios"})
+    st.transition(t["id"], T.NEEDS_INPUT, "yours")
+    fx.ns["DRAIN"].start(600, why="deploy")
+    r = ns["handle_tasks"]({"action": "release", "id": t["id"], "by": "you"})
+    check("a needs_user Release step is refused while a deploy drains",
+          not r["ok"] and "draining" in r["error"] and not fx.ns["_releasing"]
+          and st.get(t["id"])["state"] == T.NEEDS_INPUT, r)
+    fx.ns["DRAIN"].stop()
+    r = ns["handle_tasks"]({"action": "release", "id": t["id"], "by": "you"})
+    settle(fx)
+    check("the Release step runs once the drain is lifted, and closes the task",
+          r["ok"] and st.get(t["id"])["state"] == T.DONE, (r, st.get(t["id"])["state"]))
 
 
 def test_release_from_the_slack_board():

@@ -827,7 +827,8 @@ def run_suite() -> int:
 
 
 def busy_line(row: dict) -> str:
-    kind = "landing" if row.get("kind") == "landing" else (row.get("driver") or "task")
+    kind = (row["kind"] if row.get("kind") in ("landing", "release")
+            else (row.get("driver") or "task"))
     orphan = "" if row.get("live", True) else " — no live process holds it"
     return f"{row.get('id', '?')} ({kind}) {row.get('title', '')[:56]}{orphan}"
 
