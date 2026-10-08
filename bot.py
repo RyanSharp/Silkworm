@@ -2027,6 +2027,13 @@ def take_step(action: str, payload: dict) -> dict:
         return {"ok": True, "task": moved}
     if not asks.get("release"):
         return {"ok": False, "error": "it did not leave a release to run"}
+    # Checked again here, not only when it was recorded: records written
+    # before that check, and anything else that reaches the store, still name
+    # whatever the run wrote.
+    if not roles.release_is_for(asks["release"], task.get("project")):
+        return {"ok": False, "error": f"`!release {asks['release']}` is not a release of "
+                                      f"this task's project ({task.get('project') or 'none'}); "
+                                      "run it yourself if you mean it, then mark this Done"}
     # Approving parks a task with a step here and starts its landing. Shipping
     # the base while that branch is mid-landing, or after it was refused,
     # would release without the work and then close the task as if it had.
@@ -3866,7 +3873,8 @@ def execute_task(task: dict) -> None:
                                   **costs.add_run(task_store.get(tid), turn_cost),
                                   "cost_reported_total": result.cost_usd,
                                   "files_uploaded": uploaded},
-                          needs_user=(roles.parse_needs_user(result.text)
+                          needs_user=(roles.parse_needs_user(result.text,
+                                                             task.get("project"))
                                       if asks_user else None))
         if loose and send_back_uncommitted(task, loose, channel, thread_ts):
             return

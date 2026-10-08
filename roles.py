@@ -420,7 +420,19 @@ def over_to_you(asks: dict) -> str:
             + "._")
 
 
-def parse_needs_user(text: str) -> dict | None:
+def release_is_for(release: str, project: str | None) -> bool:
+    """Whether a recorded `!release` argument string releases `project`.
+
+    The string is model-written, and only a confirm dialog stands between it
+    and a deploy: a run filed under one project may only hand you a release
+    of that project. No project, no release -- there is nothing to check the
+    slug against.
+    """
+    parts = (release or "").split()
+    return bool(parts and project) and parts[0].lower() == str(project).lower()
+
+
+def parse_needs_user(text: str, project: str | None = None) -> dict | None:
     """The step a run handed to you, or None if it handed you nothing.
 
     Read the way parse_verdict reads a verdict, but failing closed the other
@@ -432,7 +444,8 @@ def parse_needs_user(text: str) -> dict | None:
 
     Returns {"action", "why", "release"}. `release` is the argument string
     for `!release` when the action is exactly one release command the board
-    can offer as a button, else "".
+    can offer as a button, else "" -- including for a release of some other
+    project than the task's own (release_is_for), which stays text to copy.
     """
     blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text or "", re.S)
     if not blocks:                       # tolerate a bare object
@@ -453,4 +466,8 @@ def parse_needs_user(text: str) -> dict | None:
     why = " ".join(why.split())[:MAX_NEEDS_USER] if isinstance(why, str) else ""
     m = _RELEASE.fullmatch(action.strip("`").strip())
     release = " ".join(g for g in m.groups() if g) if m else ""
+    if release and not release_is_for(release, project):
+        log.warning("a needs_user release of %r from a %r task; offering it as text only",
+                    release.split()[0], project)
+        release = ""
     return {"action": action, "why": why, "release": release}

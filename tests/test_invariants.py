@@ -16719,7 +16719,7 @@ _ASKS = ('Nothing to change in the repo: the build is cut by a release, '
 def test_needs_user_block_is_read_and_fails_closed():
     import roles
     print("\nthe needs_user block is read, and anything else is ignored")
-    got = roles.parse_needs_user(_ASKS)
+    got = roles.parse_needs_user(_ASKS, "cadence")
     check("a release step is read with its reason",
           got == {"action": "!release cadence all minor",
                   "why": "releasing is user-triggered",
@@ -16735,8 +16735,21 @@ def test_needs_user_block_is_read_and_fails_closed():
     check("a release with anything after it is not offered as a button",
           sneaky and sneaky["release"] == "", str(sneaky))
     check("a release in backticks still is",
-          (roles.parse_needs_user('```json\n{"needs_user": "`!release saga app 1.2.0`"}\n```')
-           or {}).get("release") == "saga app 1.2.0")
+          (roles.parse_needs_user('```json\n{"needs_user": "`!release saga app 1.2.0`"}\n```',
+                                  "saga") or {}).get("release") == "saga app 1.2.0")
+    # The slug is model-written: a cadence task must not hand you a button
+    # that deploys trader.
+    elsewhere = roles.parse_needs_user(_ASKS, "trader")
+    check("a release of another project than the task's is kept as text, no button",
+          elsewhere and elsewhere["action"] == "!release cadence all minor"
+          and elsewhere["release"] == "", str(elsewhere))
+    check("as is one from a task with no project to check it against",
+          (roles.parse_needs_user(_ASKS) or {}).get("release") == ""
+          and (roles.parse_needs_user(_ASKS, "") or {}).get("release") == "")
+    check("the project is matched whole, not as a prefix",
+          not roles.release_is_for("cadence all minor", "cad")
+          and not roles.release_is_for("cadence-support all", "cadence")
+          and roles.release_is_for("cadence all minor", "Cadence"))
     for name, text in (
             ("no block", "All done: tests pass, committed on my branch."),
             ("json that does not parse", '```json\n{"needs_user": "x",}\n```'),
@@ -16861,7 +16874,7 @@ def test_a_passing_review_still_leaves_the_step_with_you():
              "findings": [] if ok else ["it is wrong"]}) + '\n```', "C1", "1.0")
         return st.get(impl["id"])
 
-    step = roles.parse_needs_user(_ASKS)
+    step = roles.parse_needs_user(_ASKS, "cadence")
     t = reviewed(True, step)
     check("passed review, nothing to land, a step left: needs_input",
           t["state"] == T.NEEDS_INPUT and t["needs_user"] == step, t["state"])
@@ -16895,7 +16908,7 @@ def test_the_step_is_on_every_surface():
     sys.argv = ["x"]
     import visualizer as V
     now = time.time()
-    step = roles.parse_needs_user(_ASKS)
+    step = roles.parse_needs_user(_ASKS, "cadence")
     rec = {"id": "tsk_rel", "title": "Cut new test flight build", "project": "cadence",
            "state": T.NEEDS_INPUT, "role": "implementor", "needs_user": step,
            "created": now - 600, "updated": now - 60, "thread": "C1:1.0",
@@ -16986,13 +16999,14 @@ def test_taking_the_step_from_the_board():
                        holding=__import__("holding"), task_state=state,
                        release_command=release_command, RELEASE_STARTED=":rocket:",
                        LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
+                       roles=__import__("roles"),
                        tell_thread=lambda key, text: said.append(text),
                        stop_task=lambda tid: False,
                        start_landing=lambda tid, **k: landings.append((tid, k)))
     route = ns["handle_tasks"]
 
-    def parked(asks):
-        t = st.create("Cut new test flight build", role="implementor", project="cadence",
+    def parked(asks, project="cadence"):
+        t = st.create("Cut new test flight build", role="implementor", project=project,
                       thread="C1:1.0")
         st.transition(t["id"], T.RUNNING)
         st.update(t["id"], needs_user=asks)
@@ -17013,10 +17027,21 @@ def test_taking_the_step_from_the_board():
           st.get(a)["state"] == T.DONE and "released via you" in st.get(a)["events"][-1]["detail"])
     check("and its thread is told what was run", any("!release cadence all minor" in x for x in said))
 
-    b = parked(dict(rel, release="busy all minor"))
+    b = parked(dict(rel, release="busy all minor"), project="busy")
     r = route({"action": "release", "id": b})
     check("a release that could not start is refused with its reason",
           not r["ok"] and "already running" in r["error"] and st.get(b)["state"] == T.NEEDS_INPUT)
+    # Recorded before the slug was checked at parse time, or written some
+    # other way: the board still refuses to run another project's release.
+    x = parked(dict(rel, action="!release trader all", release="trader all"))
+    r = route({"action": "release", "id": x, "by": "you"})
+    check("a release of another project than the task's is refused, nothing run",
+          not r["ok"] and "not a release of this task's project" in r["error"]
+          and ran[-1] == "busy all minor" and st.get(x)["state"] == T.NEEDS_INPUT, str(r))
+    y = parked(rel, project="")
+    r = route({"action": "release", "id": y})
+    check("as is any release from a task with no project",
+          not r["ok"] and ran[-1] == "busy all minor" and st.get(y)["state"] == T.NEEDS_INPUT, str(r))
     c = parked({"action": "add the APNs key", "why": "", "release": ""})
     r = route({"action": "release", "id": c})
     check("a step that is not a release cannot be run", not r["ok"] and ran[-1] == "busy all minor")
