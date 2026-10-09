@@ -126,8 +126,16 @@ class ProjectStore:
             rec = self._data.get(slug)
             return dict(rec) if rec else None
 
-    def ensure(self, name: str, **fields) -> dict:
-        """Look up a project by name or slug, creating it if it's new."""
+    def ensure(self, name: str, initial: dict | None = None, **fields) -> dict:
+        """Look up a project by name or slug, creating it if it's new.
+
+        `fields` are written whether the project is new or not; `initial` only
+        when this call creates it. Filing a thread under a project passes the
+        thread's directory as `initial` -- passed as a field, `!project
+        Silkworm` from a fresh thread replaced Silkworm's whole scope (cwd,
+        repo, branch) with nothing, and auto-merge would have run in an empty
+        folder.
+        """
         slug = slugify(name)
         with self._lock:
             rec = self._data.get(slug)
@@ -135,6 +143,8 @@ class ProjectStore:
                 rec = {f: default(f) for f in FIELDS}
                 rec.update(slug=slug, v=VERSION, title=(name or slug).strip(),
                            created=time.time(), updated=time.time())
+                rec.update({k: v for k, v in (initial or {}).items()
+                            if k in FIELDS and k not in ("slug", "created")})
                 self._data[slug] = rec
                 log.info("project %s created (%s)", slug, rec["title"])
             rec.update({k: v for k, v in fields.items()

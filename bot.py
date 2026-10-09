@@ -983,6 +983,44 @@ def new_project_from_thread(key: str, arg: str) -> str:
     return text
 
 
+def file_thread_under(key: str, name: str) -> str:
+    """`!project <name>`: file this thread under a project, making the project
+    on first use. Returns the reply.
+
+    Filing never changes an existing project's scope: the thread's directory
+    only seeds a project this call creates. The thread moves to where the
+    project works -- a repo-less project's own home (whose CLAUDE.md only
+    loads if the thread runs there), or a repo-backed one's checkout.
+    """
+    entry = store.get(key) or {}
+    # Created on first use: needing to define a project before filing
+    # anything is how a task system stops getting used.
+    cwd = entry.get("cwd")
+    proj = project_store.ensure(name, initial={"scope": {"cwd": cwd}} if cwd else None)
+    slug = proj["slug"]
+    home = project_store.home(slug, create=True)
+    if home:
+        where = str(home)
+    else:
+        # Repo-backed: home() is None because the directory is yours, not
+        # because there is nowhere to go.
+        where = (project_store.scope_for(slug) or {}).get("cwd") or ""
+        if where and not Path(where).is_dir():
+            where = ""
+    moved = {"project": slug, "unfiled": False}
+    if where and where != entry.get("cwd"):
+        moved["cwd"] = where
+        if entry.get("session_id"):
+            # --resume cannot find a session from another directory; retire it
+            # the way `!project new` does, id kept.
+            moved.update(session_id=None, previous_sessions=(
+                (entry.get("previous_sessions") or []) + [entry["session_id"]])[-10:])
+        store.add_event(key, "moved", f"into project {slug} at {where}")
+    store.update(key, **moved)
+    return (f":card_index_dividers: Filed under *{proj['title']}* "
+            f"(`{slug}`). Tasks from this thread inherit it.")
+
+
 def github_for_thread_project(key: str) -> str:
     """`!project github`: a private GitHub repository for this thread's
     project, made only because it was asked for. Returns the reply."""
@@ -1602,18 +1640,7 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                          f"*{project_store.label_for(slug) or '(none)'}*.",
                     thread_ts=thread_ts)
         else:
-            # Created on first use: needing to define a project before filing
-            # anything is how a task system stops getting used.
-            proj = project_store.ensure(
-                arg, scope={"cwd": entry.get("cwd")} if entry.get("cwd") else {})
-            # A repo-less project keeps its context in its own CLAUDE.md, which
-            # only loads if the thread actually runs there.
-            home = project_store.home(proj["slug"], create=True)
-            store.update(key, project=proj["slug"], unfiled=False,
-                         **({"cwd": str(home)} if home else {}))
-            say(text=f":card_index_dividers: Filed under *{proj['title']}* "
-                     f"(`{proj['slug']}`). Tasks from this thread inherit it.",
-                thread_ts=thread_ts)
+            say(text=file_thread_under(key, arg), thread_ts=thread_ts)
     elif lower in ("!reset", "!new"):
         store.drop(key)
         say(text="Session cleared — the next message in this thread starts fresh.", thread_ts=thread_ts)

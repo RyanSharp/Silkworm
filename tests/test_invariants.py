@@ -4627,10 +4627,11 @@ def test_projects():
           "Claude Code loads CLAUDE.md from the working directory itself")
     check("a project task is given its project's directory to run in",
           "project_store.home(proj, create=True)" in bot)
+    ft = bot[bot.index("def file_thread_under("):bot.index("def github_for_thread_project(")]
     check("filing a thread under a repo-less project moves it into that directory",
-          'store.update(key, project=proj["slug"],' in bot
-          and '"cwd": str(home)' in bot,
-          "its CLAUDE.md only loads if the thread runs there")
+          "project_store.home(slug, create=True)" in ft and "where = str(home)" in ft,
+          "its CLAUDE.md only loads if the thread runs there; "
+          "test_filing_a_thread_never_rewrites_a_projects_scope runs it")
     check("the brief is rewritten, not appended",
           "do not append" in (BASE / "projects.py").read_text())
     check("completing a task folds the outcome back in",
@@ -15624,6 +15625,87 @@ def _release_repo():
     (d / "app" / "b.swift").write_text("z")
     g("add", "-A"); g("commit", "-qm", "app two")
     return d
+
+
+def test_filing_a_thread_never_rewrites_a_projects_scope():
+    print("\nprojects: `!project <name>` files a thread without touching an existing project's scope")
+    import projects
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    saved_root = projects.PROJECT_ROOT
+    projects.PROJECT_ROOT = root / "projects"
+    try:
+        ps = projects.ProjectStore(root / "projects.json")
+        st = SessionStore(root / "s.json")
+        ns = bot_functions("file_thread_under", store=st, project_store=ps, Path=Path)
+        # Production, 2026-10-09: `!project Silkworm` in a fresh DM thread
+        # turned silkworm's scope into {cwd: ~/workspace/projects/silkworm}.
+        repo = root / "Silkworm"
+        (repo / ".git").mkdir(parents=True)
+        want = {"cwd": str(repo), "repo": "github.com/me/Silkworm", "branch": "x"}
+        ps.ensure("Silkworm", scope=dict(want), test_cmd="./bin/silkworm test",
+                  auto_merge=True)
+        before = ps.get("silkworm")
+        elsewhere = root / "elsewhere"
+        elsewhere.mkdir()
+        st.update("C:fresh", project="", unfiled=True)
+        st.update("C:other", cwd=str(elsewhere), session_id="sess-1")
+        for k in ("C:fresh", "C:other"):
+            reply = ns["file_thread_under"](k, "Silkworm")
+            after = ps.get("silkworm")
+            check(f"{k}: the existing project's scope is exactly what it was",
+                  after["scope"] == want, str(after["scope"]))
+            check(f"{k}: and nothing else about it changed either",
+                  {f: after[f] for f in projects.FIELDS if f != "updated"}
+                  == {f: before[f] for f in projects.FIELDS if f != "updated"}, str(after))
+            check(f"{k}: no projects/<slug> folder is made for it",
+                  not (projects.PROJECT_ROOT / "silkworm").exists())
+            e = st.get(k)
+            check(f"{k}: the thread is filed and works in the real checkout",
+                  e["project"] == "silkworm" and e["cwd"] == str(repo)
+                  and e["unfiled"] is False and "Filed under" in reply, str(e))
+        e = st.get("C:other")
+        check("a session from the old directory is retired, its id kept",
+              e["session_id"] is None and e["previous_sessions"] == ["sess-1"], str(e))
+
+        # Only a brand-new project takes its first directory from the thread.
+        st.update("C:new", cwd=str(elsewhere))
+        ns["file_thread_under"]("C:new", "Fresh Thing")
+        check("a new project starts from the thread's directory",
+              ps.scope_for("fresh-thing") == {"cwd": str(elsewhere)}, str(ps.get("fresh-thing")))
+        st.update("C:again", cwd=str(repo))
+        ns["file_thread_under"]("C:again", "Fresh Thing")
+        check("and a second thread filing under it does not move it",
+              ps.scope_for("fresh-thing") == {"cwd": str(elsewhere)}
+              and st.get("C:again")["cwd"] == str(elsewhere), str(ps.get("fresh-thing")))
+
+        # Repo-less projects keep their own home, as before.
+        st.update("C:trip", project="")
+        ns["file_thread_under"]("C:trip", "Asia Trip")
+        home = projects.PROJECT_ROOT / "asia-trip"
+        check("a repo-less project with no directory gets its home, and the thread goes there",
+              home.is_dir() and ps.scope_for("asia-trip") == {"cwd": str(home)}
+              and st.get("C:trip")["cwd"] == str(home), str(st.get("C:trip")))
+    finally:
+        projects.PROJECT_ROOT = saved_root
+
+    bot = (BASE / "bot.py").read_text()
+    tree = ast.parse(bot)
+    cmd = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+               and n.name == "handle_command")
+    calls = {c.func.id for c in ast.walk(cmd) if isinstance(c, ast.Call)
+             and isinstance(c.func, ast.Name)}
+    check("`!project <name>` goes through file_thread_under",
+          "file_thread_under" in calls)
+    # Every ensure() handing over a scope must either start from the record's
+    # own scope or only seed a new project; a bare thread directory as `scope=`
+    # is the overwrite.
+    bare = [c.lineno for c in ast.walk(tree) if isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute) and c.func.attr == "ensure"
+            and any(k.arg == "scope" and isinstance(k.value, (ast.Dict, ast.IfExp))
+                    and not (isinstance(k.value, ast.Dict) and None in k.value.keys)
+                    for k in c.keywords)]
+    check("no ensure() call in bot.py replaces a scope with a literal one",
+          not bare, f"lines {bare}")
 
 
 def test_projects_overview():
