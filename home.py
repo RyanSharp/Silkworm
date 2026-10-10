@@ -24,6 +24,7 @@ import threading
 import time
 
 import costs
+import research
 import slacklinks
 import tasks
 
@@ -70,8 +71,22 @@ STEP_BUTTONS = [("Release", "release", "primary", None),
                 ("Done", "resolve", None,
                  "Mark this done? Only if you have taken the step yourself.")]
 
+#: A research task waiting on you with its findings: in place of Answer, as
+#: the dashboard does. Close ends it, Dig deeper asks a follow-up question (a
+#: modal, like Answer), Discuss is the thread link drawn beside them.
+RESEARCH_BUTTONS = [
+    ("Close", "close", "primary",
+     "Close these findings? Nothing further runs; any next steps it filed "
+     "stay on the board for you to accept or dismiss."),
+    ("Dig deeper…", "dig", None, None),
+    ("Dismiss", "dismiss", None, "Dismiss this research?")]
+
 #: Actions that are a plain call to handle_tasks; the others open a modal.
-DIRECT = ("accept", "dismiss", "approve", "retry", "cancel", "release", "resolve")
+DIRECT = ("accept", "dismiss", "approve", "retry", "cancel", "release", "resolve",
+          "close")
+#: Actions whose window asks for words: a send-back's notes, an answer, the
+#: question a Dig deeper digs into.
+NOTES = ("rework", "answer", "dig")
 MODAL_CALLBACK = "home_rework"
 CONFIRM_CALLBACK = "home_confirm"
 RELEASE_CALLBACK = "home_release"
@@ -93,10 +108,15 @@ def buttons_for(task: dict) -> list:
     state = task.get("state")
     base = BUTTONS.get(state, [])
     asks = task.get("needs_user") or {}
+    findings = research.has_findings(task)
+    if findings:
+        base = RESEARCH_BUTTONS
     if state != tasks.NEEDS_INPUT or not asks.get("action"):
         return base
     step = []
     for label_, action, style, confirm in STEP_BUTTONS:
+        if action == "resolve" and findings:
+            continue                     # Close is the same move, said once
         if action == "release":
             if not asks.get("release"):
                 continue
@@ -213,6 +233,8 @@ def _detail(task: dict) -> str:
     yours = _yours(task)
     if state == tasks.NEEDS_INPUT and yours:
         return f":raising_hand: {esc(clip(yours, 400))}"
+    if research.has_findings(task):
+        return _findings(task, 400)
     events = task.get("events") or []
     if state in (tasks.FAILED, tasks.NEEDS_INPUT) and events:
         detail = (events[-1] or {}).get("detail") or ""
@@ -222,6 +244,25 @@ def _detail(task: dict) -> str:
         first, _, rest = goal.partition("\n")
         return esc(clip(rest or "", 400)) if rest.strip() else ""
     return ""
+
+
+def _findings(task: dict, width: int) -> str:
+    """A research task's answer and its next steps, for the board."""
+    lines = []
+    ans = research.answer(task, width)
+    if ans:
+        lines.append(f":mag: {esc(ans)}")
+    kids = task.get("research_children") or []
+    held = task.get("next_steps_held") or []
+    for k in kids[:4]:
+        lines.append(f"• next step `{esc(k.get('id', ''))}` ({esc(k.get('state', ''))}) "
+                     f"{esc(clip(k.get('title', ''), 120))}")
+    if len(kids) > 4:
+        lines.append(f"_…and {len(kids) - 4} more next steps_")
+    for h in held[-4:]:
+        lines.append(f"• _not filed:_ {esc(clip(h.get('goal', ''), 100))} — "
+                     f"{esc(clip(h.get('why', ''), 140))}")
+    return "\n".join(lines)
 
 
 def _task_blocks(task: dict, now: float, base_url: str,
@@ -247,7 +288,8 @@ def _task_blocks(task: dict, now: float, base_url: str,
                for b in buttons_for(task)]
     url = thread_url(task.get("thread", ""), base_url)
     if url:
-        buttons.append(_button("Thread", "thread", tid, url=url))
+        buttons.append(_button("Discuss" if research.has_findings(task) else "Thread",
+                               "thread", tid, url=url))
     if buttons:
         blocks.append({"type": "actions", "block_id": f"a:{tid}",
                        "elements": buttons[:25]})
@@ -263,6 +305,11 @@ def _summary_line(task: dict) -> str:
         return (f"{n} finding{'s' if n != 1 else ''}: " if n else "") + head
     if task.get("state") == tasks.NEEDS_INPUT and _yours(task):
         return _yours(task)
+    if research.has_findings(task):
+        steps = research.line(task.get("research_children") or [],
+                              task.get("next_steps_held") or [])
+        return " · ".join(x for x in ("findings: " + (research.answer(task, 80) or "ready"),
+                                      steps) if x)
     events = task.get("events") or []
     if task.get("state") in (tasks.FAILED, tasks.NEEDS_INPUT) and events:
         return (events[-1] or {}).get("detail") or ""
@@ -294,7 +341,8 @@ def _task_line(task: dict, now: float, base_url: str, cost: str = "") -> dict:
                 "value": f"{b[1]}|{tid}|{state}"} for b in buttons_for(task)]
     url = thread_url(task.get("thread", ""), base_url)
     if url:
-        options.append({"text": {"type": "plain_text", "text": "Open thread"},
+        options.append({"text": {"type": "plain_text", "text":
+                                 "Discuss" if research.has_findings(task) else "Open thread"},
                         "value": f"thread|{tid}|{state}", "url": url})
     block = {"type": "section", "block_id": f"t:{tid}", "text": _text(text)}
     if options:
@@ -321,6 +369,8 @@ def full_detail(task: dict) -> str:
             lines.append(":x: tests failed")
     elif state == tasks.NEEDS_INPUT and _yours(task):
         lines.append(f":raising_hand: *{esc(_yours(task))}*")
+    elif research.has_findings(task):
+        lines.append("*Findings:*\n" + _findings(task, 1200))
     elif state in (tasks.FAILED, tasks.NEEDS_INPUT):
         detail = ((task.get("events") or [{}])[-1] or {}).get("detail") or ""
         if detail:
@@ -334,7 +384,7 @@ def full_detail(task: dict) -> str:
 #: What the confirm button says for each action.
 VERB = {"accept": "Accept", "dismiss": "Dismiss", "approve": "Approve",
         "retry": "Retry", "cancel": "Cancel task", "release": "Release",
-        "resolve": "Mark done"}
+        "resolve": "Mark done", "close": "Close findings"}
 
 
 def confirm_modal(task: dict, action: str) -> dict:
@@ -357,7 +407,10 @@ def confirm_modal(task: dict, action: str) -> dict:
              if action == "approve" else []) + ([{"type": "context", "elements": [_text(
             f"Runs `!release {esc((task.get('needs_user') or {}).get('release', ''))}`; "
             "the result goes to the task's thread.")]}]
-             if action == "release" else []),
+             if action == "release" else []) + ([{"type": "context", "elements": [_text(
+            "Closes the research as done. Nothing further runs; the next steps "
+            "it filed stay proposed for you to accept or dismiss.")]}]
+             if action == "close" else []),
     }
 
 
@@ -376,6 +429,11 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
             "This bot's task board is only visible to the people on its allowlist.")}]}
 
     items = list(all_tasks)
+    # A research task's next steps are its children; attached to the copy
+    # rendered, so the line and the detail can list them.
+    kids = research.children_by_parent(items)
+    items = [dict(t, research_children=kids[t.get("id")]) if t.get("id") in kids else t
+             for t in items]
     attention = sorted(
         (t for t in items if t.get("state") in tasks.NEEDS_ATTENTION),
         key=lambda t: (ORDER.index(t["state"]) if t["state"] in ORDER else 9,
@@ -588,29 +646,35 @@ def seen_state(value: str) -> tuple[str, str]:
     return tid, state
 
 
-def rework_modal(task: dict, answer: bool) -> dict:
-    """The notes prompt for Send back / Answer.
+def rework_modal(task: dict, answer: bool, dig: bool = False) -> dict:
+    """The notes prompt for Send back / Answer / Dig deeper.
 
     An answer is required -- a blank one resumes the task with nothing to go
-    on. Send-back notes are optional: the reviewer's findings are attached
-    either way. Closing the modal abandons the action; "never mind" is not
-    the same as "no notes".
+    on -- and so is a Dig deeper's question, for the same reason. Send-back
+    notes are optional: the reviewer's findings are attached either way.
+    Closing the modal abandons the action; "never mind" is not the same as
+    "no notes".
     """
     tid = task.get("id", "")
-    prompt = ("Your answer — the task resumes with it." if answer else
+    required = answer or dig
+    prompt = ("What should it dig into? The research resumes with your question "
+              "and parks again with new findings." if dig else
+              "Your answer — the task resumes with it." if answer else
               "Anything to add? The reviewer's findings are included "
               "automatically; leave blank to send back with just those.")
+    title = "Dig deeper" if dig else "Answer" if answer else "Send back"
     return {
         "type": "modal", "callback_id": MODAL_CALLBACK,
-        "private_metadata": json.dumps({"id": tid, "answer": answer,
+        "private_metadata": json.dumps({"id": tid, "answer": answer, "dig": dig,
                                         "seen": task.get("state", "")}),
-        "title": {"type": "plain_text", "text": "Answer" if answer else "Send back"},
+        "title": {"type": "plain_text", "text": title},
         "submit": {"type": "plain_text", "text": "Send"},
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": [
             {"type": "section", "text": _text(f"*{esc(clip(label(task), 200))}*\n`{tid}`")},
-            {"type": "input", "block_id": "notes", "optional": not answer,
-             "label": {"type": "plain_text", "text": "Answer" if answer else "Notes"},
+            {"type": "input", "block_id": "notes", "optional": not required,
+             "label": {"type": "plain_text", "text":
+                       "Question" if dig else "Answer" if answer else "Notes"},
              "element": {"type": "plain_text_input", "action_id": "notes",
                          "multiline": True},
              "hint": {"type": "plain_text", "text": prompt[:150]}},
@@ -750,7 +814,8 @@ class Home:
         task = dict(task, id=tid)
         try:
             client.views_open(trigger_id=body["trigger_id"],
-                              view=rework_modal(task, act["action_id"] == "home_answer"))
+                              view=rework_modal(task, act["action_id"] == "home_answer",
+                                                dig=act["action_id"] == "home_dig"))
         except Exception:
             log.exception("could not open the send-back modal")
 
@@ -764,18 +829,23 @@ class Home:
         if meta.get("answer") and not notes:
             return ack(response_action="errors",
                        errors={"notes": "An answer is needed to resume the task."})
+        if meta.get("dig") and not notes:
+            return ack(response_action="errors",
+                       errors={"notes": "Say what to dig into, or cancel."})
         ack()
         tid = meta.get("id", "")
         # The form can sit open for minutes; check again on the way out.
         if self.moved_on(user, tid, meta.get("seen", "")):
             return self.publish(client, user)
+        action = "dig" if meta.get("dig") else "rework"
         try:
-            r = self.call({"action": "rework", "id": tid, "notes": notes,
+            r = self.call({"action": action, "id": tid, "notes": notes,
                            "by": f"slack:{user}"})
         except Exception as e:
-            log.exception("home rework on %s failed", tid)
+            log.exception("home %s on %s failed", action, tid)
             r = {"ok": False, "error": str(e)}
-        self.note(user, self.outcome("answer" if meta.get("answer") else "rework", tid, r))
+        self.note(user, self.outcome("dig" if meta.get("dig") else
+                                     "answer" if meta.get("answer") else "rework", tid, r))
         self.publish(client, user)
 
     def on_menu(self, ack, body, client):
@@ -799,9 +869,10 @@ class Home:
             return self.publish(client, user)
         if self.moved_on(user, tid, seen):
             return self.publish(client, user)
-        task = dict(task, id=tid)
-        if action in ("rework", "answer"):
-            view = rework_modal(task, action == "answer")
+        task = dict(task, id=tid,
+                    research_children=research.children(tid, self.store.all().values()))
+        if action in NOTES:
+            view = rework_modal(task, action == "answer", dig=action == "dig")
         elif action in DIRECT:
             view = confirm_modal(task, action)
         else:
@@ -950,7 +1021,8 @@ class Home:
         done = {"accept": "Accepted", "dismiss": "Dismissed", "approve": "Approved",
                 "retry": "Requeued", "cancel": "Cancelled", "rework": "Sent back",
                 "answer": "Answered", "release": "Releasing",
-                "resolve": "Marked done"}.get(action, action)
+                "resolve": "Marked done", "close": "Closed",
+                "dig": "Sent to dig deeper"}.get(action, action)
         note = f" — {esc(r['note'])}" if r.get("note") else ""
         return f":white_check_mark: {done} `{tid}`{note}"
 
@@ -1210,6 +1282,7 @@ def register(app, home: Home) -> None:
         app.action(f"home_{action}")(home.on_direct)
     app.action("home_rework")(home.on_modal)
     app.action("home_answer")(home.on_modal)
+    app.action("home_dig")(home.on_modal)
     app.view(MODAL_CALLBACK)(home.on_submit)
     app.action("home_menu")(home.on_menu)
     app.view(CONFIRM_CALLBACK)(home.on_confirm)

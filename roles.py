@@ -1,9 +1,9 @@
 """Role templates: how a task is run, and whether its output gets checked.
 
-A role is a reusable set of run settings a task references by name. Three
-exist. `assistant` is today's Slack behaviour and is deliberately unchanged --
+A role is a reusable set of run settings a task references by name. `assistant` is today's Slack behaviour and is deliberately unchanged --
 adding roles must not alter how a DM behaves. `implementor` does work and is
-gated. `reviewer` checks that work with fresh context.
+gated. `reviewer` checks that work with fresh context. `researcher` investigates
+and hands you findings to decide on (research.py).
 
 Fresh context is the entire point of the gate. A reviewer never resumes the
 implementor's session: an independent reader is not invested in the reasoning
@@ -113,6 +113,37 @@ IMPLEMENTOR_SYSTEM = (
     "locally, and reporting that it is ready to land -- not by landing it."
 )
 
+#: The role for investigation whose findings you review and decide on. See
+#: research.py: it runs as `assistant` does, but a completed queued run parks
+#: in `needs_input` with its findings rather than closing as `done`.
+RESEARCHER = "researcher"
+
+#: {bin} is filled in at run time with the absolute path, as for the ideator.
+RESEARCHER_SYSTEM = (
+    "You are researching a question for the user. Investigate thoroughly -- "
+    "read code, run read-only commands, look things up -- but change nothing "
+    "that needs merging: your output is findings the user will read and "
+    "decide on, not a branch.\n\n"
+    "End your reply with your findings in exactly this shape:\n"
+    "*Answer:* a short, direct answer to the question.\n"
+    "*Confidence:* high, medium or low, and why.\n"
+    "*Key evidence:* the specific things you saw that support the answer -- "
+    "files and lines, commands and their output, sources.\n"
+    "*Next steps:* 2-4 concrete pieces of work that follow from this, each "
+    "written as a standalone task goal someone could pick up with no other "
+    "context (say what done looks like).\n\n"
+    "File each next step as a proposal for the user to accept or dismiss:\n"
+    "    {bin} task \"<the standalone goal>\"\n"
+    "It is filed under this research task and its project, and waits for the "
+    "user -- it never runs on its own. File the most valuable first: one run "
+    "may file only a few (the same per-pass budget as nightly proposals), the "
+    "project may already hold as many open proposals as it is allowed, or one "
+    "may duplicate work already on the board, and any of those refuses it. "
+    "Do not retry a refused one. In "
+    "your Next steps, mark each one as filed (with its task id) or not filed "
+    "(with the reason the command printed), so nothing is silently dropped."
+)
+
 #: Asked of every queued task that does work, appended by execute_task. A run
 #: that stops short because the last step is yours used to say so in prose and
 #: then close as `done`: tsk_fd122a33d3 ("Cut new test flight build") correctly
@@ -141,6 +172,15 @@ ROLES: dict[str, dict] = {
         "restricted": False,
         # Queued runs only: a Slack turn never reaches execute_task, so this
         # leaves a DM exactly as it was.
+        "asks_user": True,
+        "model": None,
+    },
+    # `assistant`'s permissions and no reviewer: nothing it does is merged.
+    # What differs is how a queued run ends (tasks.ending) and its prompt.
+    RESEARCHER: {
+        "system": RESEARCHER_SYSTEM,
+        "review": False,
+        "restricted": False,
         "asks_user": True,
         "model": None,
     },
@@ -185,6 +225,7 @@ ROLES: dict[str, dict] = {
 FILEABLE: dict[str, str] = {
     "implementor": "changes code, is tested, reviewed and merged",
     "assistant":   "investigates or answers, nothing is merged",
+    RESEARCHER:    "investigation whose findings you will review and decide on",
 }
 
 #: What you get when you do not say. Matches handle_file_task: filing work is
@@ -278,8 +319,8 @@ def permission_args(name: str, default_args: list[str], bin: str = "") -> list[s
     return list(default_args)
 
 
-def system_prompt(name: str) -> str:
-    return get(name).get("system", "")
+def system_prompt(name: str, bin: str = "") -> str:
+    return get(name).get("system", "").replace("{bin}", bin or "silkworm")
 
 
 def asks_user(name: str) -> bool:

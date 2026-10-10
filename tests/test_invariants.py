@@ -2520,7 +2520,7 @@ def _file_task_impl():
     src = (BASE / "bot.py").read_text()
     tree = ast.parse(src)
     want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn",
-            "begin_turn", "unmerged_survey")
+            "begin_turn", "unmerged_survey", "research_parent")
     def named(n):
         if isinstance(n, ast.FunctionDef):
             return n.name
@@ -2540,6 +2540,7 @@ def _file_task_impl():
     mod.__dict__.update(
         re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
         dedup=__import__("dedup"), branches=__import__("branches"),
+        research=__import__("research"), time=time,
         task_store=ts,
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
         store=types.SimpleNamespace(get=lambda k: {}),
@@ -12447,7 +12448,8 @@ def test_task_costs():
     handle = _bot_func("handle_tasks", task_store=ts, tasks=T,
                        log=logging.getLogger("t"),
                        _with_costs=None, _spend=None)
-    ns = {"task_store": ts, "costs": costs}
+    ns = {"task_store": ts, "costs": costs, "board": __import__("board"),
+          "research": __import__("research"), "slacklinks": __import__("slacklinks")}
     _bot_fns({"_with_costs", "_spend"}, ns)
     handle.__globals__.update(_with_costs=ns["_with_costs"], _spend=ns["_spend"])
     r = handle({"action": "attention"})
@@ -16220,7 +16222,7 @@ def test_tasks_are_filed_and_edited_from_the_board():
     proposal = r["task"]["id"]
     check("the roles route says which roles are held",
           {x["name"]: x["held_if_unready"] for x in ht({"action": "roles"})["roles"]}
-          == {"implementor": True, "assistant": False})
+          == {"implementor": True, "assistant": False, "researcher": False})
     r = ht({"action": "create", "goal": "Build the importer for the new feed format",
             "project": "alpha", "title": "t" * (scoping.MAX_TITLE_CHARS + 1)})
     check("an overlong title is refused", not r["ok"] and "title" in r["error"])
@@ -18079,6 +18081,490 @@ def test_release_modal_in_the_page():
           and o["elsewhere"]["previews"] == 0, o["elsewhere"]["html"][-300:])
     check("its own release still running reopens on its progress", "going" in o["ownRunning"])
     check("Cancel closes it", o["closed"] is False)
+
+
+# --- research: findings you review and decide on --------------------------------
+# Research was filed as `assistant` on the queue and finished `done`, which is
+# off the board, so its findings sat unread in a thread with no way to turn
+# them into next steps -- and a scheduled wake-up is a queued `assistant` too,
+# so the role could not tell the two apart. `researcher` parks its findings in
+# needs_input, files its next steps as proposed children, and the board offers
+# Close, Dig deeper and Discuss.
+
+_FINDINGS = ("*Answer:* the cache is never invalidated on deploy.\n"
+             "*Confidence:* high — read the code path end to end.\n"
+             "*Key evidence:* cache.py:40 sets no TTL.\n"
+             "*Next steps:* 1. add a TTL (filed tsk_x)")
+
+
+def test_researcher_is_a_role_you_can_file():
+    import roles as R, scoping as S, tasks as T
+    print("\nresearcher is a role a person can file, everywhere a role is chosen")
+    check("it is a role", "researcher" in R.ROLES and R.known("researcher"))
+    check("anyone may file it", R.validate_filed("researcher") == "")
+    check("and the form says what it is for",
+          "review and decide" in R.FILEABLE.get("researcher", ""), R.FILEABLE)
+    check("it runs as assistant does: unrestricted, unreviewed, resumable",
+          not R.is_restricted("researcher") and not R.needs_review("researcher")
+          and not R.is_fresh("researcher") and R.asks_user("researcher")
+          and R.permission_args("researcher", ["--dangerously-skip-permissions"])
+          == R.permission_args("assistant", ["--dangerously-skip-permissions"]))
+    prompt = R.system_prompt("researcher", bin="/opt/sw/bin/silkworm")
+    check("its prompt asks for the fixed findings shape",
+          all(k in prompt for k in ("Answer:", "Confidence:", "Key evidence:",
+                                    "Next steps:", "2-4", "standalone")), prompt[:200])
+    check("and says how to file next steps, with the real binary",
+          '/opt/sw/bin/silkworm task "' in prompt and "{bin}" not in prompt)
+    check("and to say which were not filed", "not filed" in prompt)
+    check("other roles' prompts are untouched by the bin substitution",
+          R.system_prompt("implementor", bin="/x") == R.IMPLEMENTOR_SYSTEM
+          and R.system_prompt("assistant", bin="/x") == "")
+    check("the in-turn filing instructions offer it, with what it means",
+          "implementor|assistant|researcher" in S.HOW_TO
+          and "findings you will review and decide on" in S.HOW_TO)
+    check("a record may be made with it", T.make("Why is the cache stale?",
+                                                 role="researcher")["role"] == "researcher")
+
+    cli_file_task, sent = _cli_file_task_impl()
+    env_was = dict(os.environ)
+    try:
+        os.environ.update(SILKWORM_THREAD="C1:1.0", SILKWORM_ROLE="assistant")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli_file_task(["--role", "researcher", "Find out why the cache goes stale"])
+    finally:
+        os.environ.clear(); os.environ.update(env_was)
+    check("the CLI files --role researcher", sent and sent[-1][1].get("role") == "researcher",
+          str(sent[-1][1] if sent else None))
+    src = (BASE / "bin" / "silkworm").read_text()
+    check("and its usage line names it", "implementor|assistant|researcher" in src)
+    file_task, _filed, _begin, ts, _made = _file_task_impl()
+    r = file_task({"key": "C9:9.0", "goal": "Find out why the cache goes stale",
+                   "role": "researcher"})
+    check("and the bot accepts it", r.get("ok") and r.get("role") == "researcher"
+          and ts.get(r["id"])["role"] == "researcher", str(r))
+
+
+def test_research_completion_parks_findings():
+    print("\na completed research run waits for you; assistant and wake-ups do not")
+    import threading
+    import research
+    import roles
+    import tasks as T
+    check("ending: research parks its findings",
+          T.ending({"role": "researcher", "source": "dashboard"})
+          == (T.NEEDS_INPUT, T.FINDINGS_DETAIL))
+    check("ending: an assistant is done, as before",
+          T.ending({"role": "assistant", "source": "dashboard"}) == (T.DONE, ""))
+    check("ending: a wake-up is done, whatever role it carries",
+          T.ending({"role": "researcher", "source": "defer"}) == (T.DONE, "")
+          and T.ending({"role": "assistant", "source": "defer"}) == (T.DONE, ""))
+    check("ending: a conversation turn is done",
+          T.ending({"role": "researcher", "source": "slack"}) == (T.DONE, ""))
+
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    root = Path(tempfile.mkdtemp())
+    told, prompts = [], []
+    state = _task_state_for(st)
+
+    def run_turn(goal, **kw):
+        prompts.append(kw.get("append_system_prompt") or "")
+        return types.SimpleNamespace(text=_FINDINGS, cost_usd=0.1,
+                                     duration_ms=1, session_id="s")
+    fn = _bot_func("execute_task", tasks=T, task_store=st, store=tmp_store(),
+                   roles=roles, research=research, Path=Path, run_turn=run_turn,
+                   review_branch=lambda t: "", worktrees=__import__("worktrees"),
+                   OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+                   permission_args=lambda: [], log=logging.getLogger("test"),
+                   task_thread=lambda t: ("C1", "1.0"), task_key=lambda t: "C1:1.0",
+                   task_state=state, tell_thread=lambda key, text: told.append((key, text)),
+                   defer=__import__("defer"),
+                   _thread_lock=lambda key: threading.Lock(),
+                   repo_guard=lambda *a, **k: contextlib.nullcontext(),
+                   render_block=lambda _: "", chunk=lambda text: [text],
+                   to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+                   upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+                   COST_NOTE="(list)", ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError)
+
+    def run(role, **fields):
+        rec = st.create("Why does the cache go stale after deploys?", role=role,
+                        project="alpha", thread="C1:1.0", driver="queue", isolate=False,
+                        scope={"cwd": str(root)}, **fields)
+        st.transition(rec["id"], T.RUNNING, "claimed")
+        fn(st.get(rec["id"]))
+        return st.get(rec["id"])
+
+    r = run("researcher", source="dashboard")
+    check("a completed researcher task is in needs_input, not done",
+          r["state"] == T.NEEDS_INPUT, r["state"])
+    check("parked by a transition, with its reason",
+          r["events"][-1]["kind"] == T.NEEDS_INPUT
+          and r["events"][-1]["detail"] == T.FINDINGS_DETAIL, str(r["events"][-1]))
+    check("with its findings on the record", (r.get("result") or {}).get("text") == _FINDINGS)
+    check("it is in front of you", r["id"] in [t["id"] for t in st.needs_attention()])
+    check("its thread is told what to do with them",
+          any("Findings ready" in t and "Dig deeper" in t for _, t in told), str(told[-1:]))
+    check("the run was given the research prompt, with the real binary",
+          "*Answer:*" in prompts[-1] and '/x/silkworm task "' in prompts[-1])
+    a = run("assistant", source="dashboard")
+    check("an assistant task still finishes done", a["state"] == T.DONE, a["state"])
+    check("and was not given the research prompt", "*Answer:*" not in prompts[-1])
+    w = run("assistant", source="defer")
+    check("a wake-up still finishes done", w["state"] == T.DONE, w["state"])
+    w2 = run("researcher", source="defer")
+    check("even one on a research thread", w2["state"] == T.DONE, w2["state"])
+
+    bot = (BASE / "bot.py").read_text()
+    tree = ast.parse(bot)
+    users = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)
+             and any(isinstance(c, ast.Attribute) and c.attr == "ending"
+                     and isinstance(c.value, ast.Name) and c.value.id == "tasks"
+                     for c in ast.walk(n))}
+    check("an inline Slack turn never asks how a task ends",
+          "handle_prompt" not in users and users <= {"execute_task", "resolve_review"},
+          str(users))
+
+
+def _research_parked(st, project="alpha", thread="C1:1.0", findings=_FINDINGS):
+    import tasks as T
+    t = st.create("Why does the cache go stale after deploys?", role="researcher",
+                  project=project, thread=thread, driver="queue")
+    st.transition(t["id"], T.RUNNING, "claimed")
+    st.update(t["id"], result={"text": findings})
+    st.transition(t["id"], T.NEEDS_INPUT, T.FINDINGS_DETAIL)
+    return t["id"]
+
+
+def test_research_next_steps_are_proposed_children():
+    import research, tasks as T, scoping as S
+    print("\na research run's next steps are proposals under it, capped and deduped")
+    file_task, filed_this_turn, begin_turn, ts, _made = _file_task_impl()
+    key = "C5:5.0"
+    rt = ts.create("Why does the cache go stale after deploys?", role="researcher",
+                   project="alpha", thread=key, driver="queue")
+    ts.transition(rt["id"], T.RUNNING, "claimed")
+    rid = rt["id"]
+    was = os.environ.get("MAX_OPEN_PROPOSALS")
+    os.environ["MAX_OPEN_PROPOSALS"] = "3"
+    try:
+        r = file_task({"key": key, "goal": "Add a TTL to the deploy cache entries in cache.py",
+                       "caller_role": "researcher", "caller_task": rid,
+                       "project": "beta", "role": "implementor"})
+        kid = ts.get(r.get("id") or "") or {}
+        check("a next step is not refused as a duplicate of the research it answers",
+              r.get("ok") and not r.get("duplicate"), str(r))
+        check("a next step is filed as a proposal, though --propose was not passed",
+              r.get("ok") and r.get("state") == T.PROPOSED and kid.get("state") == T.PROPOSED,
+              str(r))
+        check("as a child of the research task",
+              kid.get("parent") == rid and kid.get("root") == rid
+              and kid.get("source") == research.SOURCE and kid.get("source_ref") == rid,
+              str({k: kid.get(k) for k in ("parent", "root", "source", "source_ref")}))
+        check("in the research task's project, not the one asked for",
+              kid.get("project") == "alpha", kid.get("project"))
+        # A researcher with no task id in its environment: the one running here.
+        r2 = file_task({"key": key, "goal": "Invalidate the CDN on every deploy of the site",
+                        "caller_role": "researcher"})
+        kid2 = ts.get(r2.get("id") or "") or {}
+        check("a researcher's filing without its task id is still a child of the one running",
+              r2.get("ok") and kid2.get("state") == T.PROPOSED and kid2.get("parent") == rid,
+              str(r2))
+        r3 = file_task({"key": key, "goal": "Write a runbook for clearing stale caches by hand",
+                        "caller_role": "researcher", "caller_task": rid})
+        check("the per-pass proposal budget applies to it",
+              not r3.get("ok") and "limit for one pass" in r3.get("error", ""), str(r3))
+        held = ts.get(rid).get("next_steps_held") or []
+        check("and what it refused is kept on the research task, with why",
+              len(held) == 1 and "runbook" in held[0]["goal"]
+              and "limit" in held[0]["why"], str(held))
+        begin_turn(key)
+        r4 = file_task({"key": key, "goal": "Add a TTL to the deploy cache entries in cache.py",
+                        "caller_role": "researcher", "caller_task": rid})
+        check("a duplicate of an open proposal is refused by the existing dedup",
+              not r4.get("ok") and r4.get("duplicate"), str(r4))
+        check("and kept as not filed too",
+              len(ts.get(rid).get("next_steps_held") or []) == 2)
+        # The standing cap: three open proposals in alpha now.
+        ts.create("Something else entirely about logging levels", project="alpha",
+                  state=T.PROPOSED)
+        r5 = file_task({"key": key, "goal": "Measure cache hit rate before and after deploys",
+                        "caller_role": "researcher", "caller_task": rid})
+        check("the project's open-proposal cap applies to it",
+              not r5.get("ok") and str(S.max_open_proposals()) in r5.get("error", "")
+              and "already waiting" in r5.get("error", ""), str(r5))
+        check("so nothing was filed past the cap",
+              S.open_proposals(ts.by_project("alpha")) == 3)
+        check("and the cap's refusal is kept on the research task",
+              "already waiting" in (ts.get(rid)["next_steps_held"][-1]["why"]))
+    finally:
+        if was is None:
+            os.environ.pop("MAX_OPEN_PROPOSALS", None)
+        else:
+            os.environ["MAX_OPEN_PROPOSALS"] = was
+    # A Slack turn on the research thread (Discuss) while a Dig deeper is
+    # claimed and waiting for the thread: it is not the research filing.
+    begin_turn(key)
+    inline = file_task({"key": key, "goal": "Build the importer for the new feed format",
+                        "role": "implementor", "caller_role": "assistant"})
+    check("a conversation turn on the research thread files as it always did",
+          inline.get("ok") and inline.get("state") == T.QUEUED
+          and not ts.get(inline["id"]).get("parent"), str(inline))
+    other = file_task({"key": "C6:6.0", "goal": "Build the importer for the old feed format",
+                       "role": "implementor", "caller_role": "assistant"})
+    check("a filing from any other thread is untouched: queued, no parent",
+          other.get("ok") and other.get("state") == T.QUEUED
+          and not ts.get(other["id"]).get("parent"), str(other))
+    kids = research.children(rid, ts.all().values())
+    check("the children are listed under the research task",
+          [k["id"] for k in kids] == [r["id"], r2["id"]], str(kids))
+
+
+def test_research_children_show_on_the_board():
+    import board, home, research, tasks as T
+    print("\na research task's next steps show on its board row and detail")
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    rid = _research_parked(st)
+    kid = st.create("Add a TTL to the deploy cache entries", project="alpha",
+                    state=T.PROPOSED, parent=rid, root=rid, source=research.SOURCE)
+    st.update(rid, next_steps_held=[research.held_entry("Write a runbook", "limit reached", 1)])
+    recs = list(st.all().values())
+    b = board.board(recs, "alpha")
+    card = next(c for c in b["columns"]["needs"] if c["id"] == rid)
+    check("its card says it is waiting on you with findings",
+          card["findings"] is True and board.card(st.get(kid["id"]))["findings"] is False)
+    check("its card lists the child and the one held",
+          [k["id"] for k in card["research"]["children"]] == [kid["id"]]
+          and card["research"]["held"][0]["why"] == "limit reached"
+          and "1 next step filed" in card["research"]["line"]
+          and "1 not filed" in card["research"]["line"], str(card["research"]))
+    check("and carries its thread as a slacklinks link",
+          card["thread_link"] == __import__("slacklinks").for_key("C1:1.0"))
+    d = board.detail(st.get(rid), recs)
+    check("so does its detail", [k["id"] for k in d["research"]["children"]] == [kid["id"]])
+    check("an ordinary task's card has no research section",
+          board.card(st.get(kid["id"]))["research"] is None)
+    view = json.dumps(home.render([dict(r) for r in recs], now=time.time(),
+                                  base_url="https://x.slack.com"), ensure_ascii=False)
+    check("the Slack board shows the answer and the next step",
+          "the cache is never invalidated on deploy" in view and kid["id"] in view
+          and "not filed" in view, view[:400])
+    line = json.dumps(home.render([dict(r) for r in recs], now=time.time(), compact=True,
+                                  base_url="https://x.slack.com"), ensure_ascii=False)
+    check("and its one-line form counts them", "1 next step filed" in line, line[:400])
+
+
+def test_findings_actions_from_the_board():
+    print("\nClose and Dig deeper move research only from where you saw it")
+    import research, tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    state = _task_state_for(st)
+    ns = bot_functions("handle_tasks", "decide_findings", task_store=st, tasks=T,
+                       research=research, holding=__import__("holding"), task_state=state,
+                       merge=__import__("merge"), roles=__import__("roles"),
+                       tell_thread=lambda *a: None, stop_task=lambda tid: False,
+                       start_landing=lambda *a, **k: None)
+    route = ns["handle_tasks"]
+
+    a = _research_parked(st)
+    r = route({"action": "close", "id": a, "by": "you"})
+    check("Close: needs_input -> done, attributed",
+          r["ok"] and st.get(a)["state"] == T.DONE
+          and "findings closed via you" in st.get(a)["events"][-1]["detail"], str(r))
+    r = route({"action": "close", "id": a})
+    check("a second Close on a closed task is refused, not reapplied",
+          not r["ok"] and st.get(a)["state"] == T.DONE, str(r))
+    check("saying it is no longer waiting on you, and where it is",
+          "no longer waiting on you" in r.get("error", "") and "done" in r["error"], str(r))
+    r = route({"action": "dig", "id": a, "notes": "and the CDN?"})
+    check("as is Dig deeper on one", not r["ok"] and st.get(a)["state"] == T.DONE)
+
+    b = _research_parked(st)
+    st.update(b, next_steps_held=[research.held_entry("a runbook", "limit", 1)])
+    r = route({"action": "dig", "id": b, "notes": "   "})
+    check("Dig deeper with no question is refused and changes nothing",
+          not r["ok"] and st.get(b)["state"] == T.NEEDS_INPUT, str(r))
+    r = route({"action": "dig", "id": b, "notes": "Does the CDN cache it too?", "by": "you"})
+    rec = st.get(b)
+    check("Dig deeper: needs_input -> queued, with the question appended",
+          r["ok"] and rec["state"] == T.QUEUED
+          and rec["goal"].endswith("Does the CDN cache it too?")
+          and rec["goal"].startswith("Why does the cache go stale"), rec["goal"][-200:])
+    check("through the send-back mechanism (queued for the runner, nothing stale kept)",
+          rec["driver"] == "queue" and rec.get("needs_user") is None
+          and rec.get("checkpoint") is None and rec.get("next_steps_held") == [])
+    r = route({"action": "dig", "id": b, "notes": "again?"})
+    check("a second Dig deeper on the requeued task is refused",
+          not r["ok"] and st.get(b)["goal"].count("Dig deeper") == 1, str(r))
+    st.transition(b, T.RUNNING, "claimed")
+    for act in ("close", "dig"):
+        r = route({"action": act, "id": b, "notes": "x?"})
+        check(f"{act} refuses a running task, cleanly",
+              not r["ok"] and "running" in r["error"] and st.get(b)["state"] == T.RUNNING, str(r))
+
+    impl = st.create("Cut a build", role="implementor", project="alpha")["id"]
+    st.transition(impl, T.RUNNING)
+    st.update(impl, needs_user={"action": "add the key", "why": "", "release": ""})
+    st.transition(impl, T.NEEDS_INPUT, "yours")
+    for act in ("close", "dig"):
+        r = route({"action": act, "id": impl, "notes": "x?"})
+        check(f"{act} is only for research", not r["ok"] and st.get(impl)["state"] == T.NEEDS_INPUT)
+
+    # A click decided on a snapshot that has since moved: the store's lock, not
+    # the snapshot, decides. Running is refused (running -> done and -> queued
+    # are both legal, so only refuse_running stops it), and so is anywhere else
+    # the move would be legal from (blocked -> done and -> queued).
+    class Stale:
+        def __init__(self, real, snap):
+            self.real, self.snap = real, snap
+        def get(self, tid):
+            return dict(self.snap)
+        def __getattr__(self, name):
+            return getattr(self.real, name)
+    for real_state in (T.RUNNING, T.BLOCKED):
+        for act in ("close", "dig"):
+            c = _research_parked(st)
+            snap = st.get(c)
+            st.transition(c, T.QUEUED, "dug elsewhere")
+            st.transition(c, T.RUNNING, "claimed")
+            if real_state == T.BLOCKED:
+                st.transition(c, T.BLOCKED, "quota")
+            ns["task_store"] = Stale(st, snap)
+            try:
+                r = route({"action": act, "id": c, "notes": "x?"})
+            finally:
+                ns["task_store"] = st
+            check(f"a stale {act} on a task now {real_state} is refused under the lock",
+                  not r["ok"] and st.get(c)["state"] == real_state, f"{r} {st.get(c)['state']}")
+            if real_state == T.RUNNING:
+                check(f"and says it is running, not that the move is illegal",
+                      r["error"] in (T.RUNNING_BUSY, T.RUNNING_REFUSAL), r["error"])
+
+
+def test_findings_actions_on_the_slack_board():
+    print("\nthe Slack board offers Close, Dig deeper and Discuss, and refuses stale clicks")
+    import home, research, slacklinks, tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    rid = _research_parked(st)
+    rec = dict(st.get(rid), id=rid)
+    acts = [b[1] for b in home.buttons_for(rec)]
+    check("a research task with findings offers Close, Dig deeper, Dismiss",
+          acts == ["close", "dig", "dismiss"], str(acts))
+    check("with Release first when it also left a release",
+          [b[1] for b in home.buttons_for(dict(rec, needs_user={
+              "action": "!release alpha all", "why": "", "release": "alpha all"}))]
+          == ["release", "close", "dig", "dismiss"])
+    check("an ordinary needs_input task is offered what it always was",
+          home.buttons_for(dict(rec, role="implementor")) == home.BUTTONS[T.NEEDS_INPUT])
+    check("Close is a relayed action with a confirmation",
+          "close" in home.DIRECT and dict((b[1], b[3]) for b in home.buttons_for(rec))["close"])
+    check("Dig deeper opens a window", "dig" in home.NOTES and "dig" not in home.DIRECT)
+    line = home._task_line(rec, time.time(), "https://x.slack.com")
+    opts = {o["value"].split("|")[0]: o for o in line["accessory"]["options"]}
+    check("the menu has Discuss, linking the thread through slacklinks",
+          opts.get("thread", {}).get("text", {}).get("text") == "Discuss"
+          and opts["thread"]["url"] == slacklinks.for_key("C1:1.0", "https://x.slack.com"),
+          str(opts.get("thread")))
+    check("and every menu value carries the state it was drawn for",
+          all(o["value"].endswith(f"|{rid}|needs_input") for o in opts.values()))
+    modal = home.rework_modal(rec, False, dig=True)
+    check("the Dig deeper window requires a question",
+          modal["blocks"][1]["optional"] is False
+          and json.loads(modal["private_metadata"])["dig"] is True)
+    check("Close's confirmation shows the findings",
+          "the cache is never invalidated" in json.dumps(home.confirm_modal(rec, "close")))
+
+    calls, opened = [], []
+
+    class Client:
+        def views_open(self, trigger_id, view):
+            opened.append(view)
+        def views_publish(self, **k):
+            pass
+    h = home.Home(store=st, call=lambda p: calls.append(p) or {"ok": True},
+                  allowed_users=[])
+    body = lambda value: {"user": {"id": "U1"}, "trigger_id": "t",
+                          "actions": [{"selected_option": {"value": value}}]}
+    h.on_menu(lambda **k: None, body(f"dig|{rid}|needs_input"), Client())
+    check("picking Dig deeper opens its window and does nothing yet",
+          calls == [] and opened and json.loads(opened[-1]["private_metadata"]).get("dig"))
+    acked = []
+    view = dict(opened[-1], state={"values": {"notes": {"notes": {"value": ""}}}})
+    h.on_submit(lambda **k: acked.append(k), {"user": {"id": "U1"}}, Client(), view)
+    check("submitting it with no question is refused in the window, nothing sent",
+          calls == [] and acked and acked[-1].get("response_action") == "errors")
+    view = dict(opened[-1], state={"values": {"notes": {"notes": {"value": "the CDN?"}}}})
+    h.on_submit(lambda **k: acked.append(k), {"user": {"id": "U1"}}, Client(), view)
+    check("with one, it is sent as dig with the question",
+          calls and calls[-1]["action"] == "dig" and calls[-1]["notes"] == "the CDN?", str(calls))
+    st.transition(rid, T.DONE, "closed elsewhere")
+    n = len(calls)
+    h.on_submit(lambda **k: None, {"user": {"id": "U1"}}, Client(), view)
+    h.on_menu(lambda **k: None, body(f"close|{rid}|needs_input"), Client())
+    h.on_confirm(lambda **k: None, {"user": {"id": "U1"}}, Client(),
+                 {"private_metadata": json.dumps({"action": "close", "id": rid,
+                                                  "seen": "needs_input"})})
+    check("a stale Close or Dig deeper, after it moved on, sends nothing",
+          len(calls) == n, str(calls[n:]))
+
+
+def test_findings_actions_on_the_dashboard():
+    print("\nthe dashboard offers Close, Dig deeper and Discuss for research")
+    sys.argv = ["x"]
+    import visualizer as V
+    js = _re.search(r"<script>(.*?)</script>", V.PAGE, _re.S).group(1)
+    esc = _re.search(r"const esc = .*", js).group(0)
+
+    def fn(name, prefix="function "):
+        i = js.index(f"{prefix}{name}(")
+        return js[i:js.index("\n}\n", i) + 3]
+    harness = (esc + "\n" + fn("taskButtons") + fn("digDeeper", "async function ")
+               + fn("findings") + """
+let answers = [], sent = [];
+function prompt() { return answers.shift(); }
+function threadLink(k) { return "fallback:" + k; }
+async function taskAction(id, action, notes) { sent.push([id, action, notes]); }
+const R = JSON.parse(process.env.R);
+(async () => {
+  const out = {buttons: taskButtons(R), plain: taskButtons(Object.assign({}, R, {role: "assistant", findings: false})),
+               findings: findings(R)};
+  answers = [null]; await digDeeper("t1"); out.cancelled = sent.length;
+  answers = ["", "  ", null]; await digDeeper("t1"); out.blankThenCancel = sent.length;
+  answers = ["", "and the CDN?"]; await digDeeper("t1"); out.sent = sent;
+  process.stdout.write(JSON.stringify(out));
+})();""")
+    rec = {"id": "t1", "role": "researcher", "state": "needs_input", "thread": "C1:1.0",
+           "findings": True,
+           "thread_link": "https://slack.com/archives/C1/p10?thread_ts=1.0&cid=C1",
+           "research": {"children": [{"id": "tsk_kid", "state": "proposed", "title": "Add a TTL"}],
+                        "held": [{"goal": "Write a runbook", "why": "limit reached"}],
+                        "line": "1 next step filed"}}
+    try:
+        out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=30,
+                             env={**os.environ, "R": json.dumps(rec)})
+        got = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError):
+        print("    (node unavailable — dashboard not checked)")
+        return
+    except ValueError:
+        check("the dashboard's research renderers run", False, out.stderr[-300:])
+        return
+    b = got["buttons"]
+    check("Close, Dig deeper and Discuss are offered",
+          "closeFindings('t1')" in b and "digDeeper('t1')" in b and "Discuss" in b, b)
+    check("Discuss links the thread the server built with slacklinks",
+          'href="https://slack.com/archives/C1/p10?thread_ts=1.0&amp;cid=C1"' in b, b)
+    check("and Answer is not offered for research", "sendBack('t1',true)" not in b)
+    check("an assistant in needs_input still gets Answer, not these",
+          "sendBack('t1',true)" in got["plain"] and "closeFindings" not in got["plain"])
+    check("cancelling the question cancels the action", got["cancelled"] == 0)
+    check("a blank question is asked again, and cancelling then still sends nothing",
+          got["blankThenCancel"] == 0)
+    check("a question is sent as dig", got["sent"] == [["t1", "dig", "and the CDN?"]], str(got["sent"]))
+    check("the row lists its next steps and the one not filed",
+          "tsk_kid" in got["findings"] and "limit reached" in got["findings"], got["findings"])
+    cf = js[js.index("async function closeFindings("):]
+    cf = cf[:cf.index("\n}\n")]
+    check("Close asks for confirmation before acting",
+          "confirm(" in cf and cf.index("confirm(") < cf.index('taskAction(id, "close")'))
 
 
 if __name__ == "__main__":

@@ -1545,6 +1545,40 @@ async function sendBack(id, needsAnswer) {
   if (notes === null) return;
   await taskAction(id, "rework", notes);
 }
+async function digDeeper(id) {
+  // The question is the whole point of digging deeper: cancelling the prompt
+  // abandons the action, and a blank answer is asked for again rather than
+  // rerunning the research with nothing new to go on.
+  let q = "";
+  while (!q.trim()) {
+    q = prompt("What should it dig into? The research resumes with your question "
+               + "and parks again with new findings.", q);
+    if (q === null) return;
+  }
+  await taskAction(id, "dig", q);
+}
+async function closeFindings(id) {
+  if (!confirm("Close these findings?\n\nThe research is done; nothing further runs. "
+             + "Any next steps it filed stay on the board for you to accept or dismiss.")) return;
+  await taskAction(id, "close");
+}
+function hasFindings(t) {
+  // Asked of the server (research.has_findings), so the page names no role.
+  return !!t.findings;
+}
+function findings(t) {
+  // A research task's next steps: the proposals it filed under itself, and
+  // the ones the proposal cap or dedup refused -- said, never dropped.
+  const r = t.research;
+  if (!r) return "";
+  const kids = (r.children || []).map(k =>
+    `<li><code>${esc(k.id)}</code> <span class="st st-${esc(k.state)}">${esc(k.state)}</span> ${esc(k.title)}</li>`).join("");
+  const held = (r.held || []).map(h =>
+    `<li>${esc(h.goal)} — <i>${esc(h.why)}</i></li>`).join("");
+  if (!kids && !held) return "";
+  return `<div class="rev ok"><b>Next steps</b>${kids ? `<ul>${kids}</ul>` : ""}${
+    held ? `<span class="lbl">not filed:</span><ul>${held}</ul>` : ""}</div>`;
+}
 async function stopTask(id) {
   // Cancelling a running task is not the same act as cancelling a queue entry,
   // so it does not share the button. The backend kills the child mid-turn; its
@@ -1567,6 +1601,8 @@ async function taskAction(id, action, notes) {
   toast(r.ok ? ((action === "land" || action === "drop" || action === "release") && r.note
                  ? r.note
                : action === "resolve" ? "Marked done"
+               : action === "close" ? "Findings closed"
+               : action === "dig" ? "Sent to dig deeper"
                : `Task ${action}ed${r.note ? ` — ${r.note}` : ""}`)
              : (r.error || "Not allowed"));
   renderTasks();
@@ -1627,8 +1663,11 @@ function taskDetail(t) {
   const goal = (t.goal || "").trim();
   const why = t.state === "failed" ? lastEvent(t) : "";
   // A short goal is its own title; there is nothing behind it to open.
-  const body = goal && goal !== (t.title || "").trim()
-    ? `<pre class="goal">${esc(goal)}</pre>` : "";
+  // Research's findings are what you are deciding on, so they are behind it too.
+  const said = hasFindings(t) && (t.result || {}).text
+    ? `<div class="sect">findings</div><pre class="goal">${esc(t.result.text)}</pre>` : "";
+  const body = (goal && goal !== (t.title || "").trim()
+    ? `<pre class="goal">${esc(goal)}</pre>` : "") + said;
   if (!body && !why) return "";
   return (why ? `<div class="why">${esc(why)}</div>` : "") + body;
 }
@@ -1693,6 +1732,18 @@ function taskButtons(t) {
     b.push(`<button class="act" onclick="taskAction('${t.id}','approve')">Approve</button>`);
     b.push(`<button class="ghost" onclick="sendBack('${t.id}',false)">Send back…</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+  } else if (t.findings) {         // research waiting on you: hasFindings(t)
+    // Research waiting on you with its findings. Close ends it; Dig deeper
+    // sends it back with your question; Discuss opens its thread in Slack,
+    // linked the one way slacklinks builds every thread link.
+    const n = t.needs_user || {};
+    if (n.release)
+      b.push(`<button class="act" title="!release ${esc(n.release)}" onclick="releaseStep('${t.id}')">Release</button>`);
+    b.push(`<button class="act" onclick="closeFindings('${t.id}')">Close</button>`);
+    b.push(`<button class="ghost" onclick="digDeeper('${t.id}')">Dig deeper…</button>`);
+    if (t.thread)
+      b.push(`<a class="ghost" target="_blank" href="${esc(t.thread_link || threadLink(t.thread))}">Discuss ↗</a>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "needs_input") {
     // A step the run left for you: run it from here when it is a release, or
     // say you took it. Answer still sends it back with something to go on.
@@ -1749,7 +1800,7 @@ async function renderTasks() {
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
-          age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${review(t)}${landing(t)}</span>
+          age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${findings(t)}${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
   }).join("");
 }
@@ -2077,7 +2128,8 @@ function boardCard(t) {
       t.attempts > 1 ? ` · attempt ${t.attempts}` : ""}${
       t.queue_pos ? ` · <span class="qpos" title="its place in the runner's queue, all projects">${
         t.priority ? "📌 " : ""}#${t.queue_pos} in queue</span>` : ""}</div>
-    ${t.why ? `<div class="why">${esc(t.why)}</div>` : ""}${yoursToDo(t)}${cardReview(t)}${cardLanding(t)}
+    ${t.why ? `<div class="why">${esc(t.why)}</div>` : ""}${yoursToDo(t)}${
+      t.research && t.research.line ? `<div class="rv ok">🔎 ${esc(t.research.line)}</div>` : ""}${cardReview(t)}${cardLanding(t)}
     <div class="acts" onclick="event.stopPropagation()">${cardButtons(t)}</div></div>`;
 }
 function unfiledThreads() {
@@ -2189,6 +2241,9 @@ function renderDetail(t) {
       ? `<a class="ghost" href="${esc(t.thread_link)}" target="_blank">Slack thread ↗</a>` : ""}</div>
     ${yoursToDo(t)}
     <div class="sect">goal</div><pre class="goal">${esc(t.goal || "")}</pre>
+    ${t.research && (t.result || {}).text
+      ? `<div class="sect">findings</div><pre class="goal">${esc(t.result.text)}</pre>` : ""}
+    ${findings(t)}
     ${t.state === "failed" ? `<div class="sect">why it stopped</div><div class="rev">${esc(lastEvent(t))}</div>` : ""}
     ${(t.result || {}).review ? `<div class="sect">review</div>${review(t)}` : ""}
     ${reviews ? `<div class="sub">reviewed by ${reviews}</div>` : ""}

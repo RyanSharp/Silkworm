@@ -222,6 +222,10 @@ FIELDS: dict[str, tuple] = {
     "defers":      (0,     "depth of the scheduled wake-up chain"),
     # Evidence from the project's own tests, kept so the record says whether
     # work was proven rather than merely believed.
+    # Next steps a research task tried to file and was refused (the proposal
+    # cap, or a duplicate), so the board can say so rather than drop them.
+    # The ones that were filed are its children: `parent` names it.
+    "next_steps_held": (list, "research next steps refused at filing, and why"),
     "verified":        (None,  "True/False from the test command, None = not run"),
     "verify_attempts": (0,     "times it was sent back for failing tests"),
     "commit_attempts": (0,     "times it was sent back for leaving its work uncommitted"),
@@ -318,14 +322,26 @@ def needs_user_detail(asks: dict) -> str:
     return f"{NEEDS_USER_PREFIX}{(asks or {}).get('action', '')}"[:200]
 
 
+#: The event detail a completed research task parks with (see research.py).
+FINDINGS_DETAIL = "findings to review: Close, Dig deeper, or Discuss"
+
+
 def ending(rec: dict | None) -> tuple[str, str]:
     """(state, detail) for a task whose work completed: `done`, or
     `needs_input` if its last run said the rest is yours (`needs_user`, see
     roles.parse_needs_user). A run that asked nothing ends as it always did.
+
+    Research is the exception: its findings are the deliverable, and `done` is
+    off the board, so a completed research run waits for you to decide on
+    them. Asked of the role, which nothing rewrites, and never of a wake-up --
+    a scheduled check is the conversation resuming, whatever filed it.
     """
-    asks = (rec or {}).get("needs_user")
+    rec = rec or {}
+    asks = rec.get("needs_user")
     if isinstance(asks, dict) and asks.get("action"):
         return NEEDS_INPUT, needs_user_detail(asks)
+    if rec.get("role") == roles.RESEARCHER and rec.get("source") not in CONVERSATIONAL:
+        return NEEDS_INPUT, FINDINGS_DETAIL
     return DONE, ""
 
 

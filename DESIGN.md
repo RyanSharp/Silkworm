@@ -193,7 +193,10 @@ recovery already built carries over rather than being rewritten.
 
 A role is a reusable template a task references by name: model, extra system
 prompt, allowed/denied tools, permission mode, isolation (`none` | `worktree`),
-expected output, and limits. Only `assistant` exists at first.
+expected output, and limits. Only `assistant` exists at first. Now:
+`assistant`, `implementor`, `reviewer`, `ideator`, and `researcher` -- an
+assistant whose completed queued runs park in `needs_input` with findings to
+decide on, filing its next steps as proposed children (research.py).
 
 The **broker is a role, not a topology** — its output is a validated list of
 `{role, goal, scope}` to enqueue. Routing stays adaptive; there is no drawn

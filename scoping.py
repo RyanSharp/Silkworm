@@ -387,12 +387,15 @@ def board_note(open_names=(), dismissed=(), limit: int = MAX_LISTED) -> str:
 HOW_TO = """When the user asks you to scope, plan or break down a piece of \
 work, you can file the pieces as real tasks rather than only describing them:
 
-    {bin} task --project <slug> [--role implementor|assistant] "<goal>"
+    {bin} task --project <slug> [--role implementor|assistant|researcher] "<goal>"
 
 Each becomes a queued task that runs unattended in its own git worktree, off \
-fresh main, and reports back in its own thread. `implementor` is the default \
-and puts the result through an independent reviewer before it can complete; \
-use `assistant` for investigation with nothing to review.
+fresh main, and reports back in its own thread. Roles:
+- `implementor` (the default): changes code, is tested, reviewed and merged.
+- `assistant`: investigates or answers, nothing is merged.
+- `researcher`: investigation whose findings you will review and decide on — \
+it comes back to the user's board with an answer, its evidence and proposed \
+next steps.
 
 Write each goal so it stands alone — the session that runs it has this \
 conversation's context only through the project, not through this thread. \

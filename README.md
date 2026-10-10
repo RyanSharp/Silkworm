@@ -510,6 +510,32 @@ costs you a decision.
 
 It never acts on its own findings. Acceptance is always a person.
 
+## Research
+
+File a question as role **researcher** (the dashboard's New task form,
+`silkworm task --role researcher "<question>"` from a turn, or ask in a thread
+to have it filed) when you want findings to read and decide on rather than a
+change. It runs as `assistant` does -- nothing is reviewed or merged -- but
+when it finishes it waits in **Needs you** instead of closing as done, with
+its findings in a fixed shape: a short answer, confidence and why, key
+evidence, and 2-4 next steps written as standalone task goals.
+
+Those next steps are filed as **proposed** children of the research task, in
+its project, through the same gate as the nightly review: the per-pass budget,
+the project's open-proposal cap and duplicate check all apply, and a run cannot
+file them as anything but proposals. Any it could not file are listed on the
+research task with the reason, not dropped. The task's row lists both.
+
+On the board (dashboard, and the Slack board's menu):
+
+- **Close** -- you have read them; it is done and nothing further runs.
+- **Dig deeper…** -- asks for a follow-up question and sends it back with the
+  question appended; it parks again with new findings. Cancelling the prompt
+  sends nothing.
+- **Discuss** -- opens its thread in Slack.
+
+Each refuses a task that is running or has already moved on.
+
 ## Isolated checkouts for queued work
 
 A task filed against a repo-backed project runs in **its own `git` worktree**,

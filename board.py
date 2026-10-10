@@ -21,6 +21,7 @@ import branches
 import costs
 import projects as projects_mod
 import releases
+import research
 import slacklinks
 import tasks
 
@@ -159,7 +160,16 @@ def landing_summary(rec: dict) -> dict | None:
         "detail": str(l.get("detail") or "")[-300:]}
 
 
-def card(rec: dict, reviews=(), unmerged: dict | None = None) -> dict:
+def findings(rec: dict, kids=()) -> dict | None:
+    """A research task's next steps: the children it filed, and the ones the
+    cap or dedup refused. None for anything that is not research."""
+    if not research.is_research(rec):
+        return None
+    kids, held = list(kids or ()), list(rec.get("next_steps_held") or [])
+    return {"children": kids, "held": held, "line": research.line(kids, held)}
+
+
+def card(rec: dict, reviews=(), unmerged: dict | None = None, kids=()) -> dict:
     """What a board card needs: small, because the page polls the board."""
     goal = (rec.get("goal") or "").strip()
     return {
@@ -176,6 +186,8 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None) -> dict:
         "created": rec.get("created") or 0,
         "updated": rec.get("updated") or 0,
         "thread": rec.get("thread") or "",
+        # One way to link a thread (slacklinks), for Discuss and Thread alike.
+        "thread_link": slacklinks.for_key(rec.get("thread") or ""),
         "cost_total": costs.total(rec, reviews),
         "review": review_summary(rec),
         "landing": landing_summary(rec),
@@ -186,6 +198,11 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None) -> dict:
         "why": _why(rec) if rec.get("state") == tasks.FAILED else "",
         # The step its run left for you, which keeps it in Needs you.
         "needs_user": rec.get("needs_user") or None,
+        # Research: the next steps it filed, and any it could not.
+        "research": findings(rec, kids),
+        # Waiting on you with findings: what the page offers Close and Dig
+        # deeper on, decided here so the page names no role of its own.
+        "findings": research.has_findings(rec),
     }
 
 
@@ -238,6 +255,7 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
     records = list(records)
     reviewers = _reviewer_ids(records)
     reviews = costs.reviews_by_parent(records)
+    kids = research.children_by_parent(records)
     by_id = {r.get("id"): r for r in unmerged_rows}
     cols: dict = {c: [] for c in COLUMNS}
     roles_seen = set()
@@ -251,7 +269,8 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
         if not matches(rec, role, state, q):
             continue
         tid = rec.get("id")
-        cols[col].append(card(rec, reviews.get(tid, ()), unmerged_of(by_id.get(tid))))
+        cols[col].append(card(rec, reviews.get(tid, ()), unmerged_of(by_id.get(tid)),
+                              kids.get(tid, ())))
     for name, items in cols.items():
         if name == "done":
             items.sort(key=lambda c: -(c["finished"] or 0))
@@ -294,6 +313,8 @@ def detail(rec: dict, records=(), unmerged_rows=()) -> dict:
     out = dict(rec)
     out["cost_total"] = costs.total(rec, reviews)
     out["thread_link"] = slacklinks.for_key(rec.get("thread") or "")
+    out["research"] = findings(rec, research.children(rec.get("id"), records))
+    out["findings"] = research.has_findings(rec)
     out["unmerged"] = unmerged_of(next(
         (r for r in unmerged_rows if r.get("id") == rec.get("id")), None))
     out["reviews"] = [{"id": r.get("id"), "state": r.get("state"),

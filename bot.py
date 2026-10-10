@@ -53,6 +53,7 @@ import revision
 import roles
 import scoping
 import slack_health
+import research
 import slacklinks
 import tasks
 import procs
@@ -2057,6 +2058,48 @@ def approve_task(payload: dict) -> dict:
     return {"ok": True, "note": note, "task": task_store.get(tid) or done}
 
 
+def decide_findings(action: str, payload: dict) -> dict:
+    """Close a research task's findings, or send it to Dig deeper.
+
+    `close` is you having read them: the task is done, nothing further runs.
+    `dig` is a follow-up question: the task is requeued with it appended, by
+    the same send-back every other rework uses, and parks with new findings
+    when it finishes. A dig needs the question -- a blank one would rerun the
+    research with nothing new to go on -- and refusing it here is what makes
+    cancelling the prompt cancel the action.
+
+    Both refuse a task that is not a research task waiting on you, and a
+    running one, under the store's lock (refuse_running, expect): a stale
+    click on a published board is refused, never applied to whatever the
+    task has become since. Discuss needs no route; it is a link to the thread.
+    """
+    tid = payload.get("id", "")
+    task = task_store.get(tid)
+    why = research.refusal(task)
+    if why:
+        return {"ok": False, "error": why}
+    by = payload.get("by", "ui")
+    try:
+        if action == "close":
+            moved = task_store.transition(tid, tasks.DONE, f"findings closed via {by}",
+                                          refuse_running=tasks.RUNNING_BUSY,
+                                          expect=tasks.NEEDS_INPUT)
+            return {"ok": True, "task": moved}
+        question = (payload.get("notes") or "").strip()
+        if not question:
+            return {"ok": False, "error": "say what to dig into; nothing was sent"}
+        # The last round's refused next steps were said with its findings;
+        # the new round says its own.
+        moved = send_back(tid, research.dig_addendum(question, by),
+                          f"dig deeper via {by}", by_user=True,
+                          expect=tasks.NEEDS_INPUT, next_steps_held=[])
+        return {"ok": True, "task": moved}
+    except tasks.NotEditable as e:
+        return {"ok": False, "error": str(e)}
+    except tasks.InvalidTransition as e:
+        return {"ok": False, "error": f"not allowed: {e}"}
+
+
 def take_step(action: str, payload: dict) -> dict:
     """The step a run left for you (`needs_user`), taken from the board.
 
@@ -2167,8 +2210,15 @@ def land_or_drop(action: str, payload: dict) -> dict:
 def _with_costs(items: list) -> list:
     """Each task with `cost_total`: its own cost plus its reviews', and
     whether that is complete. Copies -- the store's records are not touched."""
-    reviews = costs.reviews_by_parent(task_store.all().values())
-    return [dict(t, cost_total=costs.total(t, reviews.get(t.get("id"), ())))
+    records = list(task_store.all().values())
+    reviews = costs.reviews_by_parent(records)
+    kids = research.children_by_parent(records)
+    # And, for research, the next steps it filed; and the thread as a link
+    # built the one way (slacklinks) for Discuss.
+    return [dict(t, cost_total=costs.total(t, reviews.get(t.get("id"), ())),
+                 thread_link=slacklinks.for_key(t.get("thread") or ""),
+                 research=board.findings(t, kids.get(t.get("id"), ())),
+                 findings=research.has_findings(t))
             for t in items]
 
 
@@ -2522,6 +2572,8 @@ def handle_tasks(payload: dict) -> dict:
         return approve_task(payload)
     if action in ("release", "resolve"):
         return take_step(action, payload)
+    if action in ("close", "dig"):
+        return decide_findings(action, payload)
     if action in ("land", "drop"):
         return land_or_drop(action, payload)
     if action in ("accept", "dismiss", "retry", "cancel"):
@@ -2901,6 +2953,27 @@ def filed_by_restricted_role(caller_role: str, key: str) -> bool:
                if t.get("thread") == key)
 
 
+def research_parent(caller_role: str, caller_task: str, key: str) -> dict | None:
+    """The research task a filing on `key` comes from, or None.
+
+    Only ever a researcher task the bot itself has running on this thread:
+    the request picks between those, it cannot name one anywhere else. Which
+    one is the run's own task id, from the environment the bot set up for it;
+    a run that says it is a researcher without one gets the one running here.
+    Anything else on the thread is not research -- a Slack turn carries no
+    task id and runs as assistant, and a researcher merely claimed and
+    waiting for the thread's lock must not adopt what that turn files.
+    """
+    running = [t for t in task_store.by_state(tasks.RUNNING)
+               if t.get("thread") == key and research.is_research(t)]
+    named = [t for t in running if caller_task and t.get("id") == caller_task]
+    if named:
+        return named[0]
+    if caller_role == research.ROLE and running:
+        return running[0]
+    return None
+
+
 def begin_turn(key: str) -> None:
     """Give the turn about to run on this thread a fresh filing budget.
 
@@ -2951,10 +3024,28 @@ def handle_file_task(payload: dict) -> dict:
     # full write permissions. Read-only stops the ideator editing the tree; it
     # does not stop it commissioning an agent that will. Acceptance is a
     # person, every time, so a restricted role's work waits whatever it asked.
-    restricted = filed_by_restricted_role(
-        (payload.get("caller_role") or "").strip(), key)
-    propose = bool(payload.get("propose")) or restricted
+    caller_role = (payload.get("caller_role") or "").strip()
+    restricted = filed_by_restricted_role(caller_role, key)
+    # A research run's next steps are suggestions for you to decide on, not
+    # work it may commission: each is a proposal, a child of the research
+    # task, in its project -- through the same cap and dedup as the nightly
+    # pass, whatever the CLI was asked for. The role alone is enough to force
+    # the proposal; the running task is what it is filed under.
+    parent = research_parent(caller_role, (payload.get("caller_task") or "").strip(), key)
+    from_research = parent is not None or caller_role == research.ROLE
+    propose = bool(payload.get("propose")) or restricted or from_research
     state = tasks.PROPOSED if propose else tasks.QUEUED
+
+    def held(err: str) -> None:
+        """A refused next step, kept on the research task so it is said."""
+        if not parent:
+            return
+        try:
+            rec = task_store.get(parent["id"]) or parent
+            task_store.update(parent["id"], next_steps_held=research.with_held(
+                rec, goal, err, time.time()))
+        except Exception:
+            log.exception("could not record a held next step on %s", parent["id"])
 
     # Named, not resolved. `ensure` creates the project's record and its home
     # directory on disk, which has to stay below the checks so a refused
@@ -2962,6 +3053,8 @@ def handle_file_task(payload: dict) -> dict:
     # stores under, arrived at without writing anything.
     entry = store.get(key) or {}
     proj = (payload.get("project") or entry.get("project") or "").strip()
+    if parent:
+        proj = parent.get("project") or ""
     slug = projects.slugify(proj) if proj else ""
 
     # Proposals are also bounded across passes, not just within one: the
@@ -2977,6 +3070,7 @@ def handle_file_task(payload: dict) -> dict:
     err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose,
                            open_now=open_now, slug=slug)
     if err:
+        held(err)
         return {"ok": False, "error": err}
 
     # A proposal the board already holds is refused, naming what it matched,
@@ -2985,15 +3079,23 @@ def handle_file_task(payload: dict) -> dict:
     # conversation was agreed by the person this check exists to spare. Only
     # for a named project, for the same reason as the backlog count above.
     if propose and slug:
+        # Never against the research it came out of, as file_followups never
+        # weighs a review's followups against the task reviewed: a next step
+        # shares that task's vocabulary by construction, and was refused as a
+        # duplicate of the question it answers.
         err = dedup.duplicate(goal, task_store.by_project(slug), unmerged_survey,
-                              title=goal[:70])
+                              title=goal[:70],
+                              exclude=({parent["id"], parent.get("root") or parent["id"]}
+                                       if parent else ()))
         if err:
             log.info("refused a proposal from %s: %s", key, err)
+            held(err)
             return {"ok": False, "error": err, "duplicate": True}
 
     role = (payload.get("role") or roles.DEFAULT_FILED).strip()
     err = roles.validate_filed(role)
     if err:
+        held(err)
         return {"ok": False, "error": err}
 
     # Created only once the filing is going to happen. Naming a project makes
@@ -3010,16 +3112,20 @@ def handle_file_task(payload: dict) -> dict:
         # Work scoped with you is queued: it was already reviewed by the person
         # the proposed gate exists to ask. A proposal nobody has seen is not.
         state=state, driver="queue",
-        source="ideation" if propose else "scoped",
+        source=(research.SOURCE if parent else
+                "ideation" if propose else "scoped"),
         # Filed work, not the conversation that scoped it: whoever runs it
         # starts fresh, so it gets its own checkout.
         isolate=True,
         scope=scope,
+        **({"parent": parent["id"], "root": parent.get("root") or parent["id"],
+            "source_ref": parent["id"]} if parent else {}),
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
-    log.info("filed task %s from %s (project=%s role=%s state=%s%s)",
+    log.info("filed task %s from %s (project=%s role=%s state=%s%s%s)",
              task["id"], key, proj or "-", role, state,
-             " restricted-caller" if restricted else "")
+             " restricted-caller" if restricted else "",
+             f" next step of {parent['id']}" if parent else "")
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
             "remaining": scoping.limit_for(propose) - _filed_this_turn[key]}
@@ -3766,7 +3872,7 @@ def execute_task(task: dict) -> None:
         system_note += "\n\n" + defer.WAKE_NOTE
     else:
         system_note += "\n\n" + defer.HOW_TO.format(bin=SILKWORM_BIN)
-    role_system = roles.system_prompt(role_name)
+    role_system = roles.system_prompt(role_name, bin=SILKWORM_BIN)
     if role_system:
         system_note += "\n\n" + role_system
     # Not on a wake-up: a watch already has its own way to say "over to you"
@@ -3948,7 +4054,9 @@ def execute_task(task: dict) -> None:
             task_state(tid, ending, why)
             parked = task_store.get(tid) or {}
             if ending == tasks.NEEDS_INPUT and parked.get("state") == tasks.NEEDS_INPUT:
-                tell_thread(key, roles.over_to_you(parked.get("needs_user")))
+                tell_thread(key, roles.over_to_you(parked.get("needs_user"))
+                            if parked.get("needs_user") else research.parked_note(
+                                parked, research.children(tid, task_store.all().values())))
         refresh_summary(key)
         refresh_brief(task.get("project", ""),
                       f"Task: {task.get('goal', '')[:500]}\n\n"
@@ -4196,7 +4304,7 @@ def review_addendum(findings: list) -> str:
 
 
 def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
-              **fields) -> dict:
+              expect: str = "", **fields) -> dict:
     """Requeue a task with `addendum` appended to its goal. The one way work
     is sent back for another pass -- by the dashboard, or by the gates below.
 
@@ -4211,6 +4319,10 @@ def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
     must keep working -- so the lifecycle alone let the dashboard requeue
     tsk_3172171f8b a minute after the runner claimed it. The run in flight
     never read the notes, and its end then raced the requeued copy.
+
+    `expect` refuses (tasks.InvalidTransition) unless the task is still in
+    that state under the store's lock -- for a click decided on what the task
+    was a moment ago.
     """
     task = task_store.get(tid) or {}
     # Running is refused by the move itself, under the store's lock: asked
@@ -4227,6 +4339,7 @@ def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
     return task_store.transition(
         tid, tasks.QUEUED, why,
         refuse_running=tasks.RUNNING_REFUSAL if by_user else "",
+        expect=expect,
         # And no step left for you: that was the last run's, and a rerun that
         # never gets to the end -- held at the gate, failed -- would otherwise
         # still offer it, and Release or Done would close unreworked work.
