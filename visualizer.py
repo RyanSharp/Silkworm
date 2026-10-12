@@ -9,10 +9,13 @@ Talks to the running bot (localhost) for live thread status and to relay
 messages/commands into threads. Stdlib only; binds 127.0.0.1 only.
 """
 
+import gzip
+import hashlib
 import json
 import os
 import socket
 import socketserver
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -130,9 +133,10 @@ def load_sessions() -> dict:
     status = bot_call("/status", {}, timeout=0.6)
     threads = status.get("threads", {})
     entries = raw_sessions()
+    # Only a pending turn reads `live`; with none in flight, no ps at all.
     live = procs.alive_sessions(
         [(e.get("pending") or {}).get("session_id") or e.get("session_id")
-         for e in entries.values()])
+         for e in entries.values() if e.get("pending")])
     out = []
     for key, entry in entries.items():
         channel, _, thread_ts = key.partition(":")
@@ -185,12 +189,64 @@ def load_sessions() -> dict:
                           if status.get("online") else {}))}
 
 
+#: session id -> transcript path, rebuilt only when a project directory
+#: changes. find_transcript used to glob all ~400 of them per call, and
+#: /api/sessions calls it once per thread: 0.95s of the 1s that request took.
+_index_lock = threading.Lock()
+_index: dict = {"root": None, "key": None, "checked": 0.0, "map": {}}
+
+#: How long a checked index is trusted without looking at the directories
+#: again. Long enough that one request's four hundred lookups share one look;
+#: short enough that a new session is found on the next poll.
+INDEX_RECHECK_S = 1.0
+
+
+def _scan_dirs(root: Path) -> list:
+    try:
+        return sorted((e for e in os.scandir(root) if e.is_dir()), key=lambda e: e.name)
+    except OSError:
+        return []
+
+
+def transcript_index() -> dict:
+    """{session id: transcript path}. A file appearing in, or leaving, a
+    project directory changes that directory's mtime, and a new project
+    directory changes the root's; anything else needs no rescan."""
+    root = PROJECTS_DIR
+    now = time.monotonic()
+    with _index_lock:
+        if _index["root"] == root and now - _index["checked"] < INDEX_RECHECK_S:
+            return _index["map"]
+        dirs = _scan_dirs(root)
+        try:
+            key = (root.stat().st_mtime_ns,) + tuple(
+                (e.name, e.stat().st_mtime_ns) for e in dirs)
+        except OSError:
+            key = None
+        if _index["root"] != root or key is None or key != _index["key"]:
+            found: dict = {}
+            for e in dirs:                    # first match wins, as the glob did
+                try:
+                    for f in os.scandir(e.path):
+                        if f.name.endswith(".jsonl"):
+                            found.setdefault(f.name[:-6], Path(f.path))
+                except OSError:
+                    # Not remembered as current: a directory that could not
+                    # be read is read again next time, not hidden until it
+                    # happens to change.
+                    key = None
+                    continue
+            _index.update(root=root, key=key, map=found)
+        _index["checked"] = now
+        return _index["map"]
+
+
 def find_transcript(session_id: str) -> Path | None:
     if not session_id or not PROJECTS_DIR.exists():
         return None
-    for p in PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
-        return p
-    return None
+    p = transcript_index().get(session_id)
+    # Deleted since the index was built: not there, rather than a stale path.
+    return p if p is not None and p.exists() else None
 
 
 def _block_list(content) -> list[dict]:
@@ -226,12 +282,49 @@ def iter_entries(path: Path):
             yield d
 
 
-def load_transcript(session_id: str) -> dict:
+def _complete_lines(path: Path, start: int) -> tuple[list, int, bool]:
+    """The whole lines written after byte `start`, and the offset just past the
+    last of them. A line still being written is left for the next read. A file
+    now shorter than `start` was replaced: read from the top, and say so."""
+    reset = False
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        if start > size:
+            start, reset = 0, True
+        f.seek(start)
+        chunk = f.read(size - start)
+    end = chunk.rfind(b"\n") + 1
+    return chunk[:end].splitlines(), start + end, reset
+
+
+def _entries_of(lines):
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(d, dict) and d.get("type") in ("user", "assistant"):
+            yield d
+
+
+def load_transcript(session_id: str, cursor: int | None = None) -> dict:
+    """The transcript's messages. With `cursor` (a byte offset a previous
+    answer returned), only those written since: the page polls the open
+    thread every four seconds and used to take the whole file each time."""
     path = find_transcript(session_id)
     if not path:
         return {"error": "no transcript found for this session"}
+    reset = False
+    if cursor is None:
+        entries = iter_entries(path)
+    else:
+        try:
+            lines, cursor, reset = _complete_lines(path, max(0, cursor))
+        except OSError:
+            return {"error": "no transcript found for this session"}
+        entries = _entries_of(lines)
     messages = []
-    for d in iter_entries(path):
+    for d in entries:
         msg = d.get("message") or {}
         blocks = _block_list(msg.get("content"))
         if not blocks:
@@ -247,7 +340,65 @@ def load_transcript(session_id: str) -> dict:
             }
             item["model"] = msg.get("model")
         messages.append(item)
-    return {"session_id": session_id, "path": str(path), "messages": messages}
+    out = {"session_id": session_id, "path": str(path), "messages": messages}
+    if cursor is not None:
+        out.update(cursor=cursor, reset=reset)
+    return out
+
+
+#: Per transcript, its token usage so far, read incrementally: a transcript
+#: only grows, so each poll reads what was appended since the last one rather
+#: than every transcript in full (2.4s every thirty seconds).
+_usage_lock = threading.Lock()
+_usage: dict = {}
+
+
+def _usage_of(path: Path) -> dict:
+    """{offset, ino, cache, fresh, models: {model: out}, daily: {day: {...}}}."""
+    key = str(path)
+    st = path.stat()
+    with _usage_lock:
+        rec = _usage.get(key)
+        if rec is None or rec["ino"] != st.st_ino or st.st_size < rec["offset"]:
+            rec = {"offset": 0, "ino": st.st_ino, "cache": 0, "fresh": 0,
+                   "models": {}, "daily": {}}
+        if st.st_size > rec["offset"]:
+            lines, rec["offset"], reset = _complete_lines(path, rec["offset"])
+            if reset:                         # replaced underneath us: start over
+                rec.update(cache=0, fresh=0, models={}, daily={})
+            _add_usage(rec, _entries_of(lines))
+        _usage[key] = rec
+        # A copy, taken under the lock: a second request reading the same
+        # transcript may be adding to the record while this one sums it.
+        return {"cache": rec["cache"], "fresh": rec["fresh"], "models": dict(rec["models"]),
+                "daily": {d: dict(v) for d, v in rec["daily"].items()}}
+
+
+def _add_usage(rec: dict, entries) -> None:
+    for d in entries:
+        msg = d.get("message") or {}
+        usage = msg.get("usage")
+        if d.get("type") != "assistant" or not isinstance(usage, dict):
+            continue
+        ts = d.get("timestamp", "")
+        cache = usage.get("cache_read_input_tokens", 0) or 0
+        fresh = (usage.get("input_tokens", 0) or 0) + (usage.get("cache_creation_input_tokens", 0) or 0)
+        out = usage.get("output_tokens", 0) or 0
+        rec["cache"] += cache
+        rec["fresh"] += fresh
+        model = msg.get("model") or "unknown"
+        if not model.startswith("<"):
+            rec["models"][model] = rec["models"].get(model, 0) + out
+        if ts:
+            try:
+                t = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+                day = time.strftime("%Y-%m-%d", time.localtime(t))
+            except ValueError:
+                continue
+            bucket = rec["daily"].setdefault(day, {"cache_read": 0, "fresh_in": 0, "out": 0})
+            bucket["cache_read"] += cache
+            bucket["fresh_in"] += fresh
+            bucket["out"] += out
 
 
 def load_stats(days: int = 14) -> dict:
@@ -262,30 +413,19 @@ def load_stats(days: int = 14) -> dict:
         path = find_transcript(entry.get("session_id", ""))
         if not path:
             continue
-        for d in iter_entries(path):
-            msg = d.get("message") or {}
-            usage = msg.get("usage")
-            if d.get("type") != "assistant" or not isinstance(usage, dict):
-                continue
-            ts = d.get("timestamp", "")
-            cache = usage.get("cache_read_input_tokens", 0) or 0
-            fresh = (usage.get("input_tokens", 0) or 0) + (usage.get("cache_creation_input_tokens", 0) or 0)
-            out = usage.get("output_tokens", 0) or 0
-            tot_cache += cache
-            tot_in += fresh
-            model = msg.get("model") or "unknown"
-            if not model.startswith("<"):
-                models[model] = models.get(model, 0) + out
-            if ts:
-                try:
-                    t = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
-                    day = time.strftime("%Y-%m-%d", time.localtime(t))
-                except ValueError:
-                    continue
-                if day in daily:
-                    daily[day]["cache_read"] += cache
-                    daily[day]["fresh_in"] += fresh
-                    daily[day]["out"] += out
+        try:
+            rec = _usage_of(path)
+        except OSError:
+            continue
+        tot_cache += rec["cache"]
+        tot_in += rec["fresh"]
+        for model, n in rec["models"].items():
+            models[model] = models.get(model, 0) + n
+        for day, row in daily.items():
+            got = rec["daily"].get(day)
+            if got:
+                for k in row:
+                    row[k] += got[k]
     denom = tot_cache + tot_in
     return {
         "total_cost": round(sum(e.get("cost", 0.0) for e in sessions.values()), 2),
@@ -294,6 +434,20 @@ def load_stats(days: int = 14) -> dict:
         "days": [{"date": d, **daily[d]} for d in day_keys],
         "models": sorted(models.items(), key=lambda kv: -kv[1]),
     }
+
+
+#: load_stats' answer, reused for this long. The page polls it every thirty
+#: seconds and it changes only as fast as tokens are spent; the transcripts
+#: are read incrementally underneath anyway (_usage_of).
+STATS_TTL_S = 20
+_stats_cache: dict = {"at": 0.0, "data": None}
+
+
+def cached_stats() -> dict:
+    now = time.monotonic()
+    if _stats_cache["data"] is None or now - _stats_cache["at"] >= STATS_TTL_S:
+        _stats_cache.update(data=load_stats(), at=now)
+    return _stats_cache["data"]
 
 
 def search(query: str) -> list[dict]:
@@ -346,6 +500,32 @@ def allowed_download(path_str: str) -> Path | None:
 
 # --- HTTP -----------------------------------------------------------------------
 
+#: /api/tasks actions that only read. Only these answer 304: an action that
+#: does something must always do it, whatever the page last saw.
+READ_TASK_ACTIONS = frozenset({"list", "attention", "counts", "board", "overview",
+                               "task", "unmerged", "holding", "roles", "watching"})
+
+#: Below this a body goes as it is; gzip would only add its header.
+GZIP_MIN = 1024
+
+
+def etag_for(data) -> str:
+    """A strong validator for a JSON answer: the hash of how it serialises."""
+    raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return '"' + hashlib.sha1(raw).hexdigest()[:24] + '"'
+
+
+def sessions_tag(data: dict) -> str:
+    """/api/sessions' validator, leaving out each running turn's age. The age
+    moves every second, so with it in no poll during a turn would ever match;
+    the page adds the time since its last full answer instead. Crossing into
+    `stalled` changes the answer on its own."""
+    steady = dict(data, sessions=[
+        dict(x, turn=dict(x["turn"], age_s=None)) if x.get("turn") else x
+        for x in data.get("sessions") or []])
+    return etag_for(steady)
+
+
 def make_server(bind: str, port: int, handler=None) -> ThreadingHTTPServer:
     """A server on VIZ_BIND. ThreadingHTTPServer is IPv4-only, so an IPv6
     address (``::1``, ``::``, a LAN v6 address) would fail at startup with
@@ -376,6 +556,12 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+        # The page is usually read through an SSH tunnel: JSON shrinks four or
+        # five times, which is most of what a poll costs there.
+        if (len(body) >= GZIP_MIN and ctype.startswith(("application/json", "text/"))
+                and "gzip" in self.headers.get("Accept-Encoding", "")):
+            body = gzip.compress(body, 5)
+            extra = {**(extra or {}), "Content-Encoding": "gzip", "Vary": "Accept-Encoding"}
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -384,8 +570,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, data) -> None:
-        self._send(200, json.dumps(data).encode(), "application/json")
+    def _json(self, data, tag: str | None = None) -> None:
+        """Send `data`; with `tag`, as a conditional answer -- 304 and no body
+        when the page already holds this exact answer (If-None-Match)."""
+        if tag is None:
+            self._send(200, json.dumps(data).encode(), "application/json")
+            return
+        held = {t.strip() for t in self.headers.get("If-None-Match", "").split(",")}
+        if tag in held:
+            self.send_response(304)
+            self.send_header("ETag", tag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        self._send(200, json.dumps(data).encode(), "application/json",
+                   {"ETag": tag, "Cache-Control": "no-cache"})
+
+    def _cached(self, data) -> None:
+        self._json(data, etag_for(data))
 
     def _authed(self, url) -> bool:
         """Loopback needs no token; anything else must present one.
@@ -431,15 +633,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, b"no icon", "text/plain")
         elif url.path == "/api/sessions":
-            self._json(load_sessions())
+            data = load_sessions()
+            self._json(data, sessions_tag(data))
         elif url.path == "/api/session":
-            self._json(load_transcript(qs.get("id", [""])[0]))
+            frm = qs.get("from", [""])[0]
+            cursor = int(frm) if frm.isdigit() else None
+            self._cached(load_transcript(qs.get("id", [""])[0], cursor))
         elif url.path == "/api/stats":
-            self._json(load_stats())
+            self._cached(cached_stats())
         elif url.path == "/api/search":
             self._json(search(qs.get("q", [""])[0]))
         elif url.path == "/api/artifacts":
-            self._json(artifacts(qs.get("key", [""])[0]))
+            self._cached(artifacts(qs.get("key", [""])[0]))
         elif url.path == "/download":
             p = allowed_download(qs.get("path", [""])[0])
             if not p:
@@ -472,7 +677,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/tasks":
             answer = bot_call("/tasks", payload, timeout=15)
-            self._json(answer or {"ok": False, "error": "bot is offline"})
+            if answer and payload.get("action", "list") in READ_TASK_ACTIONS:
+                self._cached(answer)
+            else:
+                self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/titles":
             answer = bot_call("/titles", payload, timeout=180)
             self._json(answer or {"ok": False, "error": "bot is offline"})
@@ -948,7 +1156,7 @@ PAGE = r"""<!doctype html>
   <main>
     <div id="content">
       <div id="dash"></div>
-      <div id="transcript"><div class="empty">Pick a session on the left.</div></div>
+      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tfiles"></div></div>
     </div>
     <div id="composer">
       <textarea id="reply" placeholder="Message this thread (also posts to Slack) — !commands work too"></textarea>
@@ -1037,6 +1245,37 @@ function age(ts) {
   return Math.round(d) + "d ago";
 }
 
+// --- polling cheaply ---
+// Each read remembers its last answer and the server's ETag for it, and asks
+// again with If-None-Match: an unchanged answer is a 304 with no body, and the
+// page draws from what it already holds. Through an SSH tunnel that is most of
+// what polling cost. `key` names the read when the URL alone does not (POSTs).
+const readCache = new Map();
+async function readJSON(url, opts, key) {
+  key = key || url;
+  const prev = readCache.get(key);
+  const headers = Object.assign({}, (opts || {}).headers);
+  if (prev) headers["If-None-Match"] = prev.etag;
+  const r = await fetch(url, Object.assign({}, opts || {}, {headers, cache: "no-store"}));
+  if (r.status === 304 && prev) return prev.data;
+  const data = await r.json();
+  const etag = r.headers && r.headers.get ? r.headers.get("ETag") : null;
+  if (etag) readCache.set(key, {etag, data, at: Date.now()});
+  else readCache.delete(key);
+  return data;
+}
+// Write markup only when it differs from what this element was last given, so
+// a poll that changed nothing leaves hover, focus, scroll, open <details> and
+// selection exactly where they were. True when it wrote.
+function setHTML(el, html) {
+  if (el._html === html) return false;
+  el.innerHTML = html;
+  el._html = html;
+  return true;
+}
+// A tab nobody is looking at polls nothing; coming back catches up at once.
+function visible() { return !document.hidden; }
+
 // --- minimal markdown -> html (escaped first) ---
 function md(src) {
   let s = esc(src);
@@ -1071,7 +1310,7 @@ function toast(msg) {
 
 // --- dashboard ---
 async function loadStats() {
-  statsCache = await (await fetch("/api/stats")).json();
+  statsCache = await readJSON("/api/stats");
   renderDash();
 }
 function renderDash() {
@@ -1106,7 +1345,7 @@ function renderDash() {
   const models = s.models.length
     ? `<div class="modelsplit">output by model: ` +
       s.models.map(([m, t]) => `${esc(m)} ${fmtTok(t)}`).join(" · ") + "</div>" : "";
-  document.getElementById("dash").innerHTML = tiles + legend + body + models;
+  if (!setHTML(document.getElementById("dash"), tiles + legend + body + models)) return;
   document.querySelectorAll("#chart .col").forEach(col => {
     col.onmousemove = e => {
       const tip = document.getElementById("tip");
@@ -1179,69 +1418,123 @@ function renderKindFilter(sessions) {
   const oldRuns = sessions.filter(
     s => !s.hidden && (s.kind || "thread") === "task"
          && (Date.now() / 1000 - s.updated) > 14 * 86400).length;
-  bar.innerHTML = kindBtns +
+  setHTML(bar, kindBtns +
     (nHidden ? `<button class="${showHidden ? "on" : ""}" onclick="toggleHidden()"
                   title="hidden threads are kept, not deleted"
                 >hidden <b>${nHidden}</b></button>` : "") +
     (oldRuns ? `<button onclick="hideOldTaskRuns()"
                   title="hide task runs untouched for 14 days"
-                >tidy <b>${oldRuns}</b></button>` : "");
+                >tidy <b>${oldRuns}</b></button>` : ""));
 }
 
+// The time a running turn has been going is the one thing in this answer that
+// moves every second, so the server leaves it out of the ETag; the page adds
+// the time since the answer it is drawing from arrived.
+function freshAges(data) {
+  const c = readCache.get("/api/sessions");
+  const gone = c ? (Date.now() - c.at) / 1000 : 0;
+  for (const s of data.sessions || []) if (s.turn) {
+    if (s.turn.age0 === undefined) s.turn.age0 = s.turn.age_s;
+    s.turn.age_s = Math.round(s.turn.age0 + gone);
+  }
+}
 async function loadList() {
-  const data = await (await fetch("/api/sessions")).json();
+  const data = await readJSON("/api/sessions");
+  freshAges(data);
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
   renderAlerts(data.sessions, data.slack, data.revision);
   refreshTaskBadge();
   lastSessions = data.sessions;
   renderKindFilter(data.sessions);
-  const nav = document.getElementById("list");
-  nav.innerHTML = "";
-  for (const s of data.sessions.filter(matchesKind)) {
-    const div = document.createElement("div");
-    div.className = "card" + (active && active.key === s.key ? " active" : "");
-    const t = s.turn;
-    const badges =
-      (t && t.stalled ? `<span class="badge stall" title="${t.child_alive
-            ? "running far past the timeout" : "no claude process — it cannot finish"}"
-         >stalled ${dur(t.age_s)}</span>`
-       : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
-       : s.running ? '<span class="badge run">running</span>' : "") +
-      (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
-    const label = s.title ? `<span class="title">${esc(s.title)}</span>`
-                          : `<span class="untitled">untitled</span>`;
-    const kindTag = s.kind === "task" ? `<span class="badge kind">task run</span>` : "";
-    const hideBtn = `<button class="hidebtn" title="${s.hidden ? "show again" : "hide"}"
-        onclick="hideThread('${s.key}', ${s.hidden ? "false" : "true"}, event)"
-      >${s.hidden ? "\u21ba" : "\u00d7"}</button>`;
-    div.innerHTML = `<div class="key">${label}${kindTag}${badges}${hideBtn}
-        ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
-      <div class="subkey">${esc(s.key)}</div>
-      ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
-      <div class="meta"><span><b>${s.turns}</b> turns</span>
-      <span title="API list-price equivalent, not billed"><b>$${(s.cost||0).toFixed(2)}</b></span>
-      <span>${esc(s.model || "default")}</span>
-      <span>${age(s.updated)}</span>
-      ${s.files ? `<span>📎 ${s.files}</span>` : ""}</div>`;
-    div.onclick = () => { active = s; loadList(); loadTranscript(true); };
-    nav.appendChild(div);
-  }
+  renderList(data.sessions.filter(matchesKind));
   if (active) {
     const cur = data.sessions.find(x => x.key === active.key);
     if (cur) active = cur;
   }
 }
+function cardHtml(s) {
+  const t = s.turn;
+  const badges =
+    (t && t.stalled ? `<span class="badge stall" title="${t.child_alive
+          ? "running far past the timeout" : "no claude process — it cannot finish"}"
+       >stalled ${dur(t.age_s)}</span>`
+     : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
+     : s.running ? '<span class="badge run">running</span>' : "") +
+    (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
+  const label = s.title ? `<span class="title">${esc(s.title)}</span>`
+                        : `<span class="untitled">untitled</span>`;
+  const kindTag = s.kind === "task" ? `<span class="badge kind">task run</span>` : "";
+  const hideBtn = `<button class="hidebtn" title="${s.hidden ? "show again" : "hide"}"
+      onclick="hideThread('${s.key}', ${s.hidden ? "false" : "true"}, event)"
+    >${s.hidden ? "↺" : "×"}</button>`;
+  return `<div class="key">${label}${kindTag}${badges}${hideBtn}
+      ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
+    <div class="subkey">${esc(s.key)}</div>
+    ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
+    <div class="meta"><span><b>${s.turns}</b> turns</span>
+    <span title="API list-price equivalent, not billed"><b>$${(s.cost||0).toFixed(2)}</b></span>
+    <span>${esc(s.model || "default")}</span>
+    <span>${age(s.updated)}</span>
+    ${s.files ? `<span>📎 ${s.files}</span>` : ""}</div>`;
+}
+// One element per thread, kept across polls: a card is rewritten only when its
+// own markup changed, and the list is reordered only when the order did. The
+// whole nav used to be rebuilt every five seconds, dropping hover and focus.
+const cardEls = new Map();
+function openSession(key) {
+  active = lastSessions.find(x => x.key === key) || active;
+  loadList(); loadTranscript(true);
+}
+function renderList(shown) {
+  const nav = document.getElementById("list");
+  const want = new Set(shown.map(s => s.key));
+  for (const [k, div] of cardEls) if (!want.has(k)) { div.remove(); cardEls.delete(k); }
+  const divs = shown.map(s => {
+    let div = cardEls.get(s.key);
+    if (!div) {
+      div = document.createElement("div");
+      div.onclick = () => openSession(s.key);
+      cardEls.set(s.key, div);
+    }
+    const cls = "card" + (active && active.key === s.key ? " active" : "");
+    if (div.className !== cls) div.className = cls;
+    setHTML(div, cardHtml(s));
+    return div;
+  });
+  const now = [...(nav.children || [])];
+  if (now.length !== divs.length || divs.some((d, i) => now[i] !== d))
+    for (const d of divs) nav.appendChild(d);
+}
 
 // --- transcript ---
-async function loadTranscript(scroll) {
-  if (!active) return;
-  const s = active;
-  const [data, files] = await Promise.all([
-    (await fetch("/api/session?id=" + encodeURIComponent(s.session_id))).json(),
-    (await fetch("/api/artifacts?key=" + encodeURIComponent(s.key))).json(),
-  ]);
-  const el = document.getElementById("transcript");
+// The open thread is read from where the last read stopped (a byte cursor the
+// server hands back), and new messages are appended: the whole transcript used
+// to be fetched and redrawn every four seconds, closing every open <details>.
+let tview = {key: null, sid: null, cursor: 0, busy: false};
+function messageHtml(m) {
+  let inner = "";
+  for (const b of m.blocks) {
+    if (b.type === "text") inner += `<div class="bubble">${md(b.text)}</div>`;
+    else if (b.type === "thinking")
+      inner += `<details><summary class="think">thinking</summary><pre>${esc(b.text)}</pre></details>`;
+    else if (b.type === "tool")
+      inner += `<details><summary>⚙ ${esc(b.name)}</summary><pre>${esc(b.input)}</pre></details>`;
+    else if (b.type === "tool_result")
+      inner += `<details><summary class="result">↳ result</summary><pre>${esc(b.text)}</pre></details>`;
+  }
+  let usage = "";
+  if (m.usage) {
+    const u = m.usage, denom = u.cache_read + u.in + u.cache_create;
+    const rate = denom ? Math.round(100 * u.cache_read / denom) : null;
+    usage = `<div class="usage">in ${fmtTok(u.in + u.cache_create)} · cache ${fmtTok(u.cache_read)}` +
+      (rate == null ? "" : ` (${rate}%)`) + ` · out ${fmtTok(u.out)}` +
+      (m.model ? ` · ${esc(m.model)}` : "") + `</div>`;
+  }
+  const when = m.ts ? new Date(m.ts).toLocaleTimeString() : "";
+  return `<div class="msg ${m.role}"><div class="who">${m.role} · ${when}</div>${inner}${usage}</div>`;
+}
+function transcriptHead(s) {
   let h = `<div class="toolbar">
     <code id="cmd">${esc(s.resume_cmd)}</code>
     <button class="act" onclick="navigator.clipboard.writeText(document.getElementById('cmd').textContent);toast('Copied')">Copy resume cmd</button>
@@ -1274,41 +1567,55 @@ async function loadTranscript(scroll) {
          <span class="t">${age(e.at)}</span>
          <span class="d">${esc(e.detail || "")}</span></div>`).join("") + `</details>`;
   }
+  return h;
+}
+function filesHtml(files) {
+  if (!files.length) return "";
+  return `<div class="artifacts"><b>Files</b>` + files.map(f =>
+    `<div class="f"><span>${f.direction === "in" ? "⬇" : "⬆"}</span>
+     ${f.exists ? `<a href="/download?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a>` : esc(f.name) + (f.pruned ? " (pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack)" : " (gone)")}
+     <span>${fmtTok(f.size)}B</span></div>`).join("") + "</div>";
+}
+async function loadTranscript(scroll) {
+  if (!active) return;
+  const s = active;
+  // A new thread, a reset session, or a click: start again from the top.
+  // Otherwise one read at a time, each from where the last stopped.
+  if (scroll || tview.key !== s.key || tview.sid !== s.session_id)
+    tview = {key: s.key, sid: s.session_id, cursor: 0, busy: false, error: false};
+  const want = tview, from = want.cursor;
+  // One read at a time; a call made meanwhile (a rename, a resummarize) is
+  // remembered and run once this one is drawn, so it still shows promptly.
+  if (want.busy) { want.again = true; return; }
+  want.busy = true;
+  let data, files;
+  try {
+    [data, files] = await Promise.all([
+      (await fetch("/api/session?id=" + encodeURIComponent(s.session_id) + "&from=" + from)).json(),
+      readJSON("/api/artifacts?key=" + encodeURIComponent(s.key)),
+    ]);
+  } finally { want.busy = false; }
+  if (tview !== want || want.cursor !== from) return;   // superseded meanwhile
+  const msgs = document.getElementById("tmsgs");
+  setHTML(document.getElementById("thead"), transcriptHead(s));
   if (data.error) {
-    h += `<div class="empty">${esc(data.error)}</div>`;
+    msgs.innerHTML = `<div class="empty">${esc(data.error)}</div>`;
+    // The messages above were just replaced, so the next read starts over.
+    want.error = true;
+    want.cursor = 0;
   } else {
-    for (const m of data.messages) {
-      let inner = "";
-      for (const b of m.blocks) {
-        if (b.type === "text") inner += `<div class="bubble">${md(b.text)}</div>`;
-        else if (b.type === "thinking")
-          inner += `<details><summary class="think">thinking</summary><pre>${esc(b.text)}</pre></details>`;
-        else if (b.type === "tool")
-          inner += `<details><summary>⚙ ${esc(b.name)}</summary><pre>${esc(b.input)}</pre></details>`;
-        else if (b.type === "tool_result")
-          inner += `<details><summary class="result">↳ result</summary><pre>${esc(b.text)}</pre></details>`;
-      }
-      let usage = "";
-      if (m.usage) {
-        const u = m.usage, denom = u.cache_read + u.in + u.cache_create;
-        const rate = denom ? Math.round(100 * u.cache_read / denom) : null;
-        usage = `<div class="usage">in ${fmtTok(u.in + u.cache_create)} · cache ${fmtTok(u.cache_read)}` +
-          (rate == null ? "" : ` (${rate}%)`) + ` · out ${fmtTok(u.out)}` +
-          (m.model ? ` · ${esc(m.model)}` : "") + `</div>`;
-      }
-      const when = m.ts ? new Date(m.ts).toLocaleTimeString() : "";
-      h += `<div class="msg ${m.role}"><div class="who">${m.role} · ${when}</div>${inner}${usage}</div>`;
-    }
+    // The first read, a file replaced underneath (reset), or recovering from
+    // an error starts the messages over; anything else is only what is new.
+    if (from === 0 || data.reset || want.error) msgs.innerHTML = "";
+    want.error = false;
+    if (data.messages.length)
+      msgs.insertAdjacentHTML("beforeend", data.messages.map(messageHtml).join(""));
+    want.cursor = data.cursor || 0;
   }
-  if (files.length) {
-    h += `<div class="artifacts"><b>Files</b>` + files.map(f =>
-      `<div class="f"><span>${f.direction === "in" ? "⬇" : "⬆"}</span>
-       ${f.exists ? `<a href="/download?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a>` : esc(f.name) + (f.pruned ? " (pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack)" : " (gone)")}
-       <span>${fmtTok(f.size)}B</span></div>`).join("") + "</div>";
-  }
-  el.innerHTML = h;
+  setHTML(document.getElementById("tfiles"), filesHtml(files));
   document.getElementById("composer").style.display = "flex";
-  if (scroll) el.scrollIntoView(false);
+  if (scroll) document.getElementById("transcript").scrollIntoView(false);
+  if (want.again && tview === want) { want.again = false; loadTranscript(false); }
 }
 
 // --- composer / commands ---
@@ -1347,7 +1654,7 @@ document.getElementById("search").addEventListener("input", e => {
     box.querySelectorAll(".hit[data-key]").forEach(hit => hit.onclick = async () => {
       box.style.display = "none";
       document.getElementById("search").value = "";
-      const data = await (await fetch("/api/sessions")).json();
+      const data = await readJSON("/api/sessions");
       active = data.sessions.find(s => s.key === hit.dataset.key) || null;
       loadList(); if (active) loadTranscript(true);
     });
@@ -1375,7 +1682,7 @@ function renderAlerts(sessions, slack, revision) {
   // "unknown" is not "fine" either — a bot too old to report the field gives
   // us nothing, which is the silence this is here to break.
   const stale = revision && revision.state && revision.state !== "current";
-  if (!stalled.length && !pricey.length && !down && !stale) { bar.innerHTML = ""; return; }
+  if (!stalled.length && !pricey.length && !down && !stale) { setHTML(bar, ""); return; }
   const parts = [];
   if (stale) parts.push(`<span class="alert ${revision.state === "stale" ? "bad" : "warn"}">⚠ ${
     esc(revision.message || "running revision unknown")} — silkworm restart</span>`);
@@ -1389,7 +1696,7 @@ function renderAlerts(sessions, slack, revision) {
     `<span class="alert warn">$ ${pricey.length} cost spike${pricey.length>1?"s":""}</span>` +
     pricey.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${
       esc(s.title || s.key)} · ${s.cost_flag.ratio}×</button>`).join(""));
-  bar.innerHTML = parts.join(" ");
+  setHTML(bar, parts.join(" "));
 }
 function jumpTo(key) {
   const card = [...document.querySelectorAll("#list .card")].find(
@@ -1443,6 +1750,13 @@ async function taskCall(payload) {
   return (await (await fetch("/api/tasks", {method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
+}
+// The same, for a read the page polls: answered 304 when nothing changed. Only
+// ever for actions that read -- the server refuses a 304 to anything else.
+async function taskRead(payload) {
+  const body = JSON.stringify(payload);
+  return readJSON("/api/tasks", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body}, "tasks " + body);
 }
 function toggleTasks() {
   const m = document.getElementById("taskmodal");
@@ -1658,22 +1972,41 @@ function lastEvent(t) {
   const e = ev.filter(x => x.kind === t.state).slice(-1)[0] || ev.slice(-1)[0];
   return (e && e.detail) || "";
 }
-function taskDetail(t) {
+function taskBody(t) {
   // A title is the goal's first line cut at sixty characters. For a nightly
   // proposal that is the opening clause of two thousand words of evidence --
   // file names, line numbers, what done looks like -- and the row asks you to
-  // spend a session on it or throw it away. The payload already carries the
-  // whole thing, so show it rather than fetching it and dropping it.
+  // spend a session on it or throw it away, so opening the row shows it all.
   const goal = (t.goal || "").trim();
-  const why = t.state === "failed" ? lastEvent(t) : "";
   // A short goal is its own title; there is nothing behind it to open.
   // Research's findings are what you are deciding on, so they are behind it too.
   const said = hasFindings(t) && (t.result || {}).text
     ? `<div class="sect">findings</div><pre class="goal">${esc(t.result.text)}</pre>` : "";
-  const body = (goal && goal !== (t.title || "").trim()
+  return (goal && goal !== (t.title || "").trim()
     ? `<pre class="goal">${esc(goal)}</pre>` : "") + said;
+}
+function taskDetail(t) {
+  const why = t.state === "failed" ? lastEvent(t) : "";
+  const body = taskBody(t);
   if (!body && !why) return "";
   return (why ? `<div class="why">${esc(why)}</div>` : "") + body;
+}
+// A row carries whether anything is behind its title (`more`) and why a failure
+// stopped (`why`) -- board.panel_row -- rather than the goal and reply, which
+// were 6 MB polled every five seconds to fill disclosures nobody had opened. A
+// whole record, from a bot older than `slim`, is asked the same questions.
+function rowMore(t) { return t.more !== undefined ? !!t.more : !!taskBody(t); }
+function rowWhy(t) {
+  return t.why !== undefined ? t.why : (t.state === "failed" ? lastEvent(t) : "");
+}
+function moreToggled(el, id) { if (el.open) openMore(id); }
+async function openMore(id) {
+  const box = document.getElementById("more-" + id);
+  if (!box || box.dataset.loaded) return;
+  const r = await taskCall({action: "task", id, full: true});
+  if (!r.ok) { box.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  box.innerHTML = taskBody(r.task) || `<div class="hint">nothing more to show</div>`;
+  box.dataset.loaded = "1";
 }
 function landing(t) {
   // A task whose commits never reached the base must not read as plainly done.
@@ -1782,22 +2115,25 @@ async function renderTasks() {
   // Awaited, not fired off: a row has to say whether its checkout is still
   // holding work before it offers a button that makes that work unreachable.
   await renderHolding();
-  const r = await taskCall({action: taskView === "attention" ? "attention" : "list",
-                            project: project || undefined});
-  if (!r.ok) { list.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  const r = await taskRead({action: taskView === "attention" ? "attention" : "list",
+                            project: project || undefined, slim: true});
+  if (!r.ok) { setHTML(list, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }
   updateTaskBadge(r.counts);
   const spend = document.getElementById("spend");
   if (spend) spend.textContent = r.spend_line ? `💰 ${r.spend_line}` : "";
   if (!r.tasks.length) {
-    list.innerHTML = taskView === "attention"
+    setHTML(list, taskView === "attention"
       ? `<div class="hint">Nothing needs you. 🎉</div>`
-      : `<div class="hint">No tasks yet — queue one above.</div>`;
+      : `<div class="hint">No tasks yet — queue one above.</div>`);
     return;
   }
-  list.innerHTML = r.tasks.map(t => {
-    const more = taskDetail(t);
-    const title = more
-      ? `<details class="more"><summary>${esc(t.title)}</summary>${more}</details>`
+  setHTML(list, r.tasks.map(t => {
+    const why = rowWhy(t), more = rowMore(t);
+    // What is behind the title is fetched when the row is opened (openMore).
+    const title = why || more
+      ? `<details class="more" ontoggle="moreToggled(this,'${esc(t.id)}')"><summary>${esc(t.title)}</summary>${
+          why ? `<div class="why">${esc(why)}</div>` : ""}${
+          more ? `<div class="lazy" id="more-${esc(t.id)}"><div class="hint">loading…</div></div>` : ""}</details>`
       : esc(t.title);
     return `<div class="task">
       <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
@@ -1806,7 +2142,7 @@ async function renderTasks() {
           esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
           age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${findings(t)}${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
-  }).join("");
+  }).join(""));
 }
 // Work that finished and never reached the base. Nothing in the dashboard
 // mentioned branches at all, so eight completed tasks left eight unmerged
@@ -1902,7 +2238,10 @@ function updateTaskBadge(counts) {
   document.getElementById("taskbadge").textContent = need ? String(need) : "";
 }
 async function refreshTaskBadge() {
-  const r = await taskCall({action: "list"});
+  // Polled with the session list: the counts alone, not two hundred tasks.
+  let r = await taskRead({action: "counts"});
+  // A bot older than `counts` refuses it; the whole list still has them.
+  if (!r.ok) r = await taskCall({action: "list"});
   if (r.ok) updateTaskBadge(r.counts);
 }
 function toggleLearn() {
@@ -2018,14 +2357,15 @@ function fmtCost(c) {
 function boardFilters() {
   const proj = document.getElementById("bproj");
   const keep = boardProject === null ? "*" : boardProject;
-  proj.innerHTML = `<option value="*">overview</option><option value="">all projects</option>`
+  const listed = ["*", "", UNFILED, ...boardRows.map(p => p.slug)].includes(keep);
+  // Rewritten only when the options change, so a poll does not shut the
+  // picker while it is open.
+  setHTML(proj, `<option value="*">overview</option><option value="">all projects</option>`
     + boardRows.map(p => `<option value="${esc(p.slug)}">${esc(p.title)}</option>`).join("")
-    + `<option value="${UNFILED}">unfiled</option>`;
-  proj.value = keep;
-  if (proj.value !== keep) {             // a slug the overview has not listed yet
-    proj.insertAdjacentHTML("beforeend", `<option value="${esc(keep)}">${esc(keep)}</option>`);
-    proj.value = keep;
-  }
+    + `<option value="${UNFILED}">unfiled</option>`
+    // a slug the overview has not listed yet
+    + (listed ? "" : `<option value="${esc(keep)}">${esc(keep)}</option>`));
+  if (proj.value !== keep) proj.value = keep;
   document.getElementById("bvover").className = boardProject === null ? "on" : "";
   document.getElementById("bvall").className = boardProject === "" ? "on" : "";
   document.getElementById("bvunfiled").className = boardProject === UNFILED ? "on" : "";
@@ -2033,9 +2373,10 @@ function boardFilters() {
 function fillSelect(id, values, label) {
   const sel = document.getElementById(id);
   const keep = sel.value;
-  sel.innerHTML = `<option value="">${label}</option>` + values.map(v =>
-    `<option value="${esc(v)}">${esc(v)}</option>`).join("");
-  sel.value = values.includes(keep) ? keep : "";
+  setHTML(sel, `<option value="">${label}</option>` + values.map(v =>
+    `<option value="${esc(v)}">${esc(v)}</option>`).join(""));
+  const want = values.includes(keep) ? keep : "";
+  if (sel.value !== want) sel.value = want;
 }
 async function renderBoard() {
   const role = document.getElementById("brole").value;
@@ -2044,24 +2385,24 @@ async function renderBoard() {
   // A filter typed on the overview means "find it", which is a board.
   if (boardProject === null && (role || state || q)) boardProject = "";
   if (boardProject === null) {
-    document.getElementById("bboard").innerHTML = "";
+    setHTML(document.getElementById("bboard"), "");
     return loadOverview();
   }
-  document.getElementById("bover").innerHTML = "";
+  setHTML(document.getElementById("bover"), "");
   boardFilters();
   // A poll in flight when a filter changes must not land on top of the
   // filtered answer: only the newest request draws.
   const ask = ++boardAsk;
-  const r = await taskCall({action: "board", project: boardProject, role, state, q});
+  const r = await taskRead({action: "board", project: boardProject, role, state, q});
   if (ask !== boardAsk) return;
   const el = document.getElementById("bboard");
-  if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  if (!r.ok) { setHTML(el, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }
   fillSelect("brole", r.roles || [], "any role");
   fillSelect("bstate", ["proposed", "queued", "running", "blocked", "awaiting_approval",
                         "needs_input", "failed", "done"], "any state");
   boardInfo = r.info || null;
-  el.innerHTML = boardHead(boardInfo) + renderColumns(r)
-    + (boardProject === UNFILED ? unfiledThreads() : "");
+  setHTML(el, boardHead(boardInfo) + renderColumns(r)
+    + (boardProject === UNFILED ? unfiledThreads() : ""));
 }
 // The open project's name, whether it can take unsupervised work, and its
 // settings. Only on a project's own board: "all" and "unfiled" have none.
@@ -2147,13 +2488,13 @@ function unfiledThreads() {
 }
 async function loadOverview() {
   const ask = ++boardAsk;
-  const r = await taskCall({action: "overview"});
+  const r = await taskRead({action: "overview"});
   if (ask !== boardAsk || boardProject !== null) return;   // superseded meanwhile
   const el = document.getElementById("bover");
-  if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; return; }
+  if (!r.ok) { setHTML(el, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }
   boardRows = r.projects || [];
   boardFilters();
-  el.innerHTML = renderOverview(r);
+  setHTML(el, renderOverview(r));
 }
 function renderOverview(r) {
   const cards = (r.projects || []).map(projectCard);
@@ -2218,15 +2559,15 @@ function closeDetail() {
   boardDetailId = null;
   const el = document.getElementById("bdetail");
   el.style.display = "none";
-  el.innerHTML = "";
+  setHTML(el, "");
 }
 async function openCard(id) {
   boardDetailId = id;
-  const r = await taskCall({action: "task", id});
+  const r = await taskRead({action: "task", id});
   if (boardDetailId !== id) return;      // another card was opened meanwhile
   const el = document.getElementById("bdetail");
-  if (!r.ok) { el.innerHTML = `<div class="hint">${esc(r.error || "bot offline")}</div>`; el.style.display = "block"; return; }
-  el.innerHTML = renderDetail(r.task);
+  if (!r.ok) { setHTML(el, `<div class="hint">${esc(r.error || "bot offline")}</div>`); el.style.display = "block"; return; }
+  setHTML(el, renderDetail(r.task));
   el.style.display = "block";
 }
 function renderDetail(t) {
@@ -2785,11 +3126,27 @@ async function archiveProject(slug, on) {
 }
 
 // --- polling ---
+// Each poll waits for its last one, so a slow tunnel queues nothing; a hidden
+// tab skips them all, and showing it again refreshes at once.
+function poller(fn) {
+  let busy = false;
+  return async () => {
+    if (busy || !visible()) return;
+    busy = true;
+    try { await fn(); } catch (e) { /* the next tick tries again */ } finally { busy = false; }
+  };
+}
+const pollList = poller(loadList), pollStats = poller(loadStats),
+      pollTranscript = poller(() => active ? loadTranscript(false) : null),
+      pollBoard = poller(() => boardIsOpen() ? refreshBoard() : null);
 loadList(); loadStats();
-setInterval(loadList, 5000);
-setInterval(loadStats, 30000);
-setInterval(() => { if (active) loadTranscript(false); }, 4000);
-setInterval(() => { if (boardIsOpen()) refreshBoard(); }, 5000);
+setInterval(pollList, 5000);
+setInterval(pollStats, 30000);
+setInterval(pollTranscript, 4000);
+setInterval(pollBoard, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (visible()) { pollList(); pollStats(); pollTranscript(); pollBoard(); }
+});
 </script>
 </body>
 </html>

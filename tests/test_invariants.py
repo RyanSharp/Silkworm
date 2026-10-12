@@ -5981,7 +5981,7 @@ def test_held_checkouts():
           "function held(t)" in js and "${held(t)}" in js,
           "approving that row is the moment the work becomes unreachable")
     marked = js.find("await renderHolding();")
-    drawn = js.find("list.innerHTML = r.tasks.map")
+    drawn = js.find("setHTML(list, r.tasks.map")
     body = js[js.index("async function renderHolding()"):js.index("function updateTaskBadge")]
     check("and a failed survey costs the marker, never the list of rows",
           "try {" in body and body.index("try {") < body.index('taskCall({action: "holding"'),
@@ -6830,16 +6830,28 @@ globalThis.fetch = async (url, opts) => {
   else if (url.startsWith("/api/stats"))
     out = {total_cost: 0, cache_rate: null, threads: 0, days: []};
   else if (url.startsWith("/api/projects")) out = {ok: true, projects: []};
-  else if (url.startsWith("/api/tasks"))
+  else if (url.startsWith("/api/tasks")) {
+    asked.push(body);
     out = (body.action === "list" || body.action === "attention")
-      ? {ok: true, tasks, counts: {}} : {ok: true};
+      ? {ok: true, tasks, counts: {}}
+      // Opening a row asks for the task itself.
+      : body.action === "task" ? {ok: true, task: tasks.find(t => t.id === body.id)}
+      : {ok: true};
+  }
   return {json: async () => out, text: async () => ""};
 };
+const asked = [];
 
-(0, eval)(src + "\n;globalThis.__renderTasks = renderTasks;");
+(0, eval)(src + "\n;globalThis.__renderTasks = renderTasks; globalThis.__openMore = openMore;");
 (async () => {
   await globalThis.__renderTasks();
-  process.stdout.write(byId("tlist").innerHTML);
+  const list = byId("tlist").innerHTML, more = {};
+  // Open every row that has something behind its title, as a click would.
+  for (const m of list.matchAll(/id="more-([^"]+)"/g)) {
+    await globalThis.__openMore(m[1]);
+    more[m[1]] = byId("more-" + m[1]).innerHTML;
+  }
+  process.stdout.write(JSON.stringify({list, more, asked}));
 })();
 """
 
@@ -6901,17 +6913,24 @@ def test_task_row_shows_its_own_goal():
     if p.returncode != 0:
         check("the dashboard's javascript runs", False, p.stderr.strip()[-400:])
         return
-    html = p.stdout
+    out = json.loads(p.stdout)
+    html, opened_rows = out["list"], out["more"]
+    behind = opened_rows.get("tsk_proposed1", "")
 
-    check("the proposal's full goal reaches the row",
-          deep in html and "FINAL LINE OF THE CASE" in html,
+    # The goal is fetched when the row is opened (openMore), not carried by
+    # every row of a list the page used to poll every five seconds.
+    check("opening the proposal shows its full goal",
+          deep in behind and "FINAL LINE OF THE CASE" in behind,
           "the panel still shows only the truncated title")
-    check("a failed row says why it failed",
+    check("asked for the whole task, reply untruncated",
+          {"action": "task", "id": "tsk_proposed1", "full": True} in out["asked"],
+          str(out["asked"]))
+    check("a failed row says why it failed, unopened",
           "NO WORKTREE, BRANCH ALREADY EXISTS" in html,
           "Retry and Dismiss with no reason on offer")
     check("the goal is escaped, not injected",
-          "&lt;script&gt;alert(1)&lt;/script&gt;" in html
-          and "<script>alert(1)</script>" not in html)
+          "&lt;script&gt;alert(1)&lt;/script&gt;" in behind
+          and "<script>alert(1)</script>" not in behind + html)
 
     # Scannable by default: fifty rows of three thousand characters is only a
     # different way of being unreadable.
@@ -19302,6 +19321,619 @@ def test_generated_paths_setting():
           'arg.lower().startswith("generated ")' in src)
     check("landing passes the project's list to merge",
           'generated=list(proj.get("generated") or [])' in src)
+
+
+# --- the dashboard, polled through a tunnel ------------------------------------
+# Measured 2026-10-12: /api/sessions took 0.95s (a 410-directory glob per
+# thread) and returned 458KB every five seconds; the task badge polled `list`
+# for 940KB of whole goals and replies; /api/stats read every transcript in
+# full, 2.4s, every thirty seconds; the open transcript was refetched whole
+# every four. Over an SSH tunnel that was over a megabyte per five seconds, and
+# the page redrew everything each time.
+
+def _viz_fixture():
+    """A sessions.json and a projects dir of transcripts, in a temp dir."""
+    d = Path(tempfile.mkdtemp())
+    proj = d / "projects"
+    (proj / "-a").mkdir(parents=True)
+    (proj / "-b").mkdir()
+    started = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 30))
+    sessions = {"D1:1.1": {"session_id": "sid-one", "title": "one", "turns": 2,
+                           "updated": time.time(), "cwd": "/tmp"},
+                "D1:2.2": {"session_id": "sid-two", "title": "two", "turns": 1,
+                           "updated": time.time() - 60, "summary": "x" * 3000,
+                           "pending": {"started": started, "session_id": "sid-two",
+                                       "prompt": "go"}}}
+    (d / "sessions.json").write_text(json.dumps(sessions))
+    return d, proj, sessions
+
+
+def _tline(role, text, ts="2026-10-12T10:00:00Z", usage=None, model="claude-x"):
+    msg = {"content": [{"type": "text", "text": text}]}
+    if usage:
+        msg.update(usage=usage, model=model)
+    return json.dumps({"type": role, "timestamp": ts, "message": msg}) + "\n"
+
+
+def test_dashboard_reads_answer_304():
+    import gzip
+    import threading
+    import urllib.error
+    import urllib.request
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe dashboard's reads: 304 when unchanged, gzip through the tunnel")
+    d, proj, sessions = _viz_fixture()
+    (proj / "-a" / "sid-one.jsonl").write_text(_tline("user", "hello"))
+    saved = (V.SESSIONS_FILE, V.PROJECTS_DIR, V.bot_call, V.procs.alive_sessions, V.STALL_AFTER_S)
+    bot_asked = []
+
+    def fake_bot(path, payload, timeout=1.0):
+        bot_asked.append((path, dict(payload)))
+        if path == "/tasks":
+            if payload.get("action") == "board":
+                return {"ok": True, "columns": {"backlog": []}, "n": len(bot_asked) * 0}
+            return {"ok": True, "did": payload.get("action")}
+        return {}
+
+    srv = None
+    try:
+        V.SESSIONS_FILE, V.PROJECTS_DIR = d / "sessions.json", proj
+        V.bot_call = fake_bot
+        V.procs.alive_sessions = lambda sids: {"sid-two"}       # the turn is alive
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def get(path, tag=None, method="GET", body=None, gz=False):
+            h = {"Content-Type": "application/json"}
+            if tag:
+                h["If-None-Match"] = tag
+            if gz:
+                h["Accept-Encoding"] = "gzip"
+            req = urllib.request.Request(base + path, headers=h, method=method,
+                                         data=json.dumps(body).encode() if body else None)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, dict(r.headers), r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers), e.read()
+
+        code, hdr, raw = get("/api/sessions")
+        tag = hdr.get("ETag")
+        check("a full answer carries an ETag", code == 200 and bool(tag), str(hdr))
+        code2, _, raw2 = get("/api/sessions", tag)
+        check("asking again with it is a 304 and no body", code2 == 304 and raw2 == b"",
+              f"{code2} {len(raw2)}B")
+        check("the 200 is not a 304 for a page holding nothing",
+              get("/api/sessions", '"stale"')[0] == 200)
+
+        # A running turn's age moves every second; it must not defeat the 304.
+        time.sleep(1.2)
+        code3, _, _ = get("/api/sessions", tag)
+        check("a running turn ageing a second is still unchanged", code3 == 304, code3)
+        # Crossing into stalled is a change.
+        V.STALL_AFTER_S = 1
+        code4, hdr4, raw4 = get("/api/sessions", tag)
+        stalled = next(s for s in json.loads(raw4)["sessions"] if s["key"] == "D1:2.2")
+        check("a turn going stalled is a new answer",
+              code4 == 200 and hdr4.get("ETag") != tag and stalled["turn"]["stalled"])
+        V.STALL_AFTER_S = saved[4]
+        tag = get("/api/sessions")[1].get("ETag")
+        sessions["D1:1.1"]["title"] = "renamed"
+        (d / "sessions.json").write_text(json.dumps(sessions))
+        code5, hdr5, raw5 = get("/api/sessions", tag)
+        check("a renamed thread is a new answer", code5 == 200 and hdr5.get("ETag") != tag
+              and "renamed" in raw5.decode())
+
+        code, hdr, zipped = get("/api/sessions", gz=True)
+        # Compared by validator: a running turn's age may tick between the two.
+        check("gzipped when the browser accepts it",
+              hdr.get("Content-Encoding") == "gzip"
+              and V.sessions_tag(json.loads(gzip.decompress(zipped)))
+              == V.sessions_tag(json.loads(raw5)),
+              str(hdr))
+        check("and well under the plain size", len(zipped) < len(raw5) / 2,
+              f"{len(zipped)} vs {len(raw5)}")
+
+        for path in ("/api/stats", "/api/artifacts?key=D1:1.1",
+                     "/api/session?id=sid-one&from=0"):
+            t = get(path)[1].get("ETag")
+            check(f"{path.split('?')[0]} answers 304 unchanged", bool(t) and get(path, t)[0] == 304)
+
+        board = {"action": "board", "project": "alpha"}
+        c1, h1, b1 = get("/api/tasks", method="POST", body=board)
+        c2, _, b2 = get("/api/tasks", h1.get("ETag"), "POST", board)
+        check("a board read answers 304 unchanged", c1 == 200 and c2 == 304 and b2 == b"",
+              f"{c1} {c2}")
+        n = len(bot_asked)
+        c3, _, b3 = get("/api/tasks", h1.get("ETag"), "POST", {"action": "accept", "id": "t1"})
+        c4, _, b4 = get("/api/tasks", etag_of_accept := V.etag_for({"ok": True, "did": "accept"}),
+                        "POST", {"action": "accept", "id": "t1"})
+        check("an action never answers 304, even matching what was sent before",
+              c3 == 200 and c4 == 200 and json.loads(b4)["did"] == "accept"
+              and len(bot_asked) == n + 2, f"{c3} {c4}")
+        check("every read action is named, and no action that changes anything is",
+              {"accept", "dismiss", "approve", "rework", "cancel", "retry", "land", "drop",
+               "create", "edit", "release", "close", "dig", "resolve",
+               "run-next"}.isdisjoint(V.READ_TASK_ACTIONS))
+        V.bot_call = lambda *a, **k: {}
+        c5, h5, b5 = get("/api/tasks", method="POST", body=board)
+        check("bot offline is said, not cached", c5 == 200 and "ETag" not in h5
+              and json.loads(b5)["ok"] is False)
+    finally:
+        (V.SESSIONS_FILE, V.PROJECTS_DIR, V.bot_call, V.procs.alive_sessions,
+         V.STALL_AFTER_S) = saved
+        if srv:
+            srv.shutdown()
+
+
+def test_transcript_index_and_cursor():
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\ntranscripts: found without a glob per thread, read from where the page stopped")
+    d, proj, _ = _viz_fixture()
+    saved = (V.PROJECTS_DIR, V.INDEX_RECHECK_S)
+    try:
+        V.PROJECTS_DIR, V.INDEX_RECHECK_S = proj, 0
+        tp = proj / "-a" / "sid-one.jsonl"
+        tp.write_text(_tline("user", "first") + _tline("assistant", "second"))
+        check("found", V.find_transcript("sid-one") == tp)
+        check("an unknown session is not", V.find_transcript("nope") is None)
+        (proj / "-c").mkdir()
+        (proj / "-c" / "sid-new.jsonl").write_text(_tline("user", "hi"))
+        check("a session in a project dir made since is found",
+              V.find_transcript("sid-new") == proj / "-c" / "sid-new.jsonl")
+        (proj / "-b" / "sid-late.jsonl").write_text(_tline("user", "hi"))
+        check("so is a new transcript in a dir already indexed",
+              V.find_transcript("sid-late") is not None)
+        (proj / "-b" / "sid-late.jsonl").unlink()
+        check("a deleted one is gone", V.find_transcript("sid-late") is None)
+        (proj / "-b" / "sid-b.jsonl").write_text(_tline("user", "hi"))
+        real_scan, flaky = V.os.scandir, {"left": 1}
+
+        def scan(path):
+            if str(path).endswith("-b") and flaky["left"]:
+                flaky["left"] -= 1
+                raise OSError(24, "Too many open files")
+            return real_scan(path)
+        V.os.scandir = scan
+        try:
+            missed = V.find_transcript("sid-b")
+            found = V.find_transcript("sid-b")
+        finally:
+            V.os.scandir = real_scan
+        check("a directory that could not be read is read again, not hidden",
+              missed is None and found == proj / "-b" / "sid-b.jsonl", f"{missed} {found}")
+        calls = []
+        real = V.os.scandir
+        V.os.scandir = lambda p: calls.append(p) or real(p)
+        V.INDEX_RECHECK_S = 60
+        try:
+            for _ in range(400):
+                V.find_transcript("sid-one")
+        finally:
+            V.os.scandir = real
+        check("four hundred lookups in a second scan nothing", len(calls) <= 1, len(calls))
+        V.INDEX_RECHECK_S = 0
+
+        full = V.load_transcript("sid-one")
+        first = V.load_transcript("sid-one", 0)
+        check("from 0, the same messages as the whole read",
+              first["messages"] == full["messages"] and len(first["messages"]) == 2)
+        check("with a cursor at the end of the file", first["cursor"] == tp.stat().st_size)
+        with open(tp, "a") as f:
+            f.write(_tline("user", "third") + _tline("assistant", "fourth")[:25])
+        nxt = V.load_transcript("sid-one", first["cursor"])
+        check("next, only what was written since",
+              [m["blocks"][0]["text"] for m in nxt["messages"]] == ["third"],
+              str(nxt["messages"]))
+        check("a line still being written is left for later",
+              nxt["cursor"] < tp.stat().st_size and not nxt["reset"])
+        with open(tp, "a") as f:
+            f.write(_tline("assistant", "fourth")[25:])
+        last = V.load_transcript("sid-one", nxt["cursor"])
+        check("and read whole once finished",
+              [m["blocks"][0]["text"] for m in last["messages"]] == ["fourth"])
+        none = V.load_transcript("sid-one", last["cursor"])
+        check("nothing new is nothing", none["messages"] == [] and none["cursor"] == last["cursor"])
+        tp.write_text(_tline("user", "replaced"))
+        again = V.load_transcript("sid-one", last["cursor"])
+        check("a file replaced underneath says reset and starts over",
+              again["reset"] and [m["blocks"][0]["text"] for m in again["messages"]] == ["replaced"])
+    finally:
+        V.PROJECTS_DIR, V.INDEX_RECHECK_S = saved
+
+
+def test_stats_read_incrementally():
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\n/api/stats reads each transcript once, then only what is appended")
+    d, proj, sessions = _viz_fixture()
+    saved = (V.SESSIONS_FILE, V.PROJECTS_DIR, V.INDEX_RECHECK_S, V._complete_lines)
+    today = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+    u = lambda c, i, o: {"cache_read_input_tokens": c, "input_tokens": i,
+                         "cache_creation_input_tokens": 0, "output_tokens": o}
+    try:
+        V.SESSIONS_FILE, V.PROJECTS_DIR, V.INDEX_RECHECK_S = d / "sessions.json", proj, 0
+        V._usage.clear()
+        (proj / "-a" / "sid-one.jsonl").write_text(
+            _tline("user", "q", today) + _tline("assistant", "a", today, u(900, 100, 50))
+            + _tline("assistant", "b", "2020-01-01T00:00:00Z", u(0, 0, 7), "claude-old"))
+        (proj / "-b" / "sid-two.jsonl").write_text(
+            _tline("assistant", "c", today, u(0, 1000, 5)))
+        reads = []
+        V._complete_lines = lambda p, s: reads.append(str(p)) or saved[3](p, s)
+        st = V.load_stats()
+        day = st["days"][-1]
+        check("today's tokens, summed across transcripts",
+              day == {"date": day["date"], "cache_read": 900, "fresh_in": 1100, "out": 55}, str(day))
+        check("the cache rate counts every line, not only the last fortnight's",
+              st["cache_rate"] == round(100 * 900 / 2000, 1), st["cache_rate"])
+        check("output by model, every line", dict(st["models"]) ==
+              {"claude-x": 55, "claude-old": 7}, str(st["models"]))
+        n = len(reads)
+        check("unchanged, nothing is read again", V.load_stats() == st and len(reads) == n)
+        with open(proj / "-b" / "sid-two.jsonl", "a") as f:
+            f.write(_tline("assistant", "d", today, u(100, 0, 1)))
+        st2 = V.load_stats()
+        check("an appended line is added, and only that file read",
+              st2["days"][-1]["cache_read"] == 1000 and st2["days"][-1]["out"] == 56
+              and reads[n:] == [str(proj / "-b" / "sid-two.jsonl")], str(reads[n:]))
+        (proj / "-b" / "sid-two.jsonl").write_text(_tline("assistant", "e", today, u(1, 1, 1)))
+        st3 = V.load_stats()
+        check("a transcript replaced by a shorter one is recounted, not added to",
+              st3["days"][-1] == {"date": day["date"], "cache_read": 901, "fresh_in": 101,
+                                  "out": 51}, str(st3["days"][-1]))
+    finally:
+        V.SESSIONS_FILE, V.PROJECTS_DIR, V.INDEX_RECHECK_S, V._complete_lines = saved
+        V._usage.clear()
+
+
+PANEL_DRIVER = r"""
+// Draws the task panel twice through the page's own renderTasks: once from
+// whole tasks (what `list` used to send) and once from board.panel_row's slim
+// rows. Every slim row is a Proxy that records any field read that it lacks.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const fx = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+function el(id) {
+  return {id, innerHTML: "", textContent: "", value: "", title: "", className: "",
+          style: {}, disabled: false, dataset: {}, children: [],
+          classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+          appendChild() {}, removeChild() {}, remove() {}, addEventListener() {},
+          insertAdjacentHTML() {}, focus() {}, scrollIntoView() {},
+          querySelector() { return null; }, querySelectorAll() { return []; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+globalThis.document = {getElementById: byId, createElement: () => el("new"),
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+let rows = fx.full;
+const missing = new Set(), asked = [];
+const watch = t => new Proxy(t, {get(o, k) {
+  if (typeof k === "string" && !(k in o)) missing.add(k);
+  return o[k];
+}});
+globalThis.fetch = async (url, opts) => {
+  const body = opts && opts.body ? JSON.parse(opts.body) : {};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions: [], slack: {}};
+  else if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  else if (url.startsWith("/api/tasks")) {
+    asked.push(body);
+    if (body.action === "list" || body.action === "attention") out = {ok: true, tasks: rows, counts: {}};
+    else if (body.action === "task") out = {ok: true, task: fx.detail[body.id]};
+  }
+  return {json: async () => out, text: async () => ""};
+};
+(0, eval)(src + "\n;globalThis.__p = {renderTasks, openMore};");
+(async () => {
+  const P = globalThis.__p, out = {};
+  await P.renderTasks();
+  out.full = byId("tlist").innerHTML;
+  rows = fx.slim.map(watch);
+  byId("tlist")._html = undefined;
+  await P.renderTasks();
+  out.slim = byId("tlist").innerHTML;
+  out.missing = [...missing];
+  out.listAsk = asked.filter(a => a.action === "list" || a.action === "attention").slice(-1)[0];
+  await P.openMore(fx.open);
+  out.opened = byId("more-" + fx.open).innerHTML;
+  out.taskAsk = asked.filter(a => a.action === "task").slice(-1)[0];
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+def test_task_panel_slim_rows():
+    import re
+    import logging
+    import board as B
+    import tasks as T
+    import costs
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe task panel's slim rows draw exactly what the whole tasks drew")
+    ts, ps, ids, survey, _ = _board_fixture()
+    long_goal = "Make the thing\n\n" + ("evidence line, " * 400) + "THE LAST WORD"
+    prop = ts.create(long_goal, title="Make the thing", state=T.PROPOSED, role="implementor",
+                     project="alpha")
+    res = ts.create("Look into it\n\nquestions", title="Look into it", role=__import__("research").ROLE,
+                    state=T.RUNNING, project="alpha", thread="C1:9.9")
+    ts.update(res["id"], result={"text": "FINDINGS " + "f" * 6000 + " END OF FINDINGS",
+                                 "review": {"ok": True, "summary": "fine"}})
+    ts.transition(res["id"], T.NEEDS_INPUT, "findings")
+    ts.update(res["id"], needs_user={"action": "!release alpha app", "release": "alpha app",
+                                     "why": "yours"})
+    ts.create("child step", state=T.PROPOSED, parent=res["id"], role="implementor",
+              project="alpha")
+    ts.update(ids["awaiting"], needs_user={"action": "do it", "why": "because"})
+    # A failure reason longer than a board card's cut: the row showed it whole.
+    ts.update(ids["failed"], events=[{"at": time.time(), "kind": "failed", "detail":
+              "claude exited 1: NO WORKTREE " + "z" * 400 + " AND THE REAL CAUSE"}])
+    recs = list(ts.all().values())
+
+    ns = {"task_store": ts, "costs": costs, "board": B,
+          "research": __import__("research"), "slacklinks": __import__("slacklinks")}
+    _bot_fns({"_with_costs"}, ns)
+    full = ns["_with_costs"](sorted(recs, key=lambda t: -(t.get("created") or 0)))
+    slim = [B.panel_row(t) for t in full]
+    big, small = len(json.dumps(full)), len(json.dumps(slim))
+    check("slim rows are a fraction of the whole tasks", small < big / 3, f"{small} vs {big}")
+    check("no goal and no reply text in a slim row",
+          all("goal" not in r and "text" not in r["result"] and "events" not in r for r in slim))
+
+    # The route: `slim` is what the panel asks for; `counts` is the badge's.
+    handle = _bot_func("handle_tasks", task_store=ts, tasks=T, board=B,
+                       log=logging.getLogger("t"), _with_costs=ns["_with_costs"],
+                       _spend=lambda p="": {"spend": {}, "spend_line": ""})
+    r = handle({"action": "list", "slim": True})
+    check("list with slim answers panel rows", r["ok"] and r["tasks"]
+          and all(set(t) == set(B.ROW_FIELDS) | {"result", "more", "why"} for t in r["tasks"]))
+    check("list without it is unchanged", "goal" in handle({"action": "list"})["tasks"][0])
+    c = handle({"action": "counts"})
+    check("counts is the counts alone", c == {"ok": True, "counts": ts.counts()}, str(c)[:200])
+    check("attention takes slim too",
+          all("goal" not in t for t in handle({"action": "attention", "slim": True})["tasks"]))
+
+    detail = {t["id"]: B.detail(ts.get(t["id"]), recs, full=True) for t in full}
+    check("the detail a row opens keeps the whole reply",
+          detail[res["id"]]["result"]["text"].endswith("END OF FINDINGS")
+          and "FINDINGS f" in detail[res["id"]]["result"]["text"])
+    check("while the board's detail still keeps its tail",
+          B.detail(ts.get(res["id"]), recs)["result"]["text"].startswith("…"))
+
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    chk = subprocess.run([node, "--check", str(d / "dash.js")], capture_output=True, text=True)
+    check("the page's script parses (node --check)", chk.returncode == 0, chk.stderr[-400:])
+    (d / "fx.json").write_text(json.dumps({"full": full, "slim": slim, "detail": detail,
+                                           "open": res["id"]}))
+    (d / "drive.js").write_text(PANEL_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(d / "fx.json")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the panel's javascript runs", False, p.stderr.strip()[-600:])
+        return
+    out = json.loads(p.stdout)
+    check("every field a row reads is in the slim row", out["missing"] == [], str(out["missing"]))
+    check("slim rows draw the panel exactly as whole tasks did", out["slim"] == out["full"],
+          next((f"{a!r} / {b!r}" for a, b in zip(out["slim"].split("<div class=\"task\">"),
+                                                  out["full"].split("<div class=\"task\">"))
+                if a != b), "lengths differ")[:600])
+    check("and the fixture has rows of every kind", all(
+        x in out["slim"] for x in ("Review flagged", "yours to do", "Close", "landed abcdef12",
+                                   "NO WORKTREE", 'id="more-' + prop["id"] + '"')))
+    check("the panel asks for slim rows", (out["listAsk"] or {}).get("slim") is True,
+          str(out["listAsk"]))
+    check("nothing behind a title is drawn until it is opened",
+          "THE LAST WORD" not in out["slim"] and "END OF FINDINGS" not in out["slim"])
+    check("opening research asks for it whole and shows the findings",
+          out["taskAsk"] == {"action": "task", "id": res["id"], "full": True}
+          and "END OF FINDINGS" in out["opened"] and "findings" in out["opened"],
+          out["opened"][:300])
+
+
+LIVE_DRIVER = r"""
+// The session list, transcript and polling, against a stub DOM that keeps real
+// children and counts writes -- the point being what a poll does NOT touch.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+let writes = 0, appends = 0;
+function el(id) {
+  const o = {id, textContent: "", value: "", title: "", className: "", style: {}, disabled: false,
+    dataset: {}, children: [], _inner: "", parent: null,
+    get innerHTML() { return this._inner; },
+    set innerHTML(v) { writes++; this._inner = v; },
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) {
+      appends++;
+      if (c.parent) c.parent.children.splice(c.parent.children.indexOf(c), 1);
+      c.parent = this; this.children.push(c); return c;
+    },
+    remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; },
+    addEventListener() {}, insertAdjacentHTML(_, h) { this._inner += h; }, focus() {},
+    scrollIntoView() {}, querySelector() { return null; }, querySelectorAll() { return []; }};
+  return o;
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+const listeners = {};
+globalThis.document = {getElementById: byId, createElement: () => el("new"), hidden: false,
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener(k, f) { listeners[k] = f; }, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+const timers = [];
+globalThis.setInterval = (f, ms) => timers.push([f, ms]);
+globalThis.setTimeout = () => 0;
+let clock = 1e12;
+Date.now = () => clock;
+const sess = (key, title, extra) => Object.assign({key, title, kind: "thread", session_id: "s-" + key,
+  updated: clock / 1000 - 3 * 86400, turns: 1, cost: 0, resume_cmd: "x", slack_link: "y"}, extra || {});
+let sessions = [sess("A:1", "alpha"), sess("B:2", "beta",
+  {turn: {age_s: 10, child_alive: true, stalled: false, prompt: "go"}})];
+let tag = '"v1"';
+const asked = [];
+let transcript = {};
+globalThis.fetch = async (url, opts) => {
+  const h = (opts && opts.headers) || {};
+  asked.push([url, h["If-None-Match"] || null]);
+  if (url.startsWith("/api/sessions")) {
+    if (h["If-None-Match"] === tag) return {status: 304, headers: {get: () => tag}};
+    const out = {bot_online: true, sessions: JSON.parse(JSON.stringify(sessions)), slack: {}};
+    return {status: 200, headers: {get: k => k === "ETag" ? tag : null}, json: async () => out};
+  }
+  if (url.startsWith("/api/session?")) {
+    const from = +new URL("http://x" + url).searchParams.get("from");
+    return {status: 200, headers: {get: () => null}, json: async () => transcript[from]};
+  }
+  let out = {ok: true};
+  if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  if (url.startsWith("/api/artifacts")) out = [];
+  return {status: 200, headers: {get: () => null}, json: async () => out};
+};
+(0, eval)(src + `;globalThis.__l = {loadList, loadTranscript, openSession,
+  setActive(k) { active = lastSessions.find(s => s.key === k); }};`);
+const tick = () => new Promise(r => setImmediate(r));
+(async () => {
+  const L = globalThis.__l, out = {};
+  await L.loadList();
+  const nav = byId("list");
+  out.first = nav.children.map(c => c._inner.includes("alpha") ? "alpha" : "beta");
+  const before = nav.children.slice();
+  writes = 0; appends = 0;
+  await L.loadList();                                    // 304: nothing changed
+  out.unchanged = {writes, appends, same: nav.children.every((c, i) => c === before[i]),
+                   conditional: asked.filter(a => a[0] === "/api/sessions").slice(-1)[0][1]};
+  clock += 65000;                                        // a minute later, still 304
+  writes = 0;
+  await L.loadList();
+  out.aged = {writes, text: nav.children[1]._inner.match(/running [^<]*/)[0]};
+  // The server's answer moved on by the same minute the page counted.
+  sessions[0].title = "alpha renamed"; sessions[1].turn.age_s = 75; tag = '"v2"';
+  writes = 0; appends = 0;
+  await L.loadList();
+  out.renamed = {writes, appends, same: nav.children.every((c, i) => c === before[i]),
+                 text: nav.children[0]._inner.includes("alpha renamed")};
+  sessions = [sessions[1], sessions[0]]; tag = '"v3"';
+  await L.loadList();
+  out.reordered = nav.children.map(c => c._inner.includes("alpha") ? "alpha" : "beta");
+  out.reusedOnReorder = nav.children[0] === before[1];
+  // The transcript: read from 0, then only what is new, appended.
+  transcript = {0: {messages: [{role: "user", ts: "", blocks: [{type: "text", text: "first msg"}]}], cursor: 40},
+                40: {messages: [{role: "assistant", ts: "", blocks: [{type: "text", text: "second msg"}]}], cursor: 90},
+                90: {messages: [], cursor: 90}};
+  L.setActive("A:1");
+  await L.loadTranscript(true);
+  const msgs = byId("tmsgs");
+  out.t1 = msgs.innerHTML;
+  await L.loadTranscript(false);
+  out.t2 = msgs.innerHTML;
+  const headWrites = writes;
+  await L.loadTranscript(false);
+  out.t3 = msgs.innerHTML;
+  out.transcriptAsks = asked.filter(a => a[0].startsWith("/api/session?")).map(a => a[0]);
+  out.headStill = writes === headWrites;
+  // A read that fails replaces the messages; the next one starts over from 0.
+  transcript = {90: {error: "no transcript found for this session"},
+                0: {messages: [{role: "user", ts: "", blocks: [{type: "text", text: "first msg"}]},
+                               {role: "assistant", ts: "", blocks: [{type: "text", text: "second msg"}]}],
+                    cursor: 90}};
+  await L.loadTranscript(false);
+  out.errored = msgs.innerHTML;
+  await L.loadTranscript(false);
+  out.recovered = msgs.innerHTML;
+  out.recoverAsk = asked.filter(a => a[0].startsWith("/api/session?")).slice(-1)[0][0];
+  // A call made while a read is in flight is run after it, not dropped.
+  const k = asked.length;
+  const first = L.loadTranscript(false);
+  await L.loadTranscript(false);
+  await first; await tick(); await tick();
+  out.queued = asked.slice(k).filter(a => a[0].startsWith("/api/session?")).length;
+  // Hidden: the timers fire and nothing is fetched.
+  document.hidden = true;
+  const n = asked.length;
+  for (const [f] of timers) await f();
+  await tick();
+  out.hiddenFetches = asked.length - n;
+  document.hidden = false;
+  listeners.visibilitychange();
+  await tick(); await tick();
+  out.backFetches = asked.slice(n).map(a => a[0].split("?")[0]);
+  out.intervals = timers.map(t => t[1]);
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+def test_dashboard_polls_without_redrawing():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe dashboard redraws only what changed, and not while hidden")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    for name in ("readJSON", "setHTML", "renderList", "cardHtml", "freshAges", "poller",
+                 "taskRead", "openMore", "moreToggled", "rowMore", "rowWhy", "taskBody",
+                 "transcriptHead", "messageHtml", "filesHtml", "openSession"):
+        check(f"{name}() is defined", re.search(rf"function\s+{name}\b", js) is not None)
+    check("the transcript's parts are in the page",
+          all(f'id="{i}"' in V.PAGE for i in ("thead", "tmsgs", "tfiles")))
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(LIVE_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the dashboard's javascript runs", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    check("the list draws newest first", o["first"] == ["alpha", "beta"], o["first"])
+    u = o["unchanged"]
+    check("a poll asks with the ETag it holds", u["conditional"] == '"v1"', u)
+    check("an unchanged poll writes nothing and moves nothing",
+          u["writes"] == 0 and u["appends"] == 0 and u["same"], u)
+    check("a running turn keeps counting through 304s",
+          o["aged"]["text"].startswith("running 1m") and o["aged"]["writes"] == 1, o["aged"])
+    r = o["renamed"]
+    check("a renamed thread rewrites its own card only, in place",
+          r["text"] and r["writes"] == 1 and r["appends"] == 0 and r["same"], r)
+    check("a reorder moves the same cards",
+          o["reordered"] == ["beta", "alpha"] and o["reusedOnReorder"], o["reordered"])
+    check("the transcript reads from its cursor",
+          o["transcriptAsks"] == ["/api/session?id=s-A%3A1&from=0", "/api/session?id=s-A%3A1&from=40",
+                                  "/api/session?id=s-A%3A1&from=90"], o["transcriptAsks"])
+    check("new messages are appended to what is there",
+          "first msg" in o["t1"] and "first msg" in o["t2"] and "second msg" in o["t2"]
+          and o["t3"] == o["t2"])
+    check("an unchanged header is not redrawn", o["headStill"])
+    check("a failed read says so", "no transcript found" in o["errored"])
+    check("and the next read starts over, showing every message once",
+          o["recoverAsk"].endswith("&from=0") and o["recovered"].count("first msg") == 1
+          and "second msg" in o["recovered"] and "no transcript" not in o["recovered"],
+          o["recoverAsk"])
+    check("a read asked for during another is run after it", o["queued"] == 2, o["queued"])
+    check("a hidden tab fetches nothing", o["hiddenFetches"] == 0, o["hiddenFetches"])
+    check("showing it again refreshes at once",
+          "/api/sessions" in o["backFetches"] and "/api/stats" in o["backFetches"]
+          and "/api/session" in o["backFetches"], o["backFetches"])
+    check("the polling cadence is unchanged", sorted(o["intervals"]) == [4000, 5000, 5000, 30000],
+          o["intervals"])
 
 
 if __name__ == "__main__":

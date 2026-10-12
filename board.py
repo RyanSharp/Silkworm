@@ -209,11 +209,42 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None, kids=()) -> dict:
     }
 
 
-def _why(rec: dict) -> str:
+def _why(rec: dict, limit: int | None = 300) -> str:
     ev = rec.get("events") or []
     e = ([x for x in ev if (x or {}).get("kind") == rec.get("state")][-1:]
          or ev[-1:] or [{}])[0]
-    return str((e or {}).get("detail") or "")[:300]
+    return str((e or {}).get("detail") or "")[:limit]
+
+
+#: What a task panel row reads of a task's result: the review and the landing
+#: are drawn on the row itself. The reply text is behind the row's disclosure.
+ROW_RESULT = ("review", "landing", "landed")
+
+#: The rest of what a task panel row reads, copied as they are.
+ROW_FIELDS = ("id", "title", "state", "role", "project", "source", "attempts",
+              "created", "thread", "thread_link", "cost_total", "needs_user",
+              "findings", "round", "research")
+
+
+def panel_row(t: dict) -> dict:
+    """A task panel row: a task as handle_tasks' `list` builds it (costs and
+    research added), cut to what the row draws.
+
+    The whole goal and the reply text are most of tasks.json -- 6 MB for 1,500
+    tasks -- and the panel showed them only behind a closed disclosure, while
+    the badge polled the lot every five seconds. The row says instead whether
+    there is anything behind its title (`more`) and, for a failure, why it
+    stopped (`why`, uncut, as the row showed it); opening it asks for the task
+    itself (the `task` action, with `full`).
+    """
+    row = {k: t.get(k) for k in ROW_FIELDS}
+    result = t.get("result") or {}
+    row["result"] = {k: result[k] for k in ROW_RESULT if k in result}
+    goal = (t.get("goal") or "").strip()
+    row["more"] = bool((goal and goal != (t.get("title") or "").strip())
+                       or (t.get("findings") and result.get("text")))
+    row["why"] = _why(t, None) if t.get("state") == tasks.FAILED else ""
+    return row
 
 
 def matches(rec: dict, role: str = "", state: str = "", q: str = "") -> bool:
@@ -306,10 +337,12 @@ def backlog_order(c: dict) -> tuple:
     return (rank,) + tasks.claim_order(c)
 
 
-def detail(rec: dict, records=(), unmerged_rows=()) -> dict:
+def detail(rec: dict, records=(), unmerged_rows=(), full: bool = False) -> dict:
     """One task in full, for the card's detail view: the whole goal, its
     events, the review and the landing as recorded, and its reviewers --
-    plus the same cached survey row its card carries."""
+    plus the same cached survey row its card carries. `full` keeps the whole
+    reply text rather than its tail: the task panel's rows showed all of it
+    before they fetched it on opening."""
     records = list(records)
     reviews = [r for r in records if r.get("role") == "reviewer"
                and r.get("parent") == rec.get("id")]
@@ -325,7 +358,7 @@ def detail(rec: dict, records=(), unmerged_rows=()) -> dict:
                        "created": r.get("created") or 0} for r in reviews]
     # The reply text can run to tens of kilobytes; the detail shows its tail.
     result = dict(out.get("result") or {})
-    if isinstance(result.get("text"), str) and len(result["text"]) > 4000:
+    if not full and isinstance(result.get("text"), str) and len(result["text"]) > 4000:
         result["text"] = "…" + result["text"][-4000:]
     out["result"] = result
     return out

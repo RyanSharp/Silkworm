@@ -2434,16 +2434,24 @@ def handle_tasks(payload: dict) -> dict:
     project = payload.get("project") or ""
     def _filter(items):
         return [t for t in items if not project or (t.get("project") or "") == project]
+    # `slim`: rows cut to what the dashboard's task panel draws (board.panel_row);
+    # the whole goal and reply come from `task` when a row is opened.
+    rows = ((lambda ts: [board.panel_row(t) for t in ts]) if payload.get("slim")
+            else (lambda ts: ts))
     if action == "list":
         state = payload.get("state")
         items = (task_store.by_state(state) if state
                  else sorted(task_store.all().values(),
                              key=lambda t: -(t.get("created") or 0)))
-        return {"ok": True, "tasks": _with_costs(_filter(items)[:200]),
+        return {"ok": True, "tasks": rows(_with_costs(_filter(items)[:200])),
                 "counts": task_store.counts(), **_spend(project)}
     if action == "attention":
-        return {"ok": True, "tasks": _with_costs(_filter(task_store.needs_attention())),
+        return {"ok": True, "tasks": rows(_with_costs(_filter(task_store.needs_attention()))),
                 "counts": task_store.counts(), **_spend(project)}
+    if action == "counts":
+        # The dashboard's badge, polled every five seconds: the counts and
+        # nothing else, where `list` would hand it two hundred whole tasks.
+        return {"ok": True, "counts": task_store.counts()}
     if action == "watching":
         # Scheduled wake-ups specifically, not everything parked in `blocked`:
         # a quota-blocked retry is the system waiting on itself, while a watch
@@ -2498,7 +2506,8 @@ def handle_tasks(payload: dict) -> dict:
         # The cached survey, as the board uses: without its row a stranded
         # done task's detail would never offer the Land and Drop its card does.
         return {"ok": True, "task": board.detail(rec, task_store.all().values(),
-                                                 unmerged_rows=board_survey())}
+                                                 unmerged_rows=board_survey(),
+                                                 full=bool(payload.get("full")))}
     if action == "roles":
         # What the form may offer, fetched rather than written into the page,
         # so the choices and the rule that enforces them cannot drift apart.
