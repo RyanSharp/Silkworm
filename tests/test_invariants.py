@@ -61,6 +61,7 @@ def bot_functions(*names, **globals_):
     assert not missing, f"bot.py has no {', '.join(sorted(missing))}"
     wanted += _shared_helpers(tree, wanted, set(names) | set(globals_))
     ns = {"log": logging.getLogger("test"), "time": time, **globals_}
+    _helper_modules(wanted, ns)
     exec(compile(ast.Module(body=wanted, type_ignores=[]), "bot.py", "exec"), ns)
     return ns
 
@@ -70,7 +71,16 @@ def bot_functions(*names, **globals_):
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
-                  "release_drain_refusal")
+                  "release_drain_refusal", "unreviewed_role")
+
+
+def _helper_modules(nodes, ns) -> None:
+    """The real modules a lifted shared helper reads, unless a test supplied
+    its own. unreviewed_role asks roles.needs_review; a test lifting a landing
+    path for another reason should not have to know that."""
+    if any(n.name == "unreviewed_role" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import roles as _roles
+        ns.setdefault("roles", _roles)
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -1221,6 +1231,7 @@ def _bot_fns(names, ns):
 
     nodes = [n for n in tree.body if defines(n) & set(names)]
     nodes += _shared_helpers(tree, nodes, set(names) | set(ns))
+    _helper_modules(nodes, ns)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<bot>", "exec"), ns)
     return {name for n in nodes for name in defines(n)}
 
@@ -5720,7 +5731,7 @@ def test_held_checkouts():
 
     def task_in(state, tid_out=None):
         """A task carried to `state` the legal way, with its own checkout."""
-        t = st.create("do a thing", driver="queue", isolate=True,
+        t = st.create("do a thing", driver="queue", isolate=True, role="implementor",
                       scope={"cwd": str(repo)})
         tid = t["id"]
         st.update(tid, title=f"work for {tid}", project="proj",
@@ -6432,7 +6443,8 @@ def test_landing_is_visible():
     gate = {"project_store": Projects({"auto_merge": True, "test_cmd": "true"}),
             "worktrees": W, "merge": M, "branches": B, "log": LOG}
     _bot_fns({"land_if_ready", "landing_enabled"}, gate)
-    t = {"id": "tsk_guard", "project": "p", "scope": {"cwd": "/nowhere"}}
+    t = {"id": "tsk_guard", "project": "p", "role": "implementor",
+         "scope": {"cwd": "/nowhere"}}
 
     def land_if_ready(task):
         """The gate's answer, or a stand-in for a version that has no answer."""
@@ -9996,7 +10008,8 @@ def test_nothing_to_land_is_not_a_refusal():
           "branches": B, "log": logging.getLogger("test")}
     _bot_fns({"land_if_ready", "landing_enabled"}, ns)
     land = ns["land_if_ready"]
-    base = {"project": "p", "verified": True, "scope": {"cwd": str(repo)}}
+    base = {"project": "p", "role": "implementor", "verified": True,
+            "scope": {"cwd": str(repo)}}
 
     for tid, why in (("tsk_gone", "its branch was tidied away as empty"),
                      ("tsk_empty", "everything on its branch is already on the base")):
@@ -10091,7 +10104,8 @@ def test_remote_only_work_lands():
           "branches": B, "log": logging.getLogger("test")}
     _bot_fns({"land_if_ready", "landing_enabled"}, ns)
     land = ns["land_if_ready"]
-    base = {"project": "p", "verified": True, "scope": {"cwd": str(repo)}}
+    base = {"project": "p", "role": "implementor", "verified": True,
+            "scope": {"cwd": str(repo)}}
 
     r = land({**base, "id": "tsk_reset"})
     check("reset branch: goes on to land, not 'nothing to land'",
@@ -10262,7 +10276,8 @@ def test_approval_lands_on_any_project():
           "branches": B, "log": logging.getLogger("test")}
     _bot_fns({"land_if_ready", "landing_enabled"}, ns)
     land = ns["land_if_ready"]
-    t = {"id": "tsk_work", "project": "p", "scope": {"cwd": str(repo)}}
+    t = {"id": "tsk_work", "project": "p", "role": "implementor",
+         "scope": {"cwd": str(repo)}}
 
     r = land({**t, "verified": True})
     check("unasked, auto-merge off still means no", r.get("stage") == "not-enabled")
@@ -10292,7 +10307,7 @@ def test_approval_lands_on_any_project():
     store.transition(run, T.RUNNING)
     check("not on work still running", lod("land", {"id": run}).get("ok") is False and not begun)
     done = store.create("finished work", state=T.QUEUED, scope={"cwd": str(repo)},
-                        branch="silkworm/tsk_work")["id"]
+                        role="implementor", branch="silkworm/tsk_work")["id"]
     store.transition(done, T.RUNNING); store.transition(done, T.DONE)
     r = lod("land", {"id": done})
     check("Land starts an approved landing", r.get("ok") and begun == [(done, True)], f"{r} {begun}")
@@ -10838,7 +10853,7 @@ def test_board_is_compact():
     ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
                        stop_task=lambda tid: False, start_landing=lambda tid, **kw: None,
                        holding=__import__("holding"), tell_thread=lambda *a: None)
-    aw = store.create("work to approve", state=T.QUEUED)["id"]
+    aw = store.create("work to approve", state=T.QUEUED, role="implementor")["id"]
     store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
     store.update(aw, result={"review": {"summary": "ok-ish",
                                         "findings": [f"issue number {i}" for i in range(7)]}})
@@ -13498,6 +13513,147 @@ def test_implementor_git_guard():
     check("status: a missing hook reads as unguarded", rows and rows[0][1] is False, str(rows))
 
 
+def test_researcher_git_guard():
+    """A queued researcher runs unattended in its own worktree with write
+    access, exactly as an implementor does, so git holds it to the same line:
+    its own branch, and nothing else. It stays writable -- trader research
+    writes caches and runs backtests -- so committing on its branch works."""
+    import git_guard as GG
+    print("\nresearcher git guard: an unattended research run cannot push, tag or move the base")
+    root = Path(tempfile.mkdtemp())
+    origin, repo, wt = root / "origin.git", root / "repo", root / "wt"
+    tid = "tsk_research1"
+    clean = GG.strip(dict(os.environ))
+    agent = {**clean, **GG.env_for("researcher", tid)}
+
+    def git(cwd, *a, env=None):
+        return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                              cwd=str(cwd), capture_output=True, text=True,
+                              env=env if env is not None else clean)
+
+    def sha(ref, cwd=repo):
+        return git(cwd, "rev-parse", "-q", "--verify", ref).stdout.strip()
+
+    check("the researcher is a guarded role, beside the implementor",
+          {"researcher", "implementor"} <= set(getattr(GG, "GUARDED_ROLES", ())),
+          str(getattr(GG, "GUARDED_ROLES", None)))
+    git(root, "init", "-q", "--bare", "-b", "main", str(origin))
+    git(root, "init", "-q", "-b", "main", str(repo))
+    (repo / "a.txt").write_text("a\n")
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "a")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-q", "origin", "main")
+    res = GG.install(repo)
+    check("install: both hooks go in", res["ok"], str(res))
+    git(repo, "worktree", "add", "-q", "-b", f"silkworm/{tid}", str(wt), "main")
+    main_at = sha("main")
+
+    (wt / "cache.csv").write_text("x\n")
+    git(wt, "add", "-A", env=agent)
+    r = git(wt, "commit", "-q", "-m", "cache", env=agent)
+    check("researcher: it is not read-only -- committing to its own branch works",
+          r.returncode == 0, r.stderr[-200:])
+    r = git(wt, "push", "-q", "origin", "HEAD:main", env=agent)
+    check("researcher: pushing is refused",
+          r.returncode != 0 and "may not push" in r.stderr
+          and sha("main", origin) == main_at, r.stderr[-300:])
+    r = git(wt, "push", "-q", "origin", f"silkworm/{tid}", env=agent)
+    check("researcher: pushing even its own branch is refused",
+          r.returncode != 0 and not sha(f"refs/heads/silkworm/{tid}", origin), r.stderr[-300:])
+    r = git(wt, "update-ref", "refs/heads/main", "HEAD", env=agent)
+    check("researcher: moving main is refused",
+          r.returncode != 0 and sha("main") == main_at, r.stderr[-200:])
+    r = git(repo, "merge", "-q", "--ff-only", f"silkworm/{tid}", env=agent)
+    check("researcher: merging into main (in the main checkout) is refused",
+          r.returncode != 0 and sha("main") == main_at, r.stderr[-200:])
+    r = git(wt, "tag", "r1", env=agent)
+    check("researcher: tagging is refused",
+          r.returncode != 0 and not sha("refs/tags/r1"), r.stderr[-200:])
+    r = git(wt, "branch", "elsewhere", env=agent)
+    check("researcher: making another branch is refused",
+          r.returncode != 0 and not sha("refs/heads/elsewhere"), r.stderr[-200:])
+    r = git(wt, "fetch", "-q", "origin", env=agent)
+    check("researcher: fetch still works", r.returncode == 0, r.stderr[-200:])
+    r = git(repo, "tag", "u1")
+    check("unset: the user is untouched", r.returncode == 0, r.stderr[-200:])
+
+
+def test_unreviewed_roles_never_land():
+    """A branch left by a role that is never reviewed is refused by Land,
+    Approve and the landing gate under both -- not merged on a click with no
+    reviewer having read it. A researcher's 'change nothing that needs
+    merging' lived only in its prompt; if it committed anyway, its branch was
+    listed as stranded work and Land merged it."""
+    import roles
+    import tasks as T
+    import branches as B
+    import merge as M
+    print("\nunreviewed roles never land: Land, Approve and the gate refuse them")
+    check("fixture: a researcher and an assistant are never reviewed; an implementor is",
+          not roles.needs_review(roles.RESEARCHER) and not roles.needs_review("assistant")
+          and roles.needs_review("implementor"))
+
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    begun, recorded = [], []
+    import contextlib
+    ns = {"task_store": store, "tasks": T, "branches": B, "roles": roles,
+          "discard": __import__("discard"), "log": logging.getLogger("test"),
+          "holding": __import__("holding"), "tell_thread": lambda *a: None,
+          "start_landing": lambda tid, approved=False: begun.append((tid, approved)) or True,
+          "record_landing": lambda task, out: recorded.append(out),
+          "repo_guard": lambda cwd: contextlib.nullcontext()}
+    got = _bot_fns({"land_or_drop", "approve_task", "unreviewed_role"}, ns)
+    check("Land, Approve and the role gate were lifted out of bot.py",
+          {"land_or_drop", "approve_task", "unreviewed_role"} <= got, str(sorted(got)))
+
+    def finished(role):
+        tid = store.create(f"{role} work", state=T.QUEUED, role=role,
+                           scope={"cwd": "/nowhere"})["id"]
+        store.transition(tid, T.RUNNING); store.transition(tid, T.DONE)
+        return tid
+
+    for role in (roles.RESEARCHER, "assistant"):
+        tid = finished(role)
+        r = ns["land_or_drop"]("land", {"id": tid})
+        err = r.get("error") or ""
+        check(f"Land refuses the branch of the {role} task, saying why and what to do instead",
+              r.get("ok") is False and not begun and role in err
+              and "Drop" in err and "implementor" in err, repr(r))
+    begun.clear()
+    tid = finished("implementor")
+    r = ns["land_or_drop"]("land", {"id": tid})
+    check("while an implementor's still lands", r.get("ok") and begun == [(tid, True)], repr(r))
+
+    begun.clear()
+    rid = store.create("researched", state=T.QUEUED, role=roles.RESEARCHER)["id"]
+    store.transition(rid, T.RUNNING); store.transition(rid, T.AWAITING_APPROVAL)
+    r = ns["approve_task"]({"id": rid, "by": "you"})
+    check("Approve refuses a researcher's work, before closing or landing anything",
+          r.get("ok") is False and "implementor" in (r.get("error") or "")
+          and not begun and store.get(rid)["state"] == T.AWAITING_APPROVAL, repr(r))
+
+    # The gate under both, and under auto-merge: a person asking does not
+    # make up for a review that never happened.
+    class Projects:
+        def get(self, slug): return {"auto_merge": True, "test_cmd": "true"}
+        def scope_for(self, slug): return {}
+    attached = []
+
+    class Worktrees:
+        def base_ref(self, *a, **k): return "main"
+        def attach(self, cwd, tid, branch): attached.append(branch); return None
+    gate = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
+            "branches": B, "roles": roles, "log": logging.getLogger("test")}
+    _bot_fns({"land_if_ready", "landing_enabled", "unreviewed_role"}, gate)
+    for approved in (False, True):
+        r = gate["land_if_ready"]({"id": "tsk_r", "project": "p", "role": roles.RESEARCHER,
+                                   "verified": True, "scope": {"cwd": "/nowhere"}},
+                                  approved=approved)
+        check(f"the landing gate refuses a researcher (approved={approved})",
+              r.get("stage") == "unreviewed-role" and r.get("eligible") is False
+              and not attached, repr(r))
+
+
 def test_guard_env_reaches_task_turns_only():
     import git_guard as GG
     import roles as R_
@@ -14098,7 +14254,8 @@ def test_one_suite_run_per_project_at_a_time():
                         "LANDING_UNDERWAY"}, ns)
         check("the landing and the verification were lifted out of bot.py",
               {"land_if_ready", "verify_work"} <= got, str(sorted(got)))
-        task = {"id": "tsk_lands", "project": "cadence", "verified": True,
+        task = {"id": "tsk_lands", "project": "cadence", "role": "implementor",
+                "verified": True,
                 "scope": {"cwd": str(repo), "branch": "main"}}
         out = {}
 
@@ -14263,7 +14420,7 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
         _bot_fns({"land_if_ready", "landing_enabled", "verify_work",
                   "LANDING_UNDERWAY"}, ns)
         r = ns["land_if_ready"]({"id": "tsk_flaky", "project": "cadence",
-                                 "verified": True,
+                                 "role": "implementor", "verified": True,
                                  "scope": {"cwd": str(repo), "branch": "main"}})
         check("a landing whose simulator failed to launch once still lands",
               r.get("landed") is True, f"got {r.get('stage')}: {r.get('detail', '')[-200:]}")

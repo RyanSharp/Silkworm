@@ -1,4 +1,4 @@
-"""Git hooks that keep an implementor task off the base branch and the remote.
+"""Git hooks that keep an unattended task off the base branch and the remote.
 
 Landing is Silkworm's job: verification, then review, then merge.land, then
 (if the project publishes) a push. On 2026-10-02 a Cadence implementor merged
@@ -15,8 +15,8 @@ does anything you type -- so the guard is invisible to both.
 Two hooks, installed once per repository into the common git dir (or
 core.hooksPath), so every worktree of the repo shares them:
 
-  pre-push              refuses every push from an implementor.
-  reference-transaction refuses an implementor moving any ref but its own
+  pre-push              refuses every push from a guarded role.
+  reference-transaction refuses a guarded role moving any ref but its own
                         branch (refs/heads/silkworm/<task id>), HEAD,
                         remote-tracking refs (so fetch works), and the
                         per-worktree bookkeeping a rebase or stash writes.
@@ -50,9 +50,15 @@ from pathlib import Path
 
 ROLE_VAR = "SILKWORM_TASK_ROLE"
 ID_VAR = "SILKWORM_TASK_ID"
-#: The one role the guard constrains. A reviewer or ideator is read-only
-#: already; an `assistant` task is a conversation the user is in.
-GUARDED_ROLE = "implementor"
+#: The roles the guard constrains: the ones that run unattended in their own
+#: worktree with write access. An implementor's work is landed after review; a
+#: researcher's is never landed at all (it reports findings, and may write
+#: caches or run backtests, so it is not made read-only) -- either way the
+#: base, the remote and the tags are not theirs to move. A reviewer or ideator
+#: is read-only already; an `assistant` task is a conversation the user is in.
+GUARDED_ROLES = frozenset({"implementor", "researcher"})
+#: The same set as a shell `case` pattern, sorted so the hook text is stable.
+_GUARDED_PATTERN = "|".join(sorted(GUARDED_ROLES))
 
 HOOKS = ("pre-push", "reference-transaction")
 CHAINED_SUFFIX = ".silkworm-chained"
@@ -67,8 +73,9 @@ chained="$0{CHAINED_SUFFIX}"
 """
 
 PRE_PUSH = _HEAD + f"""
-if [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
-    echo "silkworm: an implementor task may not push." >&2
+guarded() {{ case "${{{ROLE_VAR}:-}}" in {_GUARDED_PATTERN}) return 0 ;; esac; return 1; }}
+if guarded; then
+    echo "silkworm: this ${{{ROLE_VAR}}} task may not push." >&2
     echo "silkworm: commit to your own branch (silkworm/${{{ID_VAR}:-<task id>}}) and" >&2
     echo "silkworm: report that it is ready to land -- landing and pushing are" >&2
     echo "silkworm: Silkworm's job, after verification and review." >&2
@@ -102,8 +109,9 @@ $input
 EOF
     return 0
 }}
+guarded() {{ case "${{{ROLE_VAR}:-}}" in {_GUARDED_PATTERN}) return 0 ;; esac; return 1; }}
 state="$1"                       # kept: the command lookup below reuses $@
-if [ "$state" = "prepared" ] && [ "${{{ROLE_VAR}:-}}" = "{GUARDED_ROLE}" ]; then
+if [ "$state" = "prepared" ] && guarded; then
     own="refs/heads/silkworm/${{{ID_VAR}:-}}"
     bad="" tags=""
     while read -r old new ref; do
@@ -151,7 +159,7 @@ EOF
         bad="$bad$tags"
     fi
     if [ -n "$bad" ]; then
-        echo "silkworm: an implementor task may only move its own branch ($own)." >&2
+        echo "silkworm: this ${{{ROLE_VAR}}} task may only move its own branch ($own)." >&2
         echo "silkworm: refused:$bad" >&2
         echo "silkworm: do not merge into, reset or push the base branch, make other" >&2
         echo "silkworm: branches, or tag. Commit on your branch and report that it is" >&2

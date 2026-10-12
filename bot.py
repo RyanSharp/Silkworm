@@ -531,8 +531,9 @@ def claude_env(key: str = "", defers: int = 0, role: str = "", task_id: str = ""
     # typed, so it has no way to put an assignment in front of the CLI and
     # describe itself as something less supervised.
     env["SILKWORM_ROLE"] = role or "assistant"
-    # Who is running git, for the hooks git_guard installs: an implementor may
-    # commit to its own branch and nothing else, and may not push. The landing
+    # Who is running git, for the hooks git_guard installs: an implementor or
+    # researcher may commit to its own branch and nothing else, and may not
+    # push. The landing
     # and the verifier run in this process, which never carries these.
     if task_id:
         env.update(git_guard.env_for(role or "assistant", task_id))
@@ -2015,6 +2016,11 @@ def approve_task(payload: dict) -> dict:
     if not task:
         return {"ok": False, "error": "unknown task"}
     reviewed = task.get("state") == tasks.AWAITING_APPROVAL
+    # Approving lands, so it refuses what Land refuses, and before it closes
+    # anything: a role that is never reviewed has nothing here to approve.
+    unreviewed = unreviewed_role(task)
+    if reviewed and unreviewed:
+        return {"ok": False, "error": unreviewed}
     if task.get("state") == tasks.NEEDS_INPUT:
         # Refused as it always was. needs_input -> done is legal now (Done,
         # Release), so without this a second click on Approve would close a
@@ -2205,6 +2211,9 @@ def land_or_drop(action: str, payload: dict) -> dict:
         return {"ok": False, "error": f"its branch was handed to {taken} to catch "
                                       "up with the base; act on that task instead"}
     if action == "land":
+        unreviewed = unreviewed_role(task)
+        if unreviewed:
+            return {"ok": False, "error": unreviewed}
         if not start_landing(tid, approved=True):
             return {"ok": False, "error": "a landing for it is already under way"}
         return {"ok": True, "note": "landing under way — rebase, tests, merge, tests; "
@@ -3548,7 +3557,7 @@ def reconcile_checkouts() -> None:
 
 
 def install_git_guards(slug: str = "") -> None:
-    """Put the implementor guard into every ready project's repository.
+    """Put the git guard (git_guard.GUARDED_ROLES) into every ready project's repository.
 
     Ready means unsupervised work may run there (projects.unready), which is
     exactly where nobody is watching what an implementor does with git. Run at
@@ -4754,6 +4763,26 @@ def landing_enabled(task: dict) -> bool:
     return bool((project_store.get(task.get("project") or "") or {}).get("auto_merge"))
 
 
+def unreviewed_role(task: dict) -> str:
+    """Why this task's branch may never land, or "" if its role allows it.
+
+    Only a role that goes through review has work a landing was built for. A
+    researcher runs unattended in its own worktree with write access -- trader
+    research writes caches and runs backtests -- and its prompt says to change
+    nothing that needs merging, but a prompt is not a gate: if it commits, the
+    branch survives it and shows up as stranded work, and Land or Approve would
+    merge it with no reviewer having read a line. The same holds for an
+    `assistant` task. Asked of the role, which nothing rewrites after a run.
+    """
+    role = task.get("role") or "assistant"
+    if roles.needs_review(role):
+        return ""
+    a = "an" if role[:1] in "aeiou" else "a"
+    return (f"{a} {role} task is never reviewed, so its branch cannot be "
+            "landed: Drop it, or refile the change as an implementor task so "
+            "it is reviewed first")
+
+
 def land_if_ready(task: dict, approved: bool = False) -> dict:
     """Land a task's branch if the project allows it and the work earned it.
 
@@ -4790,6 +4819,12 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     # it gates only the landing nobody asked for. Without this split a
     # project with auto-merge off could not merge anything at all: approving
     # closed the task and left the branch, which is how 59 of them piled up.
+    # Before anything else, approved or not: a person asking does not make up
+    # for the review this role never had. Land and Approve refuse it up front
+    # with the same words; this is the gate under both, and under auto-merge.
+    unreviewed = unreviewed_role(task)
+    if unreviewed:
+        return never("unreviewed-role", unreviewed)
     if not landing_enabled(task) and not approved:
         return never("not-enabled", "this project does not land its own work")
     if not (proj.get("test_cmd") or "").strip():

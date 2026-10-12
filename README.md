@@ -516,7 +516,11 @@ File a question as role **researcher** (the dashboard's New task form,
 `silkworm task --role researcher "<question>"` from a turn, or ask in a thread
 to have it filed) when you want findings to read and decide on rather than a
 change. It runs as `assistant` does -- nothing is reviewed or merged -- but
-when it finishes it waits in **Needs you** instead of closing as done, with
+in its own worktree, unattended, so git holds it to its own branch as it does
+an implementor (no push, no tag, no moving the base), and a branch it leaves
+commits on can only be dropped: Land and Approve refuse work from a role that
+is never reviewed. It may still write files and run things, such as caches
+and backtests. When it finishes it waits in **Needs you** instead of closing as done, with
 its findings in a fixed shape: a short answer, confidence and why, key
 evidence, and 2-4 next steps written as standalone task goals.
 
@@ -636,9 +640,9 @@ refuse at `no-test-command`.
 
 **Only Silkworm lands.** In every ready project (test command *and* auto-merge),
 the bot installs two git hooks into the repo's shared hooks directory at startup
-and whenever the project becomes ready (`git_guard.py`). An implementor task's
-turn runs with `SILKWORM_TASK_ROLE=implementor` and `SILKWORM_TASK_ID` set, and
-under that role git refuses every push (`pre-push`) and any ref update except
+and whenever the project becomes ready (`git_guard.py`). An implementor or
+researcher task's turn runs with `SILKWORM_TASK_ROLE` set to its role and
+`SILKWORM_TASK_ID` set, and under either role git refuses every push (`pre-push`) and any ref update except
 the task's own `silkworm/<task id>` branch, `HEAD`, remote-tracking refs and
 tags a fetch follows (`reference-transaction`). Nothing else carries the role,
 so your own git and the bot's landing, verification and releases are
