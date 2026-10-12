@@ -45,6 +45,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import worktrees
+
 log = logging.getLogger("silkworm.releases")
 
 CONFIG = Path(".silkworm") / "release.toml"
@@ -463,7 +465,7 @@ def preview(repo, name: str) -> list[dict]:
     return [_run(c, repo, env, secrets) for c in t["preview"]]
 
 
-def ready(repo, base: str) -> str:
+def ready(repo, base: str, generated=None) -> str:
     """Why the checkout cannot release right now, or "".
 
     Released from the checkout itself, on the base branch, clean and not
@@ -475,11 +477,16 @@ def ready(repo, base: str) -> str:
         return f"the checkout is on {branch or 'a detached HEAD'}, not {base}"
     # Untracked files too: a deploy reads the working tree, and a stray
     # migration in supabase/ would be applied to production by `db push`.
-    # (Ignored files -- build output -- are still ignored.)
-    dirty = _git(repo, "status", "--porcelain", "--untracked-files=normal").stdout.strip()
+    # (Ignored files -- build output -- are still ignored.) Less the project's
+    # generated files, as for a landing: Cadence's own builds rewrite both
+    # Info.plists in this checkout, so it would never be clean enough to
+    # release. Only their modification is let through; a new file, however
+    # named, still blocks.
+    dirty = worktrees.changes(repo, generated=generated, untracked="normal")
+    if dirty is None:
+        return "could not read the checkout's git status"
     if dirty:
-        return ("the checkout has uncommitted or untracked files: "
-                + ", ".join(line[3:] for line in dirty.splitlines()[:5]))
+        return "the checkout has uncommitted or untracked files: " + ", ".join(dirty[:5])
     f = _git(repo, "fetch", "--quiet", "origin", timeout=60)
     if f.returncode != 0:
         return f"could not fetch origin, so cannot tell what it has: {f.stderr.strip()[-200:]}"
@@ -496,7 +503,8 @@ def ready(repo, base: str) -> str:
     return ""
 
 
-def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
+def release(repo, name: str, level: str = "patch", base: str = "main",
+            generated=None) -> dict:
     """Release one target. Returns a record of every step; never half-tags.
 
     Order is the point. A command target deploys first and is tagged only if
@@ -508,7 +516,7 @@ def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
     if name not in targets:
         raise ReleaseError(f"no target {name!r}")
     t = targets[name]
-    why = ready(repo, base)
+    why = ready(repo, base, generated)
     if why:
         raise ReleaseError(why)
     commits = pending(repo, t)
@@ -532,7 +540,10 @@ def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
     if t["version"]:
         write_version(repo, t, version)
         _git(repo, "add", t["version"]["file"])
-        c = _git(repo, "commit", "-q", "-m", f"Release {name} {fmt(version)}")
+        # Only the version file: a generated file may sit staged in this
+        # checkout, injected keys and all, and must never ride along.
+        c = _git(repo, "commit", "-q", "--only", "-m", f"Release {name} {fmt(version)}",
+                 "--", t["version"]["file"])
         if c.returncode != 0:
             # From HEAD: the index already holds the bump, so restoring from it
             # would leave the checkout dirty and refuse every later release.
@@ -557,7 +568,9 @@ def release(repo, name: str, level: str = "patch", base: str = "main") -> dict:
             # nothing to release.
             _git(repo, "tag", "-d", tag)
             if t["version"]:
-                _git(repo, "reset", "--hard", "-q", "HEAD~1")
+                # --keep, not --hard: it undoes the bump but leaves the
+                # generated files the person's builds rewrote as they were.
+                _git(repo, "reset", "--keep", "-q", "HEAD~1")
             record["error"] = "origin refused the push; nothing was released, and the retry is clean"
         else:
             # The deploy did happen, so the local tag is true -- it is only

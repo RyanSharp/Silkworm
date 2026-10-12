@@ -10834,6 +10834,65 @@ version = {{ file = "ios/project.yml", key = "CFBundleShortVersionString" }}
     check("an explicit version cannot apply to every target at once", bool(steps_err))
 
 
+def test_releases_look_past_generated_files():
+    import releases as R
+    print("\nreleases: a base checkout holding only its generated files can still release")
+    # Review of tsk_26cb94d8a6: Cadence's builds rewrite both Info.plists in
+    # the base checkout, so `ready` refused every Cadence release exactly as
+    # landings had refused before worktrees.changes learned about them.
+    root = Path(tempfile.mkdtemp())
+    origin, repo = root / "origin.git", root / "work"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], capture_output=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t",
+                                   "-c", "user.name=t", *a], capture_output=True, text=True)
+    def commit(path, text, msg):
+        p = repo / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(text)
+        g("add", path); g("commit", "-q", "-m", msg)
+    commit(".silkworm/release.toml", '''
+[targets.ios]
+paths = ["ios/"]
+ship = "tag"
+version = { file = "ios/project.yml", key = "CFBundleShortVersionString" }
+''', "config")
+    commit("ios/project.yml", 'CFBundleShortVersionString: "1.0.0"\n', "ios")
+    commit("ios/Cadence/Info.plist", "<plist/>\n", "plist")
+    commit("ios/a.swift", "x\n", "code")
+    g("push", "-q", "origin", "main")
+    gen = ["ios/Cadence/Info.plist"]
+    plist = repo / "ios/Cadence/Info.plist"
+    injected = "<plist>SUPABASE_KEY=sb_secret_local</plist>\n"
+    plist.write_text(injected)
+    g("add", "ios/Cadence/Info.plist")        # staged, the worst case
+
+    check("without the generated list the plist still blocks",
+          "Info.plist" in R.ready(repo, "main", generated=[]))
+    check("with it the checkout is ready", R.ready(repo, "main", generated=gen) == "",
+          R.ready(repo, "main", generated=gen))
+    (repo / "ios/new.swift").write_text("y\n")
+    check("an untracked file still blocks", "new.swift" in R.ready(repo, "main", generated=gen))
+    (repo / "ios/new.swift").unlink()
+
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n"); hook.chmod(0o755)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    r = R.release(repo, "ios", generated=gen)
+    check("a refused push is undone", not r["released"]
+          and g("rev-parse", "HEAD").stdout.strip() == head, r.get("error"))
+    check("and the undo leaves the regenerated plist as the build wrote it",
+          plist.read_text() == injected)
+    hook.unlink()
+
+    r = R.release(repo, "ios", generated=gen)
+    check("the retry releases", r["released"], r.get("error"))
+    shipped = g("show", "--name-only", "--format=", "HEAD").stdout.split()
+    check("the bump commit holds only the version file", shipped == ["ios/project.yml"], shipped)
+    check("the injected keys never reached origin",
+          "sb_secret" not in subprocess.run(["git", "-C", str(origin), "show", "main:ios/Cadence/Info.plist"],
+                                            capture_output=True, text=True).stdout)
+    check("and the plist is still there for the next local build", plist.read_text() == injected)
+
+
 
 # --- the board is a screen, not a scroll ---------------------------------------
 # Slack opens a channel at the bottom of its newest message. The board spent
