@@ -12826,7 +12826,7 @@ def _lane_worker(st, execute_task, lane_filter=None, drain=None, busy=None):
     w = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
                   hold_unsupervised=lambda task: False,
                   lane_filter=lane_filter or _lanes(),
-                  busy_threads=busy or _busy_threads(),
+                  wake_skip=busy or _busy_threads(),
                   RUNNER_HOLD=R.Hold(), DRAIN=drain or D.Drain(), TASK_POLL_S=5,
                   log=logging.getLogger("test"),
                   time=types.SimpleNamespace(sleep=idle, time=time.time))
@@ -12973,6 +12973,35 @@ def test_a_wakeup_waits_for_its_own_thread_and_for_drain():
     w2 = _wake(st2, thread="C:7")
     check("nor while a queue task runs on its thread",
           st2.claim(**_lanes()("wake")) is None and st2.get(w2["id"])["state"] == T.QUEUED)
+
+    # Its checkout held -- a landing, or a turn on another thread in the same
+    # repo: execute_task would park the lane's one worker on repo_guard.
+    repo = Path(tempfile.mkdtemp())
+    (repo / ".git").mkdir()
+    st5 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    held = _wake(st5, thread="C:repo")
+    st5.update(held["id"], created=1.0, scope={"cwd": str(repo)})
+    free = _wake(st5, thread="C:elsewhere")
+    ns = bot_functions("wake_skip", "busy_threads", "_repo_lock",
+                       _thread_locks={}, _thread_locks_guard=th.Lock(), RUNNING={},
+                       _repo_locks={}, _repo_locks_guard=th.Lock(), task_store=st5,
+                       tasks=T, CLAUDE_CWD=Path(tempfile.mkdtemp()), Path=Path,
+                       threading=th)
+    check("a free checkout holds nothing back", ns["wake_skip"]() == set())
+    ns["_repo_lock"](repo).acquire()
+    check("a held checkout holds back its wake-up's thread",
+          ns["wake_skip"]() == {"C:repo"}, str(ns["wake_skip"]()))
+    ran5 = []
+    _lane_worker(st5, lambda t: (ran5.append(t["id"]),
+                                 st5.transition(t["id"], T.DONE, "ok")),
+                 busy=ns["wake_skip"])("wake")
+    check("so the lane runs the other thread's wake-up instead of waiting",
+          ran5 == [free["id"]] and st5.get(held["id"])["state"] == T.QUEUED, str(ran5))
+    ns["_repo_lock"](repo).release()
+    _lane_worker(st5, lambda t: (ran5.append(t["id"]),
+                                 st5.transition(t["id"], T.DONE, "ok")),
+                 busy=ns["wake_skip"])("wake")
+    check("and the held one once the checkout is free", ran5 == [free["id"], held["id"]])
 
     # Draining for a deploy: nothing new starts, in this lane as in the others.
     st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")

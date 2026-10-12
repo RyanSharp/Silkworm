@@ -5655,6 +5655,26 @@ def busy_threads() -> set:
     return held | set(RUNNING)
 
 
+def wake_skip() -> set:
+    """Threads whose wake-up the wake lane must leave for now.
+
+    Its own thread mid-turn (busy_threads), and also its checkout held: a
+    wake-up runs in the thread's own directory, not a worktree, so
+    execute_task takes repo_guard on it -- and a landing holds that for two
+    full suite runs. Claimed anyway, it would park the lane's one worker on
+    that lock while every other thread's wake-up waited behind it.
+    """
+    skip = busy_threads()
+    for r in task_store.by_state(tasks.QUEUED):
+        thread = r.get("thread")
+        if not tasks.is_wakeup(r) or not thread or thread in skip:
+            continue
+        lk = _repo_lock((r.get("scope") or {}).get("cwd") or CLAUDE_CWD)
+        if lk is not None and lk.locked():
+            skip.add(thread)
+    return skip
+
+
 def _task_worker(n: int, lane: str = "task") -> None:
     """Claim and run queued work, alongside the other workers.
 
@@ -5689,9 +5709,9 @@ def _task_worker(n: int, lane: str = "task") -> None:
             if draining:
                 time.sleep(min(draining, TASK_POLL_S))
                 continue
-            # The wake lane waits for its own thread only: one mid-turn is
-            # skipped, not claimed and then waited on.
-            busy = {"skip_threads": busy_threads()} if lane == "wake" else {}
+            # The wake lane waits for its own thread only: one mid-turn, or
+            # whose checkout is held, is skipped, not claimed and waited on.
+            busy = {"skip_threads": wake_skip()} if lane == "wake" else {}
             task = task_store.claim(**claim_filter, **busy)
             if task and hold_unsupervised(task):
                 continue
