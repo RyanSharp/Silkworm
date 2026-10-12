@@ -2835,9 +2835,13 @@ def test_scoping():
               and isinstance(n.func, ast.Attribute) and n.func.attr == "limit_for"]
     check("the budget reported back is the one enforced",
           len(limits) == 1
-          and [a.id for a in limits[0].args if isinstance(a, ast.Name)] == ["propose"]
+          and [a.id for a in limits[0].args if isinstance(a, ast.Name)]
+          == ["propose", "from_research"]
           and "MAX_PER_TURN" not in h,
           "a proposal run told '9 more allowed' would go on filing")
+    check("and the research budget is the one validated for a research run",
+          isinstance(kw.get("research"), ast.Name) and kw["research"].id == "from_research",
+          "a research run told four but refused at two")
 
     # Where a filed task lands is decided by who filed it, not by a flag the
     # filer chose. The ideator's allowlist is `Bash({bin} task:*)` -- a prefix,
@@ -18235,7 +18239,7 @@ def _research_parked(st, project="alpha", thread="C1:1.0", findings=_FINDINGS):
 
 
 def test_research_next_steps_are_proposed_children():
-    import research, tasks as T, scoping as S
+    import research, roles, tasks as T, scoping as S
     print("\na research run's next steps are proposals under it, capped and deduped")
     file_task, filed_this_turn, begin_turn, ts, _made = _file_task_impl()
     key = "C5:5.0"
@@ -18244,7 +18248,7 @@ def test_research_next_steps_are_proposed_children():
     ts.transition(rt["id"], T.RUNNING, "claimed")
     rid = rt["id"]
     was = os.environ.get("MAX_OPEN_PROPOSALS")
-    os.environ["MAX_OPEN_PROPOSALS"] = "3"
+    os.environ["MAX_OPEN_PROPOSALS"] = "6"
     try:
         r = file_task({"key": key, "goal": "Add a TTL to the deploy cache entries in cache.py",
                        "caller_role": "researcher", "caller_task": rid,
@@ -18261,6 +18265,8 @@ def test_research_next_steps_are_proposed_children():
               str({k: kid.get(k) for k in ("parent", "root", "source", "source_ref")}))
         check("in the research task's project, not the one asked for",
               kid.get("project") == "alpha", kid.get("project"))
+        check("with the research budget left, not the nightly one",
+              r.get("remaining") == S.MAX_RESEARCH_STEPS - 1, str(r))
         # A researcher with no task id in its environment: the one running here.
         r2 = file_task({"key": key, "goal": "Invalidate the CDN on every deploy of the site",
                         "caller_role": "researcher"})
@@ -18268,13 +18274,26 @@ def test_research_next_steps_are_proposed_children():
         check("a researcher's filing without its task id is still a child of the one running",
               r2.get("ok") and kid2.get("state") == T.PROPOSED and kid2.get("parent") == rid,
               str(r2))
+        # The prompt asks for 2-4 next steps; under the nightly pass's budget
+        # of two, steps three and four were always refused.
         r3 = file_task({"key": key, "goal": "Write a runbook for clearing stale caches by hand",
                         "caller_role": "researcher", "caller_task": rid})
-        check("the per-pass proposal budget applies to it",
-              not r3.get("ok") and "limit for one pass" in r3.get("error", ""), str(r3))
+        r3b = file_task({"key": key, "goal": "Alert when the build manifest hash changes unexpectedly",
+                         "caller_role": "researcher", "caller_task": rid})
+        check("a research run may file its third and fourth next steps",
+              r3.get("ok") and r3b.get("ok") and r3b.get("remaining") == 0,
+              str([r3, r3b]))
+        check("the research budget is wider than the nightly pass's",
+              S.MAX_RESEARCH_STEPS == 4 > S.MAX_PROPOSALS
+              and S.limit_for(True, research=True) == S.MAX_RESEARCH_STEPS)
+        r3c = file_task({"key": key, "goal": "Document the deploy ordering for cache warmers",
+                         "caller_role": "researcher", "caller_task": rid})
+        check("but a fifth is refused by the per-run budget",
+              not r3c.get("ok") and "limit for one research run" in r3c.get("error", ""),
+              str(r3c))
         held = ts.get(rid).get("next_steps_held") or []
         check("and what it refused is kept on the research task, with why",
-              len(held) == 1 and "runbook" in held[0]["goal"]
+              len(held) == 1 and "deploy ordering" in held[0]["goal"]
               and "limit" in held[0]["why"], str(held))
         begin_turn(key)
         r4 = file_task({"key": key, "goal": "Add a TTL to the deploy cache entries in cache.py",
@@ -18283,8 +18302,10 @@ def test_research_next_steps_are_proposed_children():
               not r4.get("ok") and r4.get("duplicate"), str(r4))
         check("and kept as not filed too",
               len(ts.get(rid).get("next_steps_held") or []) == 2)
-        # The standing cap: three open proposals in alpha now.
+        # The standing cap: six open proposals in alpha now.
         ts.create("Something else entirely about logging levels", project="alpha",
+                  state=T.PROPOSED)
+        ts.create("Rotate the metrics database credentials yearly", project="alpha",
                   state=T.PROPOSED)
         r5 = file_task({"key": key, "goal": "Measure cache hit rate before and after deploys",
                         "caller_role": "researcher", "caller_task": rid})
@@ -18292,7 +18313,7 @@ def test_research_next_steps_are_proposed_children():
               not r5.get("ok") and str(S.max_open_proposals()) in r5.get("error", "")
               and "already waiting" in r5.get("error", ""), str(r5))
         check("so nothing was filed past the cap",
-              S.open_proposals(ts.by_project("alpha")) == 3)
+              S.open_proposals(ts.by_project("alpha")) == 6)
         check("and the cap's refusal is kept on the research task",
               "already waiting" in (ts.get(rid)["next_steps_held"][-1]["why"]))
     finally:
@@ -18315,7 +18336,10 @@ def test_research_next_steps_are_proposed_children():
           and not ts.get(other["id"]).get("parent"), str(other))
     kids = research.children(rid, ts.all().values())
     check("the children are listed under the research task",
-          [k["id"] for k in kids] == [r["id"], r2["id"]], str(kids))
+          [k["id"] for k in kids] == [r["id"], r2["id"], r3["id"], r3b["id"]], str(kids))
+    check("the researcher's prompt asks for no more next steps than one run may file",
+          "2-%d concrete" % S.MAX_RESEARCH_STEPS in roles.RESEARCHER_SYSTEM
+          and "at most four" in roles.RESEARCHER_SYSTEM)
 
 
 def test_research_children_show_on_the_board():

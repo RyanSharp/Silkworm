@@ -136,7 +136,7 @@ RESEARCHER_SYSTEM = (
     "    {bin} task \"<the standalone goal>\"\n"
     "It is filed under this research task and its project, and waits for the "
     "user -- it never runs on its own. File the most valuable first: one run "
-    "may file only a few (the same per-pass budget as nightly proposals), the "
+    "may file at most four, the "
     "project may already hold as many open proposals as it is allowed, or one "
     "may duplicate work already on the board, and any of those refuses it. "
     "Do not retry a refused one. In "

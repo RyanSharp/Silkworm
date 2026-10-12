@@ -32,6 +32,14 @@ MAX_PER_TURN = 10
 #: thing the whole gate protects -- a decision per proposal.
 MAX_PROPOSALS = 2
 
+#: One research run's next steps. Not MAX_PROPOSALS: that budget rations an
+#: unattended pass that went looking for work, where this is the tail of a
+#: question you asked, and the researcher is told to suggest 2-4 -- so under the
+#: nightly budget steps three and four were always refused. Still proposals,
+#: still through the project's open-proposal cap and dedup; this bounds only
+#: how many one run may suggest.
+MAX_RESEARCH_STEPS = 4
+
 
 def _env_int(name: str, default: int) -> int:
     """An override from the environment, or the default if it is not usable.
@@ -103,13 +111,17 @@ MAX_TITLE_CHARS = 120
 MAX_LISTED = 40
 
 
-def limit_for(propose: bool = False) -> int:
+def limit_for(propose: bool = False, research: bool = False) -> int:
     """How many tasks one turn may file, given what it is filing.
 
     A proposal costs you an accept or a dismiss whether or not it was worth
     making, so an unattended pass gets the smaller budget; work you scoped in
-    conversation is already agreed and gets the full one.
+    conversation is already agreed and gets the full one. A research run's
+    next steps are proposals with a budget of their own: they answer a
+    question you asked rather than one nobody did.
     """
+    if research:
+        return MAX_RESEARCH_STEPS
     return MAX_PROPOSALS if propose else MAX_PER_TURN
 
 
@@ -143,7 +155,7 @@ def backlog_refusal(slug: str, open_now: int) -> str:
 
 
 def validate(goal: str, filed_already: int = 0, propose: bool = False,
-             open_now: int = 0, slug: str = "") -> str:
+             open_now: int = 0, slug: str = "", research: bool = False) -> str:
     """Returns an error message, or '' if this task may be filed.
 
     `open_now` is how many proposals the project already has untriaged, which
@@ -159,8 +171,11 @@ def validate(goal: str, filed_already: int = 0, propose: bool = False,
         return f"that goal is over {MAX_GOAL_CHARS} characters; split it"
     if propose and backlog_full(open_now):
         return backlog_refusal(slug, open_now)
-    limit = limit_for(propose)
+    limit = limit_for(propose, research)
     if filed_already >= limit:
+        if research:
+            return (f"{limit} next steps is the limit for one research run — "
+                    "file the ones most worth doing, not every one you found")
         if propose:
             return (f"{limit} proposals is the limit for one pass — file the "
                     "ones most worth doing, not every one you found")

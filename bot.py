@@ -3068,7 +3068,7 @@ def handle_file_task(payload: dict) -> dict:
     open_now = (scoping.open_proposals(task_store.by_project(slug))
                 if propose and slug else 0)
     err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose,
-                           open_now=open_now, slug=slug)
+                           open_now=open_now, slug=slug, research=from_research)
     if err:
         held(err)
         return {"ok": False, "error": err}
@@ -3128,7 +3128,7 @@ def handle_file_task(payload: dict) -> dict:
              f" next step of {parent['id']}" if parent else "")
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
-            "remaining": scoping.limit_for(propose) - _filed_this_turn[key]}
+            "remaining": scoping.limit_for(propose, from_research) - _filed_this_turn[key]}
 
 
 def handle_hide(payload: dict) -> dict:
