@@ -824,6 +824,67 @@ silkworm watching
 Only scheduled wake-ups — a quota-blocked retry is the system waiting on
 itself, not a promise made to you.
 
+## Acting on the board from the command line
+
+The dashboard's buttons are also commands, so a script or an agent can act on
+the board with commands it can be allowlisted for rather than raw `curl`:
+
+```sh
+silkworm accept <id>                       # queue a proposal
+silkworm dismiss <id> [--round R]          # cancel it
+silkworm land <id>                         # land a finished task's branch
+silkworm drop <id>                         # delete that branch, tagging its tip first
+silkworm edit <id> [--goal G] [--title T]  # change work that has not run yet
+silkworm rework <id> --notes N             # send back with your notes (Send back)
+silkworm close <id> [--round R]            # research: close the findings
+silkworm dig <id> --notes N [--round R]    # research: Dig deeper with a question
+silkworm status --json                     # the board as one JSON document
+```
+
+Each is one POST to the bot's `/tasks` route with the action the button sends,
+so it runs the same handler and the same `transition()`, and is refused for
+exactly the same reasons — the CLI checks nothing of its own beyond its
+arguments. `--round` is the research round a findings action was read for
+(`round` in `status --json`), so a stale command is refused like a stale click.
+`--by NAME` (default `cli`) is who the task's event log says acted.
+
+Exit codes are stable: **0** done (one line on stdout, e.g.
+`ok: accept tsk_… -> queued`), **1** refused (the bot's reason on stderr, e.g.
+`refused: land tsk_…: only finished work; this one is queued`), **2** usage
+error, **3** the bot could not be reached. An unknown id is a refusal
+(`unknown task`). One caveat on 1: a handler that raised answers with nothing,
+which is reported as `refused: … the bot gave no reason` -- check the task
+before retrying, since the change may have been made before it failed.
+
+These names are subcommands now, so a session titled with one of them needs
+`--dir` first: `silkworm --dir . land the parser fix`. `status --json` lists at
+most 200 queued, running or blocked tasks each (the oldest 200: the bot's `list`
+cap); needs-you items are not capped.
+
+`silkworm status --json` prints one line of JSON:
+
+```json
+{"ok": true, "errors": [],
+ "bot": {"online": true,
+         "revision": {"state": "current|stale|unknown", "running": "<sha>",
+                      "head": "<sha>", "behind": 0, "message": "…"},
+         "drain": {"draining": false, "seconds": 0, "reason": ""},
+         "runner_hold": {"seconds": 0, "reason": ""}},
+ "needs_you": {"<project>": {"<state>": [{"id": "…", "title": "…", "state": "…",
+                                          "role": "…", "round": "…", "step": "…"}]}},
+ "tasks": {"queued": [{"id", "title", "state", "project", "role"}],
+           "running": […], "blocked": […]},
+ "unlanded": {"<project>": [{"id", "title", "branch", "base", "commits",
+                             "stage": "<last landing's stage, or empty>",
+                             "detail": "<what it said>"}]},
+ "watching": [{"id", "in_s", "goal", "thread"}]}
+```
+
+Unfiled work is under the project `""`; `round` and `step` appear only on
+research findings and on tasks that left you a step. A part the bot could not
+answer is named in `errors` and makes `ok` false and the exit code 1 — "could
+not ask" never reads as "nothing there".
+
 ## Moving a thread to the terminal
 
 Every thread is a normal Claude Code session, so it works both ways: send

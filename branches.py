@@ -566,6 +566,10 @@ def survey(records, scope_for=None) -> list:
                 "remote": found["remote"],
                 "thread": rec.get("thread") or "",
                 "updated": rec.get("updated") or rec.get("created") or 0,
+                # What the last landing of it said, so a reader of this list
+                # (`silkworm status --json`) sees why it is still here.
+                "landing": {k: ((rec.get("result") or {}).get("landing") or {}).get(k) or ""
+                            for k in ("stage", "detail")},
             })
     return sorted(rows, key=lambda r: -r["updated"])
 

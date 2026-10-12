@@ -20042,6 +20042,317 @@ def test_dashboard_polls_without_redrawing():
           o["intervals"])
 
 
+# --- the action CLI: the dashboard's buttons, as commands an agent can run -------
+# An agent driving the board needs commands it can be allowlisted for, not raw
+# curl. Each must take the same handler and transition() as the button, so a
+# refusal is the same refusal -- and must exit non-zero on one, or a script
+# reads "refused" as done.
+
+def _action_cli_bot():
+    """A stand-in bot on a free localhost port, serving the real handlers.
+
+    /tasks is handle_tasks lifted from bot.py over a real TaskStore (with
+    decide_findings, land_or_drop and approve_task as shipped); /status is
+    handle_status lifted the same way. Only what talks to Slack, git or the
+    Keychain is faked.
+    """
+    import socket as _socket
+    import board, costs, drain, research, revision, retry, slacklinks
+    import tasks as T
+    from localserver import LocalServer
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    landings, survey_rows, broken = [], [], {}
+
+    def survey(recs, scope_for=None):
+        if broken.get("survey"):
+            raise RuntimeError("git went away")
+        return list(survey_rows)
+    branches_fake = types.SimpleNamespace(
+        survey=survey,
+        line=lambda rows: f"{len(rows)} branch(es)")
+    hold, dr = retry.Hold(), drain.Drain()
+    ns = bot_functions(
+        "handle_tasks", "approve_task", "decide_findings", "land_or_drop",
+        "_with_costs", "_spend", "handle_status",
+        tasks=T, task_store=st, research=research, holding=__import__("holding"),
+        task_state=_task_state_for(st), merge=__import__("merge"),
+        roles=__import__("roles"), board=board, costs=costs, slacklinks=slacklinks,
+        defer=__import__("defer"), scoping=__import__("scoping"), projects=__import__("projects"),
+        branches=branches_fake,
+        project_store=types.SimpleNamespace(scope_for=lambda slug: None,
+                                            get=lambda slug: None),
+        tell_thread=lambda *a: None, stop_task=lambda tid: False,
+        start_landing=lambda tid, **k: landings.append(tid) or True,
+        # /status: the real revision check, against a boot sha that is not HEAD.
+        store=tmp_store(), RUNNING={}, revision=revision, BASE_DIR=BASE,
+        REVISION={"sha": "0" * 40, "dirty": False},
+        slack=types.SimpleNamespace(status=lambda now: {"connected": True}),
+        credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
+        daemons=types.SimpleNamespace(status=lambda: {"count": 1, "alive": 1}),
+        RUNNER_HOLD=hold, DRAIN=dr, os=os)
+    with _socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = LocalServer(port)
+    server.route("/tasks", ns["handle_tasks"])
+    server.route("/status", ns["handle_status"])
+    server.start()
+    return types.SimpleNamespace(port=port, store=st, landings=landings,
+                                 survey_rows=survey_rows, drain=dr, broken=broken)
+
+
+def _run_cli(port, *argv):
+    env = {**os.environ, "SILKWORM_BOT_PORT": str(port)}
+    return subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), *argv],
+                          capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_action_cli():
+    print("\nthe action CLI takes the dashboard's paths, and a refusal exits non-zero")
+    import research, tasks as T
+    bot = _action_cli_bot()
+    st = bot.store
+
+    prop = st.create("Add an appearance preference to Settings", state=T.PROPOSED,
+                     role="implementor", project="alpha")["id"]
+    r = _run_cli(bot.port, "accept", prop)
+    check("accept queues a proposal and exits 0",
+          r.returncode == 0 and st.get(prop)["state"] == T.QUEUED, r.stdout + r.stderr)
+    check("with one line naming what it did",
+          r.stdout.strip() == f"ok: accept {prop} -> queued", repr(r.stdout))
+    check("the event log says it came from the CLI, through transition()",
+          st.get(prop)["events"][-1]["detail"] == "accept via cli",
+          str(st.get(prop)["events"][-1]))
+
+    busy = st.create("Rename the sync engine's retry helper", role="implementor")["id"]
+    st.transition(busy, T.RUNNING)
+    r = _run_cli(bot.port, "accept", busy)
+    check("accepting a running task is the bot's refusal, exit 1, on stderr",
+          r.returncode == 1 and T.RUNNING_BUSY in r.stderr and not r.stdout
+          and st.get(busy)["state"] == T.RUNNING, r.stdout + r.stderr)
+
+    r = _run_cli(bot.port, "edit", prop, "--title", "Appearance setting")
+    check("edit changes unrun work",
+          r.returncode == 0 and st.get(prop)["title"] == "Appearance setting", r.stderr)
+    r = _run_cli(bot.port, "edit", prop, "--goal", "short")
+    check("an edit the route refuses is refused here, in its words",
+          r.returncode == 1 and "at least" in r.stderr, r.stderr)
+    r = _run_cli(bot.port, "edit", prop)
+    check("an edit that changes nothing is a usage error", r.returncode == 2, r.stderr)
+
+    r = _run_cli(bot.port, "land", prop)
+    check("land on unfinished work is refused as the button is",
+          r.returncode == 1 and "only finished work" in r.stderr and not bot.landings,
+          r.stderr)
+    done = st.create("Fix the countdown rounding in DeadlineView", role="implementor",
+                     project="alpha")["id"]
+    st.transition(done, T.RUNNING); st.transition(done, T.DONE)
+    r = _run_cli(bot.port, "land", done)
+    check("land on finished work starts the same landing",
+          r.returncode == 0 and bot.landings == [done] and "landing under way" in r.stdout,
+          r.stdout + r.stderr)
+
+    review = st.create("Tidy the sync retry loop in SyncEngine", role="implementor")["id"]
+    st.transition(review, T.RUNNING); st.transition(review, T.AWAITING_APPROVAL)
+    r = _run_cli(bot.port, "rework", review)
+    check("rework without notes is a usage error, and sends nothing",
+          r.returncode == 2 and st.get(review)["state"] == T.AWAITING_APPROVAL, r.stderr)
+    r = _run_cli(bot.port, "rework", review, "--notes", "Keep the backoff capped at 60s")
+    check("rework sends it back with the notes, as the person's words",
+          r.returncode == 0 and st.get(review)["state"] == T.QUEUED
+          and "From cli:\nKeep the backoff capped at 60s" in st.get(review)["goal"],
+          r.stdout + r.stderr)
+    r = _run_cli(bot.port, "dismiss", review, "--by", "operator")
+    check("dismiss cancels, and --by names who in the log",
+          r.returncode == 0 and st.get(review)["state"] == T.CANCELLED
+          and "dismiss via operator" in st.get(review)["events"][-1]["detail"], r.stderr)
+
+    rt = _research_parked(st)
+    r = _run_cli(bot.port, "dig", rt)
+    check("dig with no question is the bot's refusal",
+          r.returncode == 1 and "say what to dig into" in r.stderr, r.stderr)
+    r = _run_cli(bot.port, "close", rt, "--round", "stale-round")
+    check("a stale --round is refused, as a stale click is",
+          r.returncode == 1 and st.get(rt)["state"] == T.NEEDS_INPUT, r.stderr)
+    rnd = research.round_of(st.get(rt))
+    r = _run_cli(bot.port, "dig", rt, "--notes", "and the CDN?", "--round", rnd)
+    check("dig sends it back with the question",
+          r.returncode == 0 and st.get(rt)["state"] == T.QUEUED, r.stdout + r.stderr)
+    r = _run_cli(bot.port, "close", prop)
+    check("close on a task with no findings is refused",
+          r.returncode == 1 and "only a research task" in r.stderr, r.stderr)
+
+    for cmd, extra in (("accept", ()), ("dismiss", ()), ("land", ()), ("drop", ()),
+                       ("edit", ("--title", "x")), ("rework", ("--notes", "x")),
+                       ("close", ()), ("dig", ("--notes", "x"))):
+        r = _run_cli(bot.port, cmd, "tsk_nosuchthing", *extra)
+        check(f"{cmd} on an unknown id exits 1 saying so",
+              r.returncode == 1 and "unknown task" in r.stderr, r.stderr)
+
+    r = _run_cli(bot.port, "accept")
+    check("a missing id is a usage error, not the subcommand read as the id",
+          r.returncode == 2 and "usage: silkworm accept <task id>" in r.stderr, r.stderr)
+    r = _run_cli(bot.port, "accept", prop, "--bogus", "1")
+    check("an unknown option is a usage error", r.returncode == 2, r.stderr)
+    r = _run_cli(bot.port, "rework", prop, "--notes", "  ")
+    check("blank notes are a usage error, not an empty send-back",
+          r.returncode == 2 and st.get(prop)["state"] == T.QUEUED
+          and "Sent back" not in st.get(prop)["goal"], r.stderr)
+    r = _run_cli(bot.port, "accept", prop, "--by", "")
+    check("a blank --by is a usage error", r.returncode == 2, r.stderr)
+
+    with __import__("socket").socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+    r = _run_cli(dead, "accept", prop)
+    check("an unreachable bot is exit 3, not a refusal",
+          r.returncode == 3 and "did not answer" in r.stderr, r.stderr)
+
+    # --- status --json ------------------------------------------------------------
+    failed = st.create("Make the widget refresh at midnight", role="implementor",
+                       project="beta")["id"]
+    st.transition(failed, T.RUNNING); st.transition(failed, T.FAILED, "boom")
+    running = st.create("Add the archive screen to Mondays", role="implementor",
+                        project="beta")["id"]
+    st.transition(running, T.RUNNING)
+    wake = st.create("check whether the deploy finished", source="defer",
+                     state=T.QUEUED, thread="C1:2.0")["id"]
+    st.transition(wake, T.RUNNING)
+    st.transition(wake, T.BLOCKED, "waiting")
+    st.update(wake, retry_at=time.time() + 600)
+    bot.survey_rows.append({"id": done, "title": "Fix the countdown", "project": "alpha",
+                            "branch": f"silkworm/{done}", "base": "main", "commits": 2,
+                            "landing": {"stage": "rebase", "detail": "conflict in a.py"}})
+    bot.drain.start(120, why="deploy")
+    r = _run_cli(bot.port, "status", "--json")
+    try:
+        s = json.loads(r.stdout)
+    except ValueError:
+        s = {}
+    check("status --json is one JSON document, exit 0",
+          r.returncode == 0 and s.get("ok") is True and len(r.stdout.strip().splitlines()) == 1,
+          r.stdout[:300] + r.stderr)
+    check("its top-level shape is the documented one",
+          set(s) == {"ok", "errors", "bot", "needs_you", "tasks", "unlanded", "watching"},
+          str(sorted(s)))
+    ny = s.get("needs_you") or {}
+    check("needs-you items are grouped by project, then state",
+          [x["id"] for x in ny.get("beta", {}).get("failed", [])] == [failed]
+          and rt not in json.dumps(ny), json.dumps(ny)[:300])
+    check("each item carries id, title and state",
+          set(ny["beta"]["failed"][0]) >= {"id", "title", "state"})
+    check("queued, running and blocked tasks are listed",
+          prop in [t["id"] for t in s["tasks"]["queued"]]
+          and running in [t["id"] for t in s["tasks"]["running"]]
+          and wake in [t["id"] for t in s["tasks"]["blocked"]], json.dumps(s["tasks"])[:300])
+    ul = (s.get("unlanded") or {}).get("alpha") or [{}]
+    check("unlanded branches per project carry the last landing's stage and detail",
+          ul[0].get("id") == done and ul[0].get("stage") == "rebase"
+          and ul[0].get("detail") == "conflict in a.py" and ul[0].get("commits") == 2,
+          json.dumps(s.get("unlanded")))
+    rev = s["bot"]["revision"]
+    check("the running revision is set against the checkout's HEAD",
+          rev["state"] == "stale" and rev["running"] == "0" * 40
+          and rev["head"] == subprocess.run(["git", "-C", str(BASE), "rev-parse", "HEAD"],
+                                            capture_output=True, text=True).stdout.strip(),
+          json.dumps(rev))
+    check("drain state is reported",
+          s["bot"]["drain"].get("draining") is True
+          and s["bot"]["drain"].get("reason") == "deploy", json.dumps(s["bot"]["drain"]))
+    check("scheduled wake-ups are listed",
+          [w["id"] for w in s["watching"]] == [wake] and 0 < s["watching"][0]["in_s"] <= 600,
+          json.dumps(s["watching"]))
+
+    bot.broken["survey"] = True
+    r = _run_cli(bot.port, "status", "--json")
+    s = json.loads(r.stdout or "{}")
+    check("a part the bot could not answer is an error, ok false, exit 1 -- the rest kept",
+          r.returncode == 1 and s.get("ok") is False
+          and any(e.startswith("unlanded") for e in s.get("errors") or [])
+          and s.get("unlanded") == {} and s["bot"]["online"] is True
+          and wake in [w["id"] for w in s["watching"]], r.stdout[:400])
+    bot.broken.clear()
+
+    r = _run_cli(dead, "status", "--json")
+    s = json.loads(r.stdout or "{}")
+    check("status --json with no bot says so as JSON, exit 3",
+          r.returncode == 3 and s.get("ok") is False and s["bot"]["online"] is False, r.stdout)
+
+
+def _cli_status_summary(ask):
+    """status_summary lifted out of the CLI, over a stub `ask`."""
+    src = (BASE / "bin" / "silkworm").read_text()
+    names = {"status_summary", "_row", "BotUnreachable"}
+    nodes = [n for n in ast.parse(src).body
+             if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
+    ns: dict = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<cli>", "exec"), ns)
+    return ns["status_summary"](ask(ns["BotUnreachable"])), ns
+
+
+def test_status_json_keeps_what_it_got():
+    print("\nstatus --json: one slow part is that part unasked, not the bot offline")
+
+    def ask(unreachable):
+        def call(path, payload, timeout=30):
+            if path == "/status":
+                return {"online": True, "revision": {"state": "current"}, "drain": {}}
+            if payload.get("action") == "unmerged":
+                raise unreachable("timed out")
+            if payload.get("action") == "watching":
+                return {"ok": True, "watching": [{"id": "tsk_w", "in_s": 5}]}
+            return {"ok": True, "tasks": [{"id": "tsk_a", "title": "A", "state": "failed",
+                                           "project": "p"}]}
+        return call
+    try:
+        out, _ = _cli_status_summary(ask)
+    except Exception as e:
+        check("one part timing out does not throw the summary away", False, repr(e))
+        return
+    check("the timed-out part is named in errors and ok is false",
+          out["ok"] is False and out["errors"] == ["unlanded: timed out"], str(out["errors"]))
+    check("and what did answer is kept, with the bot still online",
+          out["bot"]["online"] is True and out["watching"][0]["id"] == "tsk_w"
+          and out["needs_you"]["p"]["failed"][0]["id"] == "tsk_a")
+
+
+def test_survey_rows_carry_the_last_landing():
+    print("\nan unmerged branch's row says what its last landing did")
+    import branches as B
+    repo = Path(tempfile.mkdtemp())
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True,
+                                    text=True, check=True)
+    git("init", "-q", "-b", "main")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+    git("checkout", "-q", "-b", "silkworm/tsk_land1")
+    (repo / "a.txt").write_text("work\n")
+    git("add", "a.txt")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work")
+    git("checkout", "-q", "main")
+    rec = {"id": "tsk_land1", "title": "t", "state": "done", "project": "p",
+           "scope": {"cwd": str(repo), "branch": "main"},
+           "result": {"landing": {"stage": "rebase", "detail": "conflict in a.txt"}}}
+    rows = B.survey([rec])
+    check("the real survey finds the branch",
+          len(rows) == 1 and rows[0]["branch"] == "silkworm/tsk_land1", str(rows))
+    check("and carries the landing's stage and detail",
+          rows and rows[0].get("landing") == {"stage": "rebase", "detail": "conflict in a.txt"},
+          str(rows and rows[0].get("landing")))
+    rows = B.survey([{**rec, "result": {}}])
+    check("a branch never landed has empty ones, not missing",
+          rows and rows[0].get("landing") == {"stage": "", "detail": ""})
+
+
+def test_action_cli_documented():
+    print("\nthe action commands are in the usage text and the README")
+    cli = (BASE / "bin" / "silkworm").read_text()
+    readme = (BASE / "README.md").read_text()
+    for cmd in ("accept", "dismiss", "land", "drop", "edit", "rework", "close", "dig",
+                "status --json"):
+        check(f"usage text names silkworm {cmd}", f"silkworm {cmd} " in cli)
+        check(f"README names silkworm {cmd}", f"silkworm {cmd} " in readme)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

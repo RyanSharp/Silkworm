@@ -2,6 +2,8 @@
 """Silkworm CLI — start tracked sessions and manage the install.
 
     silkworm [title] [--dir PATH]   start a tracked Claude session here
+                                    (a title starting with a subcommand needs --dir .
+                                    first, e.g. silkworm --dir . land the parser fix)
     silkworm import                 adopt running claude sessions into Silkworm
     silkworm harvest                run the learning harvester now
     silkworm summarize [--force]    (re)generate thread context summaries
@@ -11,6 +13,15 @@
     silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
     silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
+    silkworm status --json          the board, branches, revision, drain and wake-ups, as JSON
+    silkworm accept <id>            queue a proposal               } the dashboard's
+    silkworm dismiss <id> [--round R]  cancel it                   } buttons, through
+    silkworm land <id>              land a finished task's branch  } the same handlers:
+    silkworm drop <id>              delete it, tagging its tip     } a refusal prints
+    silkworm edit <id> [--goal G] [--title T]  change unrun work   } the bot's reason
+    silkworm rework <id> --notes N  send back with your notes      } and exits 1
+    silkworm close <id> [--round R] close research findings        }
+    silkworm dig <id> --notes N [--round R]  research: dig deeper  }
     silkworm discard <branch>...    delete task branches, keeping their tips
     silkworm artifacts [--days N]   what artifacts/ retention would remove (removes nothing)
     silkworm learnings sync         commit/pull/push shared learnings via git
@@ -24,6 +35,11 @@
     silkworm logs                   tail the bot log
     silkworm doctor                 check prerequisites
     silkworm test                   run the regression tests
+
+The action commands (accept … dig) and `status --json` are a stable interface
+for scripts and agents: exit 0 on success with one line, 1 when the bot refuses
+(its reason on stderr), 2 on a usage error, 3 when the bot cannot be reached.
+Each accepts --by NAME (default "cli") for the task's event log.
 
 Runs on macOS today (launchd LaunchAgents); Linux (systemd user units) planned —
 the ServiceManager below is the only platform-specific part. Stdlib only.
@@ -56,7 +72,9 @@ def env_file_value(name: str):
 
 
 def bot_port() -> str:
-    return env_file_value("APPROVAL_PORT") or "8787"
+    # SILKWORM_BOT_PORT first, as SILKWORM_VIZ_PORT is for the visualizer: it
+    # is how the tests point the action commands at a stand-in bot.
+    return os.environ.get("SILKWORM_BOT_PORT") or env_file_value("APPROVAL_PORT") or "8787"
 
 
 def viz_port() -> str:
@@ -660,6 +678,221 @@ def do_defer(argv) -> None:
           f"({r['remaining']} wake-ups left in this chain)")
 
 
+# --- action commands: the dashboard's buttons, for scripts and agents ----------
+#
+# Each is one POST to the bot's /tasks route with the action the dashboard's
+# button sends, so it runs the same handler and the same transition(), and a
+# refusal is the bot's own words. Nothing here decides whether an action is
+# allowed: a check in the CLI would be a second rule that could drift from the
+# first, and the operator role is meant to see exactly what a click would.
+
+#: Exit codes. Stable: the operator role and any script branch on them.
+EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_UNREACHABLE = 0, 1, 2, 3
+
+
+class BotUnreachable(Exception):
+    """The bot could not be asked at all -- not the same as it saying no."""
+
+
+def bot_ask(path: str, payload: dict, timeout: float = 30) -> dict:
+    """bot_call for commands that must tell "no answer" from "refused".
+
+    bot_call turns every failure into {}, which suits a health check that
+    reads `.get("ok")`, but here an unreachable bot and a refusal need
+    different exit codes. Raises BotUnreachable; returns whatever the bot
+    said, {} included -- the server answers {} when a handler raised.
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{bot_port()}{path}", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except Exception as e:
+        raise BotUnreachable(f"the bot did not answer on :{bot_port()} ({e})") from e
+    try:
+        answer = json.loads(body) if body else {}
+    except ValueError as e:
+        raise BotUnreachable(f"the bot's answer on :{bot_port()} was not JSON") from e
+    return answer if isinstance(answer, dict) else {}
+
+
+#: command -> (the /tasks action, {flag: payload key}, flags it must have).
+#: The action names are the dashboard's (visualizer taskAction / handle_tasks).
+TASK_ACTIONS = {
+    "accept":  ("accept",  {}, ()),
+    "dismiss": ("dismiss", {"--round": "round"}, ()),
+    "land":    ("land",    {}, ()),
+    "drop":    ("drop",    {}, ()),
+    "edit":    ("edit",    {"--goal": "goal", "--title": "title"}, ()),
+    # The send-back with notes. The route would take none, and send the work
+    # back with only "another pass" -- a rerun of the same goal, which is
+    # never what a command typed on purpose means. So the CLI asks for them.
+    "rework":  ("rework",  {"--notes": "notes"}, ("--notes",)),
+    "close":   ("close",   {"--round": "round"}, ()),
+    # A blank question is the bot's to refuse, and it does.
+    "dig":     ("dig",     {"--notes": "notes", "--round": "round"}, ()),
+}
+
+
+def action_usage(cmd: str) -> str:
+    _, flags, required = TASK_ACTIONS[cmd]
+    opts = " ".join(f"{f} <{f[2:]}>" if f in required else f"[{f} <{f[2:]}>]"
+                    for f in flags)
+    return f"usage: silkworm {cmd} <task id> {opts} [--by <name>]".replace("  ", " ")
+
+
+def parse_action(cmd: str, argv: list) -> dict:
+    """The payload for `cmd`, from the arguments after the subcommand.
+
+    Raises ValueError with the usage line. argv excludes the subcommand
+    itself: `silkworm accept tsk_1` reads tsk_1 as the id, not "accept".
+    """
+    action, flags, required = TASK_ACTIONS[cmd]
+    payload, ids, given = {"action": action, "by": "cli"}, [], set()
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in flags or a == "--by":
+            if i + 1 >= len(argv):
+                raise ValueError(f"{a} needs a value\n{action_usage(cmd)}")
+            if not argv[i + 1].strip():
+                # A blank --notes would send work back with nothing new to go
+                # on, and a blank --by leaves "via " in the event log.
+                raise ValueError(f"{a} needs a value\n{action_usage(cmd)}")
+            payload["by" if a == "--by" else flags[a]] = argv[i + 1]
+            given.add(a)
+            i += 2
+        elif a.startswith("-"):
+            raise ValueError(f"unknown option {a}\n{action_usage(cmd)}")
+        else:
+            ids.append(a)
+            i += 1
+    if len(ids) != 1:
+        raise ValueError(action_usage(cmd))
+    missing = [f for f in required if f not in given]
+    if missing:
+        raise ValueError(f"{', '.join(missing)} is required\n{action_usage(cmd)}")
+    if cmd == "edit" and not given & {"--goal", "--title"}:
+        raise ValueError(f"say what to change\n{action_usage(cmd)}")
+    payload["id"] = ids[0]
+    return payload
+
+
+def do_task_action(cmd: str, argv: list, ask=None) -> int:
+    """Run one action command; print one line; return the exit code."""
+    ask = ask or bot_ask
+    try:
+        payload = parse_action(cmd, argv)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        r = ask("/tasks", payload, timeout=60)
+    except BotUnreachable as e:
+        print(f"not done: {e}", file=sys.stderr)
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        why = r.get("error") or ("the bot gave no reason (its handler may have "
+                                 "failed; see silkworm logs)")
+        print(f"refused: {cmd} {payload['id']}: {why}", file=sys.stderr)
+        return EXIT_REFUSED
+    task = r.get("task") or {}
+    line = f"ok: {cmd} {payload['id']}"
+    if task.get("state"):
+        line += f" -> {task['state']}"
+    extra = "; ".join(x for x in (r.get("note"), r.get("held")) if x)
+    print(line + (f" ({extra})" if extra else ""))
+    return EXIT_OK
+
+
+def _row(t: dict, *keys) -> dict:
+    return {k: t.get(k) for k in ("id", "title", "state") + keys}
+
+
+def status_summary(ask) -> dict:
+    """What `status --json` prints: the board as the operator needs to see it.
+
+    Each part is its own read-only question to the bot, as the dashboard asks
+    it. One that cannot be answered goes in `errors` and turns `ok` false:
+    "could not ask" must never read as "nothing there".
+    """
+    out = {"ok": True, "errors": [], "bot": {"online": False}, "needs_you": {},
+           "tasks": {}, "unlanded": {}, "watching": []}
+
+    def asked(what, payload, timeout=30):
+        # A part that times out after /status answered is that part unasked,
+        # not the bot offline: the branch survey asks git and can be slow.
+        try:
+            r = ask("/tasks", payload, timeout=timeout)
+        except BotUnreachable as e:
+            out["errors"].append(f"{what}: {e}")
+            return None
+        if not r.get("ok"):
+            out["errors"].append(f"{what}: {r.get('error') or 'no answer'}")
+            return None
+        return r
+
+    st = ask("/status", {}, timeout=10)      # BotUnreachable propagates
+    rev = st.get("revision") or {}
+    out["bot"] = {
+        "online": bool(st.get("online")),
+        # What the process booted from against what the checkout is at now.
+        "revision": {"state": rev.get("state") or "unknown",
+                     "running": rev.get("started") or "",
+                     "head": rev.get("head") or "",
+                     "behind": rev.get("behind") or 0,
+                     "message": rev.get("message") or ""},
+        "drain": {"draining": bool((st.get("drain") or {}).get("seconds")),
+                  **(st.get("drain") or {})},
+        "runner_hold": st.get("runner_hold") or {},
+    }
+    if not rev:
+        out["errors"].append("revision: this bot does not report one")
+
+    r = asked("needs you", {"action": "attention", "slim": True})
+    for t in (r or {}).get("tasks") or []:
+        row = _row(t, "role")
+        if t.get("round"):
+            row["round"] = t["round"]          # for close/dig/dismiss --round
+        step = (t.get("needs_user") or {}).get("action")
+        if step:
+            row["step"] = step
+        out["needs_you"].setdefault(t.get("project") or "", {}) \
+            .setdefault(t.get("state") or "", []).append(row)
+
+    for state in ("queued", "running", "blocked"):
+        r = asked(state, {"action": "list", "state": state, "slim": True})
+        out["tasks"][state] = [_row(t, "project", "role")
+                               for t in (r or {}).get("tasks") or []]
+
+    r = asked("unlanded", {"action": "unmerged"}, timeout=60)
+    for b in (r or {}).get("unmerged") or []:
+        landing = b.get("landing") or {}
+        out["unlanded"].setdefault(b.get("project") or "", []).append({
+            "id": b.get("id"), "title": b.get("title"), "branch": b.get("branch"),
+            "base": b.get("base"), "commits": b.get("commits"),
+            # The last landing's outcome, "" when none was ever tried.
+            "stage": landing.get("stage") or "", "detail": landing.get("detail") or ""})
+
+    r = asked("watching", {"action": "watching"})
+    out["watching"] = [{k: w.get(k) for k in ("id", "in_s", "goal", "thread")}
+                       for w in (r or {}).get("watching") or []]
+    out["ok"] = not out["errors"]
+    return out
+
+
+def do_status_json(ask=None) -> int:
+    ask = ask or bot_ask
+    try:
+        out = status_summary(ask)
+    except BotUnreachable as e:
+        print(json.dumps({"ok": False, "errors": [str(e)], "bot": {"online": False}}))
+        return EXIT_UNREACHABLE
+    print(json.dumps(out))
+    return EXIT_OK if out["ok"] else EXIT_REFUSED
+
+
 def do_setup() -> None:
     print(f"{WORM} setting up in {REPO}")
     if not check("claude CLI on PATH", shutil.which("claude") is not None,
@@ -1227,7 +1460,11 @@ def main() -> None:
     elif cmd == "deploy":
         sys.exit(do_deploy(args[1:]))   # args[0] is the subcommand itself
     elif cmd == "status":
+        if "--json" in args[1:]:          # args[0] is the subcommand itself
+            sys.exit(do_status_json())
         do_status()
+    elif cmd in TASK_ACTIONS:
+        sys.exit(do_task_action(cmd, args[1:]))   # args[0] is the subcommand
     elif cmd == "logs":
         os.execvp("tail", ["tail", "-n", "40", "-f", str(LOGS / "bot.log")])
     elif cmd in ("help", "-h", "--help"):
