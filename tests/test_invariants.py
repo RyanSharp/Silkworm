@@ -2557,6 +2557,8 @@ def _file_task_impl():
         store=types.SimpleNamespace(get=lambda k: {}),
         project_store=types.SimpleNamespace(
             ensure=lambda n, **kw: (made.append(n), {"slug": n})[1],
+            # What the real store answers when no project was renamed.
+            slug_for=lambda n: __import__("projects").slugify(n),
             home=lambda n, create=False: made.append(n),
             scope_for=lambda n: None),
     )
@@ -8919,6 +8921,8 @@ def _dashboard_create_impl():
         projects=__import__("projects"),
         project_store=types.SimpleNamespace(
             ensure=lambda n, **kw: (made.append(n), {"slug": n})[1],
+            # What the real store answers when no project was renamed.
+            slug_for=lambda n: __import__("projects").slugify(n),
             home=lambda n, create=False: made.append(n),
             get=lambda n: None,
             scope_for=lambda n: None, all=lambda: []),
