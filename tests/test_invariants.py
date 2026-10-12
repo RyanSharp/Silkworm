@@ -3975,7 +3975,7 @@ def test_defer():
     watch = bot[bot.index('if action == "watching"'):bot.index('if action == "ingest-email"')]
     check("the watching view exists", 'return {"ok": True, "watching"' in watch)
     check("it lists only scheduled wake-ups, not every blocked task",
-          'r.get("source") != "defer"' in watch,
+          'not tasks.is_wakeup(r)' in watch,
           "a quota retry is not a promise made to you")
     check("it says when each one fires", '"in_s"' in watch)
     check("and how much of the chain is left", '"remaining"' in watch)
@@ -9563,7 +9563,8 @@ def test_dead_background_threads_are_reported():
             credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
             slack=types.SimpleNamespace(status=lambda now: {}),
             revision=types.SimpleNamespace(state=lambda *a: {}),
-            BASE_DIR=BASE, REVISION={}, os=os, daemons=daemons)
+            BASE_DIR=BASE, REVISION={}, os=os, daemons=daemons,
+            task_store=types.SimpleNamespace(late_wakeups=lambda now: []))
         out = ns["handle_status"]({})
         check("/status names the dead thread",
               [d.get("name") for d in (out.get("daemons") or {}).get("dead", [])] == ["sweeper"],
@@ -12590,8 +12591,9 @@ def _review_roles():
     return eval(compile(ast.Expression(node.value), "bot.py", "eval"))
 
 
-def _lanes(review_workers=1):
+def _lanes(review_workers=1, wake_workers=1):
     return bot_functions("lane_filter", REVIEW_WORKERS=review_workers,
+                         WAKE_WORKERS=wake_workers,
                          REVIEW_ROLES=_review_roles())["lane_filter"]
 
 
@@ -12788,6 +12790,252 @@ def test_a_review_runs_while_an_implementor_is_running():
             pass
         check(f"the review lane claims nothing under a {name}",
               not ran and st4.get(r4["id"])["state"] == T.QUEUED)
+
+
+# --- wake-ups have their own lane --------------------------------------------------
+
+def _wake(st, thread="C:w", due_ago=5.0):
+    """A wake-up as handle_defer files it, already requeued by the scheduler."""
+    import tasks as T
+    w = st.create("check the deploy", title="check the deploy", state=T.BLOCKED,
+                  driver="queue", source=T.WAKE_SOURCE, thread=thread, isolate=False,
+                  retry_at=time.time() - due_ago, defers=1)
+    for tid in st.due_retries(time.time()):
+        if tid == w["id"]:
+            st.transition(tid, T.QUEUED, "retry time reached")
+    return st.get(w["id"])
+
+
+def _busy_threads(locks=None, running=None):
+    import threading as th
+    return bot_functions("busy_threads", _thread_locks=locks if locks is not None else {},
+                         _thread_locks_guard=th.Lock(),
+                         RUNNING=running if running is not None else {})["busy_threads"]
+
+
+def _lane_worker(st, execute_task, lane_filter=None, drain=None, busy=None):
+    """The real _task_worker loop on a real store, returning when it goes idle."""
+    import drain as D
+    import retry as R
+
+    class Idle(BaseException):
+        pass
+
+    def idle(_s):
+        raise Idle()
+    w = _bot_func("_task_worker", task_store=st, execute_task=execute_task,
+                  hold_unsupervised=lambda task: False,
+                  lane_filter=lane_filter or _lanes(),
+                  busy_threads=busy or _busy_threads(),
+                  RUNNER_HOLD=R.Hold(), DRAIN=drain or D.Drain(), TASK_POLL_S=5,
+                  log=logging.getLogger("test"),
+                  time=types.SimpleNamespace(sleep=idle, time=time.time))
+
+    def run(lane):
+        try:
+            w(0, lane)
+        except Idle:
+            pass
+    return run
+
+
+def test_wakeups_are_claimed_by_their_own_lane():
+    """A due wake-up sat over an hour behind implementors in the one task lane.
+
+    2026-10-12: tsk_f8c864330d was requeued on time at 14:17 and was still
+    queued an hour later, behind long implementor tasks and accepted
+    proposals. Wake-ups now have a lane; the task workers leave them alone,
+    and everything else -- quota retries included -- stays where it was.
+    """
+    import tasks as T
+    print("\nwake-ups have their own lane")
+    lane = _lanes()
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    impl = st.create("build it", role="implementor", driver="queue", thread="C:1")
+    st.update(impl["id"], created=1.0)                  # oldest, so a leaky filter takes it
+    wake = _wake(st, thread="C:w")
+    check("a due wake-up is queued, marked by its source",
+          wake["state"] == T.QUEUED and T.is_wakeup(wake))
+    check("the wake lane takes the wake-up",
+          (st.claim(**lane("wake")) or {}).get("id") == wake["id"])
+    check("and nothing else, though an implementor is queued",
+          st.claim(**lane("wake")) is None and st.get(impl["id"])["state"] == T.QUEUED)
+    check("the review lane does not take it either",
+          st.claim(**lane("review")) is None)
+
+    st2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    w2 = _wake(st2, thread="C:w2")
+    check("the task workers never take a wake-up while the lane exists",
+          st2.claim(**lane("task")) is None and st2.get(w2["id"])["state"] == T.QUEUED)
+    check("with WAKE_WORKERS=0 they do, or wake-ups would never run",
+          (st2.claim(**_lanes(1, 0)("task")) or {}).get("id") == w2["id"])
+
+    # A quota retry: blocked with a retry time, requeued by the same scheduler
+    # beat -- but filed by a conversation, not by defer. Its lane is unchanged.
+    st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    q = st3.create("do the thing", role="assistant", driver="queue", source="slack",
+                   thread="C:q", state=T.BLOCKED, retry_at=time.time() - 5)
+    for tid in st3.due_retries(time.time()):
+        st3.transition(tid, T.QUEUED, "retry time reached")
+    check("a quota retry is not a wake-up", not T.is_wakeup(st3.get(q["id"])))
+    check("the wake lane leaves a quota retry alone", st3.claim(**lane("wake")) is None)
+    check("and the task lane runs it, as before",
+          (st3.claim(**lane("task")) or {}).get("id") == q["id"])
+
+    # Identified by the marker, not by what it looks like.
+    st4 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    st4.create("check the deploy", title="check the deploy", role="assistant",
+               driver="queue", source="slack", thread="C:x")
+    check("a task merely titled like a wake-up is not one",
+          st4.claim(**lane("wake")) is None)
+
+    # Started like the other lanes, so /status sees it, and sized by .env.
+    tree = ast.parse((BASE / "bot.py").read_text())
+    starts = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
+              and isinstance(c.func, ast.Attribute) and c.func.attr == "start"
+              and isinstance(c.func.value, ast.Name) and c.func.value.id == "daemons"
+              and c.args and isinstance(c.args[0], ast.Name) and c.args[0].id == "_task_worker"]
+    lanes = {e.value for c in starts for k in c.keywords if k.arg == "args"
+             and isinstance(k.value, ast.Tuple) for e in k.value.elts
+             if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    check("the wake lane is started through daemons.start", "wake" in lanes, str(lanes))
+    check("its size is configurable", 'os.environ.get("WAKE_WORKERS"' in (BASE / "bot.py").read_text())
+
+
+def test_a_wakeup_runs_while_an_implementor_is_running():
+    """The incident itself, with the real worker loop: the one task worker is
+    busy with a long implementor, and the wake-up still runs on time."""
+    import tasks as T
+    import threading as th
+    print("\na wake-up runs while an implementor is running")
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    impl = st.create("build it", role="implementor", driver="queue", thread="C:1")
+    started, woke = th.Event(), th.Event()
+    seen = {}
+
+    def execute_task(task):
+        if task["role"] == "implementor":
+            started.set()
+            seen["wake-up ran first"] = woke.wait(10)    # hours, in life
+            st.transition(task["id"], T.DONE, "built")
+        else:
+            seen["implementor running"] = st.get(impl["id"])["state"] == T.RUNNING
+            st.transition(task["id"], T.DONE, "checked")
+            woke.set()
+
+    task_lane = th.Thread(target=_lane_worker(st, execute_task), args=("task",))
+    task_lane.start()
+    started.wait(10)
+    wake = _wake(st, thread="C:w")             # falls due mid-implementor
+    wake_lane = th.Thread(target=_lane_worker(st, execute_task), args=("wake",))
+    wake_lane.start()
+    [t.join(30) for t in (task_lane, wake_lane)]
+    check("the wake-up ran while the implementor was still running",
+          seen.get("implementor running") is True, str(seen))
+    check("and finished before it", seen.get("wake-up ran first") is True, str(seen))
+    check("both are done", st.get(impl["id"])["state"] == st.get(wake["id"])["state"] == T.DONE)
+
+
+def test_a_wakeup_waits_for_its_own_thread_and_for_drain():
+    """It waits on its thread, not on unrelated work -- and not through a drain."""
+    import drain as D
+    import tasks as T
+    import threading as th
+    print("\na wake-up waits for its own thread, and for a drain")
+
+    # Mid-turn by a live Slack turn: no queue task, only the thread's lock.
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    mine = _wake(st, thread="C:busy")
+    other = _wake(st, thread="C:free")
+    st.update(mine["id"], created=1.0)          # oldest: it would go first
+    lk = th.Lock()
+    lk.acquire()
+    busy = _busy_threads(locks={"C:busy": lk})
+    check("a thread holding its lock reads as busy", busy() == {"C:busy"})
+    ran = []
+    _lane_worker(st, lambda t: (ran.append(t["id"]),
+                                st.transition(t["id"], T.DONE, "ok")), busy=busy)("wake")
+    check("the wake-up on a thread mid-turn is not claimed",
+          st.get(mine["id"])["state"] == T.QUEUED and mine["id"] not in ran)
+    check("another thread's wake-up is not held behind it", ran == [other["id"]], str(ran))
+    lk.release()
+    _lane_worker(st, lambda t: (ran.append(t["id"]),
+                                st.transition(t["id"], T.DONE, "ok")), busy=busy)("wake")
+    check("once the turn ends it runs", ran == [other["id"], mine["id"]], str(ran))
+
+    # A turn the bot is driving (RUNNING) counts too, lock or not.
+    check("a thread in RUNNING reads as busy",
+          _busy_threads(running={"C:r": object()})() == {"C:r"})
+    # A queue task on the thread is already caught by claim() itself.
+    st2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    q = st2.create("earlier work", role="assistant", driver="queue", thread="C:7")
+    st2.transition(q["id"], T.RUNNING, "running")
+    w2 = _wake(st2, thread="C:7")
+    check("nor while a queue task runs on its thread",
+          st2.claim(**_lanes()("wake")) is None and st2.get(w2["id"])["state"] == T.QUEUED)
+
+    # Draining for a deploy: nothing new starts, in this lane as in the others.
+    st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    w3 = _wake(st3)
+    drn = D.Drain()
+    drn.start(600)
+    ran3 = []
+    _lane_worker(st3, lambda t: ran3.append(t), drain=drn)("wake")
+    check("the wake lane claims nothing while draining",
+          not ran3 and st3.get(w3["id"])["state"] == T.QUEUED)
+    drn.stop()
+    _lane_worker(st3, lambda t: ran3.append(t), drain=drn)("wake")
+    check("and claims it once the drain lifts", [t["id"] for t in ran3] == [w3["id"]])
+
+
+def test_a_late_wakeup_is_reported():
+    """Due and unclaimed past a couple of minutes is late, and says so."""
+    import tasks as T
+    print("\nlate wake-ups are reported")
+    now = time.time()
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    fresh = _wake(st, thread="C:1", due_ago=5)
+    stale = st.create("check it", driver="queue", source=T.WAKE_SOURCE, thread="C:2",
+                      state=T.BLOCKED, retry_at=now - 3600)
+    stuck = st.create("check again", driver="queue", source=T.WAKE_SOURCE, thread="C:3",
+                      state=T.BLOCKED, retry_at=now - 10)
+    st.transition(stuck["id"], T.QUEUED, "retry time reached")
+    rec = st.get(stuck["id"])
+    rec["events"][-1]["at"] = now - 600          # requeued ten minutes ago
+    st._data[stuck["id"]]["events"] = rec["events"]
+    future = st.create("later", driver="queue", source=T.WAKE_SOURCE, thread="C:4",
+                       state=T.BLOCKED, retry_at=now + 600)
+    quota = st.create("retry", driver="queue", source="slack", thread="C:5",
+                      state=T.BLOCKED, retry_at=now - 3600)
+    late = {w["id"]: w for w in st.late_wakeups(now)}
+    check("a wake-up queued ten minutes ago and unclaimed is late",
+          stuck["id"] in late and late[stuck["id"]]["late_s"] >= 590, str(late))
+    check("so is one still blocked an hour past its time", stale["id"] in late)
+    check("one due seconds ago is not, yet", fresh["id"] not in late)
+    check("nor one not due", future["id"] not in late)
+    check("nor a quota retry, however overdue", quota["id"] not in late)
+    st.transition(stuck["id"], T.RUNNING, "claimed")
+    check("nor one already claimed", stuck["id"] not in {w["id"] for w in st.late_wakeups(now)})
+    check("the grace is a couple of minutes", 60 <= T.LATE_WAKE_S <= 300)
+
+    # Surfaced where you look: /status carries them, and both commands print them.
+    st_late = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    gone = st_late.create("check it", driver="queue", source=T.WAKE_SOURCE, thread="C:2",
+                          state=T.BLOCKED, retry_at=time.time() - 3600)
+    out = bot_functions(
+        "handle_status", store=types.SimpleNamespace(all=lambda: {}), RUNNING={},
+        RUNNER_HOLD=__import__("retry").Hold(), DRAIN=__import__("drain").Drain(),
+        credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
+        slack=types.SimpleNamespace(status=lambda now: {}),
+        revision=types.SimpleNamespace(state=lambda *a: {}),
+        BASE_DIR=BASE, REVISION={}, os=os, daemons=__import__("daemons"),
+        task_store=st_late)["handle_status"]({})
+    check("/status reports late wake-ups",
+          [w["id"] for w in out.get("late_wakeups") or []] == [gone["id"]],
+          str(out.get("late_wakeups")))
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("silkworm status checks them", "scheduled wake-ups on time" in cli)
+    check("silkworm watching marks them", 'w.get("late")' in cli)
 
 
 def _turn_runner(st, sessions, locks, RUNNING, RUNNING_TASKS, run_turn, resolve_review):

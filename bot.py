@@ -123,6 +123,12 @@ TASK_WORKERS = int(os.environ.get("TASK_WORKERS", "1"))
 REVIEW_WORKERS = int(os.environ.get("REVIEW_WORKERS", "1"))
 #: The roles the review lane claims, and the task workers therefore leave.
 REVIEW_ROLES = frozenset({"reviewer"})
+# Scheduled wake-ups (silkworm defer) get a lane too. A wake-up is a short
+# check-in somebody is relying on to arrive on time; in the task lane it was
+# requeued at its due time and then waited out every implementor and accepted
+# proposal ahead of it -- over an hour, on 2026-10-12. It still waits on its
+# own thread, never on unrelated work. 0 hands them back to the task workers.
+WAKE_WORKERS = int(os.environ.get("WAKE_WORKERS", "1"))
 #: Absolute, because a turn's PATH is not ours to assume.
 SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
@@ -1867,7 +1873,10 @@ def handle_status(payload: dict) -> dict:
             "runner_hold": {"seconds": round(RUNNER_HOLD.remaining()),
                             "reason": RUNNER_HOLD.reason()[:160]},
             "drain": {"seconds": round(DRAIN.remaining()),
-                      "reason": DRAIN.reason()[:160]}}
+                      "reason": DRAIN.reason()[:160]},
+            # Due, unclaimed, past the grace: a promise to check back that is
+            # not being kept, and from the thread that looks like silence.
+            "late_wakeups": task_store.late_wakeups(time.time())}
 
 
 def handle_drain(payload: dict) -> dict:
@@ -2456,14 +2465,21 @@ def handle_tasks(payload: dict) -> dict:
         # Scheduled wake-ups specifically, not everything parked in `blocked`:
         # a quota-blocked retry is the system waiting on itself, while a watch
         # is a promise made to you, and only one of those is worth checking on.
+        # Due-but-unclaimed ones are listed too, with how long they have
+        # waited: a wake-up that is due and has not run is exactly the one
+        # worth seeing, and it had left this list the moment it was requeued.
         now = time.time()
         out = []
         for tid, r in task_store.all().items():
-            if r.get("state") != tasks.BLOCKED or r.get("source") != "defer":
+            if not tasks.is_wakeup(r) or r.get("state") not in (tasks.BLOCKED, tasks.QUEUED):
                 continue
+            overdue = tasks.wake_overdue(r, now)
+            in_s = (round((r.get("retry_at") or now) - now) if overdue is None
+                    else -round(overdue))
             out.append({"id": tid, "goal": r.get("goal", ""),
-                        "thread": r.get("thread", ""),
-                        "in_s": round((r.get("retry_at") or now) - now),
+                        "thread": r.get("thread", ""), "state": r.get("state"),
+                        "in_s": in_s,
+                        "late": overdue is not None and overdue > tasks.LATE_WAKE_S,
                         "depth": r.get("defers") or 0,
                         "remaining": defer.MAX_DEFERS - (r.get("defers") or 0)})
         return {"ok": True, "watching": sorted(out, key=lambda w: w["in_s"])}
@@ -5610,13 +5626,33 @@ def hold_unsupervised(task: dict) -> bool:
 def lane_filter(lane: str) -> dict:
     """What a worker in `lane` may claim, as keyword arguments to claim().
 
-    The review lane takes reviews and nothing else. The task workers take
-    everything else -- and reviews too when there is no review lane to take
-    them, or they would never run at all.
+    The review lane takes reviews and nothing else; the wake lane takes
+    scheduled wake-ups and nothing else. The task workers take everything
+    else -- and either of those too when its lane is switched off, or they
+    would never run at all. A quota retry is not a wake-up (its source is
+    whatever filed it), so it stays in the task lane.
     """
     if lane == "review":
         return {"only_roles": REVIEW_ROLES}
-    return {"except_roles": REVIEW_ROLES} if REVIEW_WORKERS > 0 else {}
+    if lane == "wake":
+        return {"wakeups": True}
+    out = {"except_roles": REVIEW_ROLES} if REVIEW_WORKERS > 0 else {}
+    if WAKE_WORKERS > 0:
+        out["wakeups"] = False
+    return out
+
+
+def busy_threads() -> set:
+    """Threads with a turn running now, queue task or not.
+
+    claim() already skips threads a queue task is running on, but a live Slack
+    turn is no queue task: it only holds the thread's lock. A wake-up claimed
+    under one would sit on that lock holding the wake lane, so every other
+    thread's wake-up waited on this one's conversation.
+    """
+    with _thread_locks_guard:
+        held = {k for k, lk in _thread_locks.items() if lk.locked()}
+    return held | set(RUNNING)
 
 
 def _task_worker(n: int, lane: str = "task") -> None:
@@ -5631,8 +5667,9 @@ def _task_worker(n: int, lane: str = "task") -> None:
     enqueued as its own task and the implementor parks in `blocked` -- so
     workers cannot all end up waiting on each other.
 
-    Two lanes run this: the task workers, and the review lane (see
-    REVIEW_WORKERS), which differ only in what they may claim. Both stop for
+    Three lanes run this: the task workers, the review lane (see
+    REVIEW_WORKERS) and the wake lane (WAKE_WORKERS), which differ only in
+    what they may claim. All stop for
     the same hold and the same drain -- a quota wall kills a review exactly as
     it kills anything else, and a restart must wait for a review too.
     """
@@ -5652,7 +5689,10 @@ def _task_worker(n: int, lane: str = "task") -> None:
             if draining:
                 time.sleep(min(draining, TASK_POLL_S))
                 continue
-            task = task_store.claim(**claim_filter)
+            # The wake lane waits for its own thread only: one mid-turn is
+            # skipped, not claimed and then waited on.
+            busy = {"skip_threads": busy_threads()} if lane == "wake" else {}
+            task = task_store.claim(**claim_filter, **busy)
             if task and hold_unsupervised(task):
                 continue
             if task:
@@ -6097,6 +6137,8 @@ if __name__ == "__main__":
         daemons.start(_task_worker, f"task{_i}", args=(_i,))
     for _i in range(max(0, REVIEW_WORKERS)):
         daemons.start(_task_worker, f"review{_i}", args=(_i, "review"))
+    for _i in range(max(0, WAKE_WORKERS)):
+        daemons.start(_task_worker, f"wake{_i}", args=(_i, "wake"))
     daemons.start(_email_watcher, "email", forever=bool(GMAIL_USER and GMAIL_APP_PASSWORD))
     daemons.start(_credential_watcher, "creds")
     daemons.start(_ideation_scheduler, "ideate")
@@ -6108,9 +6150,10 @@ if __name__ == "__main__":
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))
     # Logged because "is the new limit actually in effect" is otherwise only
     # answerable by reading .env and trusting that the service was restarted.
-    log.info("turn limits: cap=%s idle=%ds · task workers: %d · review workers: %d",
+    log.info("turn limits: cap=%s idle=%ds · task workers: %d · review workers: %d"
+             " · wake workers: %d",
              f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none",
-             CLAUDE_IDLE_TIMEOUT, TASK_WORKERS, REVIEW_WORKERS)
+             CLAUDE_IDLE_TIMEOUT, TASK_WORKERS, REVIEW_WORKERS, WAKE_WORKERS)
     # Same reason as the line above, one level down: a landed fix is not a
     # running fix, and this is the only place the answer is written down at the
     # moment it is still true. Everything else asks git, which by then is

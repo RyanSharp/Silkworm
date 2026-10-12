@@ -155,6 +155,44 @@ def claim_order(rec: dict) -> tuple:
     return (-(rec.get("priority") or 0), rec.get("created") or 0)
 
 
+#: The `source` handle_defer stamps on a scheduled wake-up when it creates it.
+#: What the wake lane claims by: not role (a wake-up is an ordinary assistant
+#: turn) and not title (the model writes that), but the field set at defer time.
+WAKE_SOURCE = "defer"
+
+#: How long a due wake-up may sit unclaimed before it is reported late. The
+#: scheduler requeues on a ten-second beat and the wake lane polls on the same
+#: one, so anything past this is waiting on something it should not be.
+LATE_WAKE_S = 120
+
+
+def is_wakeup(rec: dict) -> bool:
+    """Whether a task is a scheduled wake-up (see defer.py)."""
+    return (rec or {}).get("source") == WAKE_SOURCE
+
+
+def wake_overdue(rec: dict, now: float) -> float | None:
+    """Seconds a wake-up has been due without being claimed, or None.
+
+    Due is either still `blocked` past its retry time (the scheduler has not
+    requeued it yet) or `queued` (requeued, and no worker has taken it). For
+    the queued case the retry time is already spent -- leaving `blocked` clears
+    it -- so the moment it was queued is read from its events.
+    """
+    if not is_wakeup(rec):
+        return None
+    state = rec.get("state")
+    if state == BLOCKED:
+        at = rec.get("retry_at")
+        return max(0.0, now - at) if at and at <= now else None
+    if state == QUEUED:
+        at = next((e.get("at") for e in reversed(rec.get("events") or [])
+                   if e.get("kind") == QUEUED and e.get("at")), None)
+        at = at or rec.get("updated") or rec.get("created") or now
+        return max(0.0, now - at)
+    return None
+
+
 # --- record -------------------------------------------------------------------
 
 FIELDS: dict[str, tuple] = {
@@ -813,7 +851,8 @@ class TaskStore:
             log.info("task %s edited by %s: %s", tid, by or "?", ", ".join(what))
             return dict(rec)
 
-    def claim(self, *, only_roles=None, except_roles=None) -> dict | None:
+    def claim(self, *, only_roles=None, except_roles=None, wakeups=None,
+              skip_threads=()) -> dict | None:
         """Take the next queued task the runner is allowed to execute: the
         highest `priority` (see run_next), the oldest among equals.
 
@@ -828,6 +867,15 @@ class TaskStore:
         The filter is applied in the same select, under the same lock -- a
         lane picking a task and then checking its role would be a second step
         another lane could slip between.
+
+        `wakeups` splits it the same way for scheduled wake-ups (is_wakeup):
+        True claims only those, False never them, None either. A wake-up is a
+        short check-in somebody is waiting on, and in the task lane it waited
+        out every implementor and accepted proposal ahead of it.
+
+        `skip_threads` names threads with a turn running that this store
+        cannot see -- a live Slack turn holds the thread's lock but is no
+        queue task -- so a claim does not take work only to sit on that lock.
 
         Nor is a task claimed while another queue task is running on its thread
         or is its parent or child. Their turns share the thread's lock, so the
@@ -848,6 +896,10 @@ class TaskStore:
                 if only_roles is not None and role not in only_roles:
                     return False
                 if except_roles is not None and role in except_roles:
+                    return False
+                if wakeups is not None and is_wakeup(r) != wakeups:
+                    return False
+                if r.get("thread") and r.get("thread") in skip_threads:
                     return False
                 if r.get("thread") and r.get("thread") in threads:
                     return False
@@ -1055,9 +1107,21 @@ class TaskStore:
     def has_pending_wakeup(self, thread: str) -> bool:
         """Whether a scheduled wake-up is still waiting on this thread."""
         with self._lock:
-            return any(r.get("state") == BLOCKED and r.get("source") == "defer"
+            return any(r.get("state") == BLOCKED and is_wakeup(r)
                        and r.get("thread") == thread and r.get("retry_at")
                        for r in self._data.values())
+
+    def late_wakeups(self, now: float, after: float = LATE_WAKE_S) -> list[dict]:
+        """Wake-ups due for longer than `after` that nobody has claimed."""
+        with self._lock:
+            out = []
+            for tid, r in self._data.items():
+                late = wake_overdue(r, now)
+                if late is not None and late > after:
+                    out.append({"id": tid, "thread": r.get("thread", ""),
+                                "goal": r.get("goal", ""), "state": r.get("state"),
+                                "late_s": round(late)})
+        return sorted(out, key=lambda w: -w["late_s"])
 
     def counts(self) -> dict[str, int]:
         with self._lock:
