@@ -178,8 +178,8 @@ class ProjectStore:
         repo, branch) with nothing, and auto-merge would have run in an empty
         folder.
         """
-        slug = slugify(name)
         with self._lock:
+            slug = self._resolve(name)
             rec = self._data.get(slug)
             if rec is None:
                 rec = {f: default(f) for f in FIELDS}
@@ -194,6 +194,29 @@ class ProjectStore:
             rec["updated"] = time.time()
             self._save()
             return dict(rec)
+
+    def _resolve(self, name: str) -> str:
+        """The slug `name` means: a slug that exists, else an existing
+        project's title, else the slug a new project would get.
+
+        A rename changes the title and keeps the slug, so slugifying the new
+        title alone names a project that does not exist -- `!project Japan
+        2027` after renaming Asia Trip made a second, empty one. Called with
+        the lock held.
+        """
+        slug = slugify(name)
+        if slug in self._data:
+            return slug
+        want = " ".join((name or "").split()).casefold()
+        for s, rec in self._data.items():
+            if want and " ".join((rec.get("title") or "").split()).casefold() == want:
+                return s
+        return slug
+
+    def slug_for(self, name: str) -> str:
+        """`ensure`'s lookup without writing anything."""
+        with self._lock:
+            return self._resolve(name)
 
     def set_archived(self, slug: str, archived: bool) -> bool:
         with self._lock:
@@ -232,9 +255,16 @@ class ProjectStore:
             return None
         if create:
             path.mkdir(parents=True, exist_ok=True)
-            if not (rec.get("scope") or {}).get("cwd"):
-                self.ensure(rec["title"], scope={**(rec.get("scope") or {}),
-                                                 "cwd": str(path)})
+            # By slug, re-read under the lock. Through ensure(title) a
+            # renamed project's new title slugified to a project that did not
+            # exist, which was created holding the cwd -- and this one, still
+            # without one, made the same miss on every later call.
+            with self._lock:
+                live = self._data.get(slug)
+                if live is not None and not (live.get("scope") or {}).get("cwd"):
+                    live["scope"] = {**(live.get("scope") or {}), "cwd": str(path)}
+                    live["updated"] = time.time()
+                    self._save()
         return path
 
     def brief_path(self, slug: str, create: bool = False) -> Path | None:

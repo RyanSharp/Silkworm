@@ -2734,9 +2734,10 @@ def test_scoping():
           "behind it")
     check("the count reaches the slug without writing",
           any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-              and n.func.attr == "slugify" and n.lineno < gate
+              and n.func.attr == "slug_for" and n.lineno < gate
               for n in ast.walk(fn)),
-          "by_project is keyed by slug, and slugify is the pure way there")
+          "by_project is keyed by slug, and slug_for is the read-only way there "
+          "(slugify alone misses a renamed project)")
 
     bot = (BASE / "bot.py").read_text()
     h = bot[bot.index("def handle_file_task"):bot.index("server = LocalServer")]
@@ -15888,6 +15889,107 @@ def test_filing_a_thread_never_rewrites_a_projects_scope():
                     for k in c.keywords)]
     check("no ensure() call in bot.py replaces a scope with a literal one",
           not bare, f"lines {bare}")
+
+
+def test_a_renamed_project_keeps_one_record():
+    print("\nprojects: renaming a project never spawns a ghost duplicate")
+    import projects
+    root = Path(os.path.realpath(tempfile.mkdtemp()))
+    saved_root = projects.PROJECT_ROOT
+    projects.PROJECT_ROOT = root / "projects"
+    try:
+        ps = projects.ProjectStore(root / "projects.json")
+        ps.ensure("Asia Trip")
+        check("a repo-less project starts with no directory",
+              not ps.scope_for("asia-trip").get("cwd"))
+        # The dashboard's rename: slug kept, title changed.
+        ps.ensure("asia-trip", title="Japan 2027")
+        home = ps.home("asia-trip", create=True)
+        slugs = [p["slug"] for p in ps.all()]
+        check("making its home after a rename leaves exactly one project",
+              slugs == ["asia-trip"], str(slugs))
+        check("and that project holds the directory",
+              ps.scope_for("asia-trip").get("cwd") == str(home)
+              and home == projects.PROJECT_ROOT / "asia-trip", str(ps.get("asia-trip")))
+        ps.set_brief("asia-trip", "Two weeks in October.")
+        check("a brief written after the rename goes to the same project",
+              [p["slug"] for p in ps.all()] == ["asia-trip"]
+              and ps.brief_for("asia-trip") == "Two weeks in October.")
+        check("home() reads back the stored directory",
+              ps.home("asia-trip") == home)
+
+        # A second rename, then lookups by the new title.
+        ps.ensure("asia-trip", title="Japan 2028")
+        r = ps.ensure("Japan 2028")
+        check("ensure(<new title>) finds the renamed project",
+              r["slug"] == "asia-trip" and [p["slug"] for p in ps.all()] == ["asia-trip"],
+              str([p["slug"] for p in ps.all()]))
+        check("case and spacing do not matter",
+              ps.ensure("  japan   2028 ")["slug"] == "asia-trip"
+              and ps.slug_for("JAPAN 2028") == "asia-trip")
+        check("the title is not written over by the lookup",
+              ps.get("asia-trip")["title"] == "Japan 2028")
+        check("its slug still names it after the rename",
+              ps.slug_for("Asia Trip") == "asia-trip")
+        check("a genuinely new name still makes a new project",
+              ps.ensure("Peru")["slug"] == "peru" and ps.get("peru") is not None)
+        # A slug that exists wins over another project's title.
+        ps.ensure("peru", title="Chile")
+        ps.ensure("Chile Two")
+        check("an existing slug wins over a title match",
+              ps.slug_for("Chile Two") == "chile-two" and ps.slug_for("chile") == "peru")
+
+        # A title that is another project's slug: looked up by title, the
+        # directory went to the other project.
+        ps.ensure("Lima")
+        ps.ensure("Oslo")
+        ps.ensure("oslo", title="Lima")
+        oslo_home = ps.home("oslo", create=True)
+        check("a renamed project's home is recorded on it, not on the project its title names",
+              ps.scope_for("oslo").get("cwd") == str(oslo_home)
+              and not ps.scope_for("lima").get("cwd"),
+              f"oslo={ps.scope_for('oslo')} lima={ps.scope_for('lima')}")
+
+        # A stale copy of the record is not merged back over a newer write.
+        ps.ensure("Kyoto")
+        ps.ensure("kyoto", test_cmd="make test")
+        ps.home("kyoto", create=True)
+        check("recording the directory keeps fields written meanwhile",
+              ps.get("kyoto")["test_cmd"] == "make test"
+              and ps.scope_for("kyoto").get("cwd"))
+
+        # Creating a project under a renamed one's title is refused, and the
+        # renamed project's scope is untouched.
+        import workspaces
+        repo = root / "trader"
+        (repo / ".git").mkdir(parents=True)
+        ps.ensure("Trader", scope={"cwd": str(repo), "repo": "github.com/x/trader"})
+        ps.ensure("trader", title="Trading Bot")
+        before = ps.scope_for("trader")
+        try:
+            workspaces.create("Trading Bot", ps, root=root / "workspace",
+                              gh=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no gh")))
+            refused = ""
+        except workspaces.Refused as e:
+            refused = str(e)
+        check("a new project named after a renamed one's title is refused",
+              "`trader`" in refused and ps.scope_for("trader") == before
+              and not (root / "workspace" / "trading-bot").exists(), refused)
+
+        # The dashboard rename refuses a name another project already has.
+        ns = bot_functions("handle_projects", project_store=ps, projects=projects,
+                           scoping=__import__("scoping"))
+        r = ns["handle_projects"]({"action": "title", "slug": "kyoto", "title": "trading  BOT"})
+        check("renaming to another project's name is refused",
+              not r["ok"] and "trader" in r["error"] and ps.get("kyoto")["title"] == "Kyoto", r)
+        r = ns["handle_projects"]({"action": "title", "slug": "kyoto", "title": "Lima"})
+        check("so is renaming to another project's slug",
+              not r["ok"] and ps.get("kyoto")["title"] == "Kyoto", r)
+        r = ns["handle_projects"]({"action": "title", "slug": "kyoto", "title": "KYOTO"})
+        check("re-casing a project's own name is fine",
+              r["ok"] and ps.get("kyoto")["title"] == "KYOTO", r)
+    finally:
+        projects.PROJECT_ROOT = saved_root
 
 
 def test_projects_overview():

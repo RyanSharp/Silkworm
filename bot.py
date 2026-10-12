@@ -1562,7 +1562,7 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             say(text="Unfiled — new tasks from this thread won't belong to a project.",
                 thread_ts=thread_ts)
         elif (arg.lower() == "new" or arg.lower().startswith("new ")) \
-                and not project_store.get(projects.slugify(arg)):
+                and not project_store.get(project_store.slug_for(arg)):
             # A project already called "New Something" is still filed under
             # by name; only an unknown "new ..." is a request to make one.
             say(text=new_project_from_thread(key, arg[3:].strip()), thread_ts=thread_ts)
@@ -2760,6 +2760,11 @@ def handle_projects(payload: dict) -> dict:
             return {"ok": False, "error": "a project needs a name"}
         if len(title) > scoping.MAX_NAME_CHARS:
             return {"ok": False, "error": f"a name is at most {scoping.MAX_NAME_CHARS} characters"}
+        # A name is how `!project <name>` and filing find a project, so two
+        # cannot share one: the lookup would quietly pick either.
+        other = project_store.slug_for(title)
+        if other != slug and project_store.get(other):
+            return {"ok": False, "error": f"`{other}` is already called that"}
         # Renamed, not re-keyed: the slug is what every task is filed under.
         return {"ok": True, "project": project_store.ensure(slug, title=title)}
     if action == "generated":
@@ -3153,13 +3158,14 @@ def handle_file_task(payload: dict) -> dict:
 
     # Named, not resolved. `ensure` creates the project's record and its home
     # directory on disk, which has to stay below the checks so a refused
-    # filing leaves nothing behind; `slugify` is the same key `by_project`
-    # stores under, arrived at without writing anything.
+    # filing leaves nothing behind; `slug_for` is the same key `by_project`
+    # stores under, arrived at without writing anything -- and, unlike a bare
+    # slugify, it finds a renamed project by its new title.
     entry = store.get(key) or {}
     proj = (payload.get("project") or entry.get("project") or "").strip()
     if parent:
         proj = parent.get("project") or ""
-    slug = projects.slugify(proj) if proj else ""
+    slug = project_store.slug_for(proj) if proj else ""
 
     # Proposals are also bounded across passes, not just within one: the
     # per-turn count starts at zero every run, so without this a nightly pass

@@ -255,9 +255,13 @@ def create(name: str, project_store, *, path: str = "", purpose: str = "",
     if not name:
         raise Refused("a project needs a name")
     slug = projects.slugify(name)
-    if project_store.get(slug):
-        raise Refused(f"there is already a project `{slug}` — file this thread "
-                      f"under it with `!project {slug}`")
+    # By title too: registering goes through ensure(name), which finds a
+    # renamed project by its title -- and would hand it this new directory
+    # as its whole scope.
+    existing = project_store.slug_for(name)
+    if project_store.get(existing):
+        raise Refused(f"there is already a project `{existing}` — file this thread "
+                      f"under it with `!project {existing}`")
     named = bool(path)
     base = Path(root or ROOT)
     # A relative path is relative to the workspace, not to wherever the bot
