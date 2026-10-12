@@ -283,7 +283,7 @@ def _task_blocks(task: dict, now: float, base_url: str,
     blocks = [{"type": "section", "block_id": f"t:{tid}", "text": _text(body)},
               {"type": "context", "elements": [_text(" · ".join(meta))]}]
     # The value carries the state the button was drawn for; see seen_state().
-    stamp = f"{tid}|{task.get('state', '')}"
+    stamp = f"{tid}|{seen_of(task)}"
     buttons = [_button(*b[:2], stamp, style=b[2], confirm=b[3])
                for b in buttons_for(task)]
     url = thread_url(task.get("thread", ""), base_url)
@@ -326,6 +326,7 @@ def _task_line(task: dict, now: float, base_url: str, cost: str = "") -> dict:
     that every action now opens.
     """
     tid, state = task.get("id", ""), task.get("state", "")
+    seen = seen_of(task)
     meta = [STATE_ICON.get(state, ""), f"`{tid}`"]
     if task.get("project"):
         meta.append(esc(task["project"]))
@@ -338,12 +339,12 @@ def _task_line(task: dict, now: float, base_url: str, cost: str = "") -> dict:
     text = f"*{esc(clip(label(task), 90))}*\n{' · '.join(m for m in meta if m)}" + \
         (f" — _{line}_" if line else "")
     options = [{"text": {"type": "plain_text", "text": b[0].rstrip("…")[:75]},
-                "value": f"{b[1]}|{tid}|{state}"} for b in buttons_for(task)]
+                "value": f"{b[1]}|{tid}|{seen}"} for b in buttons_for(task)]
     url = thread_url(task.get("thread", ""), base_url)
     if url:
         options.append({"text": {"type": "plain_text", "text":
                                  "Discuss" if research.has_findings(task) else "Open thread"},
-                        "value": f"thread|{tid}|{state}", "url": url})
+                        "value": f"thread|{tid}|{seen}", "url": url})
     block = {"type": "section", "block_id": f"t:{tid}", "text": _text(text)}
     if options:
         block["accessory"] = {"type": "overflow", "action_id": "home_menu",
@@ -394,7 +395,7 @@ def confirm_modal(task: dict, action: str) -> dict:
     return {
         "type": "modal", "callback_id": CONFIRM_CALLBACK,
         "private_metadata": json.dumps({"action": action, "id": tid,
-                                        "seen": task.get("state", "")}),
+                                        "seen": seen_of(task)}),
         "title": {"type": "plain_text", "text": VERB.get(action, action)[:24]},
         "submit": {"type": "plain_text", "text": VERB.get(action, action)[:24]},
         "close": {"type": "plain_text", "text": "Back"},
@@ -646,6 +647,32 @@ def seen_state(value: str) -> tuple[str, str]:
     return tid, state
 
 
+def seen_of(task: dict) -> str:
+    """What a button records of the task it was drawn for: its state, and for
+    research waiting with findings, which round of them (`state@round`).
+
+    A Dig deeper parks research in needs_input again, so by state alone a
+    Close drawn before the dig would close the findings the dig produced,
+    unread. A value without the round (drawn before it was carried) is asked
+    only the state.
+    """
+    state = task.get("state", "") or ""
+    rnd = research.round_of(task)
+    return f"{state}@{rnd}" if rnd else state
+
+
+def seen_round(seen: str) -> str:
+    """The round in a seen_of() value, or ""."""
+    return (seen or "").partition("@")[2]
+
+
+def with_round(payload: dict, seen: str) -> dict:
+    """`payload` carrying the round its click saw, so the bot asks it again
+    under the store's lock -- the check here is before that lock."""
+    rnd = seen_round(seen)
+    return dict(payload, round=rnd) if rnd else payload
+
+
 def rework_modal(task: dict, answer: bool, dig: bool = False) -> dict:
     """The notes prompt for Send back / Answer / Dig deeper.
 
@@ -666,7 +693,7 @@ def rework_modal(task: dict, answer: bool, dig: bool = False) -> dict:
     return {
         "type": "modal", "callback_id": MODAL_CALLBACK,
         "private_metadata": json.dumps({"id": tid, "answer": answer, "dig": dig,
-                                        "seen": task.get("state", "")}),
+                                        "seen": seen_of(task)}),
         "title": {"type": "plain_text", "text": title},
         "submit": {"type": "plain_text", "text": "Send"},
         "close": {"type": "plain_text", "text": "Cancel"},
@@ -791,7 +818,8 @@ class Home:
         if self.moved_on(user, tid, seen):
             return self.publish(client, user)
         try:
-            r = self.call({"action": action, "id": tid, "by": f"slack:{user}"})
+            r = self.call(with_round({"action": action, "id": tid,
+                                      "by": f"slack:{user}"}, seen))
         except Exception as e:
             log.exception("home action %s on %s failed", action, tid)
             r = {"ok": False, "error": str(e)}
@@ -839,8 +867,8 @@ class Home:
             return self.publish(client, user)
         action = "dig" if meta.get("dig") else "rework"
         try:
-            r = self.call({"action": action, "id": tid, "notes": notes,
-                           "by": f"slack:{user}"})
+            r = self.call(with_round({"action": action, "id": tid, "notes": notes,
+                                      "by": f"slack:{user}"}, meta.get("seen", "")))
         except Exception as e:
             log.exception("home %s on %s failed", action, tid)
             r = {"ok": False, "error": str(e)}
@@ -998,7 +1026,8 @@ class Home:
         if self.moved_on(user, tid, meta.get("seen", "")):
             return self.publish(client, user)
         try:
-            r = self.call({"action": action, "id": tid, "by": f"slack:{user}"})
+            r = self.call(with_round({"action": action, "id": tid,
+                                      "by": f"slack:{user}"}, meta.get("seen", "")))
         except Exception as e:
             log.exception("board action %s on %s failed", action, tid)
             r = {"ok": False, "error": str(e)}
@@ -1006,13 +1035,22 @@ class Home:
         self.publish(client, user)
 
     def moved_on(self, user: str, tid: str, seen: str) -> bool:
-        """True, with a note to the user, if the task left `seen`."""
-        now = (self.store.get(tid) or {}).get("state")
-        if not seen or now == seen:
+        """True, with a note to the user, if the task left `seen` -- its state,
+        or for findings the round of them (seen_of)."""
+        if not seen:
             return False
-        self.note(user, f":arrows_counterclockwise: `{esc(tid)}` has moved on — it "
-                        f"is {esc(now or 'gone')} now, not {esc(seen)}. Nothing was done.")
-        return True
+        task = self.store.get(tid) or {}
+        now = task.get("state")
+        state, _, rnd = seen.partition("@")
+        if now != state:
+            self.note(user, f":arrows_counterclockwise: `{esc(tid)}` has moved on — it "
+                            f"is {esc(now or 'gone')} now, not {esc(state)}. Nothing was done.")
+            return True
+        if rnd and research.round_of(dict(task, id=tid)) != rnd:
+            self.note(user, f":arrows_counterclockwise: `{esc(tid)}` was dug into and has "
+                            f"new findings since you looked. Nothing was done — read them first.")
+            return True
+        return False
 
     @staticmethod
     def outcome(action: str, tid: str, r: dict) -> str:

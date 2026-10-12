@@ -326,6 +326,28 @@ def needs_user_detail(asks: dict) -> str:
 FINDINGS_DETAIL = "findings to review: Close, Dig deeper, or Discuss"
 
 
+#: A click on a wait in needs_input that has since been replaced by another
+#: (parked_round): findings a Dig deeper produced after you looked.
+STALE_ROUND = ("these are newer findings than the ones you were looking at "
+               "(it was dug into and parked again since); nothing was done -- "
+               "read them first")
+
+
+def parked_round(rec: dict | None) -> str:
+    """Which wait in `needs_input` this is: the time of its latest move there.
+
+    The state alone cannot tell one wait from the next. A Dig deeper sends
+    research back and it parks in needs_input again, so a Close drawn before
+    the dig still saw "needs_input" -- and closed the new findings unread.
+    Every move appends an event (transition), so the latest needs_input one is
+    there for as long as the task waits; "" if there is none to read.
+    """
+    for ev in reversed((rec or {}).get("events") or []):
+        if ev.get("kind") == NEEDS_INPUT:
+            return f"{float(ev.get('at') or 0):.6f}"
+    return ""
+
+
 def ending(rec: dict | None) -> tuple[str, str]:
     """(state, detail) for a task whose work completed: `done`, or
     `needs_input` if its last run said the rest is yours (`needs_user`, see
@@ -437,7 +459,8 @@ class TaskStore:
     def transition(self, tid: str, to_state: str, detail: str = "",
                    _release: bool = True, _seen: set | None = None,
                    _unblock: tuple = (), refuse_running: str = "",
-                   fields: dict | None = None, expect: str = "") -> dict:
+                   fields: dict | None = None, expect: str = "",
+                   expect_round: str = "") -> dict:
         """Move a task's state, refusing anything the lifecycle disallows.
 
         Ending a task also releases whatever was waiting on it. That happens
@@ -456,6 +479,9 @@ class TaskStore:
         refuses the move (InvalidTransition) unless the task is in that state
         when the lock is held -- for an action decided on what it was a moment
         ago, which may since have moved on to somewhere the move is also legal.
+        `expect_round` goes further for a task back where it was seen: refused
+        unless it is still the same wait (parked_round) -- a click on findings
+        drawn before a Dig deeper must not close the next round's.
         """
         if to_state not in STATES:
             raise ValueError(f"unknown state {to_state!r}")
@@ -469,6 +495,9 @@ class TaskStore:
             if expect and current != expect:
                 raise InvalidTransition(f"{tid}: {current} -> {to_state} "
                                         f"(only from {expect})")
+            if expect_round and parked_round(rec) != expect_round:
+                raise InvalidTransition(f"{tid}: {current} -> {to_state} "
+                                        f"(it has parked again since)")
             if current == to_state and not fields:
                 return dict(rec)                     # idempotent
             if not can(current, to_state):

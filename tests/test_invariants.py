@@ -17122,8 +17122,8 @@ def test_the_step_is_on_every_surface():
           and "yours to do" not in got["held"])
     check("a finished or failed task no longer shows it", got["done"] == got["failed"] == "")
     rs = js[js.index("async function releaseStep("):js.index("\n}\n", js.index("async function releaseStep("))]
-    check("the Release button confirms, then sends only the task id",
-          "confirm(" in rs and 'taskAction(id, "release")' in rs)
+    check("the Release button confirms, then sends only the task id (and its round)",
+          "confirm(" in rs and 'taskAction(id, "release", "", round)' in rs)
 
 
 def test_taking_the_step_from_the_board():
@@ -18487,8 +18487,9 @@ def test_findings_actions_on_the_slack_board():
           opts.get("thread", {}).get("text", {}).get("text") == "Discuss"
           and opts["thread"]["url"] == slacklinks.for_key("C1:1.0", "https://x.slack.com"),
           str(opts.get("thread")))
-    check("and every menu value carries the state it was drawn for",
-          all(o["value"].endswith(f"|{rid}|needs_input") for o in opts.values()))
+    check("and every menu value carries the state it was drawn for, and which findings",
+          all(o["value"].endswith(f"|{rid}|needs_input@{research.round_of(rec)}")
+              for o in opts.values()) and research.round_of(rec), str(opts))
     modal = home.rework_modal(rec, False, dig=True)
     check("the Dig deeper window requires a question",
           modal["blocks"][1]["optional"] is False
@@ -18545,18 +18546,18 @@ def test_findings_actions_on_the_dashboard():
 let answers = [], sent = [];
 function prompt() { return answers.shift(); }
 function threadLink(k) { return "fallback:" + k; }
-async function taskAction(id, action, notes) { sent.push([id, action, notes]); }
+async function taskAction(id, action, notes, round) { sent.push([id, action, notes, round]); }
 const R = JSON.parse(process.env.R);
 (async () => {
   const out = {buttons: taskButtons(R), plain: taskButtons(Object.assign({}, R, {role: "assistant", findings: false})),
                findings: findings(R)};
   answers = [null]; await digDeeper("t1"); out.cancelled = sent.length;
   answers = ["", "  ", null]; await digDeeper("t1"); out.blankThenCancel = sent.length;
-  answers = ["", "and the CDN?"]; await digDeeper("t1"); out.sent = sent;
+  answers = ["", "and the CDN?"]; await digDeeper("t1", "12.5"); out.sent = sent;
   process.stdout.write(JSON.stringify(out));
 })();""")
     rec = {"id": "t1", "role": "researcher", "state": "needs_input", "thread": "C1:1.0",
-           "findings": True,
+           "findings": True, "round": "12.5",
            "thread_link": "https://slack.com/archives/C1/p10?thread_ts=1.0&cid=C1",
            "research": {"children": [{"id": "tsk_kid", "state": "proposed", "title": "Add a TTL"}],
                         "held": [{"goal": "Write a runbook", "why": "limit reached"}],
@@ -18573,7 +18574,8 @@ const R = JSON.parse(process.env.R);
         return
     b = got["buttons"]
     check("Close, Dig deeper and Discuss are offered",
-          "closeFindings('t1')" in b and "digDeeper('t1')" in b and "Discuss" in b, b)
+          "closeFindings('t1','12.5')" in b and "digDeeper('t1','12.5')" in b
+          and "Discuss" in b, b)
     check("Discuss links the thread the server built with slacklinks",
           'href="https://slack.com/archives/C1/p10?thread_ts=1.0&amp;cid=C1"' in b, b)
     check("and Answer is not offered for research", "sendBack('t1',true)" not in b)
@@ -18582,13 +18584,196 @@ const R = JSON.parse(process.env.R);
     check("cancelling the question cancels the action", got["cancelled"] == 0)
     check("a blank question is asked again, and cancelling then still sends nothing",
           got["blankThenCancel"] == 0)
-    check("a question is sent as dig", got["sent"] == [["t1", "dig", "and the CDN?"]], str(got["sent"]))
+    check("a question is sent as dig, with the round its button was drawn for",
+          got["sent"] == [["t1", "dig", "and the CDN?", "12.5"]], str(got["sent"]))
     check("the row lists its next steps and the one not filed",
           "tsk_kid" in got["findings"] and "limit reached" in got["findings"], got["findings"])
     cf = js[js.index("async function closeFindings("):]
     cf = cf[:cf.index("\n}\n")]
-    check("Close asks for confirmation before acting",
-          "confirm(" in cf and cf.index("confirm(") < cf.index('taskAction(id, "close")'))
+    check("Close asks for confirmation before acting, and sends its round",
+          "confirm(" in cf and cf.index("confirm(") < cf.index('taskAction(id, "close", "", round)'))
+    ta = fn("taskAction", "async function ")
+    check("taskAction puts the round in the request",
+          "p.round = round" in ta and "taskCall(p)" in ta, ta[:300])
+
+
+def test_findings_clicks_tell_rounds_apart():
+    print("\na Close or Dig deeper drawn before a Dig deeper cannot act on the next round")
+    import home, research, tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    state = _task_state_for(st)
+    ns = bot_functions("handle_tasks", "decide_findings", "send_back", task_store=st,
+                       tasks=T, research=research, holding=__import__("holding"),
+                       task_state=state, merge=__import__("merge"),
+                       roles=__import__("roles"), tell_thread=lambda *a: None,
+                       stop_task=lambda tid: False, start_landing=lambda *a, **k: None)
+    route = ns["handle_tasks"]
+
+    def repark(tid):
+        st.transition(tid, T.RUNNING, "claimed")
+        st.transition(tid, T.NEEDS_INPUT, T.FINDINGS_DETAIL)
+
+    def dig_and_repark(tid, rnd):
+        r = route({"action": "dig", "id": tid, "notes": "and the CDN?", "round": rnd})
+        assert r["ok"], r
+        time.sleep(0.002)
+        repark(tid)
+
+    a = _research_parked(st)
+    first = research.round_of(st.get(a))
+    check("a parked research task has a round", bool(first))
+    check("which is not a state anything else carries",
+          research.round_of(dict(st.get(a), role="implementor")) == "")
+    dig_and_repark(a, first)
+    second = research.round_of(st.get(a))
+    check("parking again after a dig is a new round", second and second != first,
+          f"{first} {second}")
+    for act in ("close", "dig"):
+        r = route({"action": act, "id": a, "notes": "x?", "round": first})
+        check(f"a {act} drawn for the first round is refused on the second",
+              not r["ok"] and r["error"] == research.STALE_ROUND
+              and st.get(a)["state"] == T.NEEDS_INPUT
+              and st.get(a)["goal"].count("Dig deeper") == 1, str(r))
+    r = route({"action": "close", "id": a})
+    check("one carrying no round is asked only the state, as before",
+          r["ok"] and st.get(a)["state"] == T.DONE, str(r))
+
+    b = _research_parked(st)
+    rnd = research.round_of(st.get(b))
+    r = route({"action": "close", "id": b, "round": rnd, "by": "you"})
+    check("a Close for the round that is waiting closes it",
+          r["ok"] and st.get(b)["state"] == T.DONE, str(r))
+
+    # The early check reads a snapshot; the lock decides. A snapshot of the
+    # first round (still needs_input) passes it, and the move must still refuse.
+    class Stale:
+        def __init__(self, real, snap):
+            self.real, self.snap = real, snap
+        def get(self, tid):
+            return dict(self.snap)
+        def __getattr__(self, name):
+            return getattr(self.real, name)
+    for act in ("close", "dig"):
+        c = _research_parked(st)
+        old = research.round_of(st.get(c))
+        dig_and_repark(c, old)
+        snap = dict(st.get(c))
+        snap["events"] = [e for e in snap["events"]][:3]   # as it was at round one
+        check("(the snapshot still reads as round one)",
+              research.round_of(snap) == old, research.round_of(snap))
+        ns["task_store"] = Stale(st, snap)
+        try:
+            r = route({"action": act, "id": c, "notes": "x?", "round": old})
+        finally:
+            ns["task_store"] = st
+        check(f"a stale {act} that got past the snapshot is refused under the lock",
+              not r["ok"] and st.get(c)["state"] == T.NEEDS_INPUT
+              and st.get(c)["goal"].count("Dig deeper") == 1, str(r))
+    import board as B
+    check("board cards and the detail view carry the round the page sends back",
+          B.card(st.get(c)).get("round") == research.round_of(st.get(c))
+          == B.detail(st.get(c), list(st.all().values())).get("round"))
+    w = bot_functions("_with_costs", task_store=st, costs=__import__("costs"),
+                      research=research, board=B, slacklinks=__import__("slacklinks"))
+    check("as do the task panel's rows",
+          w["_with_costs"]([st.get(c)])[0].get("round") == research.round_of(st.get(c)))
+
+    # The Slack board: a button drawn before the dig is refused before anything
+    # is sent; one drawn after carries the round through to the bot.
+    d = _research_parked(st)
+    drawn = home.seen_of(dict(st.get(d), id=d))
+    check("a Slack button records the round", drawn == "needs_input@" + research.round_of(st.get(d)),
+          drawn)
+    dig_and_repark(d, home.seen_round(drawn))
+    calls, notes = [], []
+    h = home.Home(store=st, call=lambda p: calls.append(p) or {"ok": True}, allowed_users=[])
+    h.note = lambda user, text: notes.append(text)
+
+    class Client:
+        def views_open(self, trigger_id, view): pass
+        def views_publish(self, **k): pass
+    h.on_confirm(lambda **k: None, {"user": {"id": "U1"}}, Client(),
+                 {"private_metadata": json.dumps({"action": "close", "id": d, "seen": drawn})})
+    view = {"private_metadata": json.dumps({"id": d, "dig": True, "answer": False, "seen": drawn}),
+            "state": {"values": {"notes": {"notes": {"value": "the CDN?"}}}}}
+    h.on_submit(lambda **k: None, {"user": {"id": "U1"}}, Client(), view)
+    h.on_menu(lambda **k: None, {"user": {"id": "U1"}, "trigger_id": "t", "actions": [
+        {"selected_option": {"value": f"close|{d}|{drawn}"}}]}, Client())
+    check("a Close, Dig deeper or menu pick drawn before the dig sends nothing",
+          calls == [] and st.get(d)["state"] == T.NEEDS_INPUT, str(calls))
+    check("and says the findings are new, not that it moved on to the same state",
+          notes and all("new findings" in n for n in notes), str(notes))
+    now = home.seen_of(dict(st.get(d), id=d))
+    h.on_confirm(lambda **k: None, {"user": {"id": "U1"}}, Client(),
+                 {"private_metadata": json.dumps({"action": "close", "id": d, "seen": now})})
+    check("one drawn for this round is sent, carrying it",
+          calls and calls[-1]["action"] == "close"
+          and calls[-1].get("round") == research.round_of(st.get(d)), str(calls))
+    h.on_confirm(lambda **k: None, {"user": {"id": "U1"}}, Client(),
+                 {"private_metadata": json.dumps({"action": "close", "id": d,
+                                                  "seen": "needs_input"})})
+    check("a value drawn before rounds were carried is asked the state only",
+          len(calls) == 2 and "round" not in calls[-1], str(calls))
+
+
+def test_release_and_dismiss_on_findings_tell_rounds_apart():
+    print("\nRelease and Dismiss on research findings cannot act on a later round")
+    import research, tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    state = _task_state_for(st)
+    started = {}
+
+    def release_command(arg, post, then=None):
+        started["then"] = then
+        return ":rocket: Releasing `alpha`…"
+    ns = bot_functions("handle_tasks", "decide_findings", task_store=st, tasks=T,
+                       research=research, holding=__import__("holding"), task_state=state,
+                       release_command=release_command, RELEASE_STARTED=":rocket:",
+                       LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
+                       roles=__import__("roles"), tell_thread=lambda *a: None,
+                       stop_task=lambda tid: False, start_landing=lambda *a, **k: None)
+    route = ns["handle_tasks"]
+    asks = {"action": "!release alpha all", "why": "", "release": "alpha all"}
+
+    def parked():
+        tid = _research_parked(st)
+        st.update(tid, needs_user=asks)
+        return tid
+
+    def dig_and_repark(tid):
+        r = route({"action": "dig", "id": tid, "notes": "and the CDN?"})
+        assert r["ok"], r
+        time.sleep(0.002)
+        st.transition(tid, T.RUNNING, "claimed")
+        st.update(tid, needs_user=asks)
+        st.transition(tid, T.NEEDS_INPUT, T.FINDINGS_DETAIL)
+
+    a = parked()
+    old = research.round_of(st.get(a))
+    dig_and_repark(a)
+    for act in ("release", "resolve", "dismiss"):
+        r = route({"action": act, "id": a, "round": old, "by": "you"})
+        check(f"a stale {act} drawn for the first round is refused on the second",
+              not r["ok"] and st.get(a)["state"] == T.NEEDS_INPUT and "then" not in started,
+              str(r))
+    r = route({"action": "dismiss", "id": a, "round": research.round_of(st.get(a))})
+    check("a Dismiss for the round that is waiting dismisses it",
+          r["ok"] and st.get(a)["state"] == T.CANCELLED, str(r))
+
+    # A release started on round one; dug into while it ran; round two parks;
+    # then the release goes out. It must not close round two as released.
+    b = parked()
+    r = route({"action": "release", "id": b, "round": research.round_of(st.get(b))})
+    check("Release for the round that is waiting starts it", r["ok"] and started.get("then"), str(r))
+    dig_and_repark(b)
+    started["then"](True)
+    check("the release finishing does not close the round the dig produced",
+          st.get(b)["state"] == T.NEEDS_INPUT, st.get(b)["state"])
+    c = parked()
+    route({"action": "release", "id": c})
+    started["then"](True)
+    check("while one finishing on the round it started closes it",
+          st.get(c)["state"] == T.DONE, st.get(c)["state"])
 
 
 if __name__ == "__main__":

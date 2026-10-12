@@ -1545,7 +1545,7 @@ async function sendBack(id, needsAnswer) {
   if (notes === null) return;
   await taskAction(id, "rework", notes);
 }
-async function digDeeper(id) {
+async function digDeeper(id, round) {
   // The question is the whole point of digging deeper: cancelling the prompt
   // abandons the action, and a blank answer is asked for again rather than
   // rerunning the research with nothing new to go on.
@@ -1555,12 +1555,12 @@ async function digDeeper(id) {
                + "and parks again with new findings.", q);
     if (q === null) return;
   }
-  await taskAction(id, "dig", q);
+  await taskAction(id, "dig", q, round);
 }
-async function closeFindings(id) {
+async function closeFindings(id, round) {
   if (!confirm("Close these findings?\n\nThe research is done; nothing further runs. "
              + "Any next steps it filed stay on the board for you to accept or dismiss.")) return;
-  await taskAction(id, "close");
+  await taskAction(id, "close", "", round);
 }
 function hasFindings(t) {
   // Asked of the server (research.has_findings), so the page names no role.
@@ -1591,8 +1591,12 @@ async function stopTask(id) {
              + "not discarded.")) return;
   await taskAction(id, "cancel");
 }
-async function taskAction(id, action, notes) {
-  const r = await taskCall(notes ? {action, id, notes, by: "you"} : {action, id});
+async function taskAction(id, action, notes, round) {
+  // `round` is which findings a button on research was drawn for; a dig parks
+  // research in needs_input again, so the state alone cannot tell them apart.
+  const p = notes ? {action, id, notes, by: "you"} : {action, id};
+  if (round) p.round = round;
+  const r = await taskCall(p);
   // Cancelling something that was running says whether the work was actually
   // stopped, which is the only part of it you cannot see from the board.
   // Land only starts a landing; "Task landed" would claim a merge that has
@@ -1638,13 +1642,13 @@ function yoursToDo(t) {
   return `<div class="todo">🙋 <b>yours to do:</b> <code>${esc(n.action)}</code>${
     n.why ? ` — ${esc(n.why)}` : ""}</div>`;
 }
-async function releaseStep(id) {
+async function releaseStep(id, round) {
   // Runs only the !release the task recorded; the request names nothing else.
   if (!confirm("Run the release this task left for you?\n\n"
              + "It is the same as typing the !release shown on the card. The "
              + "result is posted to the task's thread, and the task is done "
              + "only if the release goes out.")) return;
-  await taskAction(id, "release");
+  await taskAction(id, "release", "", round);
 }
 function lastEvent(t) {
   // Why a task stopped is already on the record -- transition() writes the
@@ -1738,12 +1742,12 @@ function taskButtons(t) {
     // linked the one way slacklinks builds every thread link.
     const n = t.needs_user || {};
     if (n.release)
-      b.push(`<button class="act" title="!release ${esc(n.release)}" onclick="releaseStep('${t.id}')">Release</button>`);
-    b.push(`<button class="act" onclick="closeFindings('${t.id}')">Close</button>`);
-    b.push(`<button class="ghost" onclick="digDeeper('${t.id}')">Dig deeper…</button>`);
+      b.push(`<button class="act" title="!release ${esc(n.release)}" onclick="releaseStep('${t.id}','${esc(t.round || "")}')">Release</button>`);
+    b.push(`<button class="act" onclick="closeFindings('${t.id}','${esc(t.round || "")}')">Close</button>`);
+    b.push(`<button class="ghost" onclick="digDeeper('${t.id}','${esc(t.round || "")}')">Dig deeper…</button>`);
     if (t.thread)
       b.push(`<a class="ghost" target="_blank" href="${esc(t.thread_link || threadLink(t.thread))}">Discuss ↗</a>`);
-    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
+    b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss','','${esc(t.round || "")}')">Dismiss</button>`);
   } else if (t.state === "needs_input") {
     // A step the run left for you: run it from here when it is a release, or
     // say you took it. Answer still sends it back with something to go on.

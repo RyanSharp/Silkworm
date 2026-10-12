@@ -203,6 +203,9 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None, kids=()) -> dict:
         # Waiting on you with findings: what the page offers Close and Dig
         # deeper on, decided here so the page names no role of its own.
         "findings": research.has_findings(rec),
+        # Which round of them: Close and Dig deeper send it back, so a click
+        # drawn before a dig cannot act on the findings that dig produced.
+        "round": research.round_of(rec),
     }
 
 
@@ -315,6 +318,7 @@ def detail(rec: dict, records=(), unmerged_rows=()) -> dict:
     out["thread_link"] = slacklinks.for_key(rec.get("thread") or "")
     out["research"] = findings(rec, research.children(rec.get("id"), records))
     out["findings"] = research.has_findings(rec)
+    out["round"] = research.round_of(rec)
     out["unmerged"] = unmerged_of(next(
         (r for r in unmerged_rows if r.get("id") == rec.get("id")), None))
     out["reviews"] = [{"id": r.get("id"), "state": r.get("state"),

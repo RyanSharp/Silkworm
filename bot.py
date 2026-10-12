@@ -2072,10 +2072,17 @@ def decide_findings(action: str, payload: dict) -> dict:
     running one, under the store's lock (refuse_running, expect): a stale
     click on a published board is refused, never applied to whatever the
     task has become since. Discuss needs no route; it is a link to the thread.
+
+    The state alone does not tell rounds apart: a Dig deeper parks the task in
+    needs_input again, and a Close drawn before it would close the new
+    findings unread. So a click carries the `round` it was drawn for
+    (research.round_of), checked here and again under the lock (expect_round);
+    one without it is asked only the state, as before.
     """
     tid = payload.get("id", "")
     task = task_store.get(tid)
-    why = research.refusal(task)
+    seen = str(payload.get("round") or "")
+    why = research.refusal(task, seen)
     if why:
         return {"ok": False, "error": why}
     by = payload.get("by", "ui")
@@ -2083,7 +2090,7 @@ def decide_findings(action: str, payload: dict) -> dict:
         if action == "close":
             moved = task_store.transition(tid, tasks.DONE, f"findings closed via {by}",
                                           refuse_running=tasks.RUNNING_BUSY,
-                                          expect=tasks.NEEDS_INPUT)
+                                          expect=tasks.NEEDS_INPUT, expect_round=seen)
             return {"ok": True, "task": moved}
         question = (payload.get("notes") or "").strip()
         if not question:
@@ -2092,7 +2099,8 @@ def decide_findings(action: str, payload: dict) -> dict:
         # the new round says its own.
         moved = send_back(tid, research.dig_addendum(question, by),
                           f"dig deeper via {by}", by_user=True,
-                          expect=tasks.NEEDS_INPUT, next_steps_held=[])
+                          expect=tasks.NEEDS_INPUT, expect_round=seen,
+                          next_steps_held=[])
         return {"ok": True, "task": moved}
     except tasks.NotEditable as e:
         return {"ok": False, "error": str(e)}
@@ -2121,11 +2129,19 @@ def take_step(action: str, payload: dict) -> dict:
     by = payload.get("by", "ui")
     # Every close is "only if it is still waiting on you", asked under the
     # store's lock: a release can take minutes, and a task sent back meanwhile
-    # may be running again -- from where `done` is also legal.
+    # may be running again -- from where `done` is also legal. And only this
+    # wait (tasks.parked_round): a research task dug into while its release
+    # ran parks in needs_input again, and closing that round as "released"
+    # would close findings nobody has read. A click carrying the round it was
+    # drawn for is held to it from the start.
+    seen = str(payload.get("round") or "")
+    if seen and tasks.parked_round(task) != seen:
+        return {"ok": False, "error": tasks.STALE_ROUND}
+    waiting = tasks.parked_round(task)
     if action == "resolve":
         try:
             moved = task_store.transition(tid, tasks.DONE, f"done via {by}",
-                                          expect=tasks.NEEDS_INPUT)
+                                          expect=tasks.NEEDS_INPUT, expect_round=waiting)
         except tasks.InvalidTransition as e:
             return {"ok": False, "error": f"not allowed: {e}"}
         return {"ok": True, "task": moved}
@@ -2157,7 +2173,7 @@ def take_step(action: str, payload: dict) -> dict:
         try:
             task_store.transition(tid, tasks.DONE,
                                   f"released via {by}: {asks['action']}"[:200],
-                                  expect=tasks.NEEDS_INPUT)
+                                  expect=tasks.NEEDS_INPUT, expect_round=waiting)
         except (tasks.InvalidTransition, KeyError):
             log.info("%s moved on while its release ran; leaving it be", tid)
 
@@ -2218,7 +2234,9 @@ def _with_costs(items: list) -> list:
     return [dict(t, cost_total=costs.total(t, reviews.get(t.get("id"), ())),
                  thread_link=slacklinks.for_key(t.get("thread") or ""),
                  research=board.findings(t, kids.get(t.get("id"), ())),
-                 findings=research.has_findings(t))
+                 findings=research.has_findings(t),
+                 # Which findings: Close and Dig deeper send it back (decide_findings).
+                 round=research.round_of(t))
             for t in items]
 
 
@@ -2618,7 +2636,11 @@ def handle_tasks(payload: dict) -> dict:
                 + (f" ({note})" if note else ""),
                 # Cancelling a running task is what stops it; requeueing one
                 # would put a second run beside the first.
-                refuse_running=tasks.RUNNING_BUSY if target == tasks.QUEUED else "")
+                refuse_running=tasks.RUNNING_BUSY if target == tasks.QUEUED else "",
+                # A Dismiss on research's findings carries the round it saw,
+                # like Close: one drawn before a Dig deeper must not cancel
+                # the findings that dig produced (decide_findings).
+                expect_round=str(payload.get("round") or "") if action == "dismiss" else "")
             if held:
                 tell_thread(rec.get("thread", ""), holding.note(held))
             return {"ok": True, "note": note, "task": moved}
@@ -4304,7 +4326,7 @@ def review_addendum(findings: list) -> str:
 
 
 def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
-              expect: str = "", **fields) -> dict:
+              expect: str = "", expect_round: str = "", **fields) -> dict:
     """Requeue a task with `addendum` appended to its goal. The one way work
     is sent back for another pass -- by the dashboard, or by the gates below.
 
@@ -4322,7 +4344,8 @@ def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
 
     `expect` refuses (tasks.InvalidTransition) unless the task is still in
     that state under the store's lock -- for a click decided on what the task
-    was a moment ago.
+    was a moment ago -- and `expect_round` unless it is still the same wait
+    there (tasks.parked_round).
     """
     task = task_store.get(tid) or {}
     # Running is refused by the move itself, under the store's lock: asked
@@ -4339,7 +4362,7 @@ def send_back(tid: str, addendum: str, why: str, by_user: bool = False,
     return task_store.transition(
         tid, tasks.QUEUED, why,
         refuse_running=tasks.RUNNING_REFUSAL if by_user else "",
-        expect=expect,
+        expect=expect, expect_round=expect_round,
         # And no step left for you: that was the last run's, and a rerun that
         # never gets to the end -- held at the gate, failed -- would otherwise
         # still offer it, and Release or Done would close unreworked work.

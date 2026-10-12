@@ -31,6 +31,10 @@ SOURCE = "research"
 #: The event detail a finished research task parks with.
 FINDINGS_DETAIL = tasks.FINDINGS_DETAIL
 
+
+#: Close or Dig deeper on findings that a Dig deeper has since replaced.
+STALE_ROUND = tasks.STALE_ROUND
+
 #: Bounds on what is kept of a refused next step: it is shown, not re-filed.
 MAX_HELD = 10
 
@@ -44,11 +48,22 @@ def has_findings(rec: dict | None) -> bool:
     return is_research(rec) and (rec or {}).get("state") == tasks.NEEDS_INPUT
 
 
-def refusal(rec: dict | None) -> str:
+def round_of(rec: dict | None) -> str:
+    """Which round of findings `rec` is waiting on you with, or "".
+
+    Close and Dig deeper carry it from the view they were drawn on: a dig
+    parks the task in needs_input again, so the state alone would let a Close
+    drawn before it close the new findings unread.
+    """
+    return tasks.parked_round(rec) if has_findings(rec) else ""
+
+
+def refusal(rec: dict | None, seen_round: str = "") -> str:
     """Why a findings action (Close, Dig deeper) cannot apply to `rec`, or "".
 
     Running is asked again under the store's lock by the move itself; this is
     the early, readable answer for the clicks that are plainly stale.
+    `seen_round` is round_of() as the click saw it; "" asks only the state.
     """
     if not rec:
         return "unknown task"
@@ -59,7 +74,10 @@ def refusal(rec: dict | None) -> str:
         return tasks.RUNNING_BUSY
     if state != tasks.NEEDS_INPUT:
         return f"its findings are no longer waiting on you; it is {state}"
+    if seen_round and tasks.parked_round(rec) != seen_round:
+        return STALE_ROUND
     return ""
+
 
 
 def dig_addendum(question: str, by: str = "") -> str:
