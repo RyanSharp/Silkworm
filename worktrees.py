@@ -19,7 +19,9 @@ message to the queue runner so it is not lost, and being run by the runner must
 not change where it runs.
 
 Nothing here destroys work: a worktree holding uncommitted changes is left on
-disk and reported rather than removed.
+disk and reported rather than removed. A project's generated paths -- files its
+own build rewrites, like Cadence's Info.plists -- are not work, and are put back
+as committed when a task checkout goes (see `changes`).
 """
 
 import logging
@@ -271,18 +273,206 @@ def main_repo(worktree) -> Path | None:
     return common.parent if common.name == ".git" else None
 
 
+#: Set by the bot: `fn(repo_root) -> [paths]`, the generated paths of the
+#: project(s) living in that checkout. A hook rather than an argument so that
+#: every caller deciding "does this checkout hold work" -- release, the sweep,
+#: a review's reattach, the approve/dismiss handback, landing -- gets the same
+#: answer without each having to know which project a directory belongs to.
+generated_lookup = None
+
+
+def generated_for(repo) -> list[str]:
+    """The paths a project's own build regenerates, for the project at `repo`.
+
+    Cadence's build rewrites both Info.plists through xcodegen, injecting keys
+    that must never be committed. So every finished Cadence checkout looked
+    dirty, was kept on disk as "uncommitted work", went on holding its branch
+    -- and every landing refused because git will not check a branch out
+    twice. Fourteen checkouts had piled up before anyone saw why.
+    """
+    fn = generated_lookup
+    if not fn or not repo:
+        return []
+    try:
+        return [str(p).strip() for p in (fn(Path(repo)) or []) if str(p).strip()]
+    except Exception:
+        log.exception("could not read the generated paths for %s", repo)
+        return []
+
+
+def _norm(path: str) -> str:
+    path = path.strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path.rstrip("/")
+
+
+def is_generated(path: str, generated) -> bool:
+    """True for a path listed as generated, or inside a listed directory."""
+    p = _norm(path)
+    for g in generated or ():
+        g = _norm(g)
+        if g and (p == g or p.startswith(g + "/")):
+            return True
+    return False
+
+
+#: Status codes a regenerated file can show: modified, type-changed or
+#: deleted, staged or not. Each is put back by `git checkout HEAD -- path`.
+#: Not untracked, added, renamed or copied: those are something new, and a
+#: new file is somebody's work however it is named.
+_REGENERATED = set(" MDT")
+
+
+def status(worktree, untracked: str = "normal") -> list[tuple[str, str]] | None:
+    """(code, path) for every uncommitted entry, or None if git could not say.
+
+    `-z`, so a path with a space or a quote in it comes back as itself rather
+    than in git's C-quoting -- a quoted path would never match a generated one.
+    """
+    r = _git(worktree, "status", "--porcelain", "-z",
+             f"--untracked-files={untracked}")
+    if r.returncode != 0:
+        return None
+    out, fields, i = [], r.stdout.split("\0"), 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if "R" in code or "C" in code:
+            i += 1                        # the next field is where it came from
+        out.append((code, path))
+    return out
+
+
+#: Unmerged: a conflict is somebody's half-finished merge, never a build's.
+_UNMERGED = ("DD", "AA")
+
+
+def _ignorable(code: str, path: str, generated) -> bool:
+    if "U" in code or code in _UNMERGED:
+        return False
+    return set(code) <= _REGENERATED and is_generated(path, generated)
+
+
+def _generated_or_lookup(worktree, generated):
+    if generated is not None:
+        return list(generated)
+    if not generated_lookup:
+        return []
+    try:
+        return generated_for(main_repo(worktree) or worktree)
+    except Exception:
+        log.exception("could not tell which project %s belongs to", worktree)
+        return []
+
+
+def changes(worktree, generated=None, untracked: str = "normal") -> list[str] | None:
+    """The uncommitted work this checkout holds, or None if git could not say.
+
+    The one answer to "is there work in here", shared by everything that has
+    to decide whether a checkout may go. The project's generated paths are not
+    work: a build made them and the next build makes them again, so they are
+    left out -- and only those, only as modifications of a tracked file.
+    Untracked files and every other change still count exactly as before.
+
+    `generated=None` asks `generated_lookup` for the project's list.
+    `untracked="no"` is tracked changes only, which is what a base checkout's
+    dirtiness means; "all" walks into untracked directories.
+    """
+    entries = status(worktree, untracked)
+    if entries is None:
+        return None
+    generated = _generated_or_lookup(worktree, generated)
+    return [p for c, p in entries if not _ignorable(c, p, generated)]
+
+
+def generated_changes(worktree, generated=None) -> list[str]:
+    """The generated paths this checkout holds modified -- the ignored half."""
+    entries = status(worktree, "no") or []
+    generated = _generated_or_lookup(worktree, generated)
+    return [p for c, p in entries if _ignorable(c, p, generated)]
+
+
+def discard_generated(worktree, generated=None) -> list[str]:
+    """Put a task checkout's generated files back as committed. Returns them.
+
+    Only ever for a checkout about to be removed. Never the base checkout:
+    there those files hold the injected keys the person's own builds run on.
+    """
+    paths = generated_changes(worktree, generated)
+    if paths:
+        r = _git(worktree, "checkout", "HEAD", "--", *paths)
+        if r.returncode != 0:
+            log.warning("could not restore generated files in %s: %s",
+                        worktree, (r.stderr or "").strip()[-200:])
+    return paths
+
+
 def is_dirty(worktree) -> bool:
-    r = _git(worktree, "status", "--porcelain")
-    return r.returncode == 0 and bool(r.stdout.strip())
+    """Whether this checkout holds work. A checkout git cannot read is not."""
+    return bool(changes(worktree))
 
 
 def uncommitted(worktree) -> list[str]:
     """Paths with changes that no commit holds: modified, staged, or new and
-    not ignored. Empty if the checkout is clean or cannot be read."""
-    r = _git(worktree, "status", "--porcelain", "--untracked-files=all")
+    not ignored -- less the project's generated files. Empty if the checkout
+    is clean or cannot be read."""
+    return changes(worktree, untracked="all") or []
+
+
+def checked_out_at(repo, branch: str) -> Path | None:
+    """The checkout that has `branch` checked out, if any does."""
+    r = _git(repo, "worktree", "list", "--porcelain")
     if r.returncode != 0:
-        return []
-    return [line[3:] for line in r.stdout.splitlines() if len(line) > 3]
+        return None
+    path, want = None, f"branch refs/heads/{branch}"
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+        elif line.strip() == want and path is not None:
+            return path
+    return None
+
+
+def free_branch(repo, branch: str, task_id: str) -> tuple[bool, str]:
+    """Let go of `branch` where this task's own checkout still holds it.
+
+    Returns (freed, why not). A landing reattaches the branch, and git will
+    not check one branch out twice -- so a task checkout kept for holding
+    nothing but regenerated files refused every landing as "could not check
+    out". That checkout is this task's own and holds no work, so it is
+    released here and the landing goes on. One holding real changes is kept,
+    as release() always keeps it, and the refusal says where and what.
+    """
+    holder = checked_out_at(repo, branch)
+    if holder is None:
+        return False, ""
+    own = path_for(repo, task_id)
+    try:
+        mine = holder.resolve() == own.resolve()
+    except OSError:
+        mine = False
+    if not mine:
+        return False, (f"could not check out {branch}: it is checked out in "
+                       f"{holder}, which is not this task's own checkout")
+    held = changes(holder)
+    if held is None:
+        return False, (f"could not check out {branch}: it is checked out in "
+                       f"{holder}, and git could not say what that checkout holds")
+    if held:
+        shown = ", ".join(held[:8]) + (f" and {len(held) - 8} more" if len(held) > 8 else "")
+        return False, (f"could not check out {branch}: this task's checkout "
+                       f"{holder} still holds uncommitted changes ({shown}). "
+                       f"Commit or remove them there, then land again.")
+    removed, note = release(holder, delete_empty_branch=False)
+    if not removed:
+        return False, f"could not check out {branch}: its checkout {note}"
+    log.info("released %s, which held %s with nothing but generated files",
+             holder, branch)
+    return True, ""
 
 
 def branch_of(worktree) -> str:
@@ -345,6 +535,9 @@ def release(worktree, delete_empty_branch: bool = True) -> tuple[bool, str]:
                        f"(branch `{branch}`)")
     repo = main_repo(path)
     made = commits_on(path, base_ref(repo, fetch=False) if repo else "")
+    # What is left is regenerated build output, which `worktree remove` would
+    # otherwise refuse over. Put it back as committed first; nothing else.
+    discard_generated(path)
     if repo:
         r = _git(repo, "worktree", "remove", str(path))
         if r.returncode != 0:

@@ -77,11 +77,17 @@ def changes(worktree) -> list[str] | None:
     `git status` then exits non-zero, and reading that as clean would print
     the all-clear over a checkout full of half-finished work -- at the exact
     moment somebody is deciding whether to dismiss the task.
+
+    And through worktrees.changes, so it is the same question release() and
+    the sweep ask: a project's generated files -- a build's output, not
+    anybody's work -- are not reported here either.
     """
-    r = _git(worktree, "status", "--porcelain")
-    if r.returncode != 0:
+    try:
+        files = worktrees.changes(worktree)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("git status in %s: %s", worktree, e)
         return None
-    return [line[3:].strip() for line in r.stdout.splitlines() if line[3:].strip()]
+    return None if files is None else [f.strip() for f in files if f.strip()]
 
 
 def branch_of(worktree) -> str:

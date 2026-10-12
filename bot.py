@@ -219,6 +219,31 @@ UPLOADS_ROOT.mkdir(exist_ok=True)
 store = SessionStore(BASE_DIR / "sessions.json")
 task_store = tasks.TaskStore(BASE_DIR / "tasks.json")
 project_store = projects.ProjectStore(BASE_DIR / "projects.json")
+
+
+def generated_paths(repo) -> list[str]:
+    """The generated paths of every project living in the checkout at `repo`.
+
+    What worktrees.changes leaves out of "uncommitted work", read live from the
+    project store so a change in the settings applies to the next question.
+    """
+    try:
+        target = Path(repo).expanduser().resolve()
+    except (OSError, ValueError):
+        return []
+    out = []
+    for rec in project_store.all():
+        cwd = (rec.get("scope") or {}).get("cwd") or ""
+        try:
+            here = cwd and Path(cwd).expanduser().resolve() == target
+        except (OSError, ValueError):
+            here = False
+        if here:
+            out += [p for p in (rec.get("generated") or []) if p not in out]
+    return out
+
+
+worktrees.generated_lookup = generated_paths
 #: Written once the startup cost correction has run; see correct_costs_once.
 COST_CORRECTION_FILE = BASE_DIR / "cost_correction.json"
 #: Every cost Silkworm shows is what the API would have charged at list price.
@@ -1623,6 +1648,34 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                           if sc["branch"] else
                           f":herb: *{slug}* tasks branch from the default branch again."),
                     thread_ts=thread_ts)
+        elif arg.lower() == "generated" or arg.lower().startswith("generated "):
+            # Files this project's build rewrites, which are never uncommitted
+            # work: a task checkout holding only these is released, and the
+            # base checkout is not dirty over them.
+            slug = entry.get("project") or ""
+            want = arg[len("generated"):].strip()
+            if not slug:
+                say(text="File this thread under a project first: `!project <name>`.",
+                    thread_ts=thread_ts)
+            elif not want:
+                cur = (project_store.get(slug) or {}).get("generated") or []
+                say(text=(f"*{slug}* treats {', '.join(f'`{c}`' for c in cur)} as "
+                          "generated, never as uncommitted work." if cur
+                          else f"*{slug}* has no generated paths."),
+                    thread_ts=thread_ts)
+            else:
+                try:
+                    paths = projects.parse_paths(want)
+                except ValueError as e:
+                    say(text=f":warning: {e}", thread_ts=thread_ts)
+                else:
+                    project_store.ensure(slug, generated=paths)
+                    say(text=(f":gear: *{slug}* now treats "
+                              f"{', '.join(f'`{c}`' for c in paths)} as generated: "
+                              "never uncommitted work, never committed by a landing."
+                              if paths else
+                              f":gear: *{slug}* has no generated paths now."),
+                        thread_ts=thread_ts)
         elif arg.lower() == "mail" or arg.lower().startswith("mail "):
             # The Gmail label whose mail belongs here. Defaults to the project's
             # title, so this is only needed when the label is named differently.
@@ -2700,6 +2753,17 @@ def handle_projects(payload: dict) -> dict:
             return {"ok": False, "error": f"a name is at most {scoping.MAX_NAME_CHARS} characters"}
         # Renamed, not re-keyed: the slug is what every task is filed under.
         return {"ok": True, "project": project_store.ensure(slug, title=title)}
+    if action == "generated":
+        # The dashboard's `!project generated`: paths the build regenerates,
+        # which never count as uncommitted work.
+        slug = (payload.get("slug") or "").strip()
+        if not project_store.get(slug):
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        try:
+            paths = projects.parse_paths(payload.get("paths") or "")
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "project": project_store.ensure(slug, generated=paths)}
     if action == "base":
         # Which branch this project's tasks build on and land onto -- the
         # dashboard's `!project base`. Checked against the repository: a name
@@ -4866,8 +4930,18 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
 
     here = worktrees.attach(cwd, task["id"], branch)
     if not here:
-        return {"eligible": True, "landed": False, "stage": "attach",
-                "branch": branch, "detail": f"could not check out {branch}"}
+        # Git checks a branch out once, and the commonest holder is this
+        # task's own checkout, kept because a build left regenerated files in
+        # it: all seven Cadence landings refused on exactly that. Holding only
+        # generated files, it is released and the landing goes on; holding
+        # real changes, the refusal says where and what.
+        freed, why = worktrees.free_branch(cwd, branch, task["id"])
+        if freed:
+            here = worktrees.attach(cwd, task["id"], branch)
+        if not here:
+            return {"eligible": True, "landed": False, "stage": "attach",
+                    "branch": branch,
+                    "detail": why or f"could not check out {branch}"}
 
     def run_tests(where):
         # One run of a project's suite at a time, and a launch failure -- the
@@ -4892,7 +4966,8 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
         with repo_guard(cwd):
             result = merge.land(here, cwd, branch, base,
                                 run_tests, publish=bool(proj.get("publish")),
-                                on_merge=on_merge)
+                                on_merge=on_merge,
+                                generated=list(proj.get("generated") or []))
     finally:
         worktrees.release(here)
     return {**result, "eligible": True, "branch": branch}

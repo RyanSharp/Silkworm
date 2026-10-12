@@ -2700,6 +2700,8 @@ async function projectSettings(slug) {
     <label>nightly review</label><div class="line"><input type="text" id="psideate" value="${esc(p.ideate_at || "")}" placeholder="off — or 02:00, 2am">${save("saveIdeate")}
     <label>base branch</label><div class="line"><input type="text" id="psbase" value="${esc(r.base || "")}" placeholder="the default branch">${save("saveBase")}
     <div class="note">What its tasks build on and land onto. Blank is the repository's default branch.</div>
+    <label>generated paths</label><div class="line"><input type="text" id="psgenerated" value="${esc((p.generated || []).join(", "))}" placeholder="none — e.g. ios/App/Info.plist">${save("saveGenerated")}
+    <div class="note">Files the build rewrites. Never counted as uncommitted work: a task checkout holding only these is released, and they never make the base checkout dirty.</div>
     <div class="err" id="tferr"></div>
     <div class="acts">${p.archived
       ? `<button class="ghost" onclick="archiveProject('${esc(slug)}',false)">Unarchive</button>`
@@ -2731,6 +2733,11 @@ async function saveTestCmd(slug) {
   if (!cmd && !confirm(`Clear ${slug}'s test command?\n\nIts work is then never verified, so nothing `
                        + "auto-merges and it stops taking unattended work.")) return;
   await settingsCall({action: "test-cmd", slug, cmd: cmd || "off"}, cmd ? "Test command saved" : "Test command cleared");
+}
+async function saveGenerated(slug) {
+  const paths = document.getElementById("psgenerated").value.trim();
+  await settingsCall({action: "generated", slug, paths: paths || "off"},
+                     paths ? "Generated paths saved" : "Generated paths cleared");
 }
 async function setAutoMerge(slug, on) {
   if (on && !confirm(`Turn auto-merge on for ${slug}?\n\nReviewed work that passes its tests then lands `

@@ -18933,6 +18933,377 @@ def test_release_and_dismiss_on_findings_tell_rounds_apart():
           st.get(c)["state"] == T.DONE, st.get(c)["state"])
 
 
+# --- generated files are not uncommitted work ---------------------------------
+# 2026-10-12: every Cadence build regenerates both Info.plists (injecting keys
+# that must never be committed), so every finished Cadence checkout looked
+# dirty, was kept, kept its branch checked out, and all seven landings refused
+# with "could not check out". With those checkouts cleared by hand, all six
+# then refused at base-dirty, because the main checkout holds the same two
+# files modified for the person's own builds.
+
+_GEN = ["ios/Cadence/Info.plist", "ios/CadenceWidget/Info.plist"]
+_SECRET = b"<plist><key>SUPABASE_KEY</key><string>injected-not-committed</string></plist>\n"
+
+
+def _gen_git(where, *a):
+    return subprocess.run(["git", "-C", str(where), "-c", "user.email=t@t",
+                           "-c", "user.name=t", *a], capture_output=True, text=True)
+
+
+def _gen_repo():
+    """A Cadence-shaped repository: two committed plists and a source file."""
+    repo = Path(tempfile.mkdtemp()) / "cadence"
+    repo.mkdir()
+    _gen_git(repo, "init", "-q", "-b", "main")
+    for rel in _GEN:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(b"<plist>bare</plist>\n")
+    (repo / "app.swift").write_text("let x = 1\n")
+    _gen_git(repo, "add", "-A")
+    _gen_git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+@contextlib.contextmanager
+def _gen_world(lookup=lambda repo: list(_GEN)):
+    import worktrees as W
+    old_root, old_lookup = W.ROOT, W.generated_lookup
+    W.ROOT = Path(tempfile.mkdtemp()) / "worktrees"
+    W.generated_lookup = lookup
+    try:
+        yield W
+    finally:
+        W.ROOT, W.generated_lookup = old_root, old_lookup
+
+
+def _gen_task(W, repo, tid, *, real=False):
+    """A finished task checkout: one commit, a build's regenerated plists, and
+    (if `real`) one genuinely uncommitted change."""
+    wt = W.create(repo, tid, fetch=False)
+    (wt / "feature.swift").write_text(f"// {tid}\n")
+    _gen_git(wt, "add", "-A")
+    _gen_git(wt, "commit", "-q", "-m", f"{tid} work")
+    for rel in _GEN:
+        (wt / rel).write_bytes(_SECRET)
+    if real:
+        (wt / "app.swift").write_text("let x = 2   // not committed\n")
+    return wt
+
+
+def test_generated_paths_are_not_uncommitted_work():
+    import holding
+    print("\na project's generated files are not uncommitted work")
+    repo = _gen_repo()
+    with _gen_world() as W:
+        wt = _gen_task(W, repo, "tsk_gen_only")
+        check("a checkout holding only regenerated files holds no work",
+              W.changes(wt) == [] and not W.is_dirty(wt) and W.uncommitted(wt) == [],
+              str(W.changes(wt)))
+        check("and the ignored half is still reported as such",
+              sorted(W.generated_changes(wt)) == sorted(_GEN), str(W.generated_changes(wt)))
+        check("the approve/dismiss handback sees nothing held",
+              holding.changes(wt) == [] and holding.for_task(
+                  {"id": "tsk_gen_only", "scope": {"worktree": str(wt)}}) is None)
+
+        # Everything else still counts, exactly as before.
+        (wt / "notes.txt").write_text("somebody's notes\n")
+        check("an untracked file still counts", W.changes(wt) == ["notes.txt"], str(W.changes(wt)))
+        (wt / "notes.txt").unlink()
+        (wt / "ios/Cadence/Extra.plist").write_text("new\n")
+        check("a new file beside a generated one still counts",
+              W.changes(wt) == ["ios/Cadence/Extra.plist"], str(W.changes(wt)))
+        (wt / "ios/Cadence/Extra.plist").unlink()
+        (wt / "app.swift").write_text("let x = 3\n")
+        check("a tracked non-generated change still counts",
+              W.changes(wt) == ["app.swift"] and W.is_dirty(wt), str(W.changes(wt)))
+        _gen_git(wt, "checkout", "--", "app.swift")
+        # A rename whose destination is a listed path is still a rename: it
+        # cannot be put back by a checkout, and nothing else names its source.
+        W.generated_lookup = lambda r: list(_GEN) + ["ios/Cadence/Moved.plist"]
+        _gen_git(wt, "mv", _GEN[0], "ios/Cadence/Moved.plist")
+        check("a rename onto a generated path is a change, not a regeneration",
+              W.changes(wt) == ["ios/Cadence/Moved.plist"], str(W.changes(wt)))
+        W.generated_lookup = lambda r: list(_GEN)
+        _gen_git(wt, "reset", "-q", "--hard")
+        _gen_git(wt, "rm", "-q", "--cached", _GEN[1])
+        check("a generated path that is untracked is new work, and counts",
+              W.uncommitted(wt) == [_GEN[1]], str(W.uncommitted(wt)))
+        _gen_git(wt, "reset", "-q", "--hard")
+        for rel in _GEN:
+            (wt / rel).write_bytes(_SECRET)
+
+        check("a conflict on a generated path is never a build's output",
+              not W._ignorable("DD", _GEN[0], _GEN) and not W._ignorable("UU", _GEN[0], _GEN)
+              and not W._ignorable("AA", _GEN[0], _GEN) and W._ignorable("MM", _GEN[0], _GEN))
+
+        # Another project's list is not this one's.
+        W.generated_lookup = lambda r: []
+        check("without the setting the same checkout is dirty, as it always was",
+              W.is_dirty(wt) and sorted(W.changes(wt)) == sorted(_GEN))
+        W.generated_lookup = lambda r: list(_GEN)
+
+        # release(): puts the files back and goes; the branch and its commit stay.
+        ok, note = W.release(wt)
+        check("release lets go of a checkout holding only generated files",
+              ok and not wt.exists(), note)
+        check("and the task's branch and commit survive it",
+              _gen_git(repo, "log", "-1", "--format=%s", "silkworm/tsk_gen_only").stdout.strip()
+              == "tsk_gen_only work")
+        check("the base checkout's files were not touched",
+              all((repo / rel).read_bytes() == b"<plist>bare</plist>\n" for rel in _GEN))
+
+        kept = _gen_task(W, repo, "tsk_gen_real", real=True)
+        ok, note = W.release(kept)
+        check("release keeps a checkout holding a real change",
+              not ok and kept.exists() and str(kept) in note, note)
+        check("and leaves even its generated files alone",
+              (kept / _GEN[0]).read_bytes() == _SECRET)
+        row = holding.for_task({"id": "tsk_gen_real", "scope": {"worktree": str(kept)}})
+        check("the handback names the real change and only that",
+              row and row["files"] == ["app.swift"], str(row))
+
+        # The orphan sweep: same helper, same answer.
+        swept = _gen_task(W, repo, "tsk_gen_swept")
+        n = W.sweep(keep=set(), min_age_s=0)
+        check("the sweep removes an orphan holding only generated files",
+              not swept.exists() and kept.exists() and n == 1, f"removed {n}")
+        check("and the sweep never deletes a branch",
+              _gen_git(repo, "rev-parse", "--verify", "-q", "silkworm/tsk_gen_swept").returncode == 0)
+
+        # A review reattaching an existing detached checkout.
+        tip = _gen_git(repo, "rev-parse", "silkworm/tsk_gen_only").stdout.strip()
+        rv = W.attach(repo, "tsk_gen_only", "silkworm/tsk_gen_only", label="review", detach=True)
+        for rel in _GEN:
+            (rv / rel).write_bytes(_SECRET)
+        again = W.attach(repo, "tsk_gen_only", "silkworm/tsk_gen_only", label="review", detach=True)
+        check("a review checkout holding only generated files is still the tip, untouched",
+              again == rv and _gen_git(rv, "rev-parse", "HEAD").stdout.strip() == tip)
+
+
+def test_landing_frees_its_own_generated_only_checkout():
+    import logging
+    import merge as M
+    import branches as B
+    print("\nlanding releases the task's own checkout when it holds only generated files")
+    repo = _gen_repo()
+    with _gen_world() as W:
+        clean = _gen_task(W, repo, "tsk_land_gen")
+        dirty = _gen_task(W, repo, "tsk_land_real", real=True)
+        check("fixture: plain attach refuses while the task's checkout holds the branch",
+              W.attach(repo, "tsk_probe", "silkworm/tsk_land_gen") is None)
+
+        class Projects:
+            def scope_for(self, slug):
+                return {}
+            def get(self, slug):
+                return {"auto_merge": True, "test_cmd": "true", "generated": list(_GEN)}
+        recorded = []
+        ns = {"project_store": Projects(), "worktrees": W, "merge": M, "branches": B,
+              "verify": types.SimpleNamespace(run=lambda *a, **k: {"ok": True, "output": ""}),
+              "repo_guard": lambda cwd: contextlib.nullcontext(),
+              "record_landing": lambda task, out: recorded.append(out),
+              "LANDING_UNDERWAY": "in-progress", "log": logging.getLogger("test")}
+        _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+        land = ns["land_if_ready"]
+        base = {"project": "cadence", "role": "implementor", "verified": True,
+                "scope": {"cwd": str(repo)}}
+
+        # The base checkout is where the person builds: its plists hold keys.
+        for rel in _GEN:
+            (repo / rel).write_bytes(_SECRET)
+
+        r = land({**base, "id": "tsk_land_gen"})
+        check("a checkout holding only generated files is released and the work lands",
+              r.get("landed") is True, repr(r))
+        check("its checkout is gone", not clean.exists())
+        check("the commit is on main",
+              _gen_git(repo, "log", "-1", "--format=%s", "main").stdout.strip() == "tsk_land_gen work")
+        check("and the base's injected plists are byte-identical",
+              all((repo / rel).read_bytes() == _SECRET for rel in _GEN))
+
+        head = _gen_git(repo, "rev-parse", "main").stdout.strip()
+        r = land({**base, "id": "tsk_land_real"})
+        check("one holding a real change refuses at attach",
+              r.get("stage") == "attach" and not r.get("landed"), repr(r))
+        check("naming the checkout and the changed file, not a bare 'could not check out'",
+              str(dirty) in r.get("detail", "") and "app.swift" in r.get("detail", "")
+              and "Info.plist" not in r.get("detail", ""), r.get("detail"))
+        check("and that checkout is kept with its change",
+              dirty.exists() and "2" in (dirty / "app.swift").read_text())
+        check("nothing was merged", _gen_git(repo, "rev-parse", "main").stdout.strip() == head)
+
+        # Held by some other checkout: still refused, and said where.
+        other = W.ROOT / "elsewhere"
+        _gen_git(repo, "branch", "silkworm/tsk_land_other", "main~1")
+        _gen_git(repo, "worktree", "add", "-q", str(other), "silkworm/tsk_land_other")
+        (other / "o.txt").write_text("o\n")
+        _gen_git(other, "add", "-A"); _gen_git(other, "commit", "-q", "-m", "other")
+        r = land({**base, "id": "tsk_land_other"})
+        check("a branch held by a checkout that is not the task's own is refused, named",
+              r.get("stage") == "attach" and str(other) in r.get("detail", "")
+              and other.exists(), repr(r))
+
+
+def test_base_checkout_generated_files_do_not_block_landing():
+    import merge as M
+    print("\na base checkout dirty only in generated files still lands, untouched")
+    ok = lambda where: {"ok": True, "output": ""}
+
+    def rig(change=None):
+        repo = _gen_repo()
+        for rel in _GEN:
+            (repo / rel).write_bytes(_SECRET)
+        wt = repo.parent / "wt"
+        _gen_git(repo, "worktree", "add", "-q", "-b", "silkworm/tsk_b", str(wt), "main")
+        (wt / (change or "feature.swift")).write_bytes(b"changed by the branch\n")
+        _gen_git(wt, "add", "-A"); _gen_git(wt, "commit", "-q", "-m", "work")
+        return repo, wt
+
+    repo, wt = rig()
+    before = _gen_git(repo, "rev-parse", "HEAD").stdout.strip()
+    r = M.land(wt, repo, "silkworm/tsk_b", "main", ok, generated=_GEN)
+    check("dirty only in generated paths: it lands", r.get("landed") is True, repr(r))
+    check("with the base's plists byte-identical",
+          all((repo / rel).read_bytes() == _SECRET for rel in _GEN))
+    check("and the base moved", _gen_git(repo, "rev-parse", "HEAD").stdout.strip() != before)
+
+    with _gen_world() as W:
+        repo, wt = rig()
+        r = M.land(wt, repo, "silkworm/tsk_b", "main", ok)
+        check("the project's list is found by lookup when not passed",
+              r.get("landed") is True, repr(r))
+
+    repo, wt = rig()
+    (repo / "app.swift").write_text("let x = 9   // the person's edit\n")
+    r = M.land(wt, repo, "silkworm/tsk_b", "main", ok, generated=_GEN)
+    check("dirty in a non-generated tracked file: still refused",
+          r.get("stage") == "base-dirty" and "app.swift" in r.get("detail", ""), repr(r))
+    check("and that refusal does not list the generated files",
+          "Info.plist" not in r.get("detail", ""), r.get("detail"))
+
+    repo, wt = rig()
+    r = M.land(wt, repo, "silkworm/tsk_b", "main", ok)
+    check("without the setting the same checkout refuses as base-dirty, as before",
+          r.get("stage") == "base-dirty", repr(r))
+
+    repo, wt = rig(change=_GEN[0])
+    before = _gen_git(repo, "rev-parse", "HEAD").stdout.strip()
+    ran = []
+    r = M.land(wt, repo, "silkworm/tsk_b", "main",
+               lambda where: ran.append(where) or {"ok": True}, generated=_GEN)
+    check("a landing that would overwrite a held generated file refuses",
+          r.get("stage") == "base-generated" and _GEN[0] in r.get("detail", ""), repr(r))
+    check("before spending a test run, without merging, and leaving the file alone",
+          not ran and _gen_git(repo, "rev-parse", "HEAD").stdout.strip() == before
+          and (repo / _GEN[0]).read_bytes() == _SECRET)
+
+    # A branch moving a held file away is a change to it too.
+    repo, wt = rig()
+    _gen_git(wt, "mv", _GEN[0], "ios/Cadence/Renamed.plist")
+    _gen_git(wt, "commit", "-q", "-m", "rename")
+    ran = []
+    r = M.land(wt, repo, "silkworm/tsk_b", "main",
+               lambda where: ran.append(where) or {"ok": True}, generated=_GEN)
+    check("a branch renaming a held generated file away is refused up front",
+          r.get("stage") == "base-generated" and not ran
+          and (repo / _GEN[0]).read_bytes() == _SECRET, repr(r))
+
+    # A file regenerated *during* the suite run is caught at the merge.
+    repo, wt = rig(change=_GEN[1])
+    (repo / _GEN[1]).write_bytes(b"<plist>bare</plist>\n")       # clean when it starts
+    before = _gen_git(repo, "rev-parse", "HEAD").stdout.strip()
+    def build_during(where):
+        (repo / _GEN[1]).write_bytes(_SECRET)
+        return {"ok": True}
+    r = M.land(wt, repo, "silkworm/tsk_b", "main", build_during, generated=_GEN)
+    check("a generated file a build rewrote mid-landing is caught before the merge",
+          r.get("stage") == "base-generated"
+          and _gen_git(repo, "rev-parse", "HEAD").stdout.strip() == before
+          and (repo / _GEN[1]).read_bytes() == _SECRET, repr(r))
+
+    # Broken by the merge: put back, and the injected plists kept.
+    repo, wt = rig()
+    before = _gen_git(repo, "rev-parse", "HEAD").stdout.strip()
+    calls = []
+    def second_fails(where):
+        calls.append(where)
+        return {"ok": len(calls) == 1, "output": "boom"}
+    r = M.land(wt, repo, "silkworm/tsk_b", "main", second_fails, generated=_GEN)
+    check("a landing that breaks the base is still put back",
+          r.get("stage") == "tests-after-merge"
+          and _gen_git(repo, "rev-parse", "HEAD").stdout.strip() == before, repr(r))
+    check("without the reset discarding the base's injected plists",
+          all((repo / rel).read_bytes() == _SECRET for rel in _GEN))
+
+    # The person's state of those files survives exactly: staged and deleted.
+    repo, wt = rig()
+    _gen_git(repo, "add", _GEN[0])
+    (repo / _GEN[1]).unlink()
+    before = _gen_git(repo, "rev-parse", "HEAD").stdout.strip()
+    calls = []
+    r = M.land(wt, repo, "silkworm/tsk_b", "main", second_fails, generated=_GEN)
+    st = _gen_git(repo, "status", "--porcelain").stdout
+    # (`reset --keep` leaves the index at the reset commit, so a staged copy
+    # comes back unstaged -- its bytes are what matter, and they never land.)
+    check("after a put-back a staged generated file keeps its bytes, a deleted one stays gone",
+          r.get("stage") == "tests-after-merge"
+          and _gen_git(repo, "rev-parse", "HEAD").stdout.strip() == before
+          and f" D {_GEN[1]}" in st and not (repo / _GEN[1]).exists()
+          and (repo / _GEN[0]).read_bytes() == _SECRET, st)
+
+
+def test_generated_paths_setting():
+    import logging
+    import projects as P
+    print("\nthe generated-paths setting: stored, seeded once, settable")
+    d = Path(tempfile.mkdtemp())
+    (d / "projects.json").write_text(json.dumps({
+        "cadence": {"slug": "cadence", "title": "Cadence"},
+        "saga": {"slug": "saga", "title": "Saga"},
+    }))
+    ps = P.ProjectStore(d / "projects.json")
+    check("Cadence's two plists are seeded on a record that predates the field",
+          ps.get("cadence")["generated"] == _GEN, str(ps.get("cadence")))
+    check("other projects get none", ps.get("saga")["generated"] == [])
+    ps.ensure("cadence", generated=[])
+    ps2 = P.ProjectStore(d / "projects.json")
+    check("a list the user cleared is never seeded back", ps2.get("cadence")["generated"] == [])
+
+    check("paths parse from commas, spaces and ./",
+          P.parse_paths("./a/b.plist, c.plist  d/") == ["a/b.plist", "c.plist", "d/"])
+    check("off clears", P.parse_paths("off") == [])
+    for bad in ("/etc/passwd", "../outside.plist"):
+        try:
+            P.parse_paths(bad)
+            check(f"{bad!r} is refused", False)
+        except ValueError:
+            check(f"{bad!r} is refused", True)
+
+    hp = {"projects": P, "project_store": ps2, "log": logging.getLogger("test")}
+    _bot_fns({"handle_projects"}, hp)
+    r = hp["handle_projects"]({"action": "generated", "slug": "cadence",
+                               "paths": ", ".join(_GEN)})
+    check("the dashboard route sets them", r.get("ok") and ps2.get("cadence")["generated"] == _GEN, str(r))
+    r = hp["handle_projects"]({"action": "generated", "slug": "nope", "paths": "a"})
+    check("an unknown project is refused", r.get("ok") is False)
+
+    # The bot's lookup: by the project whose checkout this is.
+    ps2.ensure("cadence", scope={"cwd": str(d)})
+    gp = {"project_store": ps2, "Path": Path}
+    _bot_fns({"generated_paths"}, gp)
+    check("the bot's lookup finds a project by its checkout",
+          gp["generated_paths"](d) == _GEN and gp["generated_paths"](d / "x") == [])
+    src = (BASE / "bot.py").read_text()
+    check("and it is what worktrees asks", "worktrees.generated_lookup = generated_paths" in src)
+    check("the dashboard has the field and its save",
+          'id="psgenerated"' in (BASE / "visualizer.py").read_text()
+          and 'action: "generated"' in (BASE / "visualizer.py").read_text())
+    check("!project generated is a command",
+          'arg.lower().startswith("generated ")' in src)
+    check("landing passes the project's list to merge",
+          'generated=list(proj.get("generated") or [])' in src)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

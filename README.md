@@ -617,6 +617,31 @@ anything, so without a test command nothing has shown that the code works.
 Having no suite is not the same as passing one, and Silkworm doesn't treat it
 that way.
 
+#### Files the build regenerates
+
+If building the project rewrites tracked files (Cadence's xcodegen build
+injects keys into both `Info.plist`s, which must never be committed), list them
+so they never count as uncommitted work:
+
+```
+!project generated ios/Cadence/Info.plist ios/CadenceWidget/Info.plist
+!project generated                   # show them
+!project generated off               # clear them
+```
+
+The dashboard's project settings have the same field. With them set:
+
+- A task checkout holding only those files is released when the task ends, and
+  by the orphan sweep. The files are put back as committed first. Untracked
+  files and any other change still keep the checkout, as before.
+- A landing whose branch is still held by the task's own checkout releases that
+  checkout and goes on, if it holds only generated files. If it holds real
+  changes, the refusal names the checkout's path and the changed files.
+- The base checkout doesn't count as dirty over them, and a landing never
+  writes them there: your local copies, keys included, stay byte-for-byte as
+  they were. If the branch itself changes one of them while your checkout holds
+  it modified, the landing is refused (`base-generated`) instead.
+
 ### 2. Turn on auto-merge
 
 There is no Slack command or dashboard button for this. Set it on the bot's

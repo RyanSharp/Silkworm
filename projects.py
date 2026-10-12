@@ -88,10 +88,48 @@ FIELDS: dict[str, tuple] = {
     # late.
     "ideate_at": ("",   "local HH:MM to look for improvements, or off"),
     "ideate_on": ("",   "YYYY-MM-DD the night was decided: run or skipped"),
+    # Files the project's own build rewrites, which therefore never count as
+    # uncommitted work: a task checkout holding only these is released (and
+    # they are put back as committed first), and the base checkout is not
+    # "dirty" over them. Cadence's xcodegen build injects keys into both
+    # Info.plists; counting those held fourteen checkouts and refused every
+    # landing. Relative to the repo root; a trailing "/" means a directory.
+    "generated": (list, "paths a build regenerates, never counted as uncommitted work"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),
 }
+
+
+#: Generated paths already known when the field was added, for records that
+#: predate it. Never re-applied once a record carries the field.
+SEED_GENERATED = {
+    "cadence": ["ios/Cadence/Info.plist", "ios/CadenceWidget/Info.plist"],
+}
+
+
+def parse_paths(text) -> list[str]:
+    """A list of repo-relative paths from a form or a command: commas,
+    spaces or newlines between them; "off"/"none"/"clear" for none."""
+    if isinstance(text, (list, tuple)):
+        items = [str(t) for t in text]
+    else:
+        text = (text or "").strip()
+        if text.lower() in ("off", "none", "clear"):
+            return []
+        items = re.split(r"[,\s]+", text)
+    out = []
+    for item in items:
+        item = item.strip()
+        while item.startswith("./"):
+            item = item[2:]
+        if not item:
+            continue
+        if item.startswith("/") or ".." in Path(item).parts:
+            raise ValueError(f"{item!r} is not a path inside the repository")
+        if item not in out:
+            out.append(item)
+    return out
 
 
 def slugify(name: str) -> str:
@@ -114,6 +152,10 @@ class ProjectStore:
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
         for slug, rec in (jsonstore.load(path, default={}) or {}).items():
+            # Seeded only where the field has never existed, so a list the
+            # user has since edited -- or cleared -- is never put back.
+            if "generated" not in rec and slug in SEED_GENERATED:
+                rec["generated"] = list(SEED_GENERATED[slug])
             for f in FIELDS:
                 rec.setdefault(f, default(f))
             self._data[slug] = rec
