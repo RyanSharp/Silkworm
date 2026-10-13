@@ -3758,27 +3758,32 @@ def test_turn_deadline_is_idleness():
     # A stand-in for the real binary: it must be executable and ignore the
     # flags run_turn always passes (-p, --output-format ...), so parameters
     # come through the environment instead of argv.
+    #
+    # Plain sh, not a Python interpreter: run_turn's silence clock starts at
+    # spawn, and under a loaded full-suite run a cold interpreter took longer
+    # than the 3s idle limit to print its first line -- so the "busy" turn was
+    # killed for silence it never chose, about one run in four, on main too.
+    # The shell's printf answers in milliseconds; what is measured is then the
+    # runner, not interpreter start-up.
     fake = Path(tempfile.mkdtemp()) / "fakeclaude"
     fake.write_text(
         "#!/bin/sh\n"
-        'exec "$PYBIN" -c \'\n'
-        "import json, os, sys, time\n"
-        "sys.stdin.read()\n"
-        "chatty = float(os.environ[\"CHATTY\"]); quiet = float(os.environ[\"QUIET\"])\n"
-        "end = time.time() + chatty\n"
-        "while time.time() < end:\n"
-        "    print(json.dumps({\"type\": \"system\", \"subtype\": \"init\",\n"
-        "                      \"session_id\": \"fake-session\"}), flush=True)\n"
-        "    time.sleep(0.2)\n"
-        "time.sleep(quiet)\n"
-        "print(json.dumps({\"type\": \"result\", \"result\": \"done\",\n"
-        "                  \"session_id\": \"fake-session\"}), flush=True)\n"
-        "'\n")
+        "cat > /dev/null\n"
+        "i=0\n"
+        'while [ "$i" -lt "$TICKS" ]; do\n'
+        "  printf '%s\\n' '{\"type\": \"system\", \"subtype\": \"init\", "
+        "\"session_id\": \"fake-session\"}'\n"
+        "  sleep 0.2\n"
+        "  i=$((i + 1))\n"
+        "done\n"
+        'sleep "$QUIET"\n'
+        "printf '%s\\n' '{\"type\": \"result\", \"result\": \"done\", "
+        "\"session_id\": \"fake-session\"}'\n")
     fake.chmod(0o755)
 
     def run(chatty, quiet, **kw):
-        env = {**os.environ, "PYBIN": sys.executable,
-               "CHATTY": str(chatty), "QUIET": str(quiet)}
+        # Busy for `chatty` seconds, one line every 0.2s, then silent for `quiet`.
+        env = {**os.environ, "TICKS": str(int(chatty / 0.2)), "QUIET": str(quiet)}
         return CR.run_turn("go", binary=str(fake), cwd=str(BASE),
                            permission_args=[], env=env, **kw)
 
