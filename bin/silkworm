@@ -22,6 +22,9 @@
     silkworm rework <id> --notes N  send back with your notes      } and exits 1
     silkworm close <id> [--round R] close research findings        }
     silkworm dig <id> --notes N [--round R]  research: dig deeper  }
+    silkworm retry <id> / run-next <id>   requeue failed work / put it first
+    silkworm tidy <checkout path>   remove a finished checkout holding only generated files
+    silkworm operator notes [--set T] | contained <id> | approvals | git …   the operator's own
     silkworm discard <branch>...    delete task branches, keeping their tips
     silkworm artifacts [--days N]   what artifacts/ retention would remove (removes nothing)
     silkworm learnings sync         commit/pull/push shared learnings via git
@@ -94,7 +97,7 @@ def learnings_file() -> Path:
 
 def bot_call(path: str, payload: dict, timeout: float = 3) -> dict:
     req = urllib.request.Request(
-        f"http://127.0.0.1:{bot_port()}{path}", data=json.dumps(payload).encode(),
+        f"http://127.0.0.1:{bot_port()}{path}", data=json.dumps(caller(payload)).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -562,6 +565,7 @@ import envfile                                       # noqa: E402
 import git_guard                                     # noqa: E402
 import jsonstore                                     # noqa: E402
 import workspaces                                    # noqa: E402
+import operator_role                                 # noqa: E402
 
 
 def check_unregistered(path: Path | None = None, roots=None) -> list[str]:
@@ -711,6 +715,24 @@ class BotUnreachable(Exception):
     """The bot could not be asked at all -- not the same as it saying no."""
 
 
+def caller(payload: dict) -> dict:
+    """`payload` stamped with who is asking, from the environment the bot set.
+
+    The bot holds an operator turn to its policy by these (operator_role
+    caller_is_operator): the role, and the thread as a second signal. The
+    operator's allowlist is prefix-matched against the command as typed, so
+    it has no way to run this with either changed. Nothing is added outside
+    a turn -- your own CLI and the dashboard are never asked about.
+    """
+    out = dict(payload)
+    role, thread = os.environ.get("SILKWORM_ROLE", ""), os.environ.get("SILKWORM_THREAD", "")
+    if role:
+        out["caller_role"] = role
+    if thread:
+        out["caller_thread"] = thread
+    return out
+
+
 def bot_ask(path: str, payload: dict, timeout: float = 30) -> dict:
     """bot_call for commands that must tell "no answer" from "refused".
 
@@ -720,7 +742,7 @@ def bot_ask(path: str, payload: dict, timeout: float = 30) -> dict:
     said, {} included -- the server answers {} when a handler raised.
     """
     req = urllib.request.Request(
-        f"http://127.0.0.1:{bot_port()}{path}", data=json.dumps(payload).encode(),
+        f"http://127.0.0.1:{bot_port()}{path}", data=json.dumps(caller(payload)).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -749,6 +771,12 @@ TASK_ACTIONS = {
     "close":   ("close",   {"--round": "round"}, ()),
     # A blank question is the bot's to refuse, and it does.
     "dig":     ("dig",     {"--notes": "notes", "--round": "round"}, ()),
+    # The dashboard's Retry and Run next. Tidy takes a checkout's path, not a
+    # task id: it removes a finished task's checkout holding only generated
+    # files, and refuses one holding anything else.
+    "retry":    ("retry",    {}, ()),
+    "run-next": ("run-next", {}, ()),
+    "tidy":     ("tidy",     {}, ()),
 }
 
 
@@ -766,7 +794,7 @@ def parse_action(cmd: str, argv: list) -> dict:
     itself: `silkworm accept tsk_1` reads tsk_1 as the id, not "accept".
     """
     action, flags, required = TASK_ACTIONS[cmd]
-    payload, ids, given = {"action": action, "by": "cli"}, [], set()
+    payload, ids, given = {"action": action, "by": default_by()}, [], set()
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -793,7 +821,32 @@ def parse_action(cmd: str, argv: list) -> dict:
     if cmd == "edit" and not given & {"--goal", "--title"}:
         raise ValueError(f"say what to change\n{action_usage(cmd)}")
     payload["id"] = ids[0]
+    if cmd == "tidy":
+        payload["path"] = ids[0]
     return payload
+
+
+def operator_state_path() -> Path:
+    # SILKWORM_OPERATOR_STATE for the tests, as SILKWORM_BOT_PORT is.
+    return Path(os.environ.get("SILKWORM_OPERATOR_STATE") or REPO / "operator.json")
+
+
+def default_by() -> str:
+    return "operator" if os.environ.get("SILKWORM_ROLE") == operator_role.ROLE else "cli"
+
+
+def operator_refusal(action: str, payload: dict, state=None) -> str:
+    """The CLI's half of the operator's policy: what it refuses before asking.
+
+    Only what needs no git and no store to decide -- accepting, approving,
+    releasing -- checked against your approvals read-only (the bot uses them
+    up). The rest (a drop, trader's landings) needs the task's branch, and the
+    bot decides it; it refuses the same verbs again either way.
+    """
+    if os.environ.get("SILKWORM_ROLE") != operator_role.ROLE:
+        return ""
+    state = state or operator_role.State(operator_state_path(), readonly=True)
+    return operator_role.check(state, operator_role.tasks_guard(action, payload, None))
 
 
 def do_task_action(cmd: str, argv: list, ask=None) -> int:
@@ -804,6 +857,10 @@ def do_task_action(cmd: str, argv: list, ask=None) -> int:
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return EXIT_USAGE
+    why = operator_refusal(payload["action"], payload)
+    if why:
+        print(f"refused: {cmd} {payload['id']}: {why}", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         r = ask("/tasks", payload, timeout=60)
     except BotUnreachable as e:
@@ -821,6 +878,71 @@ def do_task_action(cmd: str, argv: list, ask=None) -> int:
     extra = "; ".join(x for x in (r.get("note"), r.get("held")) if x)
     print(line + (f" ({extra})" if extra else ""))
     return EXIT_OK
+
+
+OPERATOR_USAGE = ("usage: silkworm operator notes [--set TEXT] | "
+                  "contained <task id> | approvals | git [--in PATH] <read-only git command>")
+
+
+def do_operator(argv, ask=None, notes_path=None, state=None) -> int:
+    """`silkworm operator ...`: the operator's own bookkeeping.
+
+    notes            print its notes file
+    notes --set T    replace it (at most 4KB; refused, not cut, if longer)
+    contained <id>   whether a task's branch is already on its base, by
+                     content -- exit 0 contained, 1 not (or refused), 3 bot down
+    approvals        what you have approved for it, unused
+    git [--in P] …   a read-only git command (operator_role.GIT_READS), vetted
+                     for options that write a file or run a program
+    """
+    ask = ask or bot_ask
+    notes_path = notes_path or (REPO / "operator_notes.md")
+    sub = argv[0] if argv else ""
+    if sub == "notes" and len(argv) == 1:
+        print(operator_role.read_notes(notes_path) or "(no notes yet)")
+        return EXIT_OK
+    if sub == "notes" and len(argv) == 3 and argv[1] == "--set":
+        why = operator_role.write_notes(notes_path, argv[2])
+        if why:
+            print(f"refused: {why}", file=sys.stderr)
+            return EXIT_REFUSED
+        print(f"ok: notes saved ({len(argv[2].strip().encode())} bytes)")
+        return EXIT_OK
+    if sub == "contained" and len(argv) == 2:
+        try:
+            r = ask("/tasks", {"action": "contained", "id": argv[1]})
+        except BotUnreachable as e:
+            print(f"not done: {e}", file=sys.stderr)
+            return EXIT_UNREACHABLE
+        if not r.get("ok"):
+            print(f"refused: {r.get('error') or 'no answer'}", file=sys.stderr)
+            return EXIT_REFUSED
+        print(f"{'contained' if r.get('contained') else 'not contained'}: "
+              f"{r.get('branch')}: {r.get('why')}")
+        return EXIT_OK if r.get("contained") else EXIT_REFUSED
+    if sub == "git":
+        # Read-only git, vetted: raw git is not on the operator's allowlist
+        # because `git log --output=<file>` writes anywhere (operator_role).
+        rest, where = list(argv[1:]), Path.cwd()
+        if rest[:1] == ["--in"] and len(rest) >= 2:
+            where, rest = Path(rest[1]).expanduser(), rest[2:]
+        why = operator_role.git_refusal(rest)
+        if why:
+            print(f"refused: {why}", file=sys.stderr)
+            return EXIT_REFUSED if rest else EXIT_USAGE
+        try:
+            return subprocess.run(operator_role.git_command(rest), cwd=str(where),
+                                  timeout=120).returncode
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"refused: {e}", file=sys.stderr)
+            return EXIT_REFUSED
+    if sub == "approvals" and len(argv) == 1:
+        state = state or operator_role.State(operator_state_path(), readonly=True)
+        live = state.approvals()
+        print("\n".join(f"{a['guard']} {a['item']}" for a in live) or "(none)")
+        return EXIT_OK
+    print(OPERATOR_USAGE, file=sys.stderr)
+    return EXIT_USAGE
 
 
 def _row(t: dict, *keys) -> dict:
@@ -1077,8 +1199,14 @@ def base_branch(repo: Path, git=git_out) -> str:
 
 def run_suite() -> int:
     py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+    # As the bot's own verification runs it: outside any turn. Run from inside
+    # one (deploy --after-turn), the turn's variables would make the suite's
+    # own CLI runs behave as that turn -- an operator's, refused.
+    env = git_guard.strip(dict(os.environ))
+    for k in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_DEFERS", "SILKWORM_BOT"):
+        env.pop(k, None)
     return subprocess.run([py, str(REPO / "tests" / "test_invariants.py")],
-                          capture_output=True, text=True).returncode
+                          capture_output=True, text=True, env=env).returncode
 
 
 def busy_line(row: dict) -> str:
@@ -1201,6 +1329,11 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
         print(f"{WORM} --now and --after-turn do not go together\n{DEPLOY_USAGE}")
         return 2
 
+    if os.environ.get("SILKWORM_ROLE") == operator_role.ROLE:
+        why = operator_deploy_refusal(call, after_turn, skip_tests)
+        if why:
+            print(f"{WORM} refused for the operator: {why}")
+            return 1
     print(f"{WORM} deploy {repo}" + (" (after this turn)" if after_turn else ""))
     if after_turn:
         return deploy_after_turn(repo, skip_tests=skip_tests, max_wait=max_wait,
@@ -1244,6 +1377,34 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
     finally:
         release_deploy_lock(lock_path, me)
     return code
+
+
+def operator_deploy_refusal(call, after_turn: bool, skip_tests: bool) -> str:
+    """Why the operator may not deploy now, or "" if it may.
+
+    Its deploys are the routine kind only: after its own turn, with the full
+    suite, when main is ahead of what is running, and with nothing else
+    running for the restart to interrupt. Anything else is yours to decide.
+    """
+    if not after_turn:
+        return "only `deploy --after-turn`"
+    if skip_tests:
+        return "not with --skip-tests"
+    st = call("/status", {}) or {}
+    rev = st.get("revision") or {}
+    if not st.get("online"):
+        return "the bot did not answer, so whether anything is running is unknown"
+    if rev.get("state") != "stale" or not (rev.get("behind") or 0) > 0:
+        return (f"main is not ahead of the running revision "
+                f"({rev.get('state') or 'unknown'}); there is nothing to deploy")
+    running = (call("/tasks", {"action": "list", "state": "running"}) or {})
+    if "tasks" not in running:
+        return "could not list running tasks"
+    me = os.environ.get("SILKWORM_THREAD", "")
+    others = [t.get("id") for t in running["tasks"] if not me or t.get("thread") != me]
+    if others:
+        return f"{len(others)} task(s) still running ({', '.join(map(str, others[:5]))})"
+    return ""
 
 
 def deploy_onto(call, head: str, *, now: bool, max_wait: float, manager=None,
@@ -1977,6 +2138,8 @@ def main() -> None:
         do_status()
     elif cmd in TASK_ACTIONS:
         sys.exit(do_task_action(cmd, args[1:]))   # args[0] is the subcommand
+    elif cmd == "operator":
+        sys.exit(do_operator(args[1:]))           # args[0] is the subcommand
     elif cmd == "logs":
         os.execvp("tail", ["tail", "-n", "40", "-f", str(LOGS / "bot.log")])
     elif cmd in ("help", "-h", "--help"):

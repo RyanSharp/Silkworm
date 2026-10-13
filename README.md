@@ -58,6 +58,8 @@ Claude Code session**.
 | `!terminal` | Get the command to continue this thread in your terminal |
 | `!stats` | This thread's session info (model, turns, cost) |
 | `!sessions` | List all active thread sessions |
+| `!operator` / `!operator where` | Make this thread the operator's home / say which thread is (see [The operator](#the-operator)) |
+| `!approve <what> <item>` / `!approve` | Let the operator do one held-back thing once / list what is approved |
 
 ## Prerequisites
 
@@ -148,6 +150,7 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `TASK_WORKERS` | `1` | How many queued tasks run at once (each is a Claude session). Reviews are not counted: they have their own lane |
 | `REVIEW_WORKERS` | `1` | How many reviews run at once, alongside the task workers; `0` hands reviews back to the task workers |
 | `DIGEST_AT` | `08:00` | Local time to post the daily digest (last 24h per project: landed, released, refused, failed or held, reran, stuck, waiting on you, unmerged, cost) to your DM; once a day, caught up after a restart; `off` to stop |
+| `OPERATOR_SWEEP_AT` | `08:30` | Local time of the operator's daily sweep, once the digest has gone out; caught up after a restart; `off` to stop (see [The operator](#the-operator)) |
 | `MAX_OPEN_PROPOSALS` | `4` | Untriaged proposals a project may hold before its nightly review pauses |
 
 ## Authentication for headless turns
@@ -838,6 +841,10 @@ silkworm edit <id> [--goal G] [--title T]  # change work that has not run yet
 silkworm rework <id> --notes N             # send back with your notes (Send back)
 silkworm close <id> [--round R]            # research: close the findings
 silkworm dig <id> --notes N [--round R]    # research: Dig deeper with a question
+silkworm retry <id>                        # requeue failed or cancelled work (Retry)
+silkworm run-next <id>                     # put queued work first (Run next)
+silkworm tidy <checkout path>              # remove a finished task's checkout (an hour
+                                           #   old+) holding only generated files
 silkworm status --json                     # the board as one JSON document
 ```
 
@@ -884,6 +891,77 @@ Unfiled work is under the project `""`; `round` and `step` appear only on
 research findings and on tasks that left you a step. A part the bot could not
 answer is named in `errors` and makes `ok` false and the exit code 1 — "could
 not ask" never reads as "nothing there".
+
+## The operator
+
+The operator is Silkworm's head agent: one Claude session with a view of every
+project, which manages tasks, routes work and runs deploys so you only make the
+decisions that are yours. It is not in front of every message. Send
+`!operator` in a DM thread to make that thread its home; messages there go to
+it, and every other thread is unchanged. `!operator where` says which thread
+it is (claiming another moves it).
+
+**What it knows.** Its context is rebuilt from live state at the start of every
+turn and wake-up, not remembered from the conversation: each project's brief
+(or CLAUDE.md excerpt), readiness and settings (`auto_merge`, `publish`,
+`test_cmd`, `generated`, base branch); `silkworm status --json`; landings from
+the last two days; bases failing their own tests; releases tagged in the last
+day; recent `deploy --after-turn` log lines; and a notes file it keeps itself
+(`operator_notes.md`, at most 4KB, replaced with `silkworm operator notes
+--set "…"`). The whole block is held to 16,000 characters; the notes are always
+kept, and anything cut says so.
+
+**What it can run.** An allowlist, not `--dangerously-skip-permissions`: the
+action commands above, `silkworm operator contained <id>` and `operator notes`,
+`deploy --after-turn`, `task` (which files proposals) and `defer`, and
+Read/Grep/Glob. No `curl`, so it reaches the bot only through `bin/silkworm`,
+which stamps every request with the role and thread the bot gave the turn. No
+raw git either — `git log --output=<file>` writes any file, its own approvals
+included, and an allowlist prefix cannot exclude a flag — so it reads history
+through `silkworm operator git [--in <repo>] <log|diff|show|status|…>`, which
+runs only read-only subcommands and refuses options that write a file or run
+a program. Its git also carries the implementor guard: no pushes, no ref moves.
+
+**What it does on its own:** land or retry refused landings; drop branches
+proven to be on their base already — by content, not patch-id (`operator
+contained` asks whether merging the branch into its base would change
+anything, so a squashed or rebased landing counts, and a change the base took
+and later reverted does not; a merge that conflicts proves nothing, so that
+drop waits for you); retry failed work, such as quota and overload failures;
+rework a landing git refused onto current main; Run next to unblock; tidy a
+finished task's checkout (an hour old or more) whose only changes are
+generated files; and, when
+Silkworm's main is ahead of the running revision and nothing else is running,
+`silkworm deploy --after-turn` (with the full suite — the CLI refuses it any
+other deploy).
+
+**What it may not do, enforced by the CLI and again by the bot:** accept a
+proposal or approve flagged work — including by the side doors: Retry or Send
+back on a proposal, Retry of one you dismissed, an edit that rewrites a goal,
+a send-back of anything but a refused landing (that is a new goal), and Land
+on anything not `done`; start a release; switch publish on (it
+cannot push either); change trader's settings, or land a trader branch that
+touches its live configuration (`scripts/paper_trade.py`, `trader/config.py`,
+`trader/research/deployed_universe.py`, `data/research/liquid_universe.json`,
+`ops/`, `.env`); or drop a branch it has not proven redundant. Each refusal
+names the approval that lifts it. You give one with your own Slack message:
+
+```text
+!approve accept tsk_…        !approve release cadence     !approve publish cadence
+!approve delete tsk_…        !approve trader-config tsk_… (or trader, for its settings)
+!approve                     # what is approved and unused
+```
+
+An approval covers that one item, is used up by the action it allows, and
+lapses after a day. Only an allowlisted person's Slack message makes one — not
+the web chat, not the bot, and there is no route for it.
+
+**The daily sweep.** Once a day at `OPERATOR_SWEEP_AT` (default `08:30`, or
+`off`), and only after the digest has gone out (unless the digest is off), the
+operator wakes in its thread — a wake-up like any other, so it runs in the wake
+lane and catches up after a restart — works the routine pile, and posts exactly
+one message: what it did, then what needs you, with the question to answer or
+the `!approve` to send for each.
 
 ## Moving a thread to the terminal
 

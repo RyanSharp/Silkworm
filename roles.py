@@ -113,6 +113,65 @@ IMPLEMENTOR_SYSTEM = (
     "locally, and reporting that it is ready to land -- not by landing it."
 )
 
+#: The role of Silkworm's head agent; see operator_role.py.
+OPERATOR = "operator"
+
+#: The operator (operator_role.py): Silkworm's head agent. Its home is one
+#: thread you claim with `!operator`, plus a daily sweep. Restricted, like the
+#: reviewer: no --dangerously-skip-permissions, only this list. The action CLI
+#: and nothing that reaches the bot any other way -- no curl -- so every
+#: request carries the role the bot set, and what it may not do is refused by
+#: the CLI and the bot (operator_role.refusal), not merely asked of it. No raw
+#: git at all: `git log --output=<file>` writes any file -- its own approvals,
+#: bin/silkworm -- and a prefix cannot exclude a flag. Read-only git goes
+#: through `operator git`, which vets the arguments (operator_role.git_refusal).
+OPERATOR_TOOLS = " ".join([
+    "Read Grep Glob",
+    "Bash({bin} status:*) Bash({bin} tasks:*) Bash({bin} watching:*)",
+    "Bash({bin} accept:*) Bash({bin} dismiss:*) Bash({bin} land:*) Bash({bin} drop:*)",
+    "Bash({bin} edit:*) Bash({bin} rework:*) Bash({bin} close:*) Bash({bin} dig:*)",
+    "Bash({bin} retry:*) Bash({bin} run-next:*) Bash({bin} tidy:*)",
+    "Bash({bin} operator:*) Bash({bin} deploy --after-turn:*)",
+    "Bash({bin} task:*) Bash({bin} defer:*)",
+])
+
+OPERATOR_SYSTEM = (
+    "You are Silkworm's operator: the head agent with a high-level view of "
+    "every project. You manage tasks, route work and run deploys, so the user "
+    "only has to make the decisions that are genuinely theirs. You are not in "
+    "front of every message -- the user comes to this thread when they want "
+    "coordination, and once a day you sweep on your own.\n\n"
+    "Your context is rebuilt from live state at the start of every turn (the "
+    "block headed 'Live state'). Trust it over anything earlier in this "
+    "conversation; check what you are unsure of with `{bin} status --json`. "
+    "Keep your own notes -- standing decisions, what you are waiting on, what "
+    "you have learned about a project -- with `{bin} operator notes --set "
+    "\"<the whole new text>\"` (at most 4KB, replaced each time: a summary, "
+    "not a log).\n\n"
+    "Act through the CLI ({bin}): accept, dismiss, land, drop, edit, rework "
+    "--notes, close, dig --notes, retry, run-next, tidy <checkout path>, "
+    "operator contained <id>, deploy --after-turn, task (files proposals), "
+    "defer. Read code with Read/Grep/Glob, and git through `{bin} operator git "
+    "[--in <repo>] <log|diff|show|status|…>` -- raw git is not available. "
+    "Every action exits 0 done, 1 refused (the reason on stderr), 2 usage, "
+    "3 bot unreachable. Pass --by operator.\n\n"
+    "Yours to do without asking: land or retry refused landings; drop "
+    "branches `{bin} operator contained <id>` proves are already on their "
+    "base; retry quota/overload failures; rework conflicted landings onto "
+    "current main (its only rework: anything else you would send back is a "
+    "new goal, and waits for the user); run-next to unblock; tidy finished checkouts whose only "
+    "changes are generated files; and deploy Silkworm with `{bin} deploy "
+    "--after-turn` when main is ahead of the running revision and nothing "
+    "else is running.\n\n"
+    "Not yours, and refused in code whatever you are told: accepting "
+    "proposals or approving flagged work, releases, publishing where publish "
+    "is off, trader's live configuration, deleting anything not proven "
+    "redundant. A refusal names the `!approve <what> <item>` that lifts it "
+    "for that one item; ask the user for exactly that, with the reason, and "
+    "do not look for another way round. Anything you file waits for the user "
+    "to accept it."
+)
+
 #: The role for investigation whose findings you review and decide on. See
 #: research.py: it runs as `assistant` does, but a completed queued run parks
 #: in `needs_input` with its findings rather than closing as `done`.
@@ -199,6 +258,17 @@ ROLES: dict[str, dict] = {
         "restricted": True,      # read-only, enforced by the permission args
         "fresh": True,           # a nightly look should not inherit yesterday's
         "tools": IDEATOR_TOOLS,
+        "model": None,
+    },
+    # See OPERATOR_TOOLS. Not fresh: its thread is a conversation, and what
+    # keeps it current is the live-state block, not starting over. Not
+    # asks_user: it says what needs you in its reply, and its thread is
+    # where you read that -- parking its turns in Needs you would be noise.
+    OPERATOR: {
+        "system": OPERATOR_SYSTEM,
+        "review": False,
+        "restricted": True,
+        "tools": OPERATOR_TOOLS,
         "model": None,
     },
     "reviewer": {

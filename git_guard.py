@@ -56,7 +56,10 @@ ID_VAR = "SILKWORM_TASK_ID"
 #: caches or run backtests, so it is not made read-only) -- either way the
 #: base, the remote and the tags are not theirs to move. A reviewer or ideator
 #: is read-only already; an `assistant` task is a conversation the user is in.
-GUARDED_ROLES = frozenset({"implementor", "researcher"})
+#: The operator lands, pushes and publishes only through Silkworm's own landing
+#: (which runs in the bot, unguarded); from its own git it moves nothing, and a
+#: push from there would skip the publish setting it is held to.
+GUARDED_ROLES = frozenset({"implementor", "researcher", "operator"})
 #: The same set as a shell `case` pattern, sorted so the hook text is stable.
 _GUARDED_PATTERN = "|".join(sorted(GUARDED_ROLES))
 

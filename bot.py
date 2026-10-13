@@ -64,6 +64,7 @@ import recovery
 import releases
 import retry
 import merge
+import operator_role
 import summaries
 import turncost
 import verify
@@ -1089,6 +1090,8 @@ HELP = """*Commands* (send inside a thread):
 • `!stats` — this thread's session info (model, turns, cost)
 • `!sessions` — list all active thread sessions
 • `!help` — this message
+• `!operator` — make this thread the operator's home: Silkworm's head agent, which works the routine pile (and sweeps daily); `!operator where` says which thread it is
+• `!approve <accept|release|publish|trader-config|delete> <task id or project>` — let the operator do that one held-back thing, once (within a day); `!approve` lists what is approved
 • `!project <name>` — file this thread's tasks under a project
 • `!project github create` — make a private GitHub repo for this thread's project and push it
 • `!project new <Name> [path] [--github] [--adopt] -- <purpose>` — make (or adopt) a project's directory, git repo and CLAUDE.md, register it, and move this thread there; `--github` also creates a private GitHub repo
@@ -1491,6 +1494,12 @@ def handle_releases(payload: dict) -> dict:
     frees a wedged thread.
     """
     action = payload.get("action", "plan")
+    # Asked only of a request made from inside a turn (the CLI stamps those);
+    # the dashboard and your own CLI never carry the stamp.
+    if payload.get("caller_role") or payload.get("caller_thread"):
+        refused = operator_refused("releases", action, payload)
+        if refused:
+            return refused
     slug = (payload.get("slug") or "").strip().lower()
     if action == "list":
         return {"ok": True, "projects": releasable_projects()}
@@ -1532,6 +1541,8 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
     lower = cmd.lower()
     if lower in ("!help", "!commands"):
         say(text=HELP, thread_ts=thread_ts)
+    elif lower.startswith("!operator"):
+        say(text=operator_command(cmd[len("!operator"):].strip(), key), thread_ts=thread_ts)
     elif lower.startswith("!brief"):
         arg = cmd[len("!brief"):].strip()
         slug = (store.get(key) or {}).get("project", "")
@@ -2006,6 +2017,11 @@ BOARD_POLL_S = 60
 # digest.py. Its once-a-day marker lives here.
 DIGEST_STATE = BASE_DIR / "digest.json"
 DIGEST_AT = os.environ.get("DIGEST_AT", digest.DEFAULT_AT).strip()
+# The operator (operator_role.py): its home thread, sweep day and your
+# approvals; the notes it keeps; and when its daily sweep runs ("off" to stop).
+OPERATOR = operator_role.State(BASE_DIR / "operator.json")
+OPERATOR_NOTES = BASE_DIR / "operator_notes.md"
+OPERATOR_SWEEP_AT = os.environ.get("OPERATOR_SWEEP_AT", operator_role.DEFAULT_SWEEP_AT).strip()
 _harvest_lock = threading.Lock()
 
 
@@ -2317,6 +2333,53 @@ def land_or_drop(action: str, payload: dict) -> dict:
     return {"ok": True, "note": f"dropped; recover with {tag}" if tag else "dropped"}
 
 
+def tidy_checkout(payload: dict) -> dict:
+    """Remove a finished task's checkout whose only changes are generated.
+
+    Generated files are what a build writes and the next build writes again
+    (worktrees.changes leaves them out of "work"), so a checkout holding
+    nothing else holds nothing anyone made. Anything more -- a file somebody
+    wrote, an untracked directory -- is refused with what it holds: whether
+    that is worth keeping is a person's call. So is a checkout a live task
+    still owns. The branch goes only if it carries no commits (release()).
+    """
+    path = str(payload.get("path") or "").strip()
+    try:
+        where = Path(path).expanduser().resolve() if path else None
+    except (OSError, ValueError):
+        where = None
+    # Only a directory directly under the worktrees root, belonging to a repo
+    # that is somewhere else: release() would rmtree anything else it is given.
+    tid = worktrees.task_of(where) if where else ""
+    repo = worktrees.main_repo(where) if where and where.is_dir() else None
+    if (not tid or not repo or where.parent != worktrees.ROOT.resolve()
+            or repo.resolve() == where):
+        return {"ok": False, "error": "not a task checkout"}
+    path = str(where)
+    owner = task_store.get(tid)
+    if not owner:
+        return {"ok": False, "error": f"no task {tid} owns it; a checkout nobody "
+                                      "filed is not Silkworm's to remove"}
+    if owner.get("state") not in tasks.TERMINAL or tid in live_worktree_tasks():
+        return {"ok": False, "error": f"{tid} still owns it"}
+    if worktrees.age_s(where) < worktrees.MIN_AGE_S:
+        return {"ok": False, "error": "it was touched within the hour; leave it a while"}
+    left = worktrees.changes(path)
+    if left is None:
+        return {"ok": False, "error": "git could not say what it holds"}
+    if left:
+        return {"ok": False, "error": "it holds work, not only generated files: "
+                                      + ", ".join(left[:8])}
+    with repo_guard(str(repo)):
+        restored = worktrees.generated_changes(path)
+        removed, note = worktrees.release(Path(path), delete_empty_branch=True)
+    if not removed:
+        return {"ok": False, "error": note or "it could not be removed"}
+    log.info("tidied %s (%d generated file(s)) via %s", path, len(restored),
+             payload.get("by", "ui"))
+    return {"ok": True, "note": f"removed; {note}" if note else "removed"}
+
+
 def _with_costs(items: list) -> list:
     """Each task with `cost_total`: its own cost plus its reviews', and
     whether that is complete. Copies -- the store's records are not touched."""
@@ -2463,6 +2526,12 @@ def edit_task(payload: dict) -> dict:
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
+    # Asked only of a request made from inside a turn (the CLI stamps those);
+    # the dashboard and your own CLI never carry the stamp.
+    if payload.get("caller_role") or payload.get("caller_thread"):
+        refused = operator_refused("tasks", action, payload)
+        if refused:
+            return refused
     project = payload.get("project") or ""
     def _filter(items):
         return [t for t in items if not project or (t.get("project") or "") == project]
@@ -2654,6 +2723,18 @@ def handle_tasks(payload: dict) -> dict:
             return {"ok": False, "error": str(e)}
     if action == "edit":
         return edit_task(payload)
+    if action == "contained":
+        # Read-only: whether a task's branch is already on its base, by
+        # content -- what an operator must show before it drops one.
+        rec = task_store.get(payload.get("id", ""))
+        if not rec:
+            return {"ok": False, "error": "unknown task"}
+        rec = dict(rec, id=payload.get("id"))
+        ok, why = task_contained(rec)
+        return {"ok": True, "contained": ok, "why": why,
+                "branch": branches.name_for(rec)}
+    if action == "tidy":
+        return tidy_checkout(payload)
     if action == "run-next":
         try:
             t = task_store.run_next(payload.get("id", ""), on=payload.get("on", True) is not False,
@@ -2766,6 +2847,12 @@ def handle_tasks(payload: dict) -> dict:
 def handle_projects(payload: dict) -> dict:
     """Route for /projects — list, create and archive (localhost-trusted)."""
     action = payload.get("action", "list")
+    # Asked only of a request made from inside a turn (the CLI stamps those);
+    # the dashboard and your own CLI never carry the stamp.
+    if payload.get("caller_role") or payload.get("caller_thread"):
+        refused = operator_refused("projects", action, payload)
+        if refused:
+            return refused
     if action == "list":
         return {"ok": True,
                 # So the nightly panel can show a project as paused rather
@@ -3059,6 +3146,9 @@ def handle_defer(payload: dict) -> dict:
     task = task_store.create(
         goal, title=goal[:70], state=tasks.BLOCKED, driver="queue",
         source="defer", thread=key, project=entry.get("project") or "",
+        # A wake-up resumes the conversation that scheduled it, as what it was:
+        # the operator's thread wakes as the operator, on its allowlist.
+        role=operator_role.ROLE if key == OPERATOR.thread() else "assistant",
         # The runner executes it, but it is the same conversation resuming the
         # same session: it belongs in the thread's checkout, not a worktree.
         isolate=False,
@@ -3375,6 +3465,12 @@ def handle_prompt(event: dict, say, client) -> None:
     text = MENTION_RE.sub("", event.get("text", "")).strip()
     files = event.get("files") or []
 
+    if text.lower().startswith("!approve"):
+        # Before handle_command, because only here is it known who sent it.
+        say(text=approve_command(text, user, event), thread_ts=thread_ts)
+        if not event.get("_web") and store.get(key):
+            store.update(key, last_msg_ts=msg_ts)
+        return
     if text.startswith("!") and handle_command(text, key, say, thread_ts):
         # Commands get the same redelivery guard as prompts: a restart-replayed
         # !reset or !takeover would otherwise run a second time. Only for
@@ -3409,6 +3505,9 @@ def handle_prompt(event: dict, say, client) -> None:
     session_id = entry.get("session_id")
     model = entry.get("model") or CLAUDE_MODEL
     cwd = Path(entry.get("cwd")) if entry.get("cwd") else resolve_cwd(client, channel)
+    # The operator's home thread runs as the operator, on its allowlist, with
+    # live state rebuilt into every turn. Every other thread is unchanged.
+    role_name = roles.OPERATOR if key == OPERATOR.thread() else "assistant"
 
     # Assemble the prompt: [thread context] + text + [attachment notes]
     prompt = text or "(see the attached files)"
@@ -3452,12 +3551,14 @@ def handle_prompt(event: dict, say, client) -> None:
     learn_block = render_block(learnings.applicable(str(cwd)))
     if learn_block:
         system_note += "\n\n" + learn_block
+    if role_name == roles.OPERATOR:
+        system_note += "\n\n" + operator_note()
 
     # Every prompt is a task now. Created before the lock, so a message
     # waiting its turn is visibly queued rather than invisible.
     task = task_store.create(
         text or "(attached files)",
-        role="assistant",
+        role=role_name,
         source="ui" if event.get("_web") else "slack",
         source_ref=msg_ts,
         thread=key,
@@ -3484,8 +3585,13 @@ def handle_prompt(event: dict, say, client) -> None:
     if lock.locked():
         progress.update(":hourglass_flowing_sand: _Queued behind an earlier message in this thread…_")
 
+    # The operator writes nothing in its checkout, and its own drop or tidy
+    # of a Silkworm task takes this checkout's repo_guard inside the request
+    # it makes -- which, held by its own turn, would wait on itself.
+    guard = (contextlib.nullcontext() if role_name == roles.OPERATOR
+             else repo_guard(cwd, progress))
     try:
-        with lock, repo_guard(cwd, progress):
+        with lock, guard:
             entry = store.get(key) or {}
             session_id = entry.get("session_id")
             log.info("thread=%s session=%s cwd=%s prompt=%r", key, session_id or "NEW", cwd, text[:120])
@@ -3518,9 +3624,15 @@ def handle_prompt(event: dict, say, client) -> None:
                 RUNNING_TASKS[task_id] = handle
 
             kwargs = dict(
-                binary=CLAUDE_BIN, cwd=cwd, permission_args=permission_args(),
+                binary=CLAUDE_BIN, cwd=cwd,
+                permission_args=roles.permission_args(role_name, permission_args(),
+                                                      bin=SILKWORM_BIN),
                 model=model, append_system_prompt=system_note,
-                extra_args=CLAUDE_EXTRA_ARGS, env=claude_env(key),
+                extra_args=CLAUDE_EXTRA_ARGS,
+                # The operator's turn carries its role and task id, for the CLI
+                # and for git_guard's hooks, which refuse it pushes and ref moves.
+                env=(claude_env(key, role=role_name, task_id=task_id)
+                     if role_name == roles.OPERATOR else claude_env(key)),
                 timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                 on_init=on_init, on_activity=on_activity, on_start=on_start,
             )
@@ -4023,12 +4135,18 @@ def execute_task(task: dict) -> None:
         "You are completing a task; report the outcome concisely. "
         f"If you create a file the user should receive, copy it into {outbox}."
     )
-    if task.get("source") == "defer":
+    if role_name == roles.OPERATOR and operator_role.is_sweep(task):
+        pass                     # its own instructions come with operator_note
+    elif task.get("source") == "defer":
         system_note += "\n\n" + defer.WAKE_NOTE
     else:
         system_note += "\n\n" + defer.HOW_TO.format(bin=SILKWORM_BIN)
     role_system = roles.system_prompt(role_name, bin=SILKWORM_BIN)
-    if role_system:
+    if role_name == roles.OPERATOR:
+        # Its role, the sweep's instructions if this is one, and the live
+        # state -- rebuilt now, not remembered from the session.
+        system_note += "\n\n" + operator_note(task)
+    elif role_system:
         system_note += "\n\n" + role_system
     # Not on a wake-up: a watch already has its own way to say "over to you"
     # (defer.STOPPED), and its quiet replies are matched exactly.
@@ -4047,8 +4165,12 @@ def execute_task(task: dict) -> None:
     mine = [None]                     # this turn's RunHandle, once it has one
     turn_id = uuid.uuid4().hex        # names this turn's recovery marker
     lock = _thread_lock(key)
+    # As in handle_prompt: the operator writes nothing here, and holding the
+    # checkout would make its own drop or tidy of a Silkworm task wait on it.
+    guard = (contextlib.nullcontext() if role_name == roles.OPERATOR
+             else repo_guard(cwd, progress))
     try:
-        with lock, repo_guard(cwd, progress):
+        with lock, guard:
             entry = store.get(key) or {}
             # A fresh role starts its own session; resuming the thread's would
             # hand the reviewer the very conversation it is meant to audit. An
@@ -4108,6 +4230,22 @@ def execute_task(task: dict) -> None:
                 uploaded = upload_outbox(app.client, outbox, channel, thread_ts, key)
             finally:
                 shutil.rmtree(outbox, ignore_errors=True)
+
+        total = (store.get(key) or {}).get("cost", 0.0)
+        footer = (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
+                  f"${turn_cost:.4f} · thread total ${total:.2f} {COST_NOTE}_")
+        if role_name == roles.OPERATOR and operator_role.is_sweep(task):
+            # The sweep promises one message: what it did, what needs you.
+            # Never swallowed as "nothing yet", never chunked into several.
+            operator_role.post_sweep(app.client, channel, thread_ts, progress.ts,
+                                     to_mrkdwn(result.text), footer, SLACK_MSG_LIMIT)
+            task_store.update(tid, session_id=result.session_id,
+                              result={"text": result.text[:4000],
+                                      **costs.add_run(task_store.get(tid), turn_cost),
+                                      "cost_reported_total": result.cost_usd,
+                                      "files_uploaded": uploaded})
+            task_state(tid, tasks.DONE, "sweep reported")
+            return
 
         if task.get("source") == "defer" and result.text.strip() == defer.QUIET:
             # The check ran and found nothing worth interrupting for. Say
@@ -4178,11 +4316,9 @@ def execute_task(task: dict) -> None:
                            if removed else
                            f"\n\n_:deciduous_tree: Isolated checkout {note}._")
 
-        total = (store.get(key) or {}).get("cost", 0.0)
         verdict = ("\n\n" + verify.summary(checked)) if checked else ""
         parts = chunk(to_mrkdwn(result.text + wt_note + verdict))
-        parts[-1] += (f"\n\n_:stopwatch: {fmt_duration(result.duration_ms)} · "
-                      f"${turn_cost:.4f} · thread total ${total:.2f} {COST_NOTE}_")
+        parts[-1] += footer
         progress.finalize(parts[0])
         for part in parts[1:]:
             app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=part)
@@ -5969,6 +6105,238 @@ def _digest_scheduler() -> None:
         time.sleep(300)
 
 
+# --- the operator (operator_role.py) -------------------------------------------
+
+def task_contained(task: dict) -> tuple[bool, str]:
+    """Whether a finished task's branch is already on its base, by content."""
+    repo = branches.repo_for(task)
+    if not repo:
+        return False, "it has no repository"
+    return operator_role.contained(repo, branches.name_for(task), task_base(task) or "HEAD")
+
+
+def task_live_paths(task: dict) -> list:
+    """The live-configuration paths a task's branch would land, if any."""
+    prefixes = operator_role.LIVE_CONFIG.get((task.get("project") or "").lower())
+    repo = branches.repo_for(task)
+    if not prefixes or not repo:
+        return []
+    return operator_role.live_paths_touched(repo, branches.name_for(task),
+                                            task_base(task) or "HEAD", prefixes)
+
+
+def operator_refused(route: str, action: str, payload: dict) -> dict | None:
+    """The bot's half of the operator's policy: a refusal, or None to go on.
+
+    Asked at the top of /tasks, /projects and /releases, before anything is
+    read or changed. Only of requests an operator turn made (the CLI stamps
+    them; see operator_role.caller_is_operator) -- a click on the dashboard or
+    your own CLI is never asked. An approval you gave is used up here, as the
+    request it covers goes ahead.
+    """
+    if not operator_role.caller_is_operator(payload, OPERATOR.thread()):
+        return None
+    if route == "tasks":
+        rec = task_store.get(str(payload.get("id") or ""))
+        guard = operator_role.tasks_guard(
+            action, payload, dict(rec, id=payload.get("id")) if rec else None,
+            contained=task_contained, live_paths=task_live_paths)
+    elif route == "projects":
+        guard = operator_role.projects_guard(action, payload)
+    else:
+        guard = operator_role.releases_guard(action, payload)
+    why = operator_role.check(OPERATOR, guard, consume=True)
+    if why:
+        log.info("operator refused: %s %s (%s)", route, action, guard)
+        return {"ok": False, "error": why, "refused": guard[0]}
+    if guard:
+        log.info("operator: %s %s went ahead on your approval of %s %s",
+                 route, action, *guard)
+    return None
+
+
+_CLI = {}
+
+
+def _cli_module():
+    """bin/silkworm loaded as a module, once (it has no .py name to import)."""
+    if "mod" not in _CLI:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("silkworm_cli", SILKWORM_BIN)
+        spec = importlib.util.spec_from_loader("silkworm_cli", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _CLI["mod"] = mod
+    return _CLI["mod"]
+
+
+def operator_status() -> dict | None:
+    """`silkworm status --json`, computed in-process by the CLI's own code.
+
+    The same function the command runs, asked of the same handlers, minus the
+    HTTP hop to ourselves. None when it cannot be built, which the context
+    says rather than leaving the section out.
+    """
+    try:
+        cli = _cli_module()
+        routes = {"/tasks": handle_tasks, "/status": handle_status}
+        return cli.status_summary(lambda path, payload, timeout=30: routes[path](payload))
+    except Exception:
+        log.exception("operator: could not build status --json")
+        return None
+
+
+def operator_context(now: float | None = None) -> str:
+    """The live-state block every operator turn and wake is given."""
+    now = time.time() if now is None else now
+    recs = []
+    for rec in project_store.all(include_archived=False):
+        recs.append({**rec, "_unready": projects.unready(rec)})
+
+    def brief(rec):
+        text = project_store.brief_for(rec["slug"])
+        if not text:
+            cwd = (rec.get("scope") or {}).get("cwd")
+            md = Path(cwd) / "CLAUDE.md" if cwd else None
+            text = md.read_text(errors="replace")[:1200] if md and md.is_file() else ""
+        return text
+
+    records = list(task_store.all().values())
+    holds = {r["slug"]: r["main_failing"] for r in recs if r.get("main_failing")}
+    released = {}
+    for rec in recs:
+        repo = (rec.get("scope") or {}).get("cwd")
+        try:
+            if repo and worktrees.is_repo(repo):
+                tags = releases.tagged_since(repo, now - digest.WINDOW_S)
+                if tags:
+                    released[rec["slug"]] = tags
+        except Exception:
+            log.exception("operator: reading release tags for %s failed", rec.get("slug"))
+    return operator_role.context(
+        recs, brief, operator_status(),
+        operator_role.recent_landings(records, now),
+        operator_role.tail(BASE_DIR / "logs" / "deploy-after-turn.log"),
+        holds, released, operator_role.read_notes(OPERATOR_NOTES))
+
+
+def operator_note(task: dict | None = None) -> str:
+    """The operator's system prompt: its role, then the live state."""
+    note = roles.system_prompt(operator_role.ROLE, bin=SILKWORM_BIN)
+    if task is not None and operator_role.is_sweep(task):
+        note += "\n\n" + operator_role.SWEEP_NOTE
+    try:
+        note += "\n\n" + operator_context()
+    except Exception:
+        log.exception("operator: building its context failed")
+        note += "\n\n(Live state could not be assembled this turn; ask `status --json`.)"
+    return note
+
+
+def operator_command(arg: str, key: str) -> str:
+    """`!operator`: make this thread the operator's home, or say which is.
+
+    One home at a time; claiming moves it. The thread is pointed at Silkworm's
+    own checkout, where its read-only git looks, and a session that ran
+    somewhere else is set aside (kept in previous_sessions) rather than
+    resumed from a directory it never ran in.
+    """
+    current = OPERATOR.thread()
+    where = (slacklinks.thread_link(*current.split(":", 1)) if ":" in current else "")
+    if arg.lower() in ("where", "status", "?"):
+        return (f":compass: The operator lives in {where or current}." if current else
+                "No operator thread yet. Send `!operator` in the thread you want it in.")
+    if arg:
+        return "usage: `!operator` (claim this thread) or `!operator where`"
+    if current == key:
+        return ":compass: This thread is already the operator's."
+    entry = store.get(key) or {}
+    fields = {"cwd": str(BASE_DIR)}
+    if entry.get("session_id") and entry.get("cwd") != str(BASE_DIR):
+        fields.update(session_id=None, previous_sessions=(
+            (entry.get("previous_sessions") or []) + [entry["session_id"]])[-10:])
+    if not entry.get("title"):
+        fields["title"] = "Operator"
+    store.update(key, **fields)
+    OPERATOR.set_thread(key)
+    log.info("operator thread is now %s (was %s)", key, current or "none")
+    moved = f" It moved here from {where}." if current else ""
+    sweep = ("" if OPERATOR_SWEEP_AT.lower() in digest.OFF else
+             f" It sweeps daily at {OPERATOR_SWEEP_AT}, after the digest, and posts one message here.")
+    return (":compass: This thread is now the operator's home: messages here go to "
+            "Silkworm's head agent, with live state rebuilt into every turn." + sweep
+            + moved + " It may land, retry, rework, drop proven-redundant branches, "
+            "tidy and deploy on its own; accepting, releasing, publishing, trader's "
+            "live config and real deletions wait for your `!approve`.")
+
+
+def approve_command(text: str, user: str, event: dict) -> str:
+    """`!approve <what> <item>`: lift one operator refusal, once.
+
+    Only a person's own Slack message makes one -- not the web chat, not the
+    bot, and no HTTP route: the operator can reach the bot only through the
+    CLI, and the CLI has nothing that writes these.
+    """
+    if event.get("_web"):
+        return ":no_entry: Approvals come from your own Slack message, not the web chat."
+    if (not user or user == BOT_USER_ID or event.get("bot_id")
+            or (ALLOWED_USERS and user not in ALLOWED_USERS)):
+        return ":no_entry: Only an allowlisted person can approve."
+    guard, item, err = operator_role.parse_approve(text)
+    if err:
+        return f":warning: {err}"
+    if not guard:
+        live = OPERATOR.approvals()
+        if not live:
+            return "Nothing approved for the operator right now."
+        return "Approved for the operator, once each:\n" + "\n".join(
+            f"• `{a['guard']} {a['item']}` — {fmt_age(a['at'])}" for a in live)
+    OPERATOR.approve(guard, item, by=user)
+    log.info("operator approval: %s %s by %s", guard, item, user)
+    return (f":white_check_mark: The operator may do this once, within a day: "
+            f"{operator_role.GUARDS[guard]} — `{item}`.")
+
+
+def file_operator_sweep(now: datetime) -> str:
+    """File today's sweep as a wake-up on the operator's thread. Its id."""
+    thread = OPERATOR.thread()
+    task = task_store.create(
+        operator_role.SWEEP_GOAL.format(bin=SILKWORM_BIN),
+        title=f"Operator sweep {now:%Y-%m-%d}",
+        role=operator_role.ROLE, state=tasks.QUEUED, driver="queue",
+        # The wake lane's source: it is the operator's conversation resuming,
+        # in its own thread and directory, not work of its own.
+        source=tasks.WAKE_SOURCE, source_ref=operator_role.SWEEP_REF,
+        thread=thread, isolate=False, scope={"cwd": str(BASE_DIR)})
+    OPERATOR.mark_sweep(now, task["id"])
+    log.info("filed the operator's sweep %s on %s", task["id"], thread)
+    return task["id"]
+
+
+def _operator_scheduler() -> None:
+    """File the operator's daily sweep once a day, after the digest -- the same
+    wall-clock catch-up as nightly ideation and the digest."""
+    if OPERATOR_SWEEP_AT.lower() in digest.OFF:
+        log.info("operator sweep off (OPERATOR_SWEEP_AT=%s)", OPERATOR_SWEEP_AT or '""')
+        return
+    try:
+        at = projects.parse_at(OPERATOR_SWEEP_AT)
+    except ValueError as e:
+        log.error("operator sweep off: OPERATOR_SWEEP_AT %s", e)
+        return
+    time.sleep(150)                     # after startup recovery, and the digest's beat
+    while True:
+        try:
+            now = datetime.now()
+            digest_on = DIGEST_AT.lower() not in digest.OFF
+            if OPERATOR.sweep_due(now, at, digest.Schedule(DIGEST_STATE).last_on, digest_on):
+                file_operator_sweep(now)
+        except Exception:
+            log.exception("operator scheduler failed")
+        time.sleep(300)
+
+
 def _board_loop() -> None:
     """Keep the board message current. It redraws only when what it shows has
     changed (or its relative times have gone stale), so this is cheap."""
@@ -6589,6 +6957,8 @@ if __name__ == "__main__":
     daemons.start(_ideation_scheduler, "ideate")
     daemons.start(_digest_scheduler, "digest",
                   forever=DIGEST_AT.lower() not in digest.OFF)
+    daemons.start(_operator_scheduler, "operator",
+                  forever=OPERATOR_SWEEP_AT.lower() not in digest.OFF)
     daemons.start(_harvester, "harvester", forever=HARVEST_INTERVAL_H > 0)
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,

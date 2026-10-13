@@ -3741,9 +3741,12 @@ def test_repo_guard():
     bot = (BASE / "bot.py").read_text()
     check("both call sites take it", bot.count("repo_guard(cwd, progress)") == 2,
           "a Slack turn and a queued task are exactly the pair that collide")
-    for site in ("with lock, repo_guard(cwd, progress):",):
-        check("taken inside the thread lock, so the order cannot deadlock",
-              site in bot)
+    # Bound to `guard` first (the operator's read-only turns take none; see
+    # test_operator_turns_do_not_hold_the_checkout...), then taken inside the
+    # thread lock at both sites.
+    check("taken inside the thread lock, so the order cannot deadlock",
+          bot.count("with lock, guard:") == 2
+          and bot.count("else repo_guard(cwd, progress))") == 2)
 
 
 # --- a turn may run as long as it is still working -------------------------------
@@ -7463,8 +7466,9 @@ def test_atomic_persistence():
                 saves += 1
                 offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
                               if writes_in_place(n)]
-    # Five: the four stores, and the task board's message pointer (home.Board).
-    check("every store's _save was found to check", saves == 5, f"found {saves}")
+    # Six: the four stores, the task board's message pointer (home.Board), and
+    # the operator's state (operator_role.State).
+    check("every store's _save was found to check", saves == 6, f"found {saves}")
     check("and every module was looked at", scanned > 20, f"{scanned}")
     check("nothing writes a state file in place", not offenders, f"at {offenders}")
 
@@ -14620,7 +14624,16 @@ def test_guard_env_reaches_task_turns_only():
     check("execute_task hands its task id to the turn's env",
           ex and all(any(k.arg == "task_id" and isinstance(k.value, ast.Name)
                          and k.value.id == "tid" for k in c.keywords) for c in ex), f"{len(ex)} call(s)")
-    others = [c for f in fns if f != "execute_task" for c in env_calls(f)]
+    # Except the operator's own Slack turn, which is held to git_guard too:
+    # only the branch of handle_prompt taken when the role is the operator's.
+    op = [n for n in ast.walk(fns["handle_prompt"]) if isinstance(n, ast.IfExp)
+          and ast.unparse(n.test) == "role_name == roles.OPERATOR"
+          and isinstance(n.body, ast.Call) and getattr(n.body.func, "id", "") == "claude_env"]
+    check("handle_prompt names a task id only for the operator's turn",
+          len(op) == 1 and ast.unparse(op[0].orelse) == "claude_env(key)",
+          str([ast.unparse(n) for n in op]))
+    exempt = {id(n.body) for n in op}
+    others = [c for f in fns if f != "execute_task" for c in env_calls(f) if id(c) not in exempt]
     check("and nothing else does: no other claude_env call names a task id",
           others and not any(k.arg == "task_id" for c in others for k in c.keywords))
     stripped = [n for n in tree.body if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
@@ -21009,7 +21022,12 @@ def _action_cli_bot():
 
 
 def _run_cli(port, *argv):
-    env = {**os.environ, "SILKWORM_BOT_PORT": str(port)}
+    # As you would run it: outside any turn, so not stamped as one (the
+    # operator's tests run it as one on purpose; see _op_cli).
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_TASK_ID",
+                        "SILKWORM_TASK_ROLE")}
+    env["SILKWORM_BOT_PORT"] = str(port)
     return subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), *argv],
                           capture_output=True, text=True, env=env, timeout=60)
 
@@ -21862,6 +21880,750 @@ def test_base_is_the_local_commit_a_landing_merges_into():
     name, sha = ns["current_base"](str(clone), {"project": "p"})
     check("origin ahead and not pulled: still the local commit",
           (name, sha) == ("main", local), f"{name} {sha[:8]} vs {local[:8]}")
+
+
+# --- the operator: a head agent held to a policy in code, not in its prompt -------
+# The operator manages the board, routes work and deploys. What it may not do --
+# accept, release, publish where publish is off, change trader's live config,
+# delete anything not proven redundant -- is refused by the CLI and the bot,
+# and lifted for one item only by an approval a person sends from Slack.
+
+def _op_git(cwd, *args):
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    assert r.returncode == 0, f"git {' '.join(args)}: {r.stderr}"
+    return r.stdout.strip()
+
+
+def _op_repo():
+    """A repo on main with branches cut from the same commit:
+
+    `silkworm/tsk_same` -- two commits main then took as one squashed commit,
+    after an unrelated change above them, as a rebase-and-squash landing
+    does: new shas and different patches, so `git cherry` still lists both
+    as unmerged though main holds every line; `silkworm/tsk_new` -- a change
+    main has never seen; `silkworm/tsk_live` -- one that touches trader's
+    live configuration; `silkworm/tsk_tight` -- main took its change, but
+    edited the line right next to it too, which no merge can tell apart from
+    a conflict.
+    """
+    repo = Path(tempfile.mkdtemp()) / "trader"
+    repo.mkdir()
+    for k in ("SILKWORM_TASK_ROLE", "SILKWORM_TASK_ID"):
+        os.environ.pop(k, None)
+
+    def edit(n, text):
+        lines = (repo / "app.py").read_text().splitlines(True)
+        lines[n - 1] = text + "\n"
+        (repo / "app.py").write_text("".join(lines))
+
+    _op_git(repo, "init", "-q", "-b", "main")
+    (repo / "app.py").write_text("".join(f"line {i}\n" for i in range(1, 41)))
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "paper_trade.py").write_text("LEVERAGE = 1.0\n")
+    _op_git(repo, "add", "-A"); _op_git(repo, "commit", "-qm", "base")
+    _op_git(repo, "branch", "fork")
+    _op_git(repo, "checkout", "-qb", "silkworm/tsk_same")
+    edit(20, "line 20 fixed"); _op_git(repo, "commit", "-qam", "fix line 20")
+    edit(25, "line 25 fixed"); _op_git(repo, "commit", "-qam", "fix line 25")
+    _op_git(repo, "checkout", "-qb", "silkworm/tsk_tight", "fork")
+    edit(32, "line 32 fixed"); _op_git(repo, "commit", "-qam", "fix line 32")
+    _op_git(repo, "checkout", "-q", "main")
+    edit(2, "line 2 tidied"); _op_git(repo, "commit", "-qam", "tidy line 2")
+    edit(20, "line 20 fixed"); edit(25, "line 25 fixed")
+    _op_git(repo, "commit", "-qam", "fix lines 20 and 25 (squashed)")
+    edit(31, "line 31 tidied"); edit(32, "line 32 fixed")
+    _op_git(repo, "commit", "-qam", "fix line 32, and 31 beside it")
+    _op_git(repo, "checkout", "-qb", "silkworm/tsk_new", "fork")
+    (repo / "new.py").write_text("print('new')\n")
+    _op_git(repo, "add", "-A"); _op_git(repo, "commit", "-qm", "new work")
+    _op_git(repo, "checkout", "-qb", "silkworm/tsk_live", "fork")
+    (repo / "scripts" / "paper_trade.py").write_text("LEVERAGE = 1.5\n")
+    _op_git(repo, "commit", "-qam", "lever up")
+    _op_git(repo, "checkout", "-q", "main")
+    return repo
+
+
+def test_operator_contained_detects_rebased_equivalents():
+    import operator_role as O
+    print("\nthe operator's drop rule: contained by content, rebased equivalents included")
+    repo = _op_repo()
+    cherry = _op_git(repo, "cherry", "main", "silkworm/tsk_same")
+    check("the fixture is the hard case: git cherry still calls both commits unmerged",
+          [ln[0] for ln in cherry.splitlines()] == ["+", "+"], cherry)
+    ok, why = O.contained(repo, "silkworm/tsk_same", "main")
+    check("a branch whose change main took squashed and rebased is contained", ok, why)
+    ok, why = O.contained(repo, "silkworm/tsk_tight", "main")
+    check("one whose neighbouring line main also changed is not proven, so it asks",
+          not ok, why)
+    ok, why = O.contained(repo, "silkworm/tsk_new", "main")
+    check("a branch with a change main lacks is not", not ok, why)
+    ok, why = O.contained(repo, "silkworm/tsk_gone", "main")
+    check("a branch that does not exist is not proven anything", not ok, why)
+    _op_git(repo, "branch", "silkworm/tsk_empty", "fork")
+    ok, why = O.contained(repo, "silkworm/tsk_empty", "main")
+    check("a branch with nothing of its own is contained", ok, why)
+    hit = O.live_paths_touched(repo, "silkworm/tsk_live", "main", O.LIVE_CONFIG["trader"])
+    check("a branch changing paper_trade.py touches trader's live config",
+          hit == ["scripts/paper_trade.py"], str(hit))
+    check("one that does not, does not",
+          O.live_paths_touched(repo, "silkworm/tsk_new", "main", O.LIVE_CONFIG["trader"]) == [])
+    check("git failing to say counts as touching it (fails closed)",
+          O.live_paths_touched(repo, "silkworm/nope", "main", ("ops/",)) == ["ops/"])
+
+
+def _operator_bot(repo=None):
+    """handle_tasks and the operator's guard as shipped, over a real TaskStore
+    and a real operator.json, serving the real CLI on a free port."""
+    import socket as _socket
+    import board, costs, research, retry, slacklinks, drain
+    import operator_role as O
+    import tasks as T
+    import branches as B
+    from localserver import LocalServer
+    tmp = Path(tempfile.mkdtemp())
+    st = T.TaskStore(tmp / "t.json")
+    state = O.State(tmp / "operator.json")
+    landings, steps = [], []
+    ns = bot_functions(
+        "handle_tasks", "approve_task", "decide_findings", "land_or_drop", "_with_costs",
+        "_spend", "operator_refused", "task_contained", "task_live_paths", "task_base",
+        tasks=T, task_store=st, research=research, holding=__import__("holding"),
+        task_state=_task_state_for(st), merge=__import__("merge"),
+        roles=__import__("roles"), board=board, costs=costs, slacklinks=slacklinks,
+        defer=__import__("defer"), scoping=__import__("scoping"), projects=__import__("projects"),
+        branches=B, operator_role=O, OPERATOR=state,
+        project_store=types.SimpleNamespace(scope_for=lambda slug: {"branch": "main"},
+                                            get=lambda slug: None),
+        tell_thread=lambda *a: None, stop_task=lambda tid: False,
+        take_step=lambda action, p: steps.append(p["id"]) or {"ok": True},
+        start_landing=lambda tid, **k: landings.append(tid) or True,
+        repo_guard=lambda *a, **k: contextlib.nullcontext(),
+        discard=types.SimpleNamespace(drop=lambda repo, br: (True, "discarded/x", "")),
+        record_landing=lambda *a, **k: None, os=os)
+    with _socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = LocalServer(port)
+    server.route("/tasks", ns["handle_tasks"])
+    server.start()
+    return types.SimpleNamespace(port=port, store=st, state=state, ns=ns, tmp=tmp,
+                                 landings=landings, steps=steps,
+                                 statefile=tmp / "operator.json")
+
+
+def _op_cli(bot, *argv, role="operator", thread="D1:1.0"):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_TASK_ID")}
+    env.update(SILKWORM_BOT_PORT=str(bot.port), SILKWORM_OPERATOR_STATE=str(bot.statefile))
+    if role:
+        env["SILKWORM_ROLE"] = role
+    if thread:
+        env["SILKWORM_THREAD"] = thread
+    return subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), *argv],
+                          capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_operator_accept_is_refused_until_approved_once():
+    import tasks as T
+    print("\nthe operator: accepting a proposal is refused, until you approve that one, once")
+    bot = _operator_bot()
+    st = bot.store
+    a = st.create("Add an appearance preference to Settings", state=T.PROPOSED,
+                  role="implementor", project="alpha")["id"]
+    b = st.create("Cache the release plan per checkout", state=T.PROPOSED,
+                  role="implementor", project="alpha")["id"]
+    r = _op_cli(bot, "accept", a)
+    check("the CLI refuses an operator's accept, exit 1, naming the approval",
+          r.returncode == 1 and f"!approve accept {a}" in r.stderr
+          and st.get(a)["state"] == T.PROPOSED, r.stdout + r.stderr)
+    dead = types.SimpleNamespace(port=1, statefile=bot.statefile)
+    r = _op_cli(dead, "accept", a)
+    check("the CLI refuses it itself, before asking any bot (1, not 3 unreachable)",
+          r.returncode == 1 and f"!approve accept {a}" in r.stderr, r.stdout + r.stderr)
+    # The bot refuses it too, for a request that never went through this CLI.
+    out = bot.ns["handle_tasks"]({"action": "accept", "id": a, "caller_role": "operator"})
+    check("the bot refuses it on its own",
+          not out["ok"] and out.get("refused") == "accept"
+          and st.get(a)["state"] == T.PROPOSED, str(out))
+    x = st.create("Show the sync error text in Settings", state=T.PROPOSED,
+                  role="implementor", project="alpha")["id"]
+    out = bot.ns["handle_tasks"]({"action": "accept", "id": x, "caller_thread": "D9:9.9"})
+    check("a request from another thread with no role is not the operator's",
+          out["ok"] and st.get(x)["state"] == T.QUEUED, str(out))
+    bot.state.set_thread("D7:7.0")
+    out = bot.ns["handle_tasks"]({"action": "accept", "id": a, "caller_thread": "D7:7.0"})
+    check("its home thread alone is enough to be held to the policy",
+          not out["ok"] and out.get("refused") == "accept", str(out))
+
+    bot.state.approve("accept", b, by="U_ME")
+    r = _op_cli(bot, "accept", a)
+    check("an approval of a different item lifts nothing",
+          r.returncode == 1 and st.get(a)["state"] == T.PROPOSED, r.stderr)
+    bot.state.approve("accept", a, by="U_ME")
+    r = _op_cli(bot, "accept", a)
+    check("approved, it goes ahead, logged as the operator's",
+          r.returncode == 0 and st.get(a)["state"] == T.QUEUED
+          and "via operator" in st.get(a)["events"][-1]["detail"], r.stdout + r.stderr)
+    check("and the approval is used up", not bot.state.has("accept", a))
+    c = st.create("Retry the sync engine on 5xx", state=T.PROPOSED,
+                  role="implementor", project="alpha")["id"]
+    bot.state.approve("accept", c, by="U_ME", now=time.time() - O_TTL() - 1)
+    r = _op_cli(bot, "accept", c)
+    check("an approval older than a day has lapsed",
+          r.returncode == 1 and st.get(c)["state"] == T.PROPOSED, r.stderr)
+
+    r = _op_cli(bot, "accept", b, role="", thread="")
+    check("the same command from you is unaffected",
+          r.returncode == 0 and st.get(b)["state"] == T.QUEUED, r.stderr)
+
+    try:
+        out = bot.ns["handle_tasks"]({"action": "create", "goal": "Fix the drawdown halt marker "
+                                      "so restarts keep it armed", "caller_role": "operator"})
+    except Exception as e:          # got past the guard into the filing itself
+        out = {"ok": True, "raised": repr(e)}
+    check("filing straight into the queue is accepting, and refused",
+          not out["ok"] and out.get("refused") == "accept", str(out))
+    w = st.create("Tidy the sync retry loop in SyncEngine", role="implementor")["id"]
+    st.transition(w, T.RUNNING); st.transition(w, T.AWAITING_APPROVAL)
+    out = bot.ns["handle_tasks"]({"action": "approve", "id": w, "caller_role": "operator"})
+    check("approving flagged work is the user's gate too",
+          not out["ok"] and st.get(w)["state"] == T.AWAITING_APPROVAL, str(out))
+
+
+def O_TTL():
+    import operator_role
+    return operator_role.APPROVAL_TTL_S
+
+
+def test_operator_release_is_refused_until_approved():
+    import tasks as T
+    print("\nthe operator: releases are refused, until you approve that one")
+    bot = _operator_bot()
+    st = bot.store
+    t = st.create("Cut a TestFlight build", role="implementor", project="cadence")["id"]
+    st.transition(t, T.RUNNING); st.transition(t, T.NEEDS_INPUT)
+    r = _op_cli(bot, "accept", t)            # warm-up: the CLI is up
+    out = bot.ns["handle_tasks"]({"action": "release", "id": t, "caller_role": "operator"})
+    check("taking a release step is refused", not out["ok"] and out.get("refused") == "release"
+          and not bot.steps, str(out))
+    bot.state.approve("release", t, by="U_ME")
+    out = bot.ns["handle_tasks"]({"action": "release", "id": t, "caller_role": "operator"})
+    check("approved, the release step is taken", out["ok"] and bot.steps == [t], str(out))
+    out = bot.ns["handle_tasks"]({"action": "release", "id": t, "caller_role": "operator"})
+    check("once", not out["ok"] and bot.steps == [t], str(out))
+    # The /releases route asks the same guard.
+    import operator_role as O
+    check("/releases start is guarded, per project",
+          O.releases_guard("start", {"slug": "Cadence"}) == ("release", "cadence"))
+    check("its read-only plan is not", O.releases_guard("plan", {"slug": "cadence"}) is None)
+
+
+def test_operator_publish_and_trader_settings_are_refused():
+    import operator_role as O
+    print("\nthe operator: publishing where it is off, and trader's settings, are refused")
+    tmp = Path(tempfile.mkdtemp())
+    state = O.State(tmp / "operator.json")
+    refused = bot_functions("operator_refused", operator_role=O, OPERATOR=state,
+                            task_store=types.SimpleNamespace(get=lambda tid: None))["operator_refused"]
+    me = {"caller_role": "operator"}
+    out = refused("projects", "publish", {**me, "slug": "cadence", "on": True})
+    check("switching publish on is refused", out and out["refused"] == "publish", str(out))
+    check("switching it off is not", refused("projects", "publish",
+                                             {**me, "slug": "cadence", "on": False}) is None)
+    for action in ("auto-merge", "test-cmd", "base", "generated", "ideate", "brief", "archive"):
+        out = refused("projects", action, {**me, "slug": "trader"})
+        check(f"trader {action} is its live configuration, and refused",
+              out and out["refused"] == "trader-config", str(out))
+    check("reading trader is not", refused("projects", "get", {**me, "slug": "trader"}) is None)
+    check("another project's settings are not",
+          refused("projects", "auto-merge", {**me, "slug": "cadence"}) is None)
+    check("and none of it applies to you",
+          refused("projects", "publish", {"slug": "cadence", "on": True}) is None)
+    state.approve("publish", "cadence", by="U_ME")
+    check("approved, publish goes through once",
+          refused("projects", "publish", {**me, "slug": "cadence", "on": True}) is None
+          and refused("projects", "publish", {**me, "slug": "cadence", "on": True}))
+    state.approve("trader-config", "trader", by="U_ME")
+    check("approved, a trader setting goes through once",
+          refused("projects", "auto-merge", {**me, "slug": "trader"}) is None
+          and refused("projects", "auto-merge", {**me, "slug": "trader"}))
+    # Every route the policy covers asks it first, before reading or changing.
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    for fn, route in (("handle_tasks", "tasks"), ("handle_projects", "projects"),
+                      ("handle_releases", "releases")):
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == fn)
+        first_call = next((c for st_ in node.body[:4] for c in ast.walk(st_)
+                           if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "operator_refused"),
+                          None)
+        check(f"{fn} asks operator_refused({route!r}, …) before anything else",
+              first_call is not None and isinstance(first_call.args[0], ast.Constant)
+              and first_call.args[0].value == route)
+    import git_guard
+    check("git refuses the operator's own pushes and ref moves (git_guard)",
+          "operator" in git_guard.GUARDED_ROLES and "operator" in git_guard.PRE_PUSH)
+
+
+def test_operator_drop_and_trader_landing_need_proof_or_approval():
+    import tasks as T
+    print("\nthe operator: it drops only what main holds, and lands nothing touching trader's live config")
+    repo = _op_repo()
+    bot = _operator_bot()
+    st = bot.store
+
+    def finished(tid_name, project="trader"):
+        t = st.create(f"Work for {tid_name}", role="implementor", project=project,
+                      scope={"cwd": str(repo), "repo": str(repo)})
+        st.update(t["id"], branch=f"silkworm/{tid_name}")
+        st.transition(t["id"], T.RUNNING); st.transition(t["id"], T.DONE)
+        return t["id"]
+
+    same, new, live = finished("tsk_same"), finished("tsk_new"), finished("tsk_live")
+    r = _op_cli(bot, "drop", new)
+    check("dropping a branch with work main lacks is refused, exit 1",
+          r.returncode == 1 and f"!approve delete {new}" in r.stderr, r.stdout + r.stderr)
+    r = _op_cli(bot, "drop", same)
+    check("dropping one main took by rebase goes ahead", r.returncode == 0, r.stdout + r.stderr)
+    r = _op_cli(bot, "operator", "contained", new)
+    check("`operator contained` says why not, exit 1",
+          r.returncode == 1 and "not contained" in r.stdout, r.stdout + r.stderr)
+    r = _op_cli(bot, "operator", "contained", same)
+    check("and proves the rebased one, exit 0",
+          r.returncode == 0 and r.stdout.startswith("contained"), r.stdout + r.stderr)
+    bot.state.approve("delete", new, by="U_ME")
+    r = _op_cli(bot, "drop", new)
+    check("approved, the drop goes ahead once", r.returncode == 0, r.stdout + r.stderr)
+
+    r = _op_cli(bot, "land", live)
+    check("landing a trader branch that changes paper_trade.py is refused",
+          r.returncode == 1 and "trader-config" in r.stderr and live not in bot.landings,
+          r.stdout + r.stderr)
+    r = _op_cli(bot, "land", new)
+    check("a trader branch that does not touch it lands", r.returncode == 0
+          and new in bot.landings, r.stdout + r.stderr)
+    r = _op_cli(bot, "land", live, role="", thread="")
+    check("you can land it yourself", r.returncode == 0 and live in bot.landings, r.stderr)
+
+
+def test_operator_approvals_come_only_from_a_person_in_slack():
+    import operator_role as O
+    print("\n!approve: one item, one use, from an allowlisted person's own Slack message")
+    check("parses guard and item", O.parse_approve("!approve delete tsk_ab12") == ("delete", "tsk_ab12", ""))
+    check("bare lists", O.parse_approve("!approve") == ("", "", ""))
+    check("an unknown guard is refused", O.parse_approve("!approve everything x")[2])
+    check("a guard with no item is refused", O.parse_approve("!approve accept")[2])
+    tmp = Path(tempfile.mkdtemp())
+    state = O.State(tmp / "operator.json")
+    ns = bot_functions("approve_command", operator_role=O, OPERATOR=state,
+                       BOT_USER_ID="UBOT", ALLOWED_USERS={"U_ME"},
+                       fmt_age=lambda ts: "now")
+    approve = ns["approve_command"]
+    check("the web chat cannot approve",
+          "web chat" in approve("!approve accept tsk_1", "U_ME", {"_web": True})
+          and not state.approvals())
+    check("the bot cannot approve", "Only" in approve("!approve accept tsk_1", "UBOT", {})
+          and not state.approvals())
+    check("someone off the allowlist cannot",
+          "Only" in approve("!approve accept tsk_1", "U_STRANGER", {}) and not state.approvals())
+    said = approve("!approve accept tsk_1", "U_ME", {})
+    check("you can", ":white_check_mark:" in said and state.has("accept", "tsk_1"), said)
+    check("and it is listed", "accept tsk_1" in approve("!approve", "U_ME", {}))
+    ro = O.State(tmp / "operator.json", readonly=True)
+    check("the CLI's read-only view sees it", ro.has("accept", "tsk_1"))
+    try:
+        ro.consume("accept", "tsk_1")
+        wrote = True
+    except PermissionError:
+        wrote = False
+    check("and cannot use it up or write one", not wrote and state.has("accept", "tsk_1"))
+    src = (BASE / "bin" / "silkworm").read_text()
+    check("no CLI path writes an approval", ".approve(" not in src)
+    bot = (BASE / "bot.py").read_text()
+    check("and no bot route does: only approve_command, from handle_prompt",
+          bot.count("OPERATOR.approve(") == 1
+          and "approve_command(text, user, event)" in bot)
+    import roles
+    tools = roles.permission_args("operator", ["--dangerously-skip-permissions"], bin="/s")
+    check("the operator runs on an allowlist, without skip-permissions",
+          tools[0] == "--allowedTools" and "--dangerously-skip-permissions" not in tools)
+    check("which has no curl and no raw git",
+          "curl" not in tools[1] and "Bash(git" not in tools[1]
+          and "Bash(/s accept:*)" in tools[1]
+          and "Bash(/s deploy --after-turn:*)" in tools[1], tools[1])
+
+
+def test_operator_deploy_only_when_behind_and_idle():
+    print("\nthe operator deploys only after its turn, with tests, when main is ahead and nothing runs")
+    src = (BASE / "bin" / "silkworm").read_text()
+    tree = ast.parse(src)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "operator_deploy_refusal")
+    ns = {"os": os}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "silkworm", "exec"), ns)
+    refuse = ns["operator_deploy_refusal"]
+
+    def call_for(state="stale", behind=3, running=()):
+        def call(path, payload):
+            if path == "/status":
+                return {"online": True, "revision": {"state": state, "behind": behind}}
+            return {"ok": True, "tasks": list(running)}
+        return call
+
+    os.environ["SILKWORM_THREAD"] = "D1:1.0"
+    try:
+        check("plain deploy is refused", "after-turn" in refuse(call_for(), False, False))
+        check("skipping tests is refused", refuse(call_for(), True, True))
+        check("nothing to deploy when current", "not ahead" in refuse(call_for("current", 0), True, False))
+        check("a stale revision with no counted gap is not 'ahead'",
+              refuse(call_for("stale", 0), True, False))
+        check("another running task holds it",
+              "running" in refuse(call_for(running=[{"id": "tsk_x", "thread": "C2:2.0"}]), True, False))
+        check("its own turn does not", refuse(call_for(running=[{"id": "tsk_me", "thread": "D1:1.0"}]),
+                                              True, False) == "")
+        check("an unreachable bot refuses", refuse(lambda p, q: {}, True, False))
+    finally:
+        os.environ.pop("SILKWORM_THREAD", None)
+    check("do_deploy asks it for the operator before anything else runs",
+          src.index("operator_deploy_refusal(call, after_turn, skip_tests)")
+          < src.index('print(f"{WORM} deploy {repo}"'))
+
+
+def test_operator_context_is_live_and_within_budget():
+    import operator_role as O
+    import projects as P
+    import tasks as T
+    print("\nthe operator's context: rebuilt from live state, within its budget")
+    tmp = Path(tempfile.mkdtemp())
+    ps = P.ProjectStore(tmp / "projects.json")
+    old_root = P.PROJECT_ROOT
+    P.PROJECT_ROOT = tmp / "homes"
+    try:
+        ps.ensure("Kitchen")
+        ps.set_brief("kitchen", "White oak cabinets; Golden Mist quartz; grout Bone.")
+        ps.ensure("Trader", initial={"scope": {"cwd": "/w/trader", "repo": "/w/trader",
+                                                "branch": "main"}},
+                  auto_merge=True, test_cmd=".venv/bin/pytest -q", publish=False)
+        st = T.TaskStore(tmp / "t.json")
+        t = st.create("Fix the halt marker", role="implementor", project="trader")
+        st.update(t["id"], result={"landing": {"stage": "conflict", "detail": "app.py",
+                                               "at": time.time() - 60}})
+        old = st.create("Ancient", role="implementor", project="trader")
+        st.update(old["id"], result={"landing": {"stage": "landed", "landed": True,
+                                                 "at": time.time() - 9 * 86400}})
+        recs = [{**r, "_unready": P.unready(r)} for r in ps.all()]
+        notes = "Waiting on Ryan re: Cadence 1.2 release.\n" * 20
+        status = {"ok": True, "bot": {"revision": {"state": "stale", "behind": 2}},
+                  "needs_you": {"cadence": {"needs_input": [{"id": "tsk_q"}]}}}
+        text = O.context(recs, lambda r: ps.brief_for(r["slug"]), status,
+                         O.recent_landings(st.all().values(), time.time()),
+                         ["2026-10-12 deployed bfb3d8a"], {"cadence": {"sha": "abc"}},
+                         {"cadence": ["cadence-v1.2.0"]}, notes)
+        check("fits the budget", len(text) <= O.CONTEXT_MAX, str(len(text)))
+        for want, why in (("Golden Mist", "a repo-less project's brief"),
+                          ('"auto_merge": true', "settings"),
+                          (".venv/bin/pytest -q", "test_cmd"),
+                          ('"behind":2', "status --json, as JSON"),
+                          ("conflict", "a recent landing"),
+                          ("cadence-v1.2.0", "a release"),
+                          ("deployed bfb3d8a", "a deploy"),
+                          ('{"sha": "abc"}', "a failing base"),
+                          (notes.strip(), "its notes, whole")):
+            check(f"carries {why}", want in text, want)
+        check("an old landing is not 'recent'", "Ancient" not in text and old["id"] not in text)
+        check("and says it is live state", text.startswith("Live state"))
+
+        huge = {"ok": True, "tasks": ["x" * 100] * 400}
+        big = O.context(recs * 60, lambda r: "b" * 5000, huge, ["l" * 150] * 200,
+                        ["d" * 200] * 50, {}, {}, notes, budget=6000)
+        check("over budget, it still fits", len(big) <= 6000, str(len(big)))
+        check("the notes survive the cut", notes.strip() in big)
+        check("and the cut is said, not silent",
+              "cut to fit" in big or "left out to fit" in big)
+        check("a status that could not be read is said",
+              "could not be read" in O.context([], lambda r: "", None, [], [], {}, {}, ""))
+    finally:
+        P.PROJECT_ROOT = old_root
+
+    # The status section is the CLI's own status_summary, run in-process
+    # against the bot's handlers rather than over HTTP to itself.
+    def fake_tasks(p):
+        if p.get("action") == "attention":
+            return {"ok": True, "tasks": [{"id": "tsk_1", "project": "a",
+                                           "state": "proposed", "title": "x"}]}
+        return {"ok": True, "tasks": [], "unmerged": [], "watching": []}
+    ns = bot_functions("operator_status", "_cli_module", _CLI={},
+                       SILKWORM_BIN=str(BASE / "bin" / "silkworm"), handle_tasks=fake_tasks,
+                       handle_status=lambda p: {"online": True,
+                                                "revision": {"state": "stale", "behind": 2}})
+    got = ns["operator_status"]() or {}
+    check("status --json is built in-process by the CLI's own code",
+          got.get("ok") and got["bot"]["revision"]["behind"] == 2
+          and got["needs_you"] == {"a": {"proposed": [{"id": "tsk_1", "title": "x",
+                                                       "state": "proposed", "role": None}]}},
+          str(got))
+    ns = bot_functions("operator_status", "_cli_module", _CLI={},
+                       SILKWORM_BIN=str(BASE / "nonexistent"), handle_tasks=fake_tasks,
+                       handle_status=lambda p: {})
+    check("and when it cannot be, that is None, not an empty board",
+          ns["operator_status"]() is None)
+
+    nb = tmp / "notes.md"
+    check("notes over 4KB are refused, not cut", O.write_notes(nb, "n" * 5000) and not nb.exists())
+    check("notes within it are kept", O.write_notes(nb, "keep this") == ""
+          and O.read_notes(nb).strip() == "keep this")
+    bot = (BASE / "bot.py").read_text()
+    for fn in ("handle_prompt", "execute_task"):
+        body = bot[bot.index(f"def {fn}("):]
+        body = body[:body.index("\ndef ", 10)]
+        check(f"{fn} builds it fresh for each operator turn", "operator_note(" in body)
+
+
+def test_operator_sweep_is_daily_after_the_digest_and_posts_once():
+    import operator_role as O
+    import tasks as T
+    print("\nthe operator's sweep: once a day, after the digest, as one message")
+    tmp = Path(tempfile.mkdtemp())
+    state = O.State(tmp / "operator.json")
+    morning = datetime(2026, 10, 13, 8, 45)
+    check("no home thread, no sweep", not state.sweep_due(morning, "08:30", "2026-10-13"))
+    state.set_thread("D1:1.0")
+    check("not before its time", not state.sweep_due(datetime(2026, 10, 13, 8, 0), "08:30", "2026-10-13"))
+    check("not before the digest has gone out", not state.sweep_due(morning, "08:30", "2026-10-12"))
+    check("unless the digest is off", state.sweep_due(morning, "08:30", "", digest_on=False))
+    check("due after both", state.sweep_due(morning, "08:30", "2026-10-13"))
+
+    st = T.TaskStore(tmp / "t.json")
+    ns = bot_functions("file_operator_sweep", task_store=st, tasks=T, operator_role=O,
+                       OPERATOR=state, BASE_DIR=tmp, datetime=datetime, SILKWORM_BIN="/s")
+    filed = []
+    for minute in range(0, 60, 5):           # the scheduler's beat, for an hour
+        now = datetime(2026, 10, 13, 8, 30 + minute // 2)
+        if state.sweep_due(now, "08:30", "2026-10-13"):
+            filed.append(ns["file_operator_sweep"](now))
+    check("filed exactly once that morning", len(filed) == 1, str(filed))
+    rec = st.get(filed[0])
+    check("as an operator wake-up on its thread, in the wake lane",
+          rec["role"] == "operator" and T.is_wakeup(rec) and O.is_sweep(rec)
+          and rec["thread"] == "D1:1.0" and rec["state"] == T.QUEUED, str(rec))
+    check("its goal names the CLI by the path its allowlist matches",
+          "/s operator contained" in rec["goal"] and "{bin}" not in rec["goal"], rec["goal"][:300])
+    check("and again the next day", state.sweep_due(datetime(2026, 10, 14, 9, 0), "08:30", "2026-10-14"))
+
+    class Client:
+        def __init__(self, fail_update=False):
+            self.calls, self.fail_update = [], fail_update
+
+        def chat_update(self, **kw):
+            self.calls.append(("update", kw))
+            if self.fail_update:
+                raise RuntimeError("message_not_found")
+
+        def chat_postMessage(self, **kw):
+            self.calls.append(("post", kw))
+
+    long = "\n".join(f"- landed tsk_{i:04d}: something worth a line" for i in range(400)) \
+        + "\n*Needs you:* approve the Cadence release?"
+    c = Client()
+    n = O.post_sweep(c, "D1", "1.0", "2.0", long, "\n_footer_", 3800)
+    check("a long report is still one message", n == 1 and len(c.calls) == 1, str(len(c.calls)))
+    body = c.calls[0][1]["text"]
+    check("within Slack's limit", len(body) <= 3800, str(len(body)))
+    check("keeping its question for you", "Needs you" in body and body.endswith("_footer_"))
+    c = Client()
+    O.post_sweep(c, "D1", "1.0", None, "short")
+    check("with no placeholder, one post", [k for k, _ in c.calls] == ["post"])
+    c = Client(fail_update=True)
+    O.post_sweep(c, "D1", "1.0", "2.0", "short")
+    check("a placeholder that cannot be edited costs no message, and adds no second",
+          [k for k, _ in c.calls] == ["update", "post"])
+    bot = (BASE / "bot.py").read_text()
+    body = bot[bot.index("        if role_name == roles.OPERATOR and operator_role.is_sweep(task):\n"
+                         "            # The sweep promises"):]
+    body = body[:body.index("            return\n")]
+    check("execute_task posts a sweep through post_sweep, then returns before chunking",
+          "operator_role.post_sweep(" in body and "chunk(" not in body
+          and "chat_postMessage" not in body)
+
+
+def test_operator_has_no_raw_git_and_its_git_cannot_write():
+    import operator_role as O
+    import roles
+    print("\nthe operator's git: no raw git on its allowlist, and `operator git` cannot write")
+    tools = roles.permission_args("operator", [], bin="/s")[1]
+    check("no Bash(git …) of any kind is allowlisted (git log --output writes any file)",
+          "Bash(git" not in tools and "Bash(/s operator:*)" in tools, tools)
+    for argv, why in ((["log", "--output=/tmp/x"], "--output"),
+                      (["diff", "--outp=/tmp/x"], "an abbreviation of --output"),
+                      (["show", "--ext-diff"], "an external diff"),
+                      (["grep", "-Oevil", "x"], "grep's pager"),
+                      (["push"], "a writing command"), (["worktree", "add", "x"], "worktree add"),
+                      (["config", "core.fsmonitor", "x"], "config")):
+        check(f"refuses {why}", O.git_refusal(argv), str(argv))
+    for argv in (["log", "--oneline", "-3"], ["diff", "main...silkworm/x"],
+                 ["worktree", "list"], ["status", "--short"]):
+        check(f"allows {' '.join(argv)}", O.git_refusal(argv) == "", O.git_refusal(argv))
+    repo = _op_repo()
+    target = Path(tempfile.mkdtemp()) / "operator.json"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SILKWORM_")}
+    env["SILKWORM_ROLE"] = "operator"
+    r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "operator", "git",
+                        "--in", str(repo), "log", "-1", f"--output={target}"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    check("through the CLI, --output is refused and nothing is written",
+          r.returncode == 1 and not target.exists(), r.stdout + r.stderr)
+    r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "operator", "git",
+                        "--in", str(repo), "log", "-1", "--format=%s"],
+                       capture_output=True, text=True, env=env, timeout=60)
+    check("and a read runs", r.returncode == 0 and r.stdout.strip() == "fix line 32, and 31 beside it",
+          r.stdout + r.stderr)
+
+
+def test_operator_cannot_queue_work_by_any_other_door():
+    import operator_role as O
+    import tasks as T
+    print("\nthe operator: retry, rework and edit are not side doors into the queue")
+    bot = _operator_bot()
+    st = bot.store
+    me = {"caller_role": "operator"}
+
+    def ask(action, tid, **kw):
+        return bot.ns["handle_tasks"]({"action": action, "id": tid, **me, **kw})
+
+    prop = st.create("Add an appearance preference to Settings", state=T.PROPOSED,
+                     role="implementor", project="alpha")["id"]
+    for action, kw in (("retry", {}), ("rework", {"notes": "go"})):
+        out = ask(action, prop, **kw)
+        check(f"{action} on a proposal is accepting it, and refused",
+              not out["ok"] and out.get("refused") == "accept"
+              and st.get(prop)["state"] == T.PROPOSED, str(out))
+    st.transition(prop, T.CANCELLED, "dismiss via ui")
+    out = ask("retry", prop)
+    check("retrying a proposal you dismissed is refused too (cancelled is final)",
+          not out["ok"] and st.get(prop)["state"] == T.CANCELLED, str(out))
+    q = st.create("Cache the release plan per checkout", role="implementor", project="alpha")["id"]
+    out = ask("edit", q, goal="Rewrite the landing code from scratch, all of it")
+    check("an edit that writes a new goal is refused", not out["ok"]
+          and "Rewrite" not in st.get(q)["goal"], str(out))
+    out = ask("edit", q, title="Release plan cache")
+    check("an edit of the title is not", out["ok"], str(out))
+    failed = st.create("Retry sync on 5xx", role="implementor", project="alpha")["id"]
+    st.transition(failed, T.RUNNING); st.transition(failed, T.FAILED, "overloaded")
+    out = ask("rework", failed, notes="also rewrite the settings screen")
+    check("reworking work whose landing was not refused is a new goal, and refused",
+          not out["ok"] and st.get(failed)["state"] == T.FAILED, str(out))
+    out = ask("retry", failed)
+    check("retrying failed work it was given is allowed",
+          out["ok"] and st.get(failed)["state"] == T.QUEUED, str(out))
+    clash = st.create("Fix the countdown", role="implementor", project="alpha")["id"]
+    st.transition(clash, T.RUNNING); st.transition(clash, T.DONE)
+    st.update(clash, result={"landing": {"eligible": True, "landed": False,
+                                         "stage": "rebase", "detail": "conflict in a.py"}})
+    check("reworking a landing git refused is its job",
+          O.tasks_guard("rework", {"id": clash}, st.get(clash)) is None)
+    flagged = st.create("Tidy the sync loop", role="implementor")["id"]
+    st.transition(flagged, T.RUNNING); st.transition(flagged, T.AWAITING_APPROVAL)
+    out = ask("dismiss", flagged)
+    out = ask("land", flagged)
+    check("dismissing flagged work and then landing it is refused",
+          not out["ok"] and out.get("refused") == "accept" and flagged not in bot.landings,
+          str(out))
+
+
+def test_operator_drops_nothing_reverted_and_tidies_only_finished_task_checkouts():
+    import operator_role as O
+    import tasks as T
+    import worktrees as W
+    print("\nthe operator: a reverted change is not 'contained'; tidy is for finished tasks' checkouts")
+    repo = _op_repo()
+    _op_git(repo, "checkout", "-qb", "silkworm/tsk_rev", "fork")
+    (repo / "rev.py").write_text("x = 1\n")
+    _op_git(repo, "add", "-A"); _op_git(repo, "commit", "-qm", "add rev.py")
+    _op_git(repo, "checkout", "-q", "main")
+    _op_git(repo, "cherry-pick", "silkworm/tsk_rev")
+    _op_git(repo, "revert", "--no-edit", "HEAD")
+    cherry = _op_git(repo, "cherry", "main", "silkworm/tsk_rev")
+    check("the fixture: git cherry calls it landed", cherry.startswith("-"), cherry)
+    ok, why = O.contained(repo, "silkworm/tsk_rev", "main")
+    check("but main no longer holds it, so it is not contained", not ok, why)
+
+    root = Path(tempfile.mkdtemp())
+    st = T.TaskStore(root / "t.json")
+    ages = {}
+    wt = types.SimpleNamespace(**{k: getattr(W, k) for k in dir(W) if not k.startswith("__")})
+    wt.ROOT = root
+    wt.age_s = lambda p: ages.get(Path(p).name, 99999)
+    ns = bot_functions("tidy_checkout", task_store=st, tasks=T, worktrees=wt,
+                       live_worktree_tasks=lambda: set(),
+                       repo_guard=lambda *a, **k: contextlib.nullcontext(), Path=Path)
+    tidy = ns["tidy_checkout"]
+
+    def checkout(tid, state=T.DONE):
+        if state:
+            t = st.create("w", role="implementor")
+            st._data[tid] = {**st._data.pop(t["id"]), "id": tid, "state": state}
+        path = root / f"trader--{tid}"
+        _op_git(repo, "worktree", "add", "-q", "-b", f"silkworm/{tid}", str(path), "main")
+        return path
+
+    stray = checkout("feature", state=None)
+    out = tidy({"path": str(stray)})
+    check("a checkout no task owns is refused", not out["ok"] and stray.exists(), str(out))
+    run = checkout("tsk_run", state=T.RUNNING)
+    out = tidy({"path": str(run)})
+    check("one a live task owns is refused", not out["ok"] and run.exists(), str(out))
+    young = checkout("tsk_young")
+    ages["trader--tsk_young"] = 5
+    out = tidy({"path": str(young)})
+    check("one touched within the hour is refused", not out["ok"] and young.exists(), str(out))
+    held = checkout("tsk_held")
+    (held / "notes.txt").write_text("somebody's work\n")
+    out = tidy({"path": str(held)})
+    check("one holding work is refused, naming it",
+          not out["ok"] and "notes.txt" in out["error"] and held.exists(), str(out))
+    clean = checkout("tsk_clean")
+    out = tidy({"path": str(clean)})
+    check("a finished task's clean checkout is removed", out["ok"] and not clean.exists(), str(out))
+    out = tidy({"path": str(repo)})
+    check("the repository itself is never a checkout to tidy",
+          not out["ok"] and repo.exists(), str(out))
+
+
+def test_operator_turns_do_not_hold_the_checkout_and_deploy_tests_run_clean():
+    print("\nthe operator's turn holds no repo_guard; deploy's suite runs outside the turn")
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for fn in ("handle_prompt", "execute_task"):
+        guards = [n for n in ast.walk(fns[fn]) if isinstance(n, ast.Assign)
+                  and ast.unparse(n.targets[0]) == "guard"]
+        check(f"{fn}: the operator's turn takes no repo_guard",
+              len(guards) == 1 and ast.unparse(guards[0].value).startswith(
+                  "contextlib.nullcontext() if role_name == roles.OPERATOR else repo_guard("),
+              str([ast.unparse(g) for g in guards]))
+    src = (BASE / "bin" / "silkworm").read_text()
+    node = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)
+                and n.name == "run_suite")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(kw.get("env") or {})
+        return types.SimpleNamespace(returncode=0)
+    ns = {"VENV_PY": Path("/nonexistent"), "sys": sys, "REPO": BASE, "os": os,
+          "git_guard": __import__("git_guard"), "str": str,
+          "subprocess": types.SimpleNamespace(run=fake_run)}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "silkworm", "exec"), ns)
+    saved = {k: os.environ.get(k) for k in ("SILKWORM_ROLE", "SILKWORM_THREAD",
+                                             "SILKWORM_TASK_ROLE", "SILKWORM_TASK_ID")}
+    os.environ.update(SILKWORM_ROLE="operator", SILKWORM_THREAD="D1:1.0",
+                      SILKWORM_TASK_ROLE="operator", SILKWORM_TASK_ID="tsk_x")
+    try:
+        ns["run_suite"]()
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    check("deploy's preflight suite runs without the turn's role, thread or guard",
+          calls and not any(k in calls[0] for k in saved), str(sorted(calls[0])[:5]))
 
 
 if __name__ == "__main__":
