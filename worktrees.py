@@ -264,6 +264,25 @@ def attach(repo, task_id: str, branch: str, label: str = "land",
     return path
 
 
+def drop_scratch(repo, path) -> bool:
+    """Remove a detached checkout that was only ever read, whatever is in it.
+
+    For checkouts nobody works in -- a base commit run through its suite to
+    see whether it fails on its own (basered.py). The suite leaves its
+    droppings behind, and release() would keep the tree over them as if they
+    were somebody's afternoon; nothing in here can be, since nothing was ever
+    written to it but by the suite. Never for a task's own checkout.
+    """
+    path = Path(path)
+    if not path.exists():
+        return True
+    r = _git(repo, "worktree", "remove", "--force", str(path))
+    if r.returncode != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        _git(repo, "worktree", "prune")
+    return not path.exists()
+
+
 def main_repo(worktree) -> Path | None:
     """The checkout a worktree belongs to."""
     r = _git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")

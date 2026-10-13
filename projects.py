@@ -95,6 +95,15 @@ FIELDS: dict[str, tuple] = {
     # Info.plists; counting those held fourteen checkouts and refused every
     # landing. Relative to the repo root; a trailing "/" means a directory.
     "generated": (list, "paths a build regenerates, never counted as uncommitted work"),
+    # Whether the base fails its own suite, with nobody's change on it. Set by
+    # basered.py when a task's tests fail and a clean checkout of the base
+    # fails them too; cleared when a later base commit passes. While set, the
+    # project's implementor work is held rather than bounced off it one task
+    # at a time. {sha, base, tests, since, attention} or None.
+    "main_failing": (None, "the base fails its own tests: {sha, base, tests, since, attention}"),
+    # What the suite said about recent base commits, so each is run at most
+    # once: {sha: {ok, failed, at}}. A handful, newest kept.
+    "base_checks": (dict, "suite results on recent base commits, by sha"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),
@@ -217,6 +226,23 @@ class ProjectStore:
         """`ensure`'s lookup without writing anything."""
         with self._lock:
             return self._resolve(name)
+
+    def update(self, slug: str, **fields) -> dict | None:
+        """Write fields on a project that exists; None if it does not.
+
+        `ensure` creates what it cannot find, which is right for a person
+        naming a project and wrong for bookkeeping about one: a record written
+        for a project since removed would bring it back, empty.
+        """
+        with self._lock:
+            rec = self._data.get(slug)
+            if rec is None:
+                return None
+            rec.update({k: v for k, v in fields.items()
+                        if k in FIELDS and k not in ("slug", "created")})
+            rec["updated"] = time.time()
+            self._save()
+            return dict(rec)
 
     def set_archived(self, slug: str, archived: bool) -> bool:
         with self._lock:

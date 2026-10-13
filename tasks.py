@@ -265,6 +265,11 @@ FIELDS: dict[str, tuple] = {
     # The ones that were filed are its children: `parent` names it.
     "next_steps_held": (list, "research next steps refused at filing, and why"),
     "verified":        (None,  "True/False from the test command, None = not run"),
+    # Set while this task's tests fail only where its project's base fails
+    # them too (basered.py): held rather than sent back, failed or refused,
+    # and verified or landed again once the base passes. {kind: verify |
+    # landing, sha, approved, at} or None.
+    "held_base":       (None,  "held while the base fails the same tests: {kind, sha, approved, at}"),
     "verify_attempts": (0,     "times it was sent back for failing tests"),
     "commit_attempts": (0,     "times it was sent back for leaving its work uncommitted"),
     # Each once at most, and only on projects that take unsupervised work:
@@ -852,7 +857,7 @@ class TaskStore:
             return dict(rec)
 
     def claim(self, *, only_roles=None, except_roles=None, wakeups=None,
-              skip_threads=()) -> dict | None:
+              skip_threads=(), hold_implementors=()) -> dict | None:
         """Take the next queued task the runner is allowed to execute: the
         highest `priority` (see run_next), the oldest among equals.
 
@@ -883,6 +888,12 @@ class TaskStore:
         while its reworked implementor runs would check out the branch before
         that implementor finished moving it. Queue tasks only: those are put
         back on every restart, so a stale `running` cannot wedge a thread.
+
+        `hold_implementors` names projects whose base fails its own tests
+        (basered.py). Their implementor tasks stay queued: every one would
+        fail verification on the base's failures, and be held for them, at
+        the price of a whole session each. Other roles still run -- an
+        assistant or a researcher may be the very thing fixing the base.
         """
         with self._lock:
             busy = [r for r in self._data.values()
@@ -898,6 +909,9 @@ class TaskStore:
                 if except_roles is not None and role in except_roles:
                     return False
                 if wakeups is not None and is_wakeup(r) != wakeups:
+                    return False
+                if (role == "implementor" and hold_implementors
+                        and (r.get("project") or "") in hold_implementors):
                     return False
                 if r.get("thread") and r.get("thread") in skip_threads:
                     return False

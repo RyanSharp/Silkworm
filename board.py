@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 
+import basered
 import branches
 import costs
 import projects as projects_mod
@@ -460,6 +461,11 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
             "unready": projects_mod.unready(p),
         }
         row["cwd"] = (p.get("scope") or {}).get("cwd") or ""
+        # The project's one line while its base fails its own tests.
+        red = p.get("main_failing") or None
+        row["main_failing"] = ({"line": basered.line(slug, red), "sha": red.get("sha"),
+                                "tests": list(red.get("tests") or []),
+                                "since": red.get("since")} if red else None)
         row["release"] = releases_by_slug.get(slug)
         out.append(row)
     out.sort(key=lambda r: (-r["needs"], -len(r["running"]), r["title"].lower()))

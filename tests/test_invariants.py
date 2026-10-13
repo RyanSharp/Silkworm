@@ -20694,6 +20694,473 @@ def test_action_cli_documented():
         check(f"README names silkworm {cmd}", f"silkworm {cmd} " in readme)
 
 
+# --- a base that fails its own tests is noticed once, not per task --------------
+# 2026-10-12: trader's main failed its own suite (a deliberate review-by date in
+# ops/bar_integrity_baseline.json passed on 10-09). Every trader task then
+# failed verification on that one test, was sent back, parked "never
+# verified", and one agent spent a run proving the failure was not its own.
+
+def _red_stores(slug="trader", test_cmd="pytest"):
+    import projects as P
+    import tasks as T
+    d = Path(tempfile.mkdtemp())
+    ps = P.ProjectStore(d / "p.json")
+    ps.ensure(slug, test_cmd=test_cmd, auto_merge=True,
+              scope={"cwd": str(d), "branch": "main"})
+    return ps, T.TaskStore(d / "t.json")
+
+
+def test_failed_tests_names_each_failure_once():
+    print("\nfailing tests are read off a run by name, from every runner")
+    import verify as V
+    silk = ("  ✔ fine\n  ✘ the broken one — got 3\n  ✔ quoting '✘ not this'\n"
+            "\n12 passed, 1 failed\n  FAILED: the broken one\n")
+    check("Silkworm's runner: the check, once, without its detail",
+          V.failed_tests(silk) == ["the broken one"], str(V.failed_tests(silk)))
+    py = ("tests/test_bar_integrity.py F.\n=== short test summary info ===\n"
+          "FAILED tests/test_bar_integrity.py::test_the_shipped_baseline - "
+          "AssertionError: review_by 2026-10-09 passed\n"
+          "==== 1 failed, 40 passed in 3.1s ====\n")
+    check("pytest: the node id, without the assertion message",
+          V.failed_tests(py) == ["tests/test_bar_integrity.py::test_the_shipped_baseline"],
+          str(V.failed_tests(py)))
+    xc = ("Test Case '-[AppTests.FooTests testBar]' failed (0.01 seconds).\n"
+          "/x/FooTests.swift:9: error: -[AppTests.FooTests testBaz] : "
+          "XCTAssertEqual failed: (\"1\") is not equal to (\"2\")\n"
+          "✘ Test quux() recorded an issue at Q.swift:3:5\n"
+          "Executed 9 tests, with 2 failures (0 unexpected)\n** TEST FAILED **\n")
+    check("xcodebuild and Swift Testing: by test, tallies left out",
+          V.failed_tests(xc) == ["-[AppTests.FooTests testBar]",
+                                 "-[AppTests.FooTests testBaz]", "quux()"],
+          str(V.failed_tests(xc)))
+    check("a run that names nothing names nothing",
+          V.failed_tests("Traceback ...\nImportError: no module named x\n") == [])
+    many = "".join(f"  ✘ check {i}\n" for i in range(40))
+    check("never trimmed: a failure cut off would look like the base's",
+          len(V.failed_tests(many)) == 40)
+
+
+def test_only_failures_also_failing_on_base_are_the_bases():
+    print("\nonly a task failing nothing but the base's own failures is held")
+    import basered as B
+    base = ["a", "b"]
+    check("the same failures: the base's", B.only_failing_on_base(["a"], base))
+    check("all of them: the base's", B.only_failing_on_base(["b", "a"], base))
+    check("one more than the base fails: a real failure",
+          not B.only_failing_on_base(["a", "c"], base),
+          "holding it would hide a test this change broke")
+    check("only others: a real failure", not B.only_failing_on_base(["c"], base))
+    check("a run that named no test: real, nothing can be compared",
+          not B.only_failing_on_base([], base))
+    check("a base that named no test holds nothing",
+          not B.only_failing_on_base(["a"], []))
+
+
+def test_base_suite_runs_once_per_commit():
+    print("\nthe base's suite runs at most once per base commit")
+    import threading as _th
+    import basered as B
+    ps, _ = _red_stores()
+    runs = []
+
+    def run(sha):
+        runs.append(sha)
+        time.sleep(0.05)
+        return {"ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n",
+                "failed": ["t1"]}
+
+    first = B.check(ps, "trader", "a" * 40, run)
+    again = B.check(ps, "trader", "a" * 40, run)
+    check("red, with the failing test named",
+          first and not first["ok"] and first["failed"] == ["t1"], str(first))
+    check("asked twice, run once", runs == ["a" * 40], str(runs))
+    check("and the second answer is the first", again == first)
+    import projects as P
+    check("cached on the project record, so a restart remembers it",
+          "a" * 40 in (P.ProjectStore(ps._path).get("trader")["base_checks"]))
+    B.check(ps, "trader", "b" * 40, run)
+    check("a new base commit is a new question", runs == ["a" * 40, "b" * 40])
+
+    out = []
+    ts = [_th.Thread(target=lambda: out.append(B.check(ps, "trader", "c" * 40, run)))
+          for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("three failures at once wait on one run", runs.count("c" * 40) == 1, str(runs))
+
+    gone = B.check(ps, "trader", "d" * 40,
+                   lambda s: {"ran": False, "ok": False, "output": "no checkout"})
+    check("could not run: no answer", gone is None)
+    check("and nothing cached, so the next failure asks again",
+          B.cached(ps, "trader", "d" * 40) is None)
+    launch = {"ran": True, "ok": False, "launch_failure": True, "output": "Unable to boot"}
+    check("a suite that never launched is no answer either",
+          B.check(ps, "trader", "e" * 40, lambda s: launch) is None
+          and B.cached(ps, "trader", "e" * 40) is None)
+    for i in range(B.MAX_CHECKS + 3):
+        B.check(ps, "trader", f"{i:040d}", lambda s: {"ran": True, "ok": True})
+    check("a handful kept, not every commit for ever",
+          len(ps.get("trader")["base_checks"]) == B.MAX_CHECKS)
+
+
+def test_failing_base_gets_one_attention_item():
+    print("\na failing base is one needs-you item, however many tasks hit it")
+    import basered as B
+    import tasks as T
+    ps, ts = _red_stores()
+    red = {"sha": "a" * 40, "ok": False, "failed": ["t1"]}
+    state, news = B.mark_red(ps, ts, "trader", red, "main")
+    state2, news2 = B.mark_red(ps, ts, "trader", red, "main")
+    items = [t for t in ts.all().values() if t.get("source") == B.SOURCE]
+    check("one item", len(items) == 1, str(len(items)))
+    check("in needs you", items and items[0]["state"] == T.NEEDS_INPUT
+          and items[0]["state"] in T.NEEDS_ATTENTION)
+    check("titled with the one line",
+          items and items[0]["title"] == "trader main is failing: t1", items and items[0]["title"])
+    check("news once, and only once", news and not news2)
+    check("recorded on the project: tests, base sha, its item",
+          ps.get("trader")["main_failing"]["tests"] == ["t1"]
+          and ps.get("trader")["main_failing"]["sha"] == "a" * 40
+          and ps.get("trader")["main_failing"]["attention"] == items[0]["id"])
+    check("never run on its own", ts.claim(except_roles=()) is None)
+
+    worse = {"sha": "b" * 40, "ok": False, "failed": ["t1", "t2"]}
+    B.mark_red(ps, ts, "trader", worse, "main")
+    items = [t for t in ts.all().values() if t.get("source") == B.SOURCE]
+    check("a later commit still failing updates the same item",
+          len(items) == 1 and items[0]["title"] == "trader main is failing: t1, t2",
+          str([i["title"] for i in items]))
+    check("and keeps when it started failing",
+          ps.get("trader")["main_failing"]["since"] == state["since"])
+
+    ts.transition(items[0]["id"], T.CANCELLED, "dismissed")
+    B.mark_red(ps, ts, "trader", worse, "main")
+    check("dismissed: not reopened for the same commit",
+          len([t for t in ts.all().values() if t.get("source") == B.SOURCE]) == 1)
+    B.mark_red(ps, ts, "trader", {"sha": "c" * 40, "ok": False, "failed": ["t1"]}, "main")
+    opened = [t for t in ts.all().values() if t.get("source") == B.SOURCE
+              and t["state"] == T.NEEDS_INPUT]
+    check("but a later commit that still fails opens one again", len(opened) == 1)
+
+
+def test_base_recovery_clears_state_and_closes_the_item():
+    print("\na base that passes again clears the state and closes the item")
+    import basered as B
+    import tasks as T
+    ps, ts = _red_stores()
+    state, _ = B.mark_red(ps, ts, "trader", {"sha": "a" * 40, "failed": ["t1"]}, "main")
+    t = ts.create("work", project="trader", role="implementor", driver="queue")
+    B.hold(ts, t["id"], "verify", "a" * 40)
+    other = ts.create("work", project="cadence", role="implementor", driver="queue")
+    B.hold(ts, other["id"], "verify", "a" * 40)
+    was, held = B.recover(ps, ts, "trader", "b" * 40)
+    check("hands back what it cleared", was.get("sha") == "a" * 40)
+    check("and this project's held tasks, no other's",
+          [h["id"] for h in held] == [t["id"]], str([h["id"] for h in held]))
+    check("the project is no longer failing", not ps.get("trader")["main_failing"]
+          and B.failing(ps) == set())
+    check("its item is closed", ts.get(state["attention"])["state"] == T.DONE)
+    check("a second recovery is nothing", B.recover(ps, ts, "trader", "c" * 40) == ({}, []))
+
+
+def test_runner_skips_implementors_of_a_failing_base():
+    print("\nthe runner takes no implementor work where the base fails")
+    import tasks as T
+    d = Path(tempfile.mkdtemp())
+    st = T.TaskStore(d / "t.json")
+    impl = st.create("fix", project="trader", role="implementor", driver="queue")
+    asst = st.create("look", project="trader", role="assistant", driver="queue")
+    res = st.create("dig", project="trader", role="researcher", driver="queue")
+    elsewhere = st.create("fix", project="cadence", role="implementor", driver="queue")
+    got = []
+    while True:
+        r = st.claim(hold_implementors={"trader"})
+        if not r:
+            break
+        got.append(r["id"])
+    check("assistant and researcher work still runs",
+          asst["id"] in got and res["id"] in got)
+    check("another project's implementor still runs", elsewhere["id"] in got)
+    check("the failing project's implementor stays queued",
+          impl["id"] not in got and st.get(impl["id"])["state"] == T.QUEUED)
+    check("and is claimed once the base is no longer failing",
+          st.claim(hold_implementors=set())["id"] == impl["id"])
+    src = (BASE / "bot.py").read_text()
+    worker = src[src.index("def _task_worker("):src.index("#: How often to re-check for orphaned turns")]
+    check("the task worker passes the failing projects to its claim",
+          "hold_implementors=red" in worker and "basered.failing(project_store)" in worker)
+
+
+def _base_glue(ps, ts, *, suite, base=("main", "b" * 40), moved=True, verify_ok=True):
+    """ask_base and its neighbours, lifted out of bot.py, against real stores."""
+    import basered as _br
+    import merge as _merge
+    import tasks as _T
+    import verify as _V
+    calls = {"posts": [], "suite": [], "landings": [], "reviews": [], "sent_back": [],
+             "verified": [], "told": []}
+
+    class Client:
+        def chat_postMessage(self, **kw):
+            calls["posts"].append(kw)
+            return {"ts": f"{len(calls['posts'])}.0"}
+
+    class SyncThread:
+        def __init__(self, target, args=(), **kw):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+    def run_suite(repo, slug, sha):
+        calls["suite"].append(sha)
+        return suite(sha)
+
+    def state(tid, to, detail=""):
+        try:
+            ts.transition(tid, to, detail)
+        except Exception:
+            pass
+
+    wt = types.SimpleNamespace(is_repo=lambda p: True, drop_scratch=lambda *a: True,
+                               attach=lambda *a, **k: Path(tempfile.mkdtemp()))
+    ns = bot_functions(
+        "ask_base", "hold_for_base", "hold_landing_for_base", "release_base",
+        "reverify_held", "announce_red",
+        project_store=ps, task_store=ts, basered=_br, verify=_V, merge=_merge,
+        tasks=_T, threading=types.SimpleNamespace(Thread=SyncThread),
+        app=types.SimpleNamespace(client=Client()), home_channel=lambda: "DHOME",
+        base_repo=lambda task: "/repo", current_base=lambda repo, task: base,
+        run_base_suite=run_suite, base_moved_on=lambda repo, red, sha: moved,
+        task_state=state, worktrees=wt,
+        branches=types.SimpleNamespace(name_for=lambda t: "silkworm/" + t["id"]),
+        start_landing=lambda tid, approved=False: calls["landings"].append((tid, approved)),
+        verify_work=lambda task, cwd: (calls["verified"].append(task["id"]) or
+                                       {"ran": True, "ok": verify_ok, "code": 0 if verify_ok else 1,
+                                        "output": "" if verify_ok else "  ✘ t9\n",
+                                        "failed": [] if verify_ok else ["t9"]}),
+        resolve_review=lambda task, role, text, c, t: calls["reviews"].append(task["id"]),
+        send_back_for_tests=lambda task, r, c, t: calls["sent_back"].append(task["id"]),
+        tell_thread=lambda key, text: calls["told"].append(text))
+    return ns, calls
+
+
+def _running(ts, project="trader"):
+    import tasks as T
+    t = ts.create("change", project=project, role="implementor", driver="queue",
+                  thread="C1:1.0", isolate=True)
+    ts.transition(t["id"], T.RUNNING, "claimed")
+    ts.update(t["id"], result={"text": "did it"})
+    return ts.get(t["id"])
+
+
+def test_task_failing_only_the_bases_tests_is_held():
+    print("\nverification failing only what the base fails holds the task")
+    import tasks as T
+    ps, ts = _red_stores()
+    red = lambda sha: {"ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n",
+                       "failed": ["t1"]}
+    ns, calls = _base_glue(ps, ts, suite=red)
+    a, b = _running(ts), _running(ts)
+    failing_t1 = {"ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n", "failed": ["t1"]}
+    check("held", ns["hold_for_base"](a, failing_t1, "C1", "1.0") is True)
+    check("the second task too", ns["hold_for_base"](b, failing_t1, "C1", "1.0") is True)
+    check("the base was run once for both", calls["suite"] == ["b" * 40], str(calls["suite"]))
+    for t in (a, b):
+        rec = ts.get(t["id"])
+        check("parked blocked, on no task", rec["state"] == T.BLOCKED
+              and not rec.get("blocked_on") and rec["held_base"]["kind"] == "verify")
+        check("not counted as a failed attempt", not rec.get("verify_attempts"))
+        check("not in needs you", rec["state"] not in T.NEEDS_ATTENTION)
+    items = [t for t in ts.needs_attention() if t["project"] == "trader"]
+    check("one needs-you item for the project, not one per task",
+          len(items) == 1 and items[0]["title"] == "trader main is failing: t1",
+          str([i["title"] for i in items]))
+    home = [p for p in calls["posts"] if p.get("channel") == "DHOME"]
+    check("announced once", len(home) == 1 and "trader main is failing: t1" in home[0]["text"])
+    check("and the announcement is the item's thread",
+          ts.get(items[0]["id"])["thread"] == "DHOME:1.0")
+
+    c = _running(ts)
+    extra = {"ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n  ✘ t2\n",
+             "failed": ["t1", "t2"]}
+    check("a test the base passes: real, not held",
+          ns["hold_for_base"](c, extra, "C1", "1.0") is False
+          and ts.get(c["id"])["state"] == T.RUNNING and not ts.get(c["id"]).get("held_base"))
+    d = _running(ts)
+    crash = {"ran": True, "ok": False, "code": 1, "output": "Traceback\n", "failed": []}
+    check("a run that names nothing: real", ns["hold_for_base"](d, crash, "C1", "1.0") is False)
+
+    ps2, ts2 = _red_stores()
+    ns2, calls2 = _base_glue(ps2, ts2, suite=lambda sha: {"ran": True, "ok": True})
+    e = _running(ts2)
+    check("a base that passes: the failure is the task's",
+          ns2["hold_for_base"](e, failing_t1, "C1", "1.0") is False
+          and not ps2.get("trader")["main_failing"] and not ts2.needs_attention())
+    ns3, _ = _base_glue(ps2, ts2, suite=lambda sha: {"ran": False, "ok": False, "output": "x"})
+    check("a base that cannot be asked: the failure is the task's",
+          ns3["hold_for_base"](e, failing_t1, "C1", "1.0") is False)
+
+    src = (BASE / "bot.py").read_text()
+    body = src[src.index("def execute_task("):src.index("def verify_work(")]
+    check("execute_task asks the base before sending work back",
+          0 < body.index("hold_for_base(task, checked") < body.index("send_back_for_tests(task, checked"))
+
+
+def test_landing_failing_only_the_bases_tests_is_held():
+    print("\na landing failing only what the base fails is held, not refused")
+    import merge as M
+    ps, ts = _red_stores()
+    ns, calls = _base_glue(ps, ts, suite=lambda sha: {
+        "ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n", "failed": ["t1"]})
+    t = ts.create("change", project="trader", role="implementor", driver="queue")
+    refused = {"eligible": True, "landed": False, "stage": "tests-after-rebase",
+               "detail": "x", "branch": "b", "base": "main", "onto": "c" * 40,
+               "failed": ["t1"]}
+    out = ns["hold_landing_for_base"](t, refused, True)
+    check("held at base-failing", out and out["stage"] == M.BASE_FAILING
+          and out["eligible"] and not out["landed"], str(out))
+    check("asked about the commit it was rebased onto", calls["suite"] == ["c" * 40])
+    check("the task remembers it, and that it was approved",
+          ts.get(t["id"])["held_base"] == {**ts.get(t["id"])["held_base"],
+                                           "kind": "landing", "approved": True})
+    check("needs no person: no rework, no awaiting-approval", not M.needs_a_person(out))
+    check("and says it is held", "held" in M.summary(out, "b").lower())
+    real = {**refused, "failed": ["t1", "t3"]}
+    t2 = ts.create("change", project="trader", role="implementor", driver="queue")
+    check("one more failure than the base: still a refusal",
+          ns["hold_landing_for_base"](t2, real, False) is None
+          and M.needs_a_person(real))
+    src = (BASE / "bot.py").read_text()
+    body = src[src.index("def land_if_ready("):src.index("def record_landing(")]
+    check("land_if_ready asks after both test stages",
+          "hold_landing_for_base(task, result, approved)" in body
+          and '"tests-after-rebase", "tests-after-merge"' in body)
+    import digest as D
+    check("not a refusal in the digest", M.BASE_FAILING in D.NOT_REFUSALS)
+
+
+def test_landing_refusals_carry_failures_and_base():
+    print("\na landing refused on its tests says which, and on which base commit")
+    import merge as M
+    repo = Path(tempfile.mkdtemp())
+    g = lambda *a, cwd=repo: subprocess.run(["git", "-C", str(cwd), "-c", "user.email=t@t",
+                                            "-c", "user.name=t", *a],
+                                           capture_output=True, text=True, check=True)
+    g("init", "-q", "-b", "main")
+    g("commit", "-q", "--allow-empty", "-m", "base")
+    base = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "-b", "silkworm/tsk_x")
+    (repo / "a").write_text("a\n")
+    g("add", "a")
+    g("commit", "-q", "-m", "work")
+    g("checkout", "-q", "main")
+    wt = Path(tempfile.mkdtemp()) / "wt"
+    g("worktree", "add", "-q", str(wt), "silkworm/tsk_x")
+    bad = {"ok": False, "ran": True, "output": "  ✘ t1\n", "failed": ["t1"]}
+    r = M.land(wt, repo, "silkworm/tsk_x", "main", lambda cwd: bad, generated=[])
+    check("after the rebase: the failing tests and the commit",
+          r["stage"] == "tests-after-rebase" and r.get("failed") == ["t1"]
+          and r.get("onto") == base, str(r))
+    r = M.land(wt, repo, "silkworm/tsk_x", "main",
+               lambda cwd: {"ok": True} if Path(cwd) == wt else bad, generated=[])
+    check("after the merge too, with the base it was put back to",
+          r["stage"] == "tests-after-merge" and r.get("failed") == ["t1"]
+          and r.get("onto") == base and g("rev-parse", "HEAD").stdout.strip() == base, str(r))
+
+
+def test_base_recovery_releases_held_work():
+    print("\na base passing again releases what it held, and says so")
+    import basered as B
+    import tasks as T
+    ps, ts = _red_stores()
+    outcomes = {"a" * 40: {"ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n",
+                           "failed": ["t1"]},
+                "b" * 40: {"ran": True, "ok": True, "code": 0, "output": ""}}
+    ns, calls = _base_glue(ps, ts, suite=lambda sha: outcomes[sha], base=("main", "a" * 40))
+    held_v = _running(ts)
+    ns["hold_for_base"](held_v, {"ran": True, "ok": False, "failed": ["t1"],
+                                 "output": "  ✘ t1\n"}, "C1", "1.0")
+    lt = ts.create("landed", project="trader", role="implementor", driver="queue")
+    B.hold(ts, lt["id"], "landing", "a" * 40, approved=True)
+    item = ps.get("trader")["main_failing"]["attention"]
+
+    ns2, calls2 = _base_glue(ps, ts, suite=lambda sha: outcomes[sha], base=("main", "b" * 40))
+    probe = {"project": "trader", "scope": {}}
+    out = ns2["ask_base"](probe, [], sha="b" * 40, base="main")
+    check("the later commit passes", out == {"held": False, "state": None})
+    check("the project is green", not ps.get("trader")["main_failing"])
+    check("its item is closed", ts.get(item)["state"] == T.DONE)
+    check("the held verification is verified again, then reviewed",
+          calls2["verified"] == [held_v["id"]] and calls2["reviews"] == [held_v["id"]])
+    check("and recorded as verified", ts.get(held_v["id"])["verified"] is True)
+    check("the held landing is landed again, approved as before",
+          calls2["landings"] == [(lt["id"], True)])
+    check("neither is held any more",
+          not ts.get(held_v["id"]).get("held_base") and not ts.get(lt["id"]).get("held_base"))
+    check("and it is said",
+          any("main is green again" in p.get("text", "") for p in calls2["posts"]))
+
+    ps3, ts3 = _red_stores()
+    ns3, calls3 = _base_glue(ps3, ts3, suite=lambda sha: outcomes[sha],
+                             base=("main", "a" * 40), verify_ok=False)
+    v = _running(ts3)
+    ns3["hold_for_base"](v, {"ran": True, "ok": False, "failed": ["t1"],
+                             "output": "  ✘ t1\n"}, "C1", "1.0")
+    ns4, calls4 = _base_glue(ps3, ts3, suite=lambda sha: outcomes[sha],
+                             base=("main", "b" * 40), verify_ok=False)
+    ns4["ask_base"](probe, [], sha="b" * 40)
+    check("failing again on a green base is a real failure, sent back",
+          calls4["sent_back"] == [v["id"]] and not calls4["reviews"])
+
+    ps5, ts5 = _red_stores()
+    ns5, _ = _base_glue(ps5, ts5, suite=lambda sha: outcomes[sha], base=("main", "a" * 40))
+    w = _running(ts5)
+    ns5["hold_for_base"](w, {"ran": True, "ok": False, "failed": ["t1"],
+                             "output": "  ✘ t1\n"}, "C1", "1.0")
+    ns6, calls6 = _base_glue(ps5, ts5, suite=lambda sha: outcomes[sha], moved=False)
+    ns6["ask_base"](probe, [], sha="b" * 40)
+    check("a green answer about an older commit releases nothing",
+          ps5.get("trader")["main_failing"] and ts5.get(w["id"])["held_base"]
+          and not calls6["verified"])
+
+    src = (BASE / "bot.py").read_text()
+    sched = src[src.index("def _task_scheduler("):src.index("def hold_unsupervised(")]
+    check("the scheduler watches failing bases for the fixing commit",
+          "probe_failing_bases()" in sched)
+
+
+def test_failing_base_is_one_line_on_board_and_digest():
+    print("\na failing base is one line in the digest and on the dashboard")
+    import basered as B
+    import board as BD
+    import digest as D
+    ps, ts = _red_stores()
+    B.mark_red(ps, ts, "trader", {"sha": "a" * 40, "failed": ["t1", "t2"]}, "main")
+    for _ in range(3):
+        t = ts.create("change", project="trader", role="implementor", driver="queue")
+        ts.transition(t["id"], "running", "x")
+        ts.transition(t["id"], "blocked", "held")
+        B.hold(ts, t["id"], "verify", "a" * 40)
+    now = time.time() + 3 * 86400            # long enough to read as stuck
+    recs = list(ts.all().values())
+    failing = {"trader": ps.get("trader")["main_failing"]}
+    text = D.render(recs, now, failing=failing)
+    check("the digest says it once",
+          text.count("main is failing") == 1 and "t1, t2" in text, text)
+    check("the held tasks are not listed as stuck", "stuck" not in text, text)
+    check("nor the item counted as needs input as well", "needs input" not in text, text)
+    check("without it, no line", "main is failing" not in D.render(recs, now))
+    ov = BD.overview(ps.all(), recs)
+    row = next(p for p in ov["projects"] if p["slug"] == "trader")
+    check("the dashboard card carries the line",
+          (row.get("main_failing") or {}).get("line") == "trader main is failing: t1, t2",
+          str(row.get("main_failing")))
+    check("and counts one thing needing you", row["needs"] == 1, str(row["needs"]))
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

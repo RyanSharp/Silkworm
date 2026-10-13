@@ -16,6 +16,7 @@ import statistics
 import time
 from datetime import datetime
 
+import basered
 import branches
 import costs
 import jsonstore
@@ -37,7 +38,7 @@ LIST_LIMIT = 5
 
 #: Landing stages that are not refusals even when merge.needs_a_person would
 #: say so: still going (bot.LANDING_UNDERWAY), or dropped on purpose.
-NOT_REFUSALS = ("in-progress", "dropped")
+NOT_REFUSALS = ("in-progress", "dropped", merge.BASE_FAILING)
 
 #: "Stuck" is measured against how long tasks usually sit in a state -- three
 #: times the median -- but never less than these, so a history of instant
@@ -174,12 +175,15 @@ def _project_of(rec: dict, by_id: dict) -> str:
     return rec.get("project") or parent.get("project") or UNFILED
 
 
-def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
+def sections(records, now: float, *, branch_rows=(), released=None,
+             failing=None) -> dict:
     """{project: {section: [lines]}} for the window ending at `now`.
 
     `branch_rows` is branches.survey's output and `released` is
     {project: [tag, ...]}; both need git, so the caller gathers them and this
-    stays a pure function of what it is given.
+    stays a pure function of what it is given. `failing` is {project:
+    main_failing} for every project whose base fails its own tests: one line
+    each, every day it is still so.
     """
     records = list(records)
     by_id = {r.get("id"): r for r in records}
@@ -189,6 +193,10 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
     def add(proj, section, line):
         out.setdefault(proj, {}).setdefault(section, []).append(line)
+
+    for proj, state in sorted((failing or {}).items()):
+        if state:
+            add(proj, "red", _esc(basered.named(state.get("tests"))))
 
     for rec in sorted(records, key=lambda r: r.get("created") or 0):
         proj = _project_of(rec, by_id)
@@ -240,6 +248,8 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
             # that is stuck, is listed itself -- or is waiting on you).
             excused = state == tasks.BLOCKED and (
                 (rec.get("retry_at") and rec["retry_at"] > now)
+                # Held for a failing base, which has a line of its own.
+                or rec.get("held_base")
                 or any((by_id.get(b) or {}).get("state") not in tasks.ENDED
                        for b in rec.get("blocked_on") or () if b in by_id))
             dwell = now - _entered(rec)
@@ -258,7 +268,8 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
     waiting: dict = {}
     for rec in records:
-        if rec.get("state") in dict(WAITING):
+        # A failing base's item has its own line above.
+        if rec.get("state") in dict(WAITING) and rec.get("source") != basered.SOURCE:
             row = waiting.setdefault(_project_of(rec, by_id), {})
             row[rec["state"]] = row.get(rec["state"], 0) + 1
     for proj, row in waiting.items():
@@ -282,7 +293,7 @@ def sections(records, now: float, *, branch_rows=(), released=None) -> dict:
 
 #: Section, its label, and whether its lines are titles to be listed on one
 #: line (with a count) rather than shown one per bullet.
-ORDER = (("todo", "yours to do", False),
+ORDER = (("red", "main is failing", False), ("todo", "yours to do", False),
          ("landed", "landed", True), ("released", "released", False),
          ("refused", "landing refused", False), ("failed", "failed or held", False),
          ("reran", "ran more than once", True), ("stuck", "stuck", False),
@@ -306,17 +317,19 @@ def unregistered_line(repos) -> str:
 
 
 def render(records, now: float, *, branch_rows=(), released=None,
-           when: datetime | None = None, unregistered=()) -> str:
+           when: datetime | None = None, unregistered=(), failing=None) -> str:
     """The digest as one compact Slack message."""
-    text = _render(records, now, branch_rows=branch_rows, released=released, when=when)
+    text = _render(records, now, branch_rows=branch_rows, released=released, when=when,
+                   failing=failing)
     line = unregistered_line(unregistered)
     return f"{text}\n{line}" if line else text
 
 
 def _render(records, now: float, *, branch_rows=(), released=None,
-            when: datetime | None = None) -> str:
+            when: datetime | None = None, failing=None) -> str:
     records = list(records)
-    data = sections(records, now, branch_rows=branch_rows, released=released)
+    data = sections(records, now, branch_rows=branch_rows, released=released,
+                    failing=failing)
     day = (when or datetime.fromtimestamp(now)).strftime("%a %-d %b")
     total = costs.by_project(records, now, days=WINDOW_S / 86400, unfiled=UNFILED)
     spent = {"usd": round(sum(f["usd"] for f in total.values()), 4),

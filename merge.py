@@ -45,6 +45,11 @@ def _git(cwd, *args, timeout: int = 300):
                           text=True, timeout=timeout)
 
 
+#: A landing whose tests fail only where the base fails them too, with no
+#: change on it: held until the base passes, not refused. See basered.py.
+BASE_FAILING = "base-failing"
+
+
 def _fail(stage: str, detail: str) -> dict:
     return {"landed": False, "stage": stage, "detail": detail.strip()[-600:]}
 
@@ -61,11 +66,14 @@ def _tests_failed(stage: str, why: str, result: dict) -> dict:
     """
     output = str(result.get("output", ""))
     named = (result.get("failures") or verify.failures(output)).strip()
+    # By name, every one, for comparing with the base's (basered.py). From the
+    # run's own list where it has one: that was read off the whole output.
+    failed = list(result.get("failed") or verify.failed_tests(output))
     if not named:
-        return _fail(stage, f"{why}:\n{output}")
+        return {**_fail(stage, f"{why}:\n{output}"), "failed": failed}
     # Under 800 in all: summary() quotes the detail's last 800 characters, and
     # a longer one would lose its head -- the reason and the failures -- there.
-    return {"landed": False, "stage": stage,
+    return {"landed": False, "stage": stage, "failed": failed,
             "detail": f"{why}:\n{named[:450]}\n--- output tail ---\n"
                       + output.strip()[-250:]}
 
@@ -337,9 +345,10 @@ def land(worktree, repo, branch: str, base: str, run_tests,
                 except OSError:
                     log.exception("could not put back %s after the reset", rel)
         log.error("landing %s broke %s; reset back to %s", branch, base_name, before[:8])
-        return _tests_failed("tests-after-merge",
-                             "merging broke the base, so it was put back",
-                             after_merge)
+        return {**_tests_failed("tests-after-merge",
+                                "merging broke the base, so it was put back",
+                                after_merge),
+                "base": base_name, "onto": before}
 
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
@@ -438,7 +447,9 @@ def needs_a_person(outcome: dict) -> bool:
     same way -- `done`, with eleven commits across five branches that no base
     had. Only the second needs someone.
     """
-    return bool(outcome.get("eligible")) and not outcome.get("landed")
+    return (bool(outcome.get("eligible")) and not outcome.get("landed")
+            # Held for the base, which has its own one item: see basered.py.
+            and outcome.get("stage") != BASE_FAILING)
 
 
 def summary(result: dict, branch: str) -> str:
@@ -457,6 +468,8 @@ def summary(result: dict, branch: str) -> str:
         if result.get("detail"):
             line += f"\n```\n{result['detail'][-800:]}\n```"
         return line
+    if result.get("stage") == BASE_FAILING:
+        return f":pause_button: _Landing held: {result.get('detail', '')[-600:]}_"
     if not result.get("eligible", True):
         # Never reached git, so there is no branch waiting and no output to
         # quote -- just the reason it was never a candidate.

@@ -81,6 +81,58 @@ PASSED_MARKS = ("✔", "✓")
 FAILURE_LINES = 20
 
 
+#: Lines FAILURE_LINE matches that count failures rather than naming one.
+_TALLY = re.compile(
+    r"^\s*(?:=+ |\d+ passed, \d+ failed|\*\* TEST FAILED \*\*"
+    r"|Executed \d+ tests?)", re.IGNORECASE)
+
+
+def _test_name(line: str) -> str:
+    """The test a failure line names, in a form two runs of one suite agree on.
+
+    The details after the name -- an assertion message, a duration, a file and
+    line -- differ between a branch and its base for the same broken test, so
+    they are dropped: comparing whole lines would call every failure new.
+    """
+    s = line.strip()
+    m = re.search(r"Test Case '([^']*)' failed", s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"\bTest (?!run with )(\S.*?) (?:recorded an issue|failed after)",
+                  s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"-\[[^\]]+\]", s)               # XCTAssert… failed, by method
+    if m and re.search(r"XCTAssert\w* failed", s, re.IGNORECASE):
+        return m.group(0)
+    s = s.lstrip("✘✗ ").strip()
+    if s.startswith("FAILED:"):                     # Silkworm's closing list
+        s = s[len("FAILED:"):].strip()
+    elif s.startswith("FAILED "):                   # pytest: FAILED t.py::x - why
+        s = s[len("FAILED "):].split(" - ", 1)[0].strip()
+    return s.split(" — ", 1)[0].strip()             # Silkworm: ✘ name — detail
+
+
+def failed_tests(output: str) -> list[str]:
+    """Every failing test `output` names, by name alone, in order, once each.
+
+    Unlike failures() this is not trimmed for a message: it is what a task's
+    run is compared with its base's (basered.only_failing_on_base), and a
+    failure cut off the list would make a real one look like the base's. An
+    empty list means the run named nothing -- a crash, a timeout, a launch
+    failure -- which nothing may read as "the same failures as the base".
+    """
+    names: list[str] = []
+    for line in (output or "").splitlines():
+        if (line.lstrip().startswith(PASSED_MARKS) or not FAILURE_LINE.search(line)
+                or _TALLY.match(line)):
+            continue
+        name = _test_name(line)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def failures(output: str) -> str:
     """The failing checks and the pass/fail summary in `output`, in order, or
     "" when it names none (a launch failure, a timeout, a crash)."""
@@ -180,6 +232,7 @@ def _run(command: str, cwd, timeout: int) -> dict:
     return {"ran": True, "ok": proc.returncode == 0, "code": proc.returncode,
             "output": out[-OUTPUT_CHARS:],
             "failures": failures(out) if proc.returncode != 0 else "",
+            "failed": failed_tests(out) if proc.returncode != 0 else [],
             "launch_failure": (proc.returncode != 0
                                and bool(LAUNCH_FAILURES.search(out))
                                and not TEST_FAILURES.search(out))}

@@ -31,6 +31,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import artifacts
 import backfill
+import basered
 import board
 import branches
 import costs
@@ -4172,6 +4173,11 @@ def execute_task(task: dict) -> None:
         if loose and send_back_uncommitted(task, loose, channel, thread_ts):
             return
         if checked and not checked["ok"] and checked["ran"]:
+            # The base first: failing only what it fails on its own is not
+            # this change's doing, and bouncing it would be one more lap of a
+            # failure no task can fix.
+            if hold_for_base(task, checked, channel, thread_ts):
+                return
             if send_back_for_tests(task, checked, channel, thread_ts):
                 return
         if not resolve_review(task, role_name, result.text, channel, thread_ts):
@@ -4274,6 +4280,317 @@ def send_back_for_tests(task: dict, result: dict, channel: str, thread_ts: str) 
                                  + verify.rework_note(result)), checkpoint=None)
     task_state(tid, tasks.QUEUED, f"tests failed; sent back (attempt {tried})")
     return True
+
+
+# --- a base that fails its own tests (basered.py) ------------------------------
+
+def base_repo(task: dict) -> str:
+    """The checkout a task's base lives in: its own scope's, else its project's."""
+    return str((task.get("scope") or {}).get("cwd")
+               or project_store.scope_for(task.get("project") or "").get("cwd") or "")
+
+
+def current_base(repo, task: dict) -> tuple[str, str]:
+    """(branch name, commit) of the base a task is measured against now, or
+    ("", "") when there is none to name. Resolved the way a landing and the
+    unmerged survey resolve it, without fetching."""
+    if not repo or not worktrees.is_repo(repo):
+        return "", ""
+    ref = worktrees.base_ref(repo, fetch=False, prefer=task_base(task), fallback="")
+    if not ref:
+        return "", ""
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+                             cwd=repo, capture_output=True, text=True,
+                             timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    return (branches.base_name(repo, ref) if sha else ""), sha
+
+
+def run_base_suite(repo, slug: str, sha: str) -> dict:
+    """The project's suite on a clean, detached checkout of base commit `sha`.
+
+    Its own checkout, never the base's: the person builds in that one, and a
+    landing may be holding it. Thrown away after, droppings and all -- nothing
+    in it was ever anybody's work.
+    """
+    cmd = ((project_store.get(slug) or {}).get("test_cmd") or "").strip()
+    if not cmd:
+        return {"ran": False, "ok": False, "output": "no test command"}
+    path = worktrees.path_for(repo, f"base-{sha[:12]}", "basecheck")
+    worktrees.drop_scratch(repo, path)              # a leftover from a crash
+    here = worktrees.attach(repo, f"base-{sha[:12]}", sha, label="basecheck",
+                            detach=True)
+    if not here:
+        return {"ran": False, "ok": False,
+                "output": f"could not check out the base at {sha[:8]}"}
+    try:
+        log.info("running %s's suite on its base %s", slug, sha[:8])
+        return verify.run(cmd, here, project=slug, retry_launch=True)
+    finally:
+        worktrees.drop_scratch(repo, here)
+
+
+def base_moved_on(repo, red_sha: str, sha: str) -> bool:
+    """Whether `sha` comes after the commit the base was failing at.
+
+    A green answer about an *older* commit -- one task measured against a stale
+    remote-tracking ref -- must not clear a red base. Only git saying outright
+    "not an ancestor" counts against it; a commit it cannot find (gc'd, never
+    fetched) is not a reason to keep the project held for ever.
+    """
+    if red_sha == sha:
+        return False
+    if not red_sha:
+        return True
+    try:
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", red_sha, sha],
+                           cwd=repo, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.returncode != 1
+
+
+def ask_base(task: dict, failed, sha: str = "", base: str = "") -> dict | None:
+    """Whether a task's failing tests are its base's own.
+
+    {"held": bool, "state": main_failing or None}, or None when the base could
+    not be asked -- no test command, no repository, a suite that would not
+    run -- and the failure stands as the task's, exactly as before this
+    existed. Asking also keeps the project's state current: a red base is
+    recorded (and announced once), a later green one releases everything.
+    """
+    slug = task.get("project") or ""
+    proj = project_store.get(slug) or {}
+    if not slug or not (proj.get("test_cmd") or "").strip():
+        return None
+    repo = base_repo(task)
+    if not sha:
+        base, sha = current_base(repo, task)
+    if not sha:
+        return None
+    seen = basered.check(project_store, slug, sha,
+                         lambda s: run_base_suite(repo, slug, s))
+    if seen is None:
+        return None
+    if seen["ok"]:
+        red = proj.get("main_failing") or {}
+        if red and base_moved_on(repo, red.get("sha", ""), sha):
+            threading.Thread(target=release_base, args=(slug, sha), daemon=True,
+                             name=f"basegreen-{slug[:12]}").start()
+        return {"held": False, "state": None}
+    state, news = basered.mark_red(project_store, task_store, slug, seen, base,
+                                   scope=project_store.scope_for(slug))
+    if news:
+        announce_red(slug, state)
+    return {"held": basered.only_failing_on_base(failed, seen["failed"]),
+            "state": state}
+
+
+def announce_red(slug: str, state: dict) -> None:
+    """Say once, in the home channel, that a project's base fails on its own,
+    and make that message the thread of its one needs-you item."""
+    channel = home_channel()
+    if not channel:
+        return
+    try:
+        resp = app.client.chat_postMessage(
+            channel=channel,
+            text=(f":red_circle: *{basered.line(slug, state)}*\n"
+                  f"_{state.get('base') or 'base'} at `{(state.get('sha') or '')[:8]}` "
+                  "fails its own suite with no task's change on it. Its implementor "
+                  "work is paused, and tasks failing only these tests are held "
+                  "until a later commit passes._"))
+        if state.get("attention"):
+            task_store.update(state["attention"], thread=f"{channel}:{resp['ts']}")
+    except Exception:
+        log.exception("announcing %s's failing base failed", slug)
+
+
+def hold_for_base(task: dict, checked: dict, channel: str, thread_ts: str) -> bool:
+    """Hold work whose only failures are its base's own. True if it was held.
+
+    Not sent back -- nothing the implementor could do would fix the base --
+    and not an attempt spent. Parked in `blocked`, waiting on no task: the
+    project's one needs-you item speaks for all of them, and the base passing
+    is what releases them (release_base), not anybody's click.
+    """
+    tid = task["id"]
+    failed = checked.get("failed") or verify.failed_tests(checked.get("output", ""))
+    try:
+        verdict = ask_base(task, failed)
+    except Exception:
+        log.exception("asking %s's base about %s failed", task.get("project"), tid)
+        return False
+    if not verdict or not verdict["held"]:
+        return False
+    state = verdict["state"]
+    basered.hold(task_store, tid, "verify", state.get("sha", ""))
+    task_store.update(tid, blocked_on=[])
+    task_state(tid, tasks.BLOCKED,
+               f"held: {task.get('project')}'s base fails the same tests")
+    try:
+        app.client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=(f":pause_button: *Held, not sent back.* Every test this fails "
+                  f"also fails on {state.get('base') or 'the base'} at "
+                  f"`{(state.get('sha') or '')[:8]}` with no change on it "
+                  f"({basered.named(failed)}). It is verified again once the base "
+                  "passes."))
+    except Exception:
+        log.exception("posting the hold on %s failed", tid)
+    return True
+
+
+def hold_landing_for_base(task: dict, result: dict, approved: bool) -> dict | None:
+    """A landing refused only over the base's own failures, held instead.
+
+    The record says stage merge.BASE_FAILING rather than a refusal: it needs
+    no person, and nothing is sent back to catch up. The branch is landed
+    again -- asked for the same way, by a person or by auto-merge -- once
+    the base passes.
+    """
+    try:
+        verdict = ask_base(task, result.get("failed") or [],
+                           sha=result.get("onto") or "", base=result.get("base") or "")
+    except Exception:
+        log.exception("asking %s's base about landing %s failed",
+                      task.get("project"), task.get("id"))
+        return None
+    if not verdict or not verdict["held"]:
+        return None
+    state = verdict["state"]
+    basered.hold(task_store, task["id"], "landing", state.get("sha", ""), approved)
+    return {**result, "stage": merge.BASE_FAILING,
+            "detail": (f"every test that failed also fails on "
+                       f"{state.get('base') or 'the base'} at "
+                       f"{(state.get('sha') or '')[:8]} with no change on it "
+                       f"({basered.named(result.get('failed'))}); landed again "
+                       "once the base passes")}
+
+
+#: Projects being asked about right now, so the beat does not start a second
+#: suite run beside one still going.
+_base_probes: set[str] = set()
+_base_probes_guard = threading.Lock()
+_base_probed_at: dict[str, float] = {}
+
+#: How often a failing base is looked at for a new commit. A look is a
+#: rev-parse; the suite only runs when the commit has changed.
+BASE_PROBE_S = 60
+
+
+def probe_failing_bases(now: float | None = None) -> list[str]:
+    """Start a look at every failing base not looked at lately. Returns the
+    slugs started. Never runs a suite on the caller's thread."""
+    now = time.time() if now is None else now
+    started = []
+    for slug in sorted(basered.failing(project_store)):
+        with _base_probes_guard:
+            if slug in _base_probes or now - _base_probed_at.get(slug, 0) < BASE_PROBE_S:
+                continue
+            _base_probes.add(slug)
+            _base_probed_at[slug] = now
+        threading.Thread(target=_probe_base, args=(slug,), daemon=True,
+                         name=f"baseprobe-{slug[:12]}").start()
+        started.append(slug)
+    return started
+
+
+def _probe_base(slug: str) -> None:
+    try:
+        state = (project_store.get(slug) or {}).get("main_failing") or {}
+        if not state:
+            return
+        probe = {"project": slug, "scope": project_store.scope_for(slug)}
+        base, sha = current_base(base_repo(probe), probe)
+        if sha and sha != state.get("sha"):
+            ask_base(probe, [], sha=sha, base=base)
+    except Exception:
+        log.exception("looking at %s's failing base failed", slug)
+    finally:
+        with _base_probes_guard:
+            _base_probes.discard(slug)
+
+
+def release_base(slug: str, sha: str) -> list[str]:
+    """The base passes again: say so, and send held work on its way.
+
+    A held verification is verified again; a held landing is landed again,
+    approved exactly as it was the first time. Each is cleared of its hold as
+    it goes, so a crash part-way leaves the rest still findable.
+    """
+    state, held = basered.recover(project_store, task_store, slug, sha)
+    if not state:
+        return []
+    channel = home_channel()
+    if channel:
+        try:
+            app.client.chat_postMessage(
+                channel=channel,
+                text=(f":large_green_circle: *{slug} main is green again* at "
+                      f"`{sha[:8]}`"
+                      + (f" — releasing {len(held)} held task"
+                         f"{'s' if len(held) != 1 else ''}." if held else ".")))
+        except Exception:
+            log.exception("announcing %s's green base failed", slug)
+    released = []
+    for t in held:
+        hb = t.get("held_base") or {}
+        try:
+            task_store.update(t["id"], held_base=None)
+            if hb.get("kind") == "landing":
+                start_landing(t["id"], approved=bool(hb.get("approved")))
+            elif t.get("state") == tasks.BLOCKED:
+                reverify_held(task_store.get(t["id"]) or t)
+            released.append(t["id"])
+        except Exception:
+            log.exception("could not release %s after %s's base passed", t["id"], slug)
+    return released
+
+
+def reverify_held(task: dict) -> None:
+    """Verify a held task again, and carry on from wherever that leaves it.
+
+    Its work is already committed on its branch, so this is the suite on a
+    detached checkout of that branch -- not another session. Passing goes on
+    to review exactly as a first-time pass does; failing is now a real
+    failure, sent back as one. If the suite cannot be run here, the task goes
+    back to the queue and its next run is verified the ordinary way.
+    """
+    tid = task["id"]
+    channel, _, thread_ts = (task.get("thread") or "").partition(":")
+    repo = base_repo(task)
+    branch = branches.name_for(task)
+    here = (worktrees.attach(repo, tid, branch, label="reverify", detach=True)
+            if repo and worktrees.is_repo(repo) else None)
+    checked = None
+    if here:
+        try:
+            checked = verify_work(task, here)
+        finally:
+            worktrees.drop_scratch(repo, here)
+    if not checked or not checked.get("ran"):
+        task_store.update(tid, goal=task.get("goal", "") + (
+            "\n\nThis task's tests failed only on tests its base was failing on "
+            "its own, so it was held. The base passes now. Your work is on its "
+            "branch: check it still passes and finish."), checkpoint=None)
+        task_state(tid, tasks.QUEUED, "the base passes again; re-running it")
+        return
+    task_store.update(tid, verified=bool(checked["ok"]))
+    if checked["ok"]:
+        if channel:
+            tell_thread(task.get("thread", ""),
+                        ":test_tube: _The base passes again, and so does this. "
+                        "On to review._")
+        resolve_review(task_store.get(tid) or task, task.get("role") or "implementor",
+                       ((task.get("result") or {}).get("text") or ""),
+                       channel, thread_ts)
+        return
+    if hold_for_base(task, checked, channel, thread_ts):
+        return
+    send_back_for_tests(task, checked, channel, thread_ts)
 
 
 #: Once is enough: a second run that still leaves its work loose is not going
@@ -5001,7 +5318,12 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
                                 generated=list(proj.get("generated") or []))
     finally:
         worktrees.release(here)
-    return {**result, "eligible": True, "branch": branch}
+    result = {**result, "eligible": True, "branch": branch}
+    # Outside repo_guard and the checkout: asking the base runs the suite
+    # again, on a checkout of its own.
+    if result.get("stage") in ("tests-after-rebase", "tests-after-merge"):
+        result = hold_landing_for_base(task, result, approved) or result
+    return result
 
 
 def record_landing(task: dict, outcome: dict) -> None:
@@ -5511,8 +5833,14 @@ def send_digest(schedule, now: datetime) -> dict:
     except Exception:
         log.exception("digest: looking for unregistered repos failed")
         found = []
+    try:
+        red = {p["slug"]: p["main_failing"] for p in project_store.all()
+               if p.get("main_failing")}
+    except Exception:
+        log.exception("digest: reading failing bases failed")
+        red = {}
     text = digest.render(records, time.time(), branch_rows=rows, released=released,
-                         when=now, unregistered=found)
+                         when=now, failing=red, unregistered=found)
     try:
         board_id = BOARD.channel(app.client)
     except Exception:
@@ -5592,6 +5920,9 @@ def _task_scheduler() -> None:
         try:
             for tid in task_store.due_retries(time.time()):
                 task_state(tid, tasks.QUEUED, "retry time reached")
+            # A failing base is watched for the commit that fixes it: nothing
+            # else would ask, since its implementor work is not being started.
+            probe_failing_bases()
             # Anything waiting on a task that ended is waiting for nothing.
             # Released here as well as when the blocker ends, so a task
             # stranded by a crash in between still reaches the board.
@@ -5712,7 +6043,10 @@ def _task_worker(n: int, lane: str = "task") -> None:
             # The wake lane waits for its own thread only: one mid-turn, or
             # whose checkout is held, is skipped, not claimed and waited on.
             busy = {"skip_threads": wake_skip()} if lane == "wake" else {}
-            task = task_store.claim(**claim_filter, **busy)
+            # No new implementor work where the base fails its own tests: it
+            # would only be held for them. See basered.py.
+            red = basered.failing(project_store) if lane == "task" else set()
+            task = task_store.claim(**claim_filter, **busy, hold_implementors=red)
             if task and hold_unsupervised(task):
                 continue
             if task:
