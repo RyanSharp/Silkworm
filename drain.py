@@ -101,6 +101,9 @@ def busy(records, landing=(), live=(), releasing=()) -> list[dict]:
         rows.append({"id": r.get("id", ""), "kind": "task",
                      "title": (r.get("title") or "")[:80],
                      "driver": r.get("driver") or "",
+                     # So `deploy --after-turn` can tell the turn that asked
+                     # for it, which it waits for, from other work.
+                     "thread": r.get("thread") or "",
                      "since": r.get("updated") or 0,
                      "live": r.get("id") in live})
     seen = {row["id"] for row in rows}

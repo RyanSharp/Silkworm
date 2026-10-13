@@ -1904,6 +1904,27 @@ def handle_drain(payload: dict) -> dict:
             "revision": REVISION.get("sha") or ""}
 
 
+def handle_tell(payload: dict) -> dict:
+    """Route for /tell -- a line posted in a thread, as the bot.
+
+    For `silkworm deploy --after-turn`, whose detached process outlives the
+    turn that started it and has to say how the deploy went in that turn's
+    thread. Localhost-only like every route here. Unlike tell_thread it
+    reports a failure: the caller has somewhere else to put the message.
+    """
+    key = (payload.get("key") or "").strip()
+    text = (payload.get("text") or "").strip()
+    if not re.fullmatch(r"[A-Z0-9]+:[0-9.]+", key) or not text:
+        return {"ok": False, "error": "unknown thread or empty message"}
+    channel, thread_ts = key.split(":", 1)
+    try:
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text[:3900])
+    except Exception as e:
+        log.exception("could not post to %s", key)
+        return {"ok": False, "error": f"could not post: {e}"}
+    return {"ok": True}
+
+
 def handle_web_message(payload: dict) -> dict:
     """Route for /web-message — a prompt or !command sent from the visualizer.
 
@@ -3285,6 +3306,7 @@ server = LocalServer(APPROVAL_PORT)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
 server.route("/drain", handle_drain)
+server.route("/tell", handle_tell)
 server.route("/web-message", handle_web_message)
 server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)

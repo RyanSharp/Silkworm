@@ -32,6 +32,9 @@
     silkworm restart                restart the services
     silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
                                     restart onto this checkout without killing work
+    silkworm deploy --after-turn [--skip-tests] [--max-wait 2h]
+                                    the same from inside a turn: checks now, then a
+                                    detached process deploys once the turn has ended
     silkworm logs                   tail the bot log
     silkworm doctor                 check prerequisites
     silkworm test                   run the regression tests
@@ -1115,13 +1118,15 @@ def deploy_preflight(repo: Path, skip_tests: bool, *, git=git_out, suite=run_sui
 
 def wait_for_quiet(call, *, max_wait: float, quiet_s: float = DEPLOY_QUIET_S,
                    progress_s: float = DEPLOY_PROGRESS_S, drain_s: float = 0,
-                   clock=time.monotonic, sleep=time.sleep, poll_s: float = 5) -> tuple[bool, list]:
+                   clock=time.monotonic, sleep=time.sleep, poll_s: float = 5,
+                   ignore=()) -> tuple[bool, list]:
     """Wait until nothing has been running for `quiet_s`. (ok, still running).
 
     "Nothing" is judged by the bot, and an unanswered question is never
     quiet: a bot that stops answering mid-wait is not evidence it is idle.
     If the drain is found lifted -- the bot restarted under us, or someone
     undrained it -- it is put back, or new work would start mid-wait.
+    A task in `ignore` does not count once no live process holds it.
     """
     start = clock()
     quiet_since = None
@@ -1131,7 +1136,8 @@ def wait_for_quiet(call, *, max_wait: float, quiet_s: float = DEPLOY_QUIET_S,
         now = clock()
         r = call("/drain", {"action": "status"})
         if r.get("ok"):
-            rows = r.get("running") or []
+            rows = [row for row in (r.get("running") or [])
+                    if not (row.get("id") in ignore and not row.get("live", True))]
             if not r.get("draining") and drain_s:
                 call("/drain", {"action": "start", "why": "deploy",
                                 "seconds": max(60, drain_s - (now - start))})
@@ -1159,12 +1165,17 @@ def wait_for_quiet(call, *, max_wait: float, quiet_s: float = DEPLOY_QUIET_S,
         sleep(poll_s)
 
 
+DEPLOY_USAGE = ("usage: silkworm deploy [--now] [--skip-tests] [--max-wait 2h]\n"
+                "       silkworm deploy --after-turn [--skip-tests] [--max-wait 2h]")
+
+
 def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
               suite=run_suite, clock=time.monotonic, sleep=time.sleep,
-              confirm_s: float = DEPLOY_CONFIRM_S) -> int:
+              confirm_s: float = DEPLOY_CONFIRM_S, handoff=None, lock_path=None,
+              log_path=None, alive=None) -> int:
     """Restart the bot onto this checkout without killing work. Exit status."""
     call = call or (lambda path, payload: bot_call(path, payload, timeout=10))
-    now, skip_tests, max_wait = False, False, DEPLOY_MAX_WAIT_S
+    now, skip_tests, after_turn, max_wait = False, False, False, DEPLOY_MAX_WAIT_S
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1172,6 +1183,8 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
             now = True
         elif a == "--skip-tests":
             skip_tests = True
+        elif a == "--after-turn":
+            after_turn = True
         elif a == "--max-wait" and i + 1 < len(argv):
             try:
                 max_wait = parse_duration(argv[i + 1])
@@ -1180,16 +1193,27 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
                 return 2
             i += 1
         else:
-            print("usage: silkworm deploy [--now] [--skip-tests] [--max-wait 2h]")
+            print(DEPLOY_USAGE)
             return 2
         i += 1
+    if now and after_turn:
+        # --now interrupts whatever runs; after a turn, the point is not to.
+        print(f"{WORM} --now and --after-turn do not go together\n{DEPLOY_USAGE}")
+        return 2
 
-    print(f"{WORM} deploy {repo}")
+    print(f"{WORM} deploy {repo}" + (" (after this turn)" if after_turn else ""))
+    if after_turn:
+        return deploy_after_turn(repo, skip_tests=skip_tests, max_wait=max_wait,
+                                 git=git, suite=suite, handoff=handoff or detach,
+                                 lock_path=lock_path or AFTER_TURN_LOCK,
+                                 log_path=log_path or AFTER_TURN_LOG,
+                                 alive=alive or deploy_pid_alive)
     # From inside a turn this would wait on its own turn for two hours, and
     # then restart the process it is a child of.
     if os.environ.get("SILKWORM_THREAD"):
         print(f"  {R}✘{N} not from inside a Silkworm turn: it would wait on itself, "
-              f"and the restart kills the turn running it — run it from a terminal")
+              f"and the restart kills the turn running it — use "
+              f"`silkworm deploy --after-turn`, which deploys once this turn has ended")
         return 1
 
     problems = deploy_preflight(repo, skip_tests, git=git, suite=suite)
@@ -1203,14 +1227,45 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
     if code != 0 or not head:
         print(f"  {R}✘{N} could not resolve HEAD")
         return 1
+    # One deploy at a time, whichever way it was started: a terminal deploy
+    # under a pending --after-turn would restart the bot twice, and the second
+    # would report the first's revision as a failure.
+    lock_path = lock_path or AFTER_TURN_LOCK
+    me = os.getpid()
+    held = take_deploy_lock(lock_path, {"pid": me, "stage": "deploying from a terminal",
+                                        "head": head, "log": "", "started": time.time()},
+                            alive=alive or deploy_pid_alive)
+    if held is not None:
+        report_pending(held, head, log_path or AFTER_TURN_LOG)
+        return 1
+    try:
+        code, _why = deploy_onto(call, head, now=now, max_wait=max_wait, manager=manager,
+                                 clock=clock, sleep=sleep, confirm_s=confirm_s)
+    finally:
+        release_deploy_lock(lock_path, me)
+    return code
 
+
+def deploy_onto(call, head: str, *, now: bool, max_wait: float, manager=None,
+                clock=time.monotonic, sleep=time.sleep,
+                confirm_s: float = DEPLOY_CONFIRM_S, ignore=(),
+                before_restart=None) -> tuple[int, str]:
+    """Drain, wait for quiet, restart, confirm `head` is what runs.
+
+    (exit status, why it failed or ""). The one implementation of a deploy:
+    `deploy` runs it in the terminal, `deploy --after-turn` in the process it
+    hands off to. `ignore` is task ids the wait may pass over once no live
+    process holds them -- the turn that asked for an after-turn deploy, whose
+    record can lag its process by a moment and must not hold this forever.
+    `before_restart`, given, says why not to restart after all ("" to go on).
+    """
     drained = False
+    drain_s = max_wait + DEPLOY_DRAIN_MARGIN_S
     status = call("/status", {})
     if not status.get("online"):
         # Nothing answering means nothing running to protect.
         print(f"  {Y}·{N} the bot is not answering — nothing to drain, starting it")
     else:
-        drain_s = max_wait + DEPLOY_DRAIN_MARGIN_S
         r = call("/drain", {"action": "start", "seconds": drain_s, "why": "deploy"})
         if r.get("ok") and r.get("draining"):
             drained = True
@@ -1221,21 +1276,22 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
         else:
             print(f"  {R}✘{N} could not drain: the running bot does not know how "
                   f"(too old) — use --now to restart regardless, or silkworm restart")
-            return 1
+            return 1, "the running bot could not drain (too old) — deploy from a terminal with --now"
 
     try:
         if drained and not now:
             print(f"  {Y}·{N} waiting for {DEPLOY_QUIET_S}s with nothing running "
                   f"(gives up after {int(max_wait // 60)}m)…")
             ok, rows = wait_for_quiet(call, max_wait=max_wait, drain_s=drain_s,
-                                      clock=clock, sleep=sleep)
+                                      clock=clock, sleep=sleep, ignore=ignore)
             if not ok:
                 call("/drain", {"action": "stop"})
                 print(f"  {R}✘{N} still busy after {int(max_wait // 60)}m — not restarting; "
                       f"drain lifted. Still running:")
                 for row in rows[:12]:
                     print(f"      {busy_line(row)}")
-                return 1
+                return 1, (f"still busy after {int(max_wait // 60)}m, so it did not restart "
+                           f"(drain lifted): " + "; ".join(busy_line(r) for r in rows[:4]))
             print(f"  {G}✔{N} nothing running")
         elif drained:
             rows = call("/drain", {"action": "status"}).get("running") or []
@@ -1248,7 +1304,22 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
         if drained:
             call("/drain", {"action": "stop"})
         print(f"\n  {Y}·{N} interrupted — not restarting; drain lifted")
-        return 130
+        return 130, "interrupted before restarting; drain lifted"
+    except SystemExit:
+        # Stopped (SIGTERM in the detached deploy): the drain must not
+        # outlive us by hours.
+        if drained:
+            call("/drain", {"action": "stop"})
+        print(f"\n  {Y}·{N} stopped — not restarting; drain lifted")
+        raise
+
+    if before_restart:
+        stop = before_restart()
+        if stop:
+            if drained:
+                call("/drain", {"action": "stop"})
+            print(f"  {R}✘{N} {stop} — drain lifted")
+            return 1, stop + "; drain lifted"
 
     mgr = manager or service_manager()
     if not mgr.restart():
@@ -1258,15 +1329,22 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
         if drained and call("/drain", {"action": "stop"}).get("ok"):
             print(f"  {Y}·{N} the old bot is still answering — drain lifted")
         print(f"  {R}✘{N} restart failed — see above; silkworm logs")
-        return 1
+        return 1, "the restart failed"
 
-    return 0 if confirm_deploy(call, head, confirm_s=confirm_s,
-                               clock=clock, sleep=sleep) else 1
+    why: list = []
+    if confirm_deploy(call, head, confirm_s=confirm_s, clock=clock, sleep=sleep, why=why):
+        return 0, ""
+    return 1, "; ".join(why) or "the restarted bot could not be confirmed"
 
 
 def confirm_deploy(call, head: str, *, confirm_s: float = DEPLOY_CONFIRM_S,
-                   clock=time.monotonic, sleep=time.sleep) -> bool:
-    """That the bot came back, reconnected, and is running `head`."""
+                   clock=time.monotonic, sleep=time.sleep, why=None) -> bool:
+    """That the bot came back, reconnected, and is running `head`.
+
+    Each failed check's reason is appended to `why`, when given, for whoever
+    has to say what went wrong somewhere other than this terminal.
+    """
+    why = [] if why is None else why
     deadline = clock() + confirm_s
     st: dict = {}
     while True:
@@ -1277,17 +1355,427 @@ def confirm_deploy(call, head: str, *, confirm_s: float = DEPLOY_CONFIRM_S,
         if (up and linked and started == head) or clock() >= deadline:
             break
         sleep(2)
-    ok = check(f"bot reachable on :{bot_port()}", up, "silkworm logs may say why")
-    ok &= check("connected to slack", up and linked,
-                f"not connected after {int(confirm_s)}s — silkworm logs")
+
+    def need(label, ok, hint, reason=None):
+        if not ok and reason != "":
+            why.append(reason or hint)
+        return check(label, ok, hint)
+    ok = need(f"bot reachable on :{bot_port()}", up, "silkworm logs may say why",
+              "the bot never answered after the restart")
+    ok &= need("connected to slack", up and linked,
+               f"not connected after {int(confirm_s)}s — silkworm logs",
+               f"not connected to Slack after {int(confirm_s)}s" if up else "")
     if not up:
-        ok &= check("running revision", False, "the bot never answered")
+        ok &= need("running revision", False, "the bot never answered", "")
     elif not started:
-        ok &= check("running revision", False, "the bot did not report one")
+        ok &= need("running revision", False, "the bot did not report one",
+                   "the bot did not report its revision")
     else:
-        ok &= check(f"running {started[:8]}, the checkout's HEAD", started == head,
-                    f"running {started[:8]}, but HEAD is {head[:8]}")
+        ok &= need(f"running {started[:8]}, the checkout's HEAD", started == head,
+                   f"running {started[:8]}, but HEAD is {head[:8]}")
     return ok
+
+
+# --- deploy --after-turn: the same deploy, from inside a turn ----------------------
+#
+# A turn cannot deploy itself: it would wait on its own turn, then the restart
+# kills it. Until now that was got round with a hand-rolled double fork. This
+# is that, supported: the checks run here, where a failure can still be read,
+# and the rest is handed to a process that belongs to nobody -- not the bot,
+# not the claude running the turn -- so the restart cannot take it down too.
+
+#: Hidden subcommand the handoff runs. Not for typing.
+AFTER_TURN_CMD = "_deploy-after-turn"
+#: One deploy at a time: held from the checks until the outcome is posted.
+AFTER_TURN_LOCK = LOGS / "deploy-after-turn.lock"
+#: Where the detached process writes everything it would have printed.
+AFTER_TURN_LOG = LOGS / "deploy-after-turn.log"
+#: The calling turn gets this long to finish. Not --max-wait: that bounds the
+#: wait on *other* work, which the turn asking is not.
+AFTER_TURN_CALLER_S = 6 * 3600
+#: Variables the handoff keeps of the SILKWORM_* family: where the bot and the
+#: visualizer listen. The rest describe the turn, which the deploy is not.
+_KEEP_ENV = ("SILKWORM_BOT_PORT", "SILKWORM_VIZ_PORT")
+
+
+def deploy_pid_alive(pid: int) -> bool:
+    """Whether `pid` is a live deploy -- by its command line, not just its
+    number, which the OS hands out again."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    try:
+        r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True     # cannot tell: a deploy we cannot see is still a deploy
+    return "silkworm" in r.stdout and "deploy" in r.stdout
+
+
+class _LockGuard:
+    """flock on a file beside the lock, so read-decide-write on the lock is one
+    step: two callers finding the same stale lock cannot both take it over, and
+    nobody reads one half-written."""
+
+    def __init__(self, path: Path):
+        self.path = path.with_name(path.name + ".guard")
+
+    def __enter__(self):
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)           # closing drops the flock
+        return False
+
+
+def _read_lock(path: Path) -> dict:
+    try:
+        held = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return held if isinstance(held, dict) else {}
+
+
+def take_deploy_lock(path: Path, record: dict, alive=deploy_pid_alive):
+    """Hold the one-deploy lock. None if taken; else the record holding it.
+
+    A lock whose process is gone is stale -- a deploy killed part-way -- and
+    is taken over.
+    """
+    with _LockGuard(path):
+        if path.exists():
+            held = _read_lock(path)
+            pid = held.get("pid")
+            if pid and alive(int(pid)):
+                return held
+        write_deploy_lock(path, record)
+        return None
+
+
+def write_deploy_lock(path: Path, record: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(record))
+    os.replace(tmp, path)
+
+
+def pass_deploy_lock(path: Path, frm: int, record: dict) -> bool:
+    """Rewrite the lock as `record` if `frm` still holds it."""
+    with _LockGuard(path):
+        if _read_lock(path).get("pid") != frm:
+            return False
+        write_deploy_lock(path, record)
+        return True
+
+
+def release_deploy_lock(path: Path, pid: int) -> None:
+    """Drop the lock if it is `pid`'s. A lock someone else took over (ours was
+    judged stale) is theirs to drop."""
+    with _LockGuard(path):
+        if path.exists() and _read_lock(path).get("pid") in (None, pid):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def detach(argv: list, env: dict, log_path: Path, cwd: Path = REPO) -> int:
+    """Run `argv` belonging to nobody. Returns its pid.
+
+    A double fork with setsid between: the first child starts a new session and
+    forks again, then exits, so the process that execs is reparented to PID 1
+    straight away -- not a child of this CLI, of the claude running the turn or
+    of the bot, and outside their process groups, so neither a restart nor a
+    Bash tool timeout signalling the group reaches it. stdin is /dev/null;
+    stdout and stderr append to `log_path`.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:                                   # first child
+        try:
+            os.close(r)
+            os.setsid()
+            pid2 = os.fork()
+            if pid2 == 0:                          # the one that runs
+                try:
+                    os.close(w)
+                    os.chdir(str(cwd))
+                    nul = os.open(os.devnull, os.O_RDONLY)
+                    out = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                    os.dup2(nul, 0)
+                    os.dup2(out, 1)
+                    os.dup2(out, 2)
+                    os.closerange(3, 4096)
+                    os.execve(argv[0], list(argv), env)
+                finally:
+                    os._exit(127)
+            os.write(w, str(pid2).encode())
+        finally:
+            os._exit(0)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 64)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    return int(data or b"0")
+
+
+def handoff_env(env=None) -> dict:
+    """The environment the detached deploy gets: the caller's, without the
+    variables that make a process a turn -- its thread, role, task and git
+    guard. It is passed what it needs on its command line instead."""
+    env = dict(os.environ if env is None else env)
+    for k in list(env):
+        if k.startswith("SILKWORM_") and k not in _KEEP_ENV:
+            del env[k]
+    return env
+
+
+def report_pending(held: dict, head: str, log_path: Path) -> int:
+    """Say which deploy holds the lock. 0 if it deploys `head` anyway, else 1."""
+    other = held.get("head") or ""
+    print(f"  {Y}·{N} a deploy is already pending — not starting another: "
+          f"pid {held.get('pid', '?')}, {held.get('stage', 'starting')}, "
+          f"of {other[:8] or '?'}"
+          + (f", for thread {held['thread']}" if held.get("thread") else "")
+          + f"; log {held.get('log') or log_path}")
+    if other and other == head:
+        return 0
+    print(f"  {R}✘{N} it deploys {other[:8] or 'another commit'}, not this checkout's "
+          f"{head[:8]} — run this again once it has finished")
+    return 1
+
+
+def deploy_after_turn(repo: Path, *, skip_tests: bool, max_wait: float, git, suite,
+                      handoff, lock_path: Path, log_path: Path, alive) -> int:
+    """Check now, then hand the deploy to a detached process. Exit status.
+
+    The checks run in the foreground so a failure is seen by the turn that
+    asked. Only one deploy at a time: asked again while one is pending, this
+    says which and starts nothing.
+    """
+    thread = os.environ.get("SILKWORM_THREAD", "")
+    task = os.environ.get("SILKWORM_TASK_ID", "")
+    code, head = git(repo, "rev-parse", "HEAD")
+    if code != 0 or not head:
+        print(f"  {R}✘{N} could not resolve HEAD")
+        return 1
+    me = os.getpid()
+    held = take_deploy_lock(lock_path, {"pid": me, "stage": "checking", "head": head,
+                                        "thread": thread, "log": str(log_path),
+                                        "started": time.time()}, alive=alive)
+    if held is not None:
+        return report_pending(held, head, log_path)
+    pid = 0
+    try:
+        problems = deploy_preflight(repo, skip_tests, git=git, suite=suite)
+        for p in problems:
+            print(f"  {R}✘{N} {p}")
+        if problems:
+            release_deploy_lock(lock_path, me)
+            return 1
+        print(f"  {G}✔{N} checkout is clean on its base branch"
+              + (" (tests skipped)" if skip_tests else ", tests pass"))
+        code, now_head = git(repo, "rev-parse", "HEAD")
+        if code != 0 or now_head != head:
+            print(f"  {R}✘{N} HEAD moved during the checks ({head[:8]} → {now_head[:8]}) — run it again")
+            release_deploy_lock(lock_path, me)
+            return 1
+        argv = [sys.executable, str(Path(__file__).resolve()), AFTER_TURN_CMD,
+                "--head", head, "--thread", thread, "--task", task,
+                "--max-wait", str(int(max_wait)),
+                "--lock", str(lock_path), "--log", str(log_path)]
+        pid = handoff(argv, handoff_env(), log_path)
+        if not pid:
+            print(f"  {R}✘{N} could not start the detached deploy")
+            release_deploy_lock(lock_path, me)
+            return 1
+        pass_deploy_lock(lock_path, me, {"pid": pid, "stage": "waiting for the turn to end",
+                                         "head": head, "thread": thread,
+                                         "log": str(log_path), "started": time.time()})
+    except BaseException:
+        if pid:
+            # Handed off already: the lock is the detached deploy's, not ours to drop.
+            pass_deploy_lock(lock_path, me, {"pid": pid, "stage": "waiting for the turn to end",
+                                             "head": head, "thread": thread,
+                                             "log": str(log_path), "started": time.time()})
+        else:
+            release_deploy_lock(lock_path, me)
+        raise
+    print(f"  {G}✔{N} handed off to pid {pid}, detached: once this turn has ended and "
+          f"{DEPLOY_QUIET_S}s pass with nothing running, it drains, restarts onto "
+          f"{head[:8]} and confirms it")
+    print(f"  {Y}·{N} the outcome is posted "
+          + ("to this thread" if thread else "nowhere (no thread) — read the log")
+          + f"; log {log_path}")
+    return 0
+
+
+def wait_for_caller(call, thread: str, task: str, *, limit: float = AFTER_TURN_CALLER_S,
+                    clock=time.monotonic, sleep=time.sleep, poll_s: float = 5,
+                    progress_s: float = DEPLOY_PROGRESS_S) -> tuple[bool, set]:
+    """Wait for the turn that asked for the deploy to end. (ended, its ids).
+
+    The turn is whatever was running for the caller's task, or on its thread,
+    when first seen -- fixed then, so a later turn on the same thread is other
+    work, waited on (not ignored) like any. It has ended once no live process
+    holds it: a record that still says running after its process is gone is
+    the bot catching up, or an orphan, and either way not worth waiting for.
+    """
+    start = clock()
+    ids: set = set()
+    seen = False
+    last_said = None
+    while True:
+        now = clock()
+        r = call("/drain", {"action": "status"})
+        if r.get("ok"):
+            rows = [row for row in (r.get("running") or []) if row.get("kind", "task") == "task"]
+            if not seen:
+                ids = {row.get("id") for row in rows
+                       if (task and row.get("id") == task)
+                       or (thread and row.get("thread") == thread)}
+                seen = True
+            if not any(row.get("id") in ids and row.get("live", True) for row in rows):
+                return True, ids
+        if now - start >= limit:
+            return False, ids
+        if last_said is None or now - last_said >= progress_s:
+            print(f"  {Y}·{N} {int(now - start)}s: "
+                  + ("waiting for the calling turn to end" if r.get("ok")
+                     else "the bot is not answering — waiting"))
+            last_said = now
+        sleep(poll_s)
+
+
+def report_outcome(call, thread: str, text: str, *, outbox: Path,
+                   sleep=time.sleep, tries: int = 3) -> str:
+    """Tell the calling thread. Where it went: thread, outbox or log.
+
+    Through the bot when it answers; a bot that never came back cannot post,
+    so the note goes in the thread's outbox, which the bot uploads to the
+    thread at the end of its next turn there.
+    """
+    print(text)
+    if not thread:
+        return "log"
+    for n in range(tries):
+        if (call("/tell", {"key": thread, "text": text}) or {}).get("ok"):
+            return "thread"
+        if n + 1 < tries:
+            sleep(10)
+    try:
+        box = outbox / thread.replace(":", "__")
+        box.mkdir(parents=True, exist_ok=True)
+        note = box / f"deploy-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        note.write_text(text + "\n")
+        print(f"  {Y}·{N} the bot did not take the message — left in {note}")
+        return "outbox"
+    except OSError as e:
+        print(f"  {R}✘{N} could not leave it in the outbox either: {e}")
+        return "log"
+
+
+def still_checked(repo: Path, head: str, git=git_out) -> str:
+    """Why the checkout is no longer what the checks passed, or "".
+
+    The checks ran before the wait; a turn can commit, or a landing move the
+    base, while it waits. The restart loads whatever is checked out, so a
+    moved HEAD would put code nobody tested into the bot -- and then the
+    revision check would call a working restart a failure.
+    """
+    code, now = git(repo, "rev-parse", "HEAD")
+    if code != 0 or not now:
+        return "could not resolve HEAD before restarting"
+    if now != head:
+        return (f"HEAD moved from {head[:8]} to {now[:8]} after the checks, so it did "
+                f"not restart onto unchecked code — run deploy --after-turn again")
+    code, dirty = git(repo, "status", "--porcelain", "--untracked-files=no")
+    if code != 0:
+        return "could not read git status before restarting"
+    if dirty:
+        return "tracked files changed after the checks, so it did not restart onto them"
+    return ""
+
+
+def after_turn_run(head: str, thread: str, task: str, max_wait: float, *, call,
+                   manager=None, lock_path: Path, log_path: Path, outbox: Path,
+                   clock=time.monotonic, sleep=time.sleep,
+                   confirm_s: float = DEPLOY_CONFIRM_S,
+                   caller_s: float = AFTER_TURN_CALLER_S,
+                   repo: Path = REPO, git=git_out) -> int:
+    """What the detached process does: wait for the caller, deploy, say how it
+    went, let go of the lock. Exit status."""
+    me = os.getpid()
+    code, why = 1, "it was stopped before finishing (a drain it held was lifted)"
+    try:
+        print(f"{WORM} deploy after turn {time.strftime('%Y-%m-%d %H:%M:%S')} pid {me} "
+              f"of {head[:8]} for {thread or 'no thread'}")
+        ended, ids = wait_for_caller(call, thread, task, limit=caller_s,
+                                     clock=clock, sleep=sleep)
+        if not ended:
+            code, why = 1, (f"the calling turn was still running after "
+                            f"{int(caller_s // 60)}m, so it did not restart")
+        else:
+            print(f"  {G}✔{N} the calling turn has ended")
+            try:
+                pass_deploy_lock(lock_path, me, {"pid": me, "stage": "deploying", "head": head,
+                                                 "thread": thread, "log": str(log_path),
+                                                 "started": time.time()})
+            except OSError:
+                pass
+            code, why = deploy_onto(call, head, now=False, max_wait=max_wait,
+                                    manager=manager, clock=clock, sleep=sleep,
+                                    confirm_s=confirm_s, ignore=ids,
+                                    before_restart=lambda: still_checked(repo, head, git))
+    except Exception as e:
+        code, why = 1, f"{type(e).__name__}: {e}"
+    finally:
+        if code == 0:
+            text = (f":rocket: Deployed: the bot is running `{head[:8]}`, the HEAD "
+                    f"this deploy was launched for. Log: `{log_path}`")
+        else:
+            text = f":x: Deploy of `{head[:8]}` did not complete: {why}. Log: `{log_path}`"
+        try:
+            report_outcome(call, thread, text, outbox=outbox, sleep=sleep)
+        finally:
+            release_deploy_lock(lock_path, me)
+    return code
+
+
+def do_after_turn_detached(argv) -> int:
+    """Entry point of the handed-off process. See deploy_after_turn."""
+    opts = {"--head": "", "--thread": "", "--task": "", "--max-wait": str(DEPLOY_MAX_WAIT_S),
+            "--lock": str(AFTER_TURN_LOCK), "--log": str(AFTER_TURN_LOG)}
+    i = 0
+    while i + 1 < len(argv) and argv[i] in opts:
+        opts[argv[i]] = argv[i + 1]
+        i += 2
+    if i != len(argv) or not opts["--head"]:
+        print(f"usage: silkworm {AFTER_TURN_CMD} --head SHA [--thread K] [--task ID] ... "
+              f"(started by deploy --after-turn, not by hand)")
+        return 2
+    import signal
+    # A stop (launchd, kill) still says so in the thread, and lets go of the lock.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    return after_turn_run(opts["--head"], opts["--thread"], opts["--task"],
+                          float(opts["--max-wait"]),
+                          call=lambda path, payload: bot_call(path, payload, timeout=10),
+                          lock_path=Path(opts["--lock"]), log_path=Path(opts["--log"]),
+                          outbox=REPO / "outbox")
 
 
 def do_launch(args: list[str]) -> None:
@@ -1480,6 +1968,9 @@ def main() -> None:
         sys.exit(0 if service_manager().restart() else 1)
     elif cmd == "deploy":
         sys.exit(do_deploy(args[1:]))   # args[0] is the subcommand itself
+    elif cmd == AFTER_TURN_CMD:
+        # Not for typing: what `deploy --after-turn` hands off to.
+        sys.exit(do_after_turn_detached(args[1:]))
     elif cmd == "status":
         if "--json" in args[1:]:          # args[0] is the subcommand itself
             sys.exit(do_status_json())

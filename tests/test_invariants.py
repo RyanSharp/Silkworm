@@ -11382,6 +11382,11 @@ def _load_cli():
     spec = importlib.util.spec_from_loader("silkworm_cli_deploy", loader)
     cli = importlib.util.module_from_spec(spec)
     loader.exec_module(cli)
+    # Never the checkout's own logs/: a suite run as a deploy's preflight
+    # would otherwise find that deploy's lock held, and refuse itself.
+    scratch = Path(tempfile.mkdtemp())
+    cli.AFTER_TURN_LOCK = scratch / "deploy-after-turn.lock"
+    cli.AFTER_TURN_LOG = scratch / "deploy-after-turn.log"
     return cli
 
 
@@ -11753,6 +11758,495 @@ def test_deploy_preflight_refuses_unfit_checkouts():
     check("durations parse as the usage says",
           (cli.parse_duration("90"), cli.parse_duration("15m"), cli.parse_duration("2h"))
           == (90, 900, 7200))
+
+
+# --- deploy --after-turn: a turn deploys without waiting on or killing itself -----
+# Until this, a turn that wanted to deploy hand-rolled a double fork with the
+# SILKWORM_* variables stripped. Plain `deploy` from a turn waited on itself
+# and the restart then killed the turn running it.
+
+def _after_turn_git(head):
+    def git(repo, *args):
+        if "--abbrev-ref" in args:
+            return 0, "main"
+        if args[:1] == ("rev-parse",):
+            return 0, head[0] if isinstance(head, list) else head
+        if args[:1] == ("status",):
+            return 0, ""
+        return 1, ""
+    return git
+
+
+def _in_turn_env(thread="C1:1.0", task="tsk_me"):
+    saved = {k: os.environ.get(k) for k in
+             ("SILKWORM_THREAD", "SILKWORM_TASK_ID", "SILKWORM_ROLE", "SILKWORM_TASK_ROLE")}
+    os.environ["SILKWORM_THREAD"] = thread
+    os.environ["SILKWORM_ROLE"] = "assistant"
+    if task:
+        os.environ["SILKWORM_TASK_ID"] = task
+        os.environ["SILKWORM_TASK_ROLE"] = "implementor"
+    else:
+        os.environ.pop("SILKWORM_TASK_ID", None)
+    def restore():
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return restore
+
+
+def test_deploy_after_turn_checks_in_the_foreground_and_hands_off_once():
+    print("\nsilkworm deploy --after-turn: checks now, hands off, one deploy at a time")
+    cli = _load_cli()
+    root = Path(tempfile.mkdtemp())
+    lock = root / "deploy.lock"
+    log_ = root / "deploy.log"
+    head = ["a" * 40]
+    handed, calls = [], []
+    live = {4242}
+
+    def handoff(argv, env, log_path):
+        handed.append((list(argv), dict(env), log_path))
+        return 4242
+
+    def run(argv, suite=lambda: 0):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.do_deploy(argv, repo=Path("/nonexistent"),
+                                 call=lambda p, b: calls.append(p) or {},
+                                 manager=types.SimpleNamespace(
+                                     restart=lambda: calls.append("restart")),
+                                 git=_after_turn_git(head), suite=suite,
+                                 handoff=handoff, lock_path=lock, log_path=log_,
+                                 alive=lambda pid: pid in live)
+        return code, out.getvalue()
+
+    restore = _in_turn_env()
+    try:
+        # Plain deploy still refuses in a turn, and says what to use instead.
+        code, out = run([])
+        check("plain deploy refuses inside a turn, pointing at --after-turn",
+              code == 1 and "--after-turn" in out and not calls and not handed, out)
+        code, out = run(["--now", "--after-turn"])
+        check("--now with --after-turn is a usage error", code == 2 and not handed, out)
+
+        # Preflight runs here and its failure is this command's failure.
+        code, out = run(["--after-turn"], suite=lambda: 1)
+        check("a failing suite fails --after-turn at once, non-zero, nothing handed off",
+              code == 1 and "test suite fails" in out and not handed and not calls, out)
+        check("and a refused check does not leave the one-deploy lock held",
+              not lock.exists())
+
+        code, out = run(["--after-turn"])
+        check("a passing check hands off and exits 0",
+              code == 0 and len(handed) == 1, f"{code} {handed}\n{out}")
+        check("it touches neither the bot nor the services itself",
+              calls == [], str(calls))
+        argv, env, lp = handed[0]
+        check("the handoff is told the HEAD, the thread and the task to wait for",
+              cli.AFTER_TURN_CMD in argv and argv[argv.index("--head") + 1] == head[0]
+              and argv[argv.index("--thread") + 1] == "C1:1.0"
+              and argv[argv.index("--task") + 1] == "tsk_me", str(argv))
+        check("and gets none of the turn's SILKWORM_* variables",
+              not [k for k in env if k.startswith("SILKWORM_")
+                   and k not in ("SILKWORM_BOT_PORT", "SILKWORM_VIZ_PORT")],
+              str(sorted(k for k in env if k.startswith("SILKWORM_"))))
+        check("it logs to the known file", lp == log_ and str(log_) in out, out)
+        held = json.loads(lock.read_text())
+        check("the lock names the detached process, not the CLI that exits",
+              held.get("pid") == 4242 and held.get("head") == head[0], str(held))
+
+        # One at a time.
+        code, out = run(["--after-turn"])
+        check("a second --after-turn while one is pending reports it, starts nothing",
+              code == 0 and len(handed) == 1 and "already pending" in out
+              and "4242" in out, out)
+        head[0] = "b" * 40
+        code, out = run(["--after-turn"])
+        check("pending for an older HEAD: says so and fails, still starts nothing",
+              code == 1 and len(handed) == 1 and "aaaaaaaa" in out, out)
+
+        # A lock whose process is gone is a deploy that died: taken over.
+        live.clear()
+        code, out = run(["--after-turn"])
+        check("a stale lock does not block the next deploy",
+              code == 0 and len(handed) == 2, f"{code} {len(handed)}\n{out}")
+    finally:
+        restore()
+
+
+def test_deploy_after_turn_handoff_is_nobodys_child():
+    print("\nthe --after-turn handoff is reparented to PID 1, in its own session")
+    cli = _load_cli()
+    root = Path(tempfile.mkdtemp())
+    report, log_ = root / "report.json", root / "handoff.log"
+    script = (
+        "import json, os, sys, time\n"
+        "eof = os.read(0, 1) == b''\n"
+        "null = os.fstat(0).st_rdev == os.stat(os.devnull).st_rdev\n"
+        "print('hello from the handoff', flush=True)\n"
+        f"open({str(report)!r} + '.tmp', 'w').write(json.dumps({{"
+        "'pid': os.getpid(), 'ppid': os.getppid(), 'sid': os.getsid(0),"
+        "'pgid': os.getpgid(0), 'eof': eof, 'null': null,"
+        "'thread': os.environ.get('SILKWORM_THREAD'),"
+        "'port': os.environ.get('SILKWORM_BOT_PORT')}))\n"
+        f"os.replace({str(report)!r} + '.tmp', {str(report)!r})\n"
+        "time.sleep(30)\n")
+    env = cli.handoff_env({**os.environ, "SILKWORM_THREAD": "C1:1.0",
+                           "SILKWORM_TASK_ID": "tsk_me", "SILKWORM_BOT_PORT": "9999"})
+    pid = cli.detach([sys.executable, "-c", script], env, log_, cwd=root)
+    try:
+        deadline = time.time() + 15
+        while not report.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        got = json.loads(report.read_text()) if report.exists() else {}
+        check("detach returns the pid of the process that runs", got.get("pid") == pid,
+              f"{pid} {got}")
+        check("its parent is PID 1, not this process", got.get("ppid") == 1, str(got))
+        # Walk its ancestry as the OS sees it now: this process is not in it.
+        chain, p = [], pid
+        while p > 1 and len(chain) < 50:
+            r = subprocess.run(["ps", "-o", "ppid=", "-p", str(p)],
+                               capture_output=True, text=True)
+            p = int(r.stdout.strip() or 1)
+            chain.append(p)
+        check("the caller is not among its ancestors",
+              os.getpid() not in chain and chain[:1] == [1], str(chain))
+        # The session is the one setsid made for the first child, which has
+        # exited -- so the process that runs leads nothing and can never take
+        # a controlling terminal.
+        check("it runs in a session of its own, outside the caller's process group",
+              got.get("sid") not in (None, os.getsid(0), pid)
+              and got.get("pgid") == got.get("sid") and got.get("pgid") != os.getpgid(0),
+              str(got))
+        check("its stdin is /dev/null, closed to the caller",
+              got.get("eof") and got.get("null"), str(got))
+        check("the turn's variables are gone, the bot's port kept",
+              got.get("thread") is None and got.get("port") == "9999", str(got))
+        check("its output goes to the log",
+              "hello from the handoff" in log_.read_text(), log_.read_text())
+    finally:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+
+
+class _TurnBot(_FakeBot):
+    """_FakeBot with rows chosen per moment, a /tell route, and a bot that
+    can fail to come back."""
+
+    def __init__(self, clock, rows, *, tell_ok=True, down_after=False, **kw):
+        super().__init__(clock, **kw)
+        self.rows, self.tell_ok, self.down_after = rows, tell_ok, down_after
+        self.told = []
+
+    def running(self):
+        if self.restarted_at is not None:
+            return []
+        return self.rows(self.clock())
+
+    def __call__(self, path, payload):
+        if self.down_after and self.restarted_at is not None:
+            return {}
+        if path == "/tell":
+            self.told.append(dict(payload))
+            return {"ok": True} if self.tell_ok else {}
+        return super().__call__(path, payload)
+
+
+def _after_turn(cli, bot, clock, *, head="h" * 40, thread="C1:1.0", task="tsk_me",
+                max_wait=600, manager=None, outbox=None, caller_s=None, git=None):
+    root = Path(tempfile.mkdtemp())
+    lock = root / "deploy.lock"
+    lock.write_text(json.dumps({"pid": os.getpid(), "head": head}))
+    restarts = []
+    class Mgr:
+        def restart(self):
+            restarts.append(clock.t[0])
+            bot.restarted_at = clock.t[0]
+            return True
+    t = clock.t
+    def sleep(s):
+        t[0] += s
+        if t[0] > 2 * 86400:
+            raise RuntimeError("the after-turn deploy waited two simulated days")
+    out = io.StringIO()
+    kw = {} if caller_s is None else {"caller_s": caller_s}
+    with contextlib.redirect_stdout(out):
+        code = cli.after_turn_run(head, thread, task, max_wait, call=bot,
+                                  manager=manager or Mgr(), lock_path=lock,
+                                  log_path=root / "deploy.log",
+                                  outbox=outbox or root / "outbox",
+                                  clock=lambda: t[0], sleep=sleep, confirm_s=10,
+                                  repo=Path("/nonexistent"),
+                                  git=git or _after_turn_git(head), **kw)
+    return code, out.getvalue(), restarts, lock, root
+
+
+def test_deploy_after_turn_waits_for_its_own_turn_then_deploys():
+    print("\nthe detached deploy waits for the turn that asked, then for quiet")
+    cli = _load_cli()
+
+    class Clock:
+        def __call__(self):
+            return self.t[0]
+    def fresh():
+        c = Clock(); c.t = [0.0]
+        return c
+
+    me = lambda live=True: {"id": "tsk_me", "kind": "task", "title": "the asking turn",
+                            "thread": "C1:1.0", "driver": "queue", "live": live}
+    # The asking turn runs three hours -- far past --max-wait (10m). Its time
+    # is not other work's: the deploy still happens, once it ends.
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: [me()] if t < 3 * 3600 else [])
+    code, out, restarts, lock, _ = _after_turn(cli, bot, clock)
+    check("a long asking turn is waited out, not counted against --max-wait",
+          code == 0 and restarts and restarts[0] >= 3 * 3600 + cli.DEPLOY_QUIET_S,
+          f"{code} {restarts}\n{out[-600:]}")
+    starts = [c for c in bot.drain_calls if c.get("action") == "start"]
+    check("it drains only once the asking turn has ended",
+          starts and all(c.get("action") == "status" for c in
+                         bot.drain_calls[:bot.drain_calls.index(starts[0])]), str(bot.drain_calls[:3]))
+    check("success is posted to the asking thread with the revision",
+          bot.told and bot.told[-1]["key"] == "C1:1.0" and "h" * 8 in bot.told[-1]["text"]
+          and "Deployed" in bot.told[-1]["text"], str(bot.told))
+    check("and the one-deploy lock is let go", not lock.exists())
+
+    # Its process has gone but its record still says running (the bot catching
+    # up, or an orphan): that must not hold the deploy forever.
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: [me(live=t < 120)])
+    code, out, restarts, _, _ = _after_turn(cli, bot, clock)
+    check("a record no live process holds is not waited on forever",
+          code == 0 and restarts and restarts[0] < 600, f"{code} {restarts}\n{out[-600:]}")
+
+    # Inline Slack turns have no task id in their environment: found by thread.
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: [{**me(), "id": "tsk_inline"}] if t < 900 else [])
+    code, out, restarts, _, _ = _after_turn(cli, bot, clock, task="")
+    check("an asking turn is found by its thread when it has no task id",
+          code == 0 and restarts and restarts[0] >= 900 + cli.DEPLOY_QUIET_S, f"{restarts}")
+
+    # Other work is still waited on as any deploy would, including a later turn
+    # on the same thread -- that is not the asking turn.
+    other = {"id": "tsk_other", "kind": "task", "title": "someone else's turn",
+             "thread": "C1:1.0", "driver": "inline", "live": True}
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: ([me()] if t < 60 else [])
+                   + ([other] if 70 <= t < 1200 else []))
+    code, out, restarts, _, _ = _after_turn(cli, bot, clock, max_wait=3600)
+    check("a later turn on the same thread is other work, waited on",
+          code == 0 and restarts and restarts[0] >= 1200 + cli.DEPLOY_QUIET_S, f"{restarts}")
+
+    # The asking turn that never ends: bounded, said, nothing restarted.
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: [me()])
+    code, out, restarts, lock, _ = _after_turn(cli, bot, clock, caller_s=3600)
+    check("an asking turn that never ends is given up on, not restarted under",
+          code == 1 and not restarts and bot.told and ":x:" in bot.told[-1]["text"]
+          and "calling turn" in bot.told[-1]["text"], f"{code} {restarts} {bot.told}")
+    check("(and the lock is still let go)", not lock.exists())
+
+
+def test_deploy_after_turn_failure_is_reported_not_silent():
+    print("\nthe detached deploy says when it could not confirm, wherever it can")
+    cli = _load_cli()
+
+    class Clock:
+        def __call__(self):
+            return self.t[0]
+    def fresh():
+        c = Clock(); c.t = [0.0]
+        return c
+    gone = lambda t: []
+
+    # Comes back on another revision: the deploy did not do what was asked.
+    clock = fresh()
+    bot = _TurnBot(clock, gone, boots="b" * 40)
+    code, out, restarts, lock, root = _after_turn(cli, bot, clock)
+    told = bot.told[-1]["text"] if bot.told else ""
+    check("a restart onto another revision fails, and the thread is told why",
+          code == 1 and restarts and ":x:" in told and "bbbbbbbb" in told
+          and "hhhhhhhh" in told, f"{code} {told}\n{out[-400:]}")
+    check("the failure names the log", str(root / "deploy.log") in told, told)
+    check("it never claims success", "Deployed" not in told)
+
+    # Never comes back: no bot to post through, so the thread's outbox gets it.
+    clock = fresh()
+    outbox = Path(tempfile.mkdtemp())
+    bot = _TurnBot(clock, gone, down_after=True)
+    code, out, restarts, lock, root = _after_turn(cli, bot, clock, outbox=outbox)
+    notes = list((outbox / "C1__1.0").glob("deploy-*.txt"))
+    text = notes[0].read_text() if notes else ""
+    check("a bot that never returns: the failure is left in the thread's outbox",
+          code == 1 and notes and "never answered" in text
+          and str(root / "deploy.log") in text, f"{code} {notes}\n{out[-400:]}")
+    check("(and the lock is let go)", not lock.exists())
+
+    # A crash inside the deploy is a failure, said, not a silent exit.
+    clock = fresh()
+    bot = _TurnBot(clock, gone)
+    def boom():
+        raise OSError("launchctl went away")
+    code, out, restarts, lock, _ = _after_turn(
+        cli, bot, clock, manager=types.SimpleNamespace(restart=boom))
+    told = bot.told[-1]["text"] if bot.told else ""
+    check("an exception mid-deploy is reported with its reason",
+          code == 1 and "launchctl went away" in told and not lock.exists(), told)
+
+    # Still busy at --max-wait: reported with what was running.
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: [{"id": "tsk_long", "kind": "task", "title": "long one",
+                                      "thread": "C9:9.9", "live": True}])
+    code, out, restarts, lock, _ = _after_turn(cli, bot, clock, max_wait=600)
+    told = bot.told[-1]["text"] if bot.told else ""
+    check("busy past --max-wait: no restart, the thread is told what held it",
+          code == 1 and not restarts and "tsk_long" in told, told)
+
+
+def test_deploy_after_turn_rechecks_and_lets_go_when_stopped():
+    print("\nthe detached deploy restarts only onto what was checked, and a stop lifts its drain")
+    cli = _load_cli()
+
+    class Clock:
+        def __call__(self):
+            return self.t[0]
+    def fresh():
+        c = Clock(); c.t = [0.0]
+        return c
+    gone = lambda t: []
+
+    # A commit (or a landing) after the checks: not restarted onto.
+    clock = fresh()
+    bot = _TurnBot(clock, gone)
+    code, out, restarts, lock, _ = _after_turn(cli, bot, clock,
+                                               git=_after_turn_git("c" * 40))
+    told = bot.told[-1]["text"] if bot.told else ""
+    check("HEAD moved after the checks: no restart, and the thread is told",
+          code == 1 and not restarts and "moved" in told and "cccccccc" in told, told)
+    check("(the drain it took is lifted)",
+          bot.drain_calls and bot.drain_calls[-1].get("action") == "stop", str(bot.drain_calls[-2:]))
+    def dirty(repo, *a):
+        return (0, " M bot.py") if a[:1] == ("status",) else _after_turn_git("h" * 40)(repo, *a)
+    clock = fresh()
+    bot = _TurnBot(clock, gone)
+    code, out, restarts, _, _ = _after_turn(cli, bot, clock, git=dirty)
+    check("tracked files changed after the checks: no restart",
+          code == 1 and not restarts and bot.told and "changed" in bot.told[-1]["text"],
+          str(bot.told))
+
+    # Stopped mid-wait (SIGTERM becomes SystemExit): drain lifted, thread told.
+    clock = fresh()
+    bot = _TurnBot(clock, lambda t: [{"id": "tsk_x", "kind": "task", "title": "other",
+                                      "thread": "C9:9.9", "live": True}])
+    root = Path(tempfile.mkdtemp())
+    lock = root / "deploy.lock"
+    lock.write_text(json.dumps({"pid": os.getpid()}))
+    def sleep(_s):
+        clock.t[0] += 5
+        if clock.t[0] > 300:
+            raise SystemExit(143)
+    stopped = False
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            cli.after_turn_run("h" * 40, "C1:1.0", "tsk_me", 3600, call=bot,
+                               manager=types.SimpleNamespace(restart=lambda: True),
+                               lock_path=lock, log_path=root / "l", outbox=root / "o",
+                               clock=clock, sleep=sleep, confirm_s=10,
+                               repo=Path("/nonexistent"), git=_after_turn_git("h" * 40))
+        except SystemExit:
+            stopped = True
+    check("a stop mid-wait lifts the drain rather than leaving it for hours",
+          stopped and bot.drain_calls[-1].get("action") == "stop" and not bot.draining,
+          str(bot.drain_calls[-2:]))
+    check("and still tells the thread, and lets go of the lock",
+          bot.told and "stopped" in bot.told[-1]["text"] and not lock.exists(), str(bot.told))
+
+
+def test_one_deploy_lock_is_shared_and_race_free():
+    print("\nterminal deploys and after-turn deploys share one lock, taken by one caller")
+    import threading
+    cli = _load_cli()
+    root = Path(tempfile.mkdtemp())
+
+    # Plain deploy from a terminal while an after-turn deploy is pending.
+    lock = root / "a.lock"
+    lock.write_text(json.dumps({"pid": 4242, "head": "a" * 40, "stage": "waiting"}))
+    restarts = []
+    saved = os.environ.pop("SILKWORM_THREAD", None)
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.do_deploy([], repo=Path("/nonexistent"), call=lambda p, b: {},
+                                 manager=types.SimpleNamespace(
+                                     restart=lambda: restarts.append(1) or True),
+                                 git=_after_turn_git("a" * 40), suite=lambda: 0,
+                                 lock_path=lock, alive=lambda pid: pid == 4242)
+        check("a terminal deploy under a pending one refuses and names it",
+              code == 1 and not restarts and "4242" in out.getvalue(), out.getvalue())
+        lock.unlink()
+        bot = _FakeBot(lambda: 0.0, head="a" * 40)
+        seen = []
+        class Mgr:
+            def restart(self):
+                seen.append(json.loads(lock.read_text()).get("pid"))
+                bot.restarted_at = 0
+                return True
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = cli.do_deploy(["--now"], repo=Path("/nonexistent"), call=bot,
+                                 manager=Mgr(), git=_after_turn_git("a" * 40),
+                                 suite=lambda: 0, lock_path=lock,
+                                 clock=lambda: 0.0, sleep=lambda s: None, confirm_s=0)
+        check("a terminal deploy holds the lock while it runs, and lets go after",
+              code == 0 and seen == [os.getpid()] and not lock.exists(), f"{code} {seen}")
+    finally:
+        if saved is not None:
+            os.environ["SILKWORM_THREAD"] = saved
+
+    # Many callers find the same stale lock at once: exactly one takes it.
+    for round_ in range(5):
+        lock = root / f"race{round_}.lock"
+        lock.write_text(json.dumps({"pid": 1, "head": "dead"}))
+        won, gate = [], threading.Barrier(8)
+        def go(n):
+            gate.wait()
+            if cli.take_deploy_lock(lock, {"pid": 1000 + n}, alive=lambda pid: pid != 1) is None:
+                won.append(n)
+        th = [threading.Thread(target=go, args=(n,)) for n in range(8)]
+        for x in th:
+            x.start()
+        for x in th:
+            x.join()
+        if len(won) != 1:
+            break
+    check("eight callers racing over one stale lock: exactly one wins",
+          len(won) == 1 and json.loads(lock.read_text())["pid"] == 1000 + won[0], str(won))
+
+
+def test_bot_tell_route_and_drain_rows_carry_threads():
+    print("\nthe bot can post a line to a thread for a detached deploy")
+    import drain as D
+    from unittest.mock import MagicMock
+    app = MagicMock()
+    tell = _bot_func("handle_tell", app=app, re=_re, log=logging.getLogger("test"))
+    r = tell({"key": "C1:1.0", "text": "deployed"})
+    kw = app.client.chat_postMessage.call_args.kwargs if app.client.chat_postMessage.called else {}
+    check("/tell posts in the thread named",
+          r == {"ok": True} and kw.get("channel") == "C1" and kw.get("thread_ts") == "1.0"
+          and kw.get("text") == "deployed", f"{r} {kw}")
+    check("a malformed key or empty text is refused",
+          not tell({"key": "nope", "text": "x"})["ok"] and not tell({"key": "C1:1.0"})["ok"])
+    app.client.chat_postMessage.side_effect = RuntimeError("slack down")
+    r = tell({"key": "C1:1.0", "text": "deployed"})
+    check("a post that fails says so, so the caller can use the outbox", r["ok"] is False, str(r))
+    check("/tell is routed", 'server.route("/tell", handle_tell)' in (BASE / "bot.py").read_text())
+
+    rows = D.busy([{"id": "tsk_a", "state": "running", "thread": "C1:1.0"}])
+    check("what a restart would kill carries each task's thread",
+          rows and rows[0].get("thread") == "C1:1.0", str(rows))
 
 
 # --- an interrupted task resumes its session, it does not start over ------------
