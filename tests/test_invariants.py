@@ -20735,6 +20735,19 @@ def test_failed_tests_names_each_failure_once():
           str(V.failed_tests(xc)))
     check("a run that names nothing names nothing",
           V.failed_tests("Traceback ...\nImportError: no module named x\n") == [])
+    ut = ("F.E\n======\nFAIL: test_b (t.T.test_b)\n------\nAssertionError\n"
+          "ERROR: test_c (t.T)\n\nRan 3 tests in 0.001s\n\nFAILED (failures=1, errors=1)\n")
+    check("unittest: each test, never its tally",
+          V.failed_tests(ut) == ["t.T.test_b", "t.T.test_c"], str(V.failed_tests(ut)))
+    check("unittest: two different failures are not the same '(failures=1)'",
+          V.failed_tests("FAIL: test_a (t.T.test_a)\nFAILED (failures=1)\n")
+          != V.failed_tests("FAIL: test_b (t.T.test_b)\nFAILED (failures=1)\n"))
+    sw = ("✘ Test foo() recorded an issue at a.swift:3:4: Expectation failed\n"
+          "✘ Test foo() failed after 0.1 seconds with 1 issue.\n"
+          "✘ Suite X failed after 0.02 seconds with 1 issue.\n"
+          "✘ Test run with 12 tests failed after 0.031 seconds with 1 issue.\n")
+    check("swift test: the test, not the suite or run summary with its timing",
+          V.failed_tests(sw) == ["foo()"], str(V.failed_tests(sw)))
     many = "".join(f"  ✘ check {i}\n" for i in range(40))
     check("never trimmed: a failure cut off would look like the base's",
           len(V.failed_tests(many)) == 40)
@@ -20928,7 +20941,7 @@ def _base_glue(ps, ts, *, suite, base=("main", "b" * 40), moved=True, verify_ok=
                                attach=lambda *a, **k: Path(tempfile.mkdtemp()))
     ns = bot_functions(
         "ask_base", "hold_for_base", "hold_landing_for_base", "release_base",
-        "reverify_held", "announce_red",
+        "reverify_held", "announce_red", "release_held",
         project_store=ps, task_store=ts, basered=_br, verify=_V, merge=_merge,
         tasks=_T, threading=types.SimpleNamespace(Thread=SyncThread),
         app=types.SimpleNamespace(client=Client()), home_channel=lambda: "DHOME",
@@ -20943,7 +20956,9 @@ def _base_glue(ps, ts, *, suite, base=("main", "b" * 40), moved=True, verify_ok=
                                         "failed": [] if verify_ok else ["t9"]}),
         resolve_review=lambda task, role, text, c, t: calls["reviews"].append(task["id"]),
         send_back_for_tests=lambda task, r, c, t: calls["sent_back"].append(task["id"]),
-        tell_thread=lambda key, text: calls["told"].append(text))
+        tell_thread=lambda key, text: calls["told"].append(text),
+        record_landing=lambda task, outcome: calls.setdefault("recorded", []).append(
+            (task["id"], outcome)))
     return ns, calls
 
 
@@ -21084,6 +21099,7 @@ def test_base_recovery_releases_held_work():
     ns["hold_for_base"](held_v, {"ran": True, "ok": False, "failed": ["t1"],
                                  "output": "  ✘ t1\n"}, "C1", "1.0")
     lt = ts.create("landed", project="trader", role="implementor", driver="queue")
+    ts.update(lt["id"], result={"landing": {"stage": "base-failing"}})
     B.hold(ts, lt["id"], "landing", "a" * 40, approved=True)
     item = ps.get("trader")["main_failing"]["attention"]
 
@@ -21159,6 +21175,127 @@ def test_failing_base_is_one_line_on_board_and_digest():
           (row.get("main_failing") or {}).get("line") == "trader main is failing: t1, t2",
           str(row.get("main_failing")))
     check("and counts one thing needing you", row["needs"] == 1, str(row["needs"]))
+
+
+
+def test_base_failing_without_naming_a_test_is_not_red():
+    print("\na base that fails without naming a test does not pause the project")
+    import tasks as T
+    ps, ts = _red_stores()
+    ns, calls = _base_glue(ps, ts, suite=lambda sha: {
+        "ran": True, "ok": False, "code": None, "output": "tests did not finish within 1800s"})
+    t = _running(ts)
+    check("the task's failure stands as its own",
+          ns["hold_for_base"](t, {"ran": True, "ok": False, "failed": ["t1"],
+                                  "output": "  ✘ t1\n"}, "C1", "1.0") is False)
+    check("and the project is not marked failing", not ps.get("trader")["main_failing"]
+          and not [x for x in ts.needs_attention() if x.get("source") == "base-red"])
+
+
+def test_held_work_is_never_stranded():
+    print("\nheld work left over a green base is found and released")
+    import basered as B
+    import tasks as T
+    ps, ts = _red_stores()
+    ns, calls = _base_glue(ps, ts, suite=lambda sha: {"ran": True, "ok": True})
+    # A restart part-way through a release: the project is green, and these
+    # are still marked.
+    v = _running(ts)
+    ts.transition(v["id"], T.BLOCKED, "held")
+    B.hold(ts, v["id"], "verify", "a" * 40)
+    lt = ts.create("landed", project="trader", role="implementor", driver="queue")
+    ts.update(lt["id"], result={"landing": {"stage": "base-failing"}})
+    B.hold(ts, lt["id"], "landing", "a" * 40, approved=False)
+    gone = ts.create("dropped", project="trader", role="implementor", driver="queue")
+    ts.update(gone["id"], result={"landing": {"stage": "dropped"}})
+    B.hold(ts, gone["id"], "landing", "a" * 40)
+    moved = _running(ts)
+    B.hold(ts, moved["id"], "verify", "a" * 40)            # retried by a person: running
+    check("all four are found", {t["id"] for t in B.stranded(ps, ts)["trader"]}
+          == {v["id"], lt["id"], gone["id"], moved["id"]})
+    out = ns["release_held"]("trader")
+    check("the held verification is verified again", calls["verified"] == [v["id"]])
+    check("the held landing is landed again", calls["landings"] == [(lt["id"], False)])
+    check("work since dropped or picked up again only loses the mark",
+          gone["id"] not in out and moved["id"] not in out
+          and not ts.get(gone["id"]).get("held_base")
+          and not ts.get(moved["id"]).get("held_base"))
+    check("nothing is left to find", not B.stranded(ps, ts))
+    src = (BASE / "bot.py").read_text()
+    body = src[src.index("def probe_failing_bases("):src.index("def _probe_base(")]
+    check("the scheduler's beat looks for them", "basered.stranded(project_store, task_store)" in body
+          and "release_held" in body)
+
+    ps2, ts2 = _red_stores()
+    ns2, calls2 = _base_glue(ps2, ts2, suite=lambda sha: {"ran": True, "ok": True})
+    ns2["start_landing"] = lambda tid, approved=False: False
+    lt2 = ts2.create("landed", project="trader", role="implementor", driver="queue")
+    ts2.update(lt2["id"], result={"landing": {"stage": "base-failing"}})
+    B.hold(ts2, lt2["id"], "landing", "a" * 40)
+    ns2["release_held"]("trader")
+    check("a landing that cannot be restarted says so on its record",
+          [o["stage"] for _, o in calls2.get("recorded", [])] == ["held-released"])
+    ps3, ts3 = _red_stores()
+    ns3, calls3 = _base_glue(ps3, ts3, base=("main", "c" * 40), verify_ok=False,
+                             suite=lambda sha: {"ran": True, "ok": False, "code": 1,
+                                                "output": "  ✘ t9\n", "failed": ["t9"]})
+    w = _running(ts3)
+    ts3.transition(w["id"], T.BLOCKED, "held")
+    B.hold(ts3, w["id"], "verify", "a" * 40)
+    ns3["release_held"]("trader")
+    check("red again at a later commit while releasing: held afresh, mark kept",
+          ts3.get(w["id"])["state"] == T.BLOCKED
+          and (ts3.get(w["id"]).get("held_base") or {}).get("sha") == "c" * 40
+          and not calls3["sent_back"], str(ts3.get(w["id"]).get("held_base")))
+    check("and the start-of-run clears a stale mark",
+          'task_store.update(tid, held_base=None)' in
+          src[src.index("def execute_task("):src.index("progress = ProgressMessage(app.client, channel, thread_ts)")])
+
+
+def test_base_renamed_or_untested_releases_the_project():
+    print("\na project whose base changed, or lost its tests, is not held for ever")
+    import basered as B
+    ps, ts = _red_stores()
+    B.mark_red(ps, ts, "trader", {"sha": "a" * 40, "failed": ["t1"]}, "research/old")
+    ns, calls = _base_glue(ps, ts, suite=lambda sha: {"ran": True, "ok": True}, moved=False)
+    ns["ask_base"]({"project": "trader", "scope": {}}, [], sha="f" * 40, base="main")
+    check("a green commit on the base it is named now releases it, ancestry or not",
+          not ps.get("trader")["main_failing"])
+    ps2, ts2 = _red_stores()
+    st, _ = B.mark_red(ps2, ts2, "trader", {"sha": "a" * 40, "failed": ["t1"]}, "main")
+    ts2.transition(st["attention"], "queued", "sent back")
+    B.recover(ps2, ts2, "trader", "b" * 40)
+    check("an item somebody queued is cancelled, not left to run on a green base",
+          ts2.get(st["attention"])["state"] == "cancelled")
+    src = (BASE / "bot.py").read_text()
+    probe = src[src.index("def _probe_base("):src.index("def release_base(")]
+    check("losing the test command lets it go", "release_base(slug" in probe
+          and 'get("test_cmd")' in probe)
+    guard = src[src.index("def take_step("):]
+    guard = guard[:guard.index("def post(text)")]
+    check("a held landing still blocks !release", "merge.BASE_FAILING" in guard)
+
+
+def test_base_is_the_local_commit_a_landing_merges_into():
+    print("\nthe base is asked about at the commit a landing would merge into")
+    import branches as BR
+    import worktrees as W
+    up = Path(tempfile.mkdtemp())
+    g = lambda d, *a: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t",
+                                      "-c", "user.name=t", *a],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+    g(up, "init", "-q", "-b", "main")
+    g(up, "commit", "-q", "--allow-empty", "-m", "one")
+    clone = Path(tempfile.mkdtemp()) / "c"
+    subprocess.run(["git", "clone", "-q", str(up), str(clone)], check=True)
+    local = g(clone, "rev-parse", "HEAD")
+    g(up, "commit", "-q", "--allow-empty", "-m", "two, not pulled")
+    g(clone, "fetch", "-q", "origin")
+    ns = bot_functions("current_base", worktrees=W, branches=BR, subprocess=subprocess,
+                       task_base=lambda t: "main")
+    name, sha = ns["current_base"](str(clone), {"project": "p"})
+    check("origin ahead and not pulled: still the local commit",
+          (name, sha) == ("main", local), f"{name} {sha[:8]} vs {local[:8]}")
 
 
 if __name__ == "__main__":

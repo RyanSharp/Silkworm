@@ -214,7 +214,7 @@ def recover(project_store, task_store, slug: str, sha: str) -> tuple[dict, list]
     Returns (the state that was cleared, the tasks that were held), or
     ({}, []) if the project was not marked. Each held task keeps its
     `held_base` -- releasing it is the caller's, and clears it -- so a crash
-    between here and there leaves the tasks findable rather than forgotten.
+    between here and there leaves them for `stranded` to find.
     """
     with _state_lock:
         rec = project_store.get(slug) or {}
@@ -224,11 +224,33 @@ def recover(project_store, task_store, slug: str, sha: str) -> tuple[dict, list]
         project_store.update(slug, main_failing=None)
         item = task_store.get(state.get("attention") or "")
         # Not one somebody sent off to fix the base: that turn ends on its own.
+        # One sent off and still waiting in the queue has nothing left to do;
+        # it cannot go straight to done from there, so it is cancelled.
         if item and item.get("state") not in tasks.ENDED + (tasks.RUNNING,):
+            to = tasks.CANCELLED if item.get("state") == tasks.QUEUED else tasks.DONE
             try:
-                task_store.transition(item["id"], tasks.DONE,
+                task_store.transition(item["id"], to,
                                       f"the base passes again at {sha[:8]}")
             except Exception:
                 log.exception("could not close %s", item["id"])
         log.warning("%s's base passes again at %s", slug, sha[:8])
         return state, held(task_store, slug)
+
+
+def stranded(project_store, task_store) -> dict[str, list[dict]]:
+    """Held tasks whose project's base is not failing: {slug: [task, ...]}.
+
+    Recovery clears the project first and then releases its tasks one at a
+    time, each a suite run long. A restart part-way leaves the rest held over
+    a green base, and a hold written just after a recovery read its list is
+    the same shape. Nothing else would ever ask about them again.
+    """
+    red = failing(project_store)
+    out: dict[str, list[dict]] = {}
+    for t in task_store.all().values():
+        slug = t.get("project") or ""
+        if t.get("held_base") and slug not in red:
+            out.setdefault(slug, []).append(t)
+    for rows in out.values():
+        rows.sort(key=lambda t: t.get("created") or 0)
+    return out

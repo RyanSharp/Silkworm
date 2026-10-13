@@ -249,7 +249,7 @@ def sections(records, now: float, *, branch_rows=(), released=None,
             excused = state == tasks.BLOCKED and (
                 (rec.get("retry_at") and rec["retry_at"] > now)
                 # Held for a failing base, which has a line of its own.
-                or rec.get("held_base")
+                or (rec.get("held_base") and not rec.get("blocked_on"))
                 or any((by_id.get(b) or {}).get("state") not in tasks.ENDED
                        for b in rec.get("blocked_on") or () if b in by_id))
             dwell = now - _entered(rec)

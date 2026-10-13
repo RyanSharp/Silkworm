@@ -81,10 +81,18 @@ PASSED_MARKS = ("✔", "✓")
 FAILURE_LINES = 20
 
 
-#: Lines FAILURE_LINE matches that count failures rather than naming one.
+#: Lines that count failures rather than naming one: Silkworm's and pytest's
+#: totals, xcodebuild's, unittest's "FAILED (failures=1)", and Swift
+#: Testing's run and suite summaries -- which carry a duration, so a branch and
+#: its base would never agree on them even if they did name something.
 _TALLY = re.compile(
-    r"^\s*(?:=+ |\d+ passed, \d+ failed|\*\* TEST FAILED \*\*"
-    r"|Executed \d+ tests?)", re.IGNORECASE)
+    r"^\s*(?:[✘✗]\s*)?(?:=+ |\d+ passed, \d+ failed|\*\* TEST FAILED \*\*"
+    r"|Executed \d+ tests?|FAILED \(|Test run with |Suite \S.*? failed after )",
+    re.IGNORECASE)
+
+#: unittest names a failure on a line FAILURE_LINE does not match at all:
+#: "FAIL: test_x (pkg.mod.Class.test_x)", and ERROR: for one that raised.
+_UNITTEST = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([^)]*)\)")
 
 
 def _test_name(line: str) -> str:
@@ -124,6 +132,13 @@ def failed_tests(output: str) -> list[str]:
     """
     names: list[str] = []
     for line in (output or "").splitlines():
+        m = _UNITTEST.match(line)
+        if m:
+            name = m.group(2) if m.group(2).endswith(m.group(1)) else \
+                f"{m.group(2)}.{m.group(1)}"
+            if name not in names:
+                names.append(name)
+            continue
         if (line.lstrip().startswith(PASSED_MARKS) or not FAILURE_LINE.search(line)
                 or _TALLY.match(line)):
             continue

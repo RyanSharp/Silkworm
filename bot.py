@@ -2227,7 +2227,8 @@ def take_step(action: str, payload: dict) -> dict:
     # the base while that branch is mid-landing, or after it was refused,
     # would release without the work and then close the task as if it had.
     landing = (task.get("result") or {}).get("landing") or {}
-    if landing.get("stage") == LANDING_UNDERWAY or merge.needs_a_person(landing):
+    if (landing.get("stage") in (LANDING_UNDERWAY, merge.BASE_FAILING)
+            or merge.needs_a_person(landing)):
         return {"ok": False, "error": f"its branch has not landed ({landing.get('stage')}); "
                                       "land it first -- mark this Done, then Land it "
                                       "from its card -- and release after"}
@@ -3909,6 +3910,11 @@ def execute_task(task: dict) -> None:
             log.exception("could not park %s behind its live session", tid)
         return
 
+    if task.get("held_base"):
+        # Running again -- retried by a person -- is no longer waiting on the
+        # base; left on, release_held would act on it later, mid-review.
+        task_store.update(tid, held_base=None)
+
     progress = ProgressMessage(app.client, channel, thread_ts)
 
     # Self-contained work in a repository gets its own checkout. It cannot then
@@ -4292,20 +4298,32 @@ def base_repo(task: dict) -> str:
 
 def current_base(repo, task: dict) -> tuple[str, str]:
     """(branch name, commit) of the base a task is measured against now, or
-    ("", "") when there is none to name. Resolved the way a landing and the
-    unmerged survey resolve it, without fetching."""
+    ("", "") when there is none to name.
+
+    The *local* branch's commit where there is one: that is what a landing
+    rebases onto and merges into (merge.land reads it off the checkout), and
+    every question about the base has to be about the same commit. Asking
+    the verification about origin's and the landing about local's flapped
+    between them -- origin fixed and not yet pulled released everything, the
+    landing failed on local again, and round it went every minute.
+    """
     if not repo or not worktrees.is_repo(repo):
         return "", ""
     ref = worktrees.base_ref(repo, fetch=False, prefer=task_base(task), fallback="")
     if not ref:
         return "", ""
-    try:
-        sha = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
-                             cwd=repo, capture_output=True, text=True,
-                             timeout=30).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "", ""
-    return (branches.base_name(repo, ref) if sha else ""), sha
+    name = branches.base_name(repo, ref)
+
+    def commit(r):
+        try:
+            return subprocess.run(["git", "rev-parse", "--verify", "-q", f"{r}^{{commit}}"],
+                                  cwd=repo, capture_output=True, text=True,
+                                  timeout=30).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    sha = (commit(f"refs/heads/{name}") if name else "") or commit(ref)
+    return (name if sha else ""), sha
 
 
 def run_base_suite(repo, slug: str, sha: str) -> dict:
@@ -4318,10 +4336,11 @@ def run_base_suite(repo, slug: str, sha: str) -> dict:
     cmd = ((project_store.get(slug) or {}).get("test_cmd") or "").strip()
     if not cmd:
         return {"ran": False, "ok": False, "output": "no test command"}
-    path = worktrees.path_for(repo, f"base-{sha[:12]}", "basecheck")
-    worktrees.drop_scratch(repo, path)              # a leftover from a crash
-    here = worktrees.attach(repo, f"base-{sha[:12]}", sha, label="basecheck",
-                            detach=True)
+    # Named for the project as well: two projects can share a repository,
+    # and their suites are locked apart, not together.
+    key = f"base-{projects.slugify(slug)}-{sha[:12]}"
+    worktrees.drop_scratch(repo, worktrees.path_for(repo, key, "basecheck"))
+    here = worktrees.attach(repo, key, sha, label="basecheck", detach=True)
     if not here:
         return {"ran": False, "ok": False,
                 "output": f"could not check out the base at {sha[:8]}"}
@@ -4376,10 +4395,19 @@ def ask_base(task: dict, failed, sha: str = "", base: str = "") -> dict | None:
         return None
     if seen["ok"]:
         red = proj.get("main_failing") or {}
-        if red and base_moved_on(repo, red.get("sha", ""), sha):
+        # Later on the same branch -- or another branch altogether, since the
+        # project renamed its base: the old red commit is then no ancestor of
+        # anything it will ever be asked about again.
+        if red and ((base and red.get("base") and base != red["base"])
+                    or base_moved_on(repo, red.get("sha", ""), sha)):
             threading.Thread(target=release_base, args=(slug, sha), daemon=True,
                              name=f"basegreen-{slug[:12]}").start()
         return {"held": False, "state": None}
+    if not seen["failed"]:
+        # Failed without naming a test -- a timeout, a crash, a hang. Nothing
+        # could be held against that, so pausing the project for it would
+        # cost every implementor and buy nothing. Unknown, not red.
+        return None
     state, news = basered.mark_red(project_store, task_store, slug, seen, base,
                                    scope=project_store.scope_for(slug))
     if news:
@@ -4482,45 +4510,54 @@ BASE_PROBE_S = 60
 
 
 def probe_failing_bases(now: float | None = None) -> list[str]:
-    """Start a look at every failing base not looked at lately. Returns the
-    slugs started. Never runs a suite on the caller's thread."""
+    """Start a look at every failing base not looked at lately, and a release
+    of any held work whose base is no longer failing. Returns the slugs
+    started. Never runs a suite on the caller's thread."""
     now = time.time() if now is None else now
+    jobs = [(slug, _probe_base) for slug in sorted(basered.failing(project_store))]
+    jobs += [(slug, release_held) for slug in sorted(
+        basered.stranded(project_store, task_store))]
     started = []
-    for slug in sorted(basered.failing(project_store)):
+    for slug, job in jobs:
         with _base_probes_guard:
             if slug in _base_probes or now - _base_probed_at.get(slug, 0) < BASE_PROBE_S:
                 continue
             _base_probes.add(slug)
             _base_probed_at[slug] = now
-        threading.Thread(target=_probe_base, args=(slug,), daemon=True,
+
+        def run(slug=slug, job=job):
+            try:
+                job(slug)
+            except Exception:
+                log.exception("looking at %s's base failed", slug)
+            finally:
+                with _base_probes_guard:
+                    _base_probes.discard(slug)
+
+        threading.Thread(target=run, daemon=True,
                          name=f"baseprobe-{slug[:12]}").start()
         started.append(slug)
     return started
 
 
 def _probe_base(slug: str) -> None:
-    try:
-        state = (project_store.get(slug) or {}).get("main_failing") or {}
-        if not state:
-            return
-        probe = {"project": slug, "scope": project_store.scope_for(slug)}
-        base, sha = current_base(base_repo(probe), probe)
-        if sha and sha != state.get("sha"):
-            ask_base(probe, [], sha=sha, base=base)
-    except Exception:
-        log.exception("looking at %s's failing base failed", slug)
-    finally:
-        with _base_probes_guard:
-            _base_probes.discard(slug)
+    proj = project_store.get(slug) or {}
+    state = proj.get("main_failing") or {}
+    if not state:
+        return
+    if not (proj.get("test_cmd") or "").strip():
+        # Nothing can prove it failing any more, or passing: let it go
+        # rather than hold its work against a suite that no longer exists.
+        release_base(slug, state.get("sha") or "")
+        return
+    probe = {"project": slug, "scope": project_store.scope_for(slug)}
+    base, sha = current_base(base_repo(probe), probe)
+    if sha and (sha != state.get("sha") or base != state.get("base")):
+        ask_base(probe, [], sha=sha, base=base)
 
 
 def release_base(slug: str, sha: str) -> list[str]:
-    """The base passes again: say so, and send held work on its way.
-
-    A held verification is verified again; a held landing is landed again,
-    approved exactly as it was the first time. Each is cleared of its hold as
-    it goes, so a crash part-way leaves the rest still findable.
-    """
+    """The base passes again: say so, and send held work on its way."""
     state, held = basered.recover(project_store, task_store, slug, sha)
     if not state:
         return []
@@ -4529,24 +4566,56 @@ def release_base(slug: str, sha: str) -> list[str]:
         try:
             app.client.chat_postMessage(
                 channel=channel,
-                text=(f":large_green_circle: *{slug} main is green again* at "
-                      f"`{sha[:8]}`"
+                text=(f":large_green_circle: *{slug} main is green again*"
+                      + (f" at `{sha[:8]}`" if sha else "")
                       + (f" — releasing {len(held)} held task"
                          f"{'s' if len(held) != 1 else ''}." if held else ".")))
         except Exception:
             log.exception("announcing %s's green base failed", slug)
+    return release_held(slug)
+
+
+def release_held(slug: str) -> list[str]:
+    """Send on every task held for `slug`'s base, now that it is not failing.
+
+    A held verification is verified again; a held landing is landed again,
+    approved exactly as it was the first time. Only if it is still where the
+    hold left it: a task somebody since cancelled, retried or dropped the
+    branch of has moved on, and only loses the mark. The mark goes once the
+    task is on its way, so a restart part-way leaves the rest for the next
+    beat (basered.stranded) rather than nowhere.
+    """
     released = []
-    for t in held:
-        hb = t.get("held_base") or {}
+    for t in basered.held(task_store, slug):
+        if slug in basered.failing(project_store):
+            break                                   # red again meanwhile
+        tid, hb = t["id"], t.get("held_base") or {}
+        landing = (t.get("result") or {}).get("landing") or {}
         try:
-            task_store.update(t["id"], held_base=None)
             if hb.get("kind") == "landing":
-                start_landing(t["id"], approved=bool(hb.get("approved")))
-            elif t.get("state") == tasks.BLOCKED:
-                reverify_held(task_store.get(t["id"]) or t)
-            released.append(t["id"])
+                if (landing.get("stage") == merge.BASE_FAILING
+                        and t.get("state") != tasks.CANCELLED):
+                    task_store.update(tid, held_base=None)
+                    if not start_landing(tid, approved=bool(hb.get("approved"))):
+                        record_landing(t, {
+                            "eligible": True, "landed": False, "stage": "held-released",
+                            "branch": branches.name_for(t),
+                            "detail": "the base passes again, but its landing could "
+                                      "not be restarted; Land it from its card"})
+                    released.append(tid)
+                else:
+                    task_store.update(tid, held_base=None)
+            elif t.get("state") == tasks.BLOCKED and not t.get("blocked_on"):
+                reverify_held(t)
+                # Unless it was held afresh -- red again at a later commit.
+                now_hb = (task_store.get(tid) or {}).get("held_base") or {}
+                if now_hb.get("at") == hb.get("at"):
+                    task_store.update(tid, held_base=None)
+                released.append(tid)
+            else:
+                task_store.update(tid, held_base=None)
         except Exception:
-            log.exception("could not release %s after %s's base passed", t["id"], slug)
+            log.exception("could not release %s after %s's base passed", tid, slug)
     return released
 
 
