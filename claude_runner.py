@@ -102,6 +102,8 @@ def run_turn(
     on_init=None,      # fn(session_id)
     on_activity=None,  # fn(tool_name, tool_input)
     on_start=None,     # fn(RunHandle)
+    clock=time.monotonic,  # what "now" is to the deadlines; tests drive it
+    poll: float | None = None,  # seconds between watchdog checks; None = derive
 ) -> TurnResult:
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose"]
     cmd += permission_args
@@ -148,15 +150,15 @@ def run_turn(
     timed_out = threading.Event()
     idle_killed = threading.Event()
     finished = threading.Event()
-    last_seen = [time.monotonic()]
+    last_seen = [clock()]
 
     def _watch():
-        started = time.monotonic()
+        started = clock()
         # Check often enough that a short idle limit is honoured promptly, but
         # never faster than is useful for a half-hour one.
-        tick = max(1.0, min(15.0, (idle_timeout or 60) / 4))
+        tick = poll or max(1.0, min(15.0, (idle_timeout or 60) / 4))
         while not finished.wait(tick):
-            now = time.monotonic()
+            now = clock()
             if idle_timeout and now - last_seen[0] > idle_timeout:
                 idle_killed.set()
                 timed_out.set()
@@ -180,7 +182,7 @@ def run_turn(
             # Any output at all counts as being alive -- including lines we do
             # not parse. The question is whether the process is doing anything,
             # not whether it said something we understand.
-            last_seen[0] = time.monotonic()
+            last_seen[0] = clock()
             line = line.strip()
             if not line:
                 continue

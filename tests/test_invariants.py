@@ -3752,19 +3752,68 @@ def test_repo_guard():
 # progress from a wedge. Only silence can.
 
 def test_turn_deadline_is_idleness():
+    import inspect
+    import threading
     import claude_runner as CR
     print("\nturns end on silence, not on the clock")
 
+    # Time here is a fake clock the test owns, not the wall. The real child's
+    # output is what advances it: each line it prints moves "now" on by one
+    # second. So a turn that keeps printing really does live for far longer
+    # than its idle limit -- and a machine that stalls the child for a few real
+    # seconds (a concurrent suite, a slow interpreter start) moves nothing, so
+    # it cannot pass for silence. Only the test decides how much time passes.
+    #
+    # Lockstep, so nothing races: after moving the clock, the reader waits for
+    # the watchdog to look at the new time before taking the next line. Every
+    # instant the test creates is judged, so a deadline measured from the start
+    # instead of from the last output cannot slip past between two checks.
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.seen = 0.0     # the latest time the watchdog has looked at
+            self.cv = threading.Condition()
+            self.dog = None     # the watchdog thread, once it first looks
+            self.lost = False   # no watchdog ever read this clock
+
+        def __call__(self):
+            with self.cv:
+                if threading.current_thread().name == "turn-watchdog":
+                    self.dog = threading.current_thread()
+                    self.seen = self.now
+                    self.cv.notify_all()
+                return self.now
+
+        def advance(self, seconds):
+            with self.cv:
+                # Not before the watchdog has taken its starting reading: a
+                # watchdog slow to start would otherwise read "started" after
+                # time had moved, and judge the cap from the wrong instant. If
+                # it never reads this clock at all, do not wait on it line by
+                # line -- run() reports that rather than stalling the suite.
+                if self.lost or not self.cv.wait_for(lambda: self.dog is not None,
+                                                     timeout=10):
+                    self.lost = True
+                    self.now += seconds
+                    return
+                self.now += seconds
+                # Wait for the watchdog to judge the new time -- unless it has
+                # already ended the turn and will never look again. The real-
+                # time bound is only so a broken watchdog cannot hang the
+                # suite; it is never what the outcome rests on.
+                give_up = time.monotonic() + 30
+                while (self.seen < self.now and time.monotonic() < give_up
+                       and not (self.dog and not self.dog.is_alive())):
+                    self.cv.wait(0.05)
+
     # A stand-in for the real binary: it must be executable and ignore the
     # flags run_turn always passes (-p, --output-format ...), so parameters
-    # come through the environment instead of argv.
+    # come through the environment instead of argv. TICKS is how many lines it
+    # prints; QUIET is how long it then goes silent, in real time.
     #
-    # Plain sh, not a Python interpreter: run_turn's silence clock starts at
-    # spawn, and under a loaded full-suite run a cold interpreter took longer
-    # than the 3s idle limit to print its first line -- so the "busy" turn was
-    # killed for silence it never chose, about one run in four, on main too.
-    # The shell's printf answers in milliseconds; what is measured is then the
-    # runner, not interpreter start-up.
+    # Plain sh, not a Python interpreter, so the fake starts in milliseconds.
+    # (Since the deadlines run on the test's clock, a slow start can no longer
+    # pass for silence; sh just keeps each run short.)
     fake = Path(tempfile.mkdtemp()) / "fakeclaude"
     fake.write_text(
         "#!/bin/sh\n"
@@ -3773,7 +3822,6 @@ def test_turn_deadline_is_idleness():
         'while [ "$i" -lt "$TICKS" ]; do\n'
         "  printf '%s\\n' '{\"type\": \"system\", \"subtype\": \"init\", "
         "\"session_id\": \"fake-session\"}'\n"
-        "  sleep 0.2\n"
         "  i=$((i + 1))\n"
         "done\n"
         'sleep "$QUIET"\n'
@@ -3781,43 +3829,67 @@ def test_turn_deadline_is_idleness():
         "\"session_id\": \"fake-session\"}'\n")
     fake.chmod(0o755)
 
-    def run(chatty, quiet, **kw):
-        # Busy for `chatty` seconds, one line every 0.2s, then silent for `quiet`.
-        env = {**os.environ, "TICKS": str(int(chatty / 0.2)), "QUIET": str(quiet)}
-        return CR.run_turn("go", binary=str(fake), cwd=str(BASE),
-                           permission_args=[], env=env, **kw)
+    def run(lines, quiet, step, **kw):
+        clock = Clock()
+        env = {**os.environ, "TICKS": str(lines), "QUIET": str(quiet)}
+        try:
+            r = CR.run_turn("go", binary=str(fake), cwd=str(BASE),
+                            permission_args=[], env=env, clock=clock, poll=0.01,
+                            on_init=lambda _sid: clock.advance(step), **kw)
+        finally:
+            run.elapsed = clock.now
+            # When the watchdog last looked: the moment it stopped the turn, if
+            # it did. Lines already in the pipe are still read after a kill and
+            # move the clock on, so elapsed alone overstates a killed turn.
+            run.judged = clock.seen
+            watched.append(clock.dog is not None)
+        return r
+    watched = []
 
-    # Busy for far longer than the idle limit: must survive.
-    t0 = time.time()
-    r = run(6, 0, timeout=0, idle_timeout=3)
-    busy = time.time() - t0
-    check("a turn that keeps working outlives the idle limit",
-          r.text == "done" and busy > 5,
-          f"ran {busy:.1f}s under a 3s idle limit")
-
-    # Quiet for longer than the idle limit: must die, and say why.
+    # Busy for far longer than the idle limit: must survive. Twelve lines a
+    # second apart is twelve seconds of work under a three-second idle limit.
     try:
-        run(0.5, 30, timeout=0, idle_timeout=3)
+        text = run(12, 0, 1, timeout=0, idle_timeout=3).text
+    except CR.ClaudeTimeout as e:
+        text = f"killed: {e}"
+    check("a turn that keeps working outlives the idle limit",
+          text == "done" and run.elapsed >= 12,
+          f"ran {run.elapsed:.0f}s under a 3s idle limit, got {text[:60]!r}")
+
+    # Quiet for longer than the idle limit: must die, and say why. One line,
+    # then four seconds pass with nothing more (the child really sleeps on).
+    try:
+        run(1, 30, 4, timeout=0, idle_timeout=3)
         check("a silent turn is stopped", False, "it was allowed to hang")
     except CR.ClaudeTimeout as e:
         check("a silent turn is stopped", True)
         check("and the error names silence, not elapsed time",
               "no output" in str(e) and "as long as it likes" in str(e), str(e)[:90])
 
-    # The absolute cap still exists for anyone who wants one.
+    # The absolute cap still exists for anyone who wants one, and it holds
+    # against a child that never stops talking: forty seconds of steady output
+    # against a three-second cap. (Forty, not forever, so a missing cap fails
+    # here rather than hanging the suite.)
     try:
-        run(30, 0, timeout=3, idle_timeout=0)
+        run(40, 0, 1, timeout=3, idle_timeout=0)
         check("an explicit absolute cap still applies", False, "it ran past the cap")
     except CR.ClaudeTimeout as e:
-        check("an explicit absolute cap still applies", "timed out after 3s" in str(e),
-              str(e)[:80])
+        check("an explicit absolute cap still applies",
+              "timed out after 3s" in str(e) and run.judged <= 4,
+              f"{str(e)[:80]} at {run.judged:.0f}s")
+
+    check("every deadline above was judged on the test's clock",
+          len(watched) == 3 and all(watched), f"watchdog read it: {watched}")
+    # The real deadlines read the wall, not a test's clock.
+    check("left alone, the deadlines run on the monotonic clock",
+          inspect.signature(CR.run_turn).parameters["clock"].default is time.monotonic)
 
     check("a timeout is still not treated as a dead session",
           issubclass(CR.ClaudeTimeout, CR.ClaudeError))
 
     src = (BASE / "claude_runner.py").read_text()
     check("any output counts as alive, even lines we cannot parse",
-          src.index("last_seen[0] = time.monotonic()") < src.index("line = line.strip()"),
+          src.index("last_seen[0] = clock()") < src.index("line = line.strip()"),
           "the question is whether the process is doing anything")
     bot = (BASE / "bot.py").read_text()
     check("turns run uncapped by default",
