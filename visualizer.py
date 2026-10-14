@@ -39,6 +39,92 @@ try:
     FAVICON = (BASE_DIR / "assets" / "favicon.svg").read_bytes()
 except OSError:
     FAVICON = b""
+
+# --- installable web app ---------------------------------------------------
+# The dashboard as a home-screen app: a manifest, its icons, and a service
+# worker. All of it is served through do_GET like every other route, so the
+# tailnet identity gate and the token apply to it too.
+
+#: The page's background, used as the app's theme and splash colour.
+THEME = "#2C0E2E"
+#: Served path -> (file in assets/icons, size). Drawn from logo.svg by
+#: assets/make_icons.py; 180 is the flattened apple-touch-icon. iOS asks for
+#: /apple-touch-icon*.png at the root on its own, so those answer too.
+ICONS = {
+    "/icons/icon-180.png": ("icon-180.png", 180),
+    "/icons/icon-192.png": ("icon-192.png", 192),
+    "/icons/icon-512.png": ("icon-512.png", 512),
+    "/apple-touch-icon.png": ("icon-180.png", 180),
+    "/apple-touch-icon-precomposed.png": ("icon-180.png", 180),
+}
+ICON_BYTES = {}
+for _path, (_name, _size) in ICONS.items():
+    try:
+        ICON_BYTES[_path] = (BASE_DIR / "assets" / "icons" / _name).read_bytes()
+    except OSError:
+        pass
+
+MANIFEST = json.dumps({
+    "name": "Silkworm",
+    "short_name": "Silkworm",
+    "id": "/",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": THEME,
+    "theme_color": THEME,
+    "icons": [{"src": p, "sizes": f"{s}x{s}", "type": "image/png", "purpose": "any"}
+              for p, (_, s) in ICONS.items() if p.startswith("/icons/")],
+}, indent=1).encode()
+
+#: The service worker, at /sw.js so its scope is the whole dashboard. It caches
+#: nothing: task state a minute stale is worse than an honest error, and the
+#: page itself is one request. What it adds is a page that says why, when the
+#: dashboard cannot be reached at all -- usually Tailscale being off. It only
+#: answers navigations; every other request (/api/*, actions, icons) goes
+#: straight to the network as if there were no worker. Web push (later) adds
+#: its own listeners below the fetch handler.
+SERVICE_WORKER = r"""// Silkworm dashboard service worker. Served by visualizer.py; caches nothing.
+const VERSION = "1";
+
+const OFFLINE = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="__THEME__"><title>Silkworm — offline</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:__THEME__;color:#F2E8F1;font:16px/1.5 -apple-system,"Segoe UI",sans-serif;
+padding:max(24px,env(safe-area-inset-top)) max(24px,env(safe-area-inset-right))
+max(24px,env(safe-area-inset-bottom)) max(24px,env(safe-area-inset-left));box-sizing:border-box}
+main{max-width:420px;text-align:center}h1{font-size:20px;margin:0 0 8px}
+p{color:#B49BB6;margin:0 0 18px}button{background:#ECB22E;color:#3D1140;border:0;
+border-radius:10px;padding:12px 22px;font:inherit;font-weight:600}</style></head>
+<body><main><h1>Can't reach Silkworm — is Tailscale connected?</h1>
+<p>The dashboard runs on your Mac and is only reachable over your tailnet.
+Turn Tailscale on, then try again.</p>
+<button onclick="location.reload()">Try again</button></main></body></html>`;
+
+self.addEventListener("install", () => self.skipWaiting());
+
+self.addEventListener("activate", event => {
+  // Nothing is cached on purpose; clear anything an older worker left behind.
+  event.waitUntil((async () => {
+    for (const key of await caches.keys()) await caches.delete(key);
+    await self.clients.claim();
+  })());
+});
+
+self.addEventListener("fetch", event => {
+  const req = event.request;
+  // Only page loads. /api/* and every action go to the network untouched,
+  // and fail the way they would without a worker.
+  if (req.mode !== "navigate") return;
+  event.respondWith(fetch(req).catch(() => new Response(OFFLINE, {
+    status: 503, headers: {"Content-Type": "text/html; charset=utf-8",
+                           "Cache-Control": "no-store"}})));
+});
+
+// --- push (step 4 adds "push" and "notificationclick" listeners here) ---
+""".replace("__THEME__", THEME).encode()
+
 SESSIONS_FILE = BASE_DIR / "sessions.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PORT = int(os.environ.get("SILKWORM_VIZ_PORT", "8790"))
@@ -730,6 +816,19 @@ class Handler(BaseHTTPRequestHandler):
                            {"Cache-Control": "public, max-age=86400"})
             else:
                 self._send(404, b"no icon", "text/plain")
+        elif url.path in ICONS:
+            if url.path in ICON_BYTES:
+                self._send(200, ICON_BYTES[url.path], "image/png",
+                           {"Cache-Control": "public, max-age=86400"})
+            else:
+                self._send(404, b"no icon", "text/plain")
+        elif url.path == "/manifest.webmanifest":
+            self._send(200, MANIFEST, "application/manifest+json",
+                       {"Cache-Control": "no-cache"})
+        elif url.path == "/sw.js":
+            # no-cache: an updated worker must reach the phone on its next load.
+            self._send(200, SERVICE_WORKER, "text/javascript; charset=utf-8",
+                       {"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
         elif url.path == "/api/sessions":
             data = load_sessions()
             self._json(data, sessions_tag(data))
@@ -812,9 +911,16 @@ PAGE = r"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Silkworm — Sessions</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<meta name="theme-color" content="#2C0E2E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Silkworm">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
   :root {
     --bg: #2C0E2E; --panel: #3A1440; --line: #57265B; --line2: #4A1F50;
@@ -1111,7 +1217,8 @@ PAGE = r"""<!doctype html>
     border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 12.5px;
     padding: 4px 8px; }
   .bfilters input { width: 240px; }
-  .pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
+            gap: 12px; }
   .pcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
            padding: 11px 13px; font-size: 12.5px; cursor: pointer; }
   .pcard:hover { border-color: var(--gold); }
@@ -1227,6 +1334,80 @@ PAGE = r"""<!doctype html>
   .lrow .origin { font-family: var(--mono); font-size: 10px; padding: 1px 6px; border-radius: 5px;
                   flex: none; border: 1px solid var(--line); color: var(--muted); }
   .lrow .origin.harvest { color: var(--gold); border-color: #C08A1C66; }
+
+  /* --- phone and home-screen app --------------------------------------
+     The page's own width rules above are for a laptop. Below 700px the list
+     and the open thread take turns (body.reading, set by showReading), the
+     boards stack their columns, and every panel is the whole screen with its
+     own close button. env(safe-area-inset-*) is 0 in a browser tab and the
+     notch / home indicator in the standalone app (viewport-fit=cover plus
+     the black-translucent status bar put the page under both). */
+  body { height: 100dvh; }
+  #backbtn { display: none; }
+  .xclose { float: right; margin-left: 8px; }
+  header { padding-top: max(10px, env(safe-area-inset-top));
+           padding-left: max(20px, env(safe-area-inset-left));
+           padding-right: max(20px, env(safe-area-inset-right)); }
+  #composer { padding-bottom: env(safe-area-inset-bottom); }
+  #toast { bottom: calc(18px + env(safe-area-inset-bottom)); }
+  @media (max-width: 700px) {
+    body { font-size: 15px; }
+    header { flex-wrap: wrap; gap: 8px; padding-bottom: 8px;
+             padding-left: max(12px, env(safe-area-inset-left));
+             padding-right: max(12px, env(safe-area-inset-right)); }
+    header h1 { font-size: 16px; }
+    header button.hbtn { margin-left: 0 !important; padding: 8px 11px; }
+    header .hbtn:first-of-type { margin-left: auto !important; }
+    header .lbl, header .wide { display: none; }
+    #search { order: 9; flex: 1 1 100%; width: auto; margin-left: 0; }
+    #searchresults { left: 8px; right: 8px; width: auto; }
+    #alertbar { padding: 0 12px 8px; }
+
+    .layout { display: block; flex: 1; overflow: hidden; }
+    .listcol { height: 100%; }
+    nav { width: auto; border-right: 0; flex: 1; min-height: 0;
+          padding: 10px max(10px, env(safe-area-inset-right))
+                   calc(10px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); }
+    main { display: none; height: 100%;
+           padding: 10px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left)); }
+    body.reading .listcol { display: none; }
+    body.reading main { display: flex; }
+    #backbtn { display: block; align-self: flex-start; margin-bottom: 8px; }
+    #dash { overflow-x: auto; }
+    .msg { max-width: 100%; }
+    #composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+    .turnbar .what { max-width: 100%; }
+
+    /* panels: the whole screen, scrolling inside, closed by their ✕ */
+    #taskmodal, #boardmodal, #learnmodal, #fmodal { padding: 0; }
+    #taskmodal .box, #boardmodal .box, #learnmodal .box, #fmodal .fbox {
+      width: 100%; max-width: 100%; height: 100%; max-height: none; border-radius: 0;
+      border: 0; -webkit-overflow-scrolling: touch;
+      padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
+               calc(18px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
+    #bdetail { width: 100vw; border-left: 0;
+      padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
+               calc(18px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
+    .bcols { grid-template-columns: 1fr; overflow-x: visible; }
+    .bfilters select, .bfilters input { flex: 1 1 140px; width: auto; min-width: 0; }
+    .lform input.text, .lform input.scope { flex: 1 1 100%; width: auto; min-width: 0; }
+    .task { flex-wrap: wrap; gap: 6px 8px; }
+    .task .tt { flex: 1 1 calc(100% - 90px); min-width: 0; word-break: break-word; }
+    .tform .acts { flex-wrap: wrap; }
+    .toolbar code { white-space: normal; word-break: break-all; }
+
+    /* fingers, not a pointer: room to hit, and 16px inputs so iOS
+       does not zoom the page on focus */
+    button.act, button.ghost, a.ghost { min-height: 40px; padding: 8px 14px; font-size: 14px; }
+    a.ghost { display: inline-flex; align-items: center; text-decoration: none; }
+    .bcard .acts button, .seg button, #kindfilter button, #nightly button,
+      #unmerged .b, #holding .b { min-height: 34px; padding: 6px 10px; font-size: 12.5px; }
+    .bcol > h4 button { min-height: 0; padding: 2px 8px; }
+    input, select, textarea, #search, #composer textarea, .tform input[type=text],
+      .tform select, .tform textarea, .lform select, .lform input,
+      .bfilters select, .bfilters input { font-size: 16px; }
+    .hidebtn { font-size: 18px; padding: 4px 8px; }
+  }
 </style>
 </head>
 <body>
@@ -1242,10 +1423,10 @@ PAGE = r"""<!doctype html>
   </svg>
   <h1>Silkworm sessions</h1>
   <span id="botdot" title="bot status"></span>
-  <button class="ghost" style="margin-left:16px" onclick="toggleTasks()">📋 Tasks<span id="taskbadge"></span></button>
-  <button class="ghost" onclick="toggleBoard()" title="per-project boards and backlogs">🗂 Projects</button>
-  <button class="ghost" onclick="toggleLearn()">🧠 Learnings</button>
-  <button class="ghost" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
+  <button class="ghost hbtn" style="margin-left:16px" onclick="toggleTasks()">📋<span class="lbl"> Tasks</span><span id="taskbadge"></span></button>
+  <button class="ghost hbtn" onclick="toggleBoard()" title="per-project boards and backlogs">🗂<span class="lbl"> Projects</span></button>
+  <button class="ghost hbtn" onclick="toggleLearn()" title="learnings">🧠<span class="lbl"> Learnings</span></button>
+  <button class="ghost hbtn wide" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
 </header>
 <div id="alertbar"></div>
@@ -1256,6 +1437,7 @@ PAGE = r"""<!doctype html>
     <nav id="list"></nav>
   </div>
   <main>
+    <button id="backbtn" class="ghost" onclick="closeSession()">‹ Sessions</button>
     <div id="content">
       <div id="dash"></div>
       <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tfiles"></div></div>
@@ -1270,7 +1452,8 @@ PAGE = r"""<!doctype html>
 <div id="toast"></div>
 <div id="taskmodal" onclick="if(event.target.id==='taskmodal')toggleTasks()">
   <div class="box">
-    <h2 style="display:flex;align-items:center;gap:12px">📋 Tasks
+    <button class="ghost xclose" onclick="toggleTasks()" title="close">✕</button>
+    <h2 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">📋 Tasks
       <span class="seg"><button id="tabneed" class="on" onclick="setTaskView('attention')">Needs you</button><button id="taball" onclick="setTaskView('all')">All</button></span>
       <select id="tproj" onchange="renderTasks()" title="filter by project"></select></h2>
     <div class="hint">Work Silkworm is managing. This opens on what needs you —
@@ -1294,6 +1477,7 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="boardmodal" onclick="if(event.target.id==='boardmodal')toggleBoard()">
   <div class="box">
+    <button class="ghost xclose" onclick="toggleBoard()" title="close">✕</button>
     <h2>🗂 Projects
       <span class="seg"><button id="bvover" class="on" onclick="setBoardProject(null)">Overview</button><button id="bvall" onclick="setBoardProject('')">All work</button><button id="bvunfiled" onclick="setBoardProject(UNFILED)">Unfiled</button></span></h2>
     <div class="hint">One card per project: what is open, running, landed and unmerged,
@@ -1314,7 +1498,8 @@ PAGE = r"""<!doctype html>
 <div id="fmodal" onclick="if(event.target.id==='fmodal')closeModal()"><div class="fbox" id="fbox"></div></div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
-    <h2 style="display:flex;align-items:center;gap:12px">🧠 Learnings
+    <button class="ghost xclose" onclick="toggleLearn()" title="close">✕</button>
+    <h2 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">🧠 Learnings
       <button class="ghost" style="font-size:12px" onclick="harvestNow(this)">✨ Harvest now</button>
       <button class="ghost" style="font-size:12px" onclick="syncLearnings(this)">⇅ Sync</button></h2>
     <div class="hint">Auto-distilled from session activity by the harvester, plus any you add
@@ -1683,6 +1868,7 @@ async function loadTranscript(scroll) {
   const s = active;
   // A new thread, a reset session, or a click: start again from the top.
   // Otherwise one read at a time, each from where the last stopped.
+  if (scroll) showReading();
   if (scroll || tview.key !== s.key || tview.sid !== s.session_id)
     tview = {key: s.key, sid: s.session_id, cursor: 0, busy: false, error: false};
   const want = tview, from = want.cursor;
@@ -1752,6 +1938,10 @@ document.getElementById("search").addEventListener("input", e => {
       `<div class="hit" data-key="${esc(h.key)}" data-sid="${esc(h.session_id)}">
          <div class="k">${esc(h.key)} · ${h.role}</div>${esc(h.snippet)}</div>`).join("")
       : `<div class="hit">No matches.</div>`;
+    // On a phone the header wraps (and sits below the notch in the app), so
+    // the results go under wherever it ends rather than a fixed 52px.
+    const head = phone() && document.querySelector && document.querySelector("header");
+    box.style.top = head ? Math.ceil(head.getBoundingClientRect().bottom + 4) + "px" : "";
     box.style.display = "block";
     box.querySelectorAll(".hit[data-key]").forEach(hit => hit.onclick = async () => {
       box.style.display = "none";
@@ -3227,6 +3417,41 @@ async function archiveProject(slug, on) {
   if (boardForm && boardForm.kind === "settings") await projectSettings(slug);
   if (boardIsOpen()) renderBoard();
 }
+
+// --- phone ---
+// Under 700px wide the session list and the open thread take turns on the
+// screen: body.reading shows the thread, and ‹ Sessions goes back. Opening one
+// pushes a history entry, so the system back gesture does the same.
+function phone() {
+  return typeof matchMedia === "function" && matchMedia("(max-width: 700px)").matches;
+}
+function showReading() {
+  const body = document.body;
+  if (!body || body.classList.contains("reading")) return;
+  body.classList.add("reading");
+  if (phone() && window.history) history.pushState({reading: true}, "");
+}
+function leaveReading() {
+  if (document.body) document.body.classList.remove("reading");
+  active = null;                 // stops the transcript poll; the list unhighlights
+  loadList();
+}
+function closeSession() {
+  if (window.history && history.state && history.state.reading) history.back();
+  else leaveReading();
+}
+// A reload while a thread was open comes back on the list, but history still
+// holds that thread's entry: one back gesture would then do nothing.
+if (window.history && history.state && history.state.reading && history.replaceState)
+  history.replaceState(null, "");
+if (window.addEventListener)
+  window.addEventListener("popstate", () => {
+    if (document.body && document.body.classList.contains("reading")) leaveReading();
+  });
+// The service worker only adds an offline page (it caches nothing); without
+// one -- plain http, an old browser -- the dashboard works the same.
+if (typeof navigator !== "undefined" && navigator.serviceWorker)
+  navigator.serviceWorker.register("/sw.js", {scope: "/"}).catch(() => {});
 
 // --- polling ---
 // Each poll waits for its last one, so a slow tunnel queues nothing; a hidden

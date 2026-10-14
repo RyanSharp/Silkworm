@@ -1079,6 +1079,17 @@ installed. `status` also fails if serve exposes anything besides the
 dashboard — never serve the bot's port (8787), which trusts every local caller
 and has no identity gate.
 
+**On the phone.** With Tailscale on, open `https://<host>.<tailnet>.ts.net`
+in Safari, then Share → Add to Home Screen: the dashboard installs as a
+standalone app named Silkworm (`/manifest.webmanifest`, icons under `/icons/`).
+Below 700px wide the session list and the open thread take turns on screen,
+and the Tasks/Projects/Learnings panels fill it, each with its own ✕. Its
+service worker (`/sw.js`) caches nothing — no API answer is ever served stale —
+and only replaces a failed page load with "Can't reach Silkworm — is Tailscale
+connected?". The icons are drawn from `assets/logo.svg` by
+`python3 assets/make_icons.py`; rerun it after changing the logo (the suite
+fails while they differ).
+
 ### SSH tunnel (laptop on the same network)
 
 On the machine you browse *from*:

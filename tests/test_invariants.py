@@ -22632,10 +22632,21 @@ def _viz_routes(fn_name):
     tree = ast.parse((BASE / "visualizer.py").read_text())
     handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handler")
     fn = next(n for n in handler.body if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    # `url.path in ICONS`: a module-level dict or tuple of paths counts too.
+    tables = {t.id: n.value for n in tree.body if isinstance(n, ast.Assign)
+              for t in n.targets if isinstance(t, ast.Name)}
     paths = set()
     for node in ast.walk(fn):
         if isinstance(node, ast.Compare) and ast.unparse(node.left) == "url.path":
-            for c in ast.walk(node.comparators[0]):
+            right = node.comparators[0]
+            if isinstance(right, ast.Name):
+                right = tables[right.id]
+                right = ast.Tuple(elts=right.keys, ctx=ast.Load()) if isinstance(right, ast.Dict) else right
+                for c in (right.elts if isinstance(right, (ast.Tuple, ast.List, ast.Set)) else []):
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                        paths.add(c.value)
+                continue
+            for c in ast.walk(right):
                 if isinstance(c, ast.Constant) and isinstance(c.value, str):
                     paths.add(c.value)
     return sorted(paths)
@@ -22934,6 +22945,354 @@ exit 0
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+# The dashboard as a home-screen app (Tailscale plan, step 2): a manifest,
+# icons drawn from logo.svg, and a service worker that caches nothing --
+# stale task state is worse than an offline error -- but explains, when the
+# page cannot be reached, that Tailscale is probably off.
+def _png_header(data: bytes):
+    """(width, height, colour type) of a PNG, or None if it is not one."""
+    import struct
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return None
+    w, h, _depth, ctype = struct.unpack(">IIBB", data[16:26])
+    return w, h, ctype
+
+
+def test_viz_web_app_routes():
+    import re
+    import threading
+    import urllib.error
+    import urllib.request
+    import visualizer as V
+    print("\nthe dashboard serves a manifest, its icons and a service worker, behind the gate")
+
+    saved_env = os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+    saved = (V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.ENV_FILE, V.bot_call)
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "sessions.json").write_text("{}")
+    srv = None
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.SESSIONS_FILE = tmp / "sessions.json"
+        V.ENV_FILE = tmp / "no.env"
+        V.bot_call = lambda path, payload, timeout=1.0: {"ok": True}
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def get(path, headers=None):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, dict(r.headers), r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers), e.read()
+
+        def via_serve(login):
+            return {"X-Forwarded-For": "100.101.102.103",
+                    "X-Forwarded-Host": "mini.tail1234.ts.net", "X-Forwarded-Proto": "https",
+                    "Tailscale-User-Login": login}
+
+        # The page points at all of it.
+        head = V.PAGE[:V.PAGE.index("</head>")]
+        manifest_href = re.search(r'<link rel="manifest" href="([^"]+)"', head)
+        touch_href = re.search(r'<link rel="apple-touch-icon" href="([^"]+)"', head)
+        check("the page links a manifest and an apple-touch-icon",
+              bool(manifest_href and touch_href), head[-600:])
+        check("the manifest link sends credentials (token mode keeps its cookie)",
+              'crossorigin="use-credentials"' in head)
+        check("the viewport reaches under the notch (viewport-fit=cover) for safe-area insets",
+              "viewport-fit=cover" in head)
+        check("standalone on iOS: apple-mobile-web-app-capable",
+              '<meta name="apple-mobile-web-app-capable" content="yes">' in head)
+
+        code, hdrs, body = get(manifest_href.group(1))
+        check("the manifest is served as application/manifest+json",
+              code == 200 and hdrs.get("Content-Type") == "application/manifest+json",
+              f"{code} {hdrs.get('Content-Type')}")
+        m = json.loads(body)
+        bg = re.search(r"--bg:\s*(#[0-9A-Fa-f]{6})", V.PAGE).group(1)
+        check("named Silkworm, standalone, starting at /",
+              m.get("name") == "Silkworm" and m.get("display") == "standalone"
+              and m.get("start_url") == "/", str(m))
+        check("theme and background are the page's own --bg",
+              m.get("theme_color") == bg and m.get("background_color") == bg
+              and f'<meta name="theme-color" content="{bg}">' in head, f"{m} {bg}")
+        sizes = sorted(int(i["sizes"].split("x")[0]) for i in m.get("icons", []))
+        check("the manifest names 180, 192 and 512 px icons", sizes == [180, 192, 512], str(sizes))
+
+        # Every icon the manifest names is served, at the size it claims.
+        for icon in m["icons"]:
+            code, hdrs, data = get(icon["src"])
+            w, h = (int(x) for x in icon["sizes"].split("x"))
+            check(f"{icon['src']} is served as a {icon['sizes']} PNG",
+                  code == 200 and hdrs.get("Content-Type") == "image/png"
+                  and (_png_header(data) or (0, 0))[:2] == (w, h) and icon["type"] == "image/png",
+                  f"{code} {hdrs.get('Content-Type')} {_png_header(data)}")
+        for path in (touch_href.group(1), "/apple-touch-icon.png",
+                     "/apple-touch-icon-precomposed.png"):
+            code, hdrs, data = get(path)
+            check(f"{path}: 180px, flattened RGB with no alpha channel",
+                  code == 200 and hdrs.get("Content-Type") == "image/png"
+                  and _png_header(data) == (180, 180, 2), f"{code} {_png_header(data)}")
+
+        code, hdrs, sw = get("/sw.js")
+        check("/sw.js is served as JavaScript, at the root (scope /), never held stale",
+              code == 200 and hdrs.get("Content-Type", "").startswith("text/javascript")
+              and "no-cache" in hdrs.get("Cache-Control", ""),
+              f"{code} {hdrs}")
+        js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+        check("the page registers /sw.js at scope /",
+              'navigator.serviceWorker.register("/sw.js", {scope: "/"})' in js)
+
+        # Behind the step-1 gate, like every route.
+        os.environ["VIZ_TAILSCALE_LOGIN"] = "owner@example.com"
+        new = ["/manifest.webmanifest", "/sw.js", *V.ICONS]
+        let_in = [p for p in new if get(p, via_serve("intruder@example.com"))[0] != 403]
+        check("a wrong Tailscale login gets 403 on the manifest, worker and every icon",
+              not let_in, str(let_in))
+        refused = [p for p in new if get(p, via_serve("owner@example.com"))[0] != 200]
+        check("the owner's login gets all of them", not refused, str(refused))
+        routes = _viz_routes("do_GET")
+        check("the gate tests' route list includes the new routes",
+              all(p in routes for p in new), str(routes))
+    finally:
+        V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.ENV_FILE, V.bot_call = saved
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+        if saved_env is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved_env
+
+
+def test_viz_icons_are_generated_from_the_logo():
+    import subprocess as _sp
+    print("\nthe committed icons are exactly what assets/make_icons.py draws from logo.svg")
+    gen = BASE / "assets" / "make_icons.py"
+    r = _sp.run([sys.executable, str(gen), "--check"], capture_output=True, text=True, timeout=120)
+    check("make_icons.py --check: the PNGs match logo.svg", r.returncode == 0,
+          (r.stdout + r.stderr)[-400:])
+    sys.path.insert(0, str(gen.parent))
+    try:
+        import make_icons
+    finally:
+        sys.path.remove(str(gen.parent))
+    logo = (gen.parent / "logo.svg").read_text()
+    try:
+        make_icons.shapes(logo.replace('<circle cx="118"', '<circle transform="scale(2)" cx="118"'))
+        refused = False
+    except ValueError:
+        refused = True
+    check("an SVG attribute the generator cannot draw is refused, not ignored", refused)
+    import visualizer as V
+    missing = [p for p, (name, _) in V.ICONS.items()
+               if not (BASE / "assets" / "icons" / name).exists()]
+    check("every icon visualizer serves is a committed file", not missing, str(missing))
+
+
+def test_viz_service_worker_never_caches():
+    import shutil
+    import subprocess as _sp
+    import visualizer as V
+    print("\nthe service worker caches nothing and answers only failed page loads")
+    sw = V.SERVICE_WORKER.decode()
+    for banned in ("caches.open", ".put(", "cache.add", "addAll("):
+        check(f"the worker never writes a cache ({banned})", banned not in sw)
+    check("the offline page asks about Tailscale",
+          "Can't reach Silkworm — is Tailscale connected?" in sw)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the worker's handlers checked by text only")
+        return
+    harness = r"""
+const listeners = {}, opened = [], deleted = [], fetched = [];
+let netFails = false, claimed = false, skipped = false;
+globalThis.self = {
+  addEventListener: (k, f) => { listeners[k] = f; },
+  skipWaiting: () => { skipped = true; },
+  clients: {claim: async () => { claimed = true; }},
+};
+globalThis.caches = {
+  keys: async () => ["old-shell"],
+  delete: async k => { deleted.push(k); return true; },
+  open: async k => { opened.push(k); return {put(){}, add(){}, addAll(){}}; },
+  match: async () => undefined,
+};
+const NET = {network: true};
+globalThis.fetch = async req => {
+  fetched.push(req.url);
+  if (netFails) throw new TypeError("Failed to fetch");
+  return NET;
+};
+""" + sw + r"""
+(async () => {
+  const out = {};
+  listeners.install({waitUntil(){}});
+  let waits = [];
+  listeners.activate({waitUntil: p => waits.push(p)});
+  await Promise.all(waits);
+  out.activate = {skipped, claimed, deleted};
+  async function dispatch(url, mode, method) {
+    let answered = null;
+    listeners.fetch({request: {url, mode, method: method || "GET"},
+                     respondWith: p => { answered = p; }});
+    return answered ? await Promise.resolve(answered).catch(e => "rejected: " + e) : null;
+  }
+  const apis = [];
+  for (const fail of [false, true]) {
+    netFails = fail;
+    for (const [u, mode, method] of [["/api/tasks", "cors", "POST"],
+                                      ["/api/sessions", "same-origin", "GET"],
+                                      ["/api/send", "same-origin", "POST"],
+                                      ["/icons/icon-192.png", "no-cors", "GET"]])
+      apis.push(await dispatch(u, mode, method));
+  }
+  out.apisAnswered = apis.filter(a => a !== null).length;
+  netFails = false;
+  out.onlineIsNetwork = (await dispatch("/", "navigate")) === NET;
+  netFails = true;
+  const off = await dispatch("/", "navigate");
+  out.offline = {status: off.status, type: off.headers.get("content-type"),
+                 body: await off.text()};
+  out.opened = opened;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    r = _sp.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    check("the worker runs under a stub ServiceWorker scope", r.returncode == 0, r.stderr[-600:])
+    if r.returncode:
+        return
+    out = json.loads(r.stdout)
+    check("installing/activating claims the page and clears any old cache",
+          out["activate"] == {"skipped": True, "claimed": True, "deleted": ["old-shell"]},
+          str(out["activate"]))
+    check("/api/* and other non-page requests are never intercepted, online or off",
+          out["apisAnswered"] == 0, str(out))
+    check("an online page load is the network's own response, not a copy",
+          out["onlineIsNetwork"] is True, str(out))
+    off = out["offline"]
+    check("offline, a page load gets a 503 HTML page about Tailscale",
+          off["status"] == 503 and off["type"].startswith("text/html")
+          and "is Tailscale connected?" in off["body"], str(off)[:300])
+    check("no cache was ever opened", out["opened"] == [], str(out["opened"]))
+
+
+def test_viz_phone_layout():
+    import re
+    import shutil
+    import subprocess as _sp
+    import visualizer as V
+    print("\nthe dashboard fits a 390px phone: list and thread take turns, panels go full screen")
+    css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
+    at = css.index("@media (max-width: 700px)")
+    desktop, phone = css[:at], css[at:]
+
+    # Any fixed width or minimum a phone cannot hold must be undone below 700px:
+    # a phone rule naming the same selector must set the same property.
+    prop_re = r"(?:^|;)\s*((?:min-)?width|grid-template-columns)\s*:\s*([^;]+)"
+
+    def rules(text):
+        for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", text):
+            sel = re.sub(r"/\*.*?\*/", "", sel, flags=re.S)
+            for part in sel.split(","):
+                yield " ".join(part.split()), body
+    phone_sets = {(sel, prop) for sel, body in rules(phone[phone.index("{") + 1:])
+                  for prop, _ in re.findall(prop_re, body)}
+    too_wide = []
+    for sel, body in rules(desktop):
+        for prop, val in re.findall(prop_re, body):
+            px = [int(n) for n in re.findall(r"(\d+)px", val)]
+            if "min(" not in val and px and (max(px) >= 200 or prop == "grid-template-columns"):
+                too_wide.append((sel, prop, val.strip()))
+    unhandled = [w for w in too_wide if (w[0], w[1]) not in phone_sets]
+    check("every desktop width of 200px+ (and every fixed grid) is overridden on a phone",
+          len(too_wide) >= 5 and not unhandled, f"unhandled: {unhandled}; found {too_wide}")
+    for rule in ("body.reading .listcol { display: none; }", "body.reading main { display: flex; }",
+                 ".bcols { grid-template-columns: 1fr;", ".task { flex-wrap: wrap;"):
+        check(f"phone rule present: {rule}", rule in phone)
+    check("panels become the full screen on a phone",
+          all(s in phone for s in ("#taskmodal .box", "#boardmodal .box", "#learnmodal .box",
+                                   "#fmodal .fbox")) and "height: 100%" in phone)
+    check("safe-area insets are respected (top, bottom, sides)",
+          all(f"env(safe-area-inset-{s})" in css for s in ("top", "bottom", "left", "right")))
+    check("inputs are 16px on a phone, so focusing one does not zoom the page",
+          re.search(r"input, select, textarea[^{]*\{ font-size: 16px; \}", phone) is not None)
+    for panel, fn in (("taskmodal", "toggleTasks()"), ("boardmodal", "toggleBoard()"),
+                      ("learnmodal", "toggleLearn()")):
+        start = V.PAGE.index(f'<div id="{panel}"')
+        chunk = V.PAGE[start:start + 400]
+        check(f"#{panel} has its own ✕ (a full-screen panel has no backdrop to tap)",
+              f'class="ghost xclose" onclick="{fn}"' in chunk, chunk)
+    check("the open thread has a way back to the list", 'onclick="closeSession()"' in V.PAGE)
+
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — showReading/closeSession checked by text only")
+        return
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    harness = r"""
+const classes = new Set(), pushed = [], winListeners = {};
+let backs = 0, wide = false, registered = null;
+const el = () => ({style: {}, classList: {add(){}, remove(){}, contains: () => false},
+  addEventListener(){}, querySelectorAll: () => [], appendChild(){}, children: [],
+  insertAdjacentHTML(){}, set innerHTML(v){}, get innerHTML(){ return ""; },
+  scrollIntoView(){}, dataset: {}, value: ""});
+globalThis.document = {getElementById: el, addEventListener(){}, querySelectorAll: () => [],
+  createElement: el, hidden: false,
+  body: {classList: {add: c => classes.add(c), remove: c => classes.delete(c),
+                     contains: c => classes.has(c)}}};
+// As after a reload with a thread open: the entry is still there.
+let replaced = 0;
+globalThis.history = {state: {reading: true},
+  replaceState(s) { replaced++; this.state = s; },
+  pushState(s) { pushed.push(s); this.state = s; },
+  back() { backs++; this.state = null; winListeners.popstate(); }};
+globalThis.window = {addEventListener: (k, f) => { winListeners[k] = f; }, history: globalThis.history,
+                     location: {search: ""}};
+globalThis.matchMedia = q => ({matches: !wide && q === "(max-width: 700px)"});
+Object.defineProperty(globalThis, "navigator", {value: {serviceWorker: {
+  register: (u, o) => { registered = [u, o]; return Promise.resolve(); }}}, configurable: true});
+globalThis.localStorage = {getItem: () => null, setItem(){}};
+globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;
+// Never answers: the page's own loads stay pending, which is all this needs.
+globalThis.fetch = () => new Promise(() => {});
+(0, eval)(__JS__ + "\n;globalThis.__p = {showReading, closeSession, getActive: () => active, setActive: a => { active = a; }};");
+const P = globalThis.__p, out = {};
+out.staleCleared = replaced === 1 && history.state === null;
+P.setActive({key: "k"});
+P.showReading();
+out.afterOpen = {reading: classes.has("reading"), pushed: pushed.length};
+P.showReading();
+out.reopenPushes = pushed.length;
+P.closeSession();
+out.afterBack = {reading: classes.has("reading"), backs, active: P.getActive()};
+P.setActive({key: "k"}); P.showReading();
+winListeners.popstate();
+out.afterGesture = {reading: classes.has("reading"), active: P.getActive()};
+wide = true; pushed.length = 0;
+P.showReading(); out.widePushes = pushed.length;
+out.registered = registered;
+process.stdout.write(JSON.stringify(out));
+""".replace("__JS__", json.dumps(js))
+    r = _sp.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    check("the page's own script runs in the phone harness", r.returncode == 0, r.stderr[-600:])
+    if r.returncode:
+        return
+    out = json.loads(r.stdout)
+    check("opening a thread on a phone shows it and pushes one history entry",
+          out["afterOpen"] == {"reading": True, "pushed": 1} and out["reopenPushes"] == 1, str(out))
+    check("‹ Sessions goes back: list shown, nothing active (the transcript poll stops)",
+          out["afterBack"] == {"reading": False, "backs": 1, "active": None}, str(out))
+    check("the system back gesture (popstate) does the same",
+          out["afterGesture"] == {"reading": False, "active": None}, str(out))
+    check("a laptop-width window pushes no history", out["widePushes"] == 0, str(out))
+    check("a reload with a thread's entry still in history clears it (no dead back step)",
+          out["staleCleared"] is True, str(out))
+    check("the service worker is registered at scope /",
+          out["registered"] == ["/sw.js", {"scope": "/"}], str(out["registered"]))
 
 
 if __name__ == "__main__":
