@@ -58,6 +58,7 @@ import research
 import slacklinks
 import tasks
 import procs
+import webthread
 import projects
 import workspaces
 import recovery
@@ -1936,35 +1937,148 @@ def handle_tell(payload: dict) -> dict:
     return {"ok": True}
 
 
+#: How long /web-message waits on a !command for its replies, so the dashboard
+#: can show them in the thread as Slack does. A command still going past this
+#: (a release, a project with a GitHub push) keeps going; the rest of what it
+#: says is in Slack.
+WEB_COMMAND_WAIT_S = 8.0
+#: Thread keys are a Slack channel and message ts.
+THREAD_KEY_RE = re.compile(r"[A-Z0-9]+:[0-9.]+")
+
+
 def handle_web_message(payload: dict) -> dict:
-    """Route for /web-message — a prompt or !command sent from the visualizer.
+    """Route for /web-message — a message sent from the dashboard's composer.
 
     Localhost-only by construction (the LocalServer binds 127.0.0.1), so it is
     trusted like the machine owner: it bypasses the Slack allowlist.
+
+    Every message, prompt or !command, goes through handle_prompt -- the very
+    path a Slack message takes -- so a command is handle_command's, never a
+    second implementation, and a prompt is the same turn, session, task and
+    thread lock whichever side sent it. The thread is the Slack thread: the
+    message is posted there (webthread.echo) so the conversation reads whole
+    in Slack too.
+
+    `{new: true, text, project?, files?}` starts a thread: its first message
+    is posted in the home channel as the thread's parent, and a `project` is
+    filed with `!project <slug>` through handle_command before the first turn,
+    so the thread inherits it exactly as one filed from Slack does.
+    `{key, text, files?}` continues any thread, Slack-born or not.
+    `files` are [{name, data (base64), type}], written into uploads/ the way
+    Slack's file_share downloads are, and handed to the turn.
+
+    Answers {ok, key, ref, link} at once for a prompt -- `ref` is the
+    message's ts, the source_ref of the task its turn becomes, which is how
+    the page follows it from sent to queued to running (handle_thread_state).
+    A command is waited on (WEB_COMMAND_WAIT_S) and its replies come back.
     """
-    key = payload.get("key", "")
     text = (payload.get("text") or "").strip()
-    # Key must look like channel:ts. Store membership isn't required — !reset
-    # drops the entry, but the thread remains valid and messages recreate it.
-    if not text or ":" not in key or not re.fullmatch(r"[A-Z0-9]+:[0-9.]+", key):
-        return {"ok": False, "error": "unknown thread or empty message"}
-    channel, thread_ts = key.split(":", 1)
+    new = bool(payload.get("new"))
+    key = "" if new else str(payload.get("key") or "")
+    project = str(payload.get("project") or "").strip()
+    command = text.startswith("!")
+    if not new and not THREAD_KEY_RE.fullmatch(key):
+        return {"ok": False, "error": "unknown thread"}
+    if not text and not payload.get("files"):
+        return {"ok": False, "error": "empty message"}
+    if command and payload.get("files"):
+        return {"ok": False, "error": "a !command takes no attachments"}
+    if project and not new:
+        return {"ok": False, "error": "a project is chosen when a thread starts; "
+                                      "in a thread, send `!project <name>`"}
+    if new and command:
+        return {"ok": False, "error": "start a thread with a message; !commands "
+                                      "work once it exists"}
+    if project and not project_store.get(project):
+        return {"ok": False, "error": f"no project {project!r}"}
+    try:
+        decoded = webthread.decode_files(payload.get("files"))
+    except webthread.Refused as e:
+        return {"ok": False, "error": str(e)}
+    names = [f["name"] for f in decoded]
+
+    if new:
+        channel = home_channel()
+        if not channel:
+            return {"ok": False, "error": "nowhere to start a thread: set "
+                                          "SILKWORM_HOME_CHANNEL in .env"}
+        try:
+            resp = app.client.chat_postMessage(channel=channel,
+                                               text=webthread.echo(text, names))
+        except Exception as e:
+            log.exception("could not start a dashboard thread in %s", channel)
+            return {"ok": False, "error": f"could not post to Slack: {e}"}
+        thread_ts = resp["ts"]
+        key = f"{channel}:{thread_ts}"
+        # The parent is the message: there is no earlier thread to read in as
+        # context, and handle_prompt reads none when the two are the same.
+        msg_ts = thread_ts
+    else:
+        channel, thread_ts = key.split(":", 1)
+        msg_ts = f"{time.time():.6f}"
+    try:
+        saved = webthread.write_files(UPLOADS_ROOT, key, decoded)
+    except (OSError, webthread.Refused) as e:
+        log.exception("could not save dashboard uploads for %s", key)
+        if new:
+            # Nothing will run under it, and trying again posts another: the
+            # parent goes, so a retry is the only thread.
+            try:
+                app.client.chat_delete(channel=channel, ts=thread_ts)
+            except Exception:
+                log.exception("could not remove the dashboard thread %s", key)
+        return {"ok": False, "error": f"could not save the files: {e}"}
+    for f in saved:
+        store.add_file(key, {"name": f["name"], "path": f["path"],
+                             "direction": "in", "ts": time.time()})
+    replies: list[str] = []
 
     def say(text, thread_ts=thread_ts, **kwargs):
+        replies.append(text)
         app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, **kwargs)
+
+    if new and project:
+        # Filed before the first turn, so that turn already runs where the
+        # project works -- by the handler `!project` itself is.
+        handle_command(f"!project {project}", key, say, thread_ts)
+    filed = list(replies)
 
     def run():
         try:
-            if not text.startswith("!"):
-                say(f":globe_with_meridians: _via visualizer:_ {text}")
-            event = {"channel": channel, "ts": f"{time.time():.6f}",
-                     "thread_ts": thread_ts, "user": "", "text": text, "_web": True}
+            if not new and not command:
+                say(webthread.echo(text, names))
+            event = {"channel": channel, "ts": msg_ts, "thread_ts": thread_ts,
+                     "user": "", "text": text, "_web": True, "_web_files": saved}
             handle_prompt(event, say, app.client)
         except Exception:
             log.exception("web message failed for %s", key)
 
-    threading.Thread(target=run, daemon=True, name="web-message").start()
-    return {"ok": True}
+    worker = threading.Thread(target=run, daemon=True, name="web-message")
+    worker.start()
+    out = {"ok": True, "key": key, "ref": msg_ts, "new": new,
+           "link": slacklinks.thread_link(channel, thread_ts)}
+    if command:
+        worker.join(WEB_COMMAND_WAIT_S)
+        out["finished"] = not worker.is_alive()
+        out["replies"] = list(replies)
+    else:
+        # A prompt's reply is the turn's, read from its transcript; only the
+        # filing a new thread did first is said here.
+        out["replies"] = filed
+    return out
+
+
+def handle_thread_state(payload: dict) -> dict:
+    """Route for /thread-state — what one thread is doing, for the dashboard's
+    open thread: running, queued behind the running turn, how recent turns
+    ended (webthread.thread_state)."""
+    key = str(payload.get("key") or "")
+    if not THREAD_KEY_RE.fullmatch(key):
+        return {"ok": False, "error": "unknown thread"}
+    state = webthread.thread_state(task_store.by_thread(key), key in RUNNING)
+    entry = store.get(key) or {}
+    state["checked_out"] = bool(entry.get("checked_out"))
+    return state
 
 
 def handle_register_terminal(payload: dict) -> dict:
@@ -3398,6 +3512,7 @@ server.route("/status", handle_status)
 server.route("/drain", handle_drain)
 server.route("/tell", handle_tell)
 server.route("/web-message", handle_web_message)
+server.route("/thread-state", handle_thread_state)
 server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
 server.route("/summaries", handle_summaries)
@@ -3464,6 +3579,9 @@ def handle_prompt(event: dict, say, client) -> None:
 
     text = MENTION_RE.sub("", event.get("text", "")).strip()
     files = event.get("files") or []
+    # Files sent from the dashboard, already written into uploads/ by
+    # handle_web_message: [{name, path, mimetype, size}].
+    web_files = (event.get("_web_files") or []) if event.get("_web") else []
 
     if text.lower().startswith("!approve"):
         # Before handle_command, because only here is it known who sent it.
@@ -3479,7 +3597,7 @@ def handle_prompt(event: dict, say, client) -> None:
         if not event.get("_web") and store.get(key):
             store.update(key, last_msg_ts=msg_ts)
         return
-    if not text and not files:
+    if not text and not files and not web_files:
         say(text="Send me a prompt (or `!help`) and I'll spin up a Claude session for this thread.",
             thread_ts=thread_ts)
         return
@@ -3515,26 +3633,16 @@ def handle_prompt(event: dict, say, client) -> None:
         ctx = thread_context(client, channel, thread_ts, msg_ts)
         if ctx:
             prompt = ctx + "The user now says: " + prompt
+    attached = []
     if files:
         saved = download_attachments(files, UPLOADS_ROOT / key.replace(":", "__"), key)
-        if saved:
-            by_name = {Path(f.get("name") or "").name: f for f in files}
-            lines, any_image = [], False
-            for path in saved:
-                meta = by_name.get(path.name.split("-", 1)[-1], {})
-                mime = meta.get("mimetype") or ""
-                size = meta.get("size")
-                note = f" ({mime}{f', {size // 1024} KB' if size else ''})" if mime else ""
-                if mime.startswith("image/"):
-                    any_image = True
-                    note += " — an image; use Read to look at it"
-                lines.append(f"- {path}{note}")
-            listing = "\n".join(lines)
-            prompt += (f"\n\n[The user attached {len(saved)} file(s), saved locally:\n"
-                       f"{listing}\n"
-                       + ("Read the image before answering — the user is showing you "
-                          "something, not describing it." if any_image else
-                          "Read them if they are relevant to the request.") + "]")
+        by_name = {Path(f.get("name") or "").name: f for f in files}
+        for path in saved:
+            meta = by_name.get(path.name.split("-", 1)[-1], {})
+            attached.append({"path": str(path), "mimetype": meta.get("mimetype") or "",
+                             "size": meta.get("size")})
+    attached += web_files
+    prompt += webthread.attachment_note(attached)
 
     # Stable per-thread outbox path: this string ends up in --append-system-prompt,
     # and prompt caching is a byte-exact prefix match — a path that changes every

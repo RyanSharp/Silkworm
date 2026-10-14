@@ -4903,8 +4903,11 @@ def test_file_uploads_are_handled():
     check("non-DM channels are ignored",
           should({"channel_type": "channel", "user": "U1", "text": "hi"}) is False)
 
+    # The note is webthread.attachment_note, shared with dashboard uploads;
+    # what it says is checked in test_webthread_files_and_note.
     check("images are pointed out as viewable, not just listed",
-          "use Read to look at it" in src)
+          "use Read to look at it" in (BASE / "webthread.py").read_text()
+          and "prompt += webthread.attachment_note(attached)" in src)
     # A thread's cwd is usually a git repo; writing uploads there leaves
     # untracked noise a stray `git add -A` would commit.
     check("uploads are not written into the thread's working directory",
@@ -20941,9 +20944,10 @@ def test_dashboard_polls_without_redrawing():
           r["text"] and r["writes"] == 1 and r["appends"] == 0 and r["same"], r)
     check("a reorder moves the same cards",
           o["reordered"] == ["beta", "alpha"] and o["reusedOnReorder"], o["reordered"])
+    # By the thread's key: the server answers for the session it is on now.
     check("the transcript reads from its cursor",
-          o["transcriptAsks"] == ["/api/session?id=s-A%3A1&from=0", "/api/session?id=s-A%3A1&from=40",
-                                  "/api/session?id=s-A%3A1&from=90"], o["transcriptAsks"])
+          o["transcriptAsks"] == ["/api/session?key=A%3A1&id=&from=0", "/api/session?key=A%3A1&id=&from=40",
+                                  "/api/session?key=A%3A1&id=&from=90"], o["transcriptAsks"])
     check("new messages are appended to what is there",
           "first msg" in o["t1"] and "first msg" in o["t2"] and "second msg" in o["t2"]
           and o["t3"] == o["t2"])
@@ -20958,7 +20962,8 @@ def test_dashboard_polls_without_redrawing():
     check("showing it again refreshes at once",
           "/api/sessions" in o["backFetches"] and "/api/stats" in o["backFetches"]
           and "/api/session" in o["backFetches"], o["backFetches"])
-    check("the polling cadence is unchanged", sorted(o["intervals"]) == [4000, 5000, 5000, 30000],
+    # 1500: the open thread while something is under way in it (threadBusy).
+    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 4000, 5000, 5000, 30000],
           o["intervals"])
 
 
@@ -23293,6 +23298,846 @@ process.stdout.write(JSON.stringify(out));
           out["staleCleared"] is True, str(out))
     check("the service worker is registered at scope /",
           out["registered"] == ["/sw.js", {"scope": "/"}], str(out["registered"]))
+
+
+
+# --- conversation threads from the dashboard --------------------------------------
+# The dashboard used to be able to answer an existing thread and nothing more:
+# no new thread, no files, a toast instead of the message, and a !command's
+# reply only ever in Slack. A thread is still the Slack thread -- the same key,
+# session and records whichever side speaks -- so what these check is that the
+# dashboard goes through the very handlers Slack does (handle_prompt,
+# handle_command), and that the pure parts (webthread.py) say what they should.
+
+def test_webthread_files_and_note():
+    import base64
+    import webthread as W
+    print("\nfiles from the phone: checked whole, written where Slack's go, and named to the turn")
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 40).decode()
+    ok = W.decode_files([{"name": "shot.png", "type": "image/png", "data": png},
+                         {"name": "../../etc/notes.txt", "data": "data:text/plain;base64,"
+                          + base64.b64encode(b"hello").decode()}])
+    check("two files decode", [f["name"] for f in ok] == ["shot.png", "notes.txt"], str(ok)[:200])
+    check("a path in a name is reduced to its last part", ok[1]["name"] == "notes.txt")
+    check("a data: URL is taken as its base64", ok[1]["data"] == b"hello")
+    check("a missing type is guessed from the name", ok[1]["mimetype"] == "text/plain")
+    dots = W.decode_files([{"name": "..", "data": png}])[0]["name"]
+    check("a name of only dots becomes a generated one", dots.startswith("file-"), dots)
+
+    def refused(files):
+        try:
+            W.decode_files(files)
+        except W.Refused as e:
+            return str(e)
+        except Exception as e:                 # a crash is not a refusal
+            return f"raised {type(e).__name__}"
+        return ""
+    check("a list is required", "list" in refused({"name": "x"}))
+    check("more than ten files on one message are refused",
+          "at most" in refused([{"name": f"{i}.txt", "data": png} for i in range(W.MAX_FILES + 1)]))
+    check("exactly ten are taken", not refused([{"name": f"{i}.txt", "data": png}
+                                               for i in range(W.MAX_FILES)]))
+    check("data that is not base64 is refused", "base64" in refused([{"name": "a", "data": "@@@@"}]))
+    check("an empty file is refused", "empty" in refused([{"name": "a", "data": ""}]))
+    check("a file that is not an object is refused", "name" in refused(["a.png"]))
+    saved_max = W.MAX_FILE_BYTES
+    try:
+        W.MAX_FILE_BYTES = 30
+        check("a file over the size limit is refused",
+              "over" in refused([{"name": "big.bin", "data": base64.b64encode(b"z" * 31).decode()}]))
+        check("one at the limit is taken",
+              not refused([{"name": "edge.bin", "data": base64.b64encode(b"z" * 30).decode()}]))
+    finally:
+        W.MAX_FILE_BYTES = saved_max
+    check("one bad file refuses the whole message, before anything is written",
+          "base64" in refused([{"name": "fine.txt", "data": png}, {"name": "bad", "data": "!!"}]))
+
+    root = Path(tempfile.mkdtemp())
+    out = W.write_files(root, "D1:111.222", ok + ok[:1], now=1700000000)
+    where = root / "D1__111.222"
+    check("written into uploads/<thread>, named <epoch>-<name> as Slack's are",
+          Path(out[0]["path"]) == where / "1700000000-shot.png" and Path(out[0]["path"]).is_file()
+          and Path(out[1]["path"]) == where / "1700000000-notes.txt", str(out)[:300])
+    check("a second file of the same name that second does not overwrite the first",
+          out[2]["path"] != out[0]["path"] and Path(out[2]["path"]).is_file()
+          and Path(out[2]["path"]).parent == where, out[2]["path"])
+    check("the record says what and how big", out[1]["size"] == 5 and out[0]["mimetype"] == "image/png")
+    try:
+        W.write_files(root, "D1:111.222", [{"name": "../escaped", "data": b"x", "mimetype": ""}])
+        escaped = "written"
+    except W.Refused:
+        escaped = "refused"
+    except Exception as e:
+        escaped = f"raised {type(e).__name__}"
+    check("a name that would leave the thread's directory is never written",
+          escaped == "refused" and not (root / "escaped").exists()
+          and not list(root.glob("*escaped")), escaped)
+    note = W.attachment_note(out[:2])
+    check("the prompt names each saved path", out[0]["path"] in note and out[1]["path"] in note)
+    check("an image is named as one, to be Read",
+          "an image; use Read to look at it" in note
+          and "Read the image before answering" in note, note)
+    plain = W.attachment_note([out[1]])
+    check("files that are not images are offered, not insisted on",
+          "Read them if they are relevant" in plain and "use Read to look" not in plain)
+    check("no files, no note", W.attachment_note([]) == "")
+    e = W.echo("look at this", ["shot.png"])
+    check("Slack sees a dashboard message marked as one, with its files named",
+          e.startswith(":globe_with_meridians: _via visualizer:_ look at this")
+          and "shot.png" in e, e)
+
+
+def _web_bot(tmp: Path):
+    """handle_web_message, handle_thread_state, handle_prompt and handle_command
+    as shipped, against scratch stores and a fake Slack client. Only Slack, the
+    claude child and git-touching filing are faked; the routing between them is
+    the real code."""
+    import threading
+    import projects as P
+    import tasks as T
+    import webthread
+    from unittest.mock import MagicMock
+    st = tmp_store()
+    ts = T.TaskStore(tmp / "t.json")
+    ps = P.ProjectStore(tmp / "projects.json")
+    posted, prompts, running = [], [], {}
+    seq = [1000]
+
+    class Client:
+        def chat_postMessage(self, channel, text, thread_ts=None, **kw):
+            seq[0] += 1
+            posted.append({"channel": channel, "text": text, "thread_ts": thread_ts})
+            return {"ts": f"{seq[0]}.000100"}
+
+        def chat_update(self, **kw):
+            posted.append({"update": kw.get("text")})
+
+        def chat_delete(self, channel, ts):
+            posted.append({"deleted": f"{channel}:{ts}"})
+
+        def __getattr__(self, name):           # reactions, chat_delete, files...
+            return MagicMock(name=name)
+    app = types.SimpleNamespace(client=Client())
+    locks: dict = {}
+
+    class Progress:                            # ProgressMessage, minus the throttle
+        def __init__(self, client, channel, thread_ts):
+            self.ts = f"p-{thread_ts}"
+            posted.append({"channel": channel, "thread_ts": thread_ts, "text": "Starting Claude"})
+
+        def update(self, text):
+            posted.append({"update": text})
+
+        finalize = update
+
+    class Reactions:
+        def __init__(self, client, channel, thread_ts, msg_ts):
+            self.msg = msg_ts if msg_ts and msg_ts != thread_ts else None
+        working = done = failed = cleared = lambda self: None
+
+    def thread_lock(key):
+        return locks.setdefault(key, threading.Lock())
+
+    def run_turn(prompt, session_id=None, **kw):
+        prompts.append({"prompt": prompt, "session_id": session_id, "cwd": str(kw.get("cwd"))})
+        if kw.get("on_init"):
+            kw["on_init"]("sid-new" if session_id is None else session_id)
+        return types.SimpleNamespace(session_id=session_id or "sid-new", cost_usd=0.01,
+                                     text="the reply", duration_ms=5)
+    cmd = bot_functions("handle_command", "file_thread_under", store=st, project_store=ps,
+                        RUNNING=running, HELP="help", Path=Path)
+    shared = dict(store=st, task_store=ts, tasks=T, webthread=webthread, RUNNING=running,
+                  RUNNING_TASKS={}, app=app, Path=Path, UPLOADS_ROOT=tmp / "uploads",
+                  OUTBOX_ROOT=tmp / "outbox", CLAUDE_CWD=tmp / "scratch")
+    prompt_fn = _bot_func(
+        "handle_prompt", **shared,
+        _dedup=lambda c, t: False, _already_handled=lambda k, t: False, ALLOWED_USERS=set(),
+        MENTION_RE=_re.compile(r"<@\w+>"), handle_command=cmd["handle_command"],
+        resolve_cwd=lambda client, ch: tmp / "scratch",
+        file_by_directory=lambda key, cwd: (st.get(key) or {}).get("project") or "",
+        repos=types.SimpleNamespace(identity=lambda c: ""), _thread_lock=thread_lock,
+        repo_guard=lambda cwd, progress=None: contextlib.nullcontext(), contextlib=contextlib,
+        ProgressMessage=Progress, ThreadReactions=Reactions, ACTIVE_SESSIONS={},
+        begin_turn=lambda key: None, refresh_brief=lambda *a: None, refresh_summary=lambda *a: None,
+        name_thread=lambda *a: None, RUNNER_HOLD=types.SimpleNamespace(open=lambda: None),
+        claude_env=lambda *a, **k: {}, permission_args=lambda: [],
+        recovery=recovery, task_state=_task_state_for(ts), run_turn=run_turn,
+        upload_outbox=lambda *a: 0, shutil=shutil, chunk=lambda t: [t], to_mrkdwn=lambda t: t,
+        fmt_duration=lambda ms: f"{ms}ms", COST_NOTE="", uuid=__import__("uuid"),
+        threading=threading, release_turn=lambda *a: None, ClaudeStopped=ClaudeStopped,
+        ClaudeTimeout=ClaudeTimeout, ClaudeError=ClaudeError, roles=__import__("roles"),
+        OPERATOR=types.SimpleNamespace(thread=lambda: ""), render_block=lambda x: "",
+        defer=__import__("defer"), scoping=__import__("scoping"), SILKWORM_BIN="silkworm",
+        harvester=types.SimpleNamespace(find_transcript=lambda s: True))
+    hooks = {"prompt": prompt_fn}
+
+    def handle_prompt(event, say, client):
+        return hooks["prompt"](event, say, client)
+    web = _bot_func("handle_web_message", **shared, handle_prompt=handle_prompt,
+                    handle_command=cmd["handle_command"], project_store=ps,
+                    home_channel=lambda: "D9", slacklinks=__import__("slacklinks"),
+                    WEB_COMMAND_WAIT_S=5.0, THREAD_KEY_RE=_re.compile(r"[A-Z0-9]+:[0-9.]+"),
+                    threading=threading, time=time)
+    state = _bot_func("handle_thread_state", store=st, task_store=ts, webthread=webthread,
+                      RUNNING=running, THREAD_KEY_RE=_re.compile(r"[A-Z0-9]+:[0-9.]+"))
+    return types.SimpleNamespace(web=web, state=state, store=st, tasks=ts, projects=ps,
+                                 posted=posted, prompts=prompts, running=running,
+                                 lock=thread_lock, hooks=hooks, cmd=cmd)
+
+
+def _wait(cond, secs=5.0):
+    end = time.time() + secs
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+def test_dashboard_starts_and_continues_threads():
+    import tasks as T
+    print("\na thread starts from the dashboard (with or without a project) and any thread continues there")
+    tmp = Path(tempfile.mkdtemp())
+    bot = _web_bot(tmp)
+    seen = []
+    real_prompt = bot.hooks["prompt"]
+
+    def watching(event, say, client):
+        key = f"{event['channel']}:{event.get('thread_ts', event['ts'])}"
+        e = bot.store.get(key) or {}
+        seen.append({"event": dict(event), "project": e.get("project"), "cwd": e.get("cwd")})
+        return real_prompt(event, say, client)
+    bot.hooks["prompt"] = watching
+
+    r = bot.web({"new": True, "text": "plan the week"})
+    check("a new thread answers its key, ref and Slack link",
+          r["ok"] and r["key"].startswith("D9:") and r["ref"] == r["key"].split(":", 1)[1]
+          and "D9" in r["link"], str(r))
+    anchor = bot.posted[0]
+    check("its first message is posted in the home channel as the thread's parent",
+          anchor["channel"] == "D9" and anchor["thread_ts"] is None
+          and "_via visualizer:_ plan the week" in anchor["text"], str(anchor))
+    _wait(lambda: bot.prompts)
+    ev = seen[0]["event"]
+    check("the turn is handle_prompt's, in that thread, as the dashboard",
+          ev["channel"] == "D9" and ev["thread_ts"] == ev["ts"] == r["ref"] and ev["_web"]
+          and ev["text"] == "plan the week", str(ev))
+    check("and nobody files it: no project", not seen[0]["project"], str(seen[0]))
+    check("its prompt is the message, with no Slack context read in",
+          bot.prompts[0]["prompt"] == "plan the week", bot.prompts[0]["prompt"][:200])
+    _wait(lambda: (bot.store.get(r["key"]) or {}).get("session_id"))
+    check("the thread's record and session are the ordinary ones",
+          (bot.store.get(r["key"]) or {}).get("session_id") == "sid-new")
+    task = [t for t in bot.tasks.by_thread(r["key"])]
+    check("its turn is a task like any other, ref'd by the message",
+          len(task) == 1 and task[0]["source"] == "ui" and task[0]["source_ref"] == r["ref"]
+          and _wait(lambda: bot.tasks.get(task[0]["id"])["state"] == T.DONE), str(task)[:300])
+
+    home = tmp / "garden-home"
+    bot.projects.ensure("Garden", initial={"scope": {"cwd": str(home)}})
+    n = len(bot.prompts)
+    r2 = bot.web({"new": True, "text": "what should I plant", "project": "garden"})
+    check("a new thread with a project starts", r2["ok"], str(r2))
+    check("filing it said so, as !project does", any("Filed under" in x for x in r2["replies"]),
+          str(r2["replies"]))
+    _wait(lambda: len(bot.prompts) > n)
+    at_turn = next(s for s in seen if s["event"]["ts"] == r2["ref"])
+    check("it was filed by !project before its first turn ran (project and directory)",
+          at_turn["project"] == "garden" and at_turn["cwd"] == str(home), str(at_turn))
+    check("so the first turn already runs where the project works",
+          bot.prompts[-1]["cwd"] == str(home), bot.prompts[-1]["cwd"])
+    check("and the filing reply went into the thread in Slack",
+          any(p.get("thread_ts") == r2["ref"] and "Filed under" in (p.get("text") or "")
+              for p in bot.posted))
+    _wait(lambda: bot.tasks.by_thread(r2["key"]))
+    check("its tasks inherit the project",
+          all(t["project"] == "garden" for t in bot.tasks.by_thread(r2["key"])))
+
+    before = len(bot.posted)
+    for payload, why in (({"new": True, "text": "x", "project": "nope"}, "no project"),
+                         ({"new": True, "text": "!reset"}, "start a thread"),
+                         ({"key": "D1:5.5", "text": "x", "project": "garden"}, "chosen when"),
+                         ({"key": "D1:5.5", "text": "!stop", "files": [{"name": "a", "data": "eA=="}]},
+                          "no attachments"),
+                         ({"key": "not a key", "text": "x"}, "unknown thread"),
+                         # A key names the uploads directory, so it is a key or nothing.
+                         ({"key": "D1:../../x", "text": "x"}, "unknown thread"),
+                         ({"key": "D1:5.5", "text": "  "}, "empty"),
+                         ({"key": "D1:5.5", "text": "x", "files": [{"name": "a", "data": "@@"}]},
+                          "base64")):
+        try:
+            got = bot.web(payload)
+        except Exception as e:
+            got = {"raised": repr(e)}
+        check(f"refused ({why}): {json.dumps(payload)[:60]}",
+              got.get("ok") is False and why in got.get("error", ""), str(got))
+    check("and nothing refused reached Slack", len(bot.posted) == before,
+          str(bot.posted[before:])[:300])
+
+    # A thread born in Slack, continued here: the same key, so the same
+    # session, record and lock.
+    key = "D1:111.222"
+    bot.store.update(key, session_id="sid-slack", cwd=str(tmp), title="from slack", turns=4)
+    n = len(bot.prompts)
+    r3 = bot.web({"key": key, "text": "and one more thing"})
+    _wait(lambda: len(bot.prompts) > n)
+    echo = next((p for p in bot.posted if p.get("thread_ts") == "111.222"
+                 and "_via visualizer:_ and one more thing" in (p.get("text") or "")), None)
+    check("continuing a Slack-born thread posts the message into it in Slack", echo is not None
+          and echo["channel"] == "D1", str(bot.posted[-3:]))
+    check("and resumes its own session in its own directory",
+          bot.prompts[-1]["session_id"] == "sid-slack" and bot.prompts[-1]["cwd"] == str(tmp),
+          str(bot.prompts[-1]))
+    check("its ref is the turn's task", r3["ok"] and _wait(lambda: any(
+        t["source_ref"] == r3["ref"] for t in bot.tasks.by_thread(key))), str(r3))
+    # And Slack, after: a reply in Slack to a dashboard-born thread is the
+    # same key, so the same session.
+    n = len(bot.prompts)
+    channel, ts = r["key"].split(":")
+    bot.hooks["prompt"]({"channel": channel, "ts": "2000.1", "thread_ts": ts, "user": "U1",
+                         "text": "from my laptop"}, lambda **k: None, None)
+    check("a Slack reply to a dashboard-born thread resumes the same session",
+          bot.prompts[-1]["session_id"] == "sid-new" and len(bot.prompts) == n + 1,
+          str(bot.prompts[-1]))
+
+
+def test_dashboard_upload_reaches_the_turn():
+    import base64
+    print("\na photo sent from the phone is saved with Slack's uploads and the turn is told to Read it")
+    tmp = Path(tempfile.mkdtemp())
+    bot = _web_bot(tmp)
+    key = "D1:300.1"
+    bot.store.update(key, session_id="sid-x", cwd=str(tmp))
+    img = b"\x89PNG\r\n\x1a\n" + b"p" * 2048
+    r = bot.web({"key": key, "text": "what is wrong here?",
+                 "files": [{"name": "IMG_0042.png", "type": "image/png",
+                            "data": base64.b64encode(img).decode()}]})
+    check("sent", r["ok"], str(r))
+    _wait(lambda: bot.prompts)
+    saved = list((tmp / "uploads" / "D1__300.1").glob("*IMG_0042.png"))
+    check("written into uploads/<thread>, as a Slack upload is",
+          len(saved) == 1 and saved[0].read_bytes() == img, str(saved))
+    prompt = bot.prompts[0]["prompt"] if bot.prompts else ""
+    check("the turn's prompt names the saved file", saved and str(saved[0]) in prompt, prompt[:300])
+    check("and says it is an image to Read", "use Read to look at it" in prompt
+          and "Read the image before answering" in prompt and "image/png" in prompt, prompt[-300:])
+    check("after the message itself", prompt.startswith("what is wrong here?"), prompt[:80])
+    files = (bot.store.get(key) or {}).get("files") or []
+    check("the thread's file list has it, incoming (so the dashboard lists it)",
+          any(f["direction"] == "in" and f["path"] == str(saved[0]) for f in files), str(files))
+    check("Slack is told a file came with it",
+          any("IMG_0042.png" in (p.get("text") or "") and p.get("thread_ts") == "300.1"
+              for p in bot.posted))
+    other = _web_bot(Path(tempfile.mkdtemp()))
+    (other_root := Path(other.web.__globals__["UPLOADS_ROOT"])).write_text("not a directory")
+    bad = other.web({"new": True, "text": "look", "files": [
+        {"name": "a.png", "type": "image/png", "data": base64.b64encode(img).decode()}]})
+    anchor = other.posted[0] if other.posted else {}
+    check("a new thread whose files cannot be saved is taken back out of Slack",
+          bad["ok"] is False and "could not save" in bad["error"]
+          and any(p.get("deleted") == f"D9:{1001}.000100" for p in other.posted)
+          and not other.prompts, f"{bad} {other.posted}")
+    del other_root, anchor
+    n = len(bot.prompts)
+    r = bot.web({"key": key, "files": [{"name": "only.png", "type": "image/png",
+                                        "data": base64.b64encode(img).decode()}]})
+    _wait(lambda: len(bot.prompts) > n)
+    check("a photo with no words is sent too", r["ok"] and len(bot.prompts) == n + 1
+          and "only.png" in bot.prompts[-1]["prompt"], str(r))
+
+
+def test_dashboard_message_queues_behind_a_running_turn():
+    import tasks as T
+    print("\na message sent mid-turn shows as queued, from either side, then runs")
+    tmp = Path(tempfile.mkdtemp())
+    bot = _web_bot(tmp)
+    key = "D1:400.1"
+    bot.store.update(key, session_id="sid-q", cwd=str(tmp))
+    lock = bot.lock(key)
+    lock.acquire()                         # a turn is running in this thread
+    bot.running[key] = object()
+    try:
+        r = bot.web({"key": key, "text": "next, please"})
+        check("the message is taken at once", r["ok"] and r["ref"], str(r))
+        _wait(lambda: bot.state({"key": key})["queued"])
+        s = bot.state({"key": key})
+        check("the thread says it is running, with the message queued behind it",
+              s["running"] and [q["ref"] for q in s["queued"]] == [r["ref"]]
+              and s["queued"][0]["state"] == T.QUEUED, str(s))
+        check("and nothing has run it yet", not bot.prompts)
+        # The task exists before the progress line is posted: wait for that too.
+        check("Slack said it is waiting its turn", _wait(lambda: any(
+            "Queued behind an earlier message" in (p.get("update") or p.get("text") or "")
+            for p in bot.posted)), str(bot.posted)[:400])
+        # A message sent from Slack meanwhile is queued the same way.
+        threading_ = __import__("threading")
+        threading_.Thread(target=bot.hooks["prompt"], daemon=True, args=(
+            {"channel": "D1", "ts": "401.5", "thread_ts": "400.1", "user": "U1",
+             "text": "from slack too"}, lambda **k: None, None)).start()
+        _wait(lambda: len(bot.state({"key": key})["queued"]) == 2)
+        s = bot.state({"key": key})
+        check("one sent from Slack meanwhile is queued too, in order",
+              [q["ref"] for q in s["queued"]] == [r["ref"], "401.5"]
+              and s["queued"][1]["source"] == "slack", str(s["queued"]))
+    finally:
+        bot.running.pop(key, None)
+        lock.release()
+    _wait(lambda: len(bot.prompts) == 2)
+    _wait(lambda: not bot.state({"key": key})["queued"]
+          and not bot.state({"key": key})["running"])
+    s = bot.state({"key": key})
+    check("once the turn ends both run, one at a time, and the thread is idle",
+          [p["prompt"] for p in bot.prompts] == ["next, please", "from slack too"]
+          and not s["queued"] and not s["running"], str(bot.prompts))
+    check("their turns read as done, by ref",
+          {t["ref"]: t["state"] for t in s["turns"]} == {r["ref"]: T.DONE, "401.5": T.DONE},
+          str(s["turns"]))
+    check("another thread's tasks are not this one's",
+          bot.state({"key": "D1:999.9"})["turns"] == [])
+    # A review the queue runs narrates into the same thread, but it is not a
+    # message in the conversation.
+    bot.tasks.create("review it", role="reviewer", driver="queue", thread=key,
+                     source="ui", source_ref="rv.1")
+    check("queued work the runner drives is not a queued message",
+          all(t["ref"] != "rv.1" for t in bot.state({"key": key})["turns"]),
+          str(bot.state({"key": key})["turns"]))
+    check("a bad key is refused", bot.state({"key": "x"})["ok"] is False)
+
+
+def test_dashboard_commands_use_the_shared_handler():
+    print("\n!commands from the composer are handle_command's, and their replies come back")
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+              and n.name == "handle_web_message")
+    calls = {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
+    check("handle_web_message hands every message to handle_prompt",
+          "handle_prompt" in calls, str(sorted(calls)))
+    lits = {c.value for c in ast.walk(fn) if isinstance(c, ast.Constant)
+            and isinstance(c.value, str) and c.value.startswith("!")}
+    joined = [ast.unparse(c) for c in ast.walk(fn) if isinstance(c, ast.JoinedStr)]
+    check("it handles no command itself: the only one it names is the !project a new "
+          "thread is filed with, through handle_command",
+          lits <= {"!", "!project "}
+          and [j for j in joined if j.startswith(("f'!", 'f"!'))] == ["f'!project {project}'"]
+          and "handle_command" in calls, f"{lits} {joined}")
+    prompt = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "handle_prompt")
+    check("and handle_prompt sends a dashboard !command to handle_command, as a Slack one",
+          any(isinstance(c, ast.Call) and ast.unparse(c.func) == "handle_command"
+              for c in ast.walk(prompt)))
+
+    from unittest.mock import MagicMock
+    tmp = Path(tempfile.mkdtemp())
+    bot = _web_bot(tmp)
+    key = "D1:500.1"
+    bot.store.update(key, session_id="sid-c", cwd=str(tmp))
+    handle = MagicMock()
+    bot.running[key] = handle
+    r = bot.web({"key": key, "text": "!stop"})
+    check("!stop stops the running turn, as from Slack", handle.stop.called, str(r))
+    check("and its reply comes back to the page", r["ok"] and r["finished"]
+          and any("Stopping" in x for x in r["replies"]), str(r))
+    check("the reply is in the Slack thread too, and the command is not echoed as a prompt",
+          any(p.get("thread_ts") == "500.1" and "Stopping" in (p.get("text") or "")
+              for p in bot.posted)
+          and not any("_via visualizer:_ !stop" in (p.get("text") or "") for p in bot.posted))
+    bot.running.pop(key)
+    r = bot.web({"key": key, "text": "!brief"})
+    check("!brief in an unfiled thread says to file it first",
+          any("isn't filed under a project" in x for x in r["replies"]), str(r))
+    home = tmp / "kitchen"
+    bot.projects.ensure("Kitchen", initial={"scope": {"cwd": str(home)}})
+    r = bot.web({"key": key, "text": "!project kitchen"})
+    check("!project files the thread through file_thread_under",
+          (bot.store.get(key) or {}).get("project") == "kitchen"
+          and any("Filed under" in x for x in r["replies"]), str(r))
+    r = bot.web({"key": key, "text": "!brief"})
+    check("then !brief answers for its project", any("kitchen" in x for x in r["replies"]),
+          str(r))
+    r = bot.web({"key": key, "text": "!reset"})
+    check("!reset clears the session", bot.store.get(key) is None
+          and any("Session cleared" in x for x in r["replies"]), str(r))
+    check("no command ran a turn", not bot.prompts, str(bot.prompts))
+
+
+def test_viz_reads_a_thread_by_its_key():
+    import http.client
+    import threading
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe open thread is read by its key: its live session, from the cursor, with what it is doing")
+    d, proj, sessions = _viz_fixture()
+    sessions["D1:3.3"] = {"title": "new", "updated": time.time(),
+                          "pending": {"started": "2026-10-14T10:00:00.000Z",
+                                      "session_id": "sid-three", "prompt": "hi"}}
+    sessions["D1:4.4"] = {"title": "fresh", "updated": time.time()}
+    (d / "sessions.json").write_text(json.dumps(sessions))
+    (proj / "-a" / "sid-one.jsonl").write_text(_tline("user", "hello") + _tline("assistant", "hi"))
+    (proj / "-a" / "sid-three.jsonl").write_text(_tline("user", "first turn, live"))
+    saved = (V.SESSIONS_FILE, V.PROJECTS_DIR, V.bot_call, V.INDEX_RECHECK_S)
+    asked = []
+    live = {"ok": True, "running": True, "queued": [{"ref": "9.9", "state": "queued"}], "turns": []}
+
+    def fake_bot(path, payload, timeout=1.0):
+        asked.append((path, dict(payload)))
+        return dict(live) if path == "/thread-state" else {}
+    try:
+        V.SESSIONS_FILE, V.PROJECTS_DIR, V.bot_call, V.INDEX_RECHECK_S = (
+            d / "sessions.json", proj, fake_bot, 0)
+        a = V.load_thread("D1:1.1", "", 0)
+        check("a first read is the whole transcript of the thread's session",
+              a["session_id"] == "sid-one" and [m["role"] for m in a["messages"]]
+              == ["user", "assistant"] and a["cursor"] > 0, str(a)[:300])
+        check("with what the thread is doing, from the bot", a["live"] == live
+              and asked[-1] == ("/thread-state", {"key": "D1:1.1"}), str(asked[-1:]))
+        b = V.load_thread("D1:1.1", "sid-one", a["cursor"])
+        check("the next is only what is new", b["messages"] == [] and not b["reset"])
+        c = V.load_thread("D1:1.1", "sid-old", a["cursor"])
+        check("a thread now on another session reads from the top, and says reset",
+              c["reset"] is True and len(c["messages"]) == 2, str(c)[:200])
+        t = V.load_thread("D1:3.3", "", 0)
+        check("a first turn is followed live, from its pending session",
+              t["session_id"] == "sid-three" and t["messages"][0]["blocks"][0]["text"]
+              == "first turn, live", str(t)[:200])
+        f = V.load_thread("D1:4.4", "", 0)
+        check("a thread with no session yet is empty, not an error",
+              "error" not in f and f["messages"] == [] and f["session_id"] == "", str(f))
+        sessions["D1:4.4"]["pending"] = {"started": "2026-10-14T10:00:00.000Z",
+                                         "session_id": "sid-unwritten"}
+        (d / "sessions.json").write_text(json.dumps(sessions))
+        g = V.load_thread("D1:4.4", "", 0)
+        check("nor is a new session that has written nothing yet",
+              "error" not in g and g["messages"] == [] and g["session_id"] == "sid-unwritten", str(g))
+        V.bot_call = lambda path, payload, timeout=1.0: {}
+        check("a bot that does not answer is said to be offline",
+              V.load_thread("D1:1.1", "", 0)["live"] == {"offline": True})
+
+        V.bot_call = fake_bot
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", "/api/session?key=D1%3A1.1&id=&from=0")
+        got = json.loads(conn.getresponse().read())
+        check("GET /api/session?key= answers the thread", got.get("key") == "D1:1.1"
+              and got["live"] == live, str(got)[:200])
+        conn.request("GET", "/api/session?id=sid-one&from=0")
+        old = json.loads(conn.getresponse().read())
+        check("and ?id= alone still reads a session, as before", "live" not in old
+              and len(old["messages"]) == 2, str(old)[:200])
+        sent = len(asked)
+        try:
+            # Says it is huge and sends nothing: refused on the header alone.
+            big = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            big.putrequest("POST", "/api/send")
+            big.putheader("Content-Type", "application/json")
+            big.putheader("Content-Length", str(V.MAX_POST_BYTES + 1))
+            big.endheaders()
+            resp = big.getresponse()
+            status, body = resp.status, json.loads(resp.read())
+            big.close()
+        except Exception as e:
+            status, body = None, {"error": repr(e)}
+        check("a POST over the size limit is refused before it is read, never relayed",
+              status == 413 and "too big" in body["error"] and len(asked) == sent,
+              f"{status} {body}")
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        payload = json.dumps({"key": "D1:1.1", "text": "hi"}).encode()
+        conn.request("POST", "/api/send", body=payload,
+                     headers={"Content-Type": "application/json"})
+        conn.getresponse().read()
+        check("one within it is relayed to /web-message whole",
+              asked[-1] == ("/web-message", {"key": "D1:1.1", "text": "hi"}), str(asked[-1:]))
+        srv.shutdown()
+    finally:
+        V.SESSIONS_FILE, V.PROJECTS_DIR, V.bot_call, V.INDEX_RECHECK_S = saved
+
+
+
+COMPOSER_DRIVER = r"""
+// The composer and the open thread's live end, against a stub DOM: a message
+// shows at once, is followed to queued and running by its ref, gives way to the
+// transcript, and a command's replies are drawn under it.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+function el(id) {
+  return {id, textContent: "", value: "", title: "", className: "", style: {}, dataset: {},
+    children: [], _inner: "", parent: null,
+    get innerHTML() { return this._inner; }, set innerHTML(v) { this._inner = v; },
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) { c.parent = this; this.children.push(c); return c; },
+    remove() {}, addEventListener() {}, insertAdjacentHTML(_, h) { this._inner += h; },
+    focus() {}, scrollIntoView() {}, querySelector() { return null; },
+    querySelectorAll() { return []; }, getBoundingClientRect() { return {bottom: 0}; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+const listeners = {};
+globalThis.document = {getElementById: byId, createElement: () => el("new"), hidden: false,
+  querySelector: () => null, querySelectorAll: () => [],
+  addEventListener(k, f) { (listeners[k] = listeners[k] || []).push(f); }, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+let isPhone = false;
+globalThis.matchMedia = q => ({matches: isPhone && q === "(max-width: 700px)"});
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.FileReader = class {
+  readAsDataURL(f) {
+    this.result = "data:" + f.type + ";base64," + Buffer.from(f.body).toString("base64");
+    setImmediate(() => this.onload());
+  }
+};
+const sessions = [{key: "A:1", title: "alpha", kind: "thread", session_id: "s1", updated: 1,
+                   turns: 1, cost: 0, resume_cmd: "x", slack_link: "y"}];
+let live = {ok: true, running: false, queued: [], turns: []}, deliver = [], cursor = 10;
+const sends = [], reads = [];
+let gate = null, sendAnswer = null;
+globalThis.fetch = async (url, opts) => {
+  if (url.startsWith("/api/send")) {
+    sends.push(JSON.parse(opts.body));
+    if (gate) await gate;
+    const a = sendAnswer; sendAnswer = null;
+    return {status: 200, headers: {get: () => null}, json: async () => a || {ok: true, ref: "r?", replies: []}};
+  }
+  let out = {ok: true};
+  if (url.startsWith("/api/session?")) {
+    reads.push(url);
+    const msgs = deliver; deliver = [];
+    cursor += msgs.length;
+    out = {session_id: "s1", messages: msgs, cursor, reset: false, live: JSON.parse(JSON.stringify(live))};
+  } else if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions, slack: {}};
+  else if (url.startsWith("/api/stats"))
+    out = {total_cost: 1.5, cache_rate: 91, threads: 7, days: [{date: "2026-10-14", cache_read: 5, fresh_in: 2, out: 1}], models: []};
+  else if (url.startsWith("/api/artifacts")) out = [];
+  else if (url.startsWith("/api/projects")) out = {ok: true, projects: [{slug: "garden", title: "Garden"}, {slug: "old", title: "Old", archived: true}]};
+  else if (url.startsWith("/api/tasks")) out = {ok: true, roles: []};
+  return {status: 200, headers: {get: () => null}, json: async () => out};
+};
+(0, eval)(src + `;globalThis.__c = {loadList, loadTranscript, loadStats, sendReply, sendText, addFiles,
+  threadBusy, newThreadForm, submitNewThread, getActive: () => active,
+  setActive(k) { active = lastSessions.find(s => s.key === k); }};`);
+const tick = async (n) => { for (let i = 0; i < (n || 6); i++) await new Promise(r => setImmediate(r)); };
+const user = text => ({role: "user", ts: "", blocks: [{type: "text", text}]});
+const said = text => ({role: "assistant", ts: "", blocks: [{type: "text", text}]});
+(async () => {
+  const C = globalThis.__c, out = {};
+  const tl = () => byId("tlive").innerHTML;
+  await C.loadList();
+  C.setActive("A:1");
+  await C.loadTranscript(true);
+  out.idle = {live: tl(), busy: C.threadBusy()};
+
+  // Typed, with a photo; Send. Shown before the request has answered.
+  byId("reply").value = "please fix the header";
+  C.addFiles([{name: "shot.png", type: "image/png", size: 4, body: "PNG!"}], "reply");
+  out.chips = byId("chips").innerHTML;
+  let release; gate = new Promise(r => { release = r; });
+  sendAnswer = {ok: true, ref: "r1", replies: []};
+  const sending = C.sendReply();
+  await tick();
+  out.sending = {live: tl(), box: byId("reply").value, chips: byId("chips").innerHTML, busy: C.threadBusy()};
+  release(); gate = null;
+  await sending; await tick();
+  out.body = sends[sends.length - 1];
+  out.sent = tl();
+
+  // A turn is running; the message waits behind it.
+  live = {ok: true, running: true, queued: [{ref: "r1", state: "queued"}],
+          turns: [{ref: "r0", state: "running"}, {ref: "r1", state: "queued"}]};
+  await C.loadTranscript(false);
+  out.queued = tl();
+  // Its turn starts: the transcript has it, so the page stops drawing it.
+  live = {ok: true, running: true, queued: [], turns: [{ref: "r0", state: "done"}, {ref: "r1", state: "running"}]};
+  deliver = [user("please fix the header\n\n[The user attached 1 file(s)...]")];
+  await C.loadTranscript(false);
+  out.running = {live: tl(), msgs: byId("tmsgs").innerHTML, busy: C.threadBusy()};
+  // The reply streams in, then the turn ends.
+  deliver = [said("Fixed: the header now wraps.")];
+  live = {ok: true, running: false, queued: [], turns: [{ref: "r1", state: "done"}]};
+  await C.loadTranscript(false);
+  out.done = {live: tl(), msgs: byId("tmsgs").innerHTML, busy: C.threadBusy()};
+
+  // One that fails: said, and the thread stops being polled fast.
+  sendAnswer = {ok: true, ref: "r3", replies: []};
+  await C.sendText("this one fails"); await tick();
+  live = {ok: true, running: false, queued: [], turns: [{ref: "r1", state: "done"},
+          {ref: "r3", state: "failed", why: "boom"}]};
+  await C.loadTranscript(false);
+  out.failedMine = {live: tl(), busy: C.threadBusy()};
+  // Sent again with the same words: an older message saying so does not
+  // count as this one having arrived.
+  sendAnswer = {ok: true, ref: "r4", replies: []};
+  await C.sendText("this one fails"); await tick();
+  live = {ok: true, running: true, queued: [], turns: [{ref: "r3", state: "failed", why: "boom"},
+          {ref: "r4", state: "running"}]};
+  deliver = [Object.assign(user("this one fails"), {ts: "2026-01-01T00:00:00Z"})];
+  await C.loadTranscript(false);
+  out.oldEcho = tl();
+  deliver = [Object.assign(user("this one fails"), {ts: new Date().toISOString()})];
+  live = {ok: true, running: true, queued: [], turns: [{ref: "r4", state: "running"}]};
+  await C.loadTranscript(false);
+  out.newEcho = tl();
+  live = {ok: true, running: false, queued: [], turns: [{ref: "r4", state: "done"}], checked_out: true};
+  await C.loadTranscript(false);
+  out.checkedOut = tl();
+
+  // A command: handle_command's replies, drawn under it.
+  sendAnswer = {ok: true, ref: "r2", finished: true, replies: [":card_index_dividers: *garden* brief:\nGrow tomatoes."]};
+  await C.sendText("!brief");
+  await tick();
+  out.command = {live: tl(), body: sends[sends.length - 1]};
+
+  // Waiting messages sent from Slack, and a last turn that failed there.
+  live = {ok: true, running: true, queued: [{ref: "s5", state: "queued"}],
+          turns: [{ref: "s4", state: "failed", why: "claude exited 1: overloaded"},
+                  {ref: "s5", state: "queued", title: "from my laptop", source: "slack"}]};
+  await C.loadTranscript(false);
+  out.fromSlack = tl();
+  live = {ok: true, running: false, queued: [], turns: [{ref: "s4", state: "failed", why: "claude exited 1: overloaded"}]};
+  await C.loadTranscript(false);
+  out.failed = tl();
+
+  // Not sent: what was typed is put back.
+  sendAnswer = {ok: false, error: "bot is offline"};
+  byId("reply").value = "try again later";
+  await C.sendReply(); await tick();
+  out.refused = {box: byId("reply").value, toast: byId("toast").textContent, live: tl()};
+
+  // Return on a phone is a new line, not Send.
+  isPhone = true;
+  const n = sends.length;
+  byId("reply").value = "line one";
+  for (const f of listeners.keydown) f({target: {id: "reply"}, key: "Enter", shiftKey: false, preventDefault() {}});
+  await tick();
+  out.phoneEnter = sends.length - n;
+  isPhone = false;
+  for (const f of listeners.keydown) f({target: {id: "reply"}, key: "Enter", shiftKey: false, preventDefault() {}});
+  await tick();
+  out.desktopEnter = sends.length - n;
+
+  // A new thread, filed under a project.
+  await C.newThreadForm();
+  out.form = byId("fbox").innerHTML;
+  byId("nttext").value = "what should I plant";
+  byId("ntproj").value = "garden";
+  sendAnswer = {ok: true, key: "D9:77.1", ref: "77.1", link: "https://slack/x", replies: ["Filed under *Garden*"]};
+  live = {ok: true, running: true, queued: [], turns: [{ref: "77.1", state: "running"}]};
+  await C.submitNewThread(); await tick();
+  out.newBody = sends[sends.length - 1];
+  out.newActive = C.getActive().key;
+  out.newRead = reads[reads.length - 1];
+  out.newLive = tl();
+  out.modal = byId("fmodal").style.display;
+
+  // The stats, where a phone can reach them: atop the session list.
+  await C.loadStats();
+  out.stats = {phone: byId("dashphone").innerHTML.includes("cache hit rate"),
+               desk: byId("dash").innerHTML.includes("cache hit rate"),
+               summary: byId("dashsum").textContent};
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+def test_dashboard_composer_and_live_thread():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe composer: sent at once, followed to queued and running, replies and files, new threads")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    for i in ("tlive", "chips", "attach", "dashm", "dashphone", "dashsum"):
+        check(f"the page has #{i}", f'id="{i}"' in V.PAGE)
+    check("the file picker takes several, of any kind (the phone offers photos and files)",
+          re.search(r'<input type="file" id="attach" multiple onchange', V.PAGE) is not None)
+    check("a button starts a new thread", 'onclick="newThreadForm()"' in V.PAGE)
+    css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
+    phone = css[css.index("@media (max-width: 700px)"):]
+    check("on a phone the stats sit atop the list, and not above the thread",
+          "#dashm { display: block; }" in phone and "#dash { display: none; }" in phone
+          and "#dashm { display: none;" in css[:css.index("@media (max-width: 700px)")])
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    chk = subprocess.run([node, "--check", str(d / "dash.js")], capture_output=True, text=True)
+    check("the page's script parses (node --check)", chk.returncode == 0, chk.stderr[-400:])
+    (d / "drive.js").write_text(COMPOSER_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js")],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the composer's javascript runs", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    check("an idle thread shows no working indicator, and is not polled fast",
+          "Working" not in o["idle"]["live"] and o["idle"]["busy"] is False, str(o["idle"]))
+    check("a picked file shows as a chip", "shot.png" in o["chips"], o["chips"])
+    s = o["sending"]
+    check("the message appears at once, before the request answers",
+          "please fix the header" in s["live"] and "sending…" in s["live"]
+          and "📎 shot.png" in s["live"], s["live"][:400])
+    check("the composer is cleared, files too", s["box"] == "" and s["chips"] == "", str(s))
+    check("and the open thread is polled fast meanwhile", s["busy"] is True)
+    b = o["body"]
+    check("the photo goes as base64 with its name and type",
+          b["key"] == "A:1" and b["text"] == "please fix the header"
+          and b["files"] == [{"name": "shot.png", "type": "image/png", "data": "UE5HIQ=="}], str(b))
+    check("once taken it is sent, awaiting its turn", "sent" in o["sent"], o["sent"][:300])
+    check("sent mid-turn it shows as queued, with the turn working",
+          "queued — runs when the turn in progress finishes" in o["queued"]
+          and "Working" in o["queued"] and "■ Stop" in o["queued"], o["queued"][:500])
+    r = o["running"]
+    check("when the transcript has it, it is drawn once, from the transcript",
+          "please fix the header" in r["msgs"] and "please fix the header" not in r["live"]
+          and "Working" in r["live"] and r["busy"] is True, str(r)[:500])
+    dn = o["done"]
+    check("the reply appears with no refresh, and working ends",
+          "Fixed: the header now wraps." in dn["msgs"] and "Working" not in dn["live"]
+          and dn["busy"] is False, str(dn)[:400])
+    fm = o["failedMine"]
+    check("a turn that failed says so on its message, and the fast poll stops",
+          "⚠ failed: boom" in fm["live"] and fm["busy"] is False, str(fm)[:400])
+    check("an older message with the same words is not taken for this one",
+          "starting…" in o["oldEcho"], o["oldEcho"][-400:])
+    check("its own is, though the failed one said the same words",
+          "starting…" not in o["newEcho"] and "Working" in o["newEcho"], o["newEcho"][:500])
+    check("a thread checked out to the terminal says so, with the way back",
+          "checked out to the terminal" in o["checkedOut"] and "!back" in o["checkedOut"],
+          o["checkedOut"][-300:])
+    c = o["command"]
+    check("a command is sent as it is typed", c["body"] == {"key": "A:1", "text": "!brief", "files": []},
+          str(c["body"]))
+    check("and its reply is drawn under it", "!brief" in c["live"] and "you · command" in c["live"]
+          and "Grow tomatoes." in c["live"] and "silkworm" in c["live"], c["live"][:500])
+    check("a message queued from Slack shows as queued too",
+          "from my laptop" in o["fromSlack"] and "you · slack" in o["fromSlack"]
+          and "queued — runs when" in o["fromSlack"], o["fromSlack"][:500])
+    check("a last turn that failed says why", "The last turn failed: claude exited 1: overloaded"
+          in o["failed"], o["failed"][:300])
+    rf = o["refused"]
+    check("a message the bot refuses is put back in the composer, and said",
+          rf["box"] == "try again later" and "bot is offline" in rf["toast"]
+          and "try again later" not in rf["live"], str(rf))
+    check("Return on a phone is a new line; on a laptop it sends",
+          o["phoneEnter"] == 0 and o["desktopEnter"] == 1, f"{o['phoneEnter']} {o['desktopEnter']}")
+    check("the new thread form offers the live projects",
+          'value="garden"' in o["form"] and 'value="old"' not in o["form"]
+          and "(no project)" in o["form"], o["form"][:300])
+    check("starting it sends new, the project and the message",
+          o["newBody"] == {"new": True, "text": "what should I plant", "project": "garden", "files": []},
+          str(o["newBody"]))
+    check("and opens the new thread, read by its key",
+          o["newActive"] == "D9:77.1" and "key=D9%3A77.1" in o["newRead"] and o["modal"] == "none",
+          f"{o['newActive']} {o['newRead']}")
+    check("showing the message and that it was filed",
+          "what should I plant" in o["newLive"] and "Filed under" in o["newLive"]
+          and "Working" in o["newLive"], o["newLive"][:400])
+    st = o["stats"]
+    check("the stats are drawn atop the phone's list too, summed up in its line",
+          st["phone"] and st["desk"] and "$1.50" in st["summary"] and "7 threads" in st["summary"],
+          str(st))
 
 
 if __name__ == "__main__":

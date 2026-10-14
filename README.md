@@ -1083,7 +1083,8 @@ and has no identity gate.
 in Safari, then Share → Add to Home Screen: the dashboard installs as a
 standalone app named Silkworm (`/manifest.webmanifest`, icons under `/icons/`).
 Below 700px wide the session list and the open thread take turns on screen,
-and the Tasks/Projects/Learnings panels fill it, each with its own ✕. Its
+and the Tasks/Projects/Learnings panels fill it, each with its own ✕. The
+cost and cache stats sit in a collapsed 📊 line at the top of the list. Its
 service worker (`/sw.js`) caches nothing — no API answer is ever served stale —
 and only replaces a failed page load with "Can't reach Silkworm — is Tailscale
 connected?". The icons are drawn from `assets/logo.svg` by
@@ -1161,9 +1162,25 @@ A local web dashboard for every thread session (localhost-only):
 - **Files** — everything exchanged with a thread (Slack uploads in, generated
   files out) listed with download links; outbound files are archived under
   `artifacts/`.
-- **Reply from the web** — a composer that relays messages (and `!commands`,
-  wired to the Stop / Take over / Model / Reset buttons) through the bot, so
-  everything also lands in the Slack thread.
+- **Conversations from the web** — the dashboard is a full place to talk, not
+  only to read. **+ New thread** starts one (optionally filed under a project,
+  which the bot does with `!project <slug>` before the first turn, so it
+  inherits it exactly as from Slack); the composer continues any thread,
+  Slack-born or not. A thread is still its Slack thread — same key, session,
+  task records and one-turn-at-a-time lock — so it carries on from either
+  side. Your message shows at once, then *queued* (behind the turn holding the
+  thread) or *working*, and the reply streams in from the transcript while a
+  turn runs (the open thread is read every 1.5s then, 4s otherwise). 📎
+  attaches files and photos (25 MB each, ten per message): they are saved in
+  `uploads/<thread>/` like Slack uploads, and the turn is told to Read an
+  image. Files the bot produces are listed with download links. `!commands`
+  (`!project`, `!stop`, `!reset`, `!brief`, …) go through the bot's own
+  handler and their replies are shown under them.
+  In Slack, a message sent from the dashboard appears in the thread posted by
+  the bot as `🌐 via visualizer: <text>`, with a 📎 line naming any files; a
+  new thread's first message is the thread's parent in the home channel
+  (`SILKWORM_HOME_CHANNEL`, else your latest DM with the bot). Tool approvals
+  (`CLAUDE_APPROVAL_MODE=slack`) are still answered in Slack only.
 
 ## Notes & limits
 

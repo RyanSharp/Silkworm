@@ -748,6 +748,15 @@ class TaskStore:
             out = [dict(v) for v in self._data.values() if (v.get("project") or "") == slug]
         return sorted(out, key=lambda t: -t.get("created", 0))
 
+    def by_thread(self, key: str) -> list[dict]:
+        """A thread's tasks, oldest first: what the dashboard's open thread
+        polls for, so one scan under the lock rather than a copy of them all."""
+        if not key:
+            return []
+        with self._lock:
+            out = [dict(v) for v in self._data.values() if v.get("thread") == key]
+        return sorted(out, key=lambda t: t.get("created", 0))
+
     def needs_attention(self) -> list[dict]:
         """The default view: only what the user has to act on."""
         return self.by_state(*NEEDS_ATTENTION)

@@ -525,6 +525,42 @@ def load_transcript(session_id: str, cursor: int | None = None) -> dict:
     return out
 
 
+def live_session(entry: dict) -> str:
+    """The session a thread is on now. A turn starting a new session (a new
+    thread, or after !reset) only writes session_id when it finishes; its
+    pending marker has the id from the moment Claude reports it, which is
+    what lets its first turn be followed live."""
+    return ((entry.get("pending") or {}).get("session_id")
+            or entry.get("session_id") or "")
+
+
+def load_thread(key: str, held: str, cursor: int) -> dict:
+    """The open thread, by its key: the transcript of the session it is on now
+    from `cursor`, and what it is doing (the bot's /thread-state).
+
+    `held` is the session the page has drawn so far. When the thread has moved
+    on to another -- reset, a new thread's first session appearing, a move
+    into a project -- the read starts again from the top and says `reset`,
+    so the page never appends one session's messages to another's. A thread
+    with no session yet, or whose new session has written nothing yet, is an
+    empty transcript rather than an error: it is the moment just after
+    sending, and the page shows the message as on its way.
+    """
+    entry = raw_sessions().get(key) or {}
+    sid = live_session(entry)
+    moved = sid != (held or "")
+    if not sid:
+        data = {"session_id": "", "messages": [], "cursor": 0, "reset": moved}
+    else:
+        data = load_transcript(sid, 0 if moved else max(0, cursor))
+        if data.get("error") and entry.get("pending"):
+            data = {"session_id": sid, "messages": [], "cursor": 0}
+        data.update(session_id=sid, reset=moved)
+    data["key"] = key
+    data["live"] = bot_call("/thread-state", {"key": key}, timeout=1.0) or {"offline": True}
+    return data
+
+
 #: Per transcript, its token usage so far, read incrementally: a transcript
 #: only grows, so each poll reads what was appended since the last one rather
 #: than every transcript in full (2.4s every thirty seconds).
@@ -684,6 +720,10 @@ def allowed_download(path_str: str) -> Path | None:
 READ_TASK_ACTIONS = frozenset({"list", "attention", "counts", "board", "overview",
                                "task", "unmerged", "holding", "roles", "watching"})
 
+#: The largest POST taken: a message's attached files travel in it as base64
+#: (webthread.MAX_FILE_BYTES each, about 4/3 larger encoded).
+MAX_POST_BYTES = 60 * 1024 * 1024
+
 #: Below this a body goes as it is; gzip would only add its header.
 GZIP_MIN = 1024
 
@@ -835,7 +875,11 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/session":
             frm = qs.get("from", [""])[0]
             cursor = int(frm) if frm.isdigit() else None
-            self._cached(load_transcript(qs.get("id", [""])[0], cursor))
+            key = qs.get("key", [""])[0]
+            if key:
+                self._cached(load_thread(key, qs.get("id", [""])[0], cursor or 0))
+            else:
+                self._cached(load_transcript(qs.get("id", [""])[0], cursor))
         elif url.path == "/api/stats":
             self._cached(cached_stats())
         elif url.path == "/api/search":
@@ -862,11 +906,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length > MAX_POST_BYTES:
+            # Said before reading it: a photo too big is refused, not buffered.
+            self._send(413, json.dumps({"ok": False, "error": (
+                f"too big: at most {MAX_POST_BYTES // (1024 * 1024)} MB in one message")}).encode(),
+                "application/json")
+            return
+        try:
             payload = json.loads(self.rfile.read(length)) if length else {}
         except Exception:
             payload = {}
         if url.path == "/api/send":
-            answer = bot_call("/web-message", payload, timeout=3)
+            # A !command is waited on for its replies (bot.WEB_COMMAND_WAIT_S),
+            # and attached files travel inside the request.
+            answer = bot_call("/web-message", payload, timeout=20)
             self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
@@ -1063,7 +1118,7 @@ PAGE = r"""<!doctype html>
   .legend button { margin-left: auto; background: none; border: 1px solid var(--line);
                    color: var(--muted); border-radius: 6px; padding: 2px 10px;
                    font-size: 11px; cursor: pointer; }
-  #chart { display: flex; align-items: flex-end; gap: 6px; height: 120px;
+  .chart { display: flex; align-items: flex-end; gap: 6px; height: 120px;
            border-bottom: 1px solid var(--line2); position: relative; }
   .col { flex: 1; display: flex; flex-direction: column-reverse; gap: 2px;
          height: 100%; justify-content: flex-start; min-width: 8px; }
@@ -1075,12 +1130,12 @@ PAGE = r"""<!doctype html>
   #tip { position: fixed; background: #1E0620; border: 1px solid var(--line);
          border-radius: 8px; padding: 8px 10px; font-size: 12px; pointer-events: none;
          display: none; z-index: 10; font-family: var(--mono); }
-  #dashtable { width: 100%; border-collapse: collapse; font-size: 12px;
+  .dashtable { width: 100%; border-collapse: collapse; font-size: 12px;
                font-family: var(--mono); margin-top: 8px; }
-  #dashtable td, #dashtable th { padding: 3px 10px 3px 0; text-align: right;
+  .dashtable td, .dashtable th { padding: 3px 10px 3px 0; text-align: right;
                border-bottom: 1px solid var(--line2); font-variant-numeric: tabular-nums; }
-  #dashtable th { color: var(--muted); font-weight: 500; }
-  #dashtable td:first-child, #dashtable th:first-child { text-align: left; }
+  .dashtable th { color: var(--muted); font-weight: 500; }
+  .dashtable td:first-child, .dashtable th:first-child { text-align: left; }
   .modelsplit { font-size: 12px; color: var(--muted); margin-top: 10px;
                 font-family: var(--mono); }
 
@@ -1129,8 +1184,38 @@ PAGE = r"""<!doctype html>
                   padding: 3px 0; color: var(--muted); }
 
   /* composer */
-  #composer { flex: none; display: none; gap: 8px; padding-top: 12px;
+  #composer { flex: none; display: none; flex-direction: column; gap: 6px; padding-top: 12px;
               border-top: 1px solid var(--line); margin-top: 8px; }
+  #composer .crow { display: flex; gap: 8px; align-items: flex-end; }
+  label.attach { display: inline-flex; align-items: center; justify-content: center;
+                 cursor: pointer; font-size: 18px; padding: 6px 10px; min-width: 44px;
+                 min-height: 44px; }
+  label.attach input { display: none; }
+  #chips, .tform .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; gap: 6px; align-items: center; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 14px; padding: 2px 4px 2px 10px;
+          font-size: 12px; font-family: var(--mono); max-width: 100%; }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+  .chip button { background: none; border: 0; color: var(--muted); cursor: pointer;
+                 font-size: 15px; padding: 0 6px; }
+  /* the live end of the open thread: what was just sent, and what it is doing */
+  #tlive .msg.out .bubble { opacity: .82; }
+  #tlive .state { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  #tlive .state.bad { color: #D8517F; }
+  #tlive .note .bubble { background: transparent; border: 1px dashed var(--line);
+                         font-size: 13.5px; }
+  .working { display: flex; gap: 10px; align-items: center; color: var(--gold);
+             font-size: 13px; margin: 0 0 14px; }
+  .working .dots::after { content: "…"; animation: blink 1.2s steps(3) infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  .listtop { display: flex; gap: 8px; padding: 10px 10px 0; }
+  .listtop button { flex: 1; }
+  #dashm { display: none; margin: 8px 10px 0; }
+  #dashm summary { font-family: inherit; font-size: 13px; color: var(--ink);
+                   background: var(--panel); border: 1px solid var(--line);
+                   border-radius: 10px; padding: 8px 12px; }
+  #dashphone { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+               padding: 12px; margin-top: 6px; overflow-x: auto; }
   #composer textarea { flex: 1; background: var(--panel); color: var(--ink);
                        border: 1px solid var(--line); border-radius: 10px;
                        padding: 9px 12px; font: inherit; font-size: 14px; resize: none;
@@ -1373,7 +1458,8 @@ PAGE = r"""<!doctype html>
     body.reading .listcol { display: none; }
     body.reading main { display: flex; }
     #backbtn { display: block; align-self: flex-start; margin-bottom: 8px; }
-    #dash { overflow-x: auto; }
+    #dash { display: none; }
+    #dashm { display: block; }
     .msg { max-width: 100%; }
     #composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
     .turnbar .what { max-width: 100%; }
@@ -1433,6 +1519,8 @@ PAGE = r"""<!doctype html>
 <div id="searchresults"></div>
 <div class="layout">
   <div class="listcol">
+    <div class="listtop"><button class="act" onclick="newThreadForm()">+ New thread</button></div>
+    <details id="dashm"><summary id="dashsum">📊 Stats</summary><div id="dashphone"></div></details>
     <div id="kindfilter"></div>
     <nav id="list"></nav>
   </div>
@@ -1440,11 +1528,15 @@ PAGE = r"""<!doctype html>
     <button id="backbtn" class="ghost" onclick="closeSession()">‹ Sessions</button>
     <div id="content">
       <div id="dash"></div>
-      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tfiles"></div></div>
+      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div><div id="tfiles"></div></div>
     </div>
     <div id="composer">
-      <textarea id="reply" placeholder="Message this thread (also posts to Slack) — !commands work too"></textarea>
-      <button class="act" onclick="sendReply()">Send</button>
+      <div id="chips"></div>
+      <div class="crow">
+        <label class="ghost attach" title="attach files or photos">📎<input type="file" id="attach" multiple onchange="addFiles(this.files, 'reply'); this.value = ''"></label>
+        <textarea id="reply" placeholder="Message this thread (also posts to Slack) — !project, !stop, !reset, !brief… work too"></textarea>
+        <button class="act" onclick="sendReply()">Send</button>
+      </div>
     </div>
   </main>
 </div>
@@ -1618,11 +1710,11 @@ function renderDash() {
     </div>`;
   let body;
   if (showTable) {
-    body = `<table id="dashtable"><tr><th>date</th><th>cache read</th><th>fresh in</th><th>output</th></tr>` +
+    body = `<table class="dashtable"><tr><th>date</th><th>cache read</th><th>fresh in</th><th>output</th></tr>` +
       s.days.map(d => `<tr><td>${d.date.slice(5)}</td><td>${fmtTok(d.cache_read)}</td><td>${fmtTok(d.fresh_in)}</td><td>${fmtTok(d.out)}</td></tr>`).join("") + "</table>";
   } else {
     const max = Math.max(1, ...s.days.map(d => d.cache_read + d.fresh_in + d.out));
-    body = `<div id="chart">` + s.days.map(d => {
+    body = `<div class="chart">` + s.days.map(d => {
       const segs = [["cache_read","var(--c-cache)"],["fresh_in","var(--c-fresh)"],["out","var(--c-out)"]]
         .map(([k, c]) => `<div class="seg" style="background:${c};height:${100*d[k]/max}%"></div>`).join("");
       return `<div class="col" data-tip="${d.date} — cache ${fmtTok(d.cache_read)} · fresh ${fmtTok(d.fresh_in)} · out ${fmtTok(d.out)}">${segs}</div>`;
@@ -1632,8 +1724,17 @@ function renderDash() {
   const models = s.models.length
     ? `<div class="modelsplit">output by model: ` +
       s.models.map(([m, t]) => `${esc(m)} ${fmtTok(t)}`).join(" · ") + "</div>" : "";
-  if (!setHTML(document.getElementById("dash"), tiles + legend + body + models)) return;
-  document.querySelectorAll("#chart .col").forEach(col => {
+  const html = tiles + legend + body + models;
+  // Twice: above the open thread, and at the top of the phone's session list,
+  // where it can be reached -- on a phone the thread column is a screen of its
+  // own and the panel scrolled away above it (#dashm).
+  const wrote = setHTML(document.getElementById("dash"), html);
+  const sum = document.getElementById("dashsum");
+  if (sum) sum.textContent = `📊 $${s.total_cost.toFixed(2)} · ${s.threads} threads · cache ${
+    s.cache_rate == null ? "—" : s.cache_rate + "%"}`;
+  const phoneDash = document.getElementById("dashphone");
+  if (!(phoneDash && setHTML(phoneDash, html)) && !wrote) return;
+  document.querySelectorAll(".chart .col").forEach(col => {
     col.onmousemove = e => {
       const tip = document.getElementById("tip");
       tip.textContent = col.dataset.tip; tip.style.display = "block";
@@ -1798,7 +1899,7 @@ function renderList(shown) {
 // The open thread is read from where the last read stopped (a byte cursor the
 // server hands back), and new messages are appended: the whole transcript used
 // to be fetched and redrawn every four seconds, closing every open <details>.
-let tview = {key: null, sid: null, cursor: 0, busy: false};
+let tview = {key: null, sid: "", cursor: 0, busy: false, live: null};
 function messageHtml(m) {
   let inner = "";
   for (const b of m.blocks) {
@@ -1866,11 +1967,14 @@ function filesHtml(files) {
 async function loadTranscript(scroll) {
   if (!active) return;
   const s = active;
-  // A new thread, a reset session, or a click: start again from the top.
-  // Otherwise one read at a time, each from where the last stopped.
+  // A new thread or a click starts again from the top. Otherwise one read at
+  // a time, each from where the last stopped. The read names the thread, not
+  // a session: the server answers for whichever session the thread is on now
+  // (a reset, or a new thread's first session, included) and says `reset`
+  // when that is not the one drawn so far.
   if (scroll) showReading();
-  if (scroll || tview.key !== s.key || tview.sid !== s.session_id)
-    tview = {key: s.key, sid: s.session_id, cursor: 0, busy: false, error: false};
+  if (scroll || tview.key !== s.key)
+    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false};
   const want = tview, from = want.cursor;
   // One read at a time; a call made meanwhile (a rename, a resummarize) is
   // remembered and run once this one is drawn, so it still shows promptly.
@@ -1879,7 +1983,8 @@ async function loadTranscript(scroll) {
   let data, files;
   try {
     [data, files] = await Promise.all([
-      (await fetch("/api/session?id=" + encodeURIComponent(s.session_id) + "&from=" + from)).json(),
+      (await fetch("/api/session?key=" + encodeURIComponent(s.key) + "&id=" +
+                   encodeURIComponent(want.sid || "") + "&from=" + from)).json(),
       readJSON("/api/artifacts?key=" + encodeURIComponent(s.key)),
     ]);
   } finally { want.busy = false; }
@@ -1892,38 +1997,284 @@ async function loadTranscript(scroll) {
     want.error = true;
     want.cursor = 0;
   } else {
-    // The first read, a file replaced underneath (reset), or recovering from
-    // an error starts the messages over; anything else is only what is new.
+    // The first read, another session (reset), or recovering from an error
+    // starts the messages over; anything else is only what is new.
     if (from === 0 || data.reset || want.error) msgs.innerHTML = "";
     want.error = false;
     if (data.messages.length)
       msgs.insertAdjacentHTML("beforeend", data.messages.map(messageHtml).join(""));
+    else if (!msgs.innerHTML && !data.session_id)
+      msgs.innerHTML = `<div class="empty">No messages yet.</div>`;
     want.cursor = data.cursor || 0;
+    want.live = data.live || null;
+    arrived(s.key, data.messages, (want.live && want.live.turns) || []);
   }
+  if (data.session_id !== undefined) want.sid = data.session_id || "";
+  want.live = data.live || null;
+  drawLive();
   setHTML(document.getElementById("tfiles"), filesHtml(files));
   document.getElementById("composer").style.display = "flex";
   if (scroll) document.getElementById("transcript").scrollIntoView(false);
   if (want.again && tview === want) { want.again = false; loadTranscript(false); }
 }
 
-// --- composer / commands ---
-async function sendText(text) {
-  if (!active || !text.trim()) return;
-  const r = await (await fetch("/api/send", {method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({key: active.key, text: text.trim()})})).json();
-  toast(r.ok ? "Sent — reply lands here and in Slack" : "Failed: " + (r.error || "unknown"));
+// --- the live end of the open thread ---
+// What was sent from this page and has not yet become transcript, per thread:
+// {ref, text, files, kind ("prompt" | "command"), at, replies, finished, seen}.
+// `ref` is the message's ts, which /api/send hands back and the bot records as
+// the source_ref of the task the message's turn becomes; the thread's live
+// state (/thread-state, carried on every transcript read) says what that
+// task is doing -- sending, queued behind the turn that holds the thread,
+// running, or how it ended. One mechanism: the transcript read above.
+const outgoing = new Map();
+function sentFor(key) {
+  if (!outgoing.has(key)) outgoing.set(key, []);
+  return outgoing.get(key);
 }
-function cmdSend(cmd) { sendText(cmd); setTimeout(loadList, 800); }
-function sendReply() {
+// A message the transcript now holds is no longer drawn as on its way. The
+// turn's prompt is the message, sometimes with Slack context before it or a
+// note about attachments after, so it is found by what was typed.
+function arrived(key, messages, turns) {
+  const items = sentFor(key);
+  // Only a message whose turn has not ended can be arriving now: the same
+  // words sent again after a failed turn are the new one.
+  const ended = new Set((turns || []).filter(t => !["queued", "running"].includes(t.state))
+                                     .map(t => t.ref));
+  const live = new Set((turns || []).filter(t => ["queued", "running"].includes(t.state))
+                                    .map(t => t.ref));
+  if (!items.length || !messages || !messages.length) return;
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    const said = m.blocks.filter(b => b.type === "text").map(b => b.text).join("\n");
+    if (!said) continue;
+    // Written after it was sent (two minutes' grace for the phone's clock),
+    // so a reread from the top cannot match an older message saying the same.
+    const at = m.ts ? Date.parse(m.ts) : NaN;
+    const fits = items.filter(i => i.kind === "prompt" && !i.seen && i.ref && !ended.has(i.ref) &&
+      !(at < i.at - 120000) &&
+      (i.text ? said.includes(i.text.slice(0, 80)) : said.includes("attached")));
+    const it = fits.find(i => live.has(i.ref)) || fits[0];
+    if (it) it.seen = true;
+  }
+}
+// Drop what is done with: a prompt whose turn finished, or which the
+// transcript now shows. Whatever was sent before it goes too -- a command's
+// replies, a turn that failed -- so the thread reads in the order it
+// happened; only what is still on its way stays.
+function prune(items, turns) {
+  const state = new Map(turns.map(t => [t.ref, t.state]));
+  const over = it => it.kind === "prompt" && !!it.ref && (state.get(it.ref) === "done" ||
+    (it.seen && (state.get(it.ref) === "running" || !state.has(it.ref))));
+  const waiting = it => it.kind === "prompt" && !over(it) &&
+    (!it.ref || ["queued", "running"].includes(state.get(it.ref)));
+  let cut = -1;
+  items.forEach((it, i) => { if (over(it)) cut = i; });
+  return items.filter((it, i) => i > cut || waiting(it));
+}
+const QUEUED_NOTE = "queued — runs when the turn in progress finishes";
+function outBubble(it, note, bad, who) {
+  const files = it.files && it.files.length
+    ? `<div class="state">📎 ${it.files.map(esc).join(", ")}</div>` : "";
+  return `<div class="msg user out"><div class="who">${esc(who || (it.kind === "command" ? "you · command" : "you · dashboard"))}</div>
+    ${it.text ? `<div class="bubble">${md(it.text)}</div>` : ""}${files}
+    ${note ? `<div class="state${bad ? " bad" : ""}">${esc(note)}</div>` : ""}</div>`;
+}
+function noteBubble(text) {
+  return `<div class="msg bot note"><div class="who">silkworm</div><div class="bubble">${md(text)}</div></div>`;
+}
+function promptNote(it, t) {
+  if (!it.ref) return ["sending…", false];
+  if (!t) return ["sent", false];
+  if (t.state === "queued") return [QUEUED_NOTE, false];
+  if (t.state === "running") return ["starting…", false];
+  if (t.state === "failed") return ["⚠ failed" + (t.why ? ": " + t.why : ""), true];
+  if (t.state === "cancelled") return ["stopped" + (t.why ? " — " + t.why : ""), true];
+  if (t.state === "blocked") return ["held — " + (t.why || "it will be retried"), true];
+  return [t.state || "", false];
+}
+function liveHtml(s, live, items) {
+  live = live || {};
+  const turns = live.turns || [];
+  const byRef = new Map(turns.map(t => [t.ref, t]));
+  let h = "";
+  for (const it of items) {
+    if (it.kind === "command")
+      h += outBubble(it, it.finished === false ? "still running — the rest of what it says is in Slack" : "");
+    else h += outBubble(it, ...promptNote(it, byRef.get(it.ref)));
+    for (const r of it.replies || []) h += noteBubble(r);
+  }
+  // Messages waiting their turn that this page did not send: from Slack, or
+  // from the dashboard open elsewhere. The thread runs one turn at a time.
+  for (const t of turns)
+    if (t.state === "queued" && !items.some(i => i.ref === t.ref))
+      h += outBubble({kind: "prompt", text: t.title, files: []}, QUEUED_NOTE, false,
+                     t.source === "slack" ? "you · slack" : "you · queued");
+  if (live.running)
+    h += `<div class="working">⏳ <b>Working<span class="dots"></span></b>
+      <span>${s.turn ? dur(s.turn.age_s) : ""}</span>
+      <button class="ghost" onclick="cmdSend('!stop')">■ Stop</button></div>`;
+  const ended = turns.filter(t => t.state !== "queued" && t.state !== "running");
+  const last = ended[ended.length - 1];
+  if (last && !live.running && ["failed", "cancelled"].includes(last.state)
+      && !items.some(i => i.ref === last.ref))
+    h += `<div class="state bad">⚠ The last turn ${last.state === "failed" ? "failed" : "was stopped"}${
+      last.why ? ": " + esc(last.why) : ""}</div>`;
+  if (live.checked_out)
+    h += `<div class="state bad">This thread is checked out to the terminal, so messages are held.
+      <button class="ghost" onclick="cmdSend('!back')">Reclaim</button>
+      <button class="ghost" onclick="cmdSend('!takeover')">Take over</button></div>`;
+  if (live.offline)
+    h += `<div class="state bad">The bot is offline: a message sent now waits until it is back.</div>`;
+  return h;
+}
+function drawLive() {
+  if (!active || tview.key !== active.key) return;
+  const turns = (tview.live && tview.live.turns) || [];
+  const items = prune(sentFor(active.key), turns);
+  outgoing.set(active.key, items);
+  setHTML(document.getElementById("tlive"), liveHtml(active, tview.live, items));
+}
+// Something is under way in the open thread: it is read every 1.5s rather
+// than every 4s, so a reply streams in as the transcript is written. A
+// message still on its way counts; one whose turn ended badly does not, nor
+// one the bot never made a turn of (a checked-out thread) after a minute.
+function threadBusy() {
+  if (!active || tview.key !== active.key) return false;
+  const live = tview.live || {};
+  const state = new Map((live.turns || []).map(t => [t.ref, t.state]));
+  return !!(live.running || (live.queued && live.queued.length) ||
+            sentFor(active.key).some(i => i.kind === "prompt" && (!i.ref ||
+              ["queued", "running"].includes(state.get(i.ref)) ||
+              (!state.has(i.ref) && Date.now() - i.at < 60000))));
+}
+
+// --- composer / commands ---
+// Files waiting to go with the next message: the composer's, and the new
+// thread form's. Read into base64 only when sent; the request carries them
+// (the dashboard's POSTs are JSON, which is also what the proxy gate wants).
+const MAX_FILE_MB = 25;
+const staged = {reply: [], nt: []};
+function addFiles(list, where) {
+  for (const f of Array.from(list || [])) {
+    if (f.size > MAX_FILE_MB * 1024 * 1024) { toast(`${f.name} is over ${MAX_FILE_MB} MB`); continue; }
+    staged[where].push(f);
+  }
+  renderChips(where);
+}
+function dropFile(where, i) { staged[where].splice(i, 1); renderChips(where); }
+function renderChips(where) {
+  const box = document.getElementById(where === "nt" ? "ntchips" : "chips");
+  if (!box) return;
+  setHTML(box, staged[where].map((f, i) =>
+    `<span class="chip"><span>${esc(f.name)}</span><button title="remove" onclick="dropFile('${where}', ${i})">✕</button></span>`).join(""));
+}
+function readB64(file) {
+  return new Promise((ok, fail) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result).split(",", 2)[1] || "");
+    r.onerror = () => fail(r.error || new Error("could not read " + file.name));
+    r.readAsDataURL(file);
+  });
+}
+async function encodeFiles(files) {
+  return Promise.all(files.map(async f =>
+    ({name: f.name, type: f.type || "", data: await readB64(f)})));
+}
+async function postSend(payload) {
+  try {
+    const r = await fetch("/api/send", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    return await r.json();
+  } catch (e) {
+    return {ok: false, error: "could not reach the dashboard"};
+  }
+}
+// Shown at once as on its way, then followed by its ref (see `outgoing`).
+// A command waits for its replies (the bot runs it through handle_command,
+// as from Slack) and they are drawn under it.
+async function sendText(text, files) {
+  if (!active) return false;
+  text = (text || "").trim(); files = files || [];
+  if (!text && !files.length) return false;
+  const key = active.key;
+  const it = {ref: "", text, files: files.map(f => f.name),
+              kind: text.startsWith("!") ? "command" : "prompt", at: Date.now()};
+  sentFor(key).push(it);
+  drawLive();
+  let r;
+  try { r = await postSend({key, text, files: await encodeFiles(files)}); }
+  catch (e) { r = {ok: false, error: String(e && e.message || e)}; }
+  if (!r.ok) {
+    outgoing.set(key, sentFor(key).filter(x => x !== it));
+    toast("Not sent: " + (r.error || "unknown"));
+  } else {
+    it.ref = r.ref || "";
+    it.replies = r.replies || [];
+    it.finished = r.finished;
+  }
+  drawLive();
+  loadTranscript(false);
+  if (it.kind === "command") loadList();
+  return !!r.ok;
+}
+function cmdSend(cmd) { sendText(cmd); }
+async function sendReply() {
   const box = document.getElementById("reply");
-  sendText(box.value); box.value = "";
+  const text = box.value, files = staged.reply.slice();
+  if (!text.trim() && !files.length) return;
+  box.value = ""; staged.reply = []; renderChips("reply");
+  // Not sent: put it back, so nothing typed or picked is lost.
+  if (!(await sendText(text, files)) && !box.value) {
+    box.value = text; staged.reply = files; renderChips("reply");
+  }
 }
 document.addEventListener("keydown", e => {
-  if (e.target.id === "reply" && e.key === "Enter" && !e.shiftKey) {
+  // On a phone Return is a new line; the Send button sends.
+  if (e.target.id === "reply" && e.key === "Enter" && !e.shiftKey && !phone()) {
     e.preventDefault(); sendReply();
   }
 });
+
+// --- a new thread ---
+// Its first message is posted in Slack's home channel as the thread's parent,
+// and the thread is then the same as one started there. A project is filed by
+// the bot with `!project <slug>` before the first turn, so it is inherited
+// exactly as from Slack.
+async function newThreadForm() {
+  try { await loadFormChoices(); } catch (e) { formProjects = formProjects || []; }
+  staged.nt = [];
+  openModal(`<div class="tform"><h3>New thread</h3>
+    <div class="sub">It starts in Slack too, under the bot's home channel — reply from either side.</div>
+    <label>project <span class="note">(optional — the thread is filed under it, as <code>!project</code> does)</span></label>
+    <select id="ntproj"><option value="">(no project)</option>${(formProjects || []).map(p =>
+      `<option value="${esc(p.slug)}">${esc(p.title || p.slug)}</option>`).join("")}</select>
+    <label>message</label>
+    <textarea id="nttext" placeholder="What is it about?"></textarea>
+    <div class="line"><label class="ghost attach" title="attach files or photos">📎<input type="file" multiple onchange="addFiles(this.files, 'nt'); this.value = ''"></label>
+      <div class="chips" id="ntchips"></div></div>
+    ${modalButtons("submitNewThread", "Start thread")}</div>`, {kind: "thread"});
+}
+async function submitNewThread() {
+  const text = document.getElementById("nttext").value.trim();
+  const project = document.getElementById("ntproj").value;
+  const files = staged.nt.slice();
+  if (!text && !files.length) { formError("a thread starts with a message"); return; }
+  formError("");
+  let r;
+  try { r = await postSend({new: true, text, project, files: await encodeFiles(files)}); }
+  catch (e) { r = {ok: false, error: String(e && e.message || e)}; }
+  if (!r.ok) { formError(r.error || "refused"); return; }
+  closeModal();
+  staged.nt = [];
+  sentFor(r.key).push({ref: r.ref, text, files: files.map(f => f.name), kind: "prompt",
+                       at: Date.now(), replies: r.replies || []});
+  // Until the list has it: enough of a session for the header to draw.
+  active = {key: r.key, title: "", kind: "thread", project, session_id: "", summary: "",
+            events: [], turns: 0, cost: 0, updated: Date.now() / 1000, files: 0,
+            resume_cmd: "", slack_link: r.link || "", running: true};
+  loadTranscript(true);
+  loadList();
+}
 
 // --- search ---
 let searchTimer = null;
@@ -3466,11 +3817,13 @@ function poller(fn) {
 }
 const pollList = poller(loadList), pollStats = poller(loadStats),
       pollTranscript = poller(() => active ? loadTranscript(false) : null),
+      pollLive = poller(() => threadBusy() ? loadTranscript(false) : null),
       pollBoard = poller(() => boardIsOpen() ? refreshBoard() : null);
 loadList(); loadStats();
 setInterval(pollList, 5000);
 setInterval(pollStats, 30000);
 setInterval(pollTranscript, 4000);
+setInterval(pollLive, 1500);
 setInterval(pollBoard, 5000);
 document.addEventListener("visibilitychange", () => {
   if (visible()) { pollList(); pollStats(); pollTranscript(); pollBoard(); }
