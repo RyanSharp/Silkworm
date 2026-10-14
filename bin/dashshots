@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Screenshots of every dashboard view, on a phone and a laptop.
+
+    bin/dashshots [--out DIR] [--views sessions,board,...] [--widths 375,430,1280]
+                  [--source DIR] [--wait 5] [--list]
+
+Mobile Safari in an iOS Simulator for the phone widths (375: iPhone SE (3rd
+generation), 430: iPhone 16 Plus), and WebKit itself (a WKWebView snapshot,
+the engine desktop Safari uses) for the laptop width. Each view is opened by
+URL -- the dashboard's own deep links, ?view= ?modal= ?thread= ?task= ?card= -- since
+the simulator has no tap automation. Files are DIR/<view>-<width>.png.
+
+Nothing here can change Silkworm's state. The dashboard is a copy of
+--source's code run from a temp directory against a copy of sessions.json,
+and the bot it talks to is a stand-in that passes only reads through to the
+real bot (the task board, projects, roles, learnings) and refuses every
+action; a release plan is a fixed sample, since a real one fetches origin.
+Transcripts are read where they are, as the dashboard always does.
+
+The simulators are this script's own ("Silkworm Shots 375" / "... 430",
+made on first use) and are shut down at the end. It refuses to touch any
+other device -- in particular "Cadence Test iPhone 17", which another
+project's test runs use.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import quote
+
+REPO = Path(__file__).resolve().parent.parent
+SWIFT_SRC = REPO / "bin" / "websnap.swift"
+FORBIDDEN_DEVICES = {"Cadence Test iPhone 17"}
+DEVICES = {375: ("Silkworm Shots 375", "iPhone SE (3rd generation)"),
+           430: ("Silkworm Shots 430", "iPhone 16 Plus")}
+DESKTOP = 1280
+
+#: /tasks actions that only read (visualizer.READ_TASK_ACTIONS, plus nothing).
+READ_TASKS = {"list", "attention", "counts", "board", "overview", "task", "unmerged",
+              "holding", "roles", "watching"}
+READ_PROJECTS = {"list", "get", "unregistered"}
+READ_LEARNINGS = {"list"}
+#: Routes that only ever read: whether the bot is up, and a thread's live turn.
+READ_ROUTES = {"/status", "/thread-state"}
+
+#: A release plan to draw, shaped as releases.plan answers.
+SAMPLE_PLAN = {
+    "ok": True, "base": "main", "running": False, "blocked": "", "confirm": "sample",
+    "targets": [
+        {"target": "functions", "pending": 3, "last": "functions-v1.4.2", "ship": "deploy",
+         "after": ["migrations"], "versions": {"patch": "1.4.3", "minor": "1.5.0", "major": "2.0.0"},
+         "commits": ["a1b2c3d Reminders use the user's own calendar, not Gregorian",
+                     "d4e5f6a create-group-invite returns a universal link",
+                     "0f9e8d7 verify-transaction checks the whole certificate chain"]},
+        {"target": "migrations", "pending": 1, "last": "migrations-v0.9.0", "ship": "deploy",
+         "versions": {"patch": "0.9.1", "minor": "0.10.0", "major": "1.0.0"},
+         "commits": ["9a8b7c6 completion_photos: owner-only delete policy"]},
+        {"target": "app", "pending": 0, "last": "v1.1.0", "ship": "tag",
+         "versions": {"patch": "1.1.1", "minor": "1.2.0", "major": "2.0.0"}, "commits": []}],
+    "steps": [{"target": "migrations", "tag": "migrations-v0.9.1", "level": "patch", "commits": 1},
+              {"target": "functions", "tag": "functions-v1.4.3", "level": "patch", "commits": 3}],
+    "effects": ["supabase db push: 1 migration", "supabase functions deploy: 3 functions"],
+}
+
+
+def live_home() -> Path:
+    """The checkout the running bot uses (the git common dir's parent)."""
+    out = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-common-dir"],
+                         capture_output=True, text=True).stdout.strip()
+    common = Path(out) if out else REPO / ".git"
+    if not common.is_absolute():
+        common = REPO / common
+    return common.resolve().parent
+
+
+def env_value(path: Path, name: str) -> str:
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:]
+            k, _, v = line.partition("=")
+            if k.strip() == name:
+                return v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# --- the stand-in bot ----------------------------------------------------------
+
+def stand_in(real_port: str):
+    class Bot(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                payload = {}
+            action = payload.get("action", "list")
+            allowed = {"/tasks": READ_TASKS, "/projects": READ_PROJECTS,
+                       "/learnings": READ_LEARNINGS}.get(self.path)
+            if self.path in READ_ROUTES:
+                allowed, action = {action}, action
+            if self.path == "/releases" and action == "plan":
+                answer = SAMPLE_PLAN
+            elif self.path == "/releases" and action == "status":
+                answer = {"ok": True, "run": None}
+            elif allowed is not None and action in allowed:
+                answer = forward(real_port, self.path, payload)
+            else:
+                answer = {"ok": False, "error": "screenshot harness: read-only"}
+            body = json.dumps(answer).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+    return Bot
+
+
+def forward(port: str, path: str, payload: dict) -> dict:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"ok": False, "error": f"real bot unreachable: {e}"}
+
+
+# --- the dashboard copy --------------------------------------------------------
+
+def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: int):
+    for f in source.glob("*.py"):
+        shutil.copy2(f, tmp / f.name)
+    if (source / "assets").is_dir():
+        shutil.copytree(source / "assets", tmp / "assets")
+    for name in ("sessions.json",):
+        if (home / name).exists():
+            shutil.copy2(home / name, tmp / name)
+    (tmp / ".env").write_text(f"APPROVAL_PORT={bot_port}\n")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("VIZ_", "SILKWORM_"))}
+    env["SILKWORM_VIZ_PORT"] = str(port)
+    py = home / ".venv" / "bin" / "python"
+    proc = subprocess.Popen([str(py if py.exists() else sys.executable), "visualizer.py"],
+                            cwd=tmp, env=env, stdout=subprocess.DEVNULL,
+                            stderr=open(tmp / "viz.log", "w"))
+    for _ in range(100):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1).read()
+            return proc
+        except Exception:
+            if proc.poll() is not None:
+                raise SystemExit("dashboard copy died:\n" + (tmp / "viz.log").read_text())
+            time.sleep(0.1)
+    raise SystemExit("dashboard copy never answered")
+
+
+# --- what to shoot ------------------------------------------------------------
+
+def get_json(url: str, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method="POST" if data else "GET",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def pick_examples(base: str, project: str) -> dict:
+    """A long conversation and a task with a review, from the copy's own data."""
+    out = {"thread": "", "card": "", "task": ""}
+    sessions = get_json(base + "/api/sessions").get("sessions", [])
+    convs = [s for s in sessions if (s.get("kind") or "thread") == "thread"
+             and not s.get("hidden") and s.get("turns", 0) > 2]
+    if convs:
+        out["thread"] = max(convs, key=lambda s: s.get("updated", 0))["key"]
+    board = get_json(base + "/api/tasks", {"action": "board", "project": project})
+    cards = [t for col in (board.get("columns") or {}).values() for t in col]
+    cards.sort(key=lambda t: (bool(t.get("review")), t.get("created", 0)), reverse=True)
+    if cards:
+        out["card"] = cards[0]["id"]
+    # ?task= opens the task panel on a row that needs you, so pick one that does.
+    needs = get_json(base + "/api/tasks", {"action": "attention"}).get("tasks") or []
+    out["task"] = needs[0]["id"] if needs else out["card"]
+    return out
+
+
+def views(ex: dict, project: str) -> list[tuple[str, str]]:
+    p = quote(project)
+    return [
+        ("sessions", "/"),
+        ("stats", "/?view=stats"),
+        ("thread", f"/?thread={quote(ex['thread'])}"),
+        ("search", "/?q=" + quote("tailscale")),
+        ("new-thread", "/?modal=new-thread"),
+        ("tasks", "/?view=tasks"),
+        ("tasks-all", "/?view=tasks&tab=all"),
+        ("task", f"/?task={quote(ex['task'])}"),
+        ("projects", "/?view=projects"),
+        ("board", f"/?view=project&slug={p}"),
+        ("card", f"/?view=project&slug={p}&card={quote(ex['card'])}"),
+        ("new-task", f"/?view=project&slug={p}&modal=new-task"),
+        ("settings", f"/?view=projects&modal=settings&slug={p}"),
+        ("new-project", "/?modal=new-project"),
+        ("release", f"/?view=projects&modal=release&slug={p}"),
+        ("learnings", "/?view=learnings"),
+    ]
+
+
+# --- simulators ----------------------------------------------------------------
+
+def simctl(*args, check=True, capture=True):
+    r = subprocess.run(["xcrun", "simctl", *args], capture_output=capture, text=True)
+    if check and r.returncode:
+        raise SystemExit(f"simctl {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout if capture else ""
+
+
+def device_for(width: int) -> str:
+    name, kind = DEVICES[width]
+    assert name not in FORBIDDEN_DEVICES
+    listing = json.loads(simctl("list", "devices", "-j"))
+    for runtime, devs in listing["devices"].items():
+        for d in devs:
+            if d["name"] == name and d.get("isAvailable", True):
+                return d["udid"]
+    runtimes = [r for r in json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
+                if r.get("isAvailable") and r["identifier"].startswith(
+                    "com.apple.CoreSimulator.SimRuntime.iOS")]
+    if not runtimes:
+        raise SystemExit("no iOS simulator runtime installed")
+    rt = max(runtimes, key=lambda r: [int(x) for x in r["version"].split(".")])
+    types = json.loads(simctl("list", "devicetypes", "-j"))["devicetypes"]
+    t = next(x for x in types if x["name"] == kind)
+    return simctl("create", name, t["identifier"], rt["identifier"]).strip()
+
+
+def shoot_phone(width: int, base: str, shots, out: Path, wait: float):
+    udid = device_for(width)
+    name = DEVICES[width][0]
+    print(f"  {name} ({udid})")
+    state = json.loads(simctl("list", "devices", "-j"))
+    booted_before = any(d["udid"] == udid and d["state"] == "Booted"
+                        for devs in state["devices"].values() for d in devs)
+    try:
+        if not booted_before:
+            simctl("boot", udid)
+        simctl("bootstatus", udid, "-b")
+        simctl("ui", udid, "appearance", "dark", check=False)
+        # Safari's first open of a page is slow on a fresh boot.
+        simctl("openurl", udid, base + "/")
+        time.sleep(wait * 2)
+        for view, path in shots:
+            simctl("openurl", udid, base + path)
+            time.sleep(wait)
+            simctl("io", udid, "screenshot", str(out / f"{view}-{width}.png"))
+            print(f"    {view}-{width}.png")
+    finally:
+        simctl("shutdown", udid, check=False)
+
+
+def snapper(tmp: Path) -> Path:
+    cache = Path.home() / ".cache" / "silkworm-dashshots"
+    cache.mkdir(parents=True, exist_ok=True)
+    exe = cache / "websnap"
+    if not exe.exists() or exe.stat().st_mtime < SWIFT_SRC.stat().st_mtime:
+        r = subprocess.run(["swiftc", "-O", str(SWIFT_SRC), "-o", str(exe)],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit("swiftc websnap failed:\n" + r.stderr)
+    return exe
+
+
+def shoot_desktop(base: str, shots, out: Path, wait: float, tmp: Path):
+    exe = snapper(tmp)
+    for view, path in shots:
+        dest = out / f"{view}-{DESKTOP}.png"
+        r = subprocess.run([str(exe), base + path, str(dest), str(DESKTOP), "860", str(wait)],
+                           capture_output=True, text=True, timeout=120)
+        print(f"    {dest.name}" + ("" if r.returncode == 0 else f"  FAILED {r.stdout}{r.stderr}"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--out", default=str(REPO / "artifacts" / "dashshots"))
+    ap.add_argument("--views", default="")
+    ap.add_argument("--widths", default="375,430,1280")
+    ap.add_argument("--source", default=str(REPO), help="checkout whose visualizer.py is shot")
+    ap.add_argument("--project", default="silkworm")
+    ap.add_argument("--wait", type=float, default=5.0, help="seconds per view to settle")
+    ap.add_argument("--list", action="store_true", help="print the views and exit")
+    a = ap.parse_args()
+
+    home = live_home()
+    real_port = env_value(home / ".env", "APPROVAL_PORT") or "8787"
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="dashshots-") as td:
+        tmp = Path(td)
+        bot_port = free_port()
+        bot = ThreadingHTTPServer(("127.0.0.1", bot_port), stand_in(real_port))
+        threading.Thread(target=bot.serve_forever, daemon=True).start()
+        port = free_port()
+        proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            ex = pick_examples(base, a.project)
+            shots = views(ex, a.project)
+            if a.views:
+                want = set(a.views.split(","))
+                shots = [s for s in shots if s[0] in want]
+            if a.list:
+                for v, p in shots:
+                    print(f"{v:12} {p}")
+                return
+            print(f"dashboard copy at {base} (stand-in bot :{bot_port}) -> {out}")
+            for w in [int(x) for x in a.widths.split(",") if x]:
+                if w == DESKTOP:
+                    print(f"  desktop {DESKTOP}px (WKWebView)")
+                    shoot_desktop(base, shots, out, a.wait, tmp)
+                elif w in DEVICES:
+                    shoot_phone(w, base, shots, out, a.wait)
+                else:
+                    raise SystemExit(f"no device for width {w}; use {sorted(DEVICES)} or {DESKTOP}")
+        finally:
+            proc.terminate()
+            bot.shutdown()
+
+
+if __name__ == "__main__":
+    main()

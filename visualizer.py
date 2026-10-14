@@ -1528,64 +1528,232 @@ PAGE = r"""<!doctype html>
   #toast { bottom: calc(18px + env(safe-area-inset-bottom)); }
   .task.flash { outline: 2px solid var(--gold); outline-offset: 2px; }
   #notifybtn.on { color: var(--gold); }
-  @media (max-width: 700px) {
-    body { font-size: 15px; }
-    header { flex-wrap: wrap; gap: 8px; padding-bottom: 8px;
-             padding-left: max(12px, env(safe-area-inset-left));
-             padding-right: max(12px, env(safe-area-inset-right)); }
-    header h1 { font-size: 16px; }
-    header button.hbtn { margin-left: 0 !important; padding: 8px 11px; }
-    header .hbtn:first-of-type { margin-left: auto !important; }
-    header .lbl, header .wide { display: none; }
-    #search { order: 9; flex: 1 1 100%; width: auto; margin-left: 0; }
-    #searchresults { left: 8px; right: 8px; width: auto; }
-    #alertbar { padding: 0 12px 8px; }
+  /* Phone-only controls: the header's search and overflow buttons and the
+     board's column picker. Hidden here, so the laptop page is unchanged. */
+  .phoneonly, .bpick { display: none; }
+  .hmore { display: contents; }
 
+  /* --- phone (max-width: 700px) ----------------------------------------
+     One breakpoint, one set of measures. On a phone:
+     - the header is one row: brand, Tasks, Projects, 🔍 (search drops in
+       as a second row only while open) and ⋯ (Learnings, Name untitled,
+       Notify, as a menu);
+     - titles and prose are the proportional face and wrap on spaces; ids,
+       keys and hashes stay monospace and ellipsize rather than break;
+     - chip rows scroll sideways inside themselves instead of wrapping;
+     - the board shows one column at a time, picked from a row of tabs;
+     - panels and forms are full-screen sheets, their actions pinned to
+       the bottom;
+     - anything tapped is at least --tap tall, and every field is --field-fs
+       so iOS does not zoom the page on focus. */
+  @media (max-width: 700px) {
+    :root {
+      --tap: 44px;                     /* Apple's minimum hit target */
+      --field-fs: 16px;                /* below this, iOS zooms in on focus */
+      --gutter: 12px;
+      --sans: -apple-system, "Segoe UI", sans-serif;
+      --safe-l: max(var(--gutter), env(safe-area-inset-left));
+      --safe-r: max(var(--gutter), env(safe-area-inset-right));
+      --safe-t: max(var(--gutter), env(safe-area-inset-top));
+      --safe-b: env(safe-area-inset-bottom);
+    }
+    body { font-size: 15px; }
+    html, body { overflow-x: hidden; }
+
+    /* header: one row */
+    header { position: relative; flex-wrap: nowrap; gap: 4px; padding: 6px var(--safe-r) 6px var(--safe-l);
+             padding-top: max(6px, env(safe-area-inset-top)); }
+    header svg { width: 30px; height: 20px; }
+    header h1 { font-size: 17px; min-width: 0; flex: 0 1 auto; overflow: hidden;
+                text-overflow: ellipsis; margin-left: 2px; }
+    #botdot { margin: 0 4px; }
+    header .lbl, header .wide { display: none; }
+    header button.hbtn { margin-left: 0 !important; min-width: var(--tap); min-height: var(--tap);
+                         padding: 0 9px; font-size: 18px; border-color: transparent;
+                         display: inline-flex; align-items: center; justify-content: center; }
+    header .hbtn:first-of-type { margin-left: auto !important; }
+    header .phoneonly { display: inline-flex; }
+    #taskbadge { font-size: 11px; }
+    .hmore { display: none; }
+    header.menu .hmore { display: flex; flex-direction: column; position: absolute; z-index: 35;
+                         top: calc(100% - 4px); right: var(--safe-r); min-width: 220px;
+                         background: #1E0620; border: 1px solid var(--line); border-radius: 12px;
+                         padding: 6px; box-shadow: 0 10px 30px #0008; }
+    header.menu .hmore button.hbtn { justify-content: flex-start; gap: 10px; font-size: 16px;
+                                     padding: 0 12px; color: var(--ink); width: 100%; }
+    header.menu .hmore .lbl, header.menu .hmore .wide { display: inline; }
+    #search { display: none; order: 9; flex: 1 1 100%; width: auto; margin: 4px 0 2px;
+              min-height: var(--tap); }
+    body.searching header { flex-wrap: wrap; }
+    body.searching #search { display: block; }
+    #searchresults { left: 8px; right: 8px; width: auto; }
+    #searchresults .hit { overflow-wrap: anywhere; }
+    #alertbar { padding: 6px var(--safe-r) 6px var(--safe-l); }
+    #alertbar .alert { min-height: 36px; display: inline-flex; align-items: center; }
+
+    /* the list and the open thread take turns */
     .layout { display: block; flex: 1; overflow: hidden; }
     .listcol { height: 100%; }
+    .listtop { padding: 10px var(--safe-r) 0 var(--safe-l); }
+    #dashm { margin: 8px var(--safe-r) 0 var(--safe-l); }
+    #dashm summary { min-height: var(--tap); display: flex; align-items: center;
+                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     nav { width: auto; border-right: 0; flex: 1; min-height: 0;
-          padding: 10px max(10px, env(safe-area-inset-right))
-                   calc(10px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); }
-    main { display: none; height: 100%;
-           padding: 10px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left)); }
+          padding: 8px var(--safe-r) calc(10px + var(--safe-b)) var(--safe-l); }
+    main { display: none; height: 100%; padding: 8px var(--safe-r) 0 var(--safe-l); }
     body.reading .listcol { display: none; }
     body.reading main { display: flex; }
-    #backbtn { display: block; align-self: flex-start; margin-bottom: 8px; }
+    #backbtn { display: inline-flex; align-self: flex-start; margin-bottom: 8px; }
     #dash { display: none; }
     #dashm { display: block; }
-    .msg { max-width: 100%; }
-    #composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
-    .turnbar .what { max-width: 100%; }
+    #dashphone .tiles { gap: 14px 22px; }
+    #dashphone .tile .n { font-size: 20px; }
+    #dashphone .xlabels span { white-space: nowrap; overflow: visible; }
 
-    /* panels: the whole screen, scrolling inside, closed by their ✕ */
+    /* chip rows: one line, scrolled sideways inside themselves */
+    #kindfilter {
+      flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none;
+      -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+    #kindfilter::-webkit-scrollbar, .bpick::-webkit-scrollbar { display: none; }
+    #kindfilter { padding: 8px var(--safe-r) 2px var(--safe-l); gap: 6px; }
+    #kindfilter button, #nightly button, #unmerged .b, #holding .b {
+      flex: none; white-space: nowrap; font-family: var(--sans); font-size: 13px;
+      min-height: var(--tap); padding: 0 12px; border-radius: 10px; }
+    /* the task panel's strips are actions, not filters: they wrap, under
+       their label */
+    #nightly .nlabel, #unmerged .nlabel, #holding .nlabel {
+      flex: 1 1 100%; font-family: var(--sans); font-size: 13px; }
+    #nightly, #unmerged, #holding { padding-bottom: 8px; }
+
+    /* session cards: title on the first line beside its ×, badges below */
+    .card { padding: 10px 6px 10px 12px; }
+    .card .key { flex-wrap: wrap; row-gap: 4px; font-family: var(--sans); word-break: normal; }
+    .card .key .title { flex: 1 1 calc(100% - var(--tap) - 6px); min-width: 0; font-size: 15px;
+                        line-height: 1.3; overflow-wrap: break-word; }
+    .card .key .untitled { flex: 1 1 calc(100% - var(--tap) - 6px); }
+    .card .key .hidebtn { order: 1; flex: none; width: var(--tap); height: var(--tap);
+                          margin: -10px -2px -6px 0; font-size: 20px; padding: 0; }
+    .card .key .badge { order: 2; }
+    .card .subkey { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                    word-break: normal; margin-right: 6px; }
+    .card .summary { font-size: 13px; margin-right: 6px; }
+    .card .meta { font-size: 13px; gap: 4px 12px; }
+    .badge { font-family: var(--sans); font-size: 11.5px; padding: 2px 7px; }
+
+    /* the open thread */
+    .toolbar { gap: 6px; }
+    .toolbar code { flex: 1 1 100%; min-width: 0; white-space: nowrap; overflow: hidden;
+                    text-overflow: ellipsis; word-break: normal; }
+    .msg { max-width: 100%; }
+    .bubble { overflow-wrap: break-word; word-break: normal; }
+    .bubble pre, details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .turnbar .what { max-width: 100%; }
+    .ctx { overflow-wrap: break-word; }
+    .ctx button.ghost { min-height: 36px; padding: 0 10px; }
+    .ev { flex-wrap: wrap; row-gap: 0; }
+    .ev .d { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; padding-left: 2px; }
+    .artifacts .f { flex-wrap: wrap; overflow-wrap: anywhere; }
+    #transcript { scroll-margin-bottom: 130px; }   /* clear of the composer */
+    #composer { position: sticky; bottom: 0; background: var(--bg);
+                padding-bottom: max(10px, var(--safe-b)); }
+    #composer textarea { min-height: var(--tap); }
+    #composer .crow button.act { min-width: 64px; }
+
+    /* panels: whole-screen sheets, scrolling inside, closed by their ✕ */
     #taskmodal, #boardmodal, #learnmodal, #fmodal { padding: 0; }
     #taskmodal .box, #boardmodal .box, #learnmodal .box, #fmodal .fbox {
       width: 100%; max-width: 100%; height: 100%; max-height: none; border-radius: 0;
-      border: 0; -webkit-overflow-scrolling: touch;
-      padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
-               calc(18px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
+      border: 0; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+      padding: var(--safe-t) var(--safe-r) calc(18px + var(--safe-b)) var(--safe-l); }
+    #taskmodal h2, #boardmodal h2, #learnmodal h2 { font-size: 20px; gap: 8px; }
+    .xclose { position: sticky; top: 0; z-index: 2; background: var(--bg); }
+    .box .hint { font-size: 13px; }
     #bdetail { width: 100vw; border-left: 0;
-      padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
-               calc(18px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
-    .bcols { grid-template-columns: 1fr; overflow-x: visible; }
-    .bfilters select, .bfilters input { flex: 1 1 140px; width: auto; min-width: 0; }
-    .lform input.text, .lform input.scope { flex: 1 1 100%; width: auto; min-width: 0; }
-    .task { flex-wrap: wrap; gap: 6px 8px; }
-    .task .tt { flex: 1 1 calc(100% - 90px); min-width: 0; word-break: break-word; }
-    .tform .acts { flex-wrap: wrap; }
-    .toolbar code { white-space: normal; word-break: break-all; }
+      padding: var(--safe-t) var(--safe-r) calc(18px + var(--safe-b)) var(--safe-l); }
+    #bdetail h3 { overflow-wrap: break-word; padding-right: 4px; }
+    #bdetail .sub, .task .sub, .bcard .sub { overflow-wrap: anywhere; }
+    #bdetail .goal, .task .goal { font-family: var(--sans); font-size: 13.5px; }
+    #bdetail .acts { display: flex; flex-wrap: wrap; gap: 6px; }
 
-    /* fingers, not a pointer: room to hit, and 16px inputs so iOS
-       does not zoom the page on focus */
-    button.act, button.ghost, a.ghost { min-height: 40px; padding: 8px 14px; font-size: 14px; }
+    /* the task panel */
+    .task { flex-wrap: wrap; gap: 6px 8px; }
+    .task .tt { flex: 1 1 calc(100% - 90px); min-width: 0; overflow-wrap: break-word; }
+    .task .more > summary { list-style-position: inside;
+                            font-family: var(--sans); font-size: 14.5px; color: var(--ink);
+                            font-weight: 600; overflow-wrap: break-word; }
+    .task .sub { overflow-wrap: anywhere; }
+    #tproj { height: var(--tap); flex: 1 1 100%; padding: 0 10px; font-weight: 400; }
+
+    /* projects: overview cards and one board column at a time */
+    .bfilters select, .bfilters input { flex: 1 1 140px; width: auto; min-width: 0;
+                                        min-height: var(--tap); }
+    .pcard { font-size: 13.5px; }
+    .pcard h3 { flex-wrap: wrap; overflow-wrap: anywhere; }
+    .pcard h3 .gear { min-width: var(--tap); min-height: var(--tap); }
+    .bhead { flex-wrap: wrap; }
+    .bpick { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none;
+             margin: 0 0 10px; padding-bottom: 2px; }
+    .bpick button { flex: none; white-space: nowrap; min-height: var(--tap); padding: 0 12px;
+                    font-size: 13.5px; background: transparent; color: var(--muted);
+                    border: 1px solid var(--line); border-radius: 10px; }
+    .bpick button.on { background: #C08A1C22; color: var(--gold); border-color: #C08A1C99; }
+    .bpick button b { color: var(--ink); margin-left: 4px; }
+    .bcols { grid-template-columns: 1fr; display: block; overflow: visible; }
+    .bcols .bcol { display: none; background: none; border: 0; padding: 0; }
+    .bcols[data-show="backlog"] .bcol[data-col="backlog"],
+    .bcols[data-show="running"] .bcol[data-col="running"],
+    .bcols[data-show="review"] .bcol[data-col="review"],
+    .bcols[data-show="needs"] .bcol[data-col="needs"],
+    .bcols[data-show="done"] .bcol[data-col="done"] { display: block; }
+    .bcol > h4 { display: none; }
+    .bcard { font-size: 14px; padding: 10px 11px; }
+    .bcard .tt { overflow-wrap: break-word; word-break: normal; }
+    .bthreads .b { min-height: var(--tap); }
+
+    /* forms: labelled fields, the actions pinned to the bottom of the sheet */
+    #fmodal .fbox { padding-bottom: 0; }
+    .tform h3 { font-size: 19px; overflow-wrap: break-word; }
+    .tform label { font-size: 13px; }
+    .tform .choice { font-size: 14.5px; }
+    .tform .choice input { width: 20px; height: 20px; flex: none; margin-top: 1px; }
+    .tform .line { flex-wrap: wrap; }
+    .tform .line input[type=text] { flex: 1 1 180px; min-width: 0; }
+    .tform input[type=text], .tform select, .tform textarea { min-height: var(--tap); }
+    .tform textarea { font-family: var(--sans); }
+    .tform .note code, .tform .sub { overflow-wrap: anywhere; }
+    .tform .acts { position: sticky; bottom: 0; z-index: 2; background: var(--bg);
+                   margin: 14px calc(-1 * var(--safe-r)) 0 calc(-1 * var(--safe-l));
+                   padding: 10px var(--safe-r) max(12px, var(--safe-b)) var(--safe-l);
+                   border-top: 1px solid var(--line); flex-wrap: wrap; }
+    .tform .acts button { flex: 1 1 0; }
+    .tform .rtarget .note code { overflow-wrap: anywhere; }
+    .tform pre.goal { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+    /* learnings */
+    .lform input.text, .lform input.scope { flex: 1 1 100%; width: auto; min-width: 0; }
+    .lform select { min-height: var(--tap); }
+    .lrow { flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+    .lrow .del { order: 1; margin-left: auto; }
+    .lrow .body { order: 2; flex: 1 1 100%; min-width: 0; overflow-wrap: break-word;
+                  padding-left: 4px; }
+    .lrow .scope { overflow-wrap: anywhere; }
+    .lrow .tog, .lrow .del { min-width: var(--tap); min-height: var(--tap); }
+
+    /* fingers, not a pointer */
+    button.act, button.ghost, a.ghost { min-height: var(--tap); padding: 0 14px; font-size: 15px; }
     a.ghost { display: inline-flex; align-items: center; text-decoration: none; }
-    .bcard .acts button, .seg button, #kindfilter button, #nightly button,
-      #unmerged .b, #holding .b { min-height: 34px; padding: 6px 10px; font-size: 12.5px; }
+    .bcard .acts button, .seg button { min-height: var(--tap); padding: 0 12px; font-size: 14px; }
+    .seg { flex: none; }
+    label.attach { min-width: var(--tap); min-height: var(--tap); }
+    .chip button { min-width: 36px; min-height: 36px; }
     .bcol > h4 button { min-height: 0; padding: 2px 8px; }
     input, select, textarea, #search, #composer textarea, .tform input[type=text],
       .tform select, .tform textarea, .lform select, .lform input,
-      .bfilters select, .bfilters input { font-size: 16px; }
-    .hidebtn { font-size: 18px; padding: 4px 8px; }
+      .bfilters select, .bfilters input { font-size: var(--field-fs); }
+  }
+  /* the narrowest phones (SE, mini): the logo gives way to the name */
+  @media (max-width: 380px) {
+    header svg { display: none; }
   }
 </style>
 </head>
@@ -1600,13 +1768,17 @@ PAGE = r"""<!doctype html>
     <circle cx="346" cy="270" r="7.5" fill="#331233"/><circle cx="382" cy="272" r="7.5" fill="#331233"/>
     <path d="M352,296 q12,10 26,2" fill="none" stroke="#331233" stroke-width="5" stroke-linecap="round"/>
   </svg>
-  <h1>Silkworm sessions</h1>
+  <h1>Silkworm<span class="wide"> sessions</span></h1>
   <span id="botdot" title="bot status"></span>
   <button class="ghost hbtn" style="margin-left:16px" onclick="toggleTasks()">📋<span class="lbl"> Tasks</span><span id="taskbadge"></span></button>
   <button class="ghost hbtn" onclick="toggleBoard()" title="per-project boards and backlogs">🗂<span class="lbl"> Projects</span></button>
+  <button class="ghost hbtn phoneonly" onclick="toggleSearch()" title="search transcripts">🔍</button>
+  <button class="ghost hbtn phoneonly" id="menubtn" onclick="toggleMenu(event)" title="more" aria-haspopup="true">⋯</button>
+  <div class="hmore" onclick="closeMenu()">
   <button class="ghost hbtn" onclick="toggleLearn()" title="learnings">🧠<span class="lbl"> Learnings</span></button>
   <button class="ghost hbtn wide" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <button class="ghost hbtn" id="notifybtn" onclick="enableNotifications()" title="Enable notifications">🔔<span class="lbl" id="notifylbl"> Notify</span></button>
+  </div>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
 </header>
 <div id="alertbar"></div>
@@ -2472,6 +2644,23 @@ document.addEventListener("click", e => {
   if (!e.target.closest("#searchresults") && e.target.id !== "search")
     document.getElementById("searchresults").style.display = "none";
 });
+// On a phone the header is one row: search is a 🔍 that opens a row under it,
+// and Learnings, Name untitled and Notify live behind ⋯. On a laptop both
+// buttons are hidden and everything sits in the header as before.
+function toggleSearch() {
+  const on = document.body.classList.toggle("searching");
+  const box = document.getElementById("search");
+  if (on) box.focus();
+  else { box.value = ""; document.getElementById("searchresults").style.display = "none"; }
+}
+function toggleMenu(e) {
+  if (e) e.stopPropagation();
+  document.querySelector("header").classList.toggle("menu");
+}
+function closeMenu() { document.querySelector("header").classList.remove("menu"); }
+document.addEventListener("click", e => {
+  if (!e.target.closest || !e.target.closest(".hmore")) closeMenu();
+});
 
 // --- learnings ---
 async function learnCall(payload) {
@@ -3138,8 +3327,16 @@ function closeBoard() {
   document.getElementById("boardmodal").style.display = "none";
   closeDetail();
 }
+function setBoardCol(k) {
+  boardCol = k;
+  const c = document.querySelector(".bcols");
+  if (c) c.dataset.show = k;
+  document.querySelectorAll(".bpick button").forEach(b =>
+    b.className = b.dataset.col === k ? "on" : "");
+}
 function setBoardProject(p) {
   boardProject = p;
+  boardCol = "";
   // Back to the overview is back to all of it: a filter left set would only
   // turn it straight back into a board.
   if (p === null) for (const id of ["brole", "bstate", "bq"]) document.getElementById(id).value = "";
@@ -3198,6 +3395,10 @@ async function renderBoard() {
   }
   setHTML(document.getElementById("bover"), "");
   boardFilters();
+  // A new filter is a new set of columns: the phone's tab goes back to the
+  // first that has something in it.
+  const fkey = [boardProject, role, state, q].join("\u0000");
+  if (fkey !== boardFilterKey) { boardFilterKey = fkey; boardCol = ""; }
   // A poll in flight when a filter changes must not land on top of the
   // filtered answer: only the newest request draws.
   const ask = ++boardAsk;
@@ -3222,8 +3423,19 @@ function boardHead(info) {
     info.release ? `<button class="ghost" onclick="releaseForm('${esc(info.slug)}')">Release…</button>` : ""}<button class="ghost" onclick="projectSettings('${
     esc(info.slug)}')">⚙ Settings</button></div>`;
 }
+// On a phone the board is one column at a time (CSS shows the one named by
+// data-show), picked from a row of tabs; on a laptop the tabs are hidden and
+// all five columns stand side by side. The pick lasts until the project changes.
+let boardCol = "", boardFilterKey = "";
 function renderColumns(r) {
-  return `<div class="bcols">` + BOARD_COLUMNS.map(([k, label]) => {
+  const cols = r.columns || {};
+  const n = k => (cols[k] || []).length;
+  if (!BOARD_COLUMNS.some(([k]) => k === boardCol))
+    boardCol = n("needs") ? "needs" : (BOARD_COLUMNS.find(([k]) => n(k)) || BOARD_COLUMNS[0])[0];
+  return `<div class="bpick">` + BOARD_COLUMNS.map(([k, label]) =>
+    `<button data-col="${k}" class="${k === boardCol ? "on" : ""}" onclick="setBoardCol('${k}')">${
+      label}<b>${n(k)}</b></button>`).join("") + `</div>`
+    + `<div class="bcols" data-show="${boardCol}">` + BOARD_COLUMNS.map(([k, label]) => {
     const items = (r.columns || {})[k] || [];
     return `<div class="bcol" data-col="${k}"><h4>${label} · ${items.length}</h4>${
       items.map(boardCard).join("") || `<div class="hint">—</div>`}</div>`;
@@ -3964,6 +4176,46 @@ if (window.addEventListener)
   window.addEventListener("popstate", () => {
     if (document.body && document.body.classList.contains("reading")) leaveReading();
   });
+// --- deep links ---
+// Every view opens from the address: a bookmark, a notification, and
+// bin/dashshots (which photographs each view in a simulator with no way to
+// tap) all land on it the same way. Read once, then taken off the address
+// bar, so a reload opens the list rather than this again.
+//   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
+//   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
+//   ?card=<task id>                       a task's detail, over the board
+//   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug=
+//   ?q=<words>                            transcript search
+async function openLink(q) {
+  const view = q.get("view") || "", slug = q.get("slug") || "", modal = q.get("modal") || "";
+  const thread = q.get("thread"), card = q.get("card"), words = q.get("q");
+  // A thread or a task: the notification's own way in (openTarget, below).
+  if (thread || q.get("task")) await openTarget("/?" + q.toString());
+  if (view === "stats") {
+    const d = document.getElementById("dashm");
+    if (d) d.open = true;
+  } else if (view === "tasks") {
+    toggleTasks();
+    if (q.get("tab") === "all") setTaskView("all");
+  } else if (view === "projects" || view === "project" || card) {
+    boardProject = view === "project" ? (slug === "all" ? "" : slug === "unfiled" ? UNFILED : slug) : null;
+    if (!boardIsOpen()) toggleBoard(); else refreshBoard();
+  } else if (view === "learnings") {
+    toggleLearn();
+  }
+  if (card) openCard(card);
+  if (modal === "new-thread") newThreadForm();
+  else if (modal === "new-project") newProjectForm();
+  else if (modal === "new-task") newTaskForm();
+  else if (modal === "settings" && slug) projectSettings(slug);
+  else if (modal === "release" && slug) releaseForm(slug);
+  if (words) {
+    document.body.classList.add("searching");     // the phone's search row
+    const box = document.getElementById("search");
+    box.value = words;
+    box.dispatchEvent(new Event("input"));
+  }
+}
 // The service worker only adds an offline page (it caches nothing); without
 // one -- plain http, an old browser -- the dashboard works the same.
 if (typeof navigator !== "undefined" && navigator.serviceWorker)
@@ -4114,11 +4366,12 @@ if (typeof navigator !== "undefined" && navigator.serviceWorker && navigator.ser
   navigator.serviceWorker.addEventListener("message", e => {
     if (e.data && e.data.type === "open") openTarget(e.data.url);
   });
-if (typeof location !== "undefined" && /[?&](thread|task)=/.test(location.search || "")) {
-  const target = location.href;
+if (typeof location !== "undefined"
+    && /[?&](thread|task|view|card|modal|q)=/.test(location.search || "")) {
+  const target = new URLSearchParams(location.search);
   // Off the address bar, so a reload opens the list rather than this again.
   if (window.history && history.replaceState) history.replaceState(null, "", "/");
-  openTarget(target);
+  openLink(target);
 }
 
 // --- polling ---

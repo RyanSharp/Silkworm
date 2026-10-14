@@ -17921,7 +17921,7 @@ def test_board_edits_in_the_page():
     o = json.loads(p.stdout)
 
     bh = o["boardHtml"]
-    cols_at = bh.find('<div class="bcols">')
+    cols_at = bh.find('<div class="bcols"')          # it carries the phone's data-show
     check("the board header offers + New task and Settings",
           '<div class="bhead">' in bh and 'newTaskForm()">+ New task' in bh
           and 0 <= bh.find("newTaskForm()") < cols_at and "projectSettings('alpha')" in bh)
@@ -23224,8 +23224,27 @@ def test_viz_phone_layout():
                                    "#fmodal .fbox")) and "height: 100%" in phone)
     check("safe-area insets are respected (top, bottom, sides)",
           all(f"env(safe-area-inset-{s})" in css for s in ("top", "bottom", "left", "right")))
+    field = re.search(r"--field-fs:\s*(\d+)px", phone)
     check("inputs are 16px on a phone, so focusing one does not zoom the page",
-          re.search(r"input, select, textarea[^{]*\{ font-size: 16px; \}", phone) is not None)
+          field is not None and int(field.group(1)) >= 16
+          and re.search(r"input, select, textarea[^{]*\{ font-size: var\(--field-fs\); \}", phone)
+          is not None)
+    tap = re.search(r"--tap:\s*(\d+)px", phone)
+    check("touch targets are at least 44px on a phone", tap is not None and int(tap.group(1)) >= 44)
+    check("on a phone the board shows one column, picked from tabs",
+          ".bcols .bcol { display: none;" in phone and ".bpick { display: flex;" in phone
+          and all(f'.bcols[data-show="{k}"] .bcol[data-col="{k}"]' in phone
+                  for k in ("backlog", "running", "review", "needs", "done")))
+    check("the kind filter is one sideways-scrolling row on a phone",
+          re.search(r"#kindfilter \{\s*flex-wrap: nowrap; overflow-x: auto;", phone) is not None)
+    check("the header is one row: search and the rest behind phone-only buttons",
+          "header { position: relative; flex-wrap: nowrap;" in phone
+          and 'onclick="toggleSearch()"' in V.PAGE and 'onclick="toggleMenu(event)"' in V.PAGE
+          and '<div class="hmore" onclick="closeMenu()">' in V.PAGE)
+    check("a laptop never sees the phone's controls",
+          ".phoneonly, .bpick { display: none; }" in desktop and ".hmore { display: contents; }" in desktop)
+    check("form buttons are pinned to the bottom of a phone sheet",
+          re.search(r"\.tform \.acts \{ position: sticky; bottom: 0;", phone) is not None)
     for panel, fn in (("taskmodal", "toggleTasks()"), ("boardmodal", "toggleBoard()"),
                       ("learnmodal", "toggleLearn()")):
         start = V.PAGE.index(f'<div id="{panel}"')
@@ -23309,6 +23328,94 @@ process.stdout.write(JSON.stringify(out));
 # session and records whichever side speaks -- so what these check is that the
 # dashboard goes through the very handlers Slack does (handle_prompt,
 # handle_command), and that the pure parts (webthread.py) say what they should.
+
+def _load_dashshots():
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    path = str(Path(__file__).resolve().parent.parent / "bin" / "dashshots")
+    loader = SourceFileLoader("dashshots_under_test", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_dashshots_stand_in_is_read_only():
+    import json as _json
+    import threading as _th
+    import urllib.request as _ur
+    from http.server import ThreadingHTTPServer
+    print("\nbin/dashshots' stand-in bot passes reads to the real bot and refuses every action")
+    D = _load_dashshots()
+    forwarded = []
+    D.forward = lambda port, path, payload: forwarded.append((path, payload.get("action"))) or {"ok": True}
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), D.stand_in("1"))
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def post(path, payload):
+        req = _ur.Request(f"http://127.0.0.1:{srv.server_address[1]}{path}",
+                          data=_json.dumps(payload).encode(),
+                          headers={"Content-Type": "application/json"}, method="POST")
+        with _ur.urlopen(req, timeout=5) as r:
+            return _json.loads(r.read())
+    try:
+        writes = [("/tasks", {"action": "create", "goal": "x"}), ("/tasks", {"action": "accept"}),
+                  ("/tasks", {"action": "land"}), ("/tasks", {"action": "run-next"}),
+                  ("/web-message", {"text": "hi"}), ("/hide", {"action": "hide"}),
+                  ("/titles", {}), ("/summaries", {}), ("/release", {}),
+                  ("/releases", {"action": "start"}), ("/releases", {"action": "preview"}),
+                  ("/projects", {"action": "new"}), ("/projects", {"action": "ideate"}),
+                  ("/learnings", {"action": "add"}), ("/learnings", {"action": "harvest"}),
+                  ("/push", {"action": "subscribe"})]
+        refused = [post(p, b) for p, b in writes]
+        check("every action is refused", all(r.get("ok") is False for r in refused), str(refused))
+        check("and none of them reaches the real bot", forwarded == [], str(forwarded))
+        reads = [("/tasks", {"action": "board"}), ("/tasks", {"action": "attention"}),
+                 ("/tasks", {"action": "task", "id": "t"}), ("/projects", {"action": "list"}),
+                 ("/learnings", {"action": "list"}), ("/status", {}),
+                 ("/thread-state", {"key": "k"})]
+        for p, b in reads:
+            post(p, b)
+        check("reads are passed through", [f[0] for f in forwarded] == [p for p, _ in reads],
+              str(forwarded))
+        check("its read actions are only the dashboard's own read actions",
+              D.READ_TASKS <= __import__("visualizer").READ_TASK_ACTIONS)
+        plan = post("/releases", {"action": "plan", "slug": "x"})
+        check("a release plan is the fixed sample, never the real route (it fetches origin)",
+              plan.get("confirm") == "sample" and ("/releases", "plan") not in forwarded)
+    finally:
+        srv.shutdown()
+    check("it will not use the other project's simulator",
+          "Cadence Test iPhone 17" in D.FORBIDDEN_DEVICES
+          and all(name not in D.FORBIDDEN_DEVICES for name, _ in D.DEVICES.values()))
+
+
+def test_deep_links_cover_every_shot():
+    import re
+    from urllib.parse import urlparse, parse_qsl
+    import visualizer as V
+    print("\nevery view bin/dashshots photographs opens from a deep link the page reads")
+    D = _load_dashshots()
+    js = V.PAGE[V.PAGE.index("async function openLink(q)"):]
+    js = js[:js.index("\n}\n")]
+    trigger = re.search(r"/\[\?&\]\(([a-z|]+)\)=/\.test\(location\.search", V.PAGE)
+    check("the page reads deep links on load", trigger is not None)
+    keys = set(trigger.group(1).split("|")) if trigger else set()
+    shots = D.views({"thread": "k", "card": "c", "task": "t"}, "p")
+    check("it photographs at least fifteen views", len(shots) >= 15, str(len(shots)))
+    for name, path in shots:
+        q = dict(parse_qsl(urlparse(path).query))
+        if not q:
+            continue
+        ok = any(k in keys for k in q)
+        for k, v in q.items():
+            ok = ok and f'q.get("{k}")' in js
+            if k in ("view", "modal"):
+                ok = ok and (f'{k} === "{v}"' in js)
+        check(f"{name}: {path} is handled by openLink", ok)
+    check("the address is cleared once read, so a reload opens the list",
+          'history.replaceState(null, "", "/")' in V.PAGE)
+
 
 def test_webthread_files_and_note():
     import base64

@@ -1216,6 +1216,41 @@ A local web dashboard for every thread session (localhost-only):
   new thread's first message is the thread's parent in the home channel
   (`SILKWORM_HOME_CHANNEL`, else your latest DM with the bot). Tool approvals
   (`CLAUDE_APPROVAL_MODE=slack`) are still answered in Slack only.
+- **On a phone** (under 700px wide) the page is its own layout: a one-row
+  header (🔍 opens search, ⋯ holds Learnings, Name untitled and Notify), the
+  list and the open thread taking turns, filter chips in one sideways-scrolling
+  row, the board one column at a time behind a row of column tabs, and panels
+  and forms as full-screen sheets with their buttons pinned to the bottom.
+  Everything tappable is at least 44px and every field 16px, so iOS does not
+  zoom in on focus. The laptop layout is untouched.
+- **Deep links** — every view opens from its address, which is how a
+  notification lands on a thread and how the screenshots below are taken:
+  `/?thread=<key>`, `/?task=<id>` (the task panel, on that row),
+  `/?view=stats|tasks|projects|learnings` (`&tab=all` for every task),
+  `/?view=project&slug=<slug>` (`all`, `unfiled`), `&card=<task id>` (a task's
+  detail), `/?modal=new-thread|new-project|new-task|settings|release`
+  (`&slug=` for the last two), `/?q=<words>` (search). The address is cleared
+  once read, so a reload opens the list.
+
+### Screenshots of every view
+
+```sh
+bin/dashshots                          # artifacts/dashshots/<view>-<width>.png
+bin/dashshots --widths 375 --views board,card
+bin/dashshots --source /path/to/other/checkout --out /tmp/before
+```
+
+Mobile Safari in an iOS Simulator at 375px (iPhone SE (3rd generation)) and
+430px (iPhone 16 Plus), and WebKit's own snapshot at 1280px for the laptop.
+The dashboard shot is a copy of the code run from a temp directory against a
+copy of `sessions.json`, and the bot behind it is a stand-in that passes only
+reads through to the real one (board, projects, roles, learnings, status) and
+refuses every action, so nothing it does can change Silkworm's state. Its
+simulators are its own (`Silkworm Shots 375` / `430`, made on first use) and are
+shut down afterwards; it never touches any other device. Needs Xcode (for
+`simctl` and `swiftc`). What the simulator cannot show: the home-screen app's
+standalone mode (Add to Home Screen needs a tap), so the safe-area insets there
+are checked by the CSS alone.
 
 ## Notes & limits
 
