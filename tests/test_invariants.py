@@ -7025,7 +7025,7 @@ def test_task_row_shows_its_own_goal():
           f"found: {opened}")
     # Scope this to the row itself: a window of characters would reach back
     # into the proposal above it and find that row's disclosure instead.
-    short = next(r for r in html.split('<div class="task">') if "tsk_short1" in r)
+    short = next(r for r in html.split('<div class="task"') if "tsk_short1" in r)
     check("a goal that fits its title gets no disclosure at all",
           "<details" not in short, "an empty expander is worse than none")
 
@@ -7469,9 +7469,10 @@ def test_atomic_persistence():
                 saves += 1
                 offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
                               if writes_in_place(n)]
-    # Six: the four stores, the task board's message pointer (home.Board), and
-    # the operator's state (operator_role.State).
-    check("every store's _save was found to check", saves == 6, f"found {saves}")
+    # Seven: the four stores, the task board's message pointer (home.Board),
+    # the operator's state (operator_role.State), and push subscriptions
+    # (push.PushStore).
+    check("every store's _save was found to check", saves == 7, f"found {saves}")
     check("and every module was looked at", scanned > 20, f"{scanned}")
     check("nothing writes a state file in place", not offenders, f"at {offenders}")
 
@@ -22614,7 +22615,7 @@ def test_operator_turns_do_not_hold_the_checkout_and_deploy_tests_run_clean():
     def fake_run(cmd, **kw):
         calls.append(kw.get("env") or {})
         return types.SimpleNamespace(returncode=0)
-    ns = {"VENV_PY": Path("/nonexistent"), "sys": sys, "REPO": BASE, "os": os,
+    ns = {"venv_python": lambda: sys.executable, "sys": sys, "REPO": BASE, "os": os,
           "git_guard": __import__("git_guard"), "str": str,
           "subprocess": types.SimpleNamespace(run=fake_run)}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "silkworm", "exec"), ns)
@@ -23400,7 +23401,7 @@ def _web_bot(tmp: Path):
     st = tmp_store()
     ts = T.TaskStore(tmp / "t.json")
     ps = P.ProjectStore(tmp / "projects.json")
-    posted, prompts, running = [], [], {}
+    posted, prompts, running, pushed = [], [], {}, []
     seq = [1000]
 
     class Client:
@@ -23440,6 +23441,8 @@ def _web_bot(tmp: Path):
 
     def run_turn(prompt, session_id=None, **kw):
         prompts.append({"prompt": prompt, "session_id": session_id, "cwd": str(kw.get("cwd"))})
+        if "make it fail" in prompt:
+            raise ClaudeError("claude exited 1: no such thing")
         if kw.get("on_init"):
             kw["on_init"]("sid-new" if session_id is None else session_id)
         return types.SimpleNamespace(session_id=session_id or "sid-new", cost_usd=0.01,
@@ -23468,21 +23471,27 @@ def _web_bot(tmp: Path):
         ClaudeTimeout=ClaudeTimeout, ClaudeError=ClaudeError, roles=__import__("roles"),
         OPERATOR=types.SimpleNamespace(thread=lambda: ""), render_block=lambda x: "",
         defer=__import__("defer"), scoping=__import__("scoping"), SILKWORM_BIN="silkworm",
-        harvester=types.SimpleNamespace(find_transcript=lambda s: True))
+        harvester=types.SimpleNamespace(find_transcript=lambda s: True),
+        PUSH=types.SimpleNamespace(reply=lambda *a, **k: pushed.append({"args": a, **k})))
     hooks = {"prompt": prompt_fn}
 
     def handle_prompt(event, say, client):
         return hooks["prompt"](event, say, client)
-    web = _bot_func("handle_web_message", **shared, handle_prompt=handle_prompt,
-                    handle_command=cmd["handle_command"], project_store=ps,
-                    home_channel=lambda: "D9", slacklinks=__import__("slacklinks"),
-                    WEB_COMMAND_WAIT_S=5.0, THREAD_KEY_RE=_re.compile(r"[A-Z0-9]+:[0-9.]+"),
-                    threading=threading, time=time)
+    channel = {"home": "D9"}
+    deliver = _bot_func("deliver_web_message", **shared, handle_prompt=handle_prompt,
+                        handle_command=cmd["handle_command"], project_store=ps,
+                        home_channel=lambda: channel["home"], slacklinks=__import__("slacklinks"),
+                        WEB_COMMAND_WAIT_S=5.0, THREAD_KEY_RE=_re.compile(r"[A-Z0-9]+:[0-9.]+"),
+                        threading=threading, time=time)
+    sends = webthread.Sends()
+    web = _bot_func("handle_web_message", webthread=webthread, WEB_SENDS=sends,
+                    WEB_REPEAT_WAIT_S=5.0, deliver_web_message=deliver)
     state = _bot_func("handle_thread_state", store=st, task_store=ts, webthread=webthread,
                       RUNNING=running, THREAD_KEY_RE=_re.compile(r"[A-Z0-9]+:[0-9.]+"))
     return types.SimpleNamespace(web=web, state=state, store=st, tasks=ts, projects=ps,
                                  posted=posted, prompts=prompts, running=running,
-                                 lock=thread_lock, hooks=hooks, cmd=cmd)
+                                 lock=thread_lock, hooks=hooks, cmd=cmd, client=app.client,
+                                 channel=channel, sends=sends, pushed=pushed)
 
 
 def _wait(cond, secs=5.0):
@@ -23629,7 +23638,7 @@ def test_dashboard_upload_reaches_the_turn():
           any("IMG_0042.png" in (p.get("text") or "") and p.get("thread_ts") == "300.1"
               for p in bot.posted))
     other = _web_bot(Path(tempfile.mkdtemp()))
-    (other_root := Path(other.web.__globals__["UPLOADS_ROOT"])).write_text("not a directory")
+    (other_root := Path(other.web.__globals__["deliver_web_message"].__globals__["UPLOADS_ROOT"])).write_text("not a directory")
     bad = other.web({"new": True, "text": "look", "files": [
         {"name": "a.png", "type": "image/png", "data": base64.b64encode(img).decode()}]})
     anchor = other.posted[0] if other.posted else {}
@@ -23707,10 +23716,18 @@ def test_dashboard_message_queues_behind_a_running_turn():
 def test_dashboard_commands_use_the_shared_handler():
     print("\n!commands from the composer are handle_command's, and their replies come back")
     tree = ast.parse((BASE / "bot.py").read_text())
+    # handle_web_message decides whether a send is new (its client_id);
+    # deliver_web_message is what delivers it.
+    outer = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "handle_web_message")
+    check("handle_web_message delivers only through deliver_web_message",
+          {ast.unparse(c.func) for c in ast.walk(outer) if isinstance(c, ast.Call)}
+          & {"handle_prompt", "handle_command"} == set()
+          and "deliver_web_message" in ast.unparse(outer))
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
-              and n.name == "handle_web_message")
+              and n.name == "deliver_web_message")
     calls = {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
-    check("handle_web_message hands every message to handle_prompt",
+    check("deliver_web_message hands every message to handle_prompt",
           "handle_prompt" in calls, str(sorted(calls)))
     lits = {c.value for c in ast.walk(fn) if isinstance(c, ast.Constant)
             and isinstance(c.value, str) and c.value.startswith("!")}
@@ -24107,8 +24124,10 @@ def test_dashboard_composer_and_live_thread():
           "checked out to the terminal" in o["checkedOut"] and "!back" in o["checkedOut"],
           o["checkedOut"][-300:])
     c = o["command"]
-    check("a command is sent as it is typed", c["body"] == {"key": "A:1", "text": "!brief", "files": []},
-          str(c["body"]))
+    check("a command is sent as it is typed, under an id of its own",
+          {k: v for k, v in c["body"].items() if k != "client_id"}
+          == {"key": "A:1", "text": "!brief", "files": []}
+          and len(c["body"].get("client_id") or "") >= 8, str(c["body"]))
     check("and its reply is drawn under it", "!brief" in c["live"] and "you · command" in c["live"]
           and "Grow tomatoes." in c["live"] and "silkworm" in c["live"], c["live"][:500])
     check("a message queued from Slack shows as queued too",
@@ -24125,9 +24144,10 @@ def test_dashboard_composer_and_live_thread():
     check("the new thread form offers the live projects",
           'value="garden"' in o["form"] and 'value="old"' not in o["form"]
           and "(no project)" in o["form"], o["form"][:300])
-    check("starting it sends new, the project and the message",
-          o["newBody"] == {"new": True, "text": "what should I plant", "project": "garden", "files": []},
-          str(o["newBody"]))
+    check("starting it sends new, the project and the message, under an id of its own",
+          {k: v for k, v in o["newBody"].items() if k != "client_id"}
+          == {"new": True, "text": "what should I plant", "project": "garden", "files": []}
+          and len(o["newBody"].get("client_id") or "") >= 8, str(o["newBody"]))
     check("and opens the new thread, read by its key",
           o["newActive"] == "D9:77.1" and "key=D9%3A77.1" in o["newRead"] and o["modal"] == "none",
           f"{o['newActive']} {o['newRead']}")
@@ -24138,6 +24158,1192 @@ def test_dashboard_composer_and_live_thread():
     check("the stats are drawn atop the phone's list too, summed up in its line",
           st["phone"] and st["desk"] and "$1.50" in st["summary"] and "7 threads" in st["summary"],
           str(st))
+
+
+# --- web push to the installed dashboard (push.py) ----------------------------------
+# Notifications on the owner's phone: a task that needs them, a reply in a thread.
+# The payload is encrypted to the subscription (RFC 8291) and signed for (RFC 8292);
+# what sends is decided from task records, once per task and state; and sending is
+# never allowed to cost the move or the turn that triggered it.
+
+def _ua_subscription(host="web.push.apple.com"):
+    """A browser's side of a subscription: its private key (to read what was
+    sent) and the PushSubscription.toJSON() the page would hand over."""
+    import push
+    from cryptography.hazmat.primitives.asymmetric import ec
+    priv = ec.generate_private_key(ec.SECP256R1())
+    auth = os.urandom(16)
+    sub = {"endpoint": f"https://{host}/{push.b64u(os.urandom(12))}",
+           "keys": {"p256dh": push.b64u(push._public_bytes(priv)), "auth": push.b64u(auth)}}
+    return priv, sub
+
+
+def _ua_decrypt(body: bytes, ua_priv, auth_b64: str) -> bytes:
+    """RFC 8291 from the receiving end: what a browser does with a push."""
+    import hashlib as _h
+    import hmac as _hm
+    import push
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    def mac(k, d):
+        return _hm.new(k, d, _h.sha256).digest()
+    salt, idlen = body[:16], body[20]
+    as_pub, sealed = body[21:21 + idlen], body[21 + idlen:]
+    shared = ua_priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), as_pub))
+    ua_pub = push._public_bytes(ua_priv)
+    ikm = mac(mac(push.unb64u(auth_b64), shared),
+              b"WebPush: info\x00" + ua_pub + as_pub + b"\x01")
+    prk = mac(salt, ikm)
+    plain = AESGCM(mac(prk, b"Content-Encoding: aes128gcm\x00\x01")[:16]).decrypt(
+        mac(prk, b"Content-Encoding: nonce\x00\x01")[:12], sealed, None)
+    assert plain.endswith(b"\x02"), "not a last record"
+    return plain[:-1]
+
+
+class _FakePushService:
+    """Stands in for push.post: records each request, answers per endpoint."""
+
+    def __init__(self):
+        self.calls, self.answers, self.raises = [], {}, set()
+        self.lock = __import__("threading").Lock()
+
+    def __call__(self, endpoint, body, authorization, urgency="normal", timeout=10):
+        with self.lock:
+            self.calls.append({"endpoint": endpoint, "body": body,
+                               "auth": authorization, "urgency": urgency})
+        if endpoint in self.raises:
+            raise OSError("connection refused")
+        return self.answers.get(endpoint, 201)
+
+
+def _push_rig(tmp: Path, settle=0.05, subs=1):
+    import push
+    import tasks as T
+    store = push.PushStore(tmp / "push.json")
+    service = _FakePushService()
+    ts = T.TaskStore(tmp / "tasks.json")
+    notifier = push.Notifier(store, tmp / "vapid", current=ts.get, sender=service,
+                             settle=settle)
+    ts.on_move = notifier.task_moved
+    push.ensure_keys(tmp / "vapid")
+    browsers = []
+    for _ in range(subs):
+        priv, sub = _ua_subscription()
+        store.add(sub)
+        browsers.append((priv, sub))
+    return types.SimpleNamespace(push=push, T=T, store=store, service=service, ts=ts,
+                                 notifier=notifier, browsers=browsers)
+
+
+def _read_pushes(rig):
+    """Every notification delivered so far, decrypted as the phone would."""
+    out = []
+    for call in list(rig.service.calls):
+        for priv, sub in rig.browsers:
+            if sub["endpoint"] == call["endpoint"]:
+                out.append(json.loads(_ua_decrypt(call["body"], priv, sub["keys"]["auth"])))
+    return out
+
+
+def test_push_payload_encryption_matches_rfc8291():
+    import push
+    from cryptography.hazmat.primitives.asymmetric import ec
+    print("\nweb push payloads are encrypted exactly as RFC 8291 says")
+    v = push.unb64u
+    # RFC 8291, section 5 and appendix A: the worked example, byte for byte.
+    as_priv = ec.derive_private_key(int.from_bytes(
+        v("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"), "big"), ec.SECP256R1())
+    body = push.encrypt(
+        v("V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24"),
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+        "BTBZMqHH6r4Tts7J_aSIgg", as_private=as_priv, salt=v("DGv6ra1nlYgDCS1FRnbzlw"))
+    header = v("DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml"
+               "mlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8")
+    cipher = v("8pfeW0KbunFT06SuDKoJH9Ql87S1QUrdirN6GcG7sFz1y1sqLgVi1VhjVkHsUoEsbI_0LpXMuGvnzQ")
+    check("the 86-octet header is the RFC's", body[:86] == header, push.b64u(body[:86]))
+    check("and so is the ciphertext", body[86:] == cipher, push.b64u(body[86:]))
+    # And a real one, read back by the receiving side.
+    priv, sub = _ua_subscription()
+    a = push.encrypt(b'{"title":"x"}', sub["keys"]["p256dh"], sub["keys"]["auth"])
+    b = push.encrypt(b'{"title":"x"}', sub["keys"]["p256dh"], sub["keys"]["auth"])
+    check("a browser holding the subscription's key reads the message",
+          _ua_decrypt(a, priv, sub["keys"]["auth"]) == b'{"title":"x"}')
+    check("every message gets its own salt and key", a[:16] != b[:16] and a[21:86] != b[21:86])
+    try:
+        push.encrypt(b"x" * 5000, sub["keys"]["p256dh"], sub["keys"]["auth"])
+        refused = False
+    except ValueError:
+        refused = True
+    check("a message too big for one record is refused, not truncated", refused)
+
+
+def test_push_vapid_jwt_is_es256_raw_and_scoped():
+    import push
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    print("\neach push request carries a VAPID JWT the push service can verify")
+    d = Path(tempfile.mkdtemp()) / "vapid"
+    pub = push.ensure_keys(d)
+    h = push.vapid_header("https://web.push.apple.com/QXabc?x=1", d, now=1_000_000)
+    check("the header is 'vapid t=<jwt>, k=<public key>'",
+          h.startswith("vapid t=") and h.endswith(f", k={pub}"), h[:40])
+    jwt = h[len("vapid t="):h.index(", k=")]
+    head, claims, sig = jwt.split(".")
+    check("ES256, typed JWT", json.loads(push.unb64u(head)) == {"typ": "JWT", "alg": "ES256"})
+    c = json.loads(push.unb64u(claims))
+    check("audience is the push service's origin only, not the endpoint path",
+          c["aud"] == "https://web.push.apple.com", str(c))
+    check("it expires within 24h (12h)", c["exp"] == 1_000_000 + 12 * 3600, str(c))
+    check("it says who is sending (sub), as Apple requires",
+          c["sub"].startswith(("mailto:", "https://")), str(c))
+    raw = push.unb64u(sig)
+    check("the signature is raw 64-byte r||s (JWS), not DER", len(raw) == 64, str(len(raw)))
+    key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), push.unb64u(pub))
+    try:
+        key.verify(encode_dss_signature(int.from_bytes(raw[:32], "big"),
+                                        int.from_bytes(raw[32:], "big")),
+                   f"{head}.{claims}".encode(), ec.ECDSA(hashes.SHA256()))
+        ok = True
+    except Exception:
+        ok = False
+    check("and it verifies against the public key the page subscribed with", ok)
+
+
+def test_push_keys_made_once_and_kept_secret():
+    import stat
+    import push
+    print("\nthe VAPID keypair is made once, outside the repository, readable only by its owner")
+    check("the default key directory is outside any repository (~/.silkworm/vapid)",
+          push.DEFAULT_KEY_DIR == Path.home() / ".silkworm" / "vapid"
+          and BASE not in push.DEFAULT_KEY_DIR.parents, str(push.DEFAULT_KEY_DIR))
+    saved = os.environ.get("SILKWORM_VAPID_DIR")
+    os.environ["SILKWORM_VAPID_DIR"] = "/elsewhere/vapid"
+    try:
+        check("SILKWORM_VAPID_DIR is read when asked (the bot loads .env after imports)",
+              push.key_dir_default() == Path("/elsewhere/vapid"))
+    finally:
+        if saved is None:
+            os.environ.pop("SILKWORM_VAPID_DIR")
+        else:
+            os.environ["SILKWORM_VAPID_DIR"] = saved
+    d = Path(tempfile.mkdtemp()) / "nested" / "vapid"
+    check("no keys before the first ask", not push.keys_present(d) and push.public_key(d) == "")
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, r):
+            records.append(r.getMessage())
+    grab = Grab(level=logging.DEBUG)
+    lg = logging.getLogger("silkworm.push")
+    old_level = lg.level
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(grab)
+    try:
+        pub = push.ensure_keys(d)
+        again = push.ensure_keys(d)
+        status = push.handle({"action": "status"}, push.PushStore(d.parent / "p.json"),
+                             push.Notifier(None, d), key_dir=d)
+    finally:
+        lg.removeHandler(grab)
+        lg.setLevel(old_level)
+    check("made once: a second ask returns the same key", pub == again and push.keys_present(d))
+    priv = (d / push.PRIVATE_FILE)
+    check("the private key is mode 600", stat.S_IMODE(priv.stat().st_mode) == 0o600,
+          oct(priv.stat().st_mode))
+    check("in a mode 700 directory", stat.S_IMODE(d.stat().st_mode) == 0o700,
+          oct(d.stat().st_mode))
+    pem = priv.read_text()
+    secret_lines = [ln for ln in pem.splitlines() if ln and not ln.startswith("-----")]
+    said = "\n".join(records) + json.dumps(status)
+    check("the private key never appears in the log or in status",
+          all(ln not in said for ln in secret_lines), said[:300])
+    check("status says where the keys are, not what they are",
+          status["keys"] is True and status["key_dir"] == str(d)
+          and "BEGIN" not in json.dumps(status), str(status))
+    import shutil as _sh
+    _sh.copy(priv, d.parent / "kept.pem")
+    (d / push.PUBLIC_FILE).unlink()
+    check("a lost public file is rebuilt from the private key, not a new pair",
+          push.ensure_keys(d) == pub and (d / push.PRIVATE_FILE).read_text() == pem)
+
+
+def test_push_subscriptions_stored_and_pruned():
+    import push
+    print("\nsubscriptions are checked, kept atomically, and dropped when the service says gone")
+    tmp = Path(tempfile.mkdtemp())
+    store = push.PushStore(tmp / "push.json")
+    priv, sub = _ua_subscription()
+    for bad, why in (({**sub, "endpoint": "http://web.push.apple.com/x"}, "https"),
+                     ({**sub, "endpoint": "https://127.0.0.1:8787/web-message"}, "not a push service"),
+                     ({**sub, "endpoint": "https://evil.example/push.apple.com"}, "not a push service"),
+                     ({**sub, "endpoint": "https://notpush.apple.com.evil.example/x"},
+                      "not a push service"),
+                     ({**sub, "endpoint": "https://evilpush.apple.com/x"}, "not a push service"),
+                     ({**sub, "keys": {"p256dh": "AAAA", "auth": sub["keys"]["auth"]}}, "P-256"),
+                     ({**sub, "keys": {"p256dh": sub["keys"]["p256dh"], "auth": "AAAA"}}, "16 bytes"),
+                     ("nope", "no subscription")):
+        try:
+            store.add(bad)
+            got = "taken"
+        except push.BadSubscription as e:
+            got = str(e)
+        check(f"refused ({why})", why in got, got)
+    check("nothing refused was kept", store.count() == 0)
+    for host in ("web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"):
+        check(f"a {host} subscription is taken", bool(store.add(_ua_subscription(host)[1])))
+    store.add(sub, "iPhone Safari")
+    store.add(sub, "iPhone Safari")
+    check("the same subscription twice is one", store.count() == 4, str(store.count()))
+    again = push.PushStore(tmp / "push.json")
+    check("they are on disk, and read back", again.count() == 4
+          and any(s["endpoint"] == sub["endpoint"] and s["agent"] == "iPhone Safari"
+                  for s in again.subscriptions()))
+    check("saved through jsonstore (atomic, with a .prev backup)",
+          (tmp / "push.json.prev").exists())
+    src = (BASE / "push.py").read_text()
+    check("push.py never writes its state file in place",
+          "write_text(json" not in src and "jsonstore.save(self._path" in src)
+
+    # Sending: one gone (410), one unknown (404), one failing (500), one raising.
+    rig = _push_rig(Path(tempfile.mkdtemp()), subs=5)
+    eps = [s["endpoint"] for _, s in rig.browsers]
+    rig.service.answers = {eps[0]: 410, eps[1]: 404, eps[2]: 500}
+    rig.service.raises = {eps[3]}
+    out = rig.notifier.send_all({"title": "t", "body": "b", "url": "/", "tag": "x"})
+    check("410 and 404 are pruned, the rest counted",
+          out == {"sent": 1, "pruned": 2, "failed": 2, "skipped": ""}, str(out))
+    left = {s["endpoint"] for s in push.PushStore(Path(rig.store._path)).subscriptions()}
+    check("the gone ones are dropped from push.json; a 500 or a network error is not",
+          left == {eps[2], eps[3], eps[4]}, str(left))
+    check("forget-all drops the rest", push.handle({"action": "forget-all"}, rig.store,
+                                                    rig.notifier)["forgot"] == 3
+          and rig.store.count() == 0)
+    for _ in range(push.MAX_SUBSCRIPTIONS + 3):
+        rig.store.add(_ua_subscription()[1])
+    check("subscriptions are capped", rig.store.count() == push.MAX_SUBSCRIPTIONS)
+
+
+def test_push_needs_you_notifies_once_per_task_and_state():
+    print("\na task needing you notifies once per state, with a short title and no goal text")
+    rig = _push_rig(Path(tempfile.mkdtemp()))
+    T, ts = rig.T, rig.ts
+    t = ts.create("SECRET-GOAL-TEXT do the thing with token sk-abc", title="Fix the header",
+                  project="cadence")
+    ts.transition(t["id"], T.RUNNING)
+    ts.transition(t["id"], T.AWAITING_APPROVAL, "reviewed")
+    _wait(lambda: len(rig.service.calls) >= 1)
+    got = _read_pushes(rig)
+    check("awaiting_approval sends one notification", len(got) == 1, str(got))
+    check("titled by what it needs, with its project", got and got[0]["title"]
+          == "Ready for your approval · cadence", str(got))
+    check("its line is the task's title; nothing of its goal",
+          got and got[0]["body"] == "Fix the header"
+          and "SECRET" not in json.dumps(got) and "sk-abc" not in json.dumps(got), str(got))
+    check("a tap opens that task", got and got[0]["url"] == f"/?task={t['id']}"
+          and got[0]["tag"] == f"task-{t['id']}", str(got))
+    check("sent urgently, with a VAPID header",
+          rig.service.calls[0]["urgency"] == "high"
+          and rig.service.calls[0]["auth"].startswith("vapid t="))
+
+    # A loop: sent back, fails, retried, fails again, ... notifies once.
+    ts.transition(t["id"], T.QUEUED, "sent back")
+    for _ in range(3):
+        ts.transition(t["id"], T.RUNNING)
+        ts.transition(t["id"], T.FAILED, "claude exited 1")
+        time.sleep(0.12)
+        ts.transition(t["id"], T.QUEUED, "retry")
+    ts.transition(t["id"], T.RUNNING)
+    ts.transition(t["id"], T.FAILED, "claude exited 1")
+    _wait(lambda: len(rig.service.calls) >= 2)
+    time.sleep(0.4)
+    states = [p["title"] for p in _read_pushes(rig)]
+    check("four failures in a loop: one 'Failed' notification",
+          states.count("Failed · cadence") == 1, str(states))
+    ts.transition(t["id"], T.QUEUED)
+    ts.transition(t["id"], T.RUNNING)
+    ts.transition(t["id"], T.AWAITING_APPROVAL)
+    time.sleep(0.4)
+    check("and a state it already notified for is not sent again",
+          len(rig.service.calls) == 2, str([p["title"] for p in _read_pushes(rig)]))
+    ts.transition(t["id"], T.NEEDS_INPUT, "yours to do: !release cadence")
+    _wait(lambda: len(rig.service.calls) >= 3)
+    check("a different state of the same task is its own notification",
+          _read_pushes(rig)[-1]["title"] == "Needs your input · cadence")
+    check("the record of what was sent survives a restart",
+          not rig.push.PushStore(Path(rig.store._path)).claim(f"task:{t['id']}:failed"))
+
+    for state in (T.QUEUED, T.RUNNING, T.BLOCKED, T.DONE, T.CANCELLED, T.PROPOSED):
+        check(f"{state} never notifies", rig.push.needs_you({"id": "x", "state": state}) is None)
+    check("exactly the needs-you states notify, proposals aside (they are filed, not reached)",
+          set(rig.push.NEEDS_YOU) == set(T.NEEDS_ATTENTION) - {T.PROPOSED})
+
+
+def test_push_never_for_transient_or_requeue():
+    print("\nquota/overload parking, a restart's requeue, and a task that moved on send nothing")
+    rig = _push_rig(Path(tempfile.mkdtemp()))
+    T, ts = rig.T, rig.ts
+    hold = types.SimpleNamespace(close=lambda *a: None, open=lambda: None)
+    fail_or_retry = _bot_func("fail_or_retry", task_store=ts, tasks=T,
+                              retry=__import__("retry"), RUNNER_HOLD=hold)
+    quota = ts.create("q", title="quota hit")
+    ts.transition(quota["id"], T.RUNNING)
+    parked = fail_or_retry(quota["id"], "Claude usage limit reached; resets 3pm", started=True)
+    over = ts.create("o", title="overloaded")
+    ts.transition(over["id"], T.RUNNING)
+    parked2 = fail_or_retry(over["id"], "API Error: 529 overloaded_error", started=True)
+    time.sleep(0.4)
+    check("a quota limit and an overload are parked to retry (blocked)",
+          parked and parked2 and ts.get(quota["id"])["state"] == T.BLOCKED
+          and ts.get(over["id"])["state"] == T.BLOCKED)
+    check("and neither notifies", rig.service.calls == [], str(_read_pushes(rig)))
+
+    real = ts.create("r", title="really broken")
+    ts.transition(real["id"], T.RUNNING)
+    if not fail_or_retry(real["id"], "claude exited 1: no such file", started=True):
+        ts.transition(real["id"], T.FAILED, "claude exited 1: no such file")
+    _wait(lambda: rig.service.calls)
+    check("a real failure does", [p["title"] for p in _read_pushes(rig)] == ["Failed"],
+          str(_read_pushes(rig)))
+
+    n = len(rig.service.calls)
+    q = ts.create("queue work", title="interrupted", driver="queue")
+    ts.transition(q["id"], T.RUNNING)
+    moved = ts.requeue_interrupted()
+    time.sleep(0.4)
+    check("a restart's failed-then-requeued is not a failure anyone hears about",
+          moved >= 1 and ts.get(q["id"])["state"] == T.QUEUED and len(rig.service.calls) == n,
+          str(_read_pushes(rig)[n:]))
+    # Each guard on its own, not only together: the store says the restart's
+    # "failed" is not a real ending, and the notifier listens to that even
+    # when the task would still read as failed.
+    told = []
+    ts2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ts2.on_move = lambda rec, prev, settled: told.append((rec["state"], settled))
+    q2 = ts2.create("queue work", title="interrupted", driver="queue")
+    ts2.transition(q2["id"], T.RUNNING)
+    ts2.requeue_interrupted()
+    check("requeue_interrupted tells on_move its 'failed' is not settled",
+          (T.FAILED, False) in told and (T.QUEUED, True) in told, str(told))
+    lone = _push_rig(Path(tempfile.mkdtemp()))
+    lone.notifier.current = lambda tid: {"state": T.FAILED}
+    lone.notifier.task_moved({"id": "tsk_x", "state": T.FAILED, "title": "x"}, T.RUNNING, False)
+    lone.notifier.task_moved({"id": "tsk_y", "state": T.FAILED, "title": "y"}, T.RUNNING, True)
+    _wait(lambda: lone.service.calls)
+    time.sleep(0.3)
+    check("an unsettled move is not sent even if the task still reads as failed",
+          [p["body"] for p in _read_pushes(lone)] == ["y"], str(_read_pushes(lone)))
+    r = ts.create("r2", title="retried at once")
+    ts.transition(r["id"], T.RUNNING)
+    ts.transition(r["id"], T.FAILED, "boom")
+    ts.transition(r["id"], T.QUEUED, "retry")     # within the settle window
+    time.sleep(0.4)
+    check("a failure already retried by the time it would send is not sent",
+          len(rig.service.calls) == n, str(_read_pushes(rig)[n:]))
+
+
+def test_push_failure_never_affects_a_transition():
+    import push
+    import tasks as T
+    print("\nnotifying can fail any way it likes: the move stands and nothing raises")
+    tmp = Path(tempfile.mkdtemp())
+    ts = T.TaskStore(tmp / "tasks.json")
+
+    def boom(*a, **k):
+        raise RuntimeError("push exploded")
+    ts.on_move = boom
+    t = ts.create("g", title="x")
+    ts.transition(t["id"], T.RUNNING)
+    try:
+        moved = ts.transition(t["id"], T.FAILED, "real")
+        raised = None
+    except Exception as e:
+        moved, raised = None, e
+    check("an on_move that raises does not fail the transition",
+          raised is None and moved and moved["state"] == T.FAILED, repr(raised))
+    check("and the move is on disk", T.TaskStore(tmp / "tasks.json").get(t["id"])["state"] == T.FAILED)
+
+    class BrokenStore:
+        def count(self):
+            raise OSError("disk gone")
+    n = push.Notifier(BrokenStore(), tmp / "vapid")
+    try:
+        n.task_moved({"id": "a", "state": T.FAILED}, T.RUNNING, True)
+        n.reply("D1:1.1", "tsk_1", "t")
+        ok = True
+    except Exception:
+        ok = False
+    check("the notifier's entry points never raise", ok)
+
+    rig = _push_rig(Path(tempfile.mkdtemp()))
+    rig.service.raises = {s["endpoint"] for _, s in rig.browsers}
+    t = rig.ts.create("g", title="unlucky")
+    rig.ts.transition(t["id"], T.RUNNING)
+    start = time.time()
+    moved = rig.ts.transition(t["id"], T.AWAITING_APPROVAL)
+    took = time.time() - start
+    _wait(lambda: rig.service.calls)
+    check("a push service that fails does not fail the move",
+          moved["state"] == T.AWAITING_APPROVAL and rig.service.calls, str(moved["state"]))
+    check("and the move does not wait on sending (it is queued, off the hot path)",
+          took < 0.05, f"{took:.3f}s")
+    slow = _push_rig(Path(tempfile.mkdtemp()), settle=0)
+    gate = __import__("threading").Event()
+    slow.notifier.sender = lambda *a, **k: gate.wait(5) and 201
+    t = slow.ts.create("g", title="slow")
+    slow.ts.transition(t["id"], T.RUNNING)
+    start = time.time()
+    slow.ts.transition(t["id"], T.FAILED)
+    took = time.time() - start
+    gate.set()
+    check("even a push service that hangs", took < 0.05, f"{took:.3f}s")
+    held = _push_rig(Path(tempfile.mkdtemp()))
+    with held.store._lock:                   # a push.json save under way
+        t = held.ts.create("g", title="mid-save")
+        held.ts.transition(t["id"], T.RUNNING)
+        start = time.time()
+        done = []
+        th = __import__("threading").Thread(
+            target=lambda: done.append(held.ts.transition(t["id"], T.FAILED)))
+        th.start(); th.join(1.0)
+        took = time.time() - start
+    check("nor a push.json save in progress", done and took < 0.5, f"{took:.3f}s")
+    check("an unreadable push.json turns push off, not the bot",
+          "push_store = None" in (BASE / "bot.py").read_text()
+          and push.handle({"action": "test"}, None, push.Notifier(None))["ok"] is False)
+
+
+def test_push_reply_on_finished_turn_not_quiet_wake():
+    import push
+    import defer
+    import tasks as T
+    print("\na finished reply notifies; a scheduled check that found nothing does not")
+    m = push.reply_message("D1:5.5", "tsk_1", "Kitchen plans", "here is the plan", "slack")
+    check("a reply names the thread, opens it, and carries none of its text",
+          m and m["body"] == "Kitchen plans" and m["url"] == "/?thread=D1:5.5"
+          and m["tag"] == "thread-D1:5.5" and "plan" not in m["title"], str(m))
+    check("one per turn", m["dedupe"] == "reply:tsk_1")
+    check("a wake-up that found nothing sends nothing",
+          push.reply_message("D1:5.5", "tsk_2", "x", f"  {defer.QUIET}\n", T.WAKE_SOURCE) is None)
+    check("a wake-up with news does",
+          push.reply_message("D1:5.5", "tsk_3", "x", "the build finished", T.WAKE_SOURCE))
+
+    tree = ast.parse((BASE / "bot.py").read_text())
+    ex = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "execute_task")
+    quiet = [n for n in ast.walk(ex) if isinstance(n, ast.If) and "defer.QUIET" in ast.unparse(n.test)]
+    check("execute_task has its quiet-wake branch", len(quiet) == 1)
+    if quiet:
+        body = ast.Module(body=quiet[0].body, type_ignores=[])
+        check("which notifies nothing and returns",
+              "PUSH" not in ast.unparse(body) and isinstance(quiet[0].body[-1], ast.Return))
+    calls = [n for n in ast.walk(ex) if isinstance(n, ast.Call)
+             and ast.unparse(n.func) == "PUSH.reply"]
+    guard = [n for n in ast.walk(ex) if isinstance(n, ast.If)
+             and "WAKE_SOURCE" in ast.unparse(n.test)
+             and any(ast.unparse(c.func) == "PUSH.reply" for c in ast.walk(n)
+                     if isinstance(c, ast.Call))]
+    check("execute_task notifies a reply only for a wake-up, passing its text and source",
+          len(calls) == 1 and len(guard) == 1
+          and {k.arg for k in calls[0].keywords} >= {"text", "source"}, ast.unparse(ex)[:0])
+    check("and only one that ended done: one that parked for you has its needs-you instead",
+          guard and "tasks.DONE" in ast.unparse(guard[0].test), guard and ast.unparse(guard[0].test))
+
+    # handle_prompt, as shipped: a finished turn notifies once; a failed one
+    # is the failed task's notification, not a reply.
+    tmp = Path(tempfile.mkdtemp())
+    bot = _web_bot(tmp)
+    key = "D1:700.1"
+    bot.store.update(key, session_id="sid-x", cwd=str(tmp), title="Garden")
+    r = bot.web({"key": key, "text": "what next"})
+    _wait(lambda: bot.pushed)
+    check("a finished turn in any thread notifies a reply, naming the thread",
+          len(bot.pushed) == 1 and bot.pushed[0]["args"][0] == key
+          and bot.pushed[0]["args"][2] == "Garden", str(bot.pushed))
+    task = [t for t in bot.tasks.by_thread(key) if t["source_ref"] == r["ref"]]
+    check("for its own task", task and bot.pushed[0]["args"][1] == task[0]["id"], str(task)[:200])
+    n = len(bot.pushed)
+    r2 = bot.web({"key": key, "text": "make it fail"})
+    _wait(lambda: any(t["state"] == T.FAILED for t in bot.tasks.by_thread(key)))
+    time.sleep(0.2)
+    check("a failed turn does not notify a reply", len(bot.pushed) == n, str(bot.pushed[n:]))
+    src = (BASE / "bot.py").read_text()
+    check("the task store tells the notifier of every move",
+          "task_store.on_move = PUSH.task_moved" in src)
+
+
+def test_viz_push_route_is_gated():
+    import threading
+    import urllib.error
+    import urllib.request
+    import visualizer as V
+    print("\n/api/push is behind the tailnet identity gate and the cross-site rules")
+    saved_env = os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+    saved = (V.LOOPBACK, V.TOKEN, V.ENV_FILE, V.bot_call)
+    sent = []
+    srv = None
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.ENV_FILE = Path(tempfile.mkdtemp()) / "no.env"
+        V.bot_call = lambda path, payload, timeout=1.0: sent.append((path, payload, timeout)) or {"ok": True}
+        os.environ["VIZ_TAILSCALE_LOGIN"] = "owner@example.com"
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def post(body, **headers):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/push", method="POST",
+                                         data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json", **headers})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode()
+        serve = {"X-Forwarded-For": "100.64.0.2", "X-Forwarded-Host": "mini.tail1.ts.net"}
+        sub = {"action": "subscribe", "subscription": {"endpoint": "https://web.push.apple.com/x"}}
+        code, _ = post(sub, **serve, **{"Tailscale-User-Login": "intruder@example.com"})
+        check("another tailnet login cannot subscribe", code == 403 and not sent, f"{code} {sent}")
+        code, _ = post(sub, **serve)
+        check("nor can a proxied request with no identity", code == 403 and not sent)
+        code, _ = post(sub, **serve, **{"Tailscale-User-Login": "owner@example.com",
+                                        "Sec-Fetch-Site": "cross-site"})
+        check("nor a cross-site page in the owner's own browser", code == 403 and not sent)
+        code, _ = post(sub, **serve, **{"Tailscale-User-Login": "owner@example.com",
+                                        "Content-Type": "text/plain"})
+        check("nor a no-preflight text/plain POST", code == 403 and not sent)
+        code, body = post(sub, **serve, **{"Tailscale-User-Login": "owner@example.com",
+                                           "Sec-Fetch-Site": "same-origin",
+                                           "Origin": "https://mini.tail1.ts.net"})
+        check("the owner's own page subscribes, relayed to the bot's /push",
+              code == 200 and sent and sent[-1][0] == "/push" and sent[-1][1] == sub, f"{code} {sent}")
+        post({"action": "test"})
+        check("a test is given time to reach every device", sent[-1][2] >= 30, str(sent[-1]))
+        check("the route is one the gate tests enumerate",
+              "/api/push" in _viz_routes("do_POST"))
+    finally:
+        V.LOOPBACK, V.TOKEN, V.ENV_FILE, V.bot_call = saved
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+        if saved_env is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved_env
+
+
+def test_viz_send_timeout_is_unknown_not_offline():
+    import socket
+    import threading
+    import visualizer as V
+    print("\n/api/send tells 'the bot did not answer in time' from 'the bot is offline'")
+    saved = V.BOT_PORT
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(5)
+    held = []
+
+    def accept():                           # takes the request, never answers
+        while True:
+            try:
+                c, _ = lsock.accept()
+            except OSError:
+                return
+            held.append(c)
+    threading.Thread(target=accept, daemon=True).start()
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    dead_port = dead.getsockname()[1]
+    dead.close()
+    try:
+        V.BOT_PORT = str(lsock.getsockname()[1])
+        slow = V.send_answer(V.bot_call("/web-message", {"text": "x"}, timeout=0.3))
+        check("a bot that took it and did not answer in time: outcome unknown",
+              slow.get("ok") is False and slow.get("unknown") is True
+              and "offline" not in slow.get("error", ""), str(slow))
+        V.BOT_PORT = str(dead_port)
+        off = V.send_answer(V.bot_call("/web-message", {"text": "x"}, timeout=0.3))
+        check("a bot that is not there: offline, definitely not sent",
+              off == {"ok": False, "error": "bot is offline"}, str(off))
+        check("an answer is passed through", V.send_answer({"ok": True, "key": "k"}) == {"ok": True, "key": "k"})
+        # Reached, then the connection dropped with no answer: it may have acted.
+        drop = socket.socket()
+        drop.bind(("127.0.0.1", 0))
+        drop.listen(5)
+
+        def hang_up():
+            while True:
+                try:
+                    c, _ = drop.accept()
+                except OSError:
+                    return
+                c.recv(65536)
+                c.close()
+        threading.Thread(target=hang_up, daemon=True).start()
+        V.BOT_PORT = str(drop.getsockname()[1])
+        dropped = V.send_answer(V.bot_call("/web-message", {"text": "x"}, timeout=2))
+        drop.close()
+        check("a connection dropped after the bot took it: unknown, not offline",
+              dropped.get("unknown") is True, str(dropped))
+        empty = socket.socket()
+        empty.bind(("127.0.0.1", 0))
+        empty.listen(5)
+
+        def answer_empty():
+            while True:
+                try:
+                    c, _ = empty.accept()
+                except OSError:
+                    return
+                c.recv(65536)
+                c.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                          b"Content-Length: 2\r\n\r\n{}")
+                c.close()
+        threading.Thread(target=answer_empty, daemon=True).start()
+        V.BOT_PORT = str(empty.getsockname()[1])
+        blank = V.send_answer(V.bot_call("/web-message", {"text": "x"}, timeout=2))
+        empty.close()
+        check("an empty answer (the bot's handler raised) is unknown too",
+              blank.get("unknown") is True, str(blank))
+        check("/api/send relays with the shared wait and answers through send_answer",
+              "bot_call(\"/web-message\", payload, timeout=SEND_WAIT_S)" in (BASE / "visualizer.py").read_text()
+              and "self._json(send_answer(answer))" in (BASE / "visualizer.py").read_text())
+    finally:
+        V.BOT_PORT = saved
+        lsock.close()
+        for c in held:
+            c.close()
+
+
+def test_dashboard_resend_makes_one_thread():
+    import threading
+    import webthread
+    print("\nsending the same message again under its client id makes one thread, not two")
+    tmp = Path(tempfile.mkdtemp())
+    bot = _web_bot(tmp)
+    real_post = bot.client.chat_postMessage
+    slow = threading.Event()
+
+    def slow_post(channel, text, thread_ts=None, **kw):
+        if thread_ts is None:                # the new thread's parent: Slack is slow
+            slow.wait(3)
+        return real_post(channel, text, thread_ts=thread_ts, **kw)
+    bot.client.chat_postMessage = slow_post
+    payload = {"new": True, "text": "plan the garden", "client_id": "c1d2e3f4-aaaa"}
+    answers = []
+    first = threading.Thread(target=lambda: answers.append(bot.web(dict(payload))))
+    first.start()
+    time.sleep(0.2)                          # the dashboard gave up; the page sends again
+    second = threading.Thread(target=lambda: answers.append(bot.web(dict(payload))))
+    second.start()
+    time.sleep(0.2)
+    slow.set()
+    first.join(5); second.join(5)
+    parents = [p for p in bot.posted if p.get("channel") == "D9" and p.get("thread_ts") is None]
+    check("both answers name the same thread", len(answers) == 2 and answers[0]["ok"]
+          and answers[1]["ok"] and answers[0]["key"] == answers[1]["key"]
+          and answers[0]["ref"] == answers[1]["ref"], str(answers))
+    check("the repeat is marked as one", sum(bool(a.get("duplicate")) for a in answers) == 1,
+          str(answers))
+    _wait(lambda: bot.prompts)
+    time.sleep(0.3)
+    check("Slack got one parent, and one turn ran", len(parents) == 1 and len(bot.prompts) == 1,
+          f"{len(parents)} parents, {len(bot.prompts)} turns")
+    later = bot.web(dict(payload))
+    check("a repeat after it finished is answered from it, posting nothing",
+          later["key"] == answers[0]["key"] and later.get("duplicate")
+          and len([p for p in bot.posted if p.get("channel") == "D9"
+                   and "thread_ts" in p and p["thread_ts"] is None]) == 1, str(later))
+
+    # Continuing a thread: the same.
+    key = answers[0]["key"]
+    n = len(bot.prompts)
+    one = {"key": key, "text": "and the shed", "client_id": "zz-continue-1"}
+    a, b = bot.web(dict(one)), bot.web(dict(one))
+    _wait(lambda: len(bot.prompts) > n)
+    time.sleep(0.3)
+    check("a reply sent twice is one message and one turn",
+          a["ref"] == b["ref"] and len(bot.prompts) == n + 1
+          and sum("_via visualizer:_ and the shed" in (p.get("text") or "") for p in bot.posted) == 1,
+          f"{a} {b} {len(bot.prompts) - n}")
+    # Refused, then tried again: a failure is not remembered as the answer.
+    bot.channel["home"] = ""
+    fail = bot.web({"new": True, "text": "x", "client_id": "retry-after-fail"})
+    bot.channel["home"] = "D9"
+    retry = bot.web({"new": True, "text": "x", "client_id": "retry-after-fail"})
+    check("a send that failed is tried again under the same id, not answered from the failure",
+          fail["ok"] is False and retry["ok"] is True and not retry.get("duplicate"),
+          f"{fail} {retry}")
+    # Broke partway, after Slack had the thread: kept as unknown, so a repeat
+    # cannot start a second one.
+    real_add = bot.store.add_file
+    bot.store.add_file = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    import base64 as _b64
+    files = [{"name": "a.png", "type": "image/png", "data": _b64.b64encode(b"PNG").decode()}]
+    parents = lambda: len([p for p in bot.posted if p.get("channel") == "D9"
+                           and "thread_ts" in p and p["thread_ts"] is None])
+    n_par = parents()
+    broke = bot.web({"new": True, "text": "z", "files": files, "client_id": "broke-partway"})
+    bot.store.add_file = real_add
+    again = bot.web({"new": True, "text": "z", "files": files, "client_id": "broke-partway"})
+    check("a send that broke partway is unknown, and a repeat does not start another thread",
+          broke.get("unknown") is True and again.get("unknown") is True
+          and again.get("duplicate") and parents() == n_par + 1, f"{broke} {again} {parents() - n_par}")
+    check("without an id every send is new, as before",
+          bot.web({"new": True, "text": "y"})["key"] != bot.web({"new": True, "text": "y"})["key"])
+    check("an id that is not one is refused",
+          "client_id" in bot.web({"new": True, "text": "y", "client_id": "../x"}).get("error", ""))
+    # Still under way past the wait: said so, not guessed.
+    sends = webthread.Sends()
+    first, slot = sends.begin("abcdefgh")
+    again, slot2 = sends.begin("abcdefgh")
+    check("a repeat while the first is still going waits, then says pending",
+          first and not again and webthread.Sends.wait(slot2, 0.05) is None)
+    sends.finish("abcdefgh", slot, {"ok": True, "key": "D1:1.1"})
+    check("and is given the first answer once there is one",
+          webthread.Sends.wait(slot2, 0.05) == {"ok": True, "key": "D1:1.1"})
+    old = webthread.Sends(ttl=10)
+    old.begin("abcdefgh", now=100)
+    check("ids are forgotten after their time", old.begin("abcdefgh", now=200)[0] is True)
+
+
+SW_PUSH_HARNESS = r"""
+const listeners = {}, shown = [], opened = [], posted = [], focused = [];
+let wins = [];
+globalThis.self = {
+  addEventListener: (k, f) => { listeners[k] = f; },
+  skipWaiting() {},
+  registration: {showNotification: async (title, opts) => { shown.push({title, opts}); }},
+  clients: {
+    claim: async () => {},
+    matchAll: async opts => { globalThis.__matchOpts = opts; return wins; },
+    openWindow: async url => { opened.push(url); return {}; },
+  },
+};
+globalThis.caches = {keys: async () => [], delete: async () => true};
+""" + "%SW%" + r"""
+async function push(data) {
+  let w = null;
+  listeners.push({data: data === undefined ? null : {json: () => JSON.parse(data), text: () => data},
+                  waitUntil: p => { w = p; }});
+  await w;
+}
+async function click(url) {
+  let w = null, closed = false;
+  listeners.notificationclick({notification: {data: {url}, close() { closed = true; }},
+                               waitUntil: p => { w = p; }});
+  await w;
+  return closed;
+}
+(async () => {
+  const out = {};
+  await push(JSON.stringify({title: "Ready for your approval · cadence", body: "Fix the header",
+                             url: "/?task=tsk_1", tag: "task-tsk_1"}));
+  await push("not json at all");
+  await push(undefined);
+  await push(JSON.stringify({title: "x", url: "https://evil.example/"}));
+  await push(JSON.stringify({title: "x", url: "//evil.example/"}));
+  await push(JSON.stringify({title: "x", url: "javascript:alert(1)"}));
+  await push(JSON.stringify({title: "x", url: "/\\evil.example"}));
+  out.shown = shown;
+  // A tap with the app open: focused and told; nothing new opened.
+  wins = [{postMessage: m => posted.push(m), focus: async () => { focused.push(1); }}];
+  out.closedOpen = await click("/?thread=D1:5.5");
+  out.whenOpen = {posted: posted.slice(), focused: focused.length, opened: opened.slice(),
+                  match: globalThis.__matchOpts};
+  // A tap with it closed: opened on the thread.
+  wins = [];
+  out.closedCold = await click("/?thread=D1:5.5");
+  out.whenClosed = {opened: opened.slice()};
+  await click("https://evil.example/");
+  out.evilOpened = opened[opened.length - 1];
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+
+
+def test_sw_push_and_notificationclick():
+    import visualizer as V
+    print("\nthe service worker shows a push and a tap opens or focuses the app on its thread or task")
+    sw = V.SERVICE_WORKER.decode()
+    check("the worker still writes no cache", not any(b in sw for b in ("caches.open", ".put(", "addAll(")))
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the worker's push handlers checked by text only")
+        return
+    r = subprocess.run([node, "-e", SW_PUSH_HARNESS.replace("%SW%", sw)],
+                       capture_output=True, text=True, timeout=60)
+    check("the worker's push handlers run under a stub scope", r.returncode == 0, r.stderr[-600:])
+    if r.returncode:
+        return
+    o = json.loads(r.stdout)
+    first = o["shown"][0]
+    check("a push is shown with its title, line and tag",
+          first["title"] == "Ready for your approval · cadence"
+          and first["opts"]["body"] == "Fix the header" and first["opts"]["tag"] == "task-tsk_1"
+          and first["opts"]["data"]["url"] == "/?task=tsk_1", str(first))
+    check("every push shows something, even one that is not JSON or is empty (iOS requires it)",
+          len(o["shown"]) == 7 and o["shown"][1]["opts"]["body"] == "not json at all"
+          and o["shown"][2]["title"] == "Silkworm", str(o["shown"][1:3]))
+    check("a url that leaves the dashboard becomes /",
+          [s["opts"]["data"]["url"] for s in o["shown"][3:]] == ["/", "/", "/", "/"],
+          str([s["opts"]["data"] for s in o["shown"][3:]]))
+    w = o["whenOpen"]
+    check("tapped with the app open: it is focused and told which thread to open",
+          w["posted"] == [{"type": "open", "url": "/?thread=D1:5.5"}] and w["focused"] == 1
+          and w["opened"] == [] and o["closedOpen"] is True, str(w))
+    check("every window is looked at, controlled or not",
+          w["match"] == {"type": "window", "includeUncontrolled": True}, str(w["match"]))
+    check("tapped with it closed: the app opens on that thread",
+          o["whenClosed"]["opened"] == ["/?thread=D1:5.5"] and o["closedCold"] is True, str(o))
+    check("and never anywhere else", o["evilOpened"] == "/", str(o["evilOpened"]))
+
+
+PAGE_PUSH_DRIVER = r"""
+// The page's notification control, the deep links a notification opens, and
+// a send whose outcome is unknown -- against a stub DOM.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const scenario = process.argv[3];
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+function el(id) {
+  return {id, textContent: "", value: "", title: "", className: "", style: {}, dataset: {},
+    children: [], _inner: "", open: false, flashed: false,
+    get innerHTML() { return this._inner; }, set innerHTML(v) { this._inner = v; },
+    classList: {add(c) { if (c === "flash") this.owner.flashed = true; }, remove() {}, toggle() {},
+                contains() { return false; }},
+    appendChild(c) { this.children.push(c); return c; }, remove() {}, addEventListener() {},
+    insertAdjacentHTML(_, h) { this._inner += h; }, focus() {}, scrollIntoView() {},
+    querySelector(sel) { return sel === "details" ? this._details || null : null; },
+    querySelectorAll() { return []; }, getBoundingClientRect() { return {bottom: 0}; }};
+}
+const els = {};
+const byId = id => { if (!els[id]) { els[id] = el(id); els[id].classList.owner = els[id]; } return els[id]; };
+const rows = {};
+globalThis.document = {getElementById: byId, createElement: () => el("new"), hidden: false,
+  querySelector: sel => { const m = /data-task="([^"]+)"/.exec(sel); return m ? rows[m[1]] || null : null; },
+  querySelectorAll: () => [], addEventListener() {}, body: el("body")};
+globalThis.CSS = {escape: s => s};
+const nav = {userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", platform: "iPhone",
+             maxTouchPoints: 5, standalone: false};
+let swMessage = null, subscribed = null, existing = null;
+const swReg = {pushManager: {
+  getSubscription: async () => existing,
+  subscribe: async opts => { subscribed = opts; return {toJSON: () => ({endpoint: "https://web.push.apple.com/z", keys: {p256dh: "p", auth: "a"}})}; }}};
+nav.serviceWorker = {register: async () => swReg, ready: Promise.resolve(swReg),
+                     addEventListener: (k, f) => { if (k === "message") swMessage = f; }};
+Object.defineProperty(globalThis, "navigator", {value: nav, configurable: true, writable: true});
+let perm = "default", asked = 0;
+const win = {addEventListener() {}, PushManager: function () {}};
+globalThis.window = win;
+globalThis.Notification = {get permission() { return perm; },
+  // As a browser does: once denied, asking again answers "denied" unprompted.
+  requestPermission: async () => { asked++; if (perm !== "denied") perm = "granted"; return perm; }};
+let standaloneApp = false;
+globalThis.matchMedia = q => ({matches: q === "(display-mode: standalone)" ? standaloneApp : false});
+globalThis.history = {replaceState(s, t, u) { globalThis.__replaced = u; }, state: null};
+win.history = globalThis.history;
+globalThis.location = {search: scenario === "cold" ? "?thread=D1%3A5.5" : "",
+                       href: scenario === "cold" ? "https://mini.ts.net/?thread=D1%3A5.5" : "https://mini.ts.net/"};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = (f) => { setImmediate(f); return 0; };
+globalThis.FileReader = class {};
+const sessions = [{key: "D1:5.5", title: "garden", kind: "thread", session_id: "s1", updated: 1,
+                   turns: 1, cost: 0, resume_cmd: "x", slack_link: "y"},
+                  {key: "A:1", title: "alpha", kind: "thread", session_id: "s2", updated: 1,
+                   turns: 1, cost: 0, resume_cmd: "x", slack_link: "y"}];
+const sends = [], pushes = [], reads = [];
+let sendAnswers = [];
+let liveNow = {ok: true, turns: []};
+globalThis.fetch = async (url, opts) => {
+  let out = {ok: true};
+  if (url.startsWith("/api/send")) {
+    sends.push(JSON.parse(opts.body));
+    out = sendAnswers.length ? sendAnswers.shift() : {ok: true, ref: "r9", replies: []};
+    if (out === "throw") throw new TypeError("Load failed");
+  } else if (url.startsWith("/api/push")) {
+    const b = JSON.parse(opts.body); pushes.push(b);
+    out = b.action === "key" ? {ok: true, key: "BAAA"} : {ok: true, subscriptions: 1};
+  } else if (url.startsWith("/api/session?")) {
+    reads.push(url);
+    out = {session_id: "s1", messages: [], cursor: 1, reset: false, live: liveNow};
+  } else if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions, slack: {}};
+  else if (url.startsWith("/api/tasks")) out = {ok: true, tasks: [], counts: {}};
+  else if (url.startsWith("/api/stats"))
+    out = {total_cost: 1, cache_rate: 90, threads: 2, days: [], models: []};
+  else if (url.startsWith("/api/artifacts")) out = [];
+  else if (url.startsWith("/api/projects")) out = {ok: true, projects: []};
+  return {status: 200, headers: {get: () => null}, json: async () => out};
+};
+(0, eval)(src + `;globalThis.__p = {enableNotifications, pushSupport, sendReply, sendText, recheckSend,
+  openTarget, openTask, newThreadForm, submitNewThread, loadList, loadTranscript,
+  getActive: () => active, setActive(k) { active = lastSessions.find(s => s.key === k); },
+  sent: k => sentFor(k)};`);
+const tick = async (n) => { for (let i = 0; i < (n || 20); i++) await new Promise(r => setImmediate(r)); };
+(async () => {
+  const P = globalThis.__p, out = {};
+  await tick();
+  if (scenario === "cold") {
+    await tick(40);
+    out.cold = {active: P.getActive() && P.getActive().key, read: reads[reads.length - 1] || "",
+                replaced: globalThis.__replaced};
+    process.stdout.write(JSON.stringify(out)); return;
+  }
+  // iPhone, in Safari: not installed. Said, and nothing is asked.
+  out.inSafari = {support: P.pushSupport(), btn: byId("notifybtn").title};
+  await P.enableNotifications();
+  out.inSafari.toast = byId("toast").textContent;
+  out.inSafari.asked = asked;
+  // Installed: the tap asks, subscribes with the bot's key, hands it over.
+  standaloneApp = true;
+  out.installed = {support: P.pushSupport()};
+  await P.enableNotifications(); await tick();
+  out.installed.asked = asked;
+  out.installed.key = subscribed && Array.from(subscribed.applicationServerKey);
+  out.installed.userVisible = subscribed && subscribed.userVisibleOnly;
+  out.installed.pushes = pushes.map(p => p.action);
+  out.installed.sub = pushes.find(p => p.action === "subscribe");
+  out.installed.btn = byId("notifybtn").title;
+  // Denied in Settings: said how to fix it.
+  perm = "denied";
+  await P.enableNotifications();
+  out.denied = {toast: byId("toast").textContent, support: P.pushSupport()};
+  perm = "granted";
+
+  // A notification tapped while the app is open: the page opens the thread.
+  await P.loadList();
+  swMessage({data: {type: "open", url: "/?thread=D1:5.5"}}); await tick();
+  out.openThread = {active: P.getActive() && P.getActive().key, read: reads[reads.length - 1] || ""};
+  // ...or the task, in the needs-you list, opened and marked.
+  rows["tsk_9"] = byId("row9"); rows["tsk_9"]._details = byId("det9");
+  byId("tproj").value = "some-other-project";
+  swMessage({data: {type: "open", url: "/?task=tsk_9"}}); await tick(40);
+  out.openTask = {modal: byId("taskmodal").style.display, details: byId("det9").open,
+                  flashed: byId("row9").flashed, filter: byId("tproj").value};
+
+  // A send whose outcome is unknown, every time: reconciled under the same
+  // id, then left unconfirmed -- and the text is not put back.
+  P.setActive("A:1");
+  await P.loadTranscript(true); await tick();
+  sendAnswers = [{ok: false, unknown: true, error: "no answer from the bot in time"},
+                 {ok: false, pending: true, error: "still being sent"},
+                 "throw",
+                 {ok: false, unknown: true, error: "x"}, {ok: false, unknown: true, error: "x"}];
+  byId("reply").value = "add the shed";
+  const before = sends.length;
+  await P.sendReply(); await tick();
+  const mine = sends.slice(before);
+  out.unknown = {tries: mine.length, ids: [...new Set(mine.map(s => s.client_id))],
+                 box: byId("reply").value, live: byId("tlive").innerHTML};
+  // Still shown after the thread is read again (pruning keeps it).
+  await P.loadTranscript(false); await tick();
+  out.unknown.afterRead = byId("tlive").innerHTML.includes("not confirmed");
+  // Check again: it had gone through after all.
+  sendAnswers = [{ok: true, ref: "r7", replies: [], duplicate: true}];
+  await P.recheckSend(0); await tick();
+  out.recheck = {id: sends[sends.length - 1].client_id, live: byId("tlive").innerHTML,
+                 box: byId("reply").value};
+  // Unknown, then the repeat finds it: sent, nothing left over.
+  sendAnswers = [{ok: false, unknown: true, error: "x"}, {ok: true, ref: "r8", replies: [], duplicate: true}];
+  byId("reply").value = "and the gate";
+  const b2 = sends.length;
+  await P.sendReply(); await tick();
+  out.reconciled = {tries: sends.length - b2, sameId: sends[b2].client_id === sends[b2 + 1].client_id,
+                    box: byId("reply").value, live: byId("tlive").innerHTML};
+  // Unknown, then Check again finds it was refused: now the words come back.
+  sendAnswers = Array(5).fill({ok: false, unknown: true, error: "x"});
+  byId("reply").value = "the fence";
+  await P.sendReply(); await tick();
+  const idx = P.sent("A:1").findIndex(i => i.unconfirmed);
+  sendAnswers = [{ok: false, error: "no such thread"}];
+  await P.recheckSend(idx); await tick();
+  out.recheckRefused = {box: byId("reply").value, live: byId("tlive").innerHTML.includes("the fence")};
+  byId("reply").value = "";
+  // An unconfirmed command outlives a later turn finishing.
+  sendAnswers = Array(5).fill({ok: false, unknown: true, error: "x"});
+  await P.sendText("!brief"); await tick();
+  sendAnswers = [{ok: true, ref: "r20", replies: []}];
+  await P.sendText("next one"); await tick();
+  liveNow = {ok: true, turns: [{ref: "r20", state: "done"}]};
+  await P.loadTranscript(false); await tick();
+  out.commandKept = byId("tlive").innerHTML.includes("!brief");
+  liveNow = {ok: true, turns: []};
+  // A definite refusal still gives the words back.
+  sendAnswers = [{ok: false, error: "bot is offline"}];
+  byId("reply").value = "later";
+  await P.sendReply(); await tick();
+  out.refused = byId("reply").value;
+
+  // A new thread whose start is unconfirmed: a second tap asks after the same id.
+  await P.newThreadForm();
+  byId("nttext").value = "plan the week"; byId("ntproj").value = "";
+  sendAnswers = Array(5).fill({ok: false, unknown: true, error: "x"});
+  const b3 = sends.length;
+  await P.submitNewThread(); await tick();
+  out.ntUnknown = {err: byId("tferr").textContent, modal: byId("fmodal").style.display};
+  sendAnswers = [{ok: true, key: "D9:1.1", ref: "1.1", replies: [], duplicate: true}];
+  await P.submitNewThread(); await tick();
+  out.ntIds = [...new Set(sends.slice(b3).map(s => s.client_id))];
+  out.ntOpened = P.getActive() && P.getActive().key;
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+def test_dashboard_notifications_and_reconcile():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe page: Enable notifications, notification deep links, and unknown sends reconciled")
+    check("the header has the notifications control",
+          'id="notifybtn" onclick="enableNotifications()"' in V.PAGE)
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    fn = js[js.index("async function enableNotifications()"):]
+    fn = fn[:fn.index("\n}\n")]
+    before = re.sub(r"//[^\n]*", "", fn[:fn.index("Notification.requestPermission()")]
+                    ).rsplit("await", 1)[0]
+    check("the permission is asked before anything else is awaited (iOS needs the tap)",
+          "await" not in before and "requestPermission" in fn, before)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "page.js").write_text(js)
+    (d / "drive.js").write_text(PAGE_PUSH_DRIVER)
+    outs = {}
+    for scenario in ("main", "cold"):
+        p = subprocess.run([node, str(d / "drive.js"), str(d / "page.js"), scenario],
+                           capture_output=True, text=True, timeout=60)
+        check(f"the page's javascript runs ({scenario})", p.returncode == 0, p.stderr.strip()[-800:])
+        if p.returncode:
+            return
+        outs[scenario] = json.loads(p.stdout)
+    o = outs["main"]
+    s = o["inSafari"]
+    check("an iPhone not running the installed app is told to Add to Home Screen first",
+          s["support"] == "install" and "Add to Home Screen first" in s["toast"]
+          and "Add to Home Screen first" in s["btn"], str(s))
+    check("and is not asked for a permission it cannot grant", s["asked"] == 0, str(s))
+    i = o["installed"]
+    check("installed, a tap asks once and subscribes with the bot's key, user-visible",
+          i["support"] == "ask" and i["asked"] == 1 and i["key"] == [4, 0, 0]
+          and i["userVisible"] is True, str(i))
+    check("then hands the subscription to the bot",
+          i["pushes"][:2] == ["key", "subscribe"] and i["sub"]["subscription"]["endpoint"]
+          == "https://web.push.apple.com/z", str(i))
+    check("and says notifications are on", i["btn"] == "Notifications are on", i["btn"])
+    check("denied in Settings: told where to turn them on",
+          o["denied"]["support"] == "denied" and "Settings" in o["denied"]["toast"], str(o["denied"]))
+    check("a tapped notification opens its thread in the app already open",
+          o["openThread"]["active"] == "D1:5.5" and "key=D1%3A5.5" in o["openThread"]["read"],
+          str(o["openThread"]))
+    check("or its task, in the needs-you list, opened and marked",
+          o["openTask"] == {"modal": "flex", "details": True, "flashed": True, "filter": ""},
+          str(o["openTask"]))
+    c = outs["cold"]["cold"]
+    check("a cold start on /?thread= opens that thread, and leaves / in the address bar",
+          c["active"] == "D1:5.5" and "key=D1%3A5.5" in c["read"] and c["replaced"] == "/", str(c))
+    u = o["unknown"]
+    check("an unknown outcome is sent again under the same id, a few times",
+          u["tries"] == 5 and len(u["ids"]) == 1 and len(u["ids"][0]) >= 8, str(u)[:300])
+    check("and if still unknown, the text is NOT put back: it is shown unconfirmed",
+          u["box"] == "" and "not confirmed" in u["live"] and "add the shed" in u["live"]
+          and "Check again" in u["live"], str(u)[:400])
+    check("an unconfirmed message stays shown when the thread is read again", u["afterRead"])
+    check("an unconfirmed command too, after a later turn has finished", o["commandKept"])
+    check("Check again that finds it refused gives the words back",
+          o["recheckRefused"]["box"] == "the fence" and not o["recheckRefused"]["live"],
+          str(o["recheckRefused"]))
+    r = o["recheck"]
+    check("Check again asks under the same id, and a found send settles",
+          r["id"] == u["ids"][0] and "not confirmed" not in r["live"] and r["box"] == "", str(r)[:300])
+    rc = o["reconciled"]
+    check("an unknown that the repeat finds is simply sent",
+          rc["tries"] == 2 and rc["sameId"] and rc["box"] == "" and "not confirmed" not in rc["live"],
+          str(rc)[:300])
+    check("a definite refusal still puts the words back", o["refused"] == "later", o["refused"])
+    check("an unconfirmed new thread says so and keeps the form",
+          "Not confirmed" in o["ntUnknown"]["err"] and o["ntUnknown"]["modal"] != "none",
+          str(o["ntUnknown"]))
+    check("tapping Start again asks after the same message: one id for the form",
+          len(o["ntIds"]) == 1 and o["ntOpened"] == "D9:1.1", f"{o['ntIds']} {o['ntOpened']}")
+
+
+def test_silkworm_push_subcommand():
+    import importlib.machinery
+    import importlib.util
+    print("\nsilkworm push status | test | forget-all, through the bot")
+    loader = importlib.machinery.SourceFileLoader("silkworm_cli_push", str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("silkworm_cli_push", loader)
+    cli = importlib.util.module_from_spec(spec)
+    sys.argv = ["silkworm"]
+    loader.exec_module(cli)
+    calls = []
+
+    def bot(answer):
+        def call(path, payload, timeout=3):
+            calls.append((path, payload, timeout))
+            return answer
+        return call
+    for argv, answer, code in (
+            ([], {"ok": True, "available": True, "keys": True, "key_dir": "/k",
+                  "subscriptions": 1, "services": ["web.push.apple.com"]}, 0),
+            (["test"], {"ok": True, "sent": 1, "pruned": 0, "failed": 0}, 0),
+            (["test"], {"ok": False, "error": "no subscriptions"}, 1),
+            (["forget-all"], {"ok": True, "forgot": 2}, 0),
+            (["status"], {}, 3)):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = cli.do_push(argv, call=bot(answer))
+        check(f"silkworm push {' '.join(argv) or '(status)'} exits {code}", got == code,
+              f"{got}: {buf.getvalue()[-200:]}")
+    check("each asks the bot's /push for that action",
+          [c[1]["action"] for c in calls] == ["status", "test", "test", "forget-all", "status"]
+          and all(c[0] == "/push" for c in calls), str(calls))
+    check("a test is given time to reach every device", calls[1][2] >= 60, str(calls[1]))
+    with contextlib.redirect_stderr(io.StringIO()):
+        check("an unknown action is a usage error", cli.do_push(["nuke"], call=bot({})) == 2)
+    check("the subcommand is dispatched and documented",
+          'cmd == "push"' in (BASE / "bin" / "silkworm").read_text()
+          and "silkworm push [status|test|forget-all]" in cli.__doc__)
+    check("requirements name cryptography, which push.py needs",
+          "cryptography" in (BASE / "requirements.txt").read_text())
+
+
+def test_silkworm_test_runs_on_the_bots_interpreter():
+    import importlib.machinery
+    import importlib.util
+    print("\nsilkworm test runs the suite on the bot's venv, from a task worktree too")
+    loader = importlib.machinery.SourceFileLoader("silkworm_cli_venv", str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("silkworm_cli_venv", loader)
+    cli = importlib.util.module_from_spec(spec)
+    sys.argv = ["silkworm"]
+    loader.exec_module(cli)
+    tmp = Path(tempfile.mkdtemp())
+    main, wt, bare = tmp / "main", tmp / "wt", tmp / "bare"
+    main.mkdir()
+    git = lambda *a, cwd=main: subprocess.run(["git", *a], cwd=cwd, capture_output=True,
+                                              text=True, check=True)
+    git("init", "-q", "-b", "main")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+    git("worktree", "add", "-q", "-b", "task", str(wt))
+    venv = main / ".venv" / "bin" / "python"
+    venv.parent.mkdir(parents=True)
+    venv.write_text("")
+    check("a checkout with its own .venv uses it", cli.venv_python(main) == str(venv))
+    check("a task worktree without one uses the main checkout's, the bot's own",
+          Path(cli.venv_python(wt)).resolve() == venv.resolve(), cli.venv_python(wt))
+    (wt / ".venv" / "bin").mkdir(parents=True)
+    (wt / ".venv" / "bin" / "python").write_text("")
+    check("but a worktree's own .venv comes first",
+          cli.venv_python(wt) == str(wt / ".venv" / "bin" / "python"))
+    bare.mkdir()
+    check("with neither, the interpreter running the CLI", cli.venv_python(bare) == sys.executable)
+    src = (BASE / "bin" / "silkworm").read_text()
+    check("silkworm test and the deploy preflight's suite both ask venv_python",
+          src.count("py = venv_python()") == 2
+          and "if VENV_PY.exists() else sys.executable" not in src)
 
 
 if __name__ == "__main__":

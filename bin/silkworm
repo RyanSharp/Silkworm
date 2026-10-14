@@ -34,6 +34,8 @@
     silkworm status                 health check: services, bot, visualizer, hooks
     silkworm restart                restart the services
     silkworm tailscale [status|on|off]  serve the dashboard to your tailnet (never Funnel)
+    silkworm push [status|test|forget-all]  phone notifications: what is set up, send a
+                                    test to every subscribed device, or drop them all
     silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
                                     restart onto this checkout without killing work
     silkworm deploy --after-turn [--skip-tests] [--max-wait 2h]
@@ -65,6 +67,27 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 VENV_PY = REPO / ".venv" / "bin" / "python"
+
+
+def venv_python(repo: Path = REPO) -> str:
+    """The interpreter the suite runs under: the bot's own, the checkout's
+    .venv. A task's git worktree has no .venv of its own, and falling back to
+    whatever python3 is on PATH ran its suite under another Python than the
+    bot's, without the bot's dependencies (requirements.txt) -- so the main
+    checkout's venv is used there. sys.executable only when there is neither.
+    """
+    own = repo / ".venv" / "bin" / "python"
+    if own.exists():
+        return str(own)
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute",
+                            "--git-common-dir"], capture_output=True, text=True, timeout=10)
+        main = Path(r.stdout.strip()).parent / ".venv" / "bin" / "python"
+        if r.returncode == 0 and r.stdout.strip() and main.exists():
+            return str(main)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sys.executable
 LOGS = REPO / "logs"
 
 Y = "\033[33m"; G = "\033[32m"; R = "\033[31m"; N = "\033[0m"
@@ -556,6 +579,45 @@ def do_tailscale(argv: list) -> int:
         print(f"  {Y}note:{N} VIZ_TAILSCALE_LOGIN is not set, so the dashboard refuses "
               "every tailnet request until you add it to .env")
     return 0 if sub == "off" else (0 if tailscale_status(ts) else 1)
+
+
+PUSH_ACTIONS = ("status", "test", "forget-all")
+
+
+def do_push(argv: list, call=None) -> int:
+    """silkworm push [status | test | forget-all]. argv excludes the subcommand.
+
+    Asked of the bot (/push, push.handle): it owns push.json and the sending.
+    The VAPID private key is never printed; status says only where it is.
+    """
+    call = call or bot_call
+    sub = argv[0] if argv else "status"
+    if sub not in PUSH_ACTIONS or len(argv) > 1:
+        print("usage: silkworm push [status | test | forget-all]", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"{WORM} push {sub}")
+    r = call("/push", {"action": sub}, timeout=70 if sub == "test" else 10)
+    if not r:
+        print(f"  {R}✘{N} bot unreachable on :{bot_port()} — is it running?")
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        print(f"  {R}✘{N} {r.get('error') or 'refused'}")
+        return EXIT_REFUSED
+    if sub == "status":
+        check("cryptography installed (web push encryption)", bool(r.get("available")),
+              "pip install -r requirements.txt into the venv, then silkworm restart")
+        check(f"VAPID keys in {r.get('key_dir')}", bool(r.get("keys")),
+              "made when a device first taps Enable notifications")
+        n = int(r.get("subscriptions") or 0)
+        check(f"{n} device(s) subscribed" + (f" ({', '.join(r.get('services') or [])})" if n else ""),
+              n > 0, "open the dashboard from the home-screen app and tap 🔔")
+    elif sub == "test":
+        print(f"  {G}✔{N} sent to {r.get('sent', 0)} device(s)"
+              + (f" · {r['pruned']} gone, removed" if r.get("pruned") else "")
+              + (f" · {r['failed']} failed (see the bot log)" if r.get("failed") else ""))
+    else:
+        print(f"  {G}✔{N} forgot {r.get('forgot', 0)} subscription(s)")
+    return EXIT_OK
 
 
 def do_status() -> None:
@@ -1341,7 +1403,7 @@ def base_branch(repo: Path, git=git_out) -> str:
 
 
 def run_suite() -> int:
-    py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+    py = venv_python()
     # As the bot's own verification runs it: outside any turn. Run from inside
     # one (deploy --after-turn), the turn's variables would make the suite's
     # own CLI runs behave as that turn -- an operator's, refused.
@@ -2180,7 +2242,7 @@ def main() -> None:
             print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
     elif cmd == "test":
         print(f"{WORM} running regression tests…")
-        py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+        py = venv_python()
         sys.exit(subprocess.run([py, str(REPO / "tests" / "test_invariants.py")]).returncode)
     elif cmd == "discard":
         # The way to reset a backlog. Doing it with `git branch -D` is how
@@ -2285,6 +2347,8 @@ def main() -> None:
         sys.exit(do_operator(args[1:]))           # args[0] is the subcommand
     elif cmd == "tailscale":
         sys.exit(do_tailscale(args[1:]))          # args[0] is the subcommand
+    elif cmd == "push":
+        sys.exit(do_push(args[1:]))               # args[0] is the subcommand
     elif cmd == "logs":
         os.execvp("tail", ["tail", "-n", "40", "-f", str(LOGS / "bot.log")])
     elif cmd in ("help", "-h", "--help"):

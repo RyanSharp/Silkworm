@@ -1,2 +1,4 @@
 slack-bolt>=1.20
 python-dotenv>=1.0
+# Web push (push.py): P-256 ECDH/ECDSA and AES-GCM, which the stdlib lacks.
+cryptography>=42

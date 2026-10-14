@@ -58,6 +58,7 @@ import research
 import slacklinks
 import tasks
 import procs
+import push
 import webthread
 import projects
 import workspaces
@@ -228,6 +229,15 @@ UPLOADS_ROOT.mkdir(exist_ok=True)
 store = SessionStore(BASE_DIR / "sessions.json")
 task_store = tasks.TaskStore(BASE_DIR / "tasks.json")
 project_store = projects.ProjectStore(BASE_DIR / "projects.json")
+# Web push to the installed dashboard (push.py). A push.json that cannot be
+# read turns push off rather than the bot: notifications are a convenience.
+try:
+    push_store = push.PushStore(BASE_DIR / "push.json")
+except Exception:
+    log.exception("push.json cannot be read; web push is off until it is fixed")
+    push_store = None
+PUSH = push.Notifier(push_store, current=task_store.get)
+task_store.on_move = PUSH.task_moved
 
 
 def generated_paths(repo) -> list[str]:
@@ -1946,8 +1956,55 @@ WEB_COMMAND_WAIT_S = 8.0
 THREAD_KEY_RE = re.compile(r"[A-Z0-9]+:[0-9.]+")
 
 
+#: How long a repeat of a send still under way waits for the first's answer:
+#: under the dashboard's own 20s wait on this route, so it answers in time.
+WEB_REPEAT_WAIT_S = 15.0
+#: Dashboard sends by their client id (webthread.Sends).
+WEB_SENDS = webthread.Sends()
+
+
 def handle_web_message(payload: dict) -> dict:
     """Route for /web-message — a message sent from the dashboard's composer.
+
+    Idempotent by `client_id`, an id the page gives each message: when the
+    page cannot tell whether a send went through (the dashboard stopped
+    waiting on a slow Slack post), it sends it again under the same id and
+    gets the first send's answer -- the same thread, the same ref -- rather
+    than a second thread. A repeat that arrives while the first is still
+    under way waits for it (WEB_REPEAT_WAIT_S); a send that failed is
+    forgotten, so a retry after a real refusal really retries. Without an id
+    every send is new, as before. See deliver_web_message for the rest.
+    """
+    cid = str(payload.get("client_id") or "")
+    if not cid:
+        return deliver_web_message(payload)
+    if not webthread.CLIENT_ID_RE.fullmatch(cid):
+        return {"ok": False, "error": "client_id must be 8-64 letters, digits, - or _"}
+    first, slot = WEB_SENDS.begin(cid)
+    if not first:
+        answer = WEB_SENDS.wait(slot, WEB_REPEAT_WAIT_S)
+        if answer is None:
+            return {"ok": False, "pending": True,
+                    "error": "still being sent — not confirmed yet"}
+        return dict(answer, duplicate=True)
+    try:
+        answer = deliver_web_message(payload)
+    except Exception:
+        # It may have got as far as Slack: the thread can exist. Remembered
+        # as unknown, not forgotten, so a repeat cannot start a second one.
+        log.exception("dashboard send %s failed partway", cid)
+        answer = {"ok": False, "unknown": True,
+                  "error": "the bot failed partway through sending it — "
+                           "look for it in the thread list"}
+        WEB_SENDS.finish(cid, slot, answer, keep=True)
+        return answer
+    WEB_SENDS.finish(cid, slot, answer)
+    return answer
+
+
+def deliver_web_message(payload: dict) -> dict:
+    """One dashboard message, delivered (handle_web_message decides whether
+    it is a new one).
 
     Localhost-only by construction (the LocalServer binds 127.0.0.1), so it is
     trusted like the machine owner: it bypasses the Slack allowlist.
@@ -2066,6 +2123,12 @@ def handle_web_message(payload: dict) -> dict:
         # filing a new thread did first is said here.
         out["replies"] = filed
     return out
+
+
+def handle_push(payload: dict) -> dict:
+    """Route for /push — subscriptions and tests for web push (push.handle),
+    from the dashboard's Enable notifications and `silkworm push`."""
+    return push.handle(payload, push_store, PUSH)
 
 
 def handle_thread_state(payload: dict) -> dict:
@@ -3513,6 +3576,7 @@ server.route("/drain", handle_drain)
 server.route("/tell", handle_tell)
 server.route("/web-message", handle_web_message)
 server.route("/thread-state", handle_thread_state)
+server.route("/push", handle_push)
 server.route("/register-terminal", handle_register_terminal)
 server.route("/learnings", handle_learnings)
 server.route("/summaries", handle_summaries)
@@ -3812,6 +3876,9 @@ def handle_prompt(event: dict, say, client) -> None:
                                   "cost_reported_total": result.cost_usd,
                                   "files_uploaded": uploaded})
         task_state(task_id, tasks.DONE)
+        # The phone's notification for the reply (push.py), which Slack's own
+        # used to be. Queued, never awaited: it cannot cost the turn anything.
+        PUSH.reply(key, task_id, (store.get(key) or {}).get("title") or "")
         refresh_summary(key)
 
     except ClaudeStopped:
@@ -4461,6 +4528,14 @@ def execute_task(task: dict) -> None:
                 tell_thread(key, roles.over_to_you(parked.get("needs_user"))
                             if parked.get("needs_user") else research.parked_note(
                                 parked, research.children(tid, task_store.all().values())))
+        if (task.get("source") == tasks.WAKE_SOURCE
+                and (task_store.get(tid) or {}).get("state") == tasks.DONE):
+            # A scheduled check reporting back is the conversation resuming,
+            # so it notifies as a reply does. One that found nothing returned
+            # above, unannounced; reply_message refuses defer.QUIET as well.
+            # One that parked for you has its needs-you notification instead.
+            PUSH.reply(key, tid, (store.get(key) or {}).get("title") or "",
+                       text=result.text, source=task.get("source"))
         refresh_summary(key)
         refresh_brief(task.get("project", ""),
                       f"Task: {task.get('goal', '')[:500]}\n\n"

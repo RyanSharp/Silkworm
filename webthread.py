@@ -17,6 +17,8 @@ is the pure part, importable without a token and so tested directly:
 import base64
 import binascii
 import mimetypes
+import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -175,3 +177,57 @@ def thread_state(turns: list[dict], running: bool) -> dict:
              if t.get("state") not in (tasks.QUEUED, tasks.RUNNING)][-RECENT_TURNS:]
     return {"ok": True, "running": bool(running) or bool(now), "queued": queued,
             "turns": ended + now + queued}
+
+
+# --- a message sent twice is sent once ------------------------------------------
+# The page names each message with an id of its own (client_id). When it cannot
+# tell whether a send went through -- the dashboard gave up waiting on a slow
+# Slack post -- it sends the same message again under the same id, and the bot
+# answers the second from the first instead of posting it again: one thread,
+# one turn. Held in memory: a restart between the two forgets it.
+
+CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+#: How long a send is remembered by its id.
+SEND_TTL_S = 3600
+MAX_SENDS = 500
+
+
+class Sends:
+    """Sends by client id: the first claims it, a repeat waits for and is
+    given the first one's answer. A send that failed is forgotten, so trying
+    again really tries again."""
+
+    def __init__(self, ttl: float = SEND_TTL_S):
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._slots: dict = {}
+
+    def begin(self, cid: str, now=None) -> tuple:
+        """(True, slot) for the first send under `cid`; (False, slot) for a repeat."""
+        now = time.time() if now is None else now
+        with self._lock:
+            for old in [k for k, s in self._slots.items() if now - s["at"] > self.ttl]:
+                del self._slots[old]
+            while len(self._slots) >= MAX_SENDS:
+                del self._slots[min(self._slots, key=lambda k: self._slots[k]["at"])]
+            slot = self._slots.get(cid)
+            if slot is not None:
+                return False, slot
+            slot = {"at": now, "answer": None, "done": threading.Event()}
+            self._slots[cid] = slot
+            return True, slot
+
+    def finish(self, cid: str, slot: dict, answer: dict, keep: bool = False) -> None:
+        """Record the first send's answer. A refusal is forgotten (`keep`
+        aside: a send that broke partway may have happened)."""
+        with self._lock:
+            slot["answer"] = answer
+            if not keep and not (answer or {}).get("ok") and self._slots.get(cid) is slot:
+                del self._slots[cid]
+        slot["done"].set()
+
+    @staticmethod
+    def wait(slot: dict, timeout: float):
+        """The first send's answer, or None if it is still going after `timeout`."""
+        slot["done"].wait(timeout)
+        return slot["answer"]

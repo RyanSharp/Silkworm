@@ -423,6 +423,11 @@ class TaskStore:
         self._path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
+        #: Told of every move once it is saved: on_move(record, from_state,
+        #: settled). push.Notifier.task_moved, in the bot. `settled` is False
+        #: for a move that is not a real ending (see requeue_interrupted).
+        #: Whatever it does or raises, the move has happened.
+        self.on_move = None
         for tid, rec in (jsonstore.load(path, default={}) or {}).items():
             # Isolation used to be inferred from `driver`. Records written
             # before it became a field of its own keep the answer that rule
@@ -581,6 +586,12 @@ class TaskStore:
             log.info("task %s %s -> %s%s", tid, current, to_state,
                      f" ({detail})" if detail else "")
             moved = dict(rec)
+        hook = self.on_move
+        if hook is not None:
+            try:
+                hook(dict(moved), current, _release)
+            except Exception:
+                log.exception("task %s: on_move failed (the move stands)", tid)
         if _release and to_state in ENDED:
             self._release_waiters(tid, to_state, detail, _seen or {tid})
         return moved

@@ -1091,6 +1091,41 @@ connected?". The icons are drawn from `assets/logo.svg` by
 `python3 assets/make_icons.py`; rerun it after changing the logo (the suite
 fails while they differ).
 
+**Notifications.** In the installed app, tap 🔔 in the header and allow
+notifications (iPhone needs iOS 16.4+ and only offers them in the home-screen
+app; in Safari the button says *Add to Home Screen first*). The phone is then
+told when a task enters **awaiting approval**, **needs input** or **failed** —
+once per task and state, so a retry loop cannot spam — and when a thread
+(dashboard- or Slack-born) has a finished reply. A quota/overload failure that
+parks to retry is not news, nor is a scheduled check that found nothing.
+Tapping one opens the app on that thread, or on the task in the needs-you
+list. A notification carries a short title and the task's or thread's title
+only — never a goal, a reply or an error. Slack's own notifications are
+unchanged.
+
+This is web push (RFC 8291/8292, `push.py`, which needs `cryptography` from
+`requirements.txt`). The VAPID keypair is made on first use in
+`~/.silkworm/vapid/` (override with `SILKWORM_VAPID_DIR`), mode 600, outside
+every repository, and is never printed; subscriptions live in `push.json`.
+Set `PUSH_CONTACT` (a `mailto:` or `https:` URL) to change the contact push
+services are given. Sending runs on its own thread and can never fail or delay
+a turn or a task's move; a device the push service reports gone (404/410) is
+dropped.
+
+```bash
+silkworm push status        # keys present, cryptography installed, devices subscribed
+silkworm push test          # send a test notification to every device now
+silkworm push forget-all    # drop every subscription (re-enable from 🔔)
+```
+
+A message sent from the dashboard carries an id of its own. If the dashboard
+gives up waiting on the bot (a slow Slack post), the page does not assume it
+failed: it sends it again under the same id, which the bot answers from the
+first send — one thread, one turn — and if it still cannot tell, shows the
+message as *not confirmed* with **Check again** rather than putting the text
+back to be sent twice. (The ids are held in the bot's memory for an hour; a
+restart between the two sends forgets them.)
+
 ### SSH tunnel (laptop on the same network)
 
 On the machine you browse *from*:

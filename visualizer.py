@@ -17,6 +17,7 @@ import socket
 import socketserver
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,8 +83,9 @@ MANIFEST = json.dumps({
 #: page itself is one request. What it adds is a page that says why, when the
 #: dashboard cannot be reached at all -- usually Tailscale being off. It only
 #: answers navigations; every other request (/api/*, actions, icons) goes
-#: straight to the network as if there were no worker. Web push (later) adds
-#: its own listeners below the fetch handler.
+#: straight to the network as if there were no worker. Below the fetch
+#: handler: web push (push.py) -- show the notification, and a tap opens or
+#: focuses the app on its thread or task.
 SERVICE_WORKER = r"""// Silkworm dashboard service worker. Served by visualizer.py; caches nothing.
 const VERSION = "1";
 
@@ -122,7 +124,42 @@ self.addEventListener("fetch", event => {
                            "Cache-Control": "no-store"}})));
 });
 
-// --- push (step 4 adds "push" and "notificationclick" listeners here) ---
+// --- push ---
+// A notification from the bot (push.py): {title, body, url, tag}, where url
+// is a path on this dashboard -- "/?thread=<key>" or "/?task=<id>".
+function safeUrl(u) {
+  // A path on this dashboard and nothing else: no other origin, no scheme.
+  return typeof u === "string" && u.startsWith("/") && !u.startsWith("//")
+    && !u.startsWith("/\\") ? u : "/";
+}
+
+self.addEventListener("push", event => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; }
+  catch (e) { d = {body: event.data ? event.data.text() : ""}; }
+  // iOS ends a subscription that receives a push and shows nothing, so
+  // every push shows something.
+  event.waitUntil(self.registration.showNotification(d.title || "Silkworm", {
+    body: d.body || "", tag: d.tag || undefined, icon: "/icons/icon-192.png",
+    data: {url: safeUrl(d.url)}}));
+});
+
+self.addEventListener("notificationclick", event => {
+  event.notification.close();
+  const url = safeUrl(event.notification.data && event.notification.data.url);
+  event.waitUntil((async () => {
+    // The app already open: bring it forward and have the page open the
+    // thread or task itself (it keeps its state; a reload would not).
+    const wins = await self.clients.matchAll({type: "window", includeUncontrolled: true});
+    for (const c of wins) {
+      if (typeof c.focus !== "function") continue;
+      c.postMessage({type: "open", url});
+      try { await c.focus(); } catch (e) { /* focused or not, it was told */ }
+      return;
+    }
+    await self.clients.openWindow(url);
+  })());
+});
 """.replace("__THEME__", THEME).encode()
 
 SESSIONS_FILE = BASE_DIR / "sessions.json"
@@ -239,15 +276,64 @@ BOT_PORT = _bot_port()
 
 # --- bot bridge ---------------------------------------------------------------
 
+#: Why the last bot_call on this thread came back empty: "offline" (the bot
+#: could not be reached, so it never saw the request) or "unknown" (it was
+#: reached and gave no usable answer -- a timeout, a dropped connection, an
+#: empty reply -- so it may have acted on it). bot_failure() reads it.
+_CALL = threading.local()
+
+
 def bot_call(path: str, payload: dict, timeout: float = 1.0) -> dict:
+    _CALL.failure = ""
     req = urllib.request.Request(
         f"http://127.0.0.1:{BOT_PORT}{path}", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except Exception:
+            answer = json.loads(resp.read())
+    except urllib.error.HTTPError:
+        _CALL.failure = "unknown"
         return {}
+    except urllib.error.URLError:
+        # urlopen wraps what goes wrong while connecting -- refused, no route,
+        # a connect that timed out: the request never reached the bot.
+        _CALL.failure = "offline"
+        return {}
+    except Exception:
+        # Connected, then no answer: a timeout, a reset, a dropped connection.
+        _CALL.failure = "unknown"
+        return {}
+    if not answer:
+        _CALL.failure = "unknown"      # the bot's handler raised (LocalServer answers {})
+    return answer
+
+
+def bot_failure() -> str:
+    """"unknown" or "offline" for this thread's last empty bot_call;
+    "offline" if it said nothing (a stand-in bot_call)."""
+    return getattr(_CALL, "failure", "") or "offline"
+
+
+#: What /api/send says when the bot took a message and did not answer in time.
+#: Not "offline": the thread may well have been made, and the page reconciles
+#: by sending it again under the same client_id, which the bot answers from
+#: the first send (bot.handle_web_message) rather than repeating it.
+SEND_UNKNOWN = {"ok": False, "unknown": True,
+                "error": "no answer from the bot in time — it may still have gone through"}
+
+
+#: How long /api/send waits on the bot (which waits WEB_COMMAND_WAIT_S on a
+#: command, and WEB_REPEAT_WAIT_S on a repeat still under way).
+SEND_WAIT_S = 20
+
+
+def send_answer(answer: dict) -> dict:
+    """/api/send's reply for what bot_call returned."""
+    if answer:
+        return answer
+    if bot_failure() == "unknown":
+        return dict(SEND_UNKNOWN)
+    return {"ok": False, "error": "bot is offline"}
 
 
 # --- data loading ---------------------------------------------------------------
@@ -921,7 +1007,12 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/send":
             # A !command is waited on for its replies (bot.WEB_COMMAND_WAIT_S),
             # and attached files travel inside the request.
-            answer = bot_call("/web-message", payload, timeout=20)
+            answer = bot_call("/web-message", payload, timeout=SEND_WAIT_S)
+            self._json(send_answer(answer))
+        elif url.path == "/api/push":
+            # A test sends to every subscription before answering.
+            answer = bot_call("/push", payload,
+                              timeout=60 if payload.get("action") == "test" else 10)
             self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/learnings":
             answer = bot_call("/learnings", payload, timeout=3)
@@ -1435,6 +1526,8 @@ PAGE = r"""<!doctype html>
            padding-right: max(20px, env(safe-area-inset-right)); }
   #composer { padding-bottom: env(safe-area-inset-bottom); }
   #toast { bottom: calc(18px + env(safe-area-inset-bottom)); }
+  .task.flash { outline: 2px solid var(--gold); outline-offset: 2px; }
+  #notifybtn.on { color: var(--gold); }
   @media (max-width: 700px) {
     body { font-size: 15px; }
     header { flex-wrap: wrap; gap: 8px; padding-bottom: 8px;
@@ -1513,6 +1606,7 @@ PAGE = r"""<!doctype html>
   <button class="ghost hbtn" onclick="toggleBoard()" title="per-project boards and backlogs">🗂<span class="lbl"> Projects</span></button>
   <button class="ghost hbtn" onclick="toggleLearn()" title="learnings">🧠<span class="lbl"> Learnings</span></button>
   <button class="ghost hbtn wide" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
+  <button class="ghost hbtn" id="notifybtn" onclick="enableNotifications()" title="Enable notifications">🔔<span class="lbl" id="notifylbl"> Notify</span></button>
   <input id="search" placeholder="Search transcripts…" autocomplete="off">
 </header>
 <div id="alertbar"></div>
@@ -1681,10 +1775,11 @@ function md(src) {
   return html.replace(/<p><\/p>/g, "").replace(/(<br>)+<\/p>/g, "</p>");
 }
 
-function toast(msg) {
+function toast(msg, ms) {
   const t = document.getElementById("toast");
   t.textContent = msg; t.style.display = "block";
-  setTimeout(() => t.style.display = "none", 2500);
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.style.display = "none", ms || 2500);
 }
 
 // --- dashboard ---
@@ -2065,8 +2160,8 @@ function prune(items, turns) {
   const state = new Map(turns.map(t => [t.ref, t.state]));
   const over = it => it.kind === "prompt" && !!it.ref && (state.get(it.ref) === "done" ||
     (it.seen && (state.get(it.ref) === "running" || !state.has(it.ref))));
-  const waiting = it => it.kind === "prompt" && !over(it) &&
-    (!it.ref || ["queued", "running"].includes(state.get(it.ref)));
+  const waiting = it => it.unconfirmed || (it.kind === "prompt" && !over(it) &&
+    (!it.ref || ["queued", "running"].includes(state.get(it.ref))));
   let cut = -1;
   items.forEach((it, i) => { if (over(it)) cut = i; });
   return items.filter((it, i) => i > cut || waiting(it));
@@ -2097,12 +2192,18 @@ function liveHtml(s, live, items) {
   const turns = live.turns || [];
   const byRef = new Map(turns.map(t => [t.ref, t]));
   let h = "";
-  for (const it of items) {
+  items.forEach((it, i) => {
+    if (it.unconfirmed) {
+      h += outBubble(it, "⚠ not confirmed — it may have gone through" + (it.why ? ` (${it.why})` : ""), true)
+        + `<div class="state">Checking sends it again under the same id, so it cannot arrive twice.
+           <button class="ghost" onclick="recheckSend(${i})">Check again</button></div>`;
+      return;
+    }
     if (it.kind === "command")
       h += outBubble(it, it.finished === false ? "still running — the rest of what it says is in Slack" : "");
     else h += outBubble(it, ...promptNote(it, byRef.get(it.ref)));
     for (const r of it.replies || []) h += noteBubble(r);
-  }
+  });
   // Messages waiting their turn that this page did not send: from Slack, or
   // from the dashboard open elsewhere. The thread runs one turn at a time.
   for (const t of turns)
@@ -2143,7 +2244,7 @@ function threadBusy() {
   const live = tview.live || {};
   const state = new Map((live.turns || []).map(t => [t.ref, t.state]));
   return !!(live.running || (live.queued && live.queued.length) ||
-            sentFor(active.key).some(i => i.kind === "prompt" && (!i.ref ||
+            sentFor(active.key).some(i => i.kind === "prompt" && !i.unconfirmed && (!i.ref ||
               ["queued", "running"].includes(state.get(i.ref)) ||
               (!state.has(i.ref) && Date.now() - i.at < 60000))));
 }
@@ -2186,8 +2287,29 @@ async function postSend(payload) {
       headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
     return await r.json();
   } catch (e) {
-    return {ok: false, error: "could not reach the dashboard"};
+    // The request may have arrived before the connection dropped.
+    return {ok: false, unknown: true, error: "could not reach the dashboard"};
   }
+}
+// Every message carries an id of its own. When a send's outcome is unknown --
+// the bot took it and did not answer in time, or a repeat found the first
+// still under way -- it is sent again under the same id, and the bot answers
+// a repeat from the first send: one thread, one turn, however many tries.
+function newClientId() {
+  try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) { /* below */ }
+  let id = "";
+  while (id.length < 32) id += Math.random().toString(36).slice(2);
+  return id.slice(0, 32);
+}
+const RECONCILE_TRIES = 4, RECONCILE_GAP_MS = 1500;
+function unsure(r) { return !r.ok && !!(r.unknown || r.pending); }
+async function sendOnce(payload) {
+  let r = await postSend(payload);
+  for (let i = 0; i < RECONCILE_TRIES && unsure(r); i++) {
+    await new Promise(ok => setTimeout(ok, RECONCILE_GAP_MS));
+    r = await postSend(payload);
+  }
+  return r;
 }
 // Shown at once as on its way, then followed by its ref (see `outgoing`).
 // A command waits for its replies (the bot runs it through handle_command,
@@ -2202,8 +2324,25 @@ async function sendText(text, files) {
   sentFor(key).push(it);
   drawLive();
   let r;
-  try { r = await postSend({key, text, files: await encodeFiles(files)}); }
-  catch (e) { r = {ok: false, error: String(e && e.message || e)}; }
+  try {
+    it.picked = files;
+    it.payload = {key, text, files: await encodeFiles(files), client_id: newClientId()};
+    r = await sendOnce(it.payload);
+  } catch (e) { r = {ok: false, error: String(e && e.message || e)}; }
+  return settleSend(key, it, r);
+}
+// What a send came to. Sent: it follows its ref. Refused: it is dropped, and
+// the caller puts the text back. Unknown even after reconciling: it stays,
+// marked unconfirmed with its payload, and the text is NOT put back -- it may
+// well have gone through, and sending it again by hand would be a second one.
+// "Check again" (recheckSend) resends it under the same id instead.
+function settleSend(key, it, r) {
+  if (unsure(r)) {
+    it.unconfirmed = true; it.why = r.error || "";
+    drawLive();
+    return "unknown";
+  }
+  it.unconfirmed = false;
   if (!r.ok) {
     outgoing.set(key, sentFor(key).filter(x => x !== it));
     toast("Not sent: " + (r.error || "unknown"));
@@ -2211,11 +2350,26 @@ async function sendText(text, files) {
     it.ref = r.ref || "";
     it.replies = r.replies || [];
     it.finished = r.finished;
+    it.payload = null; it.picked = null;
   }
   drawLive();
   loadTranscript(false);
   if (it.kind === "command") loadList();
   return !!r.ok;
+}
+async function recheckSend(i) {
+  if (!active) return;
+  const key = active.key, it = sentFor(key)[i];
+  if (!it || !it.unconfirmed || !it.payload) return;
+  it.why = "checking…"; drawLive();
+  const r = await sendOnce(it.payload);
+  if (settleSend(key, it, r) === false && it.kind === "prompt") {
+    // Definitely not sent: now it is safe to give the words back, files too.
+    const box = document.getElementById("reply");
+    if (box && !box.value && !staged.reply.length) {
+      box.value = it.text; staged.reply = it.picked || []; renderChips("reply");
+    }
+  }
 }
 function cmdSend(cmd) { sendText(cmd); }
 async function sendReply() {
@@ -2223,8 +2377,9 @@ async function sendReply() {
   const text = box.value, files = staged.reply.slice();
   if (!text.trim() && !files.length) return;
   box.value = ""; staged.reply = []; renderChips("reply");
-  // Not sent: put it back, so nothing typed or picked is lost.
-  if (!(await sendText(text, files)) && !box.value) {
+  // Refused: put it back, so nothing typed or picked is lost. Not when the
+  // outcome is unknown: it may have gone, and is shown as unconfirmed.
+  if ((await sendText(text, files)) === false && !box.value) {
     box.value = text; staged.reply = files; renderChips("reply");
   }
 }
@@ -2240,9 +2395,13 @@ document.addEventListener("keydown", e => {
 // and the thread is then the same as one started there. A project is filed by
 // the bot with `!project <slug>` before the first turn, so it is inherited
 // exactly as from Slack.
+let ntClientId = "";
 async function newThreadForm() {
   try { await loadFormChoices(); } catch (e) { formProjects = formProjects || []; }
   staged.nt = [];
+  // One id for whatever this form sends: a second tap after an unconfirmed
+  // start asks after the first rather than starting another thread.
+  ntClientId = newClientId();
   openModal(`<div class="tform"><h3>New thread</h3>
     <div class="sub">It starts in Slack too, under the bot's home channel — reply from either side.</div>
     <label>project <span class="note">(optional — the thread is filed under it, as <code>!project</code> does)</span></label>
@@ -2261,8 +2420,14 @@ async function submitNewThread() {
   if (!text && !files.length) { formError("a thread starts with a message"); return; }
   formError("");
   let r;
-  try { r = await postSend({new: true, text, project, files: await encodeFiles(files)}); }
+  try { r = await sendOnce({new: true, text, project, files: await encodeFiles(files),
+                            client_id: ntClientId}); }
   catch (e) { r = {ok: false, error: String(e && e.message || e)}; }
+  if (unsure(r)) {
+    formError("Not confirmed — it may have started. Tap Start thread again to check: "
+              + "it asks after the same message, so it cannot start a second thread.");
+    return;
+  }
   if (!r.ok) { formError(r.error || "refused"); return; }
   closeModal();
   staged.nt = [];
@@ -2778,7 +2943,7 @@ async function renderTasks() {
           why ? `<div class="why">${esc(why)}</div>` : ""}${
           more ? `<div class="lazy" id="more-${esc(t.id)}"><div class="hint">loading…</div></div>` : ""}</details>`
       : esc(t.title);
-    return `<div class="task">
+    return `<div class="task" data-task="${esc(t.id)}">
       <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
@@ -3803,6 +3968,158 @@ if (window.addEventListener)
 // one -- plain http, an old browser -- the dashboard works the same.
 if (typeof navigator !== "undefined" && navigator.serviceWorker)
   navigator.serviceWorker.register("/sw.js", {scope: "/"}).catch(() => {});
+
+// --- notifications ---
+// Web push: the bot (push.py) notifies this device when a task needs you or a
+// thread has a reply. iPhone allows it only in the installed home-screen app
+// (iOS 16.4+), and only when asked from a tap.
+function standalone() {
+  return (typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches)
+    || (typeof navigator !== "undefined" && navigator.standalone === true);
+}
+function iosDevice() {
+  const n = typeof navigator !== "undefined" ? navigator : {};
+  return /iPhone|iPad|iPod/.test(n.userAgent || "")
+    || (n.platform === "MacIntel" && n.maxTouchPoints > 1);     // iPadOS reads as a Mac
+}
+// What this device can do, before asking it anything.
+function pushSupport() {
+  if (iosDevice() && !standalone()) return "install";
+  const has = typeof navigator !== "undefined" && !!navigator.serviceWorker
+    && typeof window !== "undefined" && "PushManager" in window
+    && typeof Notification !== "undefined";
+  if (!has) return "unsupported";
+  if (Notification.permission === "denied") return "denied";
+  return Notification.permission === "granted" ? "granted" : "ask";
+}
+const PUSH_HELP = {
+  install: "Add to Home Screen first: tap Share, then Add to Home Screen, and open "
+         + "Silkworm from there. iPhone only allows notifications in the installed app.",
+  unsupported: "This browser can't receive notifications.",
+  denied: "Notifications are off for Silkworm. Turn them on in Settings › Notifications "
+        + "› Silkworm, then tap 🔔 again.",
+};
+function b64uBytes(text) {
+  const b = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4));
+  return Uint8Array.from(b, c => c.charCodeAt(0));
+}
+function b64uOf(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function pushCall(payload) {
+  try {
+    return await (await fetch("/api/push", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)})).json();
+  } catch (e) { return {ok: false, error: "could not reach the dashboard"}; }
+}
+// Subscribe (or refresh the subscription) and hand it to the bot. A
+// subscription made with another key is useless and is replaced.
+async function subscribePush() {
+  const reg = await navigator.serviceWorker.ready;
+  const k = await pushCall({action: "key"});
+  if (!k.ok) throw new Error(k.error || "the bot has no push key");
+  let sub = await reg.pushManager.getSubscription();
+  const held = sub && sub.options && sub.options.applicationServerKey;
+  if (sub && held && b64uOf(held) !== k.key) { await sub.unsubscribe(); sub = null; }
+  if (!sub) sub = await reg.pushManager.subscribe({userVisibleOnly: true,
+                                                  applicationServerKey: b64uBytes(k.key)});
+  const r = await pushCall({action: "subscribe", subscription: sub.toJSON(),
+                            agent: navigator.userAgent || ""});
+  if (!r.ok) throw new Error(r.error || "refused");
+  return r;
+}
+async function enableNotifications() {
+  const support = pushSupport();
+  if (PUSH_HELP[support] && support !== "denied") {
+    toast(PUSH_HELP[support], 8000); renderNotify(); return;
+  }
+  // Straight from the tap, before any other await: iOS refuses a permission
+  // request that is not.
+  let perm = Notification.permission;
+  if (perm !== "granted") perm = await Notification.requestPermission();
+  if (perm !== "granted") { toast(PUSH_HELP.denied, 8000); renderNotify(); return; }
+  try {
+    await subscribePush();
+    toast("Notifications are on for this device");
+  } catch (e) {
+    toast("Could not turn notifications on: " + (e && e.message || e), 8000);
+  }
+  renderNotify();
+}
+function renderNotify() {
+  const btn = document.getElementById("notifybtn"), lbl = document.getElementById("notifylbl");
+  if (!btn) return;
+  const support = pushSupport();
+  const words = {install: "Add to Home Screen first to get notifications",
+                 unsupported: "This browser can't receive notifications",
+                 denied: "Notifications are off in Settings", granted: "Notifications are on",
+                 ask: "Enable notifications"}[support];
+  btn.title = words;
+  btn.className = "ghost hbtn" + (support === "granted" ? " on" : "");
+  if (lbl) lbl.textContent = support === "granted" ? " On" : " Notify";
+}
+// Already allowed: keep the bot's copy of this device's subscription current
+// (a push service can rotate it). Quietly; nothing here is asked of anyone.
+if (pushSupport() === "granted") subscribePush().catch(() => {});
+renderNotify();
+
+// --- opening a thread or task from a notification ---
+// The app opens on "/?thread=<key>" or "/?task=<id>" (a cold start), or the
+// service worker posts {type: "open", url} to the page already open.
+async function openTarget(href) {
+  let q;
+  try { q = new URL(href, location.href).searchParams; } catch (e) { return; }
+  const thread = q.get("thread"), task = q.get("task");
+  if (thread) {
+    if (!lastSessions.length) { try { await loadList(); } catch (e) { /* drawn below anyway */ } }
+    active = lastSessions.find(x => x.key === thread) ||
+      {key: thread, title: "", kind: "thread", project: "", session_id: "", summary: "",
+       events: [], turns: 0, cost: 0, updated: Date.now() / 1000, files: 0,
+       resume_cmd: "", slack_link: "", running: false};
+    loadList(); loadTranscript(true);
+  } else if (task) {
+    await openTask(task);
+  }
+}
+async function openTask(id) {
+  const m = document.getElementById("taskmodal");
+  // Whatever project the list was narrowed to, the task must be in it.
+  const sel = document.getElementById("tproj");
+  if (sel) sel.value = "";
+  taskView = "attention";
+  document.getElementById("tabneed").className = "on";
+  document.getElementById("taball").className = "";
+  if (m.style.display !== "flex") {
+    m.style.display = "flex";
+    renderUnregistered();
+    try { await renderProjects(); } catch (e) { /* the list below still draws */ }
+  }
+  try { await renderTasks(); } catch (e) { /* looked for below all the same */ }
+  for (let i = 0; i < 50; i++) {             // a list drawn meanwhile, if not this one
+    const row = document.querySelector(`[data-task="${CSS.escape(id)}"]`);
+    if (row) {
+      const more = row.querySelector("details");
+      if (more) more.open = true;
+      row.classList.add("flash");
+      if (row.scrollIntoView) row.scrollIntoView({block: "center"});
+      return true;
+    }
+    await new Promise(ok => setTimeout(ok, 100));
+  }
+  toast("That task no longer needs you");
+  return false;
+}
+if (typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.addEventListener)
+  navigator.serviceWorker.addEventListener("message", e => {
+    if (e.data && e.data.type === "open") openTarget(e.data.url);
+  });
+if (typeof location !== "undefined" && /[?&](thread|task)=/.test(location.search || "")) {
+  const target = location.href;
+  // Off the address bar, so a reload opens the list rather than this again.
+  if (window.history && history.replaceState) history.replaceState(null, "", "/");
+  openTarget(target);
+}
 
 // --- polling ---
 // Each poll waits for its last one, so a slow tunnel queues nothing; a hidden
