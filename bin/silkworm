@@ -33,6 +33,7 @@
     silkworm install | uninstall    (un)install the login services (bot + visualizer)
     silkworm status                 health check: services, bot, visualizer, hooks
     silkworm restart                restart the services
+    silkworm tailscale [status|on|off]  serve the dashboard to your tailnet (never Funnel)
     silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
                                     restart onto this checkout without killing work
     silkworm deploy --after-turn [--skip-tests] [--max-wait 2h]
@@ -413,6 +414,148 @@ def unmerged_row(r: dict) -> str:
     return (f"{where}{r.get('branch', '')} "
             f"({'?' if n is None else n} on {r.get('base', '?')}) "
             f"{(r.get('title') or '')[:52]}")
+
+
+# --- tailscale serve ------------------------------------------------------------
+
+#: The Mac app ships its CLI inside the bundle; Homebrew's puts it on PATH.
+TAILSCALE_APP = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+
+TAILSCALE_INSTALL = """Tailscale is not installed on this machine. To reach the dashboard from
+your phone or laptop over your tailnet:
+
+  1. Install the Tailscale Mac app (https://tailscale.com/download/mac, or the
+     Mac App Store) and sign in with the account you will use on your phone.
+  2. In the admin console (https://login.tailscale.com/admin/dns) enable
+     MagicDNS, then HTTPS Certificates on the same page.
+  3. Add your Tailscale login to .env:  VIZ_TAILSCALE_LOGIN=you@example.com
+  4. silkworm tailscale on       (tailscale serve --bg {port}; never Funnel)
+  5. silkworm tailscale status   should show every check green.
+"""
+
+
+def tailscale_bin() -> str:
+    """The tailscale CLI, or "" when Tailscale is not installed."""
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    return str(TAILSCALE_APP) if TAILSCALE_APP.exists() else ""
+
+
+def tailscale_json(ts: str, *args) -> dict:
+    """`tailscale <args> --json`, parsed; {} when it fails or says nothing."""
+    try:
+        out = subprocess.run([ts, *args, "--json"], capture_output=True, text=True,
+                             timeout=15)
+        return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def serve_entries(cfg: dict) -> tuple:
+    """Everything a `tailscale serve status --json` config exposes: web
+    proxy targets, and descriptions of anything else (raw TCP forwards, file
+    or text handlers), and whether Funnel is on -- including foreground
+    sessions and Services, which nest whole configs of their own. A raw TCP
+    forward to the dashboard would skip the identity gate: serve adds no
+    headers to it."""
+    proxies, other, funnel = [], [], any((cfg.get("AllowFunnel") or {}).values())
+    for port, tcp in (cfg.get("TCP") or {}).items():
+        if (tcp or {}).get("TCPForward"):
+            other.append(f"tcp:{port} -> {tcp['TCPForward']}")
+    for host, web in (cfg.get("Web") or {}).items():
+        for path, h in ((web or {}).get("Handlers") or {}).items():
+            if (h or {}).get("Proxy"):
+                proxies.append(h["Proxy"])
+            else:
+                other.append(f"{host}{path} -> {', '.join(sorted(h or {})) or 'handler'}")
+    for nested in [*(cfg.get("Foreground") or {}).values(), *(cfg.get("Services") or {}).values()]:
+        p, o, f = serve_entries(nested or {})
+        proxies += p; other += o; funnel = funnel or f
+    return proxies, other, funnel
+
+
+def tailscale_facts(ts: str) -> dict:
+    """What `tailscale status` and `tailscale serve status` say, boiled down."""
+    st = tailscale_json(ts, "status")
+    me = st.get("Self") or {}
+    user = (st.get("User") or {}).get(str(me.get("UserID", "")), {})
+    proxies, other, funnel = serve_entries(tailscale_json(ts, "serve", "status"))
+    return {"state": st.get("BackendState", ""),
+            "login": user.get("LoginName", ""),
+            "dns": (me.get("DNSName") or "").rstrip("."),
+            "https": bool(st.get("CertDomains")),
+            "proxies": proxies, "other": other, "funnel": funnel}
+
+
+def serves_viz(proxies: list, port: str) -> bool:
+    """Serve hands tailnet requests to the dashboard's loopback port."""
+    targets = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    return any(p.rstrip("/") in targets for p in proxies)
+
+
+def tailscale_status(ts: str) -> bool:
+    """Every check `silkworm tailscale status` prints; True when all pass."""
+    f = tailscale_facts(ts)
+    # .env, not the shell: the installed visualizer sees only PATH, so a
+    # login exported here but missing from .env would let nobody in.
+    port, login = viz_port(), (env_file_value("VIZ_TAILSCALE_LOGIN") or "").strip()
+    ok = check(f"tailscale installed ({ts})", True)
+    ok &= check("tailscale logged in and running", f["state"] == "Running",
+                f"state is {f['state'] or 'unknown'} — open the Tailscale app and sign in")
+    ok &= check("HTTPS certificates enabled", f["https"],
+                "enable MagicDNS and HTTPS Certificates at "
+                "https://login.tailscale.com/admin/dns")
+    ok &= check(f"tailscale serve points at the dashboard (:{port})",
+                serves_viz(f["proxies"], port),
+                f"serving {', '.join(f['proxies']) or 'nothing'} — silkworm tailscale on")
+    others = [p for p in f["proxies"] if not serves_viz([p], port)] + f["other"]
+    ok &= check("serve exposes nothing else", not others,
+                f"also serving {', '.join(others)} — the bot's port trusts every "
+                "local caller; tailscale serve reset, then silkworm tailscale on")
+    ok &= check("Funnel is off", not f["funnel"],
+                "the public internet can reach this — tailscale funnel reset")
+    ok &= check("VIZ_TAILSCALE_LOGIN set in .env", bool(login),
+                "add VIZ_TAILSCALE_LOGIN=<your Tailscale login> to .env; until then "
+                "the dashboard refuses every tailnet request")
+    if login:
+        ok &= check(f"VIZ_TAILSCALE_LOGIN matches this machine's login "
+                    f"({f['login'] or 'unknown'})",
+                    login.lower() == f["login"].lower(),
+                    f"it is {login}; only that login will be let in")
+    if f["dns"] and serves_viz(f["proxies"], port):
+        print(f"  dashboard: https://{f['dns']}/")
+    return ok
+
+
+def do_tailscale(argv: list) -> int:
+    """silkworm tailscale [status | on | off]. argv excludes the subcommand."""
+    sub = argv[0] if argv else "status"
+    if sub not in ("status", "on", "off"):
+        print("usage: silkworm tailscale [status | on | off]", file=sys.stderr)
+        return 2
+    ts = tailscale_bin()
+    print(f"{WORM} tailscale {sub}")
+    if not ts:
+        print(TAILSCALE_INSTALL.format(port=viz_port()))
+        return 0 if sub == "status" else 1
+    if sub == "status":
+        return 0 if tailscale_status(ts) else 1
+    # Serve only: tailnet devices, over HTTPS. Never `tailscale funnel`.
+    cmd = [ts, "serve", "--bg", viz_port()] if sub == "on" else [ts, "serve", "reset"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  {R}✘{N} {' '.join(cmd)}: {e}")
+        return 1
+    if r.returncode != 0:
+        print(f"  {R}✘{N} {' '.join(cmd)} failed:\n{(r.stderr or r.stdout).strip()}")
+        return 1
+    print(f"  {G}✔{N} {' '.join(cmd[1:])}")
+    if sub == "on" and not (env_file_value("VIZ_TAILSCALE_LOGIN") or "").strip():
+        print(f"  {Y}note:{N} VIZ_TAILSCALE_LOGIN is not set, so the dashboard refuses "
+              "every tailnet request until you add it to .env")
+    return 0 if sub == "off" else (0 if tailscale_status(ts) else 1)
 
 
 def do_status() -> None:
@@ -2140,6 +2283,8 @@ def main() -> None:
         sys.exit(do_task_action(cmd, args[1:]))   # args[0] is the subcommand
     elif cmd == "operator":
         sys.exit(do_operator(args[1:]))           # args[0] is the subcommand
+    elif cmd == "tailscale":
+        sys.exit(do_tailscale(args[1:]))          # args[0] is the subcommand
     elif cmd == "logs":
         os.execvp("tail", ["tail", "-n", "40", "-f", str(LOGS / "bot.log")])
     elif cmd in ("help", "-h", "--help"):

@@ -22626,6 +22626,316 @@ def test_operator_turns_do_not_hold_the_checkout_and_deploy_tests_run_clean():
           calls and not any(k in calls[0] for k in saved), str(sorted(calls[0])[:5]))
 
 
+def _viz_routes(fn_name):
+    """Every path do_GET / do_POST answers, read from the code itself, so a
+    route added later is covered by the gate tests without editing them."""
+    tree = ast.parse((BASE / "visualizer.py").read_text())
+    handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handler")
+    fn = next(n for n in handler.body if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    paths = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Compare) and ast.unparse(node.left) == "url.path":
+            for c in ast.walk(node.comparators[0]):
+                if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                    paths.add(c.value)
+    return sorted(paths)
+
+
+# `tailscale serve` proxies tailnet requests to the dashboard on 127.0.0.1, so
+# without a gate every device on the tailnet -- a tagged server, a node shared
+# in from someone else's tailnet -- would be the trusted loopback owner, able
+# to relay prompts through /api/send. Proxied requests must carry the identity
+# serve stamps on them, and it must be VIZ_TAILSCALE_LOGIN; plain loopback is
+# untouched.
+def test_viz_tailscale_identity_gate():
+    import threading
+    import urllib.error
+    import urllib.request
+    import visualizer as V
+    print("\nthe dashboard admits only VIZ_TAILSCALE_LOGIN through tailscale serve")
+
+    saved_env = os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+    saved = (V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.ENV_FILE, V.bot_call)
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "sessions.json").write_text("{}")
+    sent = []
+    srv = None
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.SESSIONS_FILE = tmp / "sessions.json"
+        V.ENV_FILE = tmp / "no.env"           # nothing configured
+        V.bot_call = lambda path, payload, timeout=1.0: sent.append(path) or {"ok": True}
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def call(path, headers=None, post=False):
+            # As the page posts: JSON, unless a test says otherwise.
+            headers = ({"Content-Type": "application/json"} if post else {}) | (headers or {})
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}{path}", headers=headers,
+                data=b"{}" if post else None, method="POST" if post else "GET")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode()
+
+        def via_serve(login=None, **extra):
+            """Headers as tailscale serve sends them (ipn/ipnlocal/serve.go)."""
+            h = {"X-Forwarded-For": "100.101.102.103",
+                 "X-Forwarded-Host": "mini.tail1234.ts.net",
+                 "X-Forwarded-Proto": "https"}
+            if login is not None:
+                h.update({"Tailscale-User-Login": login, "Tailscale-User-Name": "Owner",
+                          "Tailscale-Headers-Info": "https://tailscale.com/s/serve-headers"})
+            h.update(extra)
+            return h
+
+        gets, posts = _viz_routes("do_GET"), _viz_routes("do_POST")
+        check("the route list is read from the code (has / and /api/send)",
+              "/" in gets and "/api/send" in posts and len(posts) >= 8, str(posts))
+
+        # Unset login: fail closed for anything proxied, loopback unchanged.
+        code, body = call("/api/sessions", via_serve("owner@example.com"))
+        check("login unset: a proxied request is refused, even with an identity",
+              code == 403 and "VIZ_TAILSCALE_LOGIN is not set" in body, f"{code} {body}")
+        code, _ = call("/api/send", via_serve("owner@example.com"), post=True)
+        check("login unset: proxied /api/send is refused and never reaches the bot",
+              code == 403 and not sent, f"{code} {sent}")
+        code, _ = call("/api/sessions")
+        check("login unset: unproxied loopback reads as before", code == 200)
+        code, _ = call("/api/send", post=True)
+        check("login unset: unproxied loopback still relays /api/send",
+              code == 200 and "/web-message" in sent, f"{code} {sent}")
+        sent.clear()
+
+        os.environ["VIZ_TAILSCALE_LOGIN"] = "Owner@Example.com"
+        code, _ = call("/api/sessions", via_serve("owner@example.com"))
+        check("the owner's login is let in (case aside)", code == 200, str(code))
+        code, _ = call("/api/send", via_serve("owner@example.com"), post=True)
+        check("the owner's login can relay /api/send",
+              code == 200 and "/web-message" in sent, f"{code} {sent}")
+        sent.clear()
+        code, _ = call("/favicon.svg", via_serve("=?utf-8?q?owner=40example.com?="))
+        check("an RFC 2047-encoded login is decoded before comparing", code == 200, str(code))
+
+        sent.clear()      # /api/sessions asks the bot for /status; start clean
+        code, body = call("/api/sessions", via_serve("intruder@example.com"))
+        check("a wrong login is refused with a plain reason",
+              code == 403 and "intruder@example.com is not" in body, f"{code} {body}")
+        refused = [p for p in gets if call(p, via_serve("intruder@example.com"))[0] != 403]
+        refused += [p for p in posts
+                    if call(p, via_serve("intruder@example.com"), post=True)[0] != 403]
+        check("a wrong login is refused on every GET and POST route",
+              not refused and not sent, f"let through: {refused} {sent}")
+
+        code, body = call("/api/sessions", via_serve())
+        check("a proxied request with no identity (a tagged device) is refused",
+              code == 403 and "no Tailscale identity" in body, f"{code} {body}")
+        code, _ = call("/api/send", via_serve(), post=True)
+        check("...including /api/send, which never reaches the bot",
+              code == 403 and not sent, f"{code} {sent}")
+        for marker, value in (("X-Forwarded-For", "100.64.0.9"),
+                              ("X-Forwarded-Host", "mini.tail1234.ts.net"),
+                              ("Host", "mini.tail1234.ts.net")):
+            code, _ = call("/api/sessions", {marker: value})
+            check(f"{marker} alone marks a request as proxied", code == 403, str(code))
+        code, body = call("/api/sessions", via_serve(None, **{
+            "Tailscale-Funnel-Request": "?1"}))
+        check("a Funnel request is refused", code == 403 and "Funnel" in body, body)
+
+        # Serve stamps the owner's login on whatever page sent the request,
+        # so a hostile page in the owner's browser must not post as them.
+        sent.clear()
+        for label, extra in (
+                ("a text/plain POST (no preflight)", {"Content-Type": "text/plain"}),
+                ("a form POST", {"Content-Type": "application/x-www-form-urlencoded"}),
+                ("a cross-site POST", {"Sec-Fetch-Site": "cross-site"}),
+                ("a same-site POST from another subdomain", {"Sec-Fetch-Site": "same-site"}),
+                ("a POST from another origin", {"Origin": "https://evil.example"})):
+            code, body = call("/api/tasks", via_serve("owner@example.com", **extra), post=True)
+            check(f"the owner's login is not enough for {label}",
+                  code == 403 and not sent, f"{code} {body} {sent}")
+        code, _ = call("/api/tasks", via_serve("owner@example.com", **{
+            "Origin": "https://mini.tail1234.ts.net", "Sec-Fetch-Site": "same-origin"}), post=True)
+        check("the dashboard's own page posts as before",
+              code == 200 and "/tasks" in sent, f"{code} {sent}")
+        sent.clear()
+        code, _ = call("/api/send", {"Content-Type": "text/plain"}, post=True)
+        check("unproxied loopback POSTs are not held to the remote rules (unchanged)",
+              code == 200 and "/web-message" in sent, f"{code} {sent}")
+        sent.clear()
+
+        code, _ = call("/api/sessions")
+        check("login set: unproxied loopback reads as before", code == 200)
+        code, _ = call("/api/send", post=True)
+        check("login set: unproxied loopback still relays /api/send",
+              code == 200 and "/web-message" in sent, f"{code} {sent}")
+        sent.clear()
+
+        # The installed service sees only PATH, so .env must be enough.
+        os.environ.pop("VIZ_TAILSCALE_LOGIN")
+        V.ENV_FILE = tmp / ".env"
+        V.ENV_FILE.write_text('VIZ_TAILSCALE_LOGIN="owner@example.com"\n')
+        code, _ = call("/api/sessions", via_serve("owner@example.com"))
+        check("VIZ_TAILSCALE_LOGIN is read from .env, without a restart", code == 200, str(code))
+        code, _ = call("/api/sessions", via_serve("intruder@example.com"))
+        check("...and still refuses anyone else", code == 403, str(code))
+
+        # Off loopback the token is still demanded on top of the identity.
+        V.LOOPBACK, V.TOKEN = False, "s3cret"
+        code, _ = call("/api/sessions", via_serve("intruder@example.com",
+                                                  **{"X-Silkworm-Token": "s3cret"}))
+        check("token mode: a valid token does not let a wrong login in", code == 403)
+        code, _ = call("/api/sessions", via_serve("owner@example.com"))
+        check("token mode: the right login still needs the token", code == 401, str(code))
+    finally:
+        V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.ENV_FILE, V.bot_call = saved
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+        if saved_env is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved_env
+
+
+def test_viz_tailscale_gate_runs_before_everything():
+    print("\nthe tailscale gate sits in _authed, ahead of the loopback shortcut")
+    tree = ast.parse((BASE / "visualizer.py").read_text())
+    handler = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handler")
+    fns = {n.name: n for n in handler.body if isinstance(n, ast.FunctionDef)}
+    first = ast.unparse(fns["_authed"].body[1])     # body[0] is the docstring
+    check("_authed asks tailnet_refusal first", "tailnet_refusal(self.headers)" in first, first)
+    for name in ("do_GET", "do_POST"):
+        stmts = [ast.unparse(s) for s in fns[name].body[:3]]
+        check(f"{name} checks _authed before any route",
+              any("if not self._authed(url)" in s for s in stmts), str(stmts))
+    check("no other HTTP verb is handled (they would skip _authed)",
+          sorted(n for n in fns if n.startswith("do_")) == ["do_GET", "do_POST"],
+          str(sorted(fns)))
+
+
+def test_silkworm_tailscale_subcommand():
+    import importlib.machinery
+    import importlib.util
+    print("\nsilkworm tailscale: status, on and off; install steps when it is missing")
+    loader = importlib.machinery.SourceFileLoader("silkworm_cli_ts", str(BASE / "bin" / "silkworm"))
+    spec = importlib.util.spec_from_loader("silkworm_cli_ts", loader)
+    cli = importlib.util.module_from_spec(spec)
+    loader.exec_module(cli)
+
+    tmp = Path(tempfile.mkdtemp())
+    bindir = tmp / "bin"; bindir.mkdir()
+    log, status_f, serve_f = tmp / "calls", tmp / "status.json", tmp / "serve.json"
+    fake = bindir / "tailscale"
+    fake.write_text(f"""#!/bin/sh
+echo "$*" >> "{log}"
+case "$*" in
+  "status --json") cat "{status_f}" ;;
+  "serve status --json") cat "{serve_f}" ;;
+esac
+exit 0
+""")
+    fake.chmod(0o755)
+    saved_env = {k: os.environ.get(k) for k in ("PATH", "VIZ_TAILSCALE_LOGIN", "SILKWORM_VIZ_PORT")}
+    dotenv = {}                                  # stands in for .env
+    cli.env_file_value = lambda name: dotenv.get(name)
+    cli.TAILSCALE_APP = tmp / "NoSuch.app" / "Tailscale"
+
+    def run(*argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = cli.do_tailscale(list(argv))
+        return rc, buf.getvalue()
+
+    def world(login="owner@example.com", proxies=("http://127.0.0.1:8790",),
+              funnel=False, state="Running", certs=True, **extra):
+        status_f.write_text(json.dumps({
+            "BackendState": state,
+            "Self": {"UserID": 42, "DNSName": "mini.tail1234.ts.net."},
+            "User": {"42": {"LoginName": login}},
+            "CertDomains": ["mini.tail1234.ts.net"] if certs else None}))
+        serve_f.write_text(json.dumps({
+            "TCP": {"443": {"HTTPS": True}},
+            "Web": {"mini.tail1234.ts.net:443": {"Handlers": {
+                f"/{i}" if i else "/": {"Proxy": p} for i, p in enumerate(proxies)}}},
+            "AllowFunnel": {"mini.tail1234.ts.net:443": True} if funnel else {},
+            **extra}))
+
+    try:
+        os.environ["SILKWORM_VIZ_PORT"] = "8790"
+        os.environ["PATH"] = "/usr/bin:/bin"          # no tailscale anywhere
+        rc, out = run("status")
+        check("not installed: status prints install steps and exits 0",
+              rc == 0 and "not installed" in out and "HTTPS Certificates" in out
+              and "MagicDNS" in out, out)
+        rc, out = run("on")
+        check("not installed: on prints the steps and exits 1, running nothing",
+              rc == 1 and "not installed" in out and not log.exists(), out)
+
+        os.environ["PATH"] = f"{bindir}:/usr/bin:/bin"
+        dotenv["VIZ_TAILSCALE_LOGIN"] = "owner@example.com"
+        world()
+        rc, out = run("status")
+        check("all set: status passes and shows the URL",
+              rc == 0 and "https://mini.tail1234.ts.net/" in out and "✘" not in out, out)
+        rc, out = run()
+        check("bare `silkworm tailscale` is status", rc == 0, out)
+        dotenv["VIZ_TAILSCALE_LOGIN"] = "someone@else.com"
+        rc, out = run("status")
+        check("a VIZ_TAILSCALE_LOGIN that is not this machine's login fails status",
+              rc == 1 and "matches this machine's login" in out, out)
+        dotenv.pop("VIZ_TAILSCALE_LOGIN")
+        rc, out = run("status")
+        check("an unset VIZ_TAILSCALE_LOGIN fails status", rc == 1 and "refuses" in out, out)
+        os.environ["VIZ_TAILSCALE_LOGIN"] = "owner@example.com"
+        rc, out = run("status")
+        check("a login exported in the shell but not in .env (the service reads .env) fails",
+              rc == 1 and "set in .env" in out, out)
+        os.environ.pop("VIZ_TAILSCALE_LOGIN")
+        dotenv["VIZ_TAILSCALE_LOGIN"] = "owner@example.com"
+        for label, kw in (("serve pointing elsewhere", {"proxies": ("http://127.0.0.1:3000",)}),
+                          ("serve also exposing the bot", {"proxies": (
+                              "http://127.0.0.1:8790", "http://127.0.0.1:8787")}),
+                          ("Funnel on", {"funnel": True}),
+                          ("a raw TCP forward (no identity headers)", {"TCP": {
+                              "8443": {"TCPForward": "127.0.0.1:8790"}}}),
+                          ("a file handler", {"Web": {"mini.tail1234.ts.net:443": {"Handlers": {
+                              "/": {"Proxy": "http://127.0.0.1:8790"}, "/f": {"Path": "/"}}}}}),
+                          ("a foreground Funnel session", {"Foreground": {"abc": {
+                              "AllowFunnel": {"mini.tail1234.ts.net:443": True}}}}),
+                          ("a Service proxying the bot", {"Services": {"svc:bot": {"Web": {
+                              "bot:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}}}}}}),
+                          ("logged out", {"state": "NeedsLogin"}),
+                          ("no HTTPS certificates", {"certs": False})):
+            world(**kw)
+            rc, out = run("status")
+            check(f"{label} fails status", rc == 1, out)
+
+        world()
+        log.unlink()
+        rc, out = run("on")
+        calls = log.read_text().splitlines()
+        check("on runs `tailscale serve --bg 8790`, then checks",
+              rc == 0 and calls[0] == "serve --bg 8790", str(calls))
+        rc, out = run("off")
+        calls = log.read_text().splitlines()
+        check("off runs `tailscale serve reset`", rc == 0 and calls[-1] == "serve reset", str(calls))
+        check("nothing ever asks for Funnel", not any("funnel" in c for c in calls), str(calls))
+        rc, out = run("funnel")
+        check("an unknown subcommand is a usage error", rc == 2, out)
+        src = (BASE / "bin" / "silkworm").read_text()
+        check("main dispatches `tailscale` with the args after the subcommand",
+              'sys.exit(do_tailscale(args[1:]))' in src)
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import email.header
 import secrets
 
 import envfile
@@ -47,6 +48,98 @@ PORT = int(os.environ.get("SILKWORM_VIZ_PORT", "8790"))
 BIND = os.environ.get("VIZ_BIND", "127.0.0.1").strip()
 TOKEN = os.environ.get("VIZ_TOKEN", "").strip()
 LOOPBACK = BIND in ("127.0.0.1", "::1", "localhost")
+#: Where VIZ_TAILSCALE_LOGIN is read from when the environment lacks it: the
+#: launchd plist passes only PATH, so the installed service sees .env or
+#: nothing. Read per request, so setting it needs no restart.
+ENV_FILE = BASE_DIR / ".env"
+
+#: What `tailscale serve` puts on every request it proxies (ipn/ipnlocal/
+#: serve.go: addProxyForwardedHeaders always sets X-Forwarded-Host;
+#: addTailscaleIdentityHeaders deletes then sets the Tailscale-* ones). A
+#: direct loopback caller -- the CLI, an SSH tunnel -- sends none of them.
+PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+                 "Forwarded", "Tailscale-User-Login", "Tailscale-User-Name",
+                 "Tailscale-Funnel-Request", "Tailscale-Headers-Info")
+
+
+def tailscale_login() -> str:
+    """The one Tailscale login allowed through `tailscale serve`, or ""."""
+    return (os.environ.get("VIZ_TAILSCALE_LOGIN", "").strip()
+            or (envfile.value(ENV_FILE, "VIZ_TAILSCALE_LOGIN") or "").strip())
+
+
+def proxied(headers) -> bool:
+    """The request came through a proxy (tailscale serve), not straight from
+    a loopback client. A Host on a tailnet name counts too, in case a serve
+    version ever stops forwarding the X-Forwarded-* headers."""
+    if any(headers.get(h) is not None for h in PROXY_HEADERS):
+        return True
+    host = (headers.get("Host") or "").split(":")[0].rstrip(".").lower()
+    return host.endswith(".ts.net")
+
+
+def _decode_login(raw: str) -> str:
+    """Serve encodes a non-ASCII login as an RFC 2047 word; decode it."""
+    try:
+        return str(email.header.make_header(email.header.decode_header(raw))).strip()
+    except Exception:
+        return raw.strip()
+
+
+def tailnet_refusal(headers) -> str:
+    """Why a proxied request may not come in, or "" if it may (or is not proxied).
+
+    Serve strips any Tailscale-User-* header a client sent and sets its own
+    from WhoIs, so the login is the tailnet's word for who is asking. It
+    leaves them off for tagged devices and for Funnel, so no header is no
+    one in particular -- refused. Without VIZ_TAILSCALE_LOGIN nothing
+    proxied gets in: turning serve on first exposes nothing."""
+    if not proxied(headers):
+        return ""
+    allowed = tailscale_login()
+    if not allowed:
+        return ("Refused: this request came through a proxy (tailscale serve), and "
+                "VIZ_TAILSCALE_LOGIN is not set, so the dashboard admits no one that "
+                "way. Set VIZ_TAILSCALE_LOGIN in .env to your Tailscale login; "
+                "`silkworm tailscale status` shows it.")
+    if headers.get("Tailscale-Funnel-Request") is not None:
+        return "Refused: the dashboard is never served over Tailscale Funnel."
+    raw = headers.get("Tailscale-User-Login")
+    if not raw or not raw.strip():
+        return ("Refused: this request came through a proxy with no Tailscale "
+                "identity (a tagged device, or not tailscale serve). Only "
+                "VIZ_TAILSCALE_LOGIN may use the dashboard remotely.")
+    login = _decode_login(raw)
+    if login.lower() != allowed.lower():
+        return (f"Refused: {login} is not the Tailscale login this dashboard "
+                "belongs to (VIZ_TAILSCALE_LOGIN).")
+    return ""
+
+
+
+def cross_site_refusal(headers) -> str:
+    """Why a proxied POST may not come in as a forgery, or "".
+
+    Serve stamps the owner's login on every request from the owner's device,
+    whichever web page sent it -- so a hostile page open in their phone's
+    browser could POST to /api/tasks as them. A cross-site POST with no
+    preflight can only be a "simple" one (text/plain, a form), and browsers
+    say where it came from; the dashboard's own page always sends JSON from
+    its own origin. Only proxied requests are held to this: direct loopback
+    callers behave as they always have."""
+    ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        return "Refused: a remote POST must be application/json."
+    site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        return f"Refused: a {site} request; only the dashboard's own page may post."
+    origin = (headers.get("Origin") or "").strip()
+    if origin:
+        host = (headers.get("X-Forwarded-Host") or headers.get("Host") or "").strip()
+        if urlparse(origin).netloc.lower() != host.lower():
+            return f"Refused: a POST from {origin}, not this dashboard."
+    return ""
+
 # Past twice the per-turn timeout, a turn is not slow -- it is stuck.
 STALL_AFTER_S = max(int(os.environ.get("CLAUDE_TIMEOUT", "900")) * 2, 3600)
 
@@ -590,11 +683,16 @@ class Handler(BaseHTTPRequestHandler):
         self._json(data, etag_for(data))
 
     def _authed(self, url) -> bool:
-        """Loopback needs no token; anything else must present one.
+        """Proxied (tailscale serve) requests must be VIZ_TAILSCALE_LOGIN;
+        then loopback needs no token, and anything else must present one.
 
         Accepts ?token= once and hands back a cookie, so a bookmarked URL
         works without the secret sitting in the address bar afterwards.
         """
+        refusal = tailnet_refusal(self.headers)
+        if refusal:
+            self._send(403, (refusal + "\n").encode(), "text/plain; charset=utf-8")
+            return False
         if LOOPBACK:
             return True
         supplied = (self.headers.get("X-Silkworm-Token", "")
@@ -658,6 +756,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         if not self._authed(url):
+            return
+        forged = cross_site_refusal(self.headers) if proxied(self.headers) else ""
+        if forged:
+            self._send(403, (forged + "\n").encode(), "text/plain; charset=utf-8")
             return
         try:
             length = int(self.headers.get("Content-Length", 0))

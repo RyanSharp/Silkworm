@@ -1021,13 +1021,67 @@ in (below).
 
 ## Reaching the dashboard from another machine
 
-The visualizer binds `127.0.0.1` only, and it should stay that way: it has no
-authentication, it can relay prompts into threads, and the bot trusts any
-localhost caller as the machine owner (bypassing the Slack allowlist). On a host
-running `--dangerously-skip-permissions`, exposing that port to a LAN hands
-arbitrary command execution to anything on the network.
+The visualizer binds `127.0.0.1` only, and it should stay that way: it can relay
+prompts into threads, and the bot trusts any localhost caller as the machine
+owner (bypassing the Slack allowlist). On a host running
+`--dangerously-skip-permissions`, exposing that port to a LAN hands arbitrary
+command execution to anything on the network.
 
-So tunnel instead. On the machine you browse *from*:
+### Tailscale (recommended — phone and laptop)
+
+`tailscale serve` gives the dashboard an HTTPS address on your tailnet
+(`https://<host>.<tailnet>.ts.net/`) with no open ports and no change to the
+bind: serve runs on the host and proxies tailnet traffic to `127.0.0.1:8790`.
+This supersedes the SSH-tunnel advice below for phone access and for reaching
+the host from outside your network.
+
+Because serve's requests arrive from loopback, the dashboard does not trust
+them the way it trusts a local caller. Serve stamps each request it proxies
+with the requester's identity (`Tailscale-User-Login`), stripping any copy a
+client sent, and the dashboard admits a proxied request only when that login
+equals `VIZ_TAILSCALE_LOGIN` — on every route, `/api/send` and the action
+endpoints included. Everything else gets a 403 with the reason:
+
+- a different tailnet user, or a node shared in from someone else's tailnet;
+- a request with no identity (tagged devices get none);
+- anything at all while `VIZ_TAILSCALE_LOGIN` is unset — so turning serve on
+  before configuring the login exposes nothing.
+
+Serve vouches for the device, not the web page, so a proxied POST must also
+look like the dashboard's own page: `Content-Type: application/json`, and no
+`Origin` or `Sec-Fetch-Site` saying it came from another site. That stops a
+hostile page open in your phone's browser from posting tasks as you.
+
+Funnel (the public internet) is never used and is refused if it reaches the
+dashboard. Direct loopback requests — the CLI, an SSH tunnel — work as before.
+
+Setup, on the host:
+
+1. Install the [Tailscale Mac app](https://tailscale.com/download/mac) and sign
+   in. Install it on your phone/laptop with the same account.
+2. In the [admin console](https://login.tailscale.com/admin/dns) enable
+   **MagicDNS** and then **HTTPS Certificates**.
+3. Add your Tailscale login (as shown in the admin console's Users page) to
+   `.env`: `VIZ_TAILSCALE_LOGIN=you@example.com`. It has to be `.env` — the
+   installed service gets no other environment — and the dashboard re-reads it
+   on every request, so no restart is needed.
+4. Run:
+
+```sh
+silkworm tailscale on       # tailscale serve --bg 8790
+silkworm tailscale status   # installed, logged in, HTTPS on, serve -> :8790 only,
+                            # Funnel off, VIZ_TAILSCALE_LOGIN matches this login
+silkworm tailscale off      # tailscale serve reset (clears all serve config)
+```
+
+`silkworm tailscale` prints these install steps instead if Tailscale is not
+installed. `status` also fails if serve exposes anything besides the
+dashboard — never serve the bot's port (8787), which trusts every local caller
+and has no identity gate.
+
+### SSH tunnel (laptop on the same network)
+
+On the machine you browse *from*:
 
 ```sh
 ./bin/silkworm-tunnel install ryansharp@your-mini.local
@@ -1064,8 +1118,9 @@ Settings → Wi-Fi → Details) and reserve against the hardware MAC, or reserve
 against the randomised one and accept that it may rotate. For an always-on
 host, Ethernet sidesteps the whole thing — no randomisation, stable MAC.
 
-For phone access, or from outside the network, Tailscale is a better fit than a
-tunnel: install it on both ends and the host gets a stable private address.
+For phone access, or from outside the network, use Tailscale (above) instead.
+
+### Binding wider with a token
 
 If you would rather bind the dashboard directly, it requires a token and
 refuses to start without one:
