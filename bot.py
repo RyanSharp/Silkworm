@@ -3471,6 +3471,15 @@ def handle_file_task(payload: dict) -> dict:
     proj = (payload.get("project") or entry.get("project") or "").strip()
     if parent:
         proj = parent.get("project") or ""
+    # Filed from a failing base's own item, it is the fix, and goes under that
+    # item so the runner does not hold it with the rest (basered.fix_item).
+    # Not if it names another project: then it is not this base's fix.
+    fixing = None if parent else basered.fix_item(
+        task_store, key, (payload.get("caller_task") or "").strip())
+    if fixing and (not proj or project_store.slug_for(proj) == fixing.get("project")):
+        proj = fixing.get("project") or proj
+    else:
+        fixing = None
     slug = project_store.slug_for(proj) if proj else ""
 
     # Proposals are also bounded across passes, not just within one: the
@@ -3535,7 +3544,9 @@ def handle_file_task(payload: dict) -> dict:
         isolate=True,
         scope=scope,
         **({"parent": parent["id"], "root": parent.get("root") or parent["id"],
-            "source_ref": parent["id"]} if parent else {}),
+            "source_ref": parent["id"]} if parent else
+           {"parent": fixing["id"], "root": fixing.get("root") or fixing["id"]}
+           if fixing else {}),
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
     log.info("filed task %s from %s (project=%s role=%s state=%s%s%s)",
@@ -6688,7 +6699,9 @@ def _task_worker(n: int, lane: str = "task") -> None:
             # No new implementor work where the base fails its own tests: it
             # would only be held for them. See basered.py.
             red = basered.failing(project_store) if lane == "task" else set()
-            task = task_store.claim(**claim_filter, **busy, hold_implementors=red)
+            # Except work filed from the base-red item itself: that is the fix.
+            task = task_store.claim(**claim_filter, **busy, hold_implementors=red,
+                                    fixes_from={basered.SOURCE})
             if task and hold_unsupervised(task):
                 continue
             if task:

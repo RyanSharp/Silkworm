@@ -877,7 +877,7 @@ class TaskStore:
             return dict(rec)
 
     def claim(self, *, only_roles=None, except_roles=None, wakeups=None,
-              skip_threads=(), hold_implementors=()) -> dict | None:
+              skip_threads=(), hold_implementors=(), fixes_from=()) -> dict | None:
         """Take the next queued task the runner is allowed to execute: the
         highest `priority` (see run_next), the oldest among equals.
 
@@ -913,7 +913,11 @@ class TaskStore:
         (basered.py). Their implementor tasks stay queued: every one would
         fail verification on the base's failures, and be held for them, at
         the price of a whole session each. Other roles still run -- an
-        assistant or a researcher may be the very thing fixing the base.
+        assistant or a researcher may be the very thing fixing the base. So
+        does an implementor whose parent has a `source` in `fixes_from`
+        (basered.SOURCE), or a rework whose root does: one filed from the
+        failing base's own item, to fix it, which held would wait on the
+        failure it exists to end.
         """
         with self._lock:
             busy = [r for r in self._data.values()
@@ -921,6 +925,18 @@ class TaskStore:
             threads = {r.get("thread") for r in busy if r.get("thread")}
             ids = {r.get("id") for r in busy}
             parents = {r.get("parent") for r in busy if r.get("parent")}
+
+            def fixes_base(r) -> bool:
+                # The item's own child, or that child redone after a landing
+                # conflict (a rework carries only the root). Not everything
+                # under the root: a review's follow-up on the fix shares it,
+                # and is new work like any other.
+                if not fixes_from:
+                    return False
+                by = "parent" if r.get("parent") else (
+                    "root" if r.get("source") == "rework" else "")
+                return bool(by) and (self._data.get(r.get(by) or "") or {}).get(
+                    "source") in fixes_from
 
             def fits(r) -> bool:
                 role = r.get("role") or "assistant"
@@ -931,7 +947,8 @@ class TaskStore:
                 if wakeups is not None and is_wakeup(r) != wakeups:
                     return False
                 if (role == "implementor" and hold_implementors
-                        and (r.get("project") or "") in hold_implementors):
+                        and (r.get("project") or "") in hold_implementors
+                        and not fixes_base(r)):
                     return False
                 if r.get("thread") and r.get("thread") in skip_threads:
                     return False

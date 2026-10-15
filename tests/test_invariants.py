@@ -2551,7 +2551,7 @@ def _file_task_impl():
     mod.__dict__.update(
         re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
         dedup=__import__("dedup"), branches=__import__("branches"),
-        research=__import__("research"), time=time,
+        research=__import__("research"), basered=__import__("basered"), time=time,
         task_store=ts,
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
         store=types.SimpleNamespace(get=lambda k: {}),
@@ -21494,6 +21494,89 @@ def test_runner_skips_implementors_of_a_failing_base():
     worker = src[src.index("def _task_worker("):src.index("#: How often to re-check for orphaned turns")]
     check("the task worker passes the failing projects to its claim",
           "hold_implementors=red" in worker and "basered.failing(project_store)" in worker)
+
+
+def test_runner_lets_the_base_fix_through():
+    import basered as B
+    print("\nan implementor filed to fix a failing base is not held with the rest")
+    import tasks as T
+    ps, ts = _red_stores()
+    state, _ = B.mark_red(ps, ts, "trader", {"sha": "a" * 40, "failed": ["t1"]}, "main")
+    item = state["attention"]
+    fix = ts.create("fix main", project="trader", role="implementor",
+                    driver="queue", parent=item, root=item)
+    # Shaped as bot.py files them: a landing conflict's catch-up rework and a
+    # review's follow-up carry only the root, and no parent.
+    redo = ts.create("catch up: fix main", project="trader", role="implementor",
+                     driver="queue", source="rework", source_ref=fix["id"], root=item)
+    followup = ts.create("tidy what the fix touched", project="trader",
+                         role="implementor", driver="queue", source="review",
+                         source_ref=fix["id"], root=item)
+    other = ts.create("unrelated", project="trader", role="implementor", driver="queue")
+    research = ts.create("dig", project="trader", role="researcher", driver="queue")
+    child = ts.create("next step", project="trader", role="implementor",
+                      driver="queue", parent=research["id"], root=research["id"])
+    ts.transition(research["id"], T.CANCELLED, "not the subject here")
+    red = B.failing(ps)
+    got = []
+    while True:
+        # Each finished as it is claimed, so nothing below waits on a running
+        # parent: only the base-red hold can keep a task queued.
+        r = ts.claim(hold_implementors=red, fixes_from={B.SOURCE})
+        if not r:
+            break
+        got.append(r["id"])
+        ts.transition(r["id"], T.DONE, "ran")
+    check("the item's own child runs", fix["id"] in got)
+    check("and its catch-up rework, by root", redo["id"] in got)
+    check("a review follow-up on the fix stays held",
+          followup["id"] not in got, str(got))
+    check("other implementor work on the project stays held",
+          other["id"] not in got and child["id"] not in got, str(got))
+    ts2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    p = ts2.create("x", source=B.SOURCE, project="trader")
+    k = ts2.create("fix", project="trader", role="implementor", driver="queue",
+                   parent=p["id"])
+    check("without fixes_from nothing is exempt",
+          ts2.claim(hold_implementors={"trader"}) is None)
+    check("with it, the fix is claimed",
+          (ts2.claim(hold_implementors={"trader"}, fixes_from={B.SOURCE}) or {}).get("id")
+          == k["id"])
+    src = (BASE / "bot.py").read_text()
+    worker = src[src.index("def _task_worker("):src.index("#: How often to re-check for orphaned turns")]
+    check("the task worker exempts the base-red item's work",
+          "fixes_from={basered.SOURCE}" in worker)
+
+
+def test_filing_from_the_base_red_item_links_to_it():
+    import basered as B
+    print("\nwork filed from a failing base's item is filed under it")
+    import tasks as T
+    handle, budget, begin, ts, made = _file_task_impl()
+    item = ts.create("trader main is failing", title="trader main is failing",
+                     state=T.NEEDS_INPUT, role="assistant", driver="queue",
+                     source=B.SOURCE, project="trader")
+    ts.update(item["id"], thread="C1:111.1")
+    goal = "Repair the expired baseline review-by date in trader"
+    r = handle({"key": "C1:222.2", "goal": goal, "role": "implementor",
+                "caller_task": item["id"]})
+    t = ts.get(r.get("id") or "") or {}
+    check("filed by the item's run: parent and project are the item's",
+          r.get("ok") and t.get("parent") == item["id"] and t.get("root") == item["id"]
+          and t.get("project") == "trader", str(r))
+    check("still queued, as scoped work", t.get("state") == T.QUEUED)
+    r = handle({"key": "C1:111.1", "goal": goal + " again", "role": "implementor"})
+    t = ts.get(r.get("id") or "") or {}
+    check("filed in the item's thread: linked too", t.get("parent") == item["id"], str(r))
+    r = handle({"key": "C1:111.1", "goal": goal + " elsewhere", "role": "implementor",
+                "project": "cadence"})
+    t = ts.get(r.get("id") or "") or {}
+    check("naming another project: not the base's fix",
+          not t.get("parent") and t.get("project") == "cadence", str(t))
+    r = handle({"key": "C1:333.3", "goal": goal + " from nowhere", "role": "implementor",
+                "project": "trader"})
+    t = ts.get(r.get("id") or "") or {}
+    check("filed anywhere else: not linked", not t.get("parent"), str(t))
 
 
 def _base_glue(ps, ts, *, suite, base=("main", "b" * 40), moved=True, verify_ok=True):

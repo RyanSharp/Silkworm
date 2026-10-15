@@ -18,7 +18,9 @@ is the task's and is handled exactly as it always was. If the base fails:
     is held, not sent back, failed or refused; a landing in the same position
     is held at stage merge.BASE_FAILING;
   - the runner takes no new implementor work for the project (tasks.claim's
-    `hold_implementors`), since every one of them would only be held too;
+    `hold_implementors`), since every one of them would only be held too --
+    except work filed from the item's own conversation (`fix_item`), which is
+    the attempt to fix the base and would otherwise wait for itself;
   - and when a later base commit passes (`recover`), all of that is undone:
     the item closes, and the held tasks are verified or landed again.
 
@@ -192,6 +194,24 @@ def mark_red(project_store, task_store, slug: str, result: dict,
             state["attention"] = item["id"]
         project_store.update(slug, main_failing=state)
         return state, not prior
+
+
+def fix_item(task_store, key: str, caller_task: str = "") -> dict | None:
+    """The base-red item a filing on thread `key` is fixing, or None.
+
+    Work filed from the item's own conversation -- the run it was sent back
+    for (`caller_task`), or a reply on its thread -- is an attempt at the very
+    failure that holds the project's implementors, and is linked to it as its
+    parent so the runner lets it through (tasks.claim's `fixes_from`). Only the
+    item itself can vouch: anything else filed while the base is red waits.
+    """
+    for t in task_store.all().values():
+        if t.get("source") != SOURCE:
+            continue
+        if (caller_task and t.get("id") == caller_task) or (
+                key and t.get("thread") == key):
+            return t
+    return None
 
 
 def hold(task_store, tid: str, kind: str, sha: str, approved: bool = False) -> None:
