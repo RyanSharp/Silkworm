@@ -22604,8 +22604,81 @@ def test_operator_git_runs_no_program_the_repository_config_names():
         check(f"`git {' '.join(argv)}` reads, running none of the repo's programs",
               r.returncode == 0 and not ran.exists(),
               (ran.read_text() if ran.exists() else "") + r.stdout + r.stderr)
-    for argv in (["cat-file", "--filters", "HEAD:f.txt"], ["cat-file", "--filt", "HEAD:f.txt"]):
-        check(f"refuses {' '.join(argv)} (runs filter programs)", O.git_refusal(argv), str(argv))
+    for argv in (["cat-file", "--filters", "HEAD:f.txt"], ["cat-file", "--filt", "HEAD:f.txt"],
+                 ["log", "--remerge-diff"], ["log", "--diff-merges=remerge"],
+                 ["show", "--diff-m", "r"], ["diff", "--submodule=diff"],
+                 ["diff", "--sub=diff"]):
+        check(f"refuses {' '.join(argv)} (runs the repo's programs)",
+              O.git_refusal(argv), str(argv))
+    for argv in (["diff", "--text"], ["log", "--diff-merges", "first-parent"],
+                 ["diff", "--submodule=log"], ["diff", "--submodule"]):
+        check(f"allows {' '.join(argv)}", O.git_refusal(argv) == "", O.git_refusal(argv))
+
+    def operator(*argv, where=repo):
+        if ran.exists():
+            ran.unlink()
+        return subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "operator",
+                               "git", "--in", str(where), *argv],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    # A signed commit, and the repo's own gpg.program -- %G? and showSignature.
+    head = subprocess.run(["git", "cat-file", "commit", "HEAD"], cwd=repo, env=env,
+                          capture_output=True, text=True, check=True).stdout
+    hdr, _, msg = head.partition("\n\n")
+    signed = (hdr + "\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n x\n"
+              " -----END PGP SIGNATURE-----\n\n" + msg)
+    sha = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo,
+                         env=env, input=signed, capture_output=True, text=True,
+                         check=True).stdout.strip()
+    git("update-ref", "refs/heads/signed", sha)
+    fake = base / "fakegpg"
+    fake.write_text(f"#!/bin/sh\necho gpg >> {ran}\nexit 1\n")
+    fake.chmod(0o755)
+    git("config", "gpg.program", str(fake))
+    git("config", "log.showSignature", "true")
+    for argv in (["log", "-1", "--format=%G?", "signed"], ["log", "-1", "signed"],
+                 ["for-each-ref", "--format=%(signature)", "refs/heads/signed"]):
+        r = operator(*argv)
+        check(f"`git {' '.join(argv)}` checks no signature with the repo's gpg.program",
+              not ran.exists(), (ran.read_text() if ran.exists() else "") + r.stderr)
+
+    # A conflicted merge, and the repo's own merge driver behind log.diffMerges.
+    (repo / ".gitattributes").write_text("*.txt diff=evil merge=evil\n")
+    git("commit", "-qam", "attrs")
+    git("config", "merge.evil.driver", f"echo merge >> {ran}; false")
+    git("checkout", "-qb", "side")
+    (repo / "f.txt").write_text("side\n")
+    git("commit", "-qam", "side")
+    git("checkout", "-q", "-")
+    (repo / "f.txt").write_text("main\n")
+    git("commit", "-qam", "main")
+    subprocess.run(["git", "merge", "-q", "side"], cwd=repo, env=env, capture_output=True)
+    (repo / "f.txt").write_text("both\n")
+    git("commit", "-qam", "merged")
+    git("config", "log.diffMerges", "remerge")
+    r = operator("log", "-m", "-p", "-1")
+    check("`git log -m -p` with log.diffMerges=remerge runs no merge driver",
+          r.returncode == 0 and not ran.exists(),
+          (ran.read_text() if ran.exists() else "") + r.stderr)
+
+    # A partial clone missing a blob: a lazy fetch would run core.sshCommand.
+    lazy = base / "lazy"
+    lazy.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=lazy, env=env, check=True)
+    (lazy / "a.txt").write_text("hello\n")
+    for a in (["add", "a.txt"], ["-c", "user.email=t@t", "-c", "user.name=t",
+                                  "commit", "-qm", "a"]):
+        subprocess.run(["git", *a], cwd=lazy, env=env, check=True)
+    blob = subprocess.run(["git", "rev-parse", "HEAD:a.txt"], cwd=lazy, env=env,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    (lazy / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    for k, v in (("extensions.partialClone", "origin"), ("remote.origin.promisor", "true"),
+                 ("remote.origin.url", "ssh://example.invalid/x"),
+                 ("core.sshCommand", f"echo ssh >> {ran}; false #")):
+        subprocess.run(["git", "config", k, v], cwd=lazy, env=env, check=True)
+    r = operator("show", "HEAD:a.txt", where=lazy)
+    check("a missing blob in a partial clone is not lazily fetched with the repo's ssh",
+          not ran.exists(), (ran.read_text() if ran.exists() else "") + r.stderr)
     check("the safe flags follow the subcommand, before the operator's own arguments",
           O.git_command(["log", "-p"])[-4:] == ["log", "--no-ext-diff", "--no-textconv", "-p"]
           and O.git_command(["status"])[-1:] == ["status"] and O.git_command([])[0] == "git")

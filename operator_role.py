@@ -366,8 +366,17 @@ GIT_READS = frozenset({"log", "diff", "show", "status", "rev-parse", "merge-base
                        "shortlog", "describe", "cat-file", "rev-list"})
 #: Options that write, or run something, refused with any abbreviation git
 #: would accept for them (it takes unique prefixes of long options).
+#: --remerge-diff re-runs each merge, with the repository's merge drivers.
 _GIT_REFUSED = ("--output", "--ext-diff", "--textconv", "--open-files-in-pager",
-                "--exec")
+                "--exec", "--remerge-diff")
+#: Real options that merely look like an abbreviation of a refused one: git
+#: takes an exact match over a prefix, so `--text` is -a, not --textconv.
+_GIT_EXACT = frozenset({"--text"})
+#: Options refused only with some values: (option, shortest abbreviation, the
+#: values that run something). --diff-merges=remerge runs merge drivers;
+#: --submodule=diff runs the submodule's own diff drivers, unflagged.
+_GIT_VALUED = (("--diff-merges", "--diff-m", lambda v: v.startswith("r")),
+               ("--submodule", "--sub", lambda v: v == "diff"))
 
 
 def git_refusal(argv) -> str:
@@ -381,11 +390,19 @@ def git_refusal(argv) -> str:
         args = args[1:]
     elif sub not in GIT_READS:
         return f"`git {sub}` is not a read-only command it may run"
-    for a in args:
-        name = a.split("=", 1)[0]
-        if name.startswith("--") and len(name) > 3 and any(
+    for i, a in enumerate(args):
+        name, eq, value = a.partition("=")
+        if name.startswith("--") and len(name) > 3 and name not in _GIT_EXACT and any(
                 r.startswith(name) for r in _GIT_REFUSED):
             return f"`{a}` writes a file or runs a program"
+        for opt, shortest, bad in _GIT_VALUED:
+            if name.startswith(shortest) and opt.startswith(name):
+                # --diff-merges takes its value as the next argument too.
+                v = value if eq else (args[i + 1] if opt == "--diff-merges"
+                                      and i + 1 < len(args) else "")
+                if bad(v):
+                    shown = a if eq else f"{a} {v}"
+                    return f"`{shown}` runs the repository's own programs"
         if sub == "grep" and name.startswith("-O"):
             return f"`{a}` runs a program"
         if sub == "cat-file" and name.startswith("--fi") and "--filters".startswith(name):
@@ -406,15 +423,26 @@ _GIT_SAFE_FLAGS = {
     "grep": ("--no-textconv",),
 }
 
+#: Global options and config the repository cannot override: no lazy fetch
+#: (a partial clone would run core.sshCommand to fetch a missing blob), no
+#: signature checks (gpg.*program -- %G? formats, log.showSignature), and
+#: config defaults that would otherwise turn a plain -m or diff into remerge
+#: or submodule diffs.
+_GIT_PINNED = ("--no-lazy-fetch", "-c", "core.fsmonitor=false", "-c", "diff.external=",
+               "-c", "core.pager=cat", "-c", "gpg.program=false",
+               "-c", "gpg.ssh.program=false", "-c", "gpg.x509.program=false",
+               "-c", "log.showSignature=false", "-c", "log.diffMerges=separate",
+               "-c", "diff.submodule=log")
+
 
 def git_command(argv) -> list:
-    """The command line `silkworm operator git` runs: no pager, no external
-    diff, textconv or fsmonitor whatever the repository's config says."""
+    """The command line `silkworm operator git` runs: no pager, and none of the
+    programs a repository's config can name -- external diff, textconv,
+    fsmonitor, gpg, a lazy fetch's ssh -- whatever that config says."""
     argv = list(argv)
     if argv:
         argv[1:1] = _GIT_SAFE_FLAGS.get(argv[0], ())
-    return ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "diff.external=",
-            "-c", "core.pager=cat", *argv]
+    return ["git", "--no-pager", *_GIT_PINNED, *argv]
 
 
 # --- notes ---------------------------------------------------------------------
