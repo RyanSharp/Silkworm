@@ -20,9 +20,10 @@ prefix-matched allowlist leaves no way to put `env -u` or an assignment in
 front of the command, so the stamp cannot be dropped.
 
 And what it may not do is refused in code (`refusal`), by the CLI and again by
-the bot, whatever it was told: accepting proposals or approving flagged work,
-releases, publishing where publish is off, changing trader's live
-configuration, and deleting anything not proven redundant. Each refusal is
+the bot, whatever it was told: deciding on proposals, reviewed work or research
+findings either way (accepting, approving, dismissing, closing, digging),
+cancelling work it does not own, releases, publishing where publish is off,
+changing trader's live configuration, and deleting anything not proven redundant. Each refusal is
 lifted for exactly one item by an approval you create with your own Slack
 message (`!approve <what> <item>`), used once and gone within a day. A model
 can ask you for one; it cannot make one -- no route writes them, only a Slack
@@ -68,7 +69,9 @@ APPROVAL_TTL_S = 24 * 3600
 #: Guard -> what it covers, for refusals and `!approve` help. The keys are what
 #: you type after `!approve`.
 GUARDS = {
-    "accept": "accepting a proposal or approving flagged work (that gate is yours)",
+    "accept": ("deciding on a proposal, reviewed work or research findings -- accepting, "
+               "approving, dismissing, closing or digging -- or cancelling running work "
+               "(those decisions are yours)"),
     "release": "starting a release (TestFlight, App Store, !release)",
     "publish": "pushing or publishing a project whose publish setting is off",
     "trader-config": "changing trader's live configuration",
@@ -123,10 +126,30 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
     # legal; cancelled -> queued is not, so a dismissed one cannot), and a
     # goal the operator wrote itself -- an edit, or a rework of anything but a
     # landing git refused, which is the one rework that is its to do.
-    if task and state == "proposed" and action in ("retry", "rework", "dig", "edit"):
+    if task and state == "proposed" and action in ("retry", "rework", "edit"):
         return "accept", tid
     if action == "edit" and (payload or {}).get("goal") is not None:
         return "accept", tid
+    # The opposite decisions are yours too. Closing research's parked
+    # findings, or digging on them with a goal it wrote itself, is deciding
+    # on them -- in any state, so the CLI can refuse it before asking. A
+    # dismiss or cancel of what waits for you (a proposal, reviewed work,
+    # findings) is final: cancelled -> queued is illegal, so nothing brings it
+    # back. Its own proposals are the exception, as nobody else saw them.
+    if action in ("close", "dig"):
+        return "accept", tid
+    # A retry of findings or reviewed work waiting on you reruns them unread:
+    # a dig without the question, or a send-back of work you were to judge.
+    if action == "retry" and state in ("awaiting_approval", "needs_input"):
+        return "accept", tid
+    if action in ("dismiss", "cancel") and task:
+        if state == "proposed" and task.get("filed_by") == ROLE:
+            return None
+        if state in ("proposed", "awaiting_approval", "needs_input"):
+            return "accept", tid
+        # Cancelling a running task kills its child (stop_task). Only its own.
+        if state == "running" and task.get("role") != ROLE:
+            return "accept", tid
     if action == "rework" and task and not _landing_refused(task):
         return "accept", tid
     # Landing finished work is its job; landing anything else (a task you

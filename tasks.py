@@ -218,6 +218,10 @@ FIELDS: dict[str, tuple] = {
     # may act, project is what it is part of. Plenty of projects have no repo.
     "project":     ("",    "project slug, or empty for unfiled"),
     "source_ref":  ("",    "identifier in the originating system, if any"),
+    # The role of the run that filed it, "" for a person. What lets the
+    # operator dismiss a proposal of its own and nobody else's
+    # (operator_role.tasks_guard): `source` says what the work is, not who.
+    "filed_by":    ("",    "role of the run that filed it; empty for a person"),
     "scope":       (dict,  "{repo, cwd, branch, worktree, paths} — where it may act"),
     "thread":      ("",    "Slack thread key for narration, if any"),
     "session_id":  (None,  "Claude Code session executing it"),

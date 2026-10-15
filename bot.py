@@ -2892,6 +2892,7 @@ def handle_tasks(payload: dict) -> dict:
                                   # are editing.
                                   isolate=True,
                                   thread=payload.get("thread", ""),
+                                  filed_by=filer_role(payload),
                                   scope=scope)
             # Filed anyway -- it is a real request -- but said, so it does not
             # look queued and then quietly turn up in Needs you.
@@ -3539,6 +3540,9 @@ def handle_file_task(payload: dict) -> dict:
         state=state, driver="queue",
         source=(research.SOURCE if parent else
                 "ideation" if propose else "scoped"),
+        # Who filed it, so the operator may dismiss its own proposals and no
+        # one else's (operator_role.tasks_guard).
+        filed_by=filer_role({"caller_role": caller_role, "caller_thread": key}),
         # Filed work, not the conversation that scoped it: whoever runs it
         # starts fresh, so it gets its own checkout.
         isolate=True,
@@ -6300,6 +6304,18 @@ def _digest_scheduler() -> None:
 
 
 # --- the operator (operator_role.py) -------------------------------------------
+
+def filer_role(payload: dict) -> str:
+    """The role a filing request comes from, for the task's `filed_by`.
+
+    `operator` by the same two signals operator_refused holds it to, so a
+    proposal it files from its home thread is its own whichever one carried;
+    otherwise the role the CLI stamped, and "" for a person.
+    """
+    if operator_role.caller_is_operator(payload, OPERATOR.thread()):
+        return operator_role.ROLE
+    return str((payload or {}).get("caller_role") or "")
+
 
 def task_contained(task: dict) -> tuple[bool, str]:
     """Whether a finished task's branch is already on its base, by content."""

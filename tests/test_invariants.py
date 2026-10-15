@@ -71,7 +71,7 @@ def bot_functions(*names, **globals_):
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
-                  "release_drain_refusal", "unreviewed_role")
+                  "release_drain_refusal", "unreviewed_role", "filer_role")
 
 
 def _helper_modules(nodes, ns) -> None:
@@ -81,6 +81,12 @@ def _helper_modules(nodes, ns) -> None:
     if any(n.name == "unreviewed_role" for n in nodes if isinstance(n, ast.FunctionDef)):
         import roles as _roles
         ns.setdefault("roles", _roles)
+    # filer_role asks who the operator is; a test that never set one up has
+    # no operator, so nothing it files is the operator's.
+    if any(n.name == "filer_role" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import operator_role as _op
+        ns.setdefault("operator_role", _op)
+        ns.setdefault("OPERATOR", types.SimpleNamespace(thread=lambda: ""))
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -2531,7 +2537,7 @@ def _file_task_impl():
     src = (BASE / "bot.py").read_text()
     tree = ast.parse(src)
     want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn",
-            "begin_turn", "unmerged_survey", "research_parent")
+            "begin_turn", "unmerged_survey", "research_parent", "filer_role")
     def named(n):
         if isinstance(n, ast.FunctionDef):
             return n.name
@@ -2552,7 +2558,8 @@ def _file_task_impl():
         re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
         dedup=__import__("dedup"), branches=__import__("branches"),
         research=__import__("research"), basered=__import__("basered"), time=time,
-        task_store=ts,
+        task_store=ts, operator_role=__import__("operator_role"),
+        OPERATOR=types.SimpleNamespace(thread=lambda: "D5:5.0"),
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),
         store=types.SimpleNamespace(get=lambda k: {}),
         project_store=types.SimpleNamespace(
@@ -9013,6 +9020,7 @@ def _dashboard_create_impl():
             scope_for=lambda n: None, all=lambda: []),
     )
     body = [fn] + _shared_helpers(tree, [fn], set())
+    _helper_modules(body, mod.__dict__)
     exec(compile(ast.Module(body=body, type_ignores=[]), "<dashboard>", "exec"),
          mod.__dict__)
     return mod.handle_tasks, ts, made
@@ -22756,10 +22764,136 @@ def test_operator_cannot_queue_work_by_any_other_door():
     flagged = st.create("Tidy the sync loop", role="implementor")["id"]
     st.transition(flagged, T.RUNNING); st.transition(flagged, T.AWAITING_APPROVAL)
     out = ask("dismiss", flagged)
+    check("dismissing flagged work is refused (test_operator_cannot_decide_against_you)",
+          not out["ok"] and st.get(flagged)["state"] == T.AWAITING_APPROVAL, str(out))
     out = ask("land", flagged)
-    check("dismissing flagged work and then landing it is refused",
+    check("and landing it while it waits for you is refused",
           not out["ok"] and out.get("refused") == "accept" and flagged not in bot.landings,
           str(out))
+
+
+def test_operator_cannot_decide_against_you():
+    import operator_role as O
+    import tasks as T
+    print("\nthe operator: dismissing, closing, digging and cancelling what waits for you "
+          "are refused too")
+    bot = _operator_bot()
+    st = bot.store
+    stopped = []
+    bot.ns["stop_task"] = lambda tid: stopped.append(tid) or True
+
+    def refused_cli(r, tid, rec, state):
+        return (r.returncode == 1 and f"!approve accept {tid}" in r.stderr
+                and st.get(tid)["state"] == state
+                and len(st.get(tid)["events"]) == len(rec["events"]))
+
+    prop = st.create("Add an appearance preference to Settings", state=T.PROPOSED,
+                     role="implementor", project="alpha")["id"]
+    before = st.get(prop)
+    r = _op_cli(bot, "dismiss", prop, "--by", "operator")
+    check("dismissing a proposal you never saw is refused, and it stays proposed",
+          refused_cli(r, prop, before, T.PROPOSED), r.stdout + r.stderr)
+    ideated = st.create("Cache the release plan per checkout", state=T.PROPOSED,
+                        role="implementor", project="alpha", filed_by="ideator")["id"]
+    r = _op_cli(bot, "dismiss", ideated, "--by", "operator")
+    check("so is one another run filed", refused_cli(r, ideated, st.get(ideated), T.PROPOSED),
+          r.stdout + r.stderr)
+
+    flagged = st.create("Tidy the sync retry loop", role="implementor", project="alpha")["id"]
+    st.transition(flagged, T.RUNNING); st.transition(flagged, T.AWAITING_APPROVAL)
+    before = st.get(flagged)
+    r = _op_cli(bot, "dismiss", flagged, "--by", "operator")
+    check("dismissing reviewed work waiting in awaiting_approval is refused",
+          refused_cli(r, flagged, before, T.AWAITING_APPROVAL), r.stdout + r.stderr)
+
+    found = st.create("Why does sync stall on cold launch?", role="researcher",
+                      project="alpha")["id"]
+    st.transition(found, T.RUNNING); st.transition(found, T.NEEDS_INPUT, "findings")
+    before = st.get(found)
+    for argv in (("dismiss", found), ("close", found), ("dig", found, "--notes", "and on iPad?")):
+        r = _op_cli(bot, *argv, "--by", "operator")
+        check(f"{argv[0]} on research's parked findings is refused, unread findings untouched",
+              refused_cli(r, found, before, T.NEEDS_INPUT), r.stdout + r.stderr)
+    for tid, rec, state in ((found, before, T.NEEDS_INPUT),
+                            (flagged, st.get(flagged), T.AWAITING_APPROVAL)):
+        r = _op_cli(bot, "retry", tid, "--by", "operator")
+        check(f"retrying work waiting on you in {state} is refused (it would rerun unread)",
+              refused_cli(r, tid, rec, state), r.stdout + r.stderr)
+    dead = types.SimpleNamespace(port=1, statefile=bot.statefile)
+    r = _op_cli(dead, "close", found)
+    check("close is refused by the CLI itself, before asking a bot (1, not 3)",
+          r.returncode == 1 and f"!approve accept {found}" in r.stderr, r.stdout + r.stderr)
+    out = bot.ns["handle_tasks"]({"action": "close", "id": found, "caller_role": "operator"})
+    check("and by the bot on its own", not out["ok"] and out.get("refused") == "accept"
+          and st.get(found)["state"] == T.NEEDS_INPUT, str(out))
+
+    work = st.create("Retry sync on 5xx", role="implementor", project="alpha")["id"]
+    st.transition(work, T.RUNNING)
+    for action in ("cancel", "dismiss"):
+        out = bot.ns["handle_tasks"]({"action": action, "id": work, "caller_role": "operator"})
+        check(f"{action} of a running implementor is refused, and its child is not killed",
+              not out["ok"] and out.get("refused") == "accept"
+              and st.get(work)["state"] == T.RUNNING and not stopped, str(out))
+    own = st.create("Sweep the board", role="operator")["id"]
+    st.transition(own, T.RUNNING)
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": own, "caller_role": "operator"})
+    check("cancelling its own running turn is still its to do",
+          out["ok"] and st.get(own)["state"] == T.CANCELLED and stopped == [own], str(out))
+
+    # Its own filings: stamped by the route that files them, then dismissable.
+    bot.ns["project_store"] = types.SimpleNamespace(
+        ensure=lambda n, **kw: {"slug": n}, home=lambda n, create=False: None,
+        scope_for=lambda slug: {"branch": "main"}, get=lambda slug: None)
+    out = bot.ns["handle_tasks"]({"action": "create", "state": "proposed", "project": "alpha",
+                                  "goal": "Show the sync error text in Settings when a push fails",
+                                  "scope": {"cwd": str(bot.tmp)}, "caller_role": "operator"})
+    mine = (out.get("task") or {}).get("id", "")
+    check("a proposal the operator files is recorded as its own",
+          out["ok"] and st.get(mine)["filed_by"] == O.ROLE, str(out))
+    r = _op_cli(bot, "dismiss", mine, "--by", "operator")
+    check("and it may dismiss that one without asking",
+          r.returncode == 0 and st.get(mine)["state"] == T.CANCELLED, r.stdout + r.stderr)
+    out = bot.ns["handle_tasks"]({"action": "create", "state": "proposed", "project": "alpha",
+                                  "goal": "Show the sync error text in Settings on a 4xx too",
+                                  "scope": {"cwd": str(bot.tmp)}})
+    check("one you file from the dashboard is nobody's run's",
+          out["ok"] and st.get(out["task"]["id"])["filed_by"] == "", str(out))
+
+    # An approval lifts each once.
+    for tid, argv, after in ((prop, ("dismiss", prop), T.CANCELLED),
+                             (flagged, ("dismiss", flagged), T.CANCELLED),
+                             (found, ("close", found), T.DONE)):
+        bot.state.approve("accept", tid, by="U_ME")
+        r = _op_cli(bot, *argv, "--by", "operator")
+        check(f"approved, {argv[0]} of {st.get(tid)['role']} work goes ahead once",
+              r.returncode == 0 and st.get(tid)["state"] == after
+              and not bot.state.has("accept", tid), r.stdout + r.stderr)
+    found2 = st.create("Is the widget timeline too eager?", role="researcher",
+                       project="alpha")["id"]
+    st.transition(found2, T.RUNNING); st.transition(found2, T.NEEDS_INPUT, "findings")
+    bot.state.approve("accept", found2, by="U_ME")
+    r = _op_cli(bot, "dig", found2, "--notes", "check iOS 26 too", "--by", "operator")
+    check("an approved dig goes ahead and uses the approval up",
+          r.returncode == 0 and st.get(found2)["state"] != T.NEEDS_INPUT
+          and not bot.state.has("accept", found2), r.stdout + r.stderr)
+    bot.state.approve("accept", work, by="U_ME")
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": work, "caller_role": "operator"})
+    check("an approved cancel stops the running task",
+          out["ok"] and st.get(work)["state"] == T.CANCELLED and work in stopped, str(out))
+
+    r = _op_cli(bot, "dismiss", ideated, role="", thread="")
+    check("your own CLI dismiss is unaffected",
+          r.returncode == 0 and st.get(ideated)["state"] == T.CANCELLED, r.stdout + r.stderr)
+
+    # `silkworm task` from a turn: the other filing route stamps the same way,
+    # by the role the bot set or by the operator's home thread (D5:5.0 here).
+    file_task, _filed, _begin, fts, _made = _file_task_impl()
+    for key, role, want in (("C1:1.0", "operator", O.ROLE), ("D5:5.0", "", O.ROLE),
+                            ("C1:2.0", "ideator", "ideator"), ("C1:3.0", "", "")):
+        out = file_task({"key": key, "propose": True, "caller_role": role,
+                         "goal": f"Add an appearance preference to Settings ({key})"})
+        check(f"a filing from {role or 'no role'} on {key} is filed_by {want or 'nobody'}",
+              out.get("ok") and fts.get(out["id"])["filed_by"] == want, str(out))
 
 
 def test_operator_drops_nothing_reverted_and_tidies_only_finished_task_checkouts():
