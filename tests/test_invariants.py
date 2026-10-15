@@ -22569,6 +22569,48 @@ def test_operator_has_no_raw_git_and_its_git_cannot_write():
           r.stdout + r.stderr)
 
 
+def test_operator_git_runs_no_program_the_repository_config_names():
+    import operator_role as O
+    print("\nthe operator's git: a repo's own diff drivers and filters run nothing")
+    base = Path(tempfile.mkdtemp())
+    repo = base / "evil"
+    repo.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SILKWORM_")}
+
+    def git(*a):
+        subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, env=env)
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (repo / ".gitattributes").write_text("*.txt diff=evil\n*.dat filter=evil\n")
+    ran = base / "ran"
+    git("config", "diff.evil.textconv", f"echo textconv >> {ran}; cat")
+    git("config", "diff.evil.command", f"echo command >> {ran}; true")
+    git("config", "filter.evil.smudge", f"echo smudge >> {ran}; cat")
+    (repo / "f.txt").write_text("one\n")
+    git("add", "f.txt", ".gitattributes")
+    git("commit", "-qm", "one")
+    (repo / "f.txt").write_text("two\n")
+    git("commit", "-qam", "two")
+    (repo / "f.txt").write_text("three\n")
+    env["SILKWORM_ROLE"] = "operator"
+    for argv in (["log", "-p"], ["show"], ["diff"], ["diff", "HEAD~1"],
+                 ["blame", "f.txt"], ["grep", "-e", "three"]):
+        if ran.exists():
+            ran.unlink()
+        r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "operator", "git",
+                            "--in", str(repo), *argv],
+                           capture_output=True, text=True, env=env, timeout=60)
+        check(f"`git {' '.join(argv)}` reads, running none of the repo's programs",
+              r.returncode == 0 and not ran.exists(),
+              (ran.read_text() if ran.exists() else "") + r.stdout + r.stderr)
+    for argv in (["cat-file", "--filters", "HEAD:f.txt"], ["cat-file", "--filt", "HEAD:f.txt"]):
+        check(f"refuses {' '.join(argv)} (runs filter programs)", O.git_refusal(argv), str(argv))
+    check("the safe flags follow the subcommand, before the operator's own arguments",
+          O.git_command(["log", "-p"])[-4:] == ["log", "--no-ext-diff", "--no-textconv", "-p"]
+          and O.git_command(["status"])[-1:] == ["status"] and O.git_command([])[0] == "git")
+
+
 def test_operator_cannot_queue_work_by_any_other_door():
     import operator_role as O
     import tasks as T

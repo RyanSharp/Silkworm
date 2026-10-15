@@ -388,12 +388,31 @@ def git_refusal(argv) -> str:
             return f"`{a}` writes a file or runs a program"
         if sub == "grep" and name.startswith("-O"):
             return f"`{a}` runs a program"
+        if sub == "cat-file" and name.startswith("--fi") and "--filters".startswith(name):
+            return f"`{a}` runs the repository's filter programs"
     return ""
+
+
+#: Flags put straight after the subcommand. A repository's own config can name
+#: a program per diff driver (diff.<driver>.textconv, diff.<driver>.command)
+#: that log/show/blame run by default and diff runs as an external diff --
+#: driver names are the repo's to choose, so `-c` cannot blank them all, and a
+#: blank textconv makes `log -p` fail rather than skip it. These flags can.
+_GIT_SAFE_FLAGS = {
+    "diff": ("--no-ext-diff", "--no-textconv"),
+    "log": ("--no-ext-diff", "--no-textconv"),
+    "show": ("--no-ext-diff", "--no-textconv"),
+    "blame": ("--no-textconv",),
+    "grep": ("--no-textconv",),
+}
 
 
 def git_command(argv) -> list:
     """The command line `silkworm operator git` runs: no pager, no external
-    diff or fsmonitor whatever the repository's config says."""
+    diff, textconv or fsmonitor whatever the repository's config says."""
+    argv = list(argv)
+    if argv:
+        argv[1:1] = _GIT_SAFE_FLAGS.get(argv[0], ())
     return ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "diff.external=",
             "-c", "core.pager=cat", *argv]
 
