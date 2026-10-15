@@ -50,6 +50,10 @@ ROLE = "operator"
 SWEEP_REF = "operator-sweep"
 #: When the sweep runs if OPERATOR_SWEEP_AT is unset: after the digest's 08:00.
 DEFAULT_SWEEP_AT = "08:30"
+#: How long past its time the sweep waits for the digest before running
+#: without it. A digest that fails to send must not silently cost the day's
+#: sweep too.
+DIGEST_GRACE_MIN = 180
 
 #: The notes file it keeps, at most this long. Read into every turn, so it has
 #: to stay a summary rather than become a log.
@@ -259,23 +263,41 @@ class State:
 
     # the sweep
     def sweep_due(self, now: datetime, at: str, digest_last_on: str = "",
-                  digest_on: bool = True) -> bool:
+                  digest_on: bool = True, grace_min: int = DIGEST_GRACE_MIN) -> bool:
         """Whether today's sweep should be filed now: its time has passed, it
         has not been filed today, and the digest has gone out first (unless the
-        digest is off). The wall-clock catch-up projects.due_for_ideation uses."""
+        digest is off). The wall-clock catch-up projects.due_for_ideation uses.
+
+        If the digest still has not gone out `grace_min` minutes after `at`,
+        the sweep is due without it (see digest_missed), rather than skipped."""
         if not self.thread():
             return False
         today = now.strftime("%Y-%m-%d")
         if self._load().get("sweep_on") == today:
             return False
-        if digest_on and digest_last_on != today:
+        if now.strftime("%H:%M") < at:
             return False
-        return now.strftime("%H:%M") >= at
+        if digest_on and digest_last_on != today:
+            return now.strftime("%H:%M") >= _plus_minutes(at, grace_min)
+        return True
+
+    @staticmethod
+    def digest_missed(now: datetime, digest_last_on: str, digest_on: bool = True) -> bool:
+        """Whether a sweep filed now runs without today's digest having posted."""
+        return digest_on and digest_last_on != now.strftime("%Y-%m-%d")
 
     def mark_sweep(self, now: datetime, task_id: str) -> None:
         data = self._load()
         data.update(sweep_on=now.strftime("%Y-%m-%d"), sweep_task=task_id)
         self._save(data)
+
+
+def _plus_minutes(at: str, minutes: int) -> str:
+    """`at` (HH:MM) plus `minutes`, held at 23:59 rather than wrapping into
+    tomorrow -- so a late sweep time still gets its fallback the same day."""
+    h, m = (int(x) for x in at.split(":"))
+    total = min(h * 60 + m + max(0, int(minutes)), 23 * 60 + 59)
+    return f"{total // 60:02d}:{total % 60:02d}"
 
 
 def check(state: State, guard_item, now: float | None = None,

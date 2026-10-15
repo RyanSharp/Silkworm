@@ -6492,12 +6492,22 @@ def approve_command(text: str, user: str, event: dict) -> str:
             f"{operator_role.GUARDS[guard]} — `{item}`.")
 
 
-def file_operator_sweep(now: datetime) -> str:
-    """File today's sweep as a wake-up on the operator's thread. Its id."""
+def file_operator_sweep(now: datetime, digest_missed: bool = False) -> str:
+    """File today's sweep as a wake-up on the operator's thread. Its id.
+
+    `digest_missed`: today's digest never posted, and the sweep has stopped
+    waiting for it. Said in the title and the goal, so the skip is visible on
+    the board and the operator can mention it, not only in the log."""
     thread = OPERATOR.thread()
+    goal = operator_role.SWEEP_GOAL.format(bin=SILKWORM_BIN)
+    title = f"Operator sweep {now:%Y-%m-%d}"
+    if digest_missed:
+        goal += ("\n\nNote: today's digest did not post (it was due before this "
+                 "sweep). Say so in your message, and check the bot log for why.")
+        title += " (no digest)"
     task = task_store.create(
-        operator_role.SWEEP_GOAL.format(bin=SILKWORM_BIN),
-        title=f"Operator sweep {now:%Y-%m-%d}",
+        goal,
+        title=title,
         role=operator_role.ROLE, state=tasks.QUEUED, driver="queue",
         # The wake lane's source: it is the operator's conversation resuming,
         # in its own thread and directory, not work of its own.
@@ -6524,8 +6534,14 @@ def _operator_scheduler() -> None:
         try:
             now = datetime.now()
             digest_on = DIGEST_AT.lower() not in digest.OFF
-            if OPERATOR.sweep_due(now, at, digest.Schedule(DIGEST_STATE).last_on, digest_on):
-                file_operator_sweep(now)
+            last_on = digest.Schedule(DIGEST_STATE).last_on
+            if OPERATOR.sweep_due(now, at, last_on, digest_on):
+                missed = OPERATOR.digest_missed(now, last_on, digest_on)
+                if missed:
+                    log.warning("today's digest has not posted %d min after the "
+                                "operator sweep time; sweeping without it",
+                                operator_role.DIGEST_GRACE_MIN)
+                file_operator_sweep(now, digest_missed=missed)
         except Exception:
             log.exception("operator scheduler failed")
         time.sleep(300)

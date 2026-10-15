@@ -22500,6 +22500,33 @@ def test_operator_sweep_is_daily_after_the_digest_and_posts_once():
           "/s operator contained" in rec["goal"] and "{bin}" not in rec["goal"], rec["goal"][:300])
     check("and again the next day", state.sweep_due(datetime(2026, 10, 14, 9, 0), "08:30", "2026-10-14"))
 
+    # A digest that never posts must not silently cost the sweep too.
+    late = O.State(tmp / "late.json")
+    late.set_thread("D1:2.0")
+    check("still waits for the digest within the grace",
+          not late.sweep_due(datetime(2026, 10, 13, 11, 29), "08:30", "2026-10-12"))
+    check("sweeps without it once the grace has passed",
+          late.sweep_due(datetime(2026, 10, 13, 11, 30), "08:30", "2026-10-12"))
+    check("and says the digest was missed",
+          O.State.digest_missed(datetime(2026, 10, 13, 11, 30), "2026-10-12")
+          and not O.State.digest_missed(datetime(2026, 10, 13, 11, 30), "2026-10-13")
+          and not O.State.digest_missed(datetime(2026, 10, 13, 11, 30), "", digest_on=False))
+    check("a late sweep time still falls back the same day, not never",
+          late.sweep_due(datetime(2026, 10, 13, 23, 59), "22:30", "2026-10-12")
+          and not late.sweep_due(datetime(2026, 10, 13, 23, 58), "22:30", "2026-10-12"))
+    lst = T.TaskStore(tmp / "late-t.json")
+    lns = bot_functions("file_operator_sweep", task_store=lst, tasks=T, operator_role=O,
+                        OPERATOR=late, BASE_DIR=tmp, datetime=datetime, SILKWORM_BIN="/s")
+    lrec = lst.get(lns["file_operator_sweep"](datetime(2026, 10, 13, 11, 30), digest_missed=True))
+    check("a sweep without the digest says so on the board and to the operator",
+          "(no digest)" in lrec["title"] and "digest did not post" in lrec["goal"], str(lrec)[:300])
+    check("and is not filed twice", not late.sweep_due(datetime(2026, 10, 13, 12, 0), "08:30", "2026-10-12"))
+    bot = (BASE / "bot.py").read_text()
+    body = bot[bot.index("def _operator_scheduler("):]
+    body = body[:body.index("\ndef ", 10)]
+    check("the scheduler logs a sweep that ran without the digest",
+          "log.warning" in body and "digest_missed=missed" in body)
+
     class Client:
         def __init__(self, fail_update=False):
             self.calls, self.fail_update = [], fail_update
