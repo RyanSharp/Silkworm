@@ -23680,6 +23680,251 @@ process.stdout.write(JSON.stringify(out));
 
 
 
+CHAT_HARNESS = r"""
+// A small DOM: elements hold their markup, children, classes and style.
+function mk(id) {
+  const cls = new Set();
+  const e = {id, style: {}, dataset: {}, value: "", placeholder: "", children: [], _inner: "",
+    scrollHeight: 0, scrollTop: 0, clientHeight: 0, parent: null,
+    classList: {add: c => cls.add(c), remove: c => cls.delete(c), contains: c => cls.has(c),
+                toggle: (c, on) => { if (on === undefined ? !cls.has(c) : on) cls.add(c); else cls.delete(c); }},
+    addEventListener(){}, querySelectorAll: () => [], querySelector(sel) {
+      return sel === ".empty" && this._inner.includes('class="empty"') ? {} : null; },
+    insertAdjacentHTML(_, h) { this._inner += h; },
+    appendChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1);
+                     this.children.push(c); c.parent = this; },
+    remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); },
+    scrollIntoView(){}, focus(){}};
+  Object.defineProperty(e, "innerHTML", {get() { return this._inner; },
+    set(v) { this._inner = v; this.children.length = 0; }});
+  return e;
+}
+const els = {};
+const byId = id => els[id] || (els[id] = mk(id));
+const bodyCls = new Set();
+let wide = false;
+globalThis.document = {getElementById: byId, addEventListener(){}, querySelectorAll: () => [],
+  querySelector: s => s === "main" ? byId("__main") : null,
+  createElement: () => mk(""), hidden: false,
+  body: {classList: {add: c => bodyCls.add(c), remove: c => bodyCls.delete(c), contains: c => bodyCls.has(c),
+                     toggle: (c, on) => { if (on === undefined ? !bodyCls.has(c) : on) bodyCls.add(c); else bodyCls.delete(c); }}}};
+globalThis.history = {state: null, replaceState(){}, pushState(){}, back(){}};
+globalThis.window = {addEventListener(){}, history: globalThis.history, location: {search: ""}};
+globalThis.matchMedia = q => ({matches: !wide && q === "(max-width: 700px)"});
+Object.defineProperty(globalThis, "navigator", {value: {}, configurable: true});
+globalThis.localStorage = {getItem: () => null, setItem(){}};
+globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;
+globalThis.fetch = () => new Promise(() => {});
+globalThis.getComputedStyle = () => ({lineHeight: "22px", paddingTop: "10px", paddingBottom: "10px",
+                                      borderTopWidth: "1px", borderBottomWidth: "1px"});
+(0, eval)(__JS__ + `
+;globalThis.__p = {chatItems, toolsLabel, chatHtml, drawChat, toggleTools, chatOpen, chatEls,
+  alertParts, renderAlerts, alertCount: () => alertList.length, defaultKind, setKind,
+  kind: () => threadKind, chatHead, growReply, jumpTo, filesHtml, keepEnd,
+  setLast: s => { lastSessions = s; }, getActive: () => active, setActive: a => { active = a; },
+  setTview: t => { tview = t; }};`);
+const P = globalThis.__p, out = {};
+const T = (role, ...blocks) => ({role, ts: "2026-10-15T10:00:00Z", blocks});
+const U = {in: 10, out: 20, cache_read: 900, cache_create: 5};
+const msgs = [
+  T("user", {type: "text", text: "please fix it"}),
+  T("assistant", {type: "tool", name: "Bash", input: "ls"}),
+  T("user", {type: "tool_result", text: "a b"}),
+  Object.assign(T("assistant", {type: "thinking", text: "hm"}, {type: "tool", name: "Read", input: "x"}),
+                {usage: U, model: "claude-opus-5-5"}),
+  T("user", {type: "tool_result", text: "file"}),
+  T("assistant", {type: "tool", name: "Bash", input: "make"}),
+  T("user", {type: "tool_result", text: "ok"}),
+  Object.assign(T("assistant", {type: "text", text: "Fixed **it**."}), {usage: U, model: "claude-opus-5-5"}),
+  T("assistant", {type: "text", text: "One more:"}, {type: "tool", name: "Edit", input: "e"}),
+  T("user", {type: "tool_result", text: "done"}),
+  T("assistant", {type: "text", text: "All done."}),
+];
+const items = P.chatItems(msgs);
+out.shape = items.map(i => i.kind === "bubble" ? i.role + ":" + i.text : "tools:" + i.tools + ":" + i.names.join("+"));
+out.ids = items.map(i => i.id);
+out.prefixIds = P.chatItems(msgs.slice(0, 6)).map(i => i.id);
+out.labels = items.filter(i => i.kind === "tools").map(P.toolsLabel);
+out.thinkingOnly = P.toolsLabel(P.chatItems([T("assistant", {type: "thinking", text: "x"})])[0]);
+const fixed = items[2];
+out.bubbleUsage = !!fixed.usage && fixed.model === "claude-opus-5-5";
+out.groupUsage = items[1].parts.some(p => p.usage && p.model);
+const firstTools = items[1];
+const closed = P.chatHtml(firstTools);
+out.closed = {pre: closed.includes("<pre>"), usage: closed.includes('class="usage"'), label: closed.includes("ran 3 tools")};
+P.chatOpen.add(firstTools.id);
+const opened = P.chatHtml(firstTools);
+out.opened = {pre: opened.includes("<pre>ls</pre>"), usage: opened.includes('class="usage"'),
+              bash: opened.includes("⚙ Bash"), result: opened.includes("↳ result")};
+P.chatOpen.clear();
+out.bubbleHtml = P.chatHtml(fixed);
+out.plainBubble = P.chatHtml(items[0]);
+// Keyed drawing: earlier items keep their elements as the thread grows, and
+// an opened tools line stays open when redrawn.
+const box = byId("tmsgs");
+P.setActive({key: "k"});
+P.setTview({key: "k", sid: "s", msgs: msgs.slice(0, 6), live: null});
+P.drawChat(box, msgs.slice(0, 6), "s");
+const firstEls = box.children.slice();
+out.drawn1 = firstEls.length;
+P.toggleTools(firstTools.id);
+out.openAfterToggle = box.children[1]._inner.includes("<pre>ls</pre>");
+P.drawChat(box, msgs, "s");
+out.drawn2 = box.children.length;
+out.kept = firstEls.every((e, i) => box.children[i] === e);
+out.stillOpen = box.children[1]._inner.includes("<pre>ls</pre>") && box.children[1]._inner.includes("make");
+P.drawChat(box, [], "");
+out.empty = box.innerHTML.includes("No messages yet");
+// Alerts: one count for the laptop's bar and the phone's ⚠.
+const now = Date.now() / 1000;
+const sess = [{key: "a", title: "A", turn: {stalled: true, age_s: 900}},
+              {key: "b", title: "B", turn: {stalled: true, age_s: 60}},
+              {key: "c", title: "C", cost_flag: {ratio: 9, last: 1, median: 0.1}},
+              {key: "d", title: "D"}];
+out.alertsAll = P.alertParts(sess, {ready: true, connected: false, down_for: 30},
+                             {state: "stale", message: "3 behind"}).length;
+out.alertsNone = P.alertParts([{key: "d"}], {ready: true, connected: true}, {state: "current"}).length;
+out.alertsTwo = P.alertParts(sess, {}, {}).length;
+P.renderAlerts(sess, {ready: true, connected: false}, {state: "stale", message: "x"});
+out.slot = byId("alertslot").innerHTML;
+out.bar = (byId("alertbar").innerHTML.match(/class="alert /g) || []).length;
+out.sheet = (byId("alertlist").innerHTML.match(/class="aitem"/g) || []).length;
+P.renderAlerts([], {}, {state: "current"});
+out.slotEmpty = byId("alertslot").innerHTML;
+// The phone opens the list on Conversations, when there are any.
+P.defaultKind([{kind: "task"}, {kind: "thread"}]); out.kindPhone = P.kind();
+P.defaultKind([{kind: "task"}, {kind: "thread", hidden: true}]); out.kindNoConv = P.kind();
+P.defaultKind([{kind: "thread"}]);                    // a phone: Conversations
+wide = true; P.defaultKind([{kind: "thread"}]); out.kindWideBefore = P.kind();
+wide = false;
+P.defaultKind([{kind: "thread"}]); P.setKind("task"); P.defaultKind([{kind: "thread"}]);
+out.kindChosen = P.kind();
+// jumpTo: a thread the list filters out is opened anyway.
+P.setActive(null);
+P.setLast([{key: "hidden-task", kind: "task", title: "T"}]);
+wide = true; P.jumpTo("hidden-task"); out.jumpedWide = (P.getActive() || {}).key || null;
+wide = false;
+P.jumpTo("hidden-task");
+out.jumped = (P.getActive() || {}).key || null;
+// The thread header.
+out.headRun = P.chatHead({title: "A <b> title", project: "silkworm", turn: {age_s: 125, stalled: false}},
+                         {running: true, turns: [{state: "queued"}, {state: "running"}]}, 3);
+out.headIdle = P.chatHead({title: "", project: "", updated: now - 120}, {turns: []}, 0);
+// Composer: grows to six lines, then scrolls.
+const reply = byId("reply");
+reply.scrollHeight = 400; P.growReply();
+out.tall = [reply.style.height, reply.style.overflowY];
+reply.scrollHeight = 42; P.growReply();
+out.short = [reply.style.height, reply.style.overflowY];
+out.placeholder = reply.placeholder;
+// Following the newest message: at the end it follows; read further up it
+// stays put and shows the pill.
+const main = byId("__main");
+Object.assign(main, {scrollHeight: 1000, clientHeight: 500, scrollTop: 500});
+P.keepEnd(() => { main.scrollHeight = 1300; });
+out.followed = [main.scrollTop, byId("jumppill").classList.contains("show")];
+main.scrollTop = 100;
+P.keepEnd(() => { main.scrollHeight = 1600; });
+out.stayed = [main.scrollTop, byId("jumppill").classList.contains("show")];
+P.keepEnd(() => {}, true);
+out.forced = [main.scrollTop, byId("jumppill").classList.contains("show")];
+out.filesCompact = P.filesHtml([{direction: "in", exists: true, path: "/p/a.png", name: "a.png", size: 2048}], true);
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def test_viz_phone_chat():
+    import re
+    import shutil
+    import subprocess as _sp
+    import visualizer as V
+    print("\non a phone the open thread is a chat: bubbles, folded tools, its own header, ⚠ count")
+    css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
+    at = css.index("@media (max-width: 700px)")
+    desktop, phone = css[:at], css[at:]
+    check("a laptop never sees the chat's header, alert count, sheet or pill",
+          "#alertslot, #chathead, #jumppill, #alertsheet { display: none; }" in desktop)
+    check("on a phone the alerts are never a bar above anything", "#alertbar { display: none; }" in phone)
+    check("an open thread on a phone has the screen: no app header, its own sticky one",
+          "body.reading header { display: none; }" in phone
+          and re.search(r"body\.reading #chathead \{ display: flex;[^}]*position: sticky;", phone) is not None)
+    check("the composer keeps above the keyboard (visual viewport height)",
+          "body { height: var(--vvh, 100dvh); }" in phone and "visualViewport" in V.PAGE)
+    check("the list header has ✏️ new thread on a phone",
+          'onclick="newThreadForm()" title="new thread"' in V.PAGE)
+
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the chat's script checked by text only")
+        return
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    r = _sp.run([node, "-e", CHAT_HARNESS.replace("__JS__", json.dumps(js))],
+                capture_output=True, text=True, timeout=60)
+    check("the page's script runs in the chat harness", r.returncode == 0, r.stderr[-800:])
+    if r.returncode:
+        return
+    o = json.loads(r.stdout)
+    check("messages become bubbles, each run of tools between them one line",
+          o["shape"] == ["user:please fix it", "tools:3:Bash+Read", "assistant:Fixed **it**.",
+                         "assistant:One more:", "tools:1:Edit", "assistant:All done."], str(o["shape"]))
+    check("an item's id is where it starts, so it is the same as the thread grows",
+          o["ids"][:len(o["prefixIds"])] == o["prefixIds"] and o["prefixIds"] == ["0.0", "1.0"],
+          f'{o["ids"]} vs {o["prefixIds"]}')
+    check("the tools line says how many ran and which",
+          o["labels"] == ["⚙ ran 3 tools · Bash, Read", "⚙ ran 1 tool · Edit"], str(o["labels"]))
+    check("a run of only thinking says so", o["thinkingOnly"] == "💭 thinking", o["thinkingOnly"])
+    check("a message's figures go with its words, else with its tools",
+          o["bubbleUsage"] is True and o["groupUsage"] is True)
+    check("folded, a tools line shows no detail and no figures",
+          o["closed"] == {"pre": False, "usage": False, "label": True}, str(o["closed"]))
+    check("opened, it shows the laptop's detail: each call, result and the figures",
+          all(o["opened"].values()), str(o["opened"]))
+    check("a bubble's figures sit behind its time, the markdown rendered",
+          '<details class="cstat"><summary>' in o["bubbleHtml"] and 'class="usage"' in o["bubbleHtml"]
+          and "<b>it</b>" in o["bubbleHtml"] and "claude-opus-5-5" in o["bubbleHtml"], o["bubbleHtml"])
+    check("a bubble with no figures is only its time",
+          "<details" not in o["plainBubble"] and 'class="cmsg user"' in o["plainBubble"], o["plainBubble"])
+    check("drawing a grown thread keeps the elements already drawn",
+          o["drawn1"] == 2 and o["drawn2"] == 6 and o["kept"] is True, str(o))
+    check("a tools line opened stays open, and still open as it collects more",
+          o["openAfterToggle"] is True and o["stillOpen"] is True)
+    check("a thread with nothing in it says so", o["empty"] is True)
+    check("the alert count is one per alert: revision, Slack, stalled, cost",
+          o["alertsAll"] == 4 and o["alertsNone"] == 0 and o["alertsTwo"] == 2,
+          f'{o["alertsAll"]} {o["alertsNone"]} {o["alertsTwo"]}')
+    check("the header's ⚠ shows that count, the bar and the sheet the same alerts",
+          "⚠ 4" in o["slot"] and o["bar"] == 4 and o["sheet"] == 4, f'{o["slot"]!r} {o["bar"]} {o["sheet"]}')
+    check("no alerts, no ⚠", o["slotEmpty"] == "", o["slotEmpty"])
+    check("a phone's list opens on Conversations", o["kindPhone"] == "thread", o["kindPhone"])
+    check("with no conversation to show, it opens on All", o["kindNoConv"] == "all", o["kindNoConv"])
+    check("a laptop keeps All, also after the window was phone-narrow",
+          o["kindWideBefore"] == "all", o["kindWideBefore"])
+    check("a filter picked by hand is kept over the default", o["kindChosen"] == "task", o["kindChosen"])
+    check("an alert's thread opens even when the list's filter hides it",
+          o["jumped"] == "hidden-task", str(o["jumped"]))
+    check("on a laptop jumpTo is as it was: only a card in the list opens",
+          o["jumpedWide"] is None, str(o["jumpedWide"]))
+    h = o["headRun"]
+    check("the header: back, the title escaped, project, running time, queued, ⚠ and Stop",
+          'onclick="closeSession()"' in h and "A &lt;b&gt; title" in h and "silkworm" in h
+          and "running 2m" in h and "1 queued" in h and "⚠ 3" in h and "cmdSend('!stop')" in h, h)
+    hi = o["headIdle"]
+    check("an idle thread's header has no Stop and no ⚠, and says untitled",
+          "!stop" not in hi and "⚠" not in hi and "untitled" in hi, hi)
+    check("the composer grows to six lines and then scrolls inside itself",
+          o["tall"] == ["154px", "auto"] and o["short"] == ["44px", "hidden"], f'{o["tall"]} {o["short"]}')
+    check("its placeholder on a phone is short enough to show whole",
+          0 < len(o["placeholder"]) <= 24, o["placeholder"])
+    check("read at the end, the chat follows a new message",
+          o["followed"] == [1300, False], str(o["followed"]))
+    check("read further up, it stays put and offers the way down",
+          o["stayed"] == [100, True], str(o["stayed"]))
+    check("what the owner just sent is brought into view", o["forced"] == [1600, False], str(o["forced"]))
+    check("the files are one line that opens onto the list",
+          o["filesCompact"].startswith('<details class="cfiles"><summary>📎 1 file</summary>')
+          and "a.png" in o["filesCompact"], o["filesCompact"][:200])
+
+
 # --- conversation threads from the dashboard --------------------------------------
 # The dashboard used to be able to answer an existing thread and nothing more:
 # no new thread, no files, a toast instead of the message, and a !command's

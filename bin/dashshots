@@ -44,6 +44,8 @@ FORBIDDEN_DEVICES = {"Cadence Test iPhone 17"}
 DEVICES = {375: ("Silkworm Shots 375", "iPhone SE (3rd generation)"),
            430: ("Silkworm Shots 430", "iPhone 16 Plus")}
 DESKTOP = 1280
+#: A thread key no session has: opened, it is an empty new thread.
+NEW_THREAD = "D0SHOTS:0000000000.000000"
 
 #: /tasks actions that only read (visualizer.READ_TASK_ACTIONS, plus nothing).
 READ_TASKS = {"list", "attention", "counts", "board", "overview", "task", "unmerged",
@@ -164,6 +166,7 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
     for name in ("sessions.json",):
         if (home / name).exists():
             shutil.copy2(home / name, tmp / name)
+    own_turn(tmp / "sessions.json")
     (tmp / ".env").write_text(f"APPROVAL_PORT={bot_port}\n")
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("VIZ_", "SILKWORM_"))}
@@ -181,6 +184,21 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
                 raise SystemExit("dashboard copy died:\n" + (tmp / "viz.log").read_text())
             time.sleep(0.1)
     raise SystemExit("dashboard copy never answered")
+
+
+def own_turn(sessions: Path) -> None:
+    """Run from inside a Silkworm turn, the copy's marker for that turn gets
+    the turn's session id when the bot has not recorded one, so the running
+    turn the harness photographs is this one, live: its transcript, and its
+    claude process found alive. Only the copy is touched."""
+    key, sid = os.environ.get("SILKWORM_THREAD", ""), os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not (key and sid and sessions.exists()):
+        return
+    data = json.loads(sessions.read_text())
+    pending = (data.get(key) or {}).get("pending")
+    if isinstance(pending, dict) and not pending.get("session_id"):
+        pending["session_id"] = sid
+        sessions.write_text(json.dumps(data))
 
 
 # --- what to shoot ------------------------------------------------------------
@@ -201,6 +219,12 @@ def pick_examples(base: str, project: str) -> dict:
              and not s.get("hidden") and s.get("turns", 0) > 2]
     if convs:
         out["thread"] = max(convs, key=lambda s: s.get("updated", 0))["key"]
+    # A turn in progress: the harness's own thread when a Silkworm turn runs
+    # it (that turn is running while it shoots), else any live one.
+    running = [s for s in sessions if s.get("turn") and not s["turn"].get("stalled")]
+    mine = os.environ.get("SILKWORM_THREAD", "")
+    if running:
+        out["running"] = next((s["key"] for s in running if s["key"] == mine), running[0]["key"])
     board = get_json(base + "/api/tasks", {"action": "board", "project": project})
     cards = [t for col in (board.get("columns") or {}).values() for t in col]
     cards.sort(key=lambda t: (bool(t.get("review")), t.get("created", 0)), reverse=True)
@@ -218,8 +242,13 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("sessions", "/"),
         ("stats", "/?view=stats"),
         ("thread", f"/?thread={quote(ex['thread'])}"),
+        *([("thread-running", f"/?thread={quote(ex['running'])}")] if ex.get("running") else []),
+        # A thread with no session yet is what a new thread is until its first
+        # turn writes: the page draws it from the key alone.
+        ("thread-new", f"/?thread={quote(NEW_THREAD)}"),
         ("search", "/?q=" + quote("tailscale")),
         ("new-thread", "/?modal=new-thread"),
+        ("alerts", "/?modal=alerts"),
         ("tasks", "/?view=tasks"),
         ("tasks-all", "/?view=tasks&tab=all"),
         ("task", f"/?task={quote(ex['task'])}"),

@@ -1223,12 +1223,24 @@ A local web dashboard for every thread session (localhost-only):
   and forms as full-screen sheets with their buttons pinned to the bottom.
   Everything tappable is at least 44px and every field 16px, so iOS does not
   zoom in on focus. The laptop layout is untouched.
+- **Chat on a phone.** The list opens on *Conversations* (task runs are
+  reached from 📋 Tasks, or the chips), and ✏️ in the header starts a new
+  thread. An open thread is a chat with the screen to itself: a sticky header
+  (‹ back, its name, project, running time with ■ Stop, ⓘ for the resume
+  command, Slack link, summary and events), your messages and Claude's
+  replies as bubbles, and each run of tool calls folded into one line
+  (`⚙ ran 6 tools · Bash, Read`) that opens onto the full log. A reply's
+  tokens, cache and model are behind its time. It follows the newest message
+  while you are at the bottom; scrolled up, *↓ Jump to latest* appears. The
+  box grows to six lines and sits on the keyboard. Alerts (stale revision,
+  Slack down, stalled threads, cost spikes) are never a bar on a phone: the
+  header shows `⚠ <count>`, which opens them as a sheet.
 - **Deep links** — every view opens from its address, which is how a
   notification lands on a thread and how the screenshots below are taken:
   `/?thread=<key>`, `/?task=<id>` (the task panel, on that row),
   `/?view=stats|tasks|projects|learnings` (`&tab=all` for every task),
   `/?view=project&slug=<slug>` (`all`, `unfiled`), `&card=<task id>` (a task's
-  detail), `/?modal=new-thread|new-project|new-task|settings|release`
+  detail), `/?modal=new-thread|new-project|new-task|settings|release|alerts`
   (`&slug=` for the last two), `/?q=<words>` (search). The address is cleared
   once read, so a reload opens the list.
 
@@ -1250,7 +1262,10 @@ simulators are its own (`Silkworm Shots 375` / `430`, made on first use) and are
 shut down afterwards; it never touches any other device. Needs Xcode (for
 `simctl` and `swiftc`). What the simulator cannot show: the home-screen app's
 standalone mode (Add to Home Screen needs a tap), so the safe-area insets there
-are checked by the CSS alone.
+are checked by the CSS alone; nor the keyboard. The thread views are a long
+conversation (`thread`), a turn running now (`thread-running` -- run from a
+Silkworm turn, its own), and a new thread with nothing in it yet
+(`thread-new`).
 
 ## Notes & limits
 

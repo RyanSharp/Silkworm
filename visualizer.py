@@ -1532,6 +1532,8 @@ PAGE = r"""<!doctype html>
      board's column picker. Hidden here, so the laptop page is unchanged. */
   .phoneonly, .bpick { display: none; }
   .hmore { display: contents; }
+  /* The phone's chat: its thread header, alert count and sheet, jump pill. */
+  #alertslot, #chathead, #jumppill, #alertsheet { display: none; }
 
   /* --- phone (max-width: 700px) ----------------------------------------
      One breakpoint, one set of measures. On a phone:
@@ -1564,8 +1566,8 @@ PAGE = r"""<!doctype html>
     header { position: relative; flex-wrap: nowrap; gap: 4px; padding: 6px var(--safe-r) 6px var(--safe-l);
              padding-top: max(6px, env(safe-area-inset-top)); }
     header svg { width: 30px; height: 20px; }
-    header h1 { font-size: 17px; min-width: 0; flex: 0 1 auto; overflow: hidden;
-                text-overflow: ellipsis; margin-left: 2px; }
+    /* the logo stands for the name: the row holds the alerts' count and ✏️ */
+    header h1 { display: none; }
     #botdot { margin: 0 4px; }
     header .lbl, header .wide { display: none; }
     header button.hbtn { margin-left: 0 !important; min-width: var(--tap); min-height: var(--tap);
@@ -1588,8 +1590,20 @@ PAGE = r"""<!doctype html>
     body.searching #search { display: block; }
     #searchresults { left: 8px; right: 8px; width: auto; }
     #searchresults .hit { overflow-wrap: anywhere; }
-    #alertbar { padding: 6px var(--safe-r) 6px var(--safe-l); }
-    #alertbar .alert { min-height: 36px; display: inline-flex; align-items: center; }
+    /* alerts: a count in the header (⚠ 3), opened as a sheet; never a bar */
+    #alertbar { display: none; }
+    header #alertslot { display: contents; }
+    header button.hbtn.alertbtn { color: #D8517F; font-size: 14px; font-weight: 650; padding: 0 6px;
+                                  min-width: 40px; white-space: nowrap; border-color: #D8517F55; }
+    #alertsheet.open { display: flex; position: fixed; inset: 0; z-index: 45; background: var(--bg); }
+    #alertsheet .box { width: 100%; overflow-y: auto; overscroll-behavior: contain;
+      padding: var(--safe-t) var(--safe-r) calc(18px + var(--safe-b)) var(--safe-l); }
+    #alertsheet h2 { font-size: 20px; margin: 6px 0 14px; }
+    #alertsheet .aitem { display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+                         margin-bottom: 18px; }
+    #alertsheet .alert { font-size: 14px; padding: 8px 12px; border-radius: 10px; }
+    #alertsheet .aitem button.ghost { text-align: left; color: var(--ink); font-size: 14.5px;
+                                      padding: 8px 12px; overflow-wrap: anywhere; }
 
     /* the list and the open thread take turns */
     .layout { display: block; flex: 1; overflow: hidden; }
@@ -1603,7 +1617,6 @@ PAGE = r"""<!doctype html>
     main { display: none; height: 100%; padding: 8px var(--safe-r) 0 var(--safe-l); }
     body.reading .listcol { display: none; }
     body.reading main { display: flex; }
-    #backbtn { display: inline-flex; align-self: flex-start; margin-bottom: 8px; }
     #dash { display: none; }
     #dashm { display: block; }
     #dashphone .tiles { gap: 14px 22px; }
@@ -1656,8 +1669,84 @@ PAGE = r"""<!doctype html>
     #transcript { scroll-margin-bottom: 130px; }   /* clear of the composer */
     #composer { position: sticky; bottom: 0; background: var(--bg);
                 padding-bottom: max(10px, var(--safe-b)); }
+    body.kb #composer { padding-bottom: 8px; }      /* the keyboard covers the indicator */
     #composer textarea { min-height: var(--tap); }
     #composer .crow button.act { min-width: 64px; }
+
+    /* the open thread is a chat: it has the screen, under its own header */
+    body { height: var(--vvh, 100dvh); }
+    body.reading header { display: none; }
+    body.reading main { padding-top: 0; }
+    #backbtn, body.reading #backbtn { display: none; }
+    body.reading #thead { display: none; }
+    body.reading.threadinfo #thead { display: block; padding-top: 10px; }
+    body.reading #chathead { display: flex; align-items: center; gap: 4px; position: sticky;
+      top: 0; z-index: 6; background: var(--bg); border-bottom: 1px solid var(--line);
+      margin: 0 calc(-1 * var(--safe-r)) 0 calc(-1 * var(--safe-l));
+      padding: max(6px, env(safe-area-inset-top)) var(--safe-r) 6px max(2px, env(safe-area-inset-left)); }
+    #chathead button { background: none; border: 0; color: var(--ink); cursor: pointer;
+                       min-width: var(--tap); min-height: var(--tap); padding: 0 8px; flex: none; }
+    #chathead .cback { font-size: 34px; line-height: 1; color: var(--gold); padding: 0 6px 4px; }
+    #chathead .ctitle { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    #chathead .ctitle b { font-size: 16px; font-weight: 650; white-space: nowrap; overflow: hidden;
+                          text-overflow: ellipsis; }
+    #chathead .ctitle b.untitled { color: var(--muted); font-style: italic; font-weight: 500; }
+    #chathead .csub { display: flex; gap: 6px; align-items: center; font-size: 12px;
+                      color: var(--muted); white-space: nowrap; overflow: hidden; }
+    #chathead .cproj { border: 1px solid var(--line); border-radius: 6px; padding: 0 6px;
+                       color: var(--silk); overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;
+                       min-width: 0; }
+    #chathead .cst { flex: none; }
+    #chathead .cst.run { color: #2EB67D; }
+    #chathead .cst.bad { color: #D8517F; }
+    #chathead .calert { color: #D8517F; font-weight: 650; font-size: 14px; padding: 0 4px;
+                        min-width: 40px; }
+    #chathead .cstop { border: 1px solid var(--line); border-radius: 10px; font-size: 14px;
+                       min-height: 36px; padding: 0 10px; }
+    #chathead .cinfo { font-size: 18px; color: var(--muted); padding: 0 6px; min-width: 38px; }
+    body.reading #transcript { padding-top: 10px; }
+    .cmsg { display: flex; flex-direction: column; align-items: flex-start; max-width: 92%;
+            margin: 0 0 12px; }
+    .cmsg.user { margin-left: auto; align-items: flex-end; max-width: 85%; }
+    .cmsg .bubble { font-size: 15.5px; line-height: 1.45; border-radius: 18px; padding: 9px 13px;
+                    max-width: 100%; }
+    .cmsg.user .bubble { border-bottom-right-radius: 6px; }
+    .cmsg.assistant .bubble { border-bottom-left-radius: 6px; }
+    .cmsg .bubble pre { font-size: 12.5px; }
+    .cmeta { font-size: 11.5px; color: var(--muted); margin: 3px 8px 0; }
+    .cmeta details { margin: 0; }
+    .cmeta summary { font-family: var(--sans); font-size: 11.5px; color: var(--muted);
+                     list-style: none; }
+    .cmeta summary::-webkit-details-marker { display: none; }
+    .ctools { margin: 0 0 12px; }
+    .ctl { background: none; border: 1px solid var(--line2); border-radius: 16px;
+           color: var(--muted); font-size: 13px; min-height: 34px; padding: 0 12px;
+           max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+           cursor: pointer; }
+    .ctools.open .ctl { color: var(--gold); border-color: #C08A1C99; }
+    .cdetail { border-left: 2px solid var(--line); padding: 8px 0 0 10px; margin: 6px 0 0 6px; }
+    .cdetail .msg { margin-bottom: 10px; }
+    body.reading #tlive .msg.user { margin-left: auto; max-width: 85%; display: flex;
+                                    flex-direction: column; align-items: flex-end; }
+    body.reading #tlive .msg .who { font-size: 10.5px; }
+    body.reading #tlive .msg.user .bubble { border-radius: 18px; border-bottom-right-radius: 6px; }
+    body.reading .working button { display: none; }   /* Stop is in the header */
+    .cfiles { margin: 6px 0 4px; }
+    .cfiles summary { font-family: var(--sans); font-size: 13px; color: var(--muted);
+                      min-height: 32px; display: flex; align-items: center; }
+    .cfiles .artifacts { border-top: 0; margin-top: 0; padding-top: 2px; }
+    #jumppill { position: absolute; bottom: calc(100% + 8px); left: 50%;
+                transform: translateX(-50%); z-index: 7; background: var(--panel);
+                color: var(--ink); border: 1px solid var(--gold); border-radius: 18px;
+                min-height: 36px; padding: 0 14px; font-size: 13.5px; box-shadow: 0 4px 14px #0008;
+                white-space: nowrap; }
+    #jumppill.show { display: block; }
+    #composer .crow { align-items: flex-end; gap: 6px; }
+    #composer textarea { height: auto; min-height: var(--tap); line-height: 22px;
+                         padding: 10px 12px; border-radius: 20px; resize: none;
+                         overflow-y: hidden; font-family: var(--sans); }
+    #composer .crow button.act { min-height: var(--tap); border-radius: 20px; }
+    #composer label.attach { padding: 0; }
 
     /* panels: whole-screen sheets, scrolling inside, closed by their ✕ */
     #taskmodal, #boardmodal, #learnmodal, #fmodal { padding: 0; }
@@ -1751,9 +1840,9 @@ PAGE = r"""<!doctype html>
       .tform select, .tform textarea, .lform select, .lform input,
       .bfilters select, .bfilters input { font-size: var(--field-fs); }
   }
-  /* the narrowest phones (SE, mini): the logo gives way to the name */
+  /* the narrowest phones (SE, mini): a little less room per button */
   @media (max-width: 380px) {
-    header svg { display: none; }
+    header button.hbtn { min-width: 40px; padding: 0 6px; }
   }
 </style>
 </head>
@@ -1770,8 +1859,10 @@ PAGE = r"""<!doctype html>
   </svg>
   <h1>Silkworm<span class="wide"> sessions</span></h1>
   <span id="botdot" title="bot status"></span>
+  <span id="alertslot"></span>
   <button class="ghost hbtn" style="margin-left:16px" onclick="toggleTasks()">📋<span class="lbl"> Tasks</span><span id="taskbadge"></span></button>
   <button class="ghost hbtn" onclick="toggleBoard()" title="per-project boards and backlogs">🗂<span class="lbl"> Projects</span></button>
+  <button class="ghost hbtn phoneonly" onclick="newThreadForm()" title="new thread" aria-label="new thread">✏️</button>
   <button class="ghost hbtn phoneonly" onclick="toggleSearch()" title="search transcripts">🔍</button>
   <button class="ghost hbtn phoneonly" id="menubtn" onclick="toggleMenu(event)" title="more" aria-haspopup="true">⋯</button>
   <div class="hmore" onclick="closeMenu()">
@@ -1792,11 +1883,13 @@ PAGE = r"""<!doctype html>
   </div>
   <main>
     <button id="backbtn" class="ghost" onclick="closeSession()">‹ Sessions</button>
+    <div id="chathead"></div>
     <div id="content">
       <div id="dash"></div>
       <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div><div id="tfiles"></div></div>
     </div>
     <div id="composer">
+      <button id="jumppill" onclick="toEnd()">↓ Jump to latest</button>
       <div id="chips"></div>
       <div class="crow">
         <label class="ghost attach" title="attach files or photos">📎<input type="file" id="attach" multiple onchange="addFiles(this.files, 'reply'); this.value = ''"></label>
@@ -1808,6 +1901,13 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="tip"></div>
 <div id="toast"></div>
+<div id="alertsheet" onclick="if(event.target.id==='alertsheet'||(event.target.closest&&event.target.closest('#alertlist button')))closeAlerts()">
+  <div class="box">
+    <button class="ghost xclose" onclick="closeAlerts()" title="close">✕</button>
+    <h2>⚠ Alerts</h2>
+    <div id="alertlist"></div>
+  </div>
+</div>
 <div id="taskmodal" onclick="if(event.target.id==='taskmodal')toggleTasks()">
   <div class="box">
     <button class="ghost xclose" onclick="toggleTasks()" title="close">✕</button>
@@ -2051,7 +2151,19 @@ async function hideOldTaskRuns() {
 
 function setKind(k) {
   threadKind = k;
+  kindChosen = true;
   loadList();
+}
+// A phone opens the list on Conversations: those are the threads its owner
+// writes in. Task runs outnumber them fifteen to one (407 to 27 in
+// sessions.json on 2026-10-15; 77 to 11 touched that week) and are reached
+// from 📋 Tasks when one needs them. A laptop keeps All, and a choice made
+// on either sticks.
+let kindChosen = false;
+function defaultKind(sessions) {
+  if (kindChosen) return;
+  if (!phone()) { threadKind = "all"; return; }   // widened again: the laptop's All
+  threadKind = sessions.some(s => !s.hidden && (s.kind || "thread") === "thread") ? "thread" : "all";
 }
 
 function renderKindFilter(sessions) {
@@ -2101,11 +2213,13 @@ async function loadList() {
   renderAlerts(data.sessions, data.slack, data.revision);
   refreshTaskBadge();
   lastSessions = data.sessions;
+  defaultKind(data.sessions);
   renderKindFilter(data.sessions);
   renderList(data.sessions.filter(matchesKind));
   if (active) {
     const cur = data.sessions.find(x => x.key === active.key);
     if (cur) active = cur;
+    drawChatHead();
   }
 }
 function cardHtml(s) {
@@ -2178,16 +2292,174 @@ function messageHtml(m) {
     else if (b.type === "tool_result")
       inner += `<details><summary class="result">↳ result</summary><pre>${esc(b.text)}</pre></details>`;
   }
-  let usage = "";
-  if (m.usage) {
-    const u = m.usage, denom = u.cache_read + u.in + u.cache_create;
-    const rate = denom ? Math.round(100 * u.cache_read / denom) : null;
-    usage = `<div class="usage">in ${fmtTok(u.in + u.cache_create)} · cache ${fmtTok(u.cache_read)}` +
-      (rate == null ? "" : ` (${rate}%)`) + ` · out ${fmtTok(u.out)}` +
-      (m.model ? ` · ${esc(m.model)}` : "") + `</div>`;
-  }
   const when = m.ts ? new Date(m.ts).toLocaleTimeString() : "";
-  return `<div class="msg ${m.role}"><div class="who">${m.role} · ${when}</div>${inner}${usage}</div>`;
+  return `<div class="msg ${m.role}"><div class="who">${m.role} · ${when}</div>${inner}${usageLine(m)}</div>`;
+}
+function usageLine(m) {
+  if (!m.usage) return "";
+  const u = m.usage, denom = u.cache_read + u.in + u.cache_create;
+  const rate = denom ? Math.round(100 * u.cache_read / denom) : null;
+  return `<div class="usage">in ${fmtTok(u.in + u.cache_create)} · cache ${fmtTok(u.cache_read)}` +
+    (rate == null ? "" : ` (${rate}%)`) + ` · out ${fmtTok(u.out)}` +
+    (m.model ? ` · ${esc(m.model)}` : "") + `</div>`;
+}
+
+// --- the phone's chat ---
+// On a phone the open thread reads as a chat: what the owner said and what
+// Claude answered, as bubbles; every run of tool calls, their results
+// and thinking between two of those folded into one line ("⚙ ran 6 tools")
+// that opens onto the same detail a laptop shows. Token, cache and model
+// figures sit behind a bubble's time, or inside the opened line. A laptop
+// keeps the full log (messageHtml above).
+//
+// chatItems turns messages into
+//   {kind: "bubble", id, role, text, ts, usage, model}
+//   {kind: "tools", id, parts: [message-shaped pieces], tools, names}
+// An id is where the item starts ("<message>.<block>"); messages are only
+// ever appended, so an item keeps its id as the thread grows, and a tools
+// line still collecting keeps its id (and whether it is open) as it grows.
+function chatItems(messages) {
+  const items = [];
+  let group = null;
+  messages.forEach((m, i) => {
+    const blocks = m.blocks || [];
+    let bubble = null, part = null, said = null;
+    blocks.forEach((b, j) => {
+      if (b.type === "text") {
+        part = null; group = null;
+        if (!bubble) {
+          bubble = said = {kind: "bubble", id: `${i}.${j}`, role: m.role, text: b.text, ts: m.ts};
+          items.push(bubble);
+        } else bubble.text += "\n\n" + b.text;
+        return;
+      }
+      bubble = null;
+      if (!group) {
+        group = {kind: "tools", id: `${i}.${j}`, parts: [], tools: 0, names: []};
+        items.push(group);
+      }
+      if (!part) { part = {role: m.role, ts: m.ts, blocks: []}; group.parts.push(part); }
+      part.blocks.push(b);
+      if (b.type === "tool") {
+        group.tools++;
+        if (!group.names.includes(b.name)) group.names.push(b.name);
+      }
+    });
+    // A message's figures go with its words when it has any, else its tools.
+    const owner = said || part;
+    if (owner && m.usage) { owner.usage = m.usage; owner.model = m.model; }
+  });
+  return items;
+}
+function toolsLabel(g) {
+  const n = g.tools;
+  const what = n ? `⚙ ran ${n} tool${n === 1 ? "" : "s"}` : "💭 thinking";
+  const names = g.names.slice(0, 3).join(", ") + (g.names.length > 3 ? ", …" : "");
+  return what + (names ? " · " + names : "");
+}
+function chatTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d)) return "";
+  const t = d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  return d.toDateString() === new Date().toDateString() ? t
+    : d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + t;
+}
+const chatOpen = new Set();
+function chatHtml(it) {
+  if (it.kind === "bubble") {
+    const when = esc(chatTime(it.ts));
+    const meta = it.usage
+      ? `<details class="cstat"><summary>${when} · ⓘ</summary>${usageLine(it)}</details>`
+      : `<span>${when}</span>`;
+    return `<div class="cmsg ${it.role}"><div class="bubble">${md(it.text)}</div>` +
+           `<div class="cmeta">${meta}</div></div>`;
+  }
+  const open = chatOpen.has(it.id);
+  return `<div class="ctools${open ? " open" : ""}"><button class="ctl" onclick="toggleTools('${it.id}')"
+    >${esc(toolsLabel(it))} <span class="caret">${open ? "▾" : "▸"}</span></button>${
+    open ? `<div class="cdetail">${it.parts.map(messageHtml).join("")}</div>` : ""}</div>`;
+}
+// One element per item, as the session list does: an item is rewritten only
+// when its own markup changed, so an open detail stays open as the thread
+// grows and a long thread is not redrawn every few seconds.
+const chatEls = new Map();
+function drawChat(msgs, messages, sessionId) {
+  const items = chatItems(messages);
+  if (!items.length) {
+    chatEls.clear();
+    msgs.innerHTML = sessionId ? "" : `<div class="empty">No messages yet — say something below.</div>`;
+    return;
+  }
+  const want = new Set(items.map(x => x.id));
+  for (const [k, div] of chatEls) if (!want.has(k)) { div.remove(); chatEls.delete(k); }
+  if (msgs.querySelector && msgs.querySelector(".empty")) msgs.innerHTML = "";
+  const divs = items.map(it => {
+    let div = chatEls.get(it.id);
+    if (!div) { div = document.createElement("div"); chatEls.set(it.id, div); }
+    setHTML(div, chatHtml(it));
+    return div;
+  });
+  const now = [...(msgs.children || [])];
+  if (now.length !== divs.length || divs.some((d, i) => now[i] !== d))
+    for (const d of divs) msgs.appendChild(d);
+}
+function toggleTools(id) {
+  if (chatOpen.has(id)) chatOpen.delete(id); else chatOpen.add(id);
+  if (active && tview.key === active.key)
+    drawChat(document.getElementById("tmsgs"), tview.msgs || [], tview.sid);
+}
+// The chat follows the newest message while it is read at the bottom; read
+// further up, it stays put and a pill offers the way down.
+function scroller() {
+  return typeof document.querySelector === "function" ? document.querySelector("main") : null;
+}
+function atEnd() {
+  const m = scroller();
+  return !m || m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+}
+function toEnd() {
+  const m = scroller();
+  if (m) m.scrollTop = m.scrollHeight;
+  showJump(false);
+}
+function showJump(on) {
+  const p = document.getElementById("jumppill");
+  if (p && p.classList && p.classList.toggle) p.classList.toggle("show", !!on);
+}
+// Draws with `fn`, then keeps the reader where they were: at the end if they
+// were there, else where they are, with the pill if something new arrived.
+function keepEnd(fn, force) {
+  if (!chatMode()) { fn(); return; }
+  const was = atEnd(), m = scroller(), before = m ? m.scrollHeight : 0;
+  fn();
+  if (force || was) toEnd();
+  else if (m && m.scrollHeight > before) showJump(true);
+}
+function chatMode() { return phone(); }
+// The open thread's own header on a phone, stuck to the top: back to the
+// list, its name and project, what it is doing (with Stop while a turn runs),
+// the alerts' count, and ⓘ for what a laptop shows above the transcript.
+function chatHead(s, live, nAlerts) {
+  const turns = (live && live.turns) || [];
+  const queued = turns.filter(t => t.state === "queued").length;
+  const t = s.turn;
+  const running = !!(t || (live && live.running) || s.running);
+  const state = t && t.stalled ? `<span class="cst bad">⚠ stalled ${dur(t.age_s)}</span>`
+    : running ? `<span class="cst run">● running${t ? " " + dur(t.age_s) : ""}</span>`
+    : s.updated ? `<span class="cst">${age(s.updated)}</span>` : "";
+  return `<button class="cback" onclick="closeSession()" title="back to the list" aria-label="back to the list">‹</button>
+    <div class="ctitle"><b class="${s.title ? "" : "untitled"}">${esc(s.title || "untitled")}</b>
+      <span class="csub">${s.project ? `<span class="cproj">${esc(s.project)}</span>` : ""}${state}${
+        queued ? `<span class="cst">· ${queued} queued</span>` : ""}</span></div>
+    ${nAlerts ? `<button class="calert" onclick="openAlerts(event)" title="alerts">⚠ ${nAlerts}</button>` : ""}
+    ${running ? `<button class="cstop" onclick="cmdSend('!stop')">■ Stop</button>` : ""}
+    <button class="cinfo" onclick="document.body.classList.toggle('threadinfo')" title="thread details">ⓘ</button>`;
+}
+function drawChatHead() {
+  const el = document.getElementById("chathead");
+  if (!el || !active) return;
+  setHTML(el, chatHead(active, tview.key === active.key ? tview.live : null, alertList.length));
 }
 function transcriptHead(s) {
   let h = `<div class="toolbar">
@@ -2224,8 +2496,11 @@ function transcriptHead(s) {
   }
   return h;
 }
-function filesHtml(files) {
+function filesHtml(files, compact) {
   if (!files.length) return "";
+  // In the phone's chat, one line that opens onto the list.
+  if (compact) return `<details class="cfiles"><summary>📎 ${files.length} file${
+    files.length === 1 ? "" : "s"}</summary>${filesHtml(files).replace("<b>Files</b>", "")}</details>`;
   return `<div class="artifacts"><b>Files</b>` + files.map(f =>
     `<div class="f"><span>${f.direction === "in" ? "⬇" : "⬆"}</span>
      ${f.exists ? `<a href="/download?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a>` : esc(f.name) + (f.pruned ? " (pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack)" : " (gone)")}
@@ -2240,8 +2515,11 @@ async function loadTranscript(scroll) {
   // (a reset, or a new thread's first session, included) and says `reset`
   // when that is not the one drawn so far.
   if (scroll) showReading();
-  if (scroll || tview.key !== s.key)
-    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false};
+  // Crossing the phone width redraws from the top in the other form.
+  if (scroll || tview.key !== s.key || tview.chat !== chatMode()) {
+    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false, msgs: [], chat: chatMode()};
+    chatOpen.clear(); chatEls.clear();
+  }
   const want = tview, from = want.cursor;
   // One read at a time; a call made meanwhile (a rename, a resummarize) is
   // remembered and run once this one is drawn, so it still shows promptly.
@@ -2257,31 +2535,39 @@ async function loadTranscript(scroll) {
   } finally { want.busy = false; }
   if (tview !== want || want.cursor !== from) return;   // superseded meanwhile
   const msgs = document.getElementById("tmsgs");
-  setHTML(document.getElementById("thead"), transcriptHead(s));
-  if (data.error) {
-    msgs.innerHTML = `<div class="empty">${esc(data.error)}</div>`;
-    // The messages above were just replaced, so the next read starts over.
-    want.error = true;
-    want.cursor = 0;
-  } else {
-    // The first read, another session (reset), or recovering from an error
-    // starts the messages over; anything else is only what is new.
-    if (from === 0 || data.reset || want.error) msgs.innerHTML = "";
-    want.error = false;
-    if (data.messages.length)
-      msgs.insertAdjacentHTML("beforeend", data.messages.map(messageHtml).join(""));
-    else if (!msgs.innerHTML && !data.session_id)
-      msgs.innerHTML = `<div class="empty">No messages yet.</div>`;
-    want.cursor = data.cursor || 0;
+  keepEnd(() => {
+    setHTML(document.getElementById("thead"), transcriptHead(s));
+    if (data.error) {
+      msgs.innerHTML = `<div class="empty">${esc(data.error)}</div>`;
+      chatEls.clear();
+      // The messages above were just replaced, so the next read starts over.
+      want.error = true;
+      want.cursor = 0;
+    } else {
+      // The first read, another session (reset), or recovering from an error
+      // starts the messages over; anything else is only what is new.
+      if (from === 0 || data.reset || want.error) {
+        msgs.innerHTML = ""; want.msgs = []; chatEls.clear(); chatOpen.clear();
+      }
+      want.error = false;
+      if (want.chat) {
+        want.msgs = want.msgs.concat(data.messages);
+        if (data.messages.length || !msgs.innerHTML) drawChat(msgs, want.msgs, data.session_id);
+      } else if (data.messages.length)
+        msgs.insertAdjacentHTML("beforeend", data.messages.map(messageHtml).join(""));
+      else if (!msgs.innerHTML && !data.session_id)
+        msgs.innerHTML = `<div class="empty">No messages yet.</div>`;
+      want.cursor = data.cursor || 0;
+      want.live = data.live || null;
+      arrived(s.key, data.messages, (want.live && want.live.turns) || []);
+    }
+    if (data.session_id !== undefined) want.sid = data.session_id || "";
     want.live = data.live || null;
-    arrived(s.key, data.messages, (want.live && want.live.turns) || []);
-  }
-  if (data.session_id !== undefined) want.sid = data.session_id || "";
-  want.live = data.live || null;
-  drawLive();
-  setHTML(document.getElementById("tfiles"), filesHtml(files));
-  document.getElementById("composer").style.display = "flex";
-  if (scroll) document.getElementById("transcript").scrollIntoView(false);
+    drawLive();
+    setHTML(document.getElementById("tfiles"), filesHtml(files, want.chat));
+    document.getElementById("composer").style.display = "flex";
+  }, scroll);
+  if (scroll && !want.chat) document.getElementById("transcript").scrollIntoView(false);
   if (want.again && tview === want) { want.again = false; loadTranscript(false); }
 }
 
@@ -2400,12 +2686,13 @@ function liveHtml(s, live, items) {
     h += `<div class="state bad">The bot is offline: a message sent now waits until it is back.</div>`;
   return h;
 }
-function drawLive() {
+function drawLive(force) {
   if (!active || tview.key !== active.key) return;
   const turns = (tview.live && tview.live.turns) || [];
   const items = prune(sentFor(active.key), turns);
   outgoing.set(active.key, items);
-  setHTML(document.getElementById("tlive"), liveHtml(active, tview.live, items));
+  keepEnd(() => setHTML(document.getElementById("tlive"), liveHtml(active, tview.live, items)), force);
+  drawChatHead();
 }
 // Something is under way in the open thread: it is read every 1.5s rather
 // than every 4s, so a reply streams in as the transcript is written. A
@@ -2494,7 +2781,7 @@ async function sendText(text, files) {
   const it = {ref: "", text, files: files.map(f => f.name),
               kind: text.startsWith("!") ? "command" : "prompt", at: Date.now()};
   sentFor(key).push(it);
-  drawLive();
+  drawLive(true);                // what was just sent is in view
   let r;
   try {
     it.picked = files;
@@ -2548,13 +2835,57 @@ async function sendReply() {
   const box = document.getElementById("reply");
   const text = box.value, files = staged.reply.slice();
   if (!text.trim() && !files.length) return;
-  box.value = ""; staged.reply = []; renderChips("reply");
+  box.value = ""; staged.reply = []; renderChips("reply"); growReply();
   // Refused: put it back, so nothing typed or picked is lost. Not when the
   // outcome is unknown: it may have gone, and is shown as unconfirmed.
   if ((await sendText(text, files)) === false && !box.value) {
-    box.value = text; staged.reply = files; renderChips("reply");
+    box.value = text; staged.reply = files; renderChips("reply"); growReply();
   }
 }
+// On a phone the box grows with what is typed, one line to six, then
+// scrolls inside itself; its placeholder is short enough to show whole.
+const REPLY_MAX_LINES = 6;
+function growReply() {
+  const box = document.getElementById("reply");
+  if (!box) return;
+  if (!phone()) { box.style.height = ""; box.style.overflowY = ""; return; }
+  const cs = typeof getComputedStyle === "function" ? getComputedStyle(box) : null;
+  const px = k => cs ? parseFloat(cs[k]) || 0 : 0;
+  const edges = px("paddingTop") + px("paddingBottom") + px("borderTopWidth") + px("borderBottomWidth");
+  const most = (px("lineHeight") || 22) * REPLY_MAX_LINES + edges;
+  box.style.height = "auto";                          // so it can shrink, too
+  const want = box.scrollHeight + px("borderTopWidth") + px("borderBottomWidth");
+  box.style.height = Math.min(want, most) + "px";
+  box.style.overflowY = want > most ? "auto" : "hidden";
+}
+(function () {
+  const box = document.getElementById("reply");
+  if (!box) return;
+  if (phone()) { box.placeholder = "Message (also in Slack)"; box.rows = 1; }
+  if (box.addEventListener) box.addEventListener("input", growReply);
+})();
+// The phone's keyboard: the page is kept to what is visible above it, so the
+// composer sits on the keyboard rather than under it. In the home-screen app
+// the home indicator's inset is dropped while the keyboard covers it.
+function fitViewport() {
+  const vv = typeof window !== "undefined" && window.visualViewport;
+  const root = typeof document !== "undefined" && document.documentElement;
+  // Pinch-zoomed, the visible area is not the keyboard's doing: leave it be.
+  if (!vv || !root || !root.style || !phone() || vv.scale > 1) return;
+  root.style.setProperty("--vvh", Math.round(vv.height) + "px");
+  if (document.body) document.body.classList.toggle("kb", window.innerHeight - vv.height > 120);
+  if (vv.offsetTop && window.scrollTo) window.scrollTo(0, 0);
+}
+if (typeof window !== "undefined" && window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener("resize", fitViewport);
+  window.visualViewport.addEventListener("scroll", fitViewport);
+  fitViewport();
+}
+(function () {
+  const m = scroller();
+  if (m && m.addEventListener) m.addEventListener("scroll", () => { if (atEnd()) showJump(false); },
+                                                  {passive: true});
+})();
 document.addEventListener("keydown", e => {
   // On a phone Return is a new line; the Send button sends.
   if (e.target.id === "reply" && e.key === "Enter" && !e.shiftKey && !phone()) {
@@ -2668,8 +2999,38 @@ async function learnCall(payload) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify(payload)})).json());
 }
+// The alerts, one string of markup each: the laptop's bar shows them in a
+// row; a phone shows only how many there are (⚠ 3), in the header, and opens
+// them as a sheet -- they never sit above the conversation.
+let alertList = [];
 function renderAlerts(sessions, slack, revision) {
-  const bar = document.getElementById("alertbar");
+  alertList = alertParts(sessions, slack, revision);
+  setHTML(document.getElementById("alertbar"), alertList.join(" "));
+  drawAlertCount();
+}
+function alertButton() {
+  return alertList.length ? `<button class="ghost hbtn alertbtn" onclick="openAlerts(event)"
+    title="${alertList.length} alert${alertList.length === 1 ? "" : "s"}">⚠ ${alertList.length}</button>` : "";
+}
+function drawAlertCount() {
+  const slot = document.getElementById("alertslot");
+  if (slot) setHTML(slot, alertButton());
+  const list = document.getElementById("alertlist");
+  if (list) setHTML(list, alertList.length
+    ? alertList.map(a => `<div class="aitem">${a}</div>`).join("")
+    : `<div class="empty">Nothing to look at.</div>`);
+  drawChatHead();
+}
+function openAlerts(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  const sheet = document.getElementById("alertsheet");
+  if (sheet) sheet.classList.add("open");
+}
+function closeAlerts() {
+  const sheet = document.getElementById("alertsheet");
+  if (sheet) sheet.classList.remove("open");
+}
+function alertParts(sessions, slack, revision) {
   const stalled = sessions.filter(s => s.turn && s.turn.stalled);
   const pricey = sessions.filter(s => s.cost_flag);
   // Only trust a full sampling window; a bot that just started is not down.
@@ -2679,7 +3040,6 @@ function renderAlerts(sessions, slack, revision) {
   // "unknown" is not "fine" either — a bot too old to report the field gives
   // us nothing, which is the silence this is here to break.
   const stale = revision && revision.state && revision.state !== "current";
-  if (!stalled.length && !pricey.length && !down && !stale) { setHTML(bar, ""); return; }
   const parts = [];
   if (stale) parts.push(`<span class="alert ${revision.state === "stale" ? "bad" : "warn"}">⚠ ${
     esc(revision.message || "running revision unknown")} — silkworm restart</span>`);
@@ -2693,12 +3053,15 @@ function renderAlerts(sessions, slack, revision) {
     `<span class="alert warn">$ ${pricey.length} cost spike${pricey.length>1?"s":""}</span>` +
     pricey.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${
       esc(s.title || s.key)} · ${s.cost_flag.ratio}×</button>`).join(""));
-  setHTML(bar, parts.join(" "));
+  return parts;
 }
 function jumpTo(key) {
   const card = [...document.querySelectorAll("#list .card")].find(
     c => c.querySelector(".subkey") && c.querySelector(".subkey").textContent === key);
   if (card) card.click();
+  // On a phone, filtered out of the list (a task run while it shows
+  // conversations): open it anyway. A laptop's list is as it always was.
+  else if (phone() && lastSessions.some(x => x.key === key)) openSession(key);
 }
 async function retitle() {
   if (!active) return;
@@ -4160,7 +4523,8 @@ function showReading() {
   if (phone() && window.history) history.pushState({reading: true}, "");
 }
 function leaveReading() {
-  if (document.body) document.body.classList.remove("reading");
+  if (document.body) { document.body.classList.remove("reading"); document.body.classList.remove("threadinfo"); }
+  showJump(false); closeAlerts();
   active = null;                 // stops the transcript poll; the list unhighlights
   loadList();
 }
@@ -4184,7 +4548,7 @@ if (window.addEventListener)
 //   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
 //   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
 //   ?card=<task id>                       a task's detail, over the board
-//   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug=
+//   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
 //   ?q=<words>                            transcript search
 async function openLink(q) {
   const view = q.get("view") || "", slug = q.get("slug") || "", modal = q.get("modal") || "";
@@ -4209,6 +4573,7 @@ async function openLink(q) {
   else if (modal === "new-task") newTaskForm();
   else if (modal === "settings" && slug) projectSettings(slug);
   else if (modal === "release" && slug) releaseForm(slug);
+  else if (modal === "alerts") openAlerts();
   if (words) {
     document.body.classList.add("searching");     // the phone's search row
     const box = document.getElementById("search");
