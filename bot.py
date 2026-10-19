@@ -2703,6 +2703,9 @@ def edit_task(payload: dict) -> dict:
 def handle_tasks(payload: dict) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted)."""
     action = payload.get("action", "list")
+    # The state the operator's guard judged is ours to record, never the
+    # caller's to supply (operator_refused stamps it).
+    payload.pop("_guard_state", None)
     # Asked only of a request made from inside a turn (the CLI stamps those);
     # the dashboard and your own CLI never carry the stamp.
     if payload.get("caller_role") or payload.get("caller_thread"):
@@ -2976,6 +2979,15 @@ def handle_tasks(payload: dict) -> dict:
         note = ""
         rec = task_store.get(tid) or {}
         current = rec.get("state")
+        # An operator's request was let through on the state its guard saw.
+        # A queued task the runner claims after that is a running one the
+        # guard never judged: cancelling it would kill its child. So the move
+        # holds to the state the guard saw -- here, before anything is
+        # stopped, and again under the store's lock in transition().
+        seen = payload.get("_guard_state") or ""
+        if seen and current != seen:
+            return {"ok": False, "error": f"not allowed: the task is {current} now, "
+                                          f"not {seen} as it was when checked"}
         if target == tasks.CANCELLED and current == tasks.RUNNING:
             note = ("stopped" if stop_task(tid) else
                     "no live child here — it was orphaned by a restart")
@@ -3009,7 +3021,8 @@ def handle_tasks(payload: dict) -> dict:
                 # A Dismiss on research's findings carries the round it saw,
                 # like Close: one drawn before a Dig deeper must not cancel
                 # the findings that dig produced (decide_findings).
-                expect_round=str(payload.get("round") or "") if action == "dismiss" else "")
+                expect_round=str(payload.get("round") or "") if action == "dismiss" else "",
+                expect=seen)
             if held:
                 tell_thread(rec.get("thread", ""), holding.note(held))
             return {"ok": True, "note": note, "task": moved}
@@ -6348,6 +6361,9 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         return None
     if route == "tasks":
         rec = task_store.get(str(payload.get("id") or ""))
+        if rec:
+            # handle_tasks holds the move to this state (see its cancel).
+            payload["_guard_state"] = rec.get("state") or ""
         guard = operator_role.tasks_guard(
             action, payload, dict(rec, id=payload.get("id")) if rec else None,
             contained=task_contained, live_paths=task_live_paths)

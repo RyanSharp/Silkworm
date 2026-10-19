@@ -22923,6 +22923,74 @@ def test_operator_cannot_decide_against_you():
               out.get("ok") and fts.get(out["id"])["filed_by"] == want, str(out))
 
 
+def test_operator_cancel_holds_to_the_state_its_guard_saw():
+    import tasks as T
+    print("\nthe operator: a queued task claimed after the guard looked is not cancelled "
+          "or killed, approved or its own")
+    bot = _operator_bot()
+    st = bot.store
+    stopped = []
+    bot.ns["stop_task"] = lambda tid: stopped.append(tid) or True
+
+    class Racing:
+        """The store, with the runner claiming `tid` at a chosen moment: after
+        the guard's read (`after_reads` gets of it), or just before the move."""
+        def __init__(self, tid, after_reads=None, at_move=False):
+            self.tid, self.after, self.at_move, self.reads = tid, after_reads, at_move, 0
+        def __getattr__(self, name):
+            return getattr(st, name)
+        def _claim(self):
+            if st.get(self.tid)["state"] == T.QUEUED:
+                st.transition(self.tid, T.RUNNING, "claimed by the runner")
+        def get(self, tid):
+            rec = st.get(tid)
+            if tid == self.tid:
+                self.reads += 1
+                if self.after is not None and self.reads == self.after:
+                    self._claim()
+            return rec
+        def transition(self, tid, *a, **kw):
+            if tid == self.tid and self.at_move:
+                self._claim()
+            return st.transition(tid, *a, **kw)
+
+    for action in ("cancel", "dismiss"):
+        for label, race in (("after the guard read it", dict(after_reads=1)),
+                            ("just before the move", dict(at_move=True))):
+            work = st.create(f"Retry sync on 5xx ({action}, {label})",
+                             role="implementor", project="alpha")["id"]
+            # Cancelling queued work needs your approval (7d32adb); you gave
+            # it for a queued task, not for killing a running one.
+            bot.state.approve("accept", work, by="U_ME")
+            bot.ns["task_store"] = Racing(work, **race)
+            stopped.clear()
+            out = bot.ns["handle_tasks"]({"action": action, "id": work,
+                                          "caller_role": "operator"})
+            check(f"an approved {action} of a queued task claimed {label} is refused, "
+                  "still running, its child not killed",
+                  not out["ok"] and not out.get("refused")
+                  and st.get(work)["state"] == T.RUNNING and not stopped, str(out))
+    own = st.create("Sweep the board", role="operator")["id"]
+    bot.ns["task_store"] = Racing(own, after_reads=1)
+    stopped.clear()
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": own, "caller_role": "operator"})
+    check("so is a cancel of its own queued turn, claimed after the guard read it",
+          not out["ok"] and st.get(own)["state"] == T.RUNNING and not stopped, str(out))
+    bot.ns["task_store"] = st
+
+    queued = st.create("Retry sync on 5xx (supplied)", role="implementor", project="alpha")["id"]
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": queued,
+                                  "_guard_state": T.RUNNING})
+    check("a caller cannot supply the guard's state itself",
+          out["ok"] and st.get(queued)["state"] == T.CANCELLED, str(out))
+    work = st.create("Retry sync on 5xx (dashboard)", role="implementor", project="alpha")["id"]
+    st.transition(work, T.RUNNING)
+    stopped.clear()
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": work})
+    check("your own cancel of a running task still stops it",
+          out["ok"] and st.get(work)["state"] == T.CANCELLED and stopped == [work], str(out))
+
+
 def test_operator_drops_nothing_reverted_and_tidies_only_finished_task_checkouts():
     import operator_role as O
     import tasks as T
