@@ -3947,6 +3947,7 @@ function projectCard(p, threads) {
       p.needs ? ` <span class="st st-failed">${p.needs} need you</span>` : ""}${
       p.slug !== UNFILED ? `<button class="ghost gear" title="settings" onclick="event.stopPropagation();projectSettings('${esc(p.slug)}')">⚙</button>` : ""}</h3>
     ${p.main_failing ? `<div class="row"><span class="warn" title="the base fails its own suite: new work is paused, and tasks failing only these tests are held">🔴 ${esc(p.main_failing.line)}</span></div>` : ""}
+    ${p.health ? `<div class="row"><span class="warn" title="a health check Silkworm runs on this project (silkworm health)">${p.health.status === "fail" ? "🔴" : "🟡"} ${esc(p.health.line)}</span></div>` : ""}
     <div class="row chips">${chips || `<span class="off">no tasks</span>`}</div>
     <div class="row"><span class="lbl">running</span>${running || `<span class="off">nothing</span>`}</div>
     <div class="row"><span class="lbl">last landed</span>${last

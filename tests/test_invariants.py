@@ -71,7 +71,7 @@ def bot_functions(*names, **globals_):
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
-                  "release_drain_refusal", "unreviewed_role", "filer_role")
+                  "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows")
 
 
 def _helper_modules(nodes, ns) -> None:
@@ -87,6 +87,10 @@ def _helper_modules(nodes, ns) -> None:
         import operator_role as _op
         ns.setdefault("operator_role", _op)
         ns.setdefault("OPERATOR", types.SimpleNamespace(thread=lambda: ""))
+    # health_rows reads the bot's health store; a test that set none up has
+    # none, which reads as "could not be read", never as "all healthy".
+    if any(n.name == "health_rows" for n in nodes if isinstance(n, ast.FunctionDef)):
+        ns.setdefault("HEALTH", None)
 
 
 def _shared_helpers(tree, nodes, supplied) -> list:
@@ -7476,10 +7480,10 @@ def test_atomic_persistence():
                 saves += 1
                 offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
                               if writes_in_place(n)]
-    # Seven: the four stores, the task board's message pointer (home.Board),
-    # the operator's state (operator_role.State), and push subscriptions
-    # (push.PushStore).
-    check("every store's _save was found to check", saves == 7, f"found {saves}")
+    # Eight: the four stores, the task board's message pointer (home.Board),
+    # the operator's state (operator_role.State), push subscriptions
+    # (push.PushStore), and health results (health.HealthStore).
+    check("every store's _save was found to check", saves == 8, f"found {saves}")
     check("and every module was looked at", scanned > 20, f"{scanned}")
     check("nothing writes a state file in place", not offenders, f"at {offenders}")
 
@@ -26338,6 +26342,547 @@ def test_silkworm_test_runs_on_the_bots_interpreter():
     check("silkworm test and the deploy preflight's suite both ask venv_python",
           src.count("py = venv_python()") == 2
           and "if VENV_PY.exists() else sys.executable" not in src)
+
+
+# --- project health (health.py) ------------------------------------------------
+
+def _health_stores():
+    import health as H
+    import tasks as T
+    d = Path(tempfile.mkdtemp())
+    return H.HealthStore(d / "health.json"), T.TaskStore(d / "t.json"), d
+
+
+def _health_items(ts, slug="cadence"):
+    import health as H
+    return [t for t in ts.all().values()
+            if t.get("source") == H.SOURCE and t.get("project") == slug]
+
+
+def _gh_run(rid, wf, sha, conclusion, at, event="push", branch="main"):
+    return {"id": rid, "workflow_id": wf, "head_sha": sha * 40 if len(sha) == 1 else sha,
+            "status": "completed", "conclusion": conclusion, "created_at": at,
+            "event": event, "head_branch": branch,
+            "html_url": f"https://github.com/o/r/actions/runs/{rid}"}
+
+
+class _HealthGh:
+    """gh, answered from fixtures: workflows, runs per workflow, logs per run."""
+
+    def __init__(self, workflows, runs, logs=None, default_branch="main"):
+        self.workflows, self.runs, self.logs = workflows, runs, logs or {}
+        self.default_branch, self.calls, self._cache = default_branch, [], {}
+
+    def __call__(self, *args, **kw):
+        import health as H
+        self.calls.append(args)
+        if args[:1] == ("run",):
+            rid = args[2]
+            if rid not in self.logs:
+                raise H.GhUnavailable(f"no log for {rid}")
+            return self.logs[rid]
+        path = args[-1]
+        if path.endswith("/actions/workflows?per_page=100"):
+            return json.dumps({"workflows": self.workflows})
+        m = _re.search(r"/actions/workflows/(\d+)/runs\?branch=([^&]+)", path)
+        if m:
+            return json.dumps({"workflow_runs": [r for r in self.runs
+                                                 if str(r["workflow_id"]) == m.group(1)]})
+        return json.dumps({"default_branch": self.default_branch})
+
+    def cached(self, name):
+        return self._cache.get(name)
+
+    def cache(self, name, value):
+        self._cache[name] = value
+
+
+def _xcode_log(*tests):
+    body = "".join(f"test\tRun tests\t2026-10-19T16:43:51.9971800Z \t{t}()\n" for t in tests)
+    return ("test\tRun tests\t2026-10-19T16:40:45.0975850Z note: building\n"
+            "test\tRun tests\t2026-10-19T16:43:51.9968970Z Failing tests:\n" + body
+            + "test\tRun tests\t2026-10-19T16:43:51.9973870Z \n"
+            "test\tRun tests\t2026-10-19T16:43:51.9974250Z ** TEST FAILED **\n")
+
+
+_CADENCE = {"slug": "cadence", "scope": {"cwd": "/w/cadence",
+                                         "repo": "github.com/RyanSharp/Cadence"}}
+_FLOWS = [{"id": 1, "name": "Tests", "path": ".github/workflows/tests.yml", "state": "active"},
+          {"id": 2, "name": "Backend tests", "path": ".github/workflows/backend-tests.yml",
+           "state": "active"}]
+
+
+def test_health_state_transitions_page_once_and_clear():
+    import health as H
+    import tasks as T
+    print("\nhealth: ok→fail is one item, fail→fail no second, fail→ok clears, unknown never pages")
+    hs, ts, d = _health_stores()
+    ok = H.result(H.OK, "2 workflows pass")
+    bad = H.result(H.FAIL, "Tests failed at aaaa", ["Tests: failure"], "https://x/1",
+                   fingerprint="1@aaaa")
+    bad2 = H.result(H.FAIL, "Tests failed at bbbb", ["Tests: failure"], "https://x/2",
+                    fingerprint="1@bbbb")
+    unk = H.unknown("gh is not installed")
+
+    def step(res, now):
+        hs.record("cadence", "ci", res, now)
+        return H.surface(hs, ts, "cadence", "ci", scope=_CADENCE["scope"])
+
+    check("an unknown first result opens nothing", step(unk, 100) == {}
+          and not _health_items(ts))
+    check("nor does ok", step(ok, 200) == {} and not _health_items(ts))
+    rec = hs.get("cadence", "ci")
+    check("first_seen is the first check, last_changed when it became ok",
+          rec["first_seen"] == 100 and rec["last_changed"] == 200, str(rec))
+    moved = step(bad, 300)
+    items = _health_items(ts)
+    check("ok→fail opens exactly one needs-you item", "opened" in moved and len(items) == 1
+          and items[0]["state"] == T.NEEDS_INPUT, str(moved))
+    check("filed under the project, as the item's source", items[0]["project"] == "cadence"
+          and items[0]["source"] == H.SOURCE and "Tests failed at aaaa" in items[0]["title"])
+    item = items[0]["id"]
+    check("fail→fail does not open a second", "updated" in step(bad, 400)
+          and len(_health_items(ts)) == 1)
+    check("nor does a different failure while the item is open -- it is reworded",
+          "updated" in step(bad2, 500) and len(_health_items(ts)) == 1
+          and "bbbb" in ts.get(item)["title"])
+    check("a persistent failure keeps its first last_changed",
+          hs.get("cadence", "ci")["last_changed"] == 300)
+    check("fail→unknown neither closes it nor opens another",
+          step(unk, 600) == {} and ts.get(item)["state"] == T.NEEDS_INPUT
+          and len(_health_items(ts)) == 1)
+    check("and unknown remembers the last known status",
+          hs.get("cadence", "ci")["last_known"]["status"] == H.FAIL)
+    check("unknown→fail again is still the one item", "updated" in step(bad2, 650)
+          and len(_health_items(ts)) == 1)
+    check("and still failing since it first failed, not since gh came back",
+          hs.get("cadence", "ci")["last_changed"] == 300, str(hs.get("cadence", "ci")))
+    moved = step(ok, 700)
+    check("fail→ok closes the item", "closed" in moved and ts.get(item)["state"] == T.DONE,
+          str(moved))
+    check("and forgets it", not hs.get("cadence", "ci")["attention"])
+    check("ok→ok says nothing", step(ok, 800) == {})
+    # A person dismissing it silences that failure, and only that one.
+    step(bad, 900)
+    item2 = hs.get("cadence", "ci")["attention"]
+    ts.transition(item2, T.CANCELLED, "dismissed")
+    check("a dismissed failure is not re-opened while it persists",
+          step(bad, 1000) == {} and len([t for t in _health_items(ts)
+                                          if t["state"] not in T.ENDED]) == 0)
+    check("a different failure opens a new item", "opened" in step(bad2, 1100)
+          and len([t for t in _health_items(ts) if t["state"] not in T.ENDED]) == 1)
+    hs.forget("cadence", "ci")              # a store that lost its records
+    hs.record("cadence", "ci", bad2, 1150)
+    check("a store that lost its pointer finds the open item, not a second",
+          "updated" in H.surface(hs, ts, "cadence", "ci")
+          and len([t for t in _health_items(ts) if t["state"] not in T.ENDED]) == 1)
+    check("warn closes a failing item too -- it is not a page",
+          "closed" in step(H.result(H.WARN, "flaky"), 1200)
+          and not [t for t in _health_items(ts) if t["state"] not in T.ENDED])
+    # The runner claims the item (a reply asked for a fix) between surface()
+    # reading it and closing it: the close must refuse, not end a live turn.
+    step(bad, 1300)
+    live = hs.get("cadence", "ci")["attention"]
+    ts.transition(live, T.QUEUED, "fix it")
+    stale = dict(ts.get(live))
+    ts.transition(live, T.RUNNING, "claimed")
+    real_get = ts.get
+    ts.get = lambda tid: dict(stale) if tid == live else real_get(tid)
+    try:
+        moved = step(ok, 1400)
+    finally:
+        ts.get = real_get
+    check("a close racing the runner refuses, leaving the turn running",
+          "closed" not in moved and ts.get(live)["state"] == T.RUNNING, str(moved))
+    reread = H.HealthStore(d / "health.json", readonly=True)
+    check("the store is on disk, atomically, with its backup",
+          reread.get("cadence", "ci")["status"] == H.OK
+          and reread.get("cadence", "ci")["checked_at"] == 1400
+          and (d / "health.json.prev").exists())
+    try:
+        reread.record("cadence", "ci", ok)
+        wrote = True
+    except RuntimeError:
+        wrote = False
+    check("a read-only store refuses to save", not wrote)
+    check("an unknown status is refused outright",
+          _raises(lambda: H.result("red", "x"), ValueError))
+
+
+def _raises(fn, exc):
+    try:
+        fn()
+    except exc:
+        return True
+    return False
+
+
+def test_health_ci_reads_the_latest_run_of_each_workflow():
+    import health as H
+    print("\nhealth ci: the latest completed run per workflow, a path-filtered one included")
+    # Tests ran a lot and passes; Backend tests (path-filtered) last ran days
+    # ago and failed. The latest run overall is a pass.
+    runs = [_gh_run(100 + i, 1, f"{i:040x}", "success", f"2026-10-1{i}T00:00:00Z")
+            for i in range(1, 9)]
+    runs += [_gh_run(50, 2, "e" * 40, "failure", "2026-10-02T00:00:00Z"),
+             _gh_run(40, 2, "d" * 40, "success", "2026-10-01T00:00:00Z")]
+    gh = _HealthGh(_FLOWS, runs, logs={"50": "FAILED tests/test_db.py::test_rls - boom\n"})
+    res = H.ci_probe(_CADENCE, gh)
+    check("a path-filtered workflow's old failing run still fails the check",
+          res["status"] == H.FAIL and "Backend tests failed at eeeeeeee" in res["summary"],
+          res["summary"])
+    check("with the failing test pulled from its log",
+          "tests/test_db.py::test_rls" in res["summary"] or
+          any("test_rls" in e for e in res["evidence"]), str(res))
+    check("its link is the failing run", res["link"].endswith("/runs/50"), res["link"])
+    check("and its fingerprint names the workflow and commit", res["fingerprint"] == "2@" + "e" * 40)
+    check("the default branch was asked for, the scope naming none",
+          any(c[-1] == "repos/RyanSharp/Cadence" for c in gh.calls))
+    # Newest first is not enough: cancelled runs and pull requests say nothing.
+    runs2 = [_gh_run(9, 1, "c" * 40, "cancelled", "2026-10-19T03:00:00Z"),
+             _gh_run(8, 1, "b" * 40, "failure", "2026-10-19T02:00:00Z", event="pull_request"),
+             _gh_run(7, 1, "a" * 40, "success", "2026-10-19T01:00:00Z"),
+             _gh_run(6, 2, "f" * 40, "success", "2026-10-18T01:00:00Z"),
+             _gh_run(5, 2, "9" * 40, "failure", "2026-10-18T01:00:00Z", branch="feature")]
+    hidden = [_gh_run(3, 1, "c" * 40, "cancelled", "2026-10-19T03:00:00Z"),
+              _gh_run(2, 1, "b" * 40, "failure", "2026-10-19T02:00:00Z")]
+    res = H.ci_probe(_CADENCE, _HealthGh(_FLOWS[:1], hidden))
+    check("a cancelled latest run does not hide the failure before it",
+          res["status"] == H.FAIL and "bbbbbbbb" in res["summary"], str(res))
+    res = H.ci_probe(_CADENCE, _HealthGh(_FLOWS, runs2))
+    check("a cancelled run, a pull request's and another branch's are looked past",
+          res["status"] == H.OK and "2 workflows pass on main" in res["summary"], str(res))
+    benji = {"slug": "benji", "scope": {"repo": "github.com/RyanSharp/BenjiChair",
+                                        "branch": "v7"}}
+    gh = _HealthGh(_FLOWS, [_gh_run(1, 1, "a" * 40, "success", "2026-10-19T01:00:00Z",
+                                  branch="v7")])
+    res = H.ci_probe(benji, gh)
+    check("a project's own base branch is read, not the default",
+          res["status"] == H.OK and "on v7" in res["summary"]
+          and not any(c[-1].endswith("BenjiChair") for c in gh.calls), str(res))
+    res = H.ci_probe(_CADENCE, _HealthGh([], []))
+    check("no workflows is ok, saying so", res["status"] == H.OK
+          and "no workflow" in res["summary"])
+    disabled = [dict(_FLOWS[0], state="disabled_manually")]
+    res = H.ci_probe(_CADENCE, _HealthGh(disabled, [_gh_run(1, 1, "a" * 40, "failure",
+                                                          "2026-10-19T01:00:00Z")]))
+    check("a disabled workflow is not read", res["status"] == H.OK, str(res))
+    check("only projects with a GitHub repository get the ci check",
+          [c.name for c in H.checks_for(_CADENCE)] == ["ci"]
+          and H.checks_for({"slug": "k", "scope": {"cwd": "/w/k"}}) == []
+          and H.github_repo({"scope": {"repo": "https://github.com/a/b.git"}}) == "a/b")
+
+
+def test_health_ci_tells_flaky_from_broken():
+    import health as H
+    print("\nhealth ci: the same test failing on and off across commits is flaky, and said so")
+    flake = "StoreServiceTests.testIsProFalseAfterSubscriptionExpires"
+    seq = [  # oldest first: fail on A, pass on B, fail on C, pass on D (latest)
+        (1, "a", "failure"), (2, "b", "success"), (3, "c", "failure"), (4, "d", "success")]
+    runs = [_gh_run(r, 1, s, c, f"2026-10-1{r}T00:00:00Z") for r, s, c in seq]
+    logs = {"1": _xcode_log(flake), "3": _xcode_log(flake)}
+    gh = _HealthGh(_FLOWS[:1], runs, logs)
+    res = H.ci_probe(_CADENCE, gh)
+    check("passing on its latest run but flaky is warn, not fail", res["status"] == H.WARN,
+          str(res))
+    check("naming the test, read from the xcodebuild log block",
+          flake in res["summary"] and any("flaky" in e and "aaaaaaaa" in e and "cccccccc" in e
+                                         for e in res["evidence"]), str(res))
+    fetched = sum(1 for c in gh.calls if c[:1] == ("run",))
+    H.ci_probe(_CADENCE, gh)
+    check("each run's log is read once and remembered",
+          fetched == 2 and sum(1 for c in gh.calls if c[:1] == ("run",)) == 2, str(fetched))
+    runs = runs + [_gh_run(5, 1, "e", "failure", "2026-10-15T00:00:00Z")]
+    res = H.ci_probe(_CADENCE, _HealthGh(_FLOWS[:1], runs, {**logs, "5": _xcode_log(flake)}))
+    check("failing on its latest run is fail, and still says flaky",
+          res["status"] == H.FAIL and "flaky" in res["summary"] and flake[:20] in res["summary"],
+          res["summary"])
+    broke = [_gh_run(1, 1, "a", "success", "2026-10-11T00:00:00Z"),
+             _gh_run(2, 1, "b", "failure", "2026-10-12T00:00:00Z"),
+             _gh_run(3, 1, "c", "failure", "2026-10-13T00:00:00Z")]
+    res = H.ci_probe(_CADENCE, _HealthGh(_FLOWS[:1], broke,
+                                       {"2": _xcode_log("T.testX"), "3": _xcode_log("T.testX")}))
+    check("broken and staying broken is fail, not flaky",
+          res["status"] == H.FAIL and "flaky" not in res["summary"]
+          and not any("flaky" in e for e in res["evidence"]), str(res))
+    retried = [_gh_run(1, 1, "a", "failure", "2026-10-11T00:00:00Z"),
+               _gh_run(2, 1, "a", "success", "2026-10-12T00:00:00Z"),
+               _gh_run(3, 1, "a", "failure", "2026-10-13T00:00:00Z"),
+               _gh_run(4, 1, "b", "success", "2026-10-14T00:00:00Z")]
+    res = H.ci_probe(_CADENCE, _HealthGh(_FLOWS[:1], retried,
+                                       {"1": _xcode_log("T.testX"), "3": _xcode_log("T.testX")}))
+    check("failures on one commit only are not called flaky across commits",
+          res["status"] == H.OK, str(res))
+    check("log text loses its job/step columns and timestamps",
+          H.log_failures(H.log_text(_xcode_log("A.b", "A.b", "C.d"))) == ["A.b", "C.d"])
+    check("an unreadable log costs the names, not the check",
+          H.ci_probe(_CADENCE, _HealthGh(_FLOWS[:1], runs[-1:]))["status"] == H.FAIL)
+    expired = [_gh_run(i, 1, f"{i:x}" * 40, "failure" if i % 2 else "success",
+                       f"2026-10-{10 + i}T00:00:00Z") for i in range(1, 10)]
+    gh = _HealthGh(_FLOWS[:1], expired)
+    H.ci_probe(_CADENCE, gh)
+    tried = sum(1 for c in gh.calls if c[:1] == ("run",))
+    H.ci_probe(_CADENCE, gh)
+    check("a log that could not be read is not tried again every probe",
+          0 < tried <= H.LOGS_PER_PROBE
+          and sum(1 for c in gh.calls if c[:1] == ("run",)) > tried
+          and sum(1 for c in gh.calls if c[:1] == ("run",)) <= 2 * tried
+          and len({c[2] for c in gh.calls if c[:1] == ("run",)}) == len(
+              [c for c in gh.calls if c[:1] == ("run",)]), str(tried))
+    check("pull requests' and workflow_run's runs are not the branch's",
+          "workflow_run" not in H.BRANCH_EVENTS and "pull_request" not in H.BRANCH_EVENTS)
+
+
+def test_health_probe_that_cannot_run_is_unknown_and_never_pages():
+    import health as H
+    print("\nhealth: a probe that cannot run is unknown -- gh missing, a raise -- and pages nobody")
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = tempfile.mkdtemp()
+    try:
+        try:
+            H.gh_cli("api", "repos/a/b")
+            why = ""
+        except H.GhUnavailable as e:
+            why = str(e)
+        check("gh missing raises GhUnavailable, saying so", why == "gh is not installed", why)
+        res = H.ci_probe(_CADENCE, H.gh_cli)
+    finally:
+        os.environ["PATH"] = old
+    check("and the ci check is unknown, not fail", res["status"] == H.UNKNOWN
+          and "not installed" in res["summary"], str(res))
+
+    def offline(*a, **k):
+        raise H.GhUnavailable("gh api failed: HTTP 403: API rate limit exceeded")
+    hs, ts, _ = _health_stores()
+    hs.record("cadence", "ci", H.result(H.FAIL, "red", fingerprint="1@a"), 1)
+    H.surface(hs, ts, "cadence", "ci")
+    item = hs.get("cadence", "ci")["attention"]
+    rows = H.run_all(hs, ts, [_CADENCE], offline)
+    check("rate-limited is unknown", rows and rows[0]["status"] == H.UNKNOWN
+          and "rate limit" in rows[0]["summary"], str(rows))
+    check("and leaves the open item exactly as it was",
+          ts.get(item)["state"] == "needs_input" and len(_health_items(ts)) == 1)
+    reg = {"boom": H.Check("boom", lambda rec, gh: 1 / 0),
+           "junk": H.Check("junk", lambda rec, gh: {"status": "purple"})}
+    rows = H.run_all(hs, ts, [_CADENCE], offline, registry=reg)
+    check("a probe that raises, or returns no result, is unknown -- the rest still run",
+          sorted((r["check"], r["status"]) for r in rows)
+          == [("boom", H.UNKNOWN), ("junk", H.UNKNOWN)], str(rows))
+    by = {r["check"]: r["summary"] for r in rows}
+    check("each saying which: the raise, or no result",
+          "ZeroDivisionError" in by["boom"] and "returned no result" in by["junk"], str(by))
+    check("and a check that no longer runs is retired, its item closed",
+          hs.get("cadence", "ci") is None and ts.get(item)["state"] == "done")
+    check("none of it opened an item", not [t for t in _health_items(ts)
+                                            if t["state"] not in ("done", "cancelled")])
+    hs.record("cadence", "ci", H.result(H.FAIL, "red", fingerprint="1@b"), 2)
+    H.surface(hs, ts, "cadence", "ci")
+    lost = hs.get("cadence", "ci")["attention"]
+    hs.update("cadence", "ci", attention="")
+    H.retire(hs, ts, set())
+    check("retiring a check whose pointer was lost still closes its item",
+          ts.get(lost)["state"] == "done" and hs.get("cadence", "ci") is None)
+    hs.record("cadence", "ci", H.result(H.FAIL, "red", fingerprint="1@c"), 3)
+    H.surface(hs, ts, "cadence", "ci")
+    busy = hs.get("cadence", "ci")["attention"]
+    ts.transition(busy, "queued", "fix it")
+    ts.transition(busy, "running", "claimed")
+    H.retire(hs, ts, set())
+    check("one whose item is mid-turn is kept, to be retired after",
+          hs.get("cadence", "ci") is not None and ts.get(busy)["state"] == "running")
+
+
+def test_health_registry_takes_new_checks_without_changing_the_core():
+    import health as H
+    print("\nhealth: a new check plugs in through the registry")
+    hs, ts, _ = _health_stores()
+    opened, closed = [], []
+    reg = {"disk": H.Check("disk", lambda rec, gh: H.result(H.FAIL, "disk 99%"),
+                           applies=lambda rec: rec["slug"] in ("cadence", "old"))}
+    projects_ = [_CADENCE, {"slug": "kitchen", "scope": {}}, {**_CADENCE, "slug": "old",
+                                                             "archived": True}]
+    H.run_all(hs, ts, projects_, None, registry=reg,
+              on_open=lambda r, i: opened.append(i["id"]),
+              on_close=lambda r, i: closed.append(i["id"]))
+    check("it runs where it applies, never on archived projects",
+          [(r["project"], r["check"]) for r in hs.all()] == [("cadence", "disk")])
+    check("and its failure is announced once", len(opened) == 1)
+    H.run_all(hs, ts, projects_, None, registry=reg, on_open=lambda r, i: opened.append(1))
+    check("not again an hour later", len(opened) == 1)
+    reg["disk"].probe = lambda rec, gh: H.result(H.OK, "disk 40%")
+    H.run_all(hs, ts, projects_, None, registry=reg, on_close=lambda r, i: closed.append(1))
+    check("and its recovery is announced", len(closed) == 1)
+    check("a bad name is refused", _raises(lambda: H.register("Bad Name", lambda r, g: None),
+                                           ValueError))
+    check("HEALTH_EVERY: hourly by default, off stops it, nonsense refused",
+          H.parse_every("") == 3600 and H.parse_every("30m") == 1800
+          and H.parse_every("off") is None and H.parse_every("OFF") is None
+          and _raises(lambda: H.parse_every("hourly"), ValueError)
+          and _raises(lambda: H.parse_every("5s"), ValueError))
+
+
+def test_health_reaches_the_operator_digest_and_board():
+    import board as BD
+    import digest as D
+    import health as H
+    import operator_role as O
+    import projects as P
+    print("\nhealth: the operator's context, the digest and the board each get it once")
+    hs, ts, d = _health_stores()
+    now = time.time()
+    hs.record("cadence", "ci", H.result(H.FAIL, "Tests failed at 29d8b76c",
+                                        ["Tests: failure at 29d8b76c", "  failing: S.t"],
+                                        "https://github.com/x/runs/1", "1@29d8"), now - 7200)
+    H.surface(hs, ts, "cadence", "ci")
+    hs.record("silkworm", "ci", H.result(H.OK, "1 workflow passes on main",
+                                         ["SECRET-OK-EVIDENCE"]), now)
+    hs.record("trader", "ci", H.unknown("gh is not installed"), now)
+    rows = hs.all()
+    sec = H.context_section(rows, now)
+    check("the section details every non-ok check, worst first",
+          sec.index("cadence") < sec.index("trader") and "failing: S.t" in sec
+          and "https://github.com/x/runs/1" in sec and "unknown" in sec, sec)
+    check("names the needs-you item", hs.get("cadence", "ci")["attention"] in sec)
+    check("and counts the ok ones without listing them",
+          "SECRET-OK-EVIDENCE" not in sec and "silkworm" not in sec
+          and "1 of 3 checks ok across 3 projects" in sec, sec)
+    check("says when nothing has run", "no health checks" in H.context_section([]))
+    text = O.context([], lambda r: "", {"ok": True}, [], [], {}, {}, "", health_rows=rows)
+    check("the operator's live state carries a Project health section",
+          "## Project health" in text and "Tests failed at 29d8b76c" in text, text[-600:])
+    text = O.context([], lambda r: "", {"ok": True}, [], [], {}, {}, "", health_rows=None)
+    check("and a store it could not read is said, not taken for healthy",
+          "(could not be read this turn)" in text.split("## Project health")[1][:120])
+    recs = list(ts.all().values())
+    dg = D.render(recs, now, health=rows)
+    check("the digest has one health line per project that is not ok",
+          dg.count("• health:") == 2 and "ci fail — Tests failed at 29d8b76c" in dg
+          and "*silkworm*" not in dg, dg)
+    check("and does not count the item as needs input as well", "needs input" not in dg, dg)
+    check("without health rows, no health line", "health" not in D.render(recs, now))
+    ps = P.ProjectStore(d / "p.json")
+    ps.ensure("cadence", scope=_CADENCE["scope"])
+    ps.ensure("silkworm", scope={"cwd": "/w/s"})
+    ov = BD.overview(ps.all(), recs, health_rows=rows)
+    card = {p["slug"]: p for p in ov["projects"]}
+    check("the dashboard card carries one line while a check fails",
+          (card["cadence"].get("health") or {}).get("status") == H.FAIL
+          and "ci: Tests failed" in card["cadence"]["health"]["line"]
+          and card["silkworm"].get("health") is None, str(card["cadence"].get("health")))
+    check("and the item counts once among what needs you", card["cadence"]["needs"] == 1)
+    viz = (BASE / "visualizer.py").read_text()
+    check("the dashboard renders it", "p.health ? " in viz and "esc(p.health.line)" in viz)
+
+
+def test_health_cli_prints_without_writing_and_operator_may_run_it():
+    import health as H
+    import roles as R
+    print("\nsilkworm health: prints the store, writes nothing, and is the operator's")
+    cli = _load_cli()
+    hs, ts, d = _health_stores()
+    path = d / "health.json"
+    now = time.time()
+    hs.record("cadence", "ci", H.result(H.WARN, "2 workflows pass on main, but flaky",
+                                        ["  flaky: S.t failed on 52518530, 29d8b76c"],
+                                        "https://github.com/x/runs/9"), now - 3600)
+    hs.record("silkworm", "ci", H.result(H.OK, "1 workflow passes on main",
+                                         ["OK-DETAIL"]), now)
+    before = {p.name: p.stat().st_mtime_ns for p in d.iterdir()}
+
+    def run(argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.do_health(argv, path=path, now=now)
+        return code, out.getvalue(), err.getvalue()
+
+    code, out, _ = run([])
+    check("prints every project's checks", code == 0 and "cadence" in out and "silkworm" in out
+          and "warn" in out and "flaky: S.t" in out and "2 check(s), 1 ok" in out, out)
+    check("an ok check gets its line, not its evidence", "OK-DETAIL" not in out, out)
+    code, out, _ = run(["--project", "cadence"])
+    check("--project narrows it", code == 0 and "  cadence" in out
+          and "  silkworm" not in out, out)
+    code, out, _ = run(["--json", "--project", "silkworm"])
+    data = json.loads(out)
+    check("--json is the records", code == 0 and data["ok"] and data["overall"] == "ok"
+          and [r["project"] for r in data["checks"]] == ["silkworm"], out)
+    for bad in (["--run"], ["--project"], ["--write", "x"], ["cadence"]):
+        code, _, err = run(bad)
+        check(f"{' '.join(bad)} is a usage error", code == 2 and "usage" in err, err)
+    after = {p.name: p.stat().st_mtime_ns for p in d.iterdir()}
+    check("and nothing was written", before == after, f"{before} {after}")
+    code, out, _ = run([])
+    missing = d / "nope.json"
+    code2 = cli.do_health([], path=missing)
+    check("no store yet is 'no checks have run', exit 0, and creates nothing",
+          code2 == 0 and not missing.exists())
+    path.write_text("{not json")
+    (d / "health.json.prev").write_text("{not json")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        code3 = cli.do_health([], path=path)
+    check("an unreadable store exits 1, saying so", code3 == 1 and "cannot be read" in err.getvalue(),
+          err.getvalue())
+    check("and is left exactly as it was", path.read_text() == "{not json"
+          and not (d / "health.json.corrupt").exists())
+    tools = R.OPERATOR_TOOLS.format(bin="/s/bin/silkworm")
+    check("the operator's allowlist has `silkworm health`",
+          "Bash(/s/bin/silkworm health:*)" in tools)
+    src = ast.get_source_segment((BASE / "bin" / "silkworm").read_text(),
+                                 next(n for n in ast.parse((BASE / "bin" / "silkworm").read_text()).body
+                                      if isinstance(n, ast.FunctionDef) and n.name == "do_health"))
+    check("do_health opens the store read-only and runs no probe",
+          "readonly=True" in src and "gh_cli" not in src and "run_all" not in src
+          and "bot_call" not in src and "_save" not in src)
+    check("documented, and dispatched", "silkworm health [--project P] [--json]" in cli.__doc__
+          and 'cmd == "health"' in (BASE / "bin" / "silkworm").read_text())
+    check("health.json is gitignored", "health.json" in
+          (BASE / ".gitignore").read_text().splitlines())
+
+
+def test_health_scheduler_is_off_the_hot_path_and_swallows_failures():
+    import health as H
+    print("\nhealth scheduler: its own registered thread, hourly, and a failing pass is swallowed")
+    src = (BASE / "bot.py").read_text()
+    check("registered with daemons, forever only when on",
+          'daemons.start(_health_scheduler, "health", forever=health_enabled())' in src)
+    runs, logged = [], []
+
+    class Stop(BaseException):
+        pass
+
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        if len(sleeps) > 3:
+            raise Stop()
+
+    def boom():
+        runs.append(1)
+        raise RuntimeError("gh exploded")
+    fake_log = types.SimpleNamespace(exception=lambda *a, **k: logged.append(a),
+                                     info=lambda *a, **k: None, error=lambda *a, **k: None)
+    def sched(every):
+        ns = bot_functions("_health_scheduler", HEALTH_EVERY=every, HEALTH=object(), health=H,
+                           run_health=boom, time=types.SimpleNamespace(sleep=sleep),
+                           log=fake_log)
+        try:
+            ns["_health_scheduler"]()
+            return False
+        except Stop:
+            return True
+
+    stopped = sched("2h")
+    check("it keeps going after a pass raises, logging each",
+          stopped and len(runs) == 3 and len(logged) == 3, f"{runs} {logged}")
+    check("at HEALTH_EVERY, after a settling delay", sleeps[0] == 180
+          and sleeps[1:] == [7200, 7200, 7200], str(sleeps))
+    for every in ("off", "nonsense"):
+        sleeps.clear()
+        runs.clear()
+        check(f"HEALTH_EVERY={every} returns at once, running nothing",
+              not sched(every) and not runs and not sleeps, f"{runs} {sleeps}")
 
 
 if __name__ == "__main__":

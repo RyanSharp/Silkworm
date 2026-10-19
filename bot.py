@@ -44,6 +44,7 @@ import drain
 import email_ingest
 import git_guard
 import harvester
+import health
 import home
 import discard
 import holding
@@ -2199,6 +2200,14 @@ DIGEST_AT = os.environ.get("DIGEST_AT", digest.DEFAULT_AT).strip()
 OPERATOR = operator_role.State(BASE_DIR / "operator.json")
 OPERATOR_NOTES = BASE_DIR / "operator_notes.md"
 OPERATOR_SWEEP_AT = os.environ.get("OPERATOR_SWEEP_AT", operator_role.DEFAULT_SWEEP_AT).strip()
+# Project health checks (health.py): how often they run ("off" to stop), and
+# where their latest results live. Unreadable, health is off -- not the bot.
+HEALTH_EVERY = os.environ.get("HEALTH_EVERY", health.DEFAULT_EVERY).strip()
+try:
+    HEALTH = health.HealthStore(BASE_DIR / "health.json")
+except Exception:
+    log.exception("health.json cannot be read; health checks are off until it is fixed")
+    HEALTH = None
 _harvest_lock = threading.Lock()
 
 
@@ -2771,7 +2780,8 @@ def handle_tasks(payload: dict) -> dict:
         live = [p for p in everyone if not p.get("archived")]
         return {"ok": True, **board.overview(
             everyone, list(task_store.all().values()), unmerged_rows=board_survey(),
-            releases_by_slug={p["slug"]: board_release(p["slug"]) for p in live})}
+            releases_by_slug={p["slug"]: board_release(p["slug"]) for p in live},
+            health_rows=health_rows() or ())}
     if action == "board":
         # One project's columns -- or every project's, or board.UNFILED's.
         prec = project_store.get(project) if project and project != board.UNFILED else None
@@ -6296,7 +6306,8 @@ def send_digest(schedule, now: datetime) -> dict:
         log.exception("digest: reading failing bases failed")
         red = {}
     text = digest.render(records, time.time(), branch_rows=rows, released=released,
-                         when=now, failing=red, unregistered=found)
+                         when=now, failing=red, health=health_rows() or (),
+                         unregistered=found)
     try:
         board_id = BOARD.channel(app.client)
     except Exception:
@@ -6332,6 +6343,79 @@ def _digest_scheduler() -> None:
         except Exception:
             log.exception("digest scheduler failed")
         time.sleep(300)
+
+
+# --- project health (health.py) ------------------------------------------------
+
+def health_rows() -> list | None:
+    """Every (project, check)'s latest result, or None when there is no store
+    -- "could not be read", which no reader may take for "all healthy"."""
+    try:
+        return None if HEALTH is None else HEALTH.all()
+    except Exception:
+        log.exception("health: reading the store failed")
+        return None
+
+
+def announce_health(rec: dict, item: dict, opened: bool) -> None:
+    """Say once, in the home channel, that a check failed (and make that
+    message its item's thread, as base-red does), or that it passes again."""
+    channel = home_channel()
+    if not channel:
+        return
+    slug, check = rec.get("project"), rec.get("check")
+    if opened:
+        text = (f":red_circle: *{slug} {check} is failing*: {rec.get('summary')}"
+                + (f"\n<{rec['link']}|the run>" if rec.get("link") else ""))
+    else:
+        text = f":large_green_circle: *{slug} {check} is {rec.get('status')} again*: {rec.get('summary')}"
+    resp = app.client.chat_postMessage(channel=channel, text=text, unfurl_links=False)
+    if opened and item and resp.get("ts"):
+        task_store.update(item["id"], thread=f"{channel}:{resp['ts']}")
+
+
+def run_health() -> list[dict]:
+    """Every applicable check on every active project, once. Off the hot
+    path: the scheduler's own thread, gh as subprocesses, nothing locked
+    that a turn needs."""
+    if HEALTH is None:
+        return []
+    rows = health.run_all(
+        HEALTH, task_store, project_store.all(include_archived=False), health.gh_cli,
+        scope_for=project_store.scope_for,
+        on_open=lambda rec, item: announce_health(rec, item, True),
+        on_close=lambda rec, item: announce_health(rec, item, False))
+    log.info("health: %d check(s) run — %s", len(rows), ", ".join(
+        f"{r['project']}/{r['check']} {r['status']}" for r in rows if r["status"] != health.OK)
+        or "all ok")
+    return rows
+
+
+def _health_scheduler() -> None:
+    """Run the health checks every HEALTH_EVERY (default hourly, "off" to
+    stop). A failing pass is logged and swallowed; the next one is on time."""
+    try:
+        every = health.parse_every(HEALTH_EVERY)
+    except ValueError as e:
+        log.error("health checks off: %s", e)
+        return
+    if every is None or HEALTH is None:
+        log.info("health checks off (HEALTH_EVERY=%s)", HEALTH_EVERY or '""')
+        return
+    time.sleep(180)                     # let startup recovery settle first
+    while True:
+        try:
+            run_health()
+        except Exception:
+            log.exception("health checks failed")
+        time.sleep(every)
+
+
+def health_enabled() -> bool:
+    try:
+        return HEALTH is not None and health.parse_every(HEALTH_EVERY) is not None
+    except ValueError:
+        return False
 
 
 # --- the operator (operator_role.py) -------------------------------------------
@@ -6462,7 +6546,8 @@ def operator_context(now: float | None = None) -> str:
         recs, brief, operator_status(),
         operator_role.recent_landings(records, now),
         operator_role.tail(BASE_DIR / "logs" / "deploy-after-turn.log"),
-        holds, released, operator_role.read_notes(OPERATOR_NOTES))
+        holds, released, operator_role.read_notes(OPERATOR_NOTES),
+        health_rows=health_rows())
 
 
 def operator_note(task: dict | None = None) -> str:
@@ -7222,6 +7307,7 @@ if __name__ == "__main__":
     daemons.start(_operator_scheduler, "operator",
                   forever=OPERATOR_SWEEP_AT.lower() not in digest.OFF)
     daemons.start(_harvester, "harvester", forever=HARVEST_INTERVAL_H > 0)
+    daemons.start(_health_scheduler, "health", forever=health_enabled())
     log.info("workspace=%s approval_mode=%s allowlist=%s channel_dirs=%d",
              CLAUDE_CWD, CLAUDE_APPROVAL_MODE,
              ",".join(ALLOWED_USERS) or "(everyone)", len(CHANNEL_DIRS))

@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import basered
+import health
 import branches
 import costs
 import projects as projects_mod
@@ -429,11 +430,12 @@ def _summary(slug: str, title: str, recs: list, spend: dict, unmerged_rows) -> d
 
 
 def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=None,
-             now: float | None = None) -> dict:
+             now: float | None = None, health_rows=()) -> dict:
     """One card per active project, plus the unfiled lane's.
 
     `releases_by_slug` is {slug: release_status(...)}, supplied already
-    computed (and cached) by the caller.
+    computed (and cached) by the caller. `health_rows` is the health store's
+    records (health.py): a project gets one line while a check fails or warns.
     """
     now = time.time() if now is None else now
     records = list(records)
@@ -447,6 +449,7 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
         slug = r.get("project") or (parents.get(r.get("parent"), "")
                                     if r.get("role") == "reviewer" else "")
         by_slug.setdefault(slug or UNFILED, []).append(r)
+    health_by = health.by_project(health_rows or ())
     out = []
     for p in project_records:
         if p.get("archived"):
@@ -467,6 +470,7 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
                                 "tests": list(red.get("tests") or []),
                                 "since": red.get("since")} if red else None)
         row["release"] = releases_by_slug.get(slug)
+        row["health"] = health.board_line(health_by.get(slug, ()))
         out.append(row)
     out.sort(key=lambda r: (-r["needs"], -len(r["running"]), r["title"].lower()))
     unfiled = _summary(UNFILED, "Unfiled", by_slug.get(UNFILED, []), spend, unmerged_rows)

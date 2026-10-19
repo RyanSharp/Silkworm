@@ -19,6 +19,7 @@ from datetime import datetime
 import basered
 import branches
 import costs
+import health as health_mod
 import jsonstore
 import merge
 import tasks
@@ -176,14 +177,16 @@ def _project_of(rec: dict, by_id: dict) -> str:
 
 
 def sections(records, now: float, *, branch_rows=(), released=None,
-             failing=None) -> dict:
+             failing=None, health=()) -> dict:
     """{project: {section: [lines]}} for the window ending at `now`.
 
     `branch_rows` is branches.survey's output and `released` is
     {project: [tag, ...]}; both need git, so the caller gathers them and this
     stays a pure function of what it is given. `failing` is {project:
     main_failing} for every project whose base fails its own tests: one line
-    each, every day it is still so.
+    each, every day it is still so. `health` is the health store's records
+    (health.py): one line per project with a check that is not ok, every day
+    it is still so; the ok ones say nothing.
     """
     records = list(records)
     by_id = {r.get("id"): r for r in records}
@@ -197,6 +200,9 @@ def sections(records, now: float, *, branch_rows=(), released=None,
     for proj, state in sorted((failing or {}).items()):
         if state:
             add(proj, "red", _esc(basered.named(state.get("tests"))))
+
+    for proj, line in sorted(health_mod.digest_lines(health or ()).items()):
+        add(proj or UNFILED, "health", _esc(line[:300]))
 
     for rec in sorted(records, key=lambda r: r.get("created") or 0):
         proj = _project_of(rec, by_id)
@@ -268,8 +274,9 @@ def sections(records, now: float, *, branch_rows=(), released=None,
 
     waiting: dict = {}
     for rec in records:
-        # A failing base's item has its own line above.
-        if rec.get("state") in dict(WAITING) and rec.get("source") != basered.SOURCE:
+        # A failing base's item, and a failing check's, have their own lines.
+        if (rec.get("state") in dict(WAITING)
+                and rec.get("source") not in (basered.SOURCE, health_mod.SOURCE)):
             row = waiting.setdefault(_project_of(rec, by_id), {})
             row[rec["state"]] = row.get(rec["state"], 0) + 1
     for proj, row in waiting.items():
@@ -293,7 +300,8 @@ def sections(records, now: float, *, branch_rows=(), released=None,
 
 #: Section, its label, and whether its lines are titles to be listed on one
 #: line (with a count) rather than shown one per bullet.
-ORDER = (("red", "main is failing", False), ("todo", "yours to do", False),
+ORDER = (("red", "main is failing", False), ("health", "health", False),
+         ("todo", "yours to do", False),
          ("landed", "landed", True), ("released", "released", False),
          ("refused", "landing refused", False), ("failed", "failed or held", False),
          ("reran", "ran more than once", True), ("stuck", "stuck", False),
@@ -317,19 +325,20 @@ def unregistered_line(repos) -> str:
 
 
 def render(records, now: float, *, branch_rows=(), released=None,
-           when: datetime | None = None, unregistered=(), failing=None) -> str:
+           when: datetime | None = None, unregistered=(), failing=None,
+           health=()) -> str:
     """The digest as one compact Slack message."""
     text = _render(records, now, branch_rows=branch_rows, released=released, when=when,
-                   failing=failing)
+                   failing=failing, health=health)
     line = unregistered_line(unregistered)
     return f"{text}\n{line}" if line else text
 
 
 def _render(records, now: float, *, branch_rows=(), released=None,
-            when: datetime | None = None, failing=None) -> str:
+            when: datetime | None = None, failing=None, health=()) -> str:
     records = list(records)
     data = sections(records, now, branch_rows=branch_rows, released=released,
-                    failing=failing)
+                    failing=failing, health=health)
     day = (when or datetime.fromtimestamp(now)).strftime("%a %-d %b")
     total = costs.by_project(records, now, days=WINDOW_S / 86400, unfiled=UNFILED)
     spent = {"usd": round(sum(f["usd"] for f in total.values()), 4),

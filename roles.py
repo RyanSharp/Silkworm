@@ -133,6 +133,9 @@ OPERATOR_TOOLS = " ".join([
     "Bash({bin} retry:*) Bash({bin} run-next:*) Bash({bin} tidy:*)",
     "Bash({bin} operator:*) Bash({bin} deploy --after-turn:*)",
     "Bash({bin} task:*) Bash({bin} defer:*)",
+    # Read-only: prints health.json, which the bot's own probes write. It has
+    # no flag that runs a probe, reaches the network or writes anything.
+    "Bash({bin} health:*)",
 ])
 
 OPERATOR_SYSTEM = (
@@ -144,6 +147,9 @@ OPERATOR_SYSTEM = (
     "Your context is rebuilt from live state at the start of every turn (the "
     "block headed 'Live state'). Trust it over anything earlier in this "
     "conversation; check what you are unsure of with `{bin} status --json`. "
+    "Project health (CI and other probes) is run by Silkworm on a schedule "
+    "and handed to you in that block: reason over it rather than fetching "
+    "anything; `{bin} health [--project P] [--json]` prints all of it. "
     "Keep your own notes -- standing decisions, what you are waiting on, what "
     "you have learned about a project -- with `{bin} operator notes --set "
     "\"<the whole new text>\"` (at most 4KB, replaced each time: a summary, "

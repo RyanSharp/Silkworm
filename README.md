@@ -151,6 +151,7 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `REVIEW_WORKERS` | `1` | How many reviews run at once, alongside the task workers; `0` hands reviews back to the task workers |
 | `DIGEST_AT` | `08:00` | Local time to post the daily digest (last 24h per project: landed, released, refused, failed or held, reran, stuck, waiting on you, unmerged, cost) to your DM; once a day, caught up after a restart; `off` to stop |
 | `OPERATOR_SWEEP_AT` | `08:30` | Local time of the operator's daily sweep, once the digest has gone out; caught up after a restart; `off` to stop (see [The operator](#the-operator)) |
+| `HEALTH_EVERY` | `1h` | How often project health checks run (health.py; first check `ci`: the latest GitHub Actions run of each workflow on the base branch, via `gh`). A failing check is one needs-you item per project and check, closed when it passes; `unknown` (gh missing, offline, rate-limited) never pages. Results in the digest, the dashboard, the operator's context and `silkworm health`; `off` to stop |
 | `MAX_OPEN_PROPOSALS` | `4` | Untriaged proposals a project may hold before its nightly review pauses |
 
 ## Authentication for headless turns

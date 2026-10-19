@@ -40,6 +40,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import health
 import jsonstore
 
 log = logging.getLogger("silkworm.operator")
@@ -561,7 +562,7 @@ def tail(path, lines: int = 12) -> list[str]:
 
 def context(project_recs, brief_for, status: dict | None, landings, deploys,
             holds: dict, released: dict, notes: str,
-            budget: int = CONTEXT_MAX) -> str:
+            budget: int = CONTEXT_MAX, health_rows=None) -> str:
     """What an operator turn is told about the world, within `budget` chars.
 
     Sections in the order they matter. When the whole is over budget the
@@ -584,6 +585,11 @@ def context(project_recs, brief_for, status: dict | None, landings, deploys,
             brief = ""
         lines.append(project_line(rec, brief))
     sections.append(("Projects", "\n".join(lines) or "(none)"))
+    # Probe results Silkworm gathered (health.py): reason over these, do not
+    # go fetching them. None is "could not be read", not "all healthy".
+    sections.append(("Project health (probes Silkworm ran; non-ok checks in detail)",
+                     "(could not be read this turn)" if health_rows is None
+                     else health.context_section(health_rows)))
     sections.append(("Landings in the last two days", "\n".join(landings) or "(none)"))
     sections.append(("Bases failing their own tests (work held for them)",
                      "\n".join(f"- {s}: {json.dumps(v)[:240]}" for s, v in holds.items())

@@ -26,3 +26,4 @@ uploads/
 .discarded/
 cost_correction.json
 push.json
+health.json

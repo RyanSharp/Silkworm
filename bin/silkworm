@@ -14,6 +14,8 @@
     silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
     silkworm status --json          the board, branches, revision, drain and wake-ups, as JSON
+    silkworm health [--project P] [--json]  the latest project health checks (CI, …),
+                                    as the bot's own probes last found them (read-only)
     silkworm accept <id>            queue a proposal               } the dashboard's
     silkworm dismiss <id> [--round R]  cancel it                   } buttons, through
     silkworm land <id>              land a finished task's branch  } the same handlers:
@@ -582,6 +584,59 @@ def do_tailscale(argv: list) -> int:
 
 
 PUSH_ACTIONS = ("status", "test", "forget-all")
+
+
+HEALTH_USAGE = "usage: silkworm health [--project P] [--json]"
+
+
+def do_health(argv: list, path=None, now=None) -> int:
+    """`silkworm health`: print health.json, which the bot's probes write.
+
+    Read-only by construction: it loads the file without repairing it and
+    never saves, runs no probe and reaches no network -- which is what lets
+    the operator have it. A store that has not been written yet is "no
+    checks have run", not "all healthy"; one that cannot be read exits 1.
+    """
+    import health as _health
+    project, as_json, rest = "", False, list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--json":
+            as_json = True
+        elif a == "--project" and rest and not rest[0].startswith("-"):
+            project = rest.pop(0)
+        else:
+            print(HEALTH_USAGE, file=sys.stderr)
+            return EXIT_USAGE
+    path = Path(path or REPO / "health.json")
+    try:
+        store = _health.HealthStore(path, readonly=True, strict=True)
+    except Exception as e:                   # noqa: BLE001 - the reason is the output
+        print(f"refused: health.json cannot be read: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    rows = [r for r in store.all() if not project or r.get("project") == project]
+    if as_json:
+        print(json.dumps({"ok": True, "ran": path.exists(), "checks": rows,
+                          "overall": _health.overall(rows) if rows else None},
+                         indent=1, sort_keys=True))
+        return EXIT_OK
+    if not rows:
+        print(f"{WORM} health — " + ("no checks have run yet" if not path.exists()
+                                   else f"no checks recorded{' for ' + project if project else ''}"))
+        return EXIT_OK
+    now = time.time() if now is None else now
+    print(f"{WORM} health — {len(rows)} check(s), "
+          f"{sum(1 for r in rows if r.get('status') == _health.OK)} ok")
+    for slug, mine in sorted(_health.by_project(rows).items()):
+        print(f"  {slug}")
+        for r in sorted(mine, key=lambda r: _health.SEVERITY.get(r.get("status"), 9)):
+            print(f"    {_health.describe(r, now)}")
+            if r.get("status") != _health.OK:
+                for e in (r.get("evidence") or [])[:6]:
+                    print(f"      {e}")
+                if r.get("link"):
+                    print(f"      {r['link']}")
+    return EXIT_OK
 
 
 def do_push(argv: list, call=None) -> int:
@@ -2349,6 +2404,8 @@ def main() -> None:
         sys.exit(do_tailscale(args[1:]))          # args[0] is the subcommand
     elif cmd == "push":
         sys.exit(do_push(args[1:]))               # args[0] is the subcommand
+    elif cmd == "health":
+        sys.exit(do_health(args[1:]))             # args[0] is the subcommand
     elif cmd == "logs":
         os.execvp("tail", ["tail", "-n", "40", "-f", str(LOGS / "bot.log")])
     elif cmd in ("help", "-h", "--help"):
