@@ -17,6 +17,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 import procs
@@ -34,28 +35,41 @@ def now_iso() -> str:
 
 
 def mark_pending(store, key: str, *, msg_ts: str | None, progress_ts: str | None,
-                 session_id: str | None, prompt: str = "", turn: str = "") -> None:
-    """Record that a turn is in flight, so a restart can pick it up.
+                 session_id: str | None, prompt: str = "", turn: str = "") -> str:
+    """Record that a turn is in flight, so a restart can pick it up, and
+    return the session it runs on.
+
+    A turn starting a fresh session has no id to resume, so one is chosen here
+    and the caller names the session with it (run_turn's new_session_id). The
+    marker then says which session is running from the moment it is written,
+    not once Claude gets round to reporting it -- or never, for a run whose
+    id was only ever kept on its task: without it the dashboard has no
+    transcript to follow and no process to find, and calls the run stalled.
 
     `turn` names the turn that wrote it, so that turn can later clear its own
     marker and no other (see clear_pending).
     """
+    sid = session_id or str(uuid.uuid4())
     store.update(key, pending={
         "started": now_iso(),
         "msg_ts": msg_ts,
         "progress_ts": progress_ts,
-        "session_id": session_id,
+        "session_id": sid,
         "prompt": prompt[:200],
         "turn": turn,
     })
+    return sid
 
 
-def note_session(store, key: str, session_id: str) -> None:
-    """Attach the session id once Claude reports it (new sessions don't have
-    one until init, and without it we can't find the transcript later)."""
+def note_session(store, key: str, session_id: str, *, turn: str = "") -> None:
+    """Correct the marker's session id to the one Claude reports, should it
+    differ from the one mark_pending recorded. Given `turn`, only that turn's
+    marker: a review sharing its implementor's thread writes its own."""
     entry = store.get(key) or {}
     pending = entry.get("pending")
-    if pending and not pending.get("session_id"):
+    if not pending or (turn and pending.get("turn") != turn):
+        return
+    if pending.get("session_id") != session_id:
         pending["session_id"] = session_id
         store.update(key, pending=pending)
 

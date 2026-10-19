@@ -15843,6 +15843,148 @@ def test_execute_task_records_a_runs_own_cost():
           any("$2.0000 · thread total $3.50 (list)" in f for f in footers), str(footers))
 
 
+def _run_task_seeing_marker(role, thread_sid, task_sid=None):
+    """Drive execute_task once and say what the thread's in-flight marker and
+    the runner were told while the run was going."""
+    import threading
+    import roles
+    import recovery
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    sessions = tmp_store()
+    if thread_sid:
+        sessions.update("C1:1.0", session_id=thread_sid)
+    root = Path(tempfile.mkdtemp())
+    rec = st.create("look", role=role, project="p", thread="C1:1.0",
+                    driver="queue", isolate=False, scope={"cwd": str(root)})
+    if task_sid:
+        st.update(rec["id"], session_id=task_sid)
+    seen = {}
+    from unittest.mock import MagicMock
+    progress = MagicMock()
+    progress.return_value.ts = "p1"          # the marker is saved as JSON
+
+    def run_turn(goal, **kw):
+        seen["marker"] = dict((sessions.get("C1:1.0") or {}).get("pending") or {})
+        seen["kw"] = kw
+        named = kw.get("session_id") or kw.get("new_session_id")
+        kw["on_init"](named)
+        seen["after_init"] = dict((sessions.get("C1:1.0") or {}).get("pending") or {})
+        return types.SimpleNamespace(text="done", cost_usd=0.1, duration_ms=1,
+                                     session_id=named)
+    fn = _bot_func("execute_task", tasks=T, task_store=st, store=sessions,
+                   roles=roles, recovery=recovery, Path=Path, run_turn=run_turn,
+                   uuid=__import__("uuid"), time=time,
+                   review_branch=lambda t: "", worktrees=__import__("worktrees"),
+                   OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
+                   permission_args=lambda: [], log=logging.getLogger("test"),
+                   task_thread=lambda t: ("C1", "1.0"), task_key=lambda t: "C1:1.0",
+                   task_state=lambda tid, state, detail="": st.transition(tid, state, detail),
+                   _thread_lock=lambda key: threading.Lock(),
+                   repo_guard=lambda *a, **k: contextlib.nullcontext(),
+                   render_block=lambda _: "", chunk=lambda text: [text],
+                   to_mrkdwn=lambda text: text, resolve_review=lambda *a, **k: False,
+                   upload_outbox=lambda *a, **k: [], RUNNING={}, RUNNING_TASKS={},
+                   COST_NOTE="(list)", ClaudeStopped=ClaudeStopped, ClaudeError=ClaudeError,
+                   ProgressMessage=progress)
+    st.transition(rec["id"], T.RUNNING, "claimed")
+    fn(st.get(rec["id"]))
+    return seen
+
+
+def test_a_running_task_run_names_its_session_on_its_marker():
+    """The dashboard follows a running turn by its marker's session id: the
+    transcript to stream and the claude process to look for. A queue run
+    never wrote one, so every running task run read as stalled."""
+    print("\na running task run's marker names its session")
+    import visualizer as V
+    for role, thread_sid, why in (("reviewer", "parent-sid",
+                                   "a review on its implementor's thread"),
+                                  ("implementor", None, "a fresh implementor")):
+        seen = _run_task_seeing_marker(role, thread_sid)
+        sid = seen.get("marker", {}).get("session_id")
+        check(f"{why}: the marker names a session while it runs", bool(sid), str(seen.get("marker")))
+        check(f"{why}: the one the runner is told to name it",
+              sid and seen["kw"].get("new_session_id") == sid
+              and not seen["kw"].get("session_id"), str(seen.get("kw", {}).get("new_session_id")))
+        check(f"{why}: not the thread's earlier session", sid != "parent-sid")
+        check(f"{why}: and Claude reporting it leaves it so",
+              seen.get("after_init", {}).get("session_id") == sid)
+        started = seen.get("marker", {}).get("started")
+        entry = {"session_id": thread_sid, "pending": {"started": started, "session_id": sid}}
+        check(f"{why}: so, writing, it reads as running",
+              V.turn_health(entry, {sid}, written=lambda s: time.time())["stalled"] is False)
+
+    seen = _run_task_seeing_marker("assistant", "thread-sid")
+    check("a resumed run's marker names the session it resumes",
+          seen.get("marker", {}).get("session_id") == "thread-sid"
+          and seen["kw"].get("session_id") == "thread-sid", str(seen.get("marker")))
+
+
+def test_every_turn_start_names_the_session_it_runs():
+    """handle_prompt and execute_task both hand run_turn the session id the
+    marker was written with -- the same write, not a later one."""
+    print("\nevery turn start names its session on the marker")
+    tree = ast.parse((BASE / "bot.py").read_text())
+    for name in ("handle_prompt", "execute_task"):
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        bound = {t.id for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                 and isinstance(n.value, ast.Call)
+                 and ast.unparse(n.value.func) == "recovery.mark_pending"
+                 for t in n.targets if isinstance(t, ast.Name)}
+        passed = {ast.unparse(k.value) for n in ast.walk(fn) if isinstance(n, ast.Call)
+                  for k in n.keywords if k.arg == "new_session_id"}
+        check(f"{name} passes mark_pending's session to the run",
+              bool(bound) and bound <= passed, f"{bound} vs {passed}")
+
+
+def test_run_turn_names_a_fresh_session_as_told():
+    print("\nrun_turn names a fresh session as told")
+    import claude_runner as CR
+    got = []
+
+    def popen(cmd, **kw):
+        got.append(cmd)
+        raise FileNotFoundError
+    saved = CR.subprocess.Popen
+    CR.subprocess.Popen = popen
+    try:
+        for kw in ({"new_session_id": "chosen"}, {"session_id": "old", "new_session_id": "chosen"}, {}):
+            try:
+                CR.run_turn("hi", binary="claude", cwd="/nonexistent-30de", permission_args=[], **kw)
+            except CR.ClaudeError:
+                pass
+    finally:
+        CR.subprocess.Popen = saved
+    check("fresh: --session-id is the chosen one",
+          got[0][got[0].index("--session-id") + 1] == "chosen", str(got[0]))
+    check("resumed: --resume, the chosen one ignored",
+          "--resume" in got[1] and "chosen" not in got[1], str(got[1]))
+    check("none chosen: one is made up",
+          len(got[2][got[2].index("--session-id") + 1]) == 36, str(got[2]))
+
+
+def test_turn_health_reads_silence_not_age():
+    print("\nturn health reads transcript silence, not age")
+    import visualizer as V
+
+    def entry(mins, sid="s"):
+        started = (datetime.now(timezone.utc) - timedelta(minutes=mins)
+                   ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        return {"pending": {"started": started, "session_id": sid}}
+    now = time.time()
+    check("just started, nothing written yet: running",
+          V.turn_health(entry(1), {"s"}, written=lambda s: None)["stalled"] is False)
+    check("three hours in, wrote ten seconds ago: running",
+          V.turn_health(entry(180), {"s"}, written=lambda s: now - 10)["stalled"] is False)
+    h = V.turn_health(entry(180), {"s"}, written=lambda s: now - 2 * 3600)
+    check("three hours in, silent for two: stalled", h["stalled"] is True and h["silent_s"] >= 7000, str(h))
+    check("an earlier session's write does not count for this turn",
+          V.turn_health(entry(180), {"s"}, written=lambda s: now - 5 * 3600)["silent_s"] <= 180 * 60 + 5)
+    check("no session on the marker: stalled, it has no process to find",
+          V.turn_health({"pending": entry(1)["pending"] | {"session_id": None}}, {"s"},
+                        written=lambda s: now)["stalled"] is True)
+
 def test_every_reported_cost_goes_through_the_session_difference():
     """`result.cost_usd` is a session total; anywhere it is used as a turn's
     cost re-counts every earlier turn. It may only be handed to add_cost --

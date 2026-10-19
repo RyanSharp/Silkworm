@@ -263,8 +263,10 @@ def cross_site_refusal(headers) -> str:
             return f"Refused: a POST from {origin}, not this dashboard."
     return ""
 
-# Past twice the per-turn timeout, a turn is not slow -- it is stuck.
-STALL_AFTER_S = max(int(os.environ.get("CLAUDE_TIMEOUT", "900")) * 2, 3600)
+# Silent past twice the bot's idle limit -- which should have stopped it at
+# once -- a turn is not slow, it is stuck. Silence, not age: a run writing to
+# its transcript is working however long it has been at it.
+STALL_AFTER_S = max(int(os.environ.get("CLAUDE_IDLE_TIMEOUT", "1800") or 0) * 2, 3600)
 
 
 def _bot_port() -> str:
@@ -346,13 +348,24 @@ def raw_sessions() -> dict[str, dict]:
     return {k: ({"session_id": v} if isinstance(v, str) else v) for k, v in raw.items()}
 
 
-def turn_health(entry: dict, live: set) -> dict | None:
-    """How long this thread's in-flight turn has been going, and whether the
-    child is actually there.
+def last_write(session_id: str) -> float | None:
+    """When this session's transcript was last written to, or None."""
+    path = find_transcript(session_id)
+    try:
+        return path.stat().st_mtime if path else None
+    except OSError:
+        return None
 
-    A turn whose child has died, or that has run far past any plausible
-    duration, is stalled -- it will never finish on its own. Surfacing that is
-    the difference between noticing in a minute and noticing in a day.
+
+def turn_health(entry: dict, live: set, written=last_write) -> dict | None:
+    """How long this thread's in-flight turn has been going, whether the
+    child is actually there, and how long it has been silent.
+
+    A turn whose child has died, or that has written nothing to its
+    transcript for far longer than any tool call takes, is stalled -- it will
+    never finish on its own. Surfacing that is the difference between
+    noticing in a minute and noticing in a day. A long run still writing is
+    not: age alone says nothing.
     """
     pending = entry.get("pending")
     if not pending:
@@ -365,11 +378,16 @@ def turn_health(entry: dict, live: set) -> dict | None:
         return None
     sid = pending.get("session_id") or entry.get("session_id") or ""
     alive = sid in live
+    # Silent since the later of its start and its last transcript write; a
+    # run that has not written yet is as silent as it is old.
+    wrote = (written(sid) if sid else None) or 0
+    silent = min(age, time.time() - wrote) if wrote else age
     return {
         "age_s": int(age),
+        "silent_s": int(max(0, silent)),
         "child_alive": alive,
-        # No child means it can never finish; past the bound it never will.
-        "stalled": (not alive) or age > STALL_AFTER_S,
+        # No child means it can never finish; silent past the bound, it never will.
+        "stalled": (not alive) or silent > STALL_AFTER_S,
         "prompt": pending.get("prompt", ""),
     }
 
@@ -821,12 +839,12 @@ def etag_for(data) -> str:
 
 
 def sessions_tag(data: dict) -> str:
-    """/api/sessions' validator, leaving out each running turn's age. The age
-    moves every second, so with it in no poll during a turn would ever match;
-    the page adds the time since its last full answer instead. Crossing into
+    """/api/sessions' validator, leaving out each running turn's age and
+    silence. They move every second, so with them in no poll during a turn
+    would ever match; the page adds the time since its last full answer instead. Crossing into
     `stalled` changes the answer on its own."""
     steady = dict(data, sessions=[
-        dict(x, turn=dict(x["turn"], age_s=None)) if x.get("turn") else x
+        dict(x, turn=dict(x["turn"], age_s=None, silent_s=None)) if x.get("turn") else x
         for x in data.get("sessions") or []])
     return etag_for(steady)
 
@@ -2226,7 +2244,7 @@ function cardHtml(s) {
   const t = s.turn;
   const badges =
     (t && t.stalled ? `<span class="badge stall" title="${t.child_alive
-          ? "running far past the timeout" : "no claude process — it cannot finish"}"
+          ? "silent far past the idle limit" : "no claude process — it cannot finish"}"
        >stalled ${dur(t.age_s)}</span>`
      : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
      : s.running ? '<span class="badge run">running</span>' : "") +

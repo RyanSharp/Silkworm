@@ -93,6 +93,7 @@ def run_turn(
     cwd,
     permission_args: list[str],
     session_id: str | None = None,
+    new_session_id: str | None = None,  # what to name a fresh session; None = any
     model: str | None = None,
     append_system_prompt: str | None = None,
     extra_args: list[str] = (),
@@ -118,7 +119,9 @@ def run_turn(
         # (procs.session_alive). With --resume that is there already; without
         # this, a first run's survivor is invisible, and the restarted task
         # would put a second claude on the same session and checkout.
-        cmd += ["--session-id", str(uuid.uuid4())]
+        # The caller may have chosen the name already, to record it before
+        # the run starts (recovery.mark_pending).
+        cmd += ["--session-id", new_session_id or str(uuid.uuid4())]
     if append_system_prompt:
         cmd += ["--append-system-prompt", append_system_prompt]
     cmd += list(extra_args)

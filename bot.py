@@ -3797,9 +3797,12 @@ def handle_prompt(event: dict, say, client) -> None:
             log.info("thread=%s session=%s cwd=%s prompt=%r", key, session_id or "NEW", cwd, text[:120])
             # Recorded before the run so a restart mid-turn can find and finish
             # it. Inside the lock, so it describes the turn actually running.
-            recovery.mark_pending(store, key, msg_ts=reactions.msg,
-                                  progress_ts=progress.ts,
-                                  session_id=session_id, prompt=text, turn=turn_id)
+            # A fresh session is named here, so the marker says which session
+            # is running from the start (the dashboard follows it by that id).
+            running_sid = recovery.mark_pending(store, key, msg_ts=reactions.msg,
+                                                progress_ts=progress.ts,
+                                                session_id=session_id, prompt=text,
+                                                turn=turn_id)
             begin_turn(key)
             task_state(task_id, tasks.RUNNING)
             if not event.get("_web"):  # web prompts have a synthetic ts
@@ -3809,7 +3812,7 @@ def handle_prompt(event: dict, say, client) -> None:
                 ACTIVE_SESSIONS[sid] = (channel, thread_ts)
                 # A new session has no id until now; recovery needs it to find
                 # the transcript if this process dies mid-turn.
-                recovery.note_session(store, key, sid)
+                recovery.note_session(store, key, sid, turn=turn_id)
                 # And the task's record says which session it is from the
                 # start, not only once the turn has finished.
                 task_store.update(task_id, session_id=sid)
@@ -3835,6 +3838,7 @@ def handle_prompt(event: dict, say, client) -> None:
                      if role_name == roles.OPERATOR else claude_env(key)),
                 timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
                 on_init=on_init, on_activity=on_activity, on_start=on_start,
+                new_session_id=running_sid,
             )
             # The outbox dir is shared by every turn in this thread, so its
             # whole lifecycle (create -> upload -> remove) stays inside the lock.
@@ -4386,8 +4390,14 @@ def execute_task(task: dict) -> None:
                 if session_id and session_id == lost_sid:
                     session_id = None        # gone from disk; --resume would fail
                 prompt = task.get("goal", "")
-            recovery.mark_pending(store, key, msg_ts=None, progress_ts=progress.ts,
-                                  session_id=session_id, prompt=prompt, turn=turn_id)
+            # Named before the run, fresh or resumed, so the thread's marker
+            # says which session this run is -- for a review on its
+            # implementor's thread too. Without it the dashboard has nothing
+            # to follow and calls a working run stalled.
+            running_sid = recovery.mark_pending(store, key, msg_ts=None,
+                                                progress_ts=progress.ts,
+                                                session_id=session_id, prompt=prompt,
+                                                turn=turn_id)
             begin_turn(key)
             outbox.mkdir(parents=True, exist_ok=True)
 
@@ -4401,6 +4411,16 @@ def execute_task(task: dict) -> None:
                 progress.update(f":hourglass_flowing_sand: `{name}` "
                                 f"{describe_tool(name, tool_input)[:120]}")
 
+            def on_init(sid: str) -> None:
+                # Should Claude name it otherwise, the marker follows.
+                recovery.note_session(store, key, sid, turn=turn_id)
+                # The moment the session exists, not when the turn ends:
+                # a restart kills the turn before it ends, and then this
+                # is the only record of what to resume.
+                task_store.update(tid, session_id=sid,
+                                  checkpoint={"session_id": sid, "at": time.time(),
+                                              "cwd": str(cwd)})
+
             try:
                 result = run_turn(
                     prompt, session_id=session_id,
@@ -4412,13 +4432,7 @@ def execute_task(task: dict) -> None:
                     env=claude_env(key, task.get("defers") or 0, role=role_name,
                                    task_id=tid),
                     timeout=CLAUDE_TIMEOUT, idle_timeout=CLAUDE_IDLE_TIMEOUT,
-                    # The moment the session exists, not when the turn ends:
-                    # a restart kills the turn before it ends, and then this
-                    # is the only record of what to resume.
-                    on_init=lambda sid: task_store.update(
-                        tid, session_id=sid,
-                        checkpoint={"session_id": sid, "at": time.time(),
-                                    "cwd": str(cwd)}),
+                    on_init=on_init, new_session_id=running_sid,
                     on_activity=on_activity,
                     on_start=on_start,
                 )
