@@ -15938,6 +15938,25 @@ def test_every_turn_start_names_the_session_it_runs():
               bool(bound) and bound <= passed, f"{bound} vs {passed}")
 
 
+
+def test_note_session_corrects_only_its_own_turns_marker():
+    """A review starting on its implementor's thread writes its own marker;
+    the earlier turn's late init must not repoint it at the earlier session."""
+    print("\nnote_session corrects only its own turn's marker")
+    st = tmp_store()
+    sid = recovery.mark_pending(st, "C:1", msg_ts=None, progress_ts=None,
+                                session_id=None, prompt="p", turn="review")
+    check("a fresh marker gets a session id of its own", len(sid) == 36, sid)
+    recovery.note_session(st, "C:1", "implementor-sid", turn="implementor")
+    check("another turn's init leaves it",
+          st.get("C:1")["pending"]["session_id"] == sid)
+    recovery.note_session(st, "C:1", "reported", turn="review")
+    check("its own turn's init corrects it",
+          st.get("C:1")["pending"]["session_id"] == "reported")
+    check("a resumed marker keeps the session it resumes",
+          recovery.mark_pending(st, "C:2", msg_ts=None, progress_ts=None,
+                                session_id="old", turn="t") == "old")
+
 def test_run_turn_names_a_fresh_session_as_told():
     print("\nrun_turn names a fresh session as told")
     import claude_runner as CR
