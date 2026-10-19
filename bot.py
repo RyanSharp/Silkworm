@@ -3870,6 +3870,10 @@ def handle_prompt(event: dict, say, client) -> None:
                     prev = (entry.get("previous_sessions") or []) + [session_id]
                     store.update(key, session_id=None, previous_sessions=prev[-10:])
                     progress.update(":hourglass_flowing_sand: _Old session was gone — starting fresh…_")
+                    # A new name, not the lost one the marker was written
+                    # with, and the marker follows it.
+                    kwargs["new_session_id"] = str(uuid.uuid4())
+                    recovery.note_session(store, key, kwargs["new_session_id"], turn=turn_id)
                     result = run_turn(prompt, session_id=None, **kwargs)
 
                 RUNNER_HOLD.open()

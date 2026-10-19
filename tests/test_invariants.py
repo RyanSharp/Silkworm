@@ -15936,6 +15936,17 @@ def test_every_turn_start_names_the_session_it_runs():
                   for k in n.keywords if k.arg == "new_session_id"}
         check(f"{name} passes mark_pending's session to the run",
               bool(bound) and bound <= passed, f"{bound} vs {passed}")
+    # handle_prompt's retry after a lost transcript starts a fresh session:
+    # under the lost id, it would take that session back (its cost, its name).
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "handle_prompt")
+    retry = next(h for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler)
+                 and "session-lost" in ast.unparse(h))
+    src = ast.unparse(retry)
+    renamed = src.find("kwargs['new_session_id'] = str(uuid.uuid4())")
+    check("the lost-session retry names a new session, and the marker follows",
+          -1 < renamed < src.find("run_turn(prompt, session_id=None")
+          and "recovery.note_session(store, key, kwargs['new_session_id'], turn=turn_id)" in src,
+          src[-400:])
 
 
 
