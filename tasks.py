@@ -919,9 +919,9 @@ class TaskStore:
         the price of a whole session each. Other roles still run -- an
         assistant or a researcher may be the very thing fixing the base. So
         does an implementor whose parent has a `source` in `fixes_from`
-        (basered.SOURCE), or a rework whose root does: one filed from the
-        failing base's own item, to fix it, which held would wait on the
-        failure it exists to end.
+        (basered.SOURCE), or a rework of one (by `source_ref`, however many
+        times redone): one filed from the failing base's own item, to fix it,
+        which held would wait on the failure it exists to end.
         """
         with self._lock:
             busy = [r for r in self._data.values()
@@ -932,14 +932,21 @@ class TaskStore:
 
             def fixes_base(r) -> bool:
                 # The item's own child, or that child redone after a landing
-                # conflict (a rework carries only the root). Not everything
-                # under the root: a review's follow-up on the fix shares it,
-                # and is new work like any other.
+                # conflict -- a rework has no parent, so it is followed back
+                # through `source_ref` (reworks of reworks too) to the task it
+                # redoes. Not the root: a review's follow-up on the fix shares
+                # it, and so does that follow-up's own catch-up rework, and
+                # both are new work like any other.
                 if not fixes_from:
                     return False
-                by = "parent" if r.get("parent") else (
-                    "root" if r.get("source") == "rework" else "")
-                return bool(by) and (self._data.get(r.get(by) or "") or {}).get(
+                seen = set()
+                while (r.get("source") == "rework" and not r.get("parent")
+                       and r.get("id") not in seen):
+                    seen.add(r.get("id"))
+                    r = self._data.get(r.get("source_ref") or "")
+                    if r is None:
+                        return False
+                return (self._data.get(r.get("parent") or "") or {}).get(
                     "source") in fixes_from
 
             def fits(r) -> bool:

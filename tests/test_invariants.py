@@ -21520,6 +21520,11 @@ def test_runner_lets_the_base_fix_through():
     followup = ts.create("tidy what the fix touched", project="trader",
                          role="implementor", driver="queue", source="review",
                          source_ref=fix["id"], root=item)
+    redo2 = ts.create("catch up again: fix main", project="trader", role="implementor",
+                      driver="queue", source="rework", source_ref=redo["id"], root=item)
+    followup_redo = ts.create("catch up: tidy", project="trader", role="implementor",
+                              driver="queue", source="rework",
+                              source_ref=followup["id"], root=item)
     other = ts.create("unrelated", project="trader", role="implementor", driver="queue")
     research = ts.create("dig", project="trader", role="researcher", driver="queue")
     child = ts.create("next step", project="trader", role="implementor",
@@ -21536,9 +21541,12 @@ def test_runner_lets_the_base_fix_through():
         got.append(r["id"])
         ts.transition(r["id"], T.DONE, "ran")
     check("the item's own child runs", fix["id"] in got)
-    check("and its catch-up rework, by root", redo["id"] in got)
+    check("and its catch-up rework, by source_ref", redo["id"] in got)
+    check("and a rework of that rework", redo2["id"] in got)
     check("a review follow-up on the fix stays held",
           followup["id"] not in got, str(got))
+    check("and so does the follow-up's catch-up rework, though it shares the root",
+          followup_redo["id"] not in got, str(got))
     check("other implementor work on the project stays held",
           other["id"] not in got and child["id"] not in got, str(got))
     ts2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
