@@ -16011,6 +16011,22 @@ def test_turn_health_reads_silence_not_age():
     check("three hours in, silent for two: stalled", h["stalled"] is True and h["silent_s"] >= 7000, str(h))
     check("an earlier session's write does not count for this turn",
           V.turn_health(entry(180), {"s"}, written=lambda s: now - 5 * 3600)["silent_s"] <= 180 * 60 + 5)
+    proj = Path(tempfile.mkdtemp())
+    main = proj / "-w" / "sid-sub.jsonl"
+    (main.parent / "sid-sub" / "subagents").mkdir(parents=True)
+    main.write_text("{}\n")
+    sub = main.parent / "sid-sub" / "subagents" / "agent-1.jsonl"
+    sub.write_text("{}\n")
+    os.utime(main, (now - 7200, now - 7200))
+    os.utime(sub, (now - 30, now - 30))
+    saved = V.find_transcript
+    V.find_transcript = lambda s: main if s == "sid-sub" else None
+    try:
+        check("a subagent writing counts: the turn is waiting on it",
+              abs(V.last_write("sid-sub") - (now - 30)) < 2
+              and V.turn_health(entry(180, "sid-sub"), {"sid-sub"})["stalled"] is False)
+    finally:
+        V.find_transcript = saved
     check("no session on the marker: stalled, it has no process to find",
           V.turn_health({"pending": entry(1)["pending"] | {"session_id": None}}, {"s"},
                         written=lambda s: now)["stalled"] is True)

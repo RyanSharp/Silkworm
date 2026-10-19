@@ -349,12 +349,19 @@ def raw_sessions() -> dict[str, dict]:
 
 
 def last_write(session_id: str) -> float | None:
-    """When this session's transcript was last written to, or None."""
+    """When this session last wrote anything, or None: its transcript, or a
+    subagent's -- each writes its own file beside it (<session>/subagents/),
+    and a turn waiting on one leaves its own transcript quiet meanwhile."""
     path = find_transcript(session_id)
-    try:
-        return path.stat().st_mtime if path else None
-    except OSError:
+    if not path:
         return None
+    times = []
+    for p in (path, *(path.with_suffix("") / "subagents").glob("*.jsonl")):
+        try:
+            times.append(p.stat().st_mtime)
+        except OSError:
+            pass
+    return max(times, default=None)
 
 
 def turn_health(entry: dict, live: set, written=last_write) -> dict | None:
