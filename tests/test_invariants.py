@@ -22842,6 +22842,25 @@ def test_operator_cannot_decide_against_you():
         check(f"{action} of a running implementor is refused, and its child is not killed",
               not out["ok"] and out.get("refused") == "accept"
               and st.get(work)["state"] == T.RUNNING and not stopped, str(out))
+    waiting = st.create("Retry sync on 4xx", role="implementor", project="alpha")["id"]
+    st.transition(waiting, T.RUNNING); st.transition(waiting, T.BLOCKED, "review")
+    broke = st.create("Retry sync on timeouts", role="implementor", project="alpha")["id"]
+    st.transition(broke, T.RUNNING); st.transition(broke, T.FAILED, "tests")
+    accepted = st.create("Retry sync offline", state=T.PROPOSED, role="implementor",
+                         project="alpha", filed_by=O.ROLE)["id"]
+    st.transition(accepted, T.QUEUED)
+    for tid, state in ((waiting, T.BLOCKED), (broke, T.FAILED), (accepted, T.QUEUED)):
+        rec = st.get(tid)
+        r = _op_cli(bot, "dismiss", tid, "--by", "operator")
+        check(f"dismissing a {state} implementor is refused (cancelled is final)",
+              refused_cli(r, tid, rec, state), r.stdout + r.stderr)
+        out = bot.ns["handle_tasks"]({"action": "cancel", "id": tid, "caller_role": "operator"})
+        check(f"so is cancelling it", not out["ok"] and out.get("refused") == "accept"
+              and st.get(tid)["state"] == state, str(out))
+    queued_own = st.create("Sweep the board later", role="operator")["id"]
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": queued_own, "caller_role": "operator"})
+    check("cancelling its own queued turn is its to do",
+          out["ok"] and st.get(queued_own)["state"] == T.CANCELLED, str(out))
     own = st.create("Sweep the board", role="operator")["id"]
     st.transition(own, T.RUNNING)
     out = bot.ns["handle_tasks"]({"action": "cancel", "id": own, "caller_role": "operator"})

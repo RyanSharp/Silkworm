@@ -147,8 +147,13 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
             return None
         if state in ("proposed", "awaiting_approval", "needs_input"):
             return "accept", tid
-        # Cancelling a running task kills its child (stop_task). Only its own.
-        if state == "running" and task.get("role") != ROLE:
+        # Everything else not yet finished is work you decided on, or are to:
+        # queued is a proposal you accepted (dismissing it undoes the accept,
+        # for good), blocked is an implementor waiting on its review, failed is
+        # in front of you to judge, and cancelling a running task kills its
+        # child (stop_task). Only its own turns are its to end.
+        if (state in ("queued", "blocked", "failed", "running")
+                and task.get("role") != ROLE):
             return "accept", tid
     if action == "rework" and task and not _landing_refused(task):
         return "accept", tid
