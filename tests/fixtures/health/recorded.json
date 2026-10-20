@@ -1,0 +1,202 @@
+{
+ "_recorded": "2026-10-20, live, read-only; see health_probes.py",
+ "cadence_functions": [
+  {
+   "created_at": 1780537886600,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_033a731e-ca3a-4822-a4bf-9dfc0acc8f76_13/source/supabase/functions/app-store-notifications/index.ts",
+   "ezbr_sha256": "edf09da923990d4915b2d1b6db55290f486c3d5304511618fc2317ebee7d0817",
+   "id": "033a731e-ca3a-4822-a4bf-9dfc0acc8f76",
+   "import_map": false,
+   "name": "app-store-notifications",
+   "slug": "app-store-notifications",
+   "status": "ACTIVE",
+   "updated_at": 1792001635061,
+   "verify_jwt": false,
+   "version": 13
+  },
+  {
+   "created_at": 1780702777839,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_b5edc7ff-8fc4-497c-af6e-d5eacf98f5ff_7/source/supabase/functions/create-group-invite/index.ts",
+   "ezbr_sha256": "5b287823685dd977a8a6f5766aa659042505dbd5502792c7df168e920570d3aa",
+   "id": "b5edc7ff-8fc4-497c-af6e-d5eacf98f5ff",
+   "import_map": false,
+   "name": "create-group-invite",
+   "slug": "create-group-invite",
+   "status": "ACTIVE",
+   "updated_at": 1792001599764,
+   "verify_jwt": true,
+   "version": 7
+  },
+  {
+   "created_at": 1780702779792,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_2f9fce9f-48f9-4dda-a1dc-524711f48be5_7/source/supabase/functions/accept-group-invite/index.ts",
+   "ezbr_sha256": "ee35a472ec9b5b2b384508e3be7cda7700ff7039b3f9d657ea245e225918e2ae",
+   "id": "2f9fce9f-48f9-4dda-a1dc-524711f48be5",
+   "import_map": false,
+   "name": "accept-group-invite",
+   "slug": "accept-group-invite",
+   "status": "ACTIVE",
+   "updated_at": 1792001605552,
+   "verify_jwt": true,
+   "version": 7
+  },
+  {
+   "created_at": 1782275272799,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_565c7200-5587-448f-8a42-709a6ecadf62_5/source/supabase/functions/notify-group-activity/index.ts",
+   "ezbr_sha256": "ab16aaf5fd7ac9f92e2dac8aac53220945d1c749cfc6faba095d2d934eaff03e",
+   "id": "565c7200-5587-448f-8a42-709a6ecadf62",
+   "import_map": false,
+   "name": "notify-group-activity",
+   "slug": "notify-group-activity",
+   "status": "ACTIVE",
+   "updated_at": 1792001619058,
+   "verify_jwt": true,
+   "version": 5
+  },
+  {
+   "created_at": 1782278081414,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_2676553c-5bf9-48c5-9adc-9344924dff8a_7/source/supabase/functions/send-reminders/index.ts",
+   "ezbr_sha256": "7144446e63b60be6b16bafe162e1f2187f82fbf44308eea6a79ac6e589fdc387",
+   "id": "2676553c-5bf9-48c5-9adc-9344924dff8a",
+   "import_map": false,
+   "name": "send-reminders",
+   "slug": "send-reminders",
+   "status": "ACTIVE",
+   "updated_at": 1792001642811,
+   "verify_jwt": false,
+   "version": 7
+  },
+  {
+   "created_at": 1787542083566,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_4e2bf2e4-5158-4b5e-8d75-e7a33b54d780_4/source/supabase/functions/verify-transaction/index.ts",
+   "ezbr_sha256": "6eaaa7522cc4b260bb5918e82b55118e5fc738260294b123cc699b8108b796de",
+   "id": "4e2bf2e4-5158-4b5e-8d75-e7a33b54d780",
+   "import_map": false,
+   "name": "verify-transaction",
+   "slug": "verify-transaction",
+   "status": "ACTIVE",
+   "updated_at": 1792001612562,
+   "verify_jwt": true,
+   "version": 4
+  },
+  {
+   "created_at": 1792001630279,
+   "entrypoint_path": "file:///tmp/user_fn_glwhwbsyjpqmdajkntrp_c209a874-c405-4656-b456-43195ab79b26_1/source/supabase/functions/delete-account/index.ts",
+   "ezbr_sha256": "8c1a1232627472b46e06af9a438d7a1797b48e0a9ec4c7c3cd4a9cc3d2e80e97",
+   "id": "c209a874-c405-4656-b456-43195ab79b26",
+   "import_map": false,
+   "name": "delete-account",
+   "slug": "delete-account",
+   "status": "ACTIVE",
+   "updated_at": 1792001630279,
+   "verify_jwt": true,
+   "version": 1
+  }
+ ],
+ "cadence_migrations": [
+  {
+   "name": "initial_schema",
+   "version": "20260602000001"
+  },
+  {
+   "name": "add_subscription_to_profiles",
+   "version": "20260603000001"
+  },
+  {
+   "name": "groups_foundation",
+   "version": "20260604000001"
+  },
+  {
+   "name": "group_invites",
+   "version": "20260604000002"
+  },
+  {
+   "name": "lock_subscription_columns",
+   "version": "20260606000001"
+  },
+  {
+   "name": "conflict_resolution",
+   "version": "20260608000001"
+  },
+  {
+   "name": "subscription_idempotency",
+   "version": "20260608000002"
+  },
+  {
+   "name": "group_polish",
+   "version": "20260609000001"
+  },
+  {
+   "name": "complimentary_pro",
+   "version": "20260610000001"
+  },
+  {
+   "name": "device_tokens",
+   "version": "20260624000001"
+  },
+  {
+   "name": "reminder_prefs",
+   "version": "20260625000001"
+  },
+  {
+   "name": "schedule_reminders",
+   "version": "20260625000002"
+  },
+  {
+   "name": "reminders_cron_secret",
+   "version": "20260701000001"
+  },
+  {
+   "name": "group_style",
+   "version": "20260703000001"
+  },
+  {
+   "name": "task_category",
+   "version": "20260816000001"
+  },
+  {
+   "name": "task_categories",
+   "version": "20260818000001"
+  },
+  {
+   "name": "entitlement_grace_period",
+   "version": "20260821000001"
+  },
+  {
+   "name": "gate_personal_sync_on_pro",
+   "version": "20260821000002"
+  },
+  {
+   "name": "park_unclaimed_subscription_events",
+   "version": "20260823000001"
+  },
+  {
+   "name": "device_reminder_prefs",
+   "version": "20261001000001"
+  },
+  {
+   "name": "gate_sandbox_entitlement",
+   "version": "20261004000001"
+  },
+  {
+   "name": "keep_production_link",
+   "version": "20261005000001"
+  },
+  {
+   "name": "account_deletion",
+   "version": "20261008000001"
+  }
+ ],
+ "certificates": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"certificates\",\n      \"id\": \"22N4UUKL3M\",\n      \"attributes\": {\n        \"name\": \"Apple Development: Created via API\",\n        \"expirationDate\": \"2027-08-14T18:27:36.000+00:00\",\n        \"certificateType\": \"DEVELOPMENT\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/certificates/22N4UUKL3M\"\n      }\n    },\n    {\n      \"type\": \"certificates\",\n      \"id\": \"2GPPTA23J8\",\n      \"attributes\": {\n        \"name\": \"Apple Distribution: Ryan Sharp\",\n        \"expirationDate\": \"2027-08-14T18:28:47.000+00:00\",\n        \"certificateType\": \"DISTRIBUTION\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/certificates/2GPPTA23J8\"\n      }\n    },\n    {\n      \"type\": \"certificates\",\n      \"id\": \"2HYWYZQ9QN\",\n      \"attributes\": {\n        \"name\": \"Apple Development: Ryan Sharp\",\n        \"expirationDate\": \"2027-05-07T15:59:11.000+00:00\",\n        \"certificateType\": \"DEVELOPMENT\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/certificates/2HYWYZQ9QN\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/certificates?fields%5Bcertificates%5D=name%2CcertificateType%2CexpirationDate&limit=200\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 3,\n      \"limit\": 200\n    }\n  }\n}\n",
+ "fathom_submissions": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"reviewSubmissions\",\n      \"id\": \"ed2e9b7b-2a02-4b78-a71b-a8081854da26\",\n      \"attributes\": {\n        \"platform\": \"IOS\",\n        \"submittedDate\": \"2026-10-09T15:23:59.706Z\",\n        \"state\": \"WAITING_FOR_REVIEW\"\n      },\n      \"relationships\": {\n        \"items\": {\n          \"links\": {\n            \"self\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/ed2e9b7b-2a02-4b78-a71b-a8081854da26/relationships/items\",\n            \"related\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/ed2e9b7b-2a02-4b78-a71b-a8081854da26/items\"\n          }\n        }\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/ed2e9b7b-2a02-4b78-a71b-a8081854da26\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions?filter%5Bapp%5D=6818993851&limit=10\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 1,\n      \"limit\": 10\n    }\n  }\n}\n",
+ "fathom_versions": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"appStoreVersions\",\n      \"id\": \"da170c85-7aa4-47f0-90d7-bf081c76746e\",\n      \"attributes\": {\n        \"platform\": \"IOS\",\n        \"versionString\": \"1.0\",\n        \"appStoreState\": \"WAITING_FOR_REVIEW\",\n        \"appVersionState\": \"WAITING_FOR_REVIEW\",\n        \"createdDate\": \"2026-10-04T03:51:53-07:00\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/appStoreVersions/da170c85-7aa4-47f0-90d7-bf081c76746e\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/apps/6818993851/appStoreVersions?fields%5BappStoreVersions%5D=createdDate%2CversionString%2CappStoreState%2CappVersionState%2Cplatform&limit=10\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 1,\n      \"limit\": 10\n    }\n  }\n}\n",
+ "lsof": "COMMAND   PID      USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\nPython  62231 ryansharp    6u  IPv4 0x529056ad705c4c11      0t0  TCP 127.0.0.1:65264->127.0.0.1:4002 (ESTABLISHED)\n",
+ "mondays_builds": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"builds\",\n      \"id\": \"4bfb766a-26d5-4d9f-b591-6834c075dcd9\",\n      \"attributes\": {\n        \"version\": \"41\",\n        \"uploadedDate\": \"2026-10-20T14:47:20-07:00\",\n        \"expirationDate\": \"2027-01-18T13:47:20-08:00\",\n        \"expired\": false,\n        \"processingState\": \"VALID\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/builds/4bfb766a-26d5-4d9f-b591-6834c075dcd9\"\n      }\n    }\n  ],\n  \"included\": [\n    {\n      \"type\": \"preReleaseVersions\",\n      \"id\": \"f7198e6d-0d18-47eb-8b77-26b8541bf2d2\",\n      \"attributes\": {\n        \"version\": \"1.1\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/preReleaseVersions/f7198e6d-0d18-47eb-8b77-26b8541bf2d2\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/builds?fields%5BpreReleaseVersions%5D=version&fields%5Bbuilds%5D=processingState%2Cexpired%2CuploadedDate%2Cversion%2CexpirationDate&filter%5Bapp%5D=6806709316&include=preReleaseVersion&sort=-uploadedDate&limit=1\",\n    \"next\": \"https://api.appstoreconnect.apple.com/v1/builds?fields%5Bbuilds%5D=processingState%2Cexpired%2CuploadedDate%2Cversion%2CexpirationDate&fields%5BpreReleaseVersions%5D=version&filter%5Bapp%5D=6806709316&include=preReleaseVersion&sort=-uploadedDate&cursor=AQ&limit=1\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 41,\n      \"nextCursor\": \"AQ\",\n      \"limit\": 1\n    }\n  }\n}\n",
+ "mondays_submissions": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"reviewSubmissions\",\n      \"id\": \"cf6c7b44-9f88-49aa-9c94-8d133c1b132e\",\n      \"attributes\": {\n        \"platform\": \"IOS\",\n        \"submittedDate\": \"2026-10-08T14:49:36.035Z\",\n        \"state\": \"COMPLETE\"\n      },\n      \"relationships\": {\n        \"items\": {\n          \"links\": {\n            \"self\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/cf6c7b44-9f88-49aa-9c94-8d133c1b132e/relationships/items\",\n            \"related\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/cf6c7b44-9f88-49aa-9c94-8d133c1b132e/items\"\n          }\n        }\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/cf6c7b44-9f88-49aa-9c94-8d133c1b132e\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/reviewSubmissions?filter%5Bapp%5D=6806709316&limit=10\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 1,\n      \"limit\": 10\n    }\n  }\n}\n",
+ "mondays_versions": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"appStoreVersions\",\n      \"id\": \"9ecd5e83-b960-437f-a737-7de8ec41bf80\",\n      \"attributes\": {\n        \"platform\": \"IOS\",\n        \"versionString\": \"1.1\",\n        \"appStoreState\": \"PREPARE_FOR_SUBMISSION\",\n        \"appVersionState\": \"PREPARE_FOR_SUBMISSION\",\n        \"createdDate\": \"2026-10-20T08:46:29-07:00\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/appStoreVersions/9ecd5e83-b960-437f-a737-7de8ec41bf80\"\n      }\n    },\n    {\n      \"type\": \"appStoreVersions\",\n      \"id\": \"5e1461ca-288c-410c-9b85-4bf573d284fb\",\n      \"attributes\": {\n        \"platform\": \"IOS\",\n        \"versionString\": \"1.0\",\n        \"appStoreState\": \"READY_FOR_SALE\",\n        \"appVersionState\": \"READY_FOR_DISTRIBUTION\",\n        \"createdDate\": \"2026-08-29T19:49:29-07:00\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/appStoreVersions/5e1461ca-288c-410c-9b85-4bf573d284fb\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/apps/6806709316/appStoreVersions?fields%5BappStoreVersions%5D=createdDate%2CversionString%2CappStoreState%2CappVersionState%2Cplatform&limit=10\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 2,\n      \"limit\": 10\n    }\n  }\n}\n",
+ "netstat": "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address                                 Foreign Address                               (state)    \ntcp4       0      0  127.0.0.1.4002         127.0.0.1.65264        ESTABLISHED\ntcp4       0      0  127.0.0.1.65264        127.0.0.1.4002         ESTABLISHED\ntcp46      0      0  *.4002                 *.*                    LISTEN     \ntcp4       0      0  127.0.0.1.60085        127.0.0.1.4002         TIME_WAIT  ",
+ "paper_health_log": "tegrity suppression EXPIRED (frozen_with_volume, impossible_volume, nonpositive, zero_volume; review_by 2026-10-09) \u2014 decide the underlying issue or extend it deliberately\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-15\npaper healthcheck 2026-10-16T13:15:05\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (136d ago)\n  [OK] daemon: daemon PID=57811\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-14 (2d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (136d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [FAIL] bars: bar-integrity suppression EXPIRED (frozen_with_volume, impossible_volume, nonpositive, zero_volume; review_by 2026-10-09) \u2014 decide the underlying issue or extend it deliberately\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-16\n  (alert suppressed \u2014 identical message sent within 6h)\npaper healthcheck 2026-10-19T06:15:04\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (139d ago)\n  [OK] daemon: daemon PID=62231\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-15 (4d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (139d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [FAIL] bars: bar-integrity suppression EXPIRED (frozen_with_volume, impossible_volume, nonpositive, zero_volume; review_by 2026-10-09) \u2014 decide the underlying issue or extend it deliberately\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-16\npaper healthcheck 2026-10-19T12:50:03\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (139d ago)\n  [OK] daemon: daemon PID=62231\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-15 (4d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (139d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [OK] bars: 62 live symbols clean over 2024-10-19..2026-10-18\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-16\npaper healthcheck 2026-10-19T13:15:02\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (139d ago)\n  [OK] daemon: daemon PID=62231\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-15 (4d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (139d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [OK] bars: 62 live symbols clean over 2024-10-19..2026-10-18\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-19\n  (alert suppressed \u2014 identical message sent within 6h)\npaper healthcheck 2026-10-20T06:15:00\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (140d ago)\n  [OK] daemon: daemon PID=62231\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-16 (4d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (140d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [FAIL] bars: 1 corrupt bar(s) [ohlc_inconsistent] on 1 of 62 symbols the live book reads (BRK.A), 2026-10-19..2026-10-19 \u2014 run scripts/check_bar_integrity.py --scope live\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-19\n  [OK] dispatch: newest dispatch 2026-10-19 20:00 UTC close, 62/62 live quotes\npaper healthcheck 2026-10-20T12:50:05\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (140d ago)\n  [OK] daemon: daemon PID=62231\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-16 (4d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (140d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [FAIL] bars: 1 corrupt bar(s) [ohlc_inconsistent] on 1 of 62 symbols the live book reads (BRK.A), 2026-10-19..2026-10-19 \u2014 run scripts/check_bar_integrity.py --scope live\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-19\n  [OK] dispatch: newest dispatch 2026-10-20 13:32 UTC open, 62/62 live quotes\npaper healthcheck 2026-10-20T13:15:05\nmomentum universe: 50 names from data/research/liquid_universe.json [static], decided 2026-06-02 (140d ago)\n  [OK] daemon: daemon PID=62231\n  [OK] gateway: Gateway 127.0.0.1:4002 listening\n  [OK] halt: no drawdown halt active\n  [OK] snapshot: last equity snapshot 2026-10-16 (4d old)\n  [FAIL] universe: STALE: static universe data/research/liquid_universe.json, 50 names, decided 2026-06-02 (140d ago) \u2014 older than one rebalance cycle (35d); rebuild with scripts/build_pit_universe.py\n  [FAIL] bars: 1 corrupt bar(s) [ohlc_inconsistent] on 1 of 62 symbols the live book reads (BRK.A), 2026-10-19..2026-10-19 \u2014 run scripts/check_bar_integrity.py --scope live\n  [OK] freshness: all 62 live symbols have bars within 1 session(s) of 2026-10-20\n  [OK] dispatch: newest dispatch 2026-10-20 20:00 UTC close, 62/62 live quotes\n  (universe: alert suppressed \u2014 this condition was paged within 6h)\n  (bars: alert suppressed \u2014 this condition was paged within 6h)\n",
+ "paperhealth_plist": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!--\n  LaunchAgent: health-check the paper-trade daemon around the dispatch windows.\n\n  Runs scripts/paper_healthcheck.py \u2014 verifies the daemon has a live PID, IB Gateway's API port is\n  listening, and the equity snapshot isn't stale. On failure it posts a macOS notification and exits\n  non-zero. Fires weekdays at three Pacific times chosen to catch problems before/after the daemon\n  actually trades: 06:15 (before the 6:30 open), 12:50 (before the 1:00 close), 13:15 (after it).\n  This keeps alerting to when it matters and avoids overnight false alarms from the Gateway\n  auto-restart.\n\n  Install:\n    cp ops/com.traderjoe.paperhealth.plist ~/Library/LaunchAgents/\n    launchctl load ~/Library/LaunchAgents/com.traderjoe.paperhealth.plist\n  Run now:  launchctl start com.traderjoe.paperhealth\n  Logs:     data/paper_health.log\n  (For email/Slack instead of a desktop notification, swap `notify` in the script for a webhook.)\n-->\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>com.traderjoe.paperhealth</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>/Users/ryansharp/workspace/trader/.venv/bin/python3</string>\n        <string>/Users/ryansharp/workspace/trader/scripts/paper_healthcheck.py</string>\n    </array>\n\n    <key>WorkingDirectory</key>\n    <string>/Users/ryansharp/workspace/trader</string>\n\n    <key>StartCalendarInterval</key>\n    <array>\n        <!-- 06:15 PT (pre-open), 12:50 PT (pre-close), 13:15 PT (post-close) \u2014 Mon\u2013Fri -->\n        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>50</integer></dict>\n        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>50</integer></dict>\n        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>50</integer></dict>\n        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>50</integer></dict>\n        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>\n        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>50</integer></dict>\n        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>\n    </array>\n\n    <key>StandardOutPath</key>\n    <string>/Users/ryansharp/workspace/trader/data/paper_health.log</string>\n    <key>StandardErrorPath</key>\n    <string>/Users/ryansharp/workspace/trader/data/paper_health.log</string>\n</dict>\n</plist>\n",
+ "profiles": "HTTP 200 \n{\n  \"data\": [\n    {\n      \"type\": \"profiles\",\n      \"id\": \"69BF72JYS6\",\n      \"attributes\": {\n        \"name\": \"Mondays App Store\",\n        \"profileState\": \"ACTIVE\",\n        \"profileType\": \"IOS_APP_STORE\",\n        \"expirationDate\": \"2027-08-14T18:28:47.000+00:00\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/profiles/69BF72JYS6\"\n      }\n    },\n    {\n      \"type\": \"profiles\",\n      \"id\": \"A6STBDHS3R\",\n      \"attributes\": {\n        \"name\": \"Fathom App Store\",\n        \"profileState\": \"ACTIVE\",\n        \"profileType\": \"IOS_APP_STORE\",\n        \"expirationDate\": \"2027-08-14T18:28:47.000+00:00\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/profiles/A6STBDHS3R\"\n      }\n    },\n    {\n      \"type\": \"profiles\",\n      \"id\": \"RYWG3BB7J2\",\n      \"attributes\": {\n        \"name\": \"Silk Swing App Store\",\n        \"profileState\": \"ACTIVE\",\n        \"profileType\": \"IOS_APP_STORE\",\n        \"expirationDate\": \"2027-08-14T18:28:47.000+00:00\"\n      },\n      \"links\": {\n        \"self\": \"https://api.appstoreconnect.apple.com/v1/profiles/RYWG3BB7J2\"\n      }\n    }\n  ],\n  \"links\": {\n    \"self\": \"https://api.appstoreconnect.apple.com/v1/profiles?fields%5Bprofiles%5D=name%2CprofileType%2CprofileState%2CexpirationDate&limit=200\"\n  },\n  \"meta\": {\n    \"paging\": {\n      \"total\": 3,\n      \"limit\": 200\n    }\n  }\n}\n",
+ "trader_snippet_stdout": "HEALTH_JSON {\"label\": \"com.traderjoe.papertrade\", \"gateway\": [\"127.0.0.1\", 4002], \"log\": \"data/paper_trade.log\", \"daemon\": [true, \"daemon PID=62231\"], \"gateway_check\": [true, \"Gateway 127.0.0.1:4002 listening\"], \"verdict\": [true, \"newest dispatch 2026-10-20 20:00 UTC close, 62/62 live quotes\"], \"due\": \"2026-10-20T20:00:00+00:00\", \"newest\": {\"at\": \"2026-10-20T20:00:35+00:00\", \"timing\": \"close\", \"live\": 62, \"total\": 62, \"describe\": \"2026-10-20 20:00 UTC close, 62/62 live quotes\"}, \"min_live_ratio\": 0.5}\n"
+}

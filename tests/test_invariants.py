@@ -26860,9 +26860,10 @@ def test_health_cli_prints_without_writing_and_operator_may_run_it():
     src = ast.get_source_segment((BASE / "bin" / "silkworm").read_text(),
                                  next(n for n in ast.parse((BASE / "bin" / "silkworm").read_text()).body
                                       if isinstance(n, ast.FunctionDef) and n.name == "do_health"))
-    check("do_health opens the store read-only and runs no probe",
+    check("do_health opens the store read-only and runs no probe unless --probe asks",
           "readonly=True" in src and "gh_cli" not in src and "run_all" not in src
-          and "bot_call" not in src and "_save" not in src)
+          and "bot_call" not in src and "_save" not in src
+          and src.count("probe_now(") == 1 and "if probe:" in src)
     check("documented, and dispatched", "silkworm health [--project P] [--json]" in cli.__doc__
           and 'cmd == "health"' in (BASE / "bin" / "silkworm").read_text())
     check("health.json is gitignored", "health.json" in
@@ -26912,6 +26913,816 @@ def test_health_scheduler_is_off_the_hot_path_and_swallows_failures():
         runs.clear()
         check(f"HEALTH_EVERY={every} returns at once, running nothing",
               not sched(every) and not runs and not sleeps, f"{runs} {sleeps}")
+
+
+# --- project health probes (health_probes.py) -------------------------------------
+
+_PROBE_REC = None
+
+
+def _probes():
+    """health_probes, imported without its registrations reaching the global
+    registry: the CI tests above run H.run_all on a 'cadence' record, and must
+    not find live App Store and Supabase probes registered beside "ci"."""
+    import health as H
+    saved = dict(H.REGISTRY)
+    import health_probes as P
+    H.REGISTRY.clear()
+    H.REGISTRY.update(saved)
+    return P
+
+
+def _recorded():
+    global _PROBE_REC
+    if _PROBE_REC is None:
+        _PROBE_REC = json.loads((BASE / "tests" / "fixtures" / "health" / "recorded.json")
+                                .read_text())
+    return _PROBE_REC
+
+
+#: 2026-10-20 22:00 UTC, just after the fixtures were recorded.
+_PROBE_NOW = datetime(2026, 10, 20, 22, 0, tzinfo=timezone.utc).timestamp()
+
+
+def _probe_sys(**kw):
+    """A System answering from recordings: `node` (App Store Connect), the
+    trader's interpreter, lsof and netstat by responder; HTTP by URL suffix;
+    git for real, over a scratch repository; files on a scratch home."""
+    P = _probes()
+
+    class Sys(P.System):
+        def __init__(self, home, now=_PROBE_NOW, asc=None, trader=None, lsof=None,
+                     netstat=None, http=None, env=None, disk=None, tick=0.0):
+            self._home, self._now = Path(home), now
+            self.asc, self.trader, self.lsof, self.netstat = asc or {}, trader, lsof, netstat
+            self.http, self.envs, self.disk, self.tick = http or {}, env or {}, disk, tick
+            self.calls, self._clock = [], 0.0
+
+        def home(self):
+            return self._home
+
+        def now(self):
+            return self._now
+
+        def clock(self):
+            return self._clock
+
+        def env(self, name):
+            return self.envs.get(name)
+
+        def _answer(self, ans, argv):
+            if isinstance(ans, Exception):
+                raise ans
+            return ans(argv) if callable(ans) else ans
+
+        def run(self, argv, timeout, cwd=None):
+            argv = [str(a) for a in argv]
+            self.calls.append((argv, timeout))
+            self._clock += self.tick
+            name = Path(argv[0]).name
+            if name == "git":
+                return super().run(argv, timeout, cwd)
+            if name == "node":
+                path = argv[3]
+                for k, v in self.asc.items():
+                    if path == k or path.endswith(k):
+                        return self._answer(v, argv)
+                return 0, "HTTP 404 Not Found\n{}", ""
+            if name.startswith("python"):
+                return self._answer(self.trader, argv)
+            if name == "lsof":
+                return self._answer(self.lsof, argv)
+            if name == "netstat":
+                return self._answer(self.netstat, argv)
+            raise P.Unavailable(f"{name} is not installed here")
+
+        def http_get(self, url, headers, timeout):
+            self.calls.append(([url], timeout))
+            self._clock += self.tick
+            for k, v in self.http.items():
+                if url.endswith(k):
+                    if isinstance(v, Exception):
+                        raise v
+                    return v
+            return 404, '{"message":"not found"}'
+
+        def disk_usage(self, path):
+            if isinstance(self.disk, Exception):
+                raise self.disk
+            return self.disk
+
+    return Sys(**kw)
+
+
+def _asc_ok(text):
+    """asc.mjs's output for a recorded body: status line, then the JSON."""
+    return (0, text, "")
+
+
+def _asc_mut(text, fn):
+    head, _, body = text.partition("\n")
+    data = json.loads(body)
+    fn(data)
+    return (0, head + "\n" + json.dumps(data), "")
+
+
+_ASC_401 = (0, "HTTP 401 Unauthorized\n" + json.dumps({"errors": [{
+    "status": "401", "code": "NOT_AUTHORIZED",
+    "title": "Authentication credentials are missing or invalid.",
+    "detail": "Provide a properly configured and signed bearer token, and make sure that it "
+              "has not expired."}]}), "")
+
+
+def _probe_home():
+    d = Path(tempfile.mkdtemp())
+    (d / "home").mkdir()
+    return d
+
+
+def _run_probe(probe, rec):
+    import health as H
+    return H.run_check(H.Check("t", probe), rec, None)
+
+
+def test_probe_app_store_reads_versions_and_reviews():
+    P = _probes()
+    import health as H
+    print("\napp-store: version state and open review, from recorded App Store Connect answers")
+    R = _recorded()
+    cfg = {"apps": {"fathom": "6818993851", "mondays": "6806709316"}}
+    fathom, mondays = {"slug": "fathom", "scope": {}}, {"slug": "mondays", "scope": {}}
+    client = Path(tempfile.mkdtemp()) / "asc.mjs"
+    client.write_text("// stand-in")
+    cfg["asc"] = {"client": str(client)}
+
+    def run(rec, asc, now=_PROBE_NOW, **kw):
+        sys_ = _probe_sys(home=_probe_home(), now=now, asc=asc, **kw)
+        return _run_probe(P.make_app_store(sys_, cfg), rec), sys_
+
+    fa = {"appStoreVersions": _asc_ok(R["fathom_versions"]),
+          "/v1/reviewSubmissions": _asc_ok(R["fathom_submissions"])}
+    r, _ = run(fathom, fa)
+    check("waiting for review 11 days is warn, saying how long and since when",
+          r["status"] == H.WARN and "waiting for review for 11d" in r["summary"]
+          and "2026-10-09" in r["summary"] and "longer than 3d" in r["summary"], r["summary"])
+    r, _ = run(fathom, fa, now=datetime(2026, 10, 10, 12, tzinfo=timezone.utc).timestamp())
+    check("a day in review is ok", r["status"] == H.OK and "waiting for review" in r["summary"],
+          r["summary"])
+    rej = dict(fa, appStoreVersions=_asc_mut(R["fathom_versions"], lambda d: d["data"][0]
+                                             ["attributes"].update(appStoreState="REJECTED")))
+    r, _ = run(fathom, rej)
+    check("REJECTED fails, naming the version", r["status"] == H.FAIL and "1.0 rejected"
+          in r["summary"] and r["fingerprint"], r["summary"])
+    dan = dict(fa, appStoreVersions=_asc_mut(
+        R["fathom_versions"], lambda d: d["data"][0]["attributes"].update(
+            appStoreState="DEVELOPER_ACTION_NEEDED")))
+    check("DEVELOPER_ACTION_NEEDED fails", run(fathom, dan)[0]["status"] == H.FAIL)
+    unres = dict(fa, **{"/v1/reviewSubmissions": _asc_mut(
+        R["fathom_submissions"], lambda d: d["data"][0]["attributes"].update(
+            state="UNRESOLVED_ISSUES"))})
+    r, _ = run(fathom, unres)
+    check("a review submission with unresolved issues fails", r["status"] == H.FAIL
+          and "unresolved issues" in r["summary"], r["summary"])
+    r, _ = run(mondays, {"appStoreVersions": _asc_ok(R["mondays_versions"]),
+                         "/v1/reviewSubmissions": _asc_ok(R["mondays_submissions"])})
+    check("a version in preparation beside a live one is ok, and says both",
+          r["status"] == H.OK and "1.1 prepare for submission" in r["summary"]
+          and "1.0 live" in r["summary"], r["summary"])
+    r, _ = run(fathom, {"appStoreVersions": _ASC_401, "/v1/reviewSubmissions": _ASC_401})
+    check("a refused key is unknown, never fail", r["status"] == H.UNKNOWN
+          and "refused the API key" in r["summary"], r["summary"])
+    r, s = run(fathom, {"appStoreVersions": P.Unavailable("node timed out after 30s")})
+    check("a timeout is unknown", r["status"] == H.UNKNOWN and "timed out" in r["summary"])
+    check("every App Store Connect call is bounded",
+          all(t <= 30 for argv, t in s.calls if Path(argv[0]).name == "node"))
+    r, _ = run(fathom, {"appStoreVersions": (1, "", "Error: ENOENT AuthKey_X.p8")})
+    check("the client failing is unknown", r["status"] == H.UNKNOWN, r["summary"])
+    r, _ = run(fathom, {"appStoreVersions": (0, "HTTP 500 Internal Server Error\n{}", "")})
+    check("Apple's own error is unknown", r["status"] == H.UNKNOWN, r["summary"])
+    html = (0, "HTTP 200 OK\n<html>maintenance</html>", "")
+    r, s = run(fathom, {"appStoreVersions": html, "/v1/reviewSubmissions": html})
+    check("a 200 that is not JSON is unknown, not 'no version yet'", r["status"] == H.UNKNOWN,
+          r["summary"])
+    r, s = run(fathom, fa)
+    q = next(a[4] for a, _ in s.calls if a[3] == "/v1/reviewSubmissions")
+    check("it asks for the open submissions, not the newest ten",
+          "filter[state]=" in q and "UNRESOLVED_ISSUES" in q, q)
+    r = _run_probe(P.make_app_store(_probe_sys(home=_probe_home()), {"apps": {}}), fathom)
+    check("no app id in the table is unknown, not a guess", r["status"] == H.UNKNOWN
+          and "health.toml" in r["summary"])
+    slow = _probe_sys(home=_probe_home(), asc=fa, tick=P.PROBE_BUDGET_S - 0.5)
+    r = _run_probe(P.make_app_store(slow, cfg), fathom)
+    check("a probe out of its budget stops and is unknown", r["status"] == H.UNKNOWN
+          and "budget" in r["summary"], r["summary"])
+
+
+def test_probe_testflight_reads_the_latest_build():
+    P = _probes()
+    import health as H
+    print("\ntestflight: the latest build's processing state")
+    R = _recorded()
+    client = Path(tempfile.mkdtemp()) / "asc.mjs"
+    client.write_text("// stand-in")
+    cfg = {"apps": {"mondays": "6806709316"}, "asc": {"client": str(client)}}
+    rec = {"slug": "mondays", "scope": {}}
+
+    def run(ans, now=_PROBE_NOW):
+        return _run_probe(P.make_testflight(_probe_sys(home=_probe_home(), now=now,
+                                                       asc={"/v1/builds": ans}), cfg), rec)
+
+    r = run(_asc_ok(R["mondays_builds"]))
+    check("VALID is ok, naming build and version", r["status"] == H.OK
+          and "build 41 (1.1) valid" in r["summary"], r["summary"])
+
+    def state(s):
+        return _asc_mut(R["mondays_builds"], lambda d: d["data"][0]["attributes"]
+                        .update(processingState=s))
+    for bad in ("INVALID", "FAILED"):
+        r = run(state(bad))
+        check(f"{bad} fails", r["status"] == H.FAIL and r["fingerprint"], r["summary"])
+    # The recorded build was uploaded 2026-10-20 21:47 UTC.
+    r = run(state("PROCESSING"), now=_PROBE_NOW + 3 * 3600)
+    check("processing for over 2h warns", r["status"] == H.WARN and "still processing"
+          in r["summary"], r["summary"])
+    r = run(state("PROCESSING"))
+    check("processing just after upload is ok", r["status"] == H.OK, r["summary"])
+    r = run(_ASC_401)
+    check("a refused key is unknown", r["status"] == H.UNKNOWN)
+    r = run(P.Unavailable("node timed out after 30s"))
+    check("a timeout is unknown", r["status"] == H.UNKNOWN)
+    r = run(_asc_mut(R["mondays_builds"], lambda d: d.update(data=[], included=[])))
+    check("no builds is ok", r["status"] == H.OK and "no builds" in r["summary"])
+
+
+def _trader_tree(snippet_stdout=None):
+    d = _probe_home()
+    trader = d / "trader"
+    (trader / ".venv" / "bin").mkdir(parents=True)
+    (trader / ".venv" / "bin" / "python3").write_text("")
+    return d, {"slug": "trader", "scope": {"cwd": str(trader)}}
+
+
+def _trader_out(**changes):
+    R = _recorded()
+    line = next(ln for ln in R["trader_snippet_stdout"].splitlines()
+                if ln.startswith("HEALTH_JSON "))
+    data = json.loads(line[len("HEALTH_JSON "):])
+    data.update(changes)
+    return (0, "HEALTH_JSON " + json.dumps(data) + "\n", "")
+
+
+def test_probe_trader_dispatching_reuses_the_heartbeat_verdict():
+    P = _probes()
+    import health as H
+    print("\ndispatching: the trader's own heartbeat verdict, under its own interpreter")
+    d, rec = _trader_tree()
+    cfg = {"trader": {"project": "trader", "dispatch_grace_minutes": 60}}
+
+    def run(trader):
+        s = _probe_sys(home=d / "home", trader=trader)
+        return _run_probe(P.make_dispatching(s, cfg), rec), s
+
+    r, s = run(_trader_out())
+    check("a dispatch for the latest slot is ok", r["status"] == H.OK
+          and "62/62 live quotes" in r["summary"], r["summary"])
+    argv = next(a for a, _ in s.calls if Path(a[0]).name.startswith("python"))
+    check("it runs the trader's interpreter with the trader's verdict, grace 60 min",
+          argv[0].endswith(".venv/bin/python3") and "health_verdict" in argv[2]
+          and argv[-1] == "60")
+    check("and the snippet runs nothing that pages", "page_failures" not in P.TRADER_SNIPPET
+          and "main()" not in P.TRADER_SNIPPET and "notify" not in P.TRADER_SNIPPET)
+    frozen = _trader_out(verdict=[False, "NOT DISPATCHING: newest dispatch 2026-10-14 20:00 UTC "
+                                         "close, 62/62 live quotes — the daemon is alive but "
+                                         "has missed its scheduled dispatch(es)"],
+                         newest={"at": "2026-10-14T20:00:41+00:00", "timing": "close",
+                                 "live": 62, "total": 62,
+                                 "describe": "2026-10-14 20:00 UTC close, 62/62 live quotes"})
+    r, _ = run(frozen)
+    check("the 10-15/16 freeze shape fails, in the verdict's words", r["status"] == H.FAIL
+          and "NOT DISPATCHING" in r["summary"]
+          and r["fingerprint"] == "2026-10-14T20:00:41+00:00", r["summary"])
+    r, _ = run((1, "", "ModuleNotFoundError: No module named 'pandas'"))
+    check("the trader's code failing to run is unknown", r["status"] == H.UNKNOWN
+          and "could not run" in r["summary"], r["summary"])
+    r, _ = run(P.Unavailable("python3 timed out after 60s"))
+    check("a timeout is unknown", r["status"] == H.UNKNOWN and "timed out" in r["summary"])
+    r, _ = run(_trader_out(log_error="FileNotFoundError: data/paper_trade.log"))
+    check("a missing daemon log is unknown", r["status"] == H.UNKNOWN)
+    (Path(rec["scope"]["cwd"]) / ".venv" / "bin" / "python3").unlink()
+    r, _ = run(_trader_out())
+    check("no trader interpreter is unknown", r["status"] == H.UNKNOWN
+          and "interpreter" in r["summary"], r["summary"])
+
+
+def test_probe_trader_gateway_listening_and_connected():
+    P = _probes()
+    import health as H
+    print("\ngateway: the API port listening, and the daemon connected to it")
+    R = _recorded()
+    d, rec = _trader_tree()
+    cfg = {"trader": {"project": "trader"}}
+
+    def run(trader=None, lsof=(0, R["lsof"], ""), netstat=(0, R["netstat"], "")):
+        s = _probe_sys(home=d / "home", trader=trader or _trader_out(), lsof=lsof,
+                       netstat=netstat)
+        return _run_probe(P.make_gateway(s, cfg), rec)
+
+    r = run()
+    check("listening and connected (recorded lsof) is ok", r["status"] == H.OK
+          and "connected" in r["summary"], r["summary"])
+    r = run(_trader_out(gateway_check=[False, "Gateway 127.0.0.1:4002 unreachable"]))
+    check("the port not listening fails", r["status"] == H.FAIL
+          and "not listening" in r["summary"])
+    r = run(_trader_out(daemon=[False, "daemon not loaded"]))
+    check("the daemon not running fails", r["status"] == H.FAIL and "not running" in r["summary"])
+    no_client = "\n".join(ln for ln in R["netstat"].splitlines() if "ESTABLISHED" not in ln)
+    head = R["lsof"].splitlines()[0]
+    r = run(lsof=(1, head + "\n", ""), netstat=(0, no_client, ""))
+    check("disconnected while the newest dispatch covers the latest slot warns: the "
+          "daemon reconnects at its next dispatch (Gateway's nightly re-auth)",
+          r["status"] == H.WARN and "next dispatch" in r["summary"], r["summary"])
+    missed = _trader_out(newest={"at": "2026-10-19T20:00:51+00:00", "timing": "close",
+                                 "live": 62, "total": 62, "describe": "x"})
+    r = run(missed, lsof=(1, head + "\n", ""), netstat=(0, no_client, ""))
+    check("disconnected with a slot due since the newest dispatch fails", r["status"] == H.FAIL
+          and "not connected" in r["summary"], r["summary"])
+    r = run(_trader_out(daemon=[False, "launchctl failed: timed out"]))
+    check("launchctl failing to answer is unknown, not 'daemon down'",
+          r["status"] == H.UNKNOWN, r["summary"])
+    r = run(lsof=(1, "", ""))
+    check("a client lsof does not attribute to the daemon warns", r["status"] == H.WARN,
+          r["summary"])
+    r = run(lsof=(2, "", "lsof: bad"), netstat=(1, "", ""))
+    check("neither tool answering is unknown", r["status"] == H.UNKNOWN, r["summary"])
+    r = run(lsof=P.Unavailable("lsof timed out after 15s"))
+    check("a timeout is unknown", r["status"] == H.UNKNOWN and "timed out" in r["summary"])
+
+
+def _healthcheck_home(log_text):
+    R = _recorded()
+    d, rec = _trader_tree()
+    log = d / "paper_health.log"
+    log.write_text(log_text)
+    agents = d / "home" / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    (agents / "com.traderjoe.paperhealth.plist").write_text(
+        R["paperhealth_plist"].replace("/Users/ryansharp/workspace/trader/data/paper_health.log",
+                                       str(log)))
+    return d, rec
+
+
+def test_probe_trader_healthcheck_reads_its_log_never_runs_it():
+    P = _probes()
+    import health as H
+    print("\nhealthcheck: the latest run of paper_healthcheck.py, from its log")
+    R = _recorded()
+    cfg = {"trader": {"project": "trader", "healthcheck_label": "com.traderjoe.paperhealth"}}
+    # The recorded run: Tuesday 2026-10-20 13:15 local; next slot Wednesday 06:15.
+    tue = datetime(2026, 10, 20, 14, 0).timestamp()
+
+    def run(text, now=tue):
+        d, rec = _healthcheck_home(text)
+        s = _probe_sys(home=d / "home", now=now)
+        return _run_probe(P.make_healthcheck(s, cfg), rec), s
+
+    r, s = run(R["paper_health_log"])
+    check("the recorded run fails, naming its failing checks", r["status"] == H.FAIL
+          and "universe, bars" in r["summary"], r["summary"])
+    check("its evidence is the healthcheck's own messages",
+          any(e.startswith("FAIL universe: STALE") for e in r["evidence"]), r["evidence"])
+    check("it ran nothing", not [a for a, _ in s.calls if Path(a[0]).name != "git"], s.calls)
+    r2, _ = run(R["paper_health_log"].replace("(140d ago)", "(141d ago)"))
+    check("the same failure a day older is the same fingerprint",
+          r2["fingerprint"] == r["fingerprint"] and r["fingerprint"].startswith("bars,universe:"),
+          f'{r["fingerprint"]} {r2["fingerprint"]}')
+    r3, _ = run(R["paper_health_log"].replace("STALE: static universe", "MISSING: static universe"))
+    check("a different failure of the same check is a different fingerprint",
+          r3["status"] == H.FAIL and r3["fingerprint"] != r["fingerprint"])
+    healthy = R["paper_health_log"].replace("[FAIL]", "[OK]")
+    r, _ = run(healthy)
+    check("a run with every check OK is ok", r["status"] == H.OK and "OK" in r["summary"],
+          r["summary"])
+    thu = datetime(2026, 10, 22, 9, 0).timestamp()
+    r, _ = run(healthy, now=thu)
+    check("a healthcheck that stopped running (missed Wed and Thu) warns",
+          r["status"] == H.WARN and "has not run since" in r["summary"], r["summary"])
+    sat = datetime(2026, 10, 24, 12, 0).timestamp()
+    r, _ = run(healthy.replace("2026-10-20T13:15:05", "2026-10-23T13:15:05"), now=sat)
+    check("a weekend with Friday's run is not stale", r["status"] == H.OK, r["summary"])
+    r, _ = run("Traceback (most recent call last):\n  ...\n")
+    check("a log with no completed run is unknown", r["status"] == H.UNKNOWN)
+    d, rec = _trader_tree()
+    r = _run_probe(P.make_healthcheck(_probe_sys(home=d / "home"), cfg), rec)
+    check("no plist anywhere is unknown", r["status"] == H.UNKNOWN, r["summary"])
+
+
+def _drift_repo(commits):
+    """A scratch repo: commits = [(epoch, {path: text})], on main."""
+    d = Path(tempfile.mkdtemp()) / "repo"
+    d.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(d)], check=True, env=env)
+    for at, files in commits:
+        for path, text in files.items():
+            (d / path).parent.mkdir(parents=True, exist_ok=True)
+            (d / path).write_text(text)
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True, env=env)
+        stamp = f"@{int(at)} +0000"
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", "c"], check=True,
+                       env={**env, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
+    return d
+
+
+def _supabase_home(token="sbp_" + "a1b2c3d4" * 5, account="personal", ref="refabc"):
+    d = _probe_home()
+    sb = d / "home" / ".supabase"
+    (sb / "projects").mkdir(parents=True)
+    (sb / "accounts").mkdir()
+    (sb / "projects" / f"{ref}.env").write_text(
+        (f"SUPABASE_ACCOUNT={account}\n" if account else "")
+        + "SUPABASE_DB_PASSWORD=dbpassSECRET123\n")
+    if token is not None:
+        (sb / "accounts" / f"{account or 'personal'}.env").write_text(
+            f"SUPABASE_ACCESS_TOKEN={token}\n")
+    return d
+
+
+def _deployed(slug, version, at):
+    R = _recorded()
+    f = dict(R["cadence_functions"][0])
+    f.update(slug=slug, name=slug, version=version, updated_at=int(at * 1000))
+    return f
+
+
+def test_probe_backend_drift_compares_production_with_the_base_branch():
+    P = _probes()
+    import health as H
+    print("\nbackend-drift: deployed functions and applied migrations against main")
+    R = _recorded()
+    day = 86400
+    now = _PROBE_NOW
+    cfg = {"supabase": {"cadence": {"ref": "refabc", "dir": "supabase"}}}
+    base_files = {"supabase/functions/alpha/index.ts": "a1",
+                  "supabase/functions/_shared/util.ts": "s1",
+                  "supabase/functions/import_map.json": "{}",
+                  "supabase/migrations/20261001000001_first.sql": "select 1;"}
+    applied = [{"version": "20261001000001", "name": "first"}]
+
+    def run(repo, http, home=None, now=now):
+        rec = {"slug": "cadence", "scope": {"cwd": str(repo)}}
+        s = _probe_sys(home=(home or _supabase_home()) / "home", now=now, http=http)
+        return _run_probe(P.make_backend_drift(s, cfg), rec), s
+
+    def api(funcs, migs=applied):
+        return {"/functions": (200, json.dumps(funcs)),
+                "/database/migrations": (200, json.dumps(migs))}
+
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    r, s = run(repo, api([_deployed("alpha", 3, now - 19 * day)]))
+    check("deployed after main's last change, every migration applied: ok",
+          r["status"] == H.OK and "1 function(s) and 1 migration(s) match main" in r["summary"],
+          r["summary"])
+    check("read-only: GETs only, against the project's own ref",
+          all(a[0].startswith("https://api.supabase.com/v1/projects/refabc/")
+              for a, _ in s.calls if a[0].startswith("http")))
+    check("each call bounded", all(t <= 30 for _, t in s.calls))
+    check("the real response shape parsed (recorded cadence functions)",
+          isinstance(R["cadence_functions"], list) and "updated_at" in R["cadence_functions"][0])
+
+    repo = _drift_repo([(now - 20 * day, base_files),
+                        (now - 2 * day, {"supabase/functions/_shared/util.ts": "s2"})])
+    r, _ = run(repo, api([_deployed("alpha", 3, now - 19 * day)]))
+    check("shared code changed after the deploy: that function drifted, warn while young",
+          r["status"] == H.WARN and "alpha" in r["summary"] and "oldest 2d" in r["summary"],
+          r["summary"])
+    repo = _drift_repo([(now - 20 * day, base_files),
+                        (now - 8 * day, {"supabase/functions/alpha/index.ts": "a2",
+                                         "supabase/migrations/20261012000001_second.sql": "x"})])
+    r, _ = run(repo, api([_deployed("alpha", 3, now - 19 * day)]))
+    check(f"drift older than {P.DRIFT_FAIL_D}d fails, naming function and migration",
+          r["status"] == H.FAIL and "alpha" in r["summary"] and "20261012000001" in r["summary"]
+          and "stale:alpha:3" in r["fingerprint"] and "mig:20261012000001" in r["fingerprint"],
+          r["summary"])
+    repo = _drift_repo([(now - 20 * day, base_files),
+                        (now - day, {"supabase/functions/beta/index.ts": "b"})])
+    r, _ = run(repo, api([_deployed("alpha", 3, now - 19 * day)]))
+    check("a function on main never deployed is drift", r["status"] == H.WARN
+          and any("beta" in e and "never deployed" in e for e in r["evidence"]), r["evidence"])
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    r, _ = run(repo, api([_deployed("alpha", 3, now - 19 * day), _deployed("gamma", 1, now)],
+                         applied + [{"version": "20261019000001", "name": "elsewhere"}]))
+    check("production running things main lacks warns", r["status"] == H.WARN
+          and any("gamma" in e for e in r["evidence"])
+          and any("20261019000001" in e for e in r["evidence"]), r["evidence"])
+    r, _ = run(repo, api([_deployed("alpha", 3, now - 19 * day)], []))
+    check("no migration history in production is unknown, not 'nothing applied'",
+          r["status"] == H.UNKNOWN and "no migration history" in r["summary"], r["summary"])
+
+    tok = "sbp_" + "a1b2c3d4" * 5
+    refused = {"/functions": (401, json.dumps({"message": "JWT could not be decoded"})),
+               "/database/migrations": (401, "{}")}
+    r, _ = run(repo, refused)
+    check("a refused management token is unknown, with the reason (the Mondays case)",
+          r["status"] == H.UNKNOWN and "refused account personal's management token" in r["summary"]
+          and "JWT could not be decoded" in r["summary"], r["summary"])
+    forbidden = {"/functions": (403, '{"message":"Your account does not have the necessary '
+                                     'privileges to access this endpoint."}')}
+    r, _ = run(repo, forbidden)
+    check("a token for another account (403, recorded for Saga) is unknown",
+          r["status"] == H.UNKNOWN and "HTTP 403" in r["summary"])
+    r, _ = run(repo, {"/functions": P.Unavailable("api.supabase.com unreachable: timed out")})
+    check("a timeout is unknown", r["status"] == H.UNKNOWN and "timed out" in r["summary"])
+    r, _ = run(repo, api([]), home=_supabase_home(account=""))
+    check("a project file naming no account is unknown, saying which file",
+          r["status"] == H.UNKNOWN and "SUPABASE_ACCOUNT" in r["summary"]
+          and "refabc.env" in r["summary"], r["summary"])
+    r, _ = run(repo, api([]), home=_supabase_home(token="sb_secret_" + "z" * 30))
+    check("a project secret key where the management token goes is unknown",
+          r["status"] == H.UNKNOWN and "not a management token" in r["summary"], r["summary"])
+    r, _ = run(repo, api([]), home=_supabase_home(ref="other"))
+    check("no credentials for the project is unknown", r["status"] == H.UNKNOWN
+          and "no credentials" in r["summary"], r["summary"])
+    for res in (r,):
+        check("and no token value appears", tok not in json.dumps(res))
+
+    # Landing rebases: the committer time becomes the landing, after a deploy
+    # made from the task's worktree. Author time is when the change was made.
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_AUTHOR_DATE": f"@{int(now - 3 * day)} +0000",
+           "GIT_COMMITTER_DATE": f"@{int(now - day)} +0000"}
+    (repo / "supabase/functions/alpha/index.ts").write_text("a2")
+    (repo / "supabase/functions/README.md").write_text("notes")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "x"], check=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "readme"], check=True,
+                   env={**env, "GIT_AUTHOR_DATE": f"@{int(now - 3600)} +0000"})
+    r, _ = run(repo, api([_deployed("alpha", 4, now - 2 * day)]))
+    check("deployed from the branch before it landed is current (author time, not landing)",
+          r["status"] == H.OK, r["summary"])
+    check("and a README beside the functions is not shared code", r["status"] == H.OK)
+    # origin ahead of local main (merged on the forge): origin is the base.
+    subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"],
+                   check=True)
+    (repo / "supabase/functions/alpha/index.ts").write_text("a3")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "forge"], check=True,
+                   env={**env, "GIT_AUTHOR_DATE": f"@{int(now - 3600)} +0000"})
+    subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard", "HEAD~1"], check=True)
+    r, _ = run(repo, api([_deployed("alpha", 4, now - 2 * day)]))
+    check("a base whose origin copy is ahead is read from origin", r["status"] == H.WARN
+          and "alpha" in r["summary"], r["summary"])
+
+
+def test_probe_mini_credentials_and_disk():
+    P = _probes()
+    import health as H
+    print("\ncredentials and disk: the mini's own checks")
+    R = _recorded()
+    client = Path(tempfile.mkdtemp()) / "asc.mjs"
+    client.write_text("// stand-in")
+    cfg = {"asc": {"client": str(client)}, "mini": {"disk": "/x"}}
+    asc = {"/v1/certificates": _asc_ok(R["certificates"]), "/v1/profiles": _asc_ok(R["profiles"])}
+    token = lambda has: {"mode": "token", "stores": []}            # noqa: E731
+    soonest = min(P._parse_time(c["attributes"]["expirationDate"])
+                  for c in json.loads(R["certificates"].partition("\n")[2])["data"])
+
+    def run(state=token, asc=asc, now=_PROBE_NOW):
+        s = _probe_sys(home=_probe_home(), now=now, asc=asc)
+        return _run_probe(P.make_credentials(s, cfg, claude_state=state), MINI)
+
+    MINI = P.MINI
+    r = run()
+    check("a long-lived claude token and certificates good for months is ok",
+          r["status"] == H.OK, r["summary"])
+    r = run(now=soonest - 10 * 86400)
+    check("a certificate expiring in 10 days warns, naming it", r["status"] == H.WARN
+          and "Apple Development: Ryan Sharp" in r["summary"], r["summary"])
+    r = run(now=soonest - 2 * 86400)
+    check("inside 3 days fails", r["status"] == H.FAIL and r["fingerprint"], r["summary"])
+    invalid = dict(asc, **{"/v1/profiles": _asc_mut(R["profiles"], lambda d: d["data"][0]
+                                                    ["attributes"].update(profileState="INVALID"))})
+    r = run(asc=invalid)
+    check("an invalidated profile warns", r["status"] == H.WARN and "INVALID" in r["summary"])
+    oauth = lambda h: lambda has: {"mode": "oauth", "stores": ["file"], "source": "file",  # noqa: E731
+                                   "expires_at": _PROBE_NOW + h * 3600, "hours_left": h}
+    check("claude's refresh token: 8 days left warns, 2 fails, a month is ok",
+          run(state=oauth(8 * 24))["status"] == H.WARN
+          and run(state=oauth(48))["status"] == H.FAIL
+          and run(state=oauth(30 * 24))["status"] == H.OK)
+    r = run(state=lambda has: {"mode": "missing", "stores": []})
+    check("claude credentials missing fails", r["status"] == H.FAIL)
+    r = run(state=lambda has: {"mode": "unreadable", "stores": ["keychain"],
+                               "source": "keychain"})
+    check("a Keychain copy this process cannot read is unknown (security timing out, rc 36)",
+          r["status"] == H.UNKNOWN, r["summary"])
+    r = run(state=lambda has: {"mode": "unreadable", "stores": ["file"], "source": "file"})
+    check("a credentials file that will not parse fails", r["status"] == H.FAIL)
+    exp = min(P._parse_time(c["attributes"]["expirationDate"])
+              for c in json.loads(R["profiles"].partition("\n")[2])["data"])
+    certs_far = _asc_mut(R["certificates"], lambda d: [c["attributes"].update(
+        expirationDate="2030-01-01T00:00:00.000+00:00") for c in d["data"]])
+    r = run(asc=dict(asc, **{"/v1/certificates": certs_far}), now=exp - 86400)
+    check("a profile a day from expiry warns, never fails (Xcode renews it)",
+          r["status"] == H.WARN, r["summary"])
+    r = run(asc={"/v1/certificates": _ASC_401})
+    check("Apple unreadable (key refused) is unknown, never fail", r["status"] == H.UNKNOWN,
+          r["summary"])
+    r = run(asc={"/v1/certificates": P.Unavailable("node timed out after 30s")})
+    check("an Apple timeout is unknown", r["status"] == H.UNKNOWN)
+    check("credentials.state is what it reuses", "credentials.state(" in
+          (BASE / "health_probes.py").read_text())
+
+    Usage = types.SimpleNamespace
+
+    def disk(free, total=1000):
+        s = _probe_sys(home=_probe_home(), disk=Usage(free=free, total=total, used=total - free))
+        return _run_probe(P.make_disk(s, cfg), MINI)
+    check("disk: 42% free ok, 10% warn, 4% fail",
+          disk(420)["status"] == H.OK and disk(100)["status"] == H.WARN
+          and disk(40)["status"] == H.FAIL)
+    check("disk unreadable is unknown",
+          _run_probe(P.make_disk(_probe_sys(home=_probe_home(), disk=OSError("x")), cfg),
+                     MINI)["status"] == H.UNKNOWN)
+
+
+def test_probe_results_never_carry_a_secret():
+    P = _probes()
+    import health as H
+    print("\nhealth probes: no secret in any summary, evidence line, link, fingerprint or log")
+    R = _recorded()
+    secrets = {"sbp": "sbp_" + "f00dfeed" * 5, "jwt": "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJ4In0.c2lnbmF0dXJlLXNpZw",
+               "anth": "sk-ant-oat01-" + "Q" * 30, "dbpass": "dbpassSECRET123",
+               "sbsecret": "sb_secret_" + "k" * 24}
+    home = _supabase_home(token=secrets["sbp"])
+    repo = _drift_repo([(_PROBE_NOW - 10 * 86400,
+                         {"supabase/functions/alpha/index.ts": "a",
+                          "supabase/migrations/20261001000001_first.sql": "x"})])
+    echo = (f'Invalid token {secrets["sbp"]} (Bearer {secrets["jwt"]}) '
+            f'key {secrets["sbsecret"]} {secrets["anth"]}')
+    client = Path(tempfile.mkdtemp()) / "asc.mjs"
+    client.write_text("//")
+    agents = home / "home" / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    log = home / "paper_health.log"
+    log.write_text("paper healthcheck 2026-10-20T13:15:05\n"
+                   f"  [FAIL] webhook: ALERT_WEBHOOK_URL rejected {secrets['anth']}\n")
+    (agents / "com.traderjoe.paperhealth.plist").write_text(
+        R["paperhealth_plist"].replace("/Users/ryansharp/workspace/trader/data/paper_health.log",
+                                       str(log)))
+    trader = home / "trader"
+    (trader / ".venv" / "bin").mkdir(parents=True)
+    (trader / ".venv" / "bin" / "python3").write_text("")
+    cfg = {"trader": {"project": "trader"}, "apps": {"fathom": "1"},
+           "supabase": {"cadence": {"ref": "refabc", "dir": "supabase"}},
+           "asc": {"client": str(client)}, "mini": {"disk": "/x"}}
+    leaky_asc = (0, "HTTP 401 Unauthorized\n" + json.dumps(
+        {"errors": [{"detail": echo}]}), "")
+    scenarios = [
+        dict(http={"/functions": (401, json.dumps({"message": echo}))}),
+        dict(http={"/functions": (500, json.dumps({"message": echo}))}),
+        dict(http={"/functions": P.Unavailable(echo)}),
+        dict(asc={"appStoreVersions": leaky_asc, "/v1/builds": leaky_asc,
+                  "/v1/certificates": leaky_asc}),
+        dict(asc={"appStoreVersions": (1, "", echo), "/v1/builds": (1, echo, ""),
+                  "/v1/certificates": (1, "", echo)}),
+        dict(trader=(1, "", f"KeyError: {echo}"), lsof=(1, "", echo)),
+        dict(trader=_trader_out(verdict=[False, echo], daemon=[True, f"PID=1 {echo}"]),
+             lsof=(1, "", ""), netstat=(1, "", echo)),
+    ]
+    records, logs = [], []
+    handler = logging.Handler()
+    handler.emit = lambda rec: logs.append(rec.getMessage())
+    logging.getLogger("silkworm.health").addHandler(handler)
+    try:
+        for kw in scenarios:
+            s = _probe_sys(home=home / "home", disk=types.SimpleNamespace(free=1, total=100),
+                           **kw)
+            reg = P.register_all(s, cfg, registry={})
+            for rec in ({"slug": "trader", "scope": {"cwd": str(trader)}},
+                        {"slug": "fathom", "scope": {}},
+                        {"slug": "cadence", "scope": {"cwd": str(repo)}}, dict(P.MINI)):
+                for check_ in H.checks_for(rec, reg):
+                    records.append(H.run_check(check_, rec, None))
+    finally:
+        logging.getLogger("silkworm.health").removeHandler(handler)
+    blob = json.dumps(records) + "\n".join(logs)
+    leaked = [k for k, v in secrets.items() if v in blob]
+    check(f"{len(records)} results across every probe, none carrying a secret", not leaked
+          and len(records) >= 40, f"leaked: {leaked}")
+    check("and the scrubbing is on every registered probe",
+          all(getattr(c.probe, "__wrapped__", None) for c in P.register_all(
+              registry={}).values()))
+    boom = P.scrubbed(lambda rec, gh: (_ for _ in ()).throw(
+        RuntimeError(f"failed with {secrets['sbp']}")))
+    out = H.run_check(H.Check("boom", boom), {"slug": "x"}, None)
+    check("a probe that raises is unknown, and its message scrubbed too",
+          out["status"] == H.UNKNOWN and secrets["sbp"] not in json.dumps(out), out["summary"])
+    check("scrub keeps ordinary text", P.scrub("1.0 waiting for review for 11d") ==
+          "1.0 waiting for review for 11d")
+    check("and removes a credential it was handed, whatever its shape",
+          P.scrub("token plainSECRETvalue42 refused", known=["plainSECRETvalue42"])
+          == "token [redacted] refused")
+
+
+def test_probe_mini_is_checked_and_the_cli_can_probe_now():
+    P = _probes()
+    import health as H
+    print("\nhealth probes: the bot's pass includes the mini; `silkworm health --probe`")
+    calls = {}
+    fake_h = types.SimpleNamespace(
+        run_all=lambda store, ts, recs, gh, **kw: calls.setdefault("recs", list(recs)) and [],
+        gh_cli=None, OK="ok")
+    ns = bot_functions("run_health", HEALTH=object(), task_store=None, health=fake_h,
+                       health_probes=P, project_store=types.SimpleNamespace(
+                           all=lambda include_archived=False: [{"slug": "cadence"}],
+                           scope_for=lambda s: {}),
+                       announce_health=lambda *a: None)
+    ns["run_health"]()
+    check("the bot's pass runs over every project and the mini",
+          [r["slug"] for r in calls.get("recs") or ()] == ["cadence", "mini"], calls)
+    check("bot.py imports the probes, so they are registered",
+          "import health_probes" in (BASE / "bot.py").read_text())
+    check("projects_with_mini never doubles it",
+          [r["slug"] for r in P.projects_with_mini([{"slug": "mini"}, {"slug": "a"}])]
+          == ["a", "mini"])
+    reg = {"disk": H.Check("disk", lambda rec, gh: H.result(H.WARN, "disk 12% free"),
+                           applies=lambda rec: rec["slug"] == "mini"),
+           "x": H.Check("x", lambda rec, gh: H.result(H.OK, "fine"),
+                        applies=lambda rec: rec["slug"] == "a")}
+    cli = _load_cli()
+    old = os.environ.get("SILKWORM_TASK_ROLE")
+    try:
+        os.environ["SILKWORM_TASK_ROLE"] = "operator"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            refused = cli.probe_now("", recs=[{"slug": "a"}], registry=reg)
+        check("--probe is refused to the operator (restricted, no network)",
+              refused is None and "refused" in err.getvalue(), err.getvalue())
+        os.environ.pop("SILKWORM_TASK_ROLE", None)
+        old_role = os.environ.get("SILKWORM_ROLE")
+        os.environ["SILKWORM_ROLE"] = "operator"
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                refused = cli.probe_now("", recs=[{"slug": "a"}], registry=reg)
+        finally:
+            if old_role is None:
+                os.environ.pop("SILKWORM_ROLE", None)
+            else:
+                os.environ["SILKWORM_ROLE"] = old_role
+        check("and to an operator turn known only by SILKWORM_ROLE", refused is None)
+        os.environ["SILKWORM_TASK_ROLE"] = "implementor"
+        rows = cli.probe_now("", recs=[{"slug": "a"}, {"slug": "z", "archived": True}],
+                             registry=reg)
+        check("anyone else gets every applicable check, the mini included, archived skipped",
+              [(r["project"], r["check"], r["status"]) for r in rows]
+              == [("a", "x", "ok"), ("mini", "disk", "warn")], rows)
+        rows = cli.probe_now("mini", recs=[{"slug": "a"}], registry=reg)
+        check("--project narrows it", [r["project"] for r in rows] == ["mini"])
+    finally:
+        if old is None:
+            os.environ.pop("SILKWORM_TASK_ROLE", None)
+        else:
+            os.environ["SILKWORM_TASK_ROLE"] = old
+    src = (BASE / "bin" / "silkworm").read_text()
+    seg = ast.get_source_segment(src, next(n for n in ast.parse(src).body
+                                           if isinstance(n, ast.FunctionDef)
+                                           and n.name == "probe_now"))
+    check("probe_now records nothing and opens no item",
+          "record(" not in seg and "surface(" not in seg and "run_all" not in seg
+          and "_save" not in seg and "repair=False" in seg)
+
+
+def test_probe_config_maps_projects_explicitly():
+    P = _probes()
+    print("\nhealth.toml: an explicit table, read by every probe that needs one")
+    cfg = P.load_config()
+    check("the five apps, by App Store Connect id",
+          sorted(cfg.get("apps") or {}) == ["cadence", "fathom", "mondays", "saga", "silkswing"]
+          and all(str(v).isdigit() for v in cfg["apps"].values()))
+    check("the three Supabase backends, each with its ref and directory",
+          sorted(cfg.get("supabase") or {}) == ["cadence", "mondays", "saga"]
+          and all(v.get("ref") and v.get("dir") for v in cfg["supabase"].values()))
+    text = (BASE / "health.toml").read_text()
+    check("and no credential in it", not _re.search(r"sbp_|sb_secret|sk-ant|BEGIN|PASSWORD=",
+                                                     text))
+    reg = P.register_all(registry={})
+    check("every probe registered under its name",
+          sorted(reg) == ["app-store", "backend-drift", "credentials", "disk", "dispatching",
+                          "gateway", "healthcheck", "testflight"])
+    applies = {n: [s for s in ("trader", "cadence", "saga", "mondays", "fathom", "silkswing",
+                               "silkworm", "mini") if reg[n].applies({"slug": s})]
+               for n in reg}
+    check("each applies only where the table says",
+          applies == {"app-store": ["cadence", "saga", "mondays", "fathom", "silkswing"],
+                      "testflight": ["cadence", "saga", "mondays", "fathom", "silkswing"],
+                      "backend-drift": ["cadence", "saga", "mondays"],
+                      "dispatching": ["trader"], "gateway": ["trader"],
+                      "healthcheck": ["trader"], "credentials": ["mini"], "disk": ["mini"]},
+          applies)
 
 
 if __name__ == "__main__":

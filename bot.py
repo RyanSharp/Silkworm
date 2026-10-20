@@ -45,6 +45,7 @@ import email_ingest
 import git_guard
 import harvester
 import health
+import health_probes  # noqa: F401 - registers the project-specific probes
 import home
 import discard
 import holding
@@ -6381,7 +6382,9 @@ def run_health() -> list[dict]:
     if HEALTH is None:
         return []
     rows = health.run_all(
-        HEALTH, task_store, project_store.all(include_archived=False), health.gh_cli,
+        HEALTH, task_store,
+        health_probes.projects_with_mini(project_store.all(include_archived=False)),
+        health.gh_cli,
         scope_for=project_store.scope_for,
         on_open=lambda rec, item: announce_health(rec, item, True),
         on_close=lambda rec, item: announce_health(rec, item, False))

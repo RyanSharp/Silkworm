@@ -14,7 +14,7 @@
     silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
     silkworm status --json          the board, branches, revision, drain and wake-ups, as JSON
-    silkworm health [--project P] [--json]  the latest project health checks (CI, …),
+    silkworm health [--project P] [--json] [--probe]  the latest project health checks (CI, …),
                                     as the bot's own probes last found them (read-only)
     silkworm accept <id>            queue a proposal               } the dashboard's
     silkworm dismiss <id> [--round R]  cancel it                   } buttons, through
@@ -586,7 +586,7 @@ def do_tailscale(argv: list) -> int:
 PUSH_ACTIONS = ("status", "test", "forget-all")
 
 
-HEALTH_USAGE = "usage: silkworm health [--project P] [--json]"
+HEALTH_USAGE = "usage: silkworm health [--project P] [--json] [--probe]"
 
 
 def do_health(argv: list, path=None, now=None) -> int:
@@ -598,35 +598,44 @@ def do_health(argv: list, path=None, now=None) -> int:
     checks have run", not "all healthy"; one that cannot be read exits 1.
     """
     import health as _health
-    project, as_json, rest = "", False, list(argv)
+    project, as_json, probe, rest = "", False, False, list(argv)
     while rest:
         a = rest.pop(0)
         if a == "--json":
             as_json = True
+        elif a == "--probe":
+            probe = True
         elif a == "--project" and rest and not rest[0].startswith("-"):
             project = rest.pop(0)
         else:
             print(HEALTH_USAGE, file=sys.stderr)
             return EXIT_USAGE
-    path = Path(path or REPO / "health.json")
-    try:
-        store = _health.HealthStore(path, readonly=True, strict=True)
-    except Exception as e:                   # noqa: BLE001 - the reason is the output
-        print(f"refused: health.json cannot be read: {e}", file=sys.stderr)
-        return EXIT_REFUSED
-    rows = [r for r in store.all() if not project or r.get("project") == project]
+    if probe:
+        rows = probe_now(project)
+        if rows is None:
+            return EXIT_REFUSED
+        path = None
+    else:
+        path = Path(path or REPO / "health.json")
+        try:
+            store = _health.HealthStore(path, readonly=True, strict=True)
+        except Exception as e:                   # noqa: BLE001 - the reason is the output
+            print(f"refused: health.json cannot be read: {e}", file=sys.stderr)
+            return EXIT_REFUSED
+        rows = [r for r in store.all() if not project or r.get("project") == project]
     if as_json:
-        print(json.dumps({"ok": True, "ran": path.exists(), "checks": rows,
+        print(json.dumps({"ok": True, "ran": probe or path.exists(), "checks": rows,
                           "overall": _health.overall(rows) if rows else None},
                          indent=1, sort_keys=True))
         return EXIT_OK
     if not rows:
-        print(f"{WORM} health — " + ("no checks have run yet" if not path.exists()
+        print(f"{WORM} health — " + ("no checks have run yet" if path and not path.exists()
                                    else f"no checks recorded{' for ' + project if project else ''}"))
         return EXIT_OK
     now = time.time() if now is None else now
     print(f"{WORM} health — {len(rows)} check(s), "
-          f"{sum(1 for r in rows if r.get('status') == _health.OK)} ok")
+          f"{sum(1 for r in rows if r.get('status') == _health.OK)} ok"
+          + (" (probed just now; nothing recorded)" if probe else ""))
     for slug, mine in sorted(_health.by_project(rows).items()):
         print(f"  {slug}")
         for r in sorted(mine, key=lambda r: _health.SEVERITY.get(r.get("status"), 9)):
@@ -637,6 +646,49 @@ def do_health(argv: list, path=None, now=None) -> int:
                 if r.get("link"):
                     print(f"      {r['link']}")
     return EXIT_OK
+
+
+def probe_now(project: str = "", recs=None, gh=None, now=None,
+              registry=None) -> list | None:
+    """`silkworm health --probe`: run every applicable check now, in this
+    process, and return the rows -- recording nothing, opening no item.
+
+    For seeing what the next pass will say (a new probe, a fix just made)
+    without waiting a day for it. It reaches the network, so a restricted
+    role (the operator) is refused: its `silkworm health` is the read-only
+    one, and it reasons over what the bot gathered rather than fetching.
+    """
+    import health as _health
+    import health_probes as _probes
+    import roles as _roles
+    restricted = [r for r in (os.environ.get("SILKWORM_TASK_ROLE", ""),
+                              os.environ.get("SILKWORM_ROLE", "")) if r and _roles.is_restricted(r)]
+    role = restricted[0] if restricted else ""
+    if role:
+        print(f"refused: --probe reaches the network; the {role} role reads "
+              "`silkworm health` instead", file=sys.stderr)
+        return None
+    if recs is None:
+        # Read-only, like status: never repair the bot's live file from here.
+        # A task worktree has no projects.json; its main checkout does.
+        found = _probes.checkout_file(_probes.SYSTEM, "projects.json")
+        try:
+            raw = jsonstore.load(found, default={}, repair=False) if found else {}
+        except Exception as e:               # noqa: BLE001 - the reason is the output
+            print(f"refused: projects.json cannot be read: {e}", file=sys.stderr)
+            return None
+        recs = [{**r, "slug": r.get("slug") or slug} for slug, r in (raw or {}).items()
+                if isinstance(r, dict)]
+    now = time.time() if now is None else now
+    rows = []
+    for rec in _probes.projects_with_mini(recs):
+        if rec.get("archived") or (project and rec.get("slug") != project):
+            continue
+        for check in _health.checks_for(rec, registry):
+            res = _health.run_check(check, rec, gh or _health.gh_cli)
+            rows.append({"project": rec.get("slug"), "check": check.name, **res,
+                         "checked_at": now, "last_changed": now, "first_seen": now})
+    return rows
 
 
 def do_push(argv: list, call=None) -> int:

@@ -29,8 +29,9 @@ gh and no curl, on purpose).
 
 Checks plug in through `register()`: the core here -- the store, the
 transitions, the needs-you item -- knows nothing about what any probe looks
-at. The first is "ci" (GitHub Actions, below); project-specific probes add
-themselves the same way.
+at. The first is "ci" (GitHub Actions, below); the project-specific probes
+(the trader's daemon, Supabase drift, App Store Connect, the mini itself) add
+themselves the same way, from health_probes.py.
 
 Pure logic, testable without a token: every network call goes through the
 `gh` callable a probe is handed.

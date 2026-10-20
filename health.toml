@@ -1,0 +1,49 @@
+# What each project's health probes (health_probes.py) look at. Explicit, so a
+# probe never guesses which App Store app or Supabase project is a project's:
+# a wrong guess would report on someone else's thing with full confidence.
+#
+# Identifiers only. Credentials stay where they live -- ~/.appstoreconnect/
+# and ~/.supabase/ (accounts/<label>.env, projects/<ref>.env, as ~/.supabase/sb
+# resolves them) -- and nothing here or in a probe's output may hold one.
+
+# The trader's paper daemon. The probes run the trader's own code under its own
+# interpreter (heartbeat.health_verdict, paper_healthcheck.check_daemon /
+# check_gateway), so its constants -- the launchd label, Gateway port, daemon
+# log -- are read from there, not copied here.
+[trader]
+project = "trader"
+python = ".venv/bin/python3"
+# The healthcheck's launchd job: its plist says where it logs and when it runs.
+healthcheck_label = "com.traderjoe.paperhealth"
+# A scheduled dispatch slot this long past with no dispatch line fails.
+dispatch_grace_minutes = 60
+
+# Supabase backends: project ref, and where the repo keeps supabase/.
+[supabase.cadence]
+ref = "glwhwbsyjpqmdajkntrp"
+dir = "supabase"
+
+[supabase.saga]
+ref = "jlwovmozhisqywlkqxzy"
+dir = "backend/supabase"
+
+[supabase.mondays]
+ref = "twqhvixtqgdpwgmljnvm"
+dir = "backend/supabase"
+
+# App Store Connect app ids (the numeric id in the app's ASC URL).
+[apps]
+silkswing = "6800932367"
+fathom = "6818993851"
+mondays = "6806709316"
+cadence = "6767707089"
+saga = "6783572549"
+
+[asc]
+# The App Store Connect client that already signs requests (raw P1363 ES256)
+# with the key in ~/.appstoreconnect/. Relative to Silkworm's main checkout.
+client = "workspace/asc.mjs"
+
+# This machine, checked as the pseudo-project "mini".
+[mini]
+disk = "/System/Volumes/Data"

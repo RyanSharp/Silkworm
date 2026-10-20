@@ -133,8 +133,9 @@ OPERATOR_TOOLS = " ".join([
     "Bash({bin} retry:*) Bash({bin} run-next:*) Bash({bin} tidy:*)",
     "Bash({bin} operator:*) Bash({bin} deploy --after-turn:*)",
     "Bash({bin} task:*) Bash({bin} defer:*)",
-    # Read-only: prints health.json, which the bot's own probes write. It has
-    # no flag that runs a probe, reaches the network or writes anything.
+    # Read-only: prints health.json, which the bot's own probes write. Its one
+    # flag that runs probes (--probe, reaching the network) refuses a
+    # restricted role; nothing in it writes anything.
     "Bash({bin} health:*)",
 ])
 
