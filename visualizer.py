@@ -2008,6 +2008,9 @@ function dur(s) {
   if (s < 86400) return Math.floor(s/3600) + "h" + (Math.floor(s%3600/60) || "") ;
   return Math.floor(s/86400) + "d" + (Math.floor(s%86400/3600) || "");
 }
+// How long a stalled turn has been silent -- what makes it stalled. Its age
+// says nothing: a turn ten hours in and still writing is fine.
+function silence(t) { return t.silent_s ?? t.age_s; }
 function age(ts) {
   const d = (Date.now()/1000 - ts) / 86400;
   if (d < 1/24) return Math.max(1, Math.round(d*24*60)) + "m ago";
@@ -2219,15 +2222,21 @@ function renderKindFilter(sessions) {
                 >tidy <b>${oldRuns}</b></button>` : ""));
 }
 
-// The time a running turn has been going is the one thing in this answer that
-// moves every second, so the server leaves it out of the ETag; the page adds
-// the time since the answer it is drawing from arrived.
+// The time a running turn has been going, and has been silent, are the things
+// in this answer that move every second, so the server leaves them out of the
+// ETag; the page adds the time since the answer it is drawing from arrived. A
+// write ends the silence, but only a stalled turn's is shown, and a write
+// un-stalls it -- which changes the ETag, so the page is not counting on.
 function freshAges(data) {
   const c = readCache.get("/api/sessions");
   const gone = c ? (Date.now() - c.at) / 1000 : 0;
   for (const s of data.sessions || []) if (s.turn) {
     if (s.turn.age0 === undefined) s.turn.age0 = s.turn.age_s;
     s.turn.age_s = Math.round(s.turn.age0 + gone);
+    if (s.turn.silent_s != null) {
+      if (s.turn.silent0 === undefined) s.turn.silent0 = s.turn.silent_s;
+      s.turn.silent_s = Math.round(s.turn.silent0 + gone);
+    }
   }
 }
 async function loadList() {
@@ -2252,7 +2261,7 @@ function cardHtml(s) {
   const badges =
     (t && t.stalled ? `<span class="badge stall" title="${t.child_alive
           ? "silent far past the idle limit" : "no claude process — it cannot finish"}"
-       >stalled ${dur(t.age_s)}</span>`
+       >stalled · silent ${dur(silence(t))}</span>`
      : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
      : s.running ? '<span class="badge run">running</span>' : "") +
     (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
@@ -2470,7 +2479,7 @@ function chatHead(s, live, nAlerts) {
   const queued = turns.filter(t => t.state === "queued").length;
   const t = s.turn;
   const running = !!(t || (live && live.running) || s.running);
-  const state = t && t.stalled ? `<span class="cst bad">⚠ stalled ${dur(t.age_s)}</span>`
+  const state = t && t.stalled ? `<span class="cst bad">⚠ stalled · silent ${dur(silence(t))}</span>`
     : running ? `<span class="cst run">● running${t ? " " + dur(t.age_s) : ""}</span>`
     : s.updated ? `<span class="cst">${age(s.updated)}</span>` : "";
   return `<button class="cback" onclick="closeSession()" title="back to the list" aria-label="back to the list">‹</button>
@@ -2500,7 +2509,8 @@ function transcriptHead(s) {
   if (s.turn) {
     const t = s.turn;
     h += `<div class="turnbar${t.stalled ? " bad" : ""}">
-      <b>${t.stalled ? "⚠ Turn stalled" : "⏳ Turn running"} · ${dur(t.age_s)}</b>
+      <b>${t.stalled ? `⚠ Turn stalled · silent ${dur(silence(t))} · ${dur(t.age_s)} in`
+                   : `⏳ Turn running · ${dur(t.age_s)}`}</b>
       <span>${t.child_alive ? "claude process alive" : "no claude process — cannot finish"}</span>
       ${t.prompt ? `<span class="what">${esc(t.prompt)}</span>` : ""}
       <button class="ghost" onclick="releaseThread()">Release thread</button></div>`;
@@ -3073,7 +3083,7 @@ function alertParts(sessions, slack, revision) {
   if (stalled.length) parts.push(
     `<span class="alert bad">⚠ ${stalled.length} thread${stalled.length>1?"s":""} stalled</span>` +
     stalled.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${
-      esc(s.title || s.key)} · ${dur(s.turn.age_s)}</button>`).join(""));
+      esc(s.title || s.key)} · silent ${dur(silence(s.turn))}</button>`).join(""));
   if (pricey.length) parts.push(
     `<span class="alert warn">$ ${pricey.length} cost spike${pricey.length>1?"s":""}</span>` +
     pricey.map(s => `<button class="ghost" onclick="jumpTo('${s.key}')">${

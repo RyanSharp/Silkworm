@@ -24007,7 +24007,9 @@ globalThis.getComputedStyle = () => ({lineHeight: "22px", paddingTop: "10px", pa
 (0, eval)(__JS__ + `
 ;globalThis.__p = {chatItems, toolsLabel, chatHtml, drawChat, toggleTools, chatOpen, chatEls,
   alertParts, renderAlerts, alertCount: () => alertList.length, defaultKind, setKind,
-  kind: () => threadKind, chatHead, growReply, jumpTo, filesHtml, keepEnd,
+  kind: () => threadKind, chatHead, growReply, jumpTo, filesHtml, keepEnd, cardHtml, freshAges, transcriptHead,
+  answeredAgo: s => readCache.set("/api/sessions", {etag: "x", data: {}, at: Date.now() - s * 1000}),
+  forgetAnswer: () => readCache.delete("/api/sessions"),
   setLast: s => { lastSessions = s; }, getActive: () => active, setActive: a => { active = a; },
   setTview: t => { tview = t; }};`);
 const P = globalThis.__p, out = {};
@@ -24097,6 +24099,21 @@ out.jumped = (P.getActive() || {}).key || null;
 out.headRun = P.chatHead({title: "A <b> title", project: "silkworm", turn: {age_s: 125, stalled: false}},
                          {running: true, turns: [{state: "queued"}, {state: "running"}]}, 3);
 out.headIdle = P.chatHead({title: "", project: "", updated: now - 120}, {turns: []}, 0);
+// A stalled turn: five hours in, silent for the last two. Every place it is
+// shown says how long it has been silent, not how old it is.
+const stuck = () => ({key: "s", title: "S", turn: {age_s: 5 * 3600, silent_s: 2 * 3600 + 60,
+                                                   stalled: true, child_alive: true}});
+out.stallCard = P.cardHtml(stuck());
+out.stallHead = P.chatHead(stuck(), {turns: []}, 0);
+out.stallAlert = P.alertParts([stuck()], {}, {}).join("");
+try { out.stallBar = (P.transcriptHead(Object.assign(stuck(), {resume_cmd: "x", slack_link: "y"})).match(/<b>[^<]*Turn[^<]*<\/b>/) || [""])[0]; }
+catch (e) { out.stallBar = "threw: " + e.message; }
+out.stallOld = P.cardHtml({key: "o", turn: {age_s: 600, stalled: true, child_alive: false}});
+// Between full answers the page counts the silence on, as it does the age.
+const later = {sessions: [stuck()]};
+P.answeredAgo(3600); P.freshAges(later);
+out.stallLater = [later.sessions[0].turn.age_s, later.sessions[0].turn.silent_s];
+P.forgetAnswer();
 // Composer: grows to six lines, then scrolls.
 const reply = byId("reply");
 reply.scrollHeight = 400; P.growReply();
@@ -24195,6 +24212,18 @@ def test_viz_phone_chat():
     check("the header: back, the title escaped, project, running time, queued, ⚠ and Stop",
           'onclick="closeSession()"' in h and "A &lt;b&gt; title" in h and "silkworm" in h
           and "running 2m" in h and "1 queued" in h and "⚠ 3" in h and "cmdSend('!stop')" in h, h)
+    check("a stalled card says how long it has been silent, not how old it is",
+          "stalled · silent 2h1" in o["stallCard"] and "5h" not in o["stallCard"], o["stallCard"])
+    check("so does a stalled thread's header",
+          "stalled · silent 2h1" in o["stallHead"] and "5h" not in o["stallHead"], o["stallHead"])
+    check("and the alert bar's button for it",
+          "silent 2h1" in o["stallAlert"] and "5h" not in o["stallAlert"], o["stallAlert"])
+    check("the open thread's turn bar leads with the silence, then the age",
+          "Turn stalled · silent 2h1 · 5h in" in o["stallBar"], o["stallBar"])
+    check("an answer without silent_s still shows a number (its age)",
+          "stalled · silent 10m" in o["stallOld"], o["stallOld"])
+    check("between answers the silence counts on with the age",
+          o["stallLater"] == [6 * 3600, 3 * 3600 + 60], o["stallLater"])
     hi = o["headIdle"]
     check("an idle thread's header has no Stop and no ⚠, and says untitled",
           "!stop" not in hi and "⚠" not in hi and "untitled" in hi, hi)
