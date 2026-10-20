@@ -71,7 +71,8 @@ APPROVAL_TTL_S = 24 * 3600
 #: you type after `!approve`.
 GUARDS = {
     "accept": ("deciding on a proposal, reviewed work or research findings -- accepting, "
-               "approving, dismissing, closing or digging -- or cancelling running work "
+               "approving, dismissing, closing or digging -- or dismissing or cancelling "
+               "queued, blocked, failed or running work it does not own "
                "(those decisions are yours)"),
     "release": "starting a release (TestFlight, App Store, !release)",
     "publish": "pushing or publishing a project whose publish setting is off",
