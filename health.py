@@ -45,6 +45,7 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import jsonstore
@@ -65,9 +66,16 @@ SOURCE = "health"
 #: Lines of evidence kept per check: enough to act on, not a log.
 EVIDENCE_MAX = 12
 
-#: Default schedule (HEALTH_EVERY), and the values that switch it off.
-DEFAULT_EVERY = "1h"
-OFF = ("off", "none", "0", "false", "no")
+#: The daily pass runs this long before the operator's sweep (HEALTH_LEAD),
+#: so the sweep's brief reads this morning's results; and the values that
+#: switch it off. "0" is not one of them: it means "at the sweep's time".
+DEFAULT_LEAD = "15m"
+OFF = ("off", "none", "false", "no")
+#: The longest lead accepted: further back than this is not "before the
+#: sweep" but a different schedule.
+MAX_LEAD_MIN = 12 * 60
+#: A check warning this many days (HEALTH_WARN_DAYS) may get one fix proposal.
+DEFAULT_WARN_DAYS = 3.0
 
 
 # --- results -------------------------------------------------------------------
@@ -96,18 +104,31 @@ class Check:
     `applies(project_record)` says whether it means anything for that project
     at all (a CI check for a project with no GitHub repository does not)."""
 
-    def __init__(self, name: str, probe, applies=None, about: str = ""):
+    def __init__(self, name: str, probe, applies=None, about: str = "",
+                 decision=None, short=None):
         self.name, self.probe, self.about = name, probe, about
         self.applies = applies or (lambda rec: True)
+        # `decision(record) -> str`: for a check whose trouble is the owner's
+        # to settle (a release, an Apple review, a credential), the decision
+        # it needs, in words -- or "" when this particular result is not one.
+        # A check with a decision is never filed as code work.
+        self.decision = decision
+        # `short(record) -> str`: a few words for an ok result in the brief
+        # ("CI green", "1.1.0 live").
+        self.short = short
+        # `identity(record) -> str`: which trouble this is, where the
+        # fingerprint is too fine for "proposed once" (see health.identity).
+        self.identity = None
 
 
 REGISTRY: dict[str, Check] = {}
 
 
-def register(name: str, probe, applies=None, about: str = "") -> Check:
+def register(name: str, probe, applies=None, about: str = "",
+             decision=None, short=None) -> Check:
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name or ""):
         raise ValueError(f"bad check name {name!r}")
-    check = Check(name, probe, applies, about)
+    check = Check(name, probe, applies, about, decision, short)
     REGISTRY[name] = check
     return check
 
@@ -146,6 +167,12 @@ def key(slug: str, check: str) -> str:
     return f"{slug}/{check}"
 
 
+#: Fields of a record that outlive each new result: its needs-you item, its
+#: fix proposal (and a filing that was held), and what it was before.
+CARRIED = ("attention", "attention_for", "proposal", "proposal_at", "proposal_for",
+           "proposal_held", "proposal_held_at", "was")
+
+
 class HealthStore:
     """health.json: the latest result of every (project, check), atomically.
 
@@ -173,12 +200,24 @@ class HealthStore:
             data = {}
         self._checks: dict = dict(data.get("checks") or {})
         self._cache: dict = dict(data.get("cache") or {})
+        self._meta: dict = dict(data.get("meta") or {})
 
     def _save(self) -> None:
         if self.readonly:
             raise RuntimeError("a read-only health store does not save")
         jsonstore.save(self.path, {"version": self.VERSION, "checks": self._checks,
-                                   "cache": self._cache})
+                                   "cache": self._cache, "meta": self._meta})
+
+    # the daily pass
+    def pass_on(self) -> str:
+        """The day (YYYY-MM-DD) the scheduled pass last completed, or ""."""
+        with self._lock:
+            return str(self._meta.get("pass_on") or "")
+
+    def mark_pass(self, now: datetime) -> None:
+        with self._lock:
+            self._meta.update(pass_on=now.strftime("%Y-%m-%d"), pass_at=now.timestamp())
+            self._save()
 
     def get(self, slug: str, check: str) -> dict | None:
         with self._lock:
@@ -209,8 +248,12 @@ class HealthStore:
             new = {"project": slug, "check": check, **res, "checked_at": now,
                    "first_seen": (prior or {}).get("first_seen") or now,
                    "last_changed": changed,
-                   "attention": (prior or {}).get("attention") or "",
-                   "attention_for": (prior or {}).get("attention_for") or ""}
+                   **{f: (prior or {}).get(f) or "" for f in CARRIED}}
+            if prior and changed == now and prior.get("status") != res["status"]:
+                # What it was before it became this, for "new since yesterday
+                # (was ok)". Through a blip, the last thing it was seen to be.
+                new["was"] = (known.get("status") if prior.get("status") == UNKNOWN
+                              and known.get("status") else prior.get("status")) or ""
             if res["status"] == UNKNOWN:
                 new["last_known"] = (prior or {}).get("last_known") or {}
             elif ((prior or {}).get("last_known") or {}).get("status") == res["status"]:
@@ -324,6 +367,8 @@ def surface(store: HealthStore, task_store, slug: str, check: str,
         store.update(slug, check, attention=item["id"],
                      attention_for=rec.get("fingerprint") or "")
         return {"opened": item}
+    if rec["status"] == OK:
+        retire_proposal(store, task_store, slug, check, f"the {check} check passes again")
     if not item:
         return {}
     store.update(slug, check, attention="", attention_for="")
@@ -363,6 +408,8 @@ def retire(store: HealthStore, task_store, keep: set) -> list[str]:
             except Exception:
                 log.exception("health: could not close %s", item["id"])
                 continue
+        retire_proposal(store, task_store, rec["project"], rec["check"],
+                        f"the {rec['check']} check no longer runs here")
         store.forget(rec["project"], rec["check"])
         gone.append(k)
     return gone
@@ -453,9 +500,11 @@ def by_project(rows) -> dict:
     return out
 
 
-def context_section(rows, now: float | None = None, evidence: int = 4) -> str:
+def context_section(rows, now: float | None = None, evidence: int = 4,
+                    actions=None) -> str:
     """The operator's "Project health" section: every non-ok check in detail,
-    with its evidence and link; the ok ones counted, not listed."""
+    with its evidence and link; the ok ones counted, not listed. `actions(rec)`
+    is what is being done about one (see `action`), said under it."""
     rows = list(rows)
     if not rows:
         return "(no health checks have run yet)"
@@ -469,6 +518,14 @@ def context_section(rows, now: float | None = None, evidence: int = 4) -> str:
         lines += [f"    {e}" for e in (r.get("evidence") or [])[:evidence]]
         if r.get("link"):
             lines.append(f"    {r['link']}")
+        if actions:
+            try:
+                said = actions(r)
+            except Exception:
+                log.exception("health: what is done about %s/%s", r.get("project"), r.get("check"))
+                said = ""
+            if said:
+                lines.append(f"    → {said}")
     projects = len({r.get("project") for r in rows})
     lines.append(f"({oks} of {len(rows)} checks ok across {projects} project"
                  f"{'s' if projects != 1 else ''})")
@@ -498,19 +555,374 @@ def board_line(rows) -> dict | None:
             "link": bad[0].get("link") or ""}
 
 
-def parse_every(text: str) -> float | None:
-    """HEALTH_EVERY -> seconds, or None for off. `90`, `90s`, `15m`, `2h`.
-    Raises ValueError on anything else, or on less than a minute."""
-    t = (text if text is not None else DEFAULT_EVERY).strip().lower() or DEFAULT_EVERY
+# --- what is done about it: decisions and fix proposals -----------------------------
+
+#: The `source_ref` prefix of a fix proposal filed for a check, so one is
+#: found from the task store alone if the record lost its pointer.
+PROPOSAL_REF = "health:"
+
+
+def warn_days(text: str | None) -> float:
+    """HEALTH_WARN_DAYS -> days, DEFAULT_WARN_DAYS for unset or unreadable."""
+    try:
+        v = float(str(text).strip()) if text not in (None, "") else DEFAULT_WARN_DAYS
+    except ValueError:
+        log.warning("HEALTH_WARN_DAYS %r is not a number; using %g", text, DEFAULT_WARN_DAYS)
+        return DEFAULT_WARN_DAYS
+    return max(0.0, v)
+
+
+def identity(rec: dict) -> str:
+    """Which trouble this is, for "proposed once": its fingerprint where the
+    probe gives one (the commits failing), else the status and when it
+    started -- the same warning, not the same wording, since a summary that
+    counts days changes every day."""
+    check = REGISTRY.get(rec.get("check") or "")
+    if check and getattr(check, "identity", None):
+        try:
+            got = check.identity(rec)
+            if got:
+                return got
+        except Exception:
+            log.exception("health: the identity of %s", rec.get("check"))
+    return rec.get("fingerprint") or f"{rec.get('status')}@{int(rec.get('last_changed') or 0)}"
+
+
+def decision(rec: dict, registry: dict | None = None) -> str:
+    """The owner's decision this result needs, in words, or ""."""
+    registry = REGISTRY if registry is None else registry
+    check = registry.get(rec.get("check") or "")
+    if not check or not check.decision or rec.get("status") == OK:
+        return ""
+    try:
+        return " ".join(str(check.decision(rec) or "").split())
+    except Exception:
+        log.exception("health: the decision for %s/%s", rec.get("project"), rec.get("check"))
+        return ""
+
+
+def proposal_ref(slug: str, check: str) -> str:
+    return f"{PROPOSAL_REF}{key(slug, check)}"
+
+
+def proposal_of(rec: dict, task_store) -> dict | None:
+    """The (project, check)'s fix proposal: the one its record points at, or
+    -- a record that lost the pointer -- an open task filed for it."""
+    if rec.get("proposal"):
+        t = task_store.get(rec["proposal"])
+        if t:
+            return t
+    ref = proposal_ref(rec.get("project") or "", rec.get("check") or "")
+    for t in task_store.all().values():
+        if t.get("source_ref") == ref and t.get("state") not in tasks.ENDED:
+            return t
+    return None
+
+
+def proposal_refusal(rec: dict | None, task_store, now: float | None = None, *,
+                     registry: dict | None = None,
+                     warn_after: float = DEFAULT_WARN_DAYS) -> str:
+    """Why a fix proposal may not be filed for this check now, or "".
+
+    Once per (project, check) and trouble: a check that newly fails, or has
+    warned for `warn_after` days, may get one -- through the ordinary proposed
+    gate, whose caps and dedup still apply on top of this. Never while one is
+    open; never again for the same trouble once one was filed (dismissed is an
+    answer); never for a decision that is the owner's to make, which is said,
+    not filed as code work.
+    """
+    now = time.time() if now is None else now
+    if not rec:
+        return "no such health check has run"
+    name = f"{rec.get('project')}/{rec.get('check')}"
+    status = rec.get("status")
+    if status in (OK, UNKNOWN):
+        return f"{name} is {status}: there is nothing to fix"
+    owner = decision(rec, registry)
+    if owner:
+        return (f"{name} is the owner's decision, not code work: {owner}. Say it in "
+                "your report; do not file it")
+    if status == WARN:
+        age = (now - (rec.get("last_changed") or now)) / 86400
+        if age < warn_after:
+            return (f"{name} has warned for {age:.1f}d; a fix is proposed only once it "
+                    f"has warned for {warn_after:g}d")
+    item = task_store.get(rec["attention"]) if rec.get("attention") else None
+    if item and item.get("state") == tasks.RUNNING:
+        return f"{name}'s item {item['id']} is being worked on right now"
+    prop = proposal_of(rec, task_store)
+    if prop and prop.get("state") not in tasks.ENDED:
+        return f"{name} already has a fix proposal open: {prop['id']} ({prop.get('state')})"
+    if rec.get("proposal") and rec.get("proposal_for") == identity(rec):
+        state = (prop or {}).get("state") or "gone"
+        return (f"{name} was already proposed as {rec['proposal']} ({state}) for this same "
+                "trouble; a different failure may be proposed when it comes")
+    return ""
+
+
+def retire_proposal(store: HealthStore, task_store, slug: str, check: str, why: str) -> str:
+    """Dismiss the check's fix proposal if it is still only a proposal, once
+    the check passes (or stops being checked): a fix for something already
+    fixed should not wait on the board, counting against the backlog cap, to
+    be accepted by mistake. One already accepted is work under way, and left
+    alone. Returns the id dismissed, or ""."""
+    rec = store.get(slug, check) or {"project": slug, "check": check}
+    prop = proposal_of(rec, task_store)
+    if not prop or prop.get("state") != tasks.PROPOSED:
+        return ""
+    try:
+        task_store.transition(prop["id"], tasks.CANCELLED, why, expect=tasks.PROPOSED)
+    except Exception:
+        log.exception("health: could not dismiss proposal %s", prop["id"])
+        return ""
+    return prop["id"]
+
+
+def own_items(task_store, slug: str, check: str) -> set:
+    """Every needs-you item this (project, check) ever opened, open or closed:
+    each carries the check's evidence by construction, so a fix proposal is
+    never a "duplicate" of its own alarms."""
+    pre = ref_prefix(slug, check)
+    return {t["id"] for t in task_store.all().values()
+            if t.get("source") == SOURCE and str(t.get("source_ref") or "").startswith(pre)}
+
+
+def proposal_goal(goal: str, rec: dict, now: float | None = None, limit: int = 3900) -> str:
+    """The goal a fix proposal is filed with: the operator's words, then the
+    check's evidence -- so whoever picks it up has what the probe saw, not
+    the operator's paraphrase of it."""
+    now = time.time() if now is None else now
+    ev = "\n".join(f"  {e}" for e in (rec.get("evidence") or ())) or "  (no evidence recorded)"
+    block = (f"\n\nHealth check {rec.get('project')}/{rec.get('check')}: {rec.get('status')} "
+             f"for {_age(now - (rec.get('last_changed') or now))} — {rec.get('summary')}\n"
+             f"Evidence:\n{ev}" + (f"\nLink: {rec['link']}" if rec.get("link") else ""))
+    goal = (goal or "").strip()
+    return (goal[:max(0, limit - len(block))] + block)[:limit]
+
+
+def link_proposal(store: HealthStore, slug: str, check: str, task_id: str,
+                  now: float | None = None) -> None:
+    rec = store.get(slug, check) or {}
+    store.update(slug, check, proposal=task_id, proposal_at=time.time() if now is None else now,
+                 proposal_for=identity(rec), proposal_held="", proposal_held_at="")
+
+
+def hold_proposal(store: HealthStore, slug: str, check: str, why: str,
+                  now: float | None = None) -> None:
+    """A filing the caps or dedup refused, kept so the brief says why."""
+    store.update(slug, check, proposal_held=" ".join(str(why or "").split())[:240],
+                 proposal_held_at=time.time() if now is None else now)
+
+
+def _when(ts: float, now: float) -> str:
+    """"today", a weekday within the week, else the date -- for a phone."""
+    then, today = datetime.fromtimestamp(ts), datetime.fromtimestamp(now)
+    days = (today.date() - then.date()).days
+    if days <= 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    return then.strftime("%A") if days < 7 else then.strftime("%b %d").replace(" 0", " ")
+
+
+def action(rec: dict, task_store, now: float | None = None, *, registry: dict | None = None,
+           warn_after: float = DEFAULT_WARN_DAYS) -> tuple[str, str]:
+    """(kind, words) for what is being done about a non-ok check.
+
+    kinds: "decision" (the owner's, stated), "proposal" (one is open),
+    "proposed" (one was, for this same trouble), "held" (a filing the caps or
+    dedup refused), "eligible" (a fix may be proposed now), "watching" (a
+    warning not yet old enough), "looking" (unknown: the probe could not see).
+    """
+    now = time.time() if now is None else now
+    status = rec.get("status")
+    owner = decision(rec, registry)
+    if owner:
+        return "decision", f"decide: {owner}"
+    if status == UNKNOWN:
+        return "looking", "nothing to act on until it can look"
+    if status == OK:
+        return "", ""
+    prop = proposal_of(rec, task_store)
+    if prop and prop.get("state") not in tasks.ENDED:
+        return "proposal", (f"proposal {prop['id']} open since "
+                            f"{_when(prop.get('created') or rec.get('proposal_at') or now, now)}"
+                            + (" — accept it to start the fix" if prop.get("state") == tasks.PROPOSED
+                               else f" ({prop.get('state')})"))
+    if rec.get("proposal") and rec.get("proposal_for") == identity(rec):
+        return "proposed", (f"proposed as {rec['proposal']} "
+                            f"({(prop or {}).get('state') or 'gone'}); not refiled for the same trouble")
+    why = proposal_refusal(rec, task_store, now, registry=registry, warn_after=warn_after)
+    if why and status == WARN and "has warned for" in why:
+        left = warn_after - (now - (rec.get("last_changed") or now)) / 86400
+        return "watching", f"watching; a fix is proposed if it still warns in {max(left, 0):.0f}d"
+    if why:
+        return "held", why
+    # Held since the latest pass only: a cap that refused it yesterday says
+    # nothing about today, and a stale hold would hide the offer for good.
+    if rec.get("proposal_held") and (rec.get("proposal_held_at") or 0) >= (rec.get("checked_at") or 0):
+        return "held", f"fix proposal held: {rec['proposal_held']}"
+    return "eligible", "a fix may be proposed (once)"
+
+
+def short(rec: dict, registry: dict | None = None) -> str:
+    """A few words for an ok check in the brief."""
+    registry = REGISTRY if registry is None else registry
+    check = registry.get(rec.get("check") or "")
+    if check and check.short:
+        try:
+            got = " ".join(str(check.short(rec) or "").split())
+            if got:
+                return got[:40]
+        except Exception:
+            log.exception("health: the short form of %s", rec.get("check"))
+    return f"{rec.get('check')} ok"
+
+
+def _new_at_last_pass(rec: dict, now: float) -> bool:
+    """Whether the status became what it is at the latest pass -- "since
+    yesterday" for a daily pass, by the passes themselves rather than a window
+    of hours alone, which a pass a little late would make say it two days
+    running. (And within a day: a latest pass days old is not news.)"""
+    changed = rec.get("last_changed") or 0
+    return changed >= (rec.get("checked_at") or 0) - 1 and now - changed < 26 * 3600
+
+
+def _changed(rec: dict, now: float) -> str:
+    """What changed since yesterday, in a few words."""
+    since = rec.get("last_changed") or now
+    if not _new_at_last_pass(rec, now):
+        return f"unchanged {_age(now - since)}"
+    was = rec.get("was")
+    if was:
+        return f"new since yesterday (was {was})"
+    # Never anything else: it has been this since it was first looked at,
+    # which says nothing about whether it is new.
+    return f"first checked {_when(rec.get('first_seen') or since, now)}"
+
+
+_LABEL = {FAIL: "failing", WARN: "warn", UNKNOWN: "can't look"}
+#: The order a project's ok checks are named in: code, backend, store.
+_SHORT_ORDER = ("ci", "backend-drift", "app-store", "testflight")
+
+
+def brief(rows, task_store, now: float | None = None, *, registry: dict | None = None,
+          warn_after: float = DEFAULT_WARN_DAYS, checked_on: str = "",
+          summary_chars: int = 110) -> str:
+    """The sweep's per-project health brief, Slack mrkdwn, read on a phone.
+
+    One line per project -- its icon, its name, a few words per ok check --
+    and under it, for each check that is not ok, how long and whether that
+    changed since yesterday, the probe's summary, and either what is being
+    done (a fix proposal and since when) or the exact decision it needs from
+    the owner. Worst projects first. `rows` None is "could not be read".
+    """
+    now = time.time() if now is None else now
+    if rows is None:
+        return "*Project health:* could not be read this morning (see the bot log)."
+    rows = list(rows)
+    if not rows:
+        return "*Project health:* no checks have run yet."
+    groups = by_project(rows)
+    order = sorted(groups, key=lambda slug: (SEVERITY.get(overall(groups[slug]), 9), slug))
+    oks = sum(1 for r in rows if r.get("status") == OK)
+    head = (f"*Project health* — {oks} of {len(rows)} checks ok"
+            + (f", checked {checked_on}" if checked_on else ""))
+    lines = [head]
+    for slug in order:
+        mine = sorted(groups[slug], key=lambda r: (SEVERITY.get(r.get("status"), 9),
+                                                   r.get("check") or ""))
+        good = [short(r, registry) for r in sorted(
+            mine, key=lambda r: (_SHORT_ORDER.index(r.get("check"))
+                                 if r.get("check") in _SHORT_ORDER else 99, r.get("check") or ""))
+            if r.get("status") == OK]
+        fixed = [r.get("check") for r in mine if r.get("status") == OK and r.get("was")
+                 and r.get("was") != OK and _new_at_last_pass(r, now)]
+        line = f"{ICON.get(overall(mine), '?')} *{slug}*"
+        if good:
+            line += " — " + ", ".join(good)
+        if fixed:
+            line += f" (ok again since yesterday: {', '.join(fixed)})"
+        lines.append(line)
+        for r in mine:
+            if r.get("status") == OK:
+                continue
+            summ = _clip(r.get("summary") or r.get("status"), summary_chars)
+            lines.append(f"   • {r.get('check')} {_LABEL.get(r.get('status'), r.get('status'))}, "
+                         f"{_changed(r, now)}: {summ}")
+            _kind, words = action(r, task_store, now, registry=registry, warn_after=warn_after)
+            if words:
+                lines.append(f"      → {words}")
+    return "\n".join(lines)
+
+
+def _clip(text: str, n: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:max(0, n - 1)].rstrip() + "…"
+
+
+# --- the schedule: once a day, just before the operator's sweep -----------------
+
+def parse_lead(text: str | None) -> int | None:
+    """HEALTH_LEAD -> whole minutes before the sweep, or None for off.
+    `15`, `15m`, `1h`, `0` (at the sweep's own time). Raises ValueError on
+    anything else, or on more than MAX_LEAD_MIN."""
+    t = (text if text is not None else DEFAULT_LEAD).strip().lower() or DEFAULT_LEAD
     if t in OFF:
         return None
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smh]?)", t)
+    m = re.fullmatch(r"(\d+)\s*([mh]?)", t)
     if not m:
-        raise ValueError(f"HEALTH_EVERY {text!r} is not a duration like 30m or 1h")
-    secs = float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
-    if secs < 60:
-        raise ValueError(f"HEALTH_EVERY {text!r} is under a minute")
-    return secs
+        raise ValueError(f"HEALTH_LEAD {text!r} is not a lead like 15m or 1h")
+    minutes = int(m.group(1)) * (60 if m.group(2) == "h" else 1)
+    if minutes > MAX_LEAD_MIN:
+        raise ValueError(f"HEALTH_LEAD {text!r} is more than {MAX_LEAD_MIN // 60}h")
+    return minutes
+
+
+def pass_at(sweep_at: str, lead_min: int) -> str:
+    """The pass's time of day: `sweep_at` (HH:MM) less `lead_min`, held at
+    00:00 rather than wrapping into yesterday -- a pass "before" an early
+    sweep must still be today's."""
+    h, m = (int(x) for x in sweep_at.split(":"))
+    total = max(0, h * 60 + m - max(0, int(lead_min)))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def pass_due(now: datetime, at: str, last_on: str) -> bool:
+    """Whether today's pass should run now: its time has passed and it has not
+    completed today. The wall-clock catch-up projects.due_for_ideation and
+    the operator's sweep use, so a bot that was down at 08:15 runs it as soon
+    as it is back, and a restart after it ran does not run it again."""
+    return last_on != now.strftime("%Y-%m-%d") and now.strftime("%H:%M") >= at
+
+
+def schedule(sweep_at_text: str, lead_text: str | None, default_sweep: str,
+             parse_at) -> tuple[str | None, str]:
+    """(HH:MM or None for off, the line the bot logs at startup).
+
+    Anchored to the sweep's time whether or not the sweep runs: with
+    OPERATOR_SWEEP_AT off (or unreadable) the pass keeps the time it would
+    have run before the default sweep, so turning the operator off does not
+    turn health off with it."""
+    try:
+        lead = parse_lead(lead_text)
+    except ValueError as e:
+        return None, f"off: {e}"
+    if lead is None:
+        return None, f"off (HEALTH_LEAD={lead_text})"
+    sweep_text = (sweep_at_text or "").strip()
+    note = ""
+    if not sweep_text or sweep_text.lower() in ("off", "none"):     # digest.OFF
+        sweep, note = default_sweep, " (the sweep is off; the pass runs at this time anyway)"
+    else:
+        try:
+            sweep = parse_at(sweep_text)
+        except ValueError:
+            sweep, note = default_sweep, (f" (OPERATOR_SWEEP_AT {sweep_text!r} is unreadable;"
+                                          " anchored to the default sweep time)")
+    at = pass_at(sweep, lead)
+    return at, (f"daily at {at}, {lead} min before the operator's sweep at {sweep}"
+                f"{note}; caught up after a restart")
 
 
 # --- gh ------------------------------------------------------------------------
@@ -776,5 +1188,20 @@ def ci_probe(rec: dict, gh) -> dict:
                       f"{branch} (latest at {', '.join(shas[:3])})", evidence, link)
 
 
+def ci_short(rec: dict) -> str:
+    return "no CI runs" if (rec.get("summary") or "").startswith("no workflow") else "CI green"
+
+
+def ci_identity(rec: dict) -> str:
+    """One red spell of the same workflows, whatever is pushed meanwhile: the
+    fingerprint names the commit, so every push to a red main would read as a
+    new trouble, and a dismissed fix would be proposed again the next day."""
+    if rec.get("status") != FAIL:
+        return ""
+    flows = sorted({fp.split("@")[0] for fp in (rec.get("fingerprint") or "").split(",") if fp})
+    return f"fail@{int(rec.get('last_changed') or 0)}:{','.join(flows)}"
+
+
 register("ci", ci_probe, applies=lambda rec: bool(github_repo(rec)),
-         about="GitHub Actions: the latest completed run of each workflow on the base branch")
+         about="GitHub Actions: the latest completed run of each workflow on the base branch",
+         short=ci_short).identity = ci_identity

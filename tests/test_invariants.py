@@ -26743,11 +26743,12 @@ def test_health_registry_takes_new_checks_without_changing_the_core():
     check("and its recovery is announced", len(closed) == 1)
     check("a bad name is refused", _raises(lambda: H.register("Bad Name", lambda r, g: None),
                                            ValueError))
-    check("HEALTH_EVERY: hourly by default, off stops it, nonsense refused",
-          H.parse_every("") == 3600 and H.parse_every("30m") == 1800
-          and H.parse_every("off") is None and H.parse_every("OFF") is None
-          and _raises(lambda: H.parse_every("hourly"), ValueError)
-          and _raises(lambda: H.parse_every("5s"), ValueError))
+    check("HEALTH_LEAD: 15 minutes by default, off stops it, nonsense refused",
+          H.parse_lead("") == 15 and H.parse_lead(None) == 15 and H.parse_lead("1h") == 60
+          and H.parse_lead("0") == 0 and H.parse_lead("off") is None
+          and H.parse_lead("OFF") is None
+          and _raises(lambda: H.parse_lead("hourly"), ValueError)
+          and _raises(lambda: H.parse_lead("5s"), ValueError))
 
 
 def test_health_reaches_the_operator_digest_and_board():
@@ -26872,47 +26873,572 @@ def test_health_cli_prints_without_writing_and_operator_may_run_it():
 
 def test_health_scheduler_is_off_the_hot_path_and_swallows_failures():
     import health as H
-    print("\nhealth scheduler: its own registered thread, hourly, and a failing pass is swallowed")
+    print("\nhealth scheduler: its own registered thread, daily, and a failing pass is retried")
     src = (BASE / "bot.py").read_text()
     check("registered with daemons, forever only when on",
           'daemons.start(_health_scheduler, "health", forever=health_enabled())' in src)
-    runs, logged = [], []
 
     class Stop(BaseException):
         pass
 
-    sleeps = []
+    class Store:
+        def __init__(self):
+            self.on = "2026-10-19"
+        def pass_on(self):
+            return self.on
+        def mark_pass(self, now):
+            self.on = now.strftime("%Y-%m-%d")
 
-    def sleep(s):
-        sleeps.append(s)
-        if len(sleeps) > 3:
-            raise Stop()
+    def sched(at, clock, run, beats=4):
+        sleeps, logged = [], []
+        times = iter(clock)
 
-    def boom():
-        runs.append(1)
-        raise RuntimeError("gh exploded")
-    fake_log = types.SimpleNamespace(exception=lambda *a, **k: logged.append(a),
-                                     info=lambda *a, **k: None, error=lambda *a, **k: None)
-    def sched(every):
-        ns = bot_functions("_health_scheduler", HEALTH_EVERY=every, HEALTH=object(), health=H,
-                           run_health=boom, time=types.SimpleNamespace(sleep=sleep),
-                           log=fake_log)
+        def sleep(sec):
+            sleeps.append(sec)
+            if len(sleeps) > beats:
+                raise Stop()
+        fake_log = types.SimpleNamespace(exception=lambda *a, **k: logged.append(a),
+                                         info=lambda *a, **k: None, error=lambda *a, **k: None)
+        store = Store()
+        import threading
+        ns = bot_functions("_health_scheduler", HEALTH_AT=at, HEALTH_SCHEDULE="x",
+                           HEALTH_BUSY=threading.Event(),
+                           HEALTH=store, health=H, run_health=run,
+                           datetime=types.SimpleNamespace(now=lambda: next(times)),
+                           time=types.SimpleNamespace(sleep=sleep), log=fake_log)
         try:
             ns["_health_scheduler"]()
-            return False
+            return False, sleeps, logged, store
         except Stop:
-            return True
+            return True, sleeps, logged, store
 
-    stopped = sched("2h")
-    check("it keeps going after a pass raises, logging each",
-          stopped and len(runs) == 3 and len(logged) == 3, f"{runs} {logged}")
-    check("at HEALTH_EVERY, after a settling delay", sleeps[0] == 180
-          and sleeps[1:] == [7200, 7200, 7200], str(sleeps))
-    for every in ("off", "nonsense"):
-        sleeps.clear()
-        runs.clear()
-        check(f"HEALTH_EVERY={every} returns at once, running nothing",
-              not sched(every) and not runs and not sleeps, f"{runs} {sleeps}")
+    day = lambda h, m=0: datetime(2026, 10, 20, h, m)
+    runs = []
+    stopped, sleeps, _, store = sched("08:15", [day(7), day(8, 14), day(8, 15), day(9),
+                                                day(23)], lambda: runs.append(1))
+    check("one pass a day, at its time: not before, not twice",
+          stopped and len(runs) == 1 and store.on == "2026-10-20", f"{runs} {store.on}")
+    check("after a settling delay, then a five-minute beat", sleeps[0] == 120
+          and set(sleeps[1:]) == {300}, str(sleeps))
+    boom = []
+
+    def raising():
+        boom.append(1)
+        raise RuntimeError("gh exploded")
+    stopped, _, logged, store = sched("08:15", [day(10), day(10, 5), day(10, 10), day(10, 15),
+                                                day(10, 20)], raising)
+    check("a pass that raises is logged and tried again on the next beat, not marked done",
+          stopped and len(boom) == 4 and len(logged) == 4 and store.on == "2026-10-19",
+          f"{boom} {store.on}")
+    stopped, sleeps, _, _ = sched(None, [], lambda: runs.append("off"))
+    check("off (no time) returns at once, running nothing", not stopped and not sleeps
+          and "off" not in runs)
+
+
+def test_health_runs_daily_just_before_the_operator_sweep():
+    import health as H
+    import operator_role as O
+    import projects as P
+    print("\nhealth: once a day, shortly before the sweep, caught up after a restart")
+    at, line = H.schedule("08:30", "15m", O.DEFAULT_SWEEP_AT, P.parse_at)
+    check("15 minutes before the operator's sweep", at == "08:15"
+          and "daily at 08:15" in line and "before the operator's sweep at 08:30" in line, line)
+    at, _ = H.schedule("9am", "1h", O.DEFAULT_SWEEP_AT, P.parse_at)
+    check("the lead is configurable, and follows the sweep's own time", at == "08:00", at)
+    at, _ = H.schedule("08:30", "0", O.DEFAULT_SWEEP_AT, P.parse_at)
+    check("0 is at the sweep's time, not off", at == "08:30", str(at))
+    at, line = H.schedule("off", "15m", O.DEFAULT_SWEEP_AT, P.parse_at)
+    check("with the sweep off the daily pass still runs, at that time",
+          at == "08:15" and "sweep is off" in line, f"{at} {line}")
+    at, _ = H.schedule("0", "15m", O.DEFAULT_SWEEP_AT, P.parse_at)
+    check("OPERATOR_SWEEP_AT=0 is midnight, as the sweep reads it, not off", at == "00:00", str(at))
+    at, line = H.schedule("nonsense", "15m", O.DEFAULT_SWEEP_AT, P.parse_at)
+    check("an unreadable sweep time anchors to the default, saying so",
+          at == "08:15" and "unreadable" in line, line)
+    for lead in ("off", "none"):
+        at, line = H.schedule("08:30", lead, O.DEFAULT_SWEEP_AT, P.parse_at)
+        check(f"HEALTH_LEAD={lead} is off", at is None and "off" in line, f"{at} {line}")
+    for bad in ("soon", "13h", "-5m", "90s"):
+        at, line = H.schedule("08:30", bad, O.DEFAULT_SWEEP_AT, P.parse_at)
+        check(f"HEALTH_LEAD={bad} is refused as off, with the reason",
+              at is None and line.startswith("off: "), f"{at} {line}")
+    check("a lead past midnight is held at 00:00, still today", H.pass_at("00:10", 30) == "00:00")
+    d = lambda h, m=0: datetime(2026, 10, 20, h, m)
+    check("not before its time", not H.pass_due(d(8, 14), "08:15", "2026-10-19"))
+    check("due at its time", H.pass_due(d(8, 15), "08:15", "2026-10-19"))
+    check("caught up after a restart that slept through it",
+          H.pass_due(d(13), "08:15", "2026-10-18"))
+    check("and never twice in a day", not H.pass_due(d(13), "08:15", "2026-10-20"))
+    hs, _ts, dd = _health_stores()
+    hs.record("cadence", "ci", H.result(H.OK, "fine"))
+    hs.mark_pass(d(8, 16))
+    again = H.HealthStore(dd / "health.json", readonly=True)
+    check("the day a pass finished is durable, beside the results",
+          again.pass_on() == "2026-10-20" and again.get("cadence", "ci"))
+
+    # The sweep waits for that morning's pass as it waits for the digest.
+    st = O.State(Path(tempfile.mkdtemp()) / "operator.json")
+    st.set_thread("D1:1.0")
+    today = "2026-10-20"
+    check("health on and not yet run: the sweep waits",
+          not st.sweep_due(d(8, 30), "08:30", today, True, health_last_on="2026-10-19",
+                           health_on=True))
+    check("but not for ever: due after the grace, as for the digest",
+          st.sweep_due(d(11, 31), "08:30", today, True, health_last_on="2026-10-19",
+                       health_on=True))
+    check("health ran this morning: due at its time",
+          st.sweep_due(d(8, 30), "08:30", today, True, health_last_on=today, health_on=True))
+    check("health off: never waited for",
+          st.sweep_due(d(8, 30), "08:30", today, True, health_last_on="", health_on=False))
+
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    main = next(n for n in tree.body if isinstance(n, ast.If)
+                and "__main__" in ast.unparse(n.test))
+    logs = [ast.unparse(c) for c in ast.walk(main) if isinstance(c, ast.Call)
+            and ast.unparse(c.func) == "log.info"]
+    check("the resolved schedule is logged at startup",
+          any("'health checks: %s'" in c and "HEALTH_SCHEDULE" in c for c in logs), str(logs)[-400:])
+    check("and HEALTH_EVERY is no longer read, only warned about if left in .env",
+          'os.environ.get("HEALTH_EVERY", ' not in src and "parse_every" not in src
+          and "HEALTH_EVERY" in ast.unparse(main) and not hasattr(H, "parse_every"))
+    sched = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                             and n.name == "_operator_scheduler"))
+    check("the sweep scheduler passes today's health pass to sweep_due",
+          "health_last_on=" in sched and "health_on=health_on" in sched, sched[-500:])
+    check("and waits while a pass is under way",
+          "HEALTH_BUSY.is_set()" in sched.split("sweep_due")[0], sched[-700:])
+    readme = (BASE / "README.md").read_text()
+    env = (BASE / ".env.example").read_text()
+    check("documented: HEALTH_LEAD and HEALTH_WARN_DAYS in the README and .env.example",
+          "`HEALTH_LEAD`" in readme and "`HEALTH_WARN_DAYS`" in readme
+          and "#HEALTH_LEAD=15m" in env and "#HEALTH_WARN_DAYS=3" in env
+          and "| `HEALTH_EVERY`" not in readme)
+
+
+def _brief_registry():
+    """The real registry's decisions and short forms -- the CI check's and
+    the probes' -- without the probes registered globally."""
+    import health as H
+    P = _probes()
+    reg = P.register_all(registry={})
+    reg["ci"] = H.REGISTRY["ci"]
+    return reg
+
+
+def test_health_brief_is_one_line_per_project_with_what_is_done_or_decided():
+    import health as H
+    import operator_role as O
+    print("\nhealth brief: one line per project, a decision or a proposal per problem, one message")
+    reg = _brief_registry()
+    hs, ts, _d = _health_stores()
+    now = time.time()
+    day = 86400
+    hs.record("cadence", "ci", H.result(H.OK, "2 workflows pass on main (latest at 77e936ec)"),
+              now - 5 * day)
+    hs.record("cadence", "backend-drift", H.result(H.OK, "production matches origin/main"),
+              now - 5 * day)
+    hs.record("cadence", "app-store", H.result(H.OK, "1.1.0 live"), now - 5 * day)
+    hs.record("silkworm", "ci", H.result(H.OK, "no workflow has run on main"), now - day)
+    green = H.brief(hs.all(), ts, now, registry=reg)
+    check("all green: one line per project, nothing under them",
+          green.splitlines()[1:] == ["🟢 *cadence* — CI green, backend current, 1.1.0 live",
+                                     "🟢 *silkworm* — no CI runs"]
+          and "4 of 4 checks ok" in green and "•" not in green, green)
+    # A failure that is new, a warning that is old, a decision, an unknown.
+    hs.record("cadence", "ci", H.result(H.FAIL, "on main: Tests failed at 29d8b76c",
+                                        ["Tests: failure at 29d8b76c"], "https://x/1", "1@29d8"),
+              now - 3600)
+    hs.record("cadence", "backend-drift", H.result(H.WARN, "2 change(s) on origin/main not in "
+                                                   "production, oldest 5d"), now - 2 * day)
+    hs.record("trader", "healthcheck", H.result(H.FAIL, "the trader's healthcheck fails: bars",
+                                                ["bars: stale"], fingerprint="bars"),
+              now - 6 * day)
+    hs.record("trader", "dispatching", H.result(H.OK, "dispatched"), now - 6 * day)
+    hs.record("saga", "backend-drift", H.unknown("no credentials for Supabase project jl (x.env "
+                                                 "is missing)"), now - day)
+    prop = ts.create("Fix the bars", state="proposed", role="implementor", project="trader",
+                     source="ideation", source_ref=H.proposal_ref("trader", "healthcheck"))
+    H.link_proposal(hs, "trader", "healthcheck", prop["id"], now - 2 * day)
+    text = H.brief(hs.all(), ts, now, registry=reg)
+    lines = text.splitlines()
+    check("worst projects first, ok ones last",
+          [l.split("*")[1] for l in lines[1:] if not l.startswith("   ")]
+          == ["cadence", "trader", "saga", "silkworm"], text)
+    check("a project with trouble still names its ok checks in its line",
+          "🔴 *cadence* — 1.1.0 live" in text and "🔴 *trader* — dispatching" in text, text)
+    check("a new failure says it is new since yesterday, and what it was",
+          "ci failing, new since yesterday (was ok): on main: Tests failed at 29d8b76c" in text, text)
+    check("and that a fix may be proposed", "→ a fix may be proposed (once)" in text, text)
+    check("an old one says how long it has been unchanged",
+          "healthcheck failing, unchanged 6d" in text, text)
+    check("and names its open proposal and since when, by weekday",
+          f"→ proposal {prop['id']} open since "
+          "today" in text,
+          text)
+    check("a backend's drift is the owner's decision, stated exactly",
+          "→ decide: release cadence backend (`!release cadence backend`), or tell me it waits"
+          in text, text)
+    check("an unknown says it cannot look, and the decision that would let it",
+          "backend-drift can't look" in text and "→ decide: add the saga Supabase credential"
+          in text, text)
+    check("readable on a phone: no line over 200 chars",
+          max(len(l) for l in lines) <= 200, str(max(len(l) for l in lines)))
+    check("a store that could not be read is said, not taken for healthy",
+          "could not be read" in H.brief(None, ts, now)
+          and "no checks have run" in H.brief([], ts, now))
+    # The next morning's pass, a little late: yesterday's news is not new.
+    for slug, chk in (("cadence", "ci"), ("cadence", "backend-drift")):
+        r = hs.get(slug, chk)
+        hs.record(slug, chk, H.result(r["status"], r["summary"], r["evidence"], r["link"],
+                                      r["fingerprint"]), now + 86400 + 1800)
+    nxt = H.brief(hs.all(), ts, now + 86400 + 2400, registry=reg)
+    check("a change is new since yesterday on one morning only, however late the pass",
+          "new since yesterday" not in nxt.split("*cadence*")[1].split("*trader*")[0]
+          and "ci failing, unchanged" in nxt, nxt)
+    # A proposal filed on Tuesday reads "since Tuesday".
+    ts.update(prop["id"], created=now - 3 * day)
+    later = H.brief(hs.all(), ts, now, registry=reg)
+    check("a proposal from days ago is dated by weekday",
+          f"open since {datetime.fromtimestamp(now - 3 * day).strftime('%A')}" in later, later)
+
+    # One Slack message: the brief, then the reply -- whatever their size.
+    reply = ("Landed tsk_a.\nRetried tsk_b.\n" * 200) + "*Needs you:* answer Q-END"
+    big_brief = "\n".join(f"🟢 *p{i}* — CI green" for i in range(400))
+    for limit in (3800, 1500):
+        body = O.compose_sweep(big_brief, reply, limit)
+        check(f"brief and reply fit one {limit}-char message",
+              len(body) <= limit and body.startswith("🟢 *p0*") and body.endswith("Q-END"),
+              f"{len(body)}")
+        check("the brief is cut by whole lines, saying where the rest is",
+              "more line(s): `silkworm health`" in body
+              and all(l.startswith("🟢 *p") or "more line" in l
+                      for l in body.split("\n\n")[0].splitlines()), body[:300])
+    small = O.compose_sweep(text, "Landed tsk_a.\n*Needs you:* nothing.", 3800)
+    check("a brief that fits is whole, above the reply",
+          small.startswith(text) and small.endswith("*Needs you:* nothing."), small[-200:])
+    check("no brief is the reply alone", O.compose_sweep("", "hi", 3800) == "hi")
+    sent = []
+
+    class Client:
+        def chat_update(self, **kw):
+            sent.append(kw["text"])
+    n = O.post_sweep(Client(), "D1", "1.0", "2.0", reply, "\n_footer_", 3800, brief=big_brief)
+    check("post_sweep posts brief and reply as one message within the limit",
+          n == 1 and len(sent) == 1 and len(sent[0]) <= 3800 and sent[0].startswith("🟢 *p0*")
+          and sent[0].endswith("_footer_"), str(len(sent[0]) if sent else 0))
+    bot = (BASE / "bot.py").read_text()
+    check("the sweep posts Silkworm's brief, not the model's paraphrase",
+          "brief = health_brief()" in bot and "brief=brief)" in bot)
+
+
+def _health_filing(**hs_kw):
+    """handle_file_task, lifted, with a real health store and the real
+    proposal rules wired in beside the real caps and dedup."""
+    import health as H
+    fn, counts, begin, ts, made = _file_task_impl()
+    hs = H.HealthStore(Path(tempfile.mkdtemp()) / "health.json")
+    fn.__globals__.update(health=H, HEALTH=hs, HEALTH_WARN_DAYS=3.0)
+    return fn, counts, begin, ts, hs
+
+
+def test_health_fix_proposals_are_once_per_check_through_the_gate():
+    import health as H
+    import scoping as S
+    print("\nhealth fix proposals: once per (project, check), proposed, capped, deduped")
+    fn, counts, begin, ts, hs = _health_filing()
+    H.REGISTRY.setdefault("ci", H.REGISTRY["ci"])
+    now = time.time()
+    hs.record("cadence", "ci", H.result(H.FAIL, "on main: Tests failed at 29d8b76c",
+                                        ["Tests: failure at 29d8b76c", "  failing: StoreServiceTests"],
+                                        "https://github.com/x/runs/1", "1@29d8"), now - 3600)
+    H.surface(hs, ts, "cadence", "ci")
+    item = hs.get("cadence", "ci")["attention"]
+    key = "D9:9.0"
+
+    def file(goal, health="cadence/ci", **kw):
+        return fn({"key": key, "goal": goal, "health": health, "caller_role": "operator",
+                   "role": "implementor", **kw})
+    begin(key)
+    goal = "Fix the failing StoreServiceTests on main so the Tests workflow is green again"
+    r = file(goal)
+    t = ts.get(r.get("id") or "") or {}
+    check("a newly failing check gets one proposal", r.get("ok") and t.get("state") == "proposed",
+          str(r))
+    check("under the check's project, filed by the operator, linked from its ref",
+          t.get("project") == "cadence" and t.get("filed_by") == "operator"
+          and t.get("source_ref") == "health:cadence/ci", str(t)[:300])
+    check("with the check's evidence in its goal",
+          "failing: StoreServiceTests" in t.get("goal", "")
+          and "https://github.com/x/runs/1" in t.get("goal", "") and t["goal"].startswith(goal))
+    rec = hs.get("cadence", "ci")
+    check("and the check records the link, for this red spell of this workflow",
+          rec.get("proposal") == t.get("id")
+          and rec.get("proposal_for") == f"fail@{int(rec['last_changed'])}:1", str(rec)[:300])
+    check("not a duplicate of the check's own needs-you item",
+          ts.get(item)["state"] == "needs_input")
+    r2 = file("Fix the failing tests on main another way, rewriting StoreServiceTests entirely")
+    check("refused while that proposal is open", not r2.get("ok")
+          and "already has a fix proposal open" in r2.get("error", ""), str(r2))
+    ts.transition(t["id"], "cancelled", "dismissed")
+    r3 = file("Fix the failing tests on main another way, rewriting StoreServiceTests entirely")
+    check("and for the same trouble once it was dismissed", not r3.get("ok")
+          and "already proposed" in r3.get("error", ""), str(r3))
+    hs.record("cadence", "ci", H.result(H.FAIL, "on main: Tests failed at 52518530",
+                                        ["Tests: failure at 52518530", "  failing: StoreServiceTests"],
+                                        fingerprint="1@5251"), now)
+    r3b = file("Fix the failing tests on main another way, rewriting StoreServiceTests entirely")
+    check("a push to a still-red main is the same trouble, not a new one to propose again",
+          not r3b.get("ok") and "already proposed" in r3b.get("error", ""), str(r3b))
+    hs.record("cadence", "ci", H.result(H.FAIL, "on main: Tests failed at 52518530",
+                                        ["Tests: failure at 52518530", "  failing: SyncTests"],
+                                        fingerprint="1@5251,2@5251"), now)
+    r4 = file("Fix SyncTests failing on main after the sync refactor broke the merge order")
+    check("a different failure may be proposed once the old proposal is closed",
+          r4.get("ok"), str(r4))
+    # Restored from the task store alone: a record that lost its link.
+    hs.update("cadence", "ci", proposal="", proposal_for="")
+    r5 = file("Fix SyncTests failing on main, a third attempt at the same failing test")
+    check("an open proposal is found by its ref when the record lost the link",
+          not r5.get("ok") and r4.get("id", "?") in r5.get("error", ""), str(r5))
+
+    # Warnings: only once they have persisted.
+    hs.record("trader", "healthcheck", H.result(H.WARN, "the healthcheck has not run since Fri"),
+              now - 86400)
+    r6 = file("Make the trader healthcheck run on its schedule again", health="trader/healthcheck")
+    check("a young warning is refused, saying when it becomes eligible",
+          not r6.get("ok") and "has warned for 1.0d" in r6.get("error", ""), str(r6))
+    hs.record("silkworm", "ci", H.result(H.WARN, "1 workflow passes on main, but flaky"),
+              now - 4 * 86400)
+    begin(key)                   # a new turn: the per-turn cap is checked below
+    r7 = file("Make the flaky silkworm test deterministic with a fake clock", health="silkworm/ci")
+    check("one past HEALTH_WARN_DAYS may be proposed", r7.get("ok"), str(r7))
+
+    # Owner decisions are never tasks.
+    _brief_registry()            # imports the probes; register their decisions locally
+    P = _probes()
+    saved = dict(H.REGISTRY)
+    try:
+        P.register_all(registry=H.REGISTRY)
+        hs.record("cadence", "backend-drift", H.result(H.FAIL, "3 change(s) not in production, "
+                                                       "oldest 9d"), now - 9 * 86400)
+        before = len(ts.all())
+        r8 = file("Deploy the cadence backend functions that drifted from main",
+                  health="cadence/backend-drift")
+        check("an owner decision is refused as a task, with the decision it is",
+              not r8.get("ok") and "owner's decision" in r8.get("error", "")
+              and "!release cadence backend" in r8.get("error", ""), str(r8))
+        hs.record("fathom", "app-store", H.result(H.WARN, "1.0 waiting for review for 11d"),
+                  now - 11 * 86400)
+        r9 = file("Chase the App Store review for fathom", health="fathom/app-store")
+        check("so is a slow App Review", not r9.get("ok") and "owner's decision" in r9["error"])
+        check("and neither filed anything", len(ts.all()) == before)
+    finally:
+        H.REGISTRY.clear()
+        H.REGISTRY.update(saved)
+
+    # The ordinary caps still apply: the per-turn proposal limit...
+    fn, counts, begin, ts, hs = _health_filing()
+    begin(key)
+    for i, (slug, words) in enumerate((("a", "alpha widget parser"), ("b", "beta cache eviction"),
+                                       ("c", "gamma socket retries"))):
+        hs.record(slug, "ci", H.result(H.FAIL, f"{slug} failing", [f"{slug}: failure"],
+                                       fingerprint=f"{slug}@1"), now)
+    got = [fn({"key": key, "goal": f"Fix the {w} that broke CI on main for {s}",
+               "health": f"{s}/ci", "caller_role": "operator"})
+           for s, w in (("a", "alpha widget parser"), ("b", "beta cache eviction"),
+                        ("c", "gamma socket retries"))]
+    check("the per-turn proposal cap still holds", [g.get("ok") for g in got][:S.MAX_PROPOSALS]
+          == [True] * S.MAX_PROPOSALS and not got[S.MAX_PROPOSALS].get("ok")
+          and "limit" in got[S.MAX_PROPOSALS].get("error", ""), str(got))
+    check("and a held filing is kept on the check, for the brief",
+          "limit" in (hs.get("c", "ci") or {}).get("proposal_held", ""),
+          str(hs.get("c", "ci"))[:300])
+    # ...the backlog cap...
+    fn, counts, begin, ts, hs = _health_filing()
+    begin(key)
+    for i in range(S.max_open_proposals()):
+        ts.create(f"Unrelated proposal number {i} about the {i}th widget", state="proposed",
+                  role="implementor", project="d", source="ideation")
+    hs.record("d", "ci", H.result(H.FAIL, "d failing", ["d: failure"], fingerprint="d@1"), now)
+    r = fn({"key": key, "goal": "Fix the zebra encoder that broke CI on main",
+            "health": "d/ci", "caller_role": "operator"})
+    check("the open-proposal backlog cap still holds", not r.get("ok")
+          and "standing limit" in r.get("error", ""), str(r))
+    # ...and dedup, against anything but the check's own item.
+    fn, counts, begin, ts, hs = _health_filing()
+    begin(key)
+    ts.create("Fix the failing StoreServiceTests on main so the Tests workflow is green",
+              state="queued", role="implementor", project="cadence", source="scoped")
+    hs.record("cadence", "ci", H.result(H.FAIL, "on main: Tests failed",
+                                        ["failing: StoreServiceTests"], fingerprint="z"), now)
+    r = fn({"key": key, "goal": "Fix the failing StoreServiceTests on main so the Tests "
+            "workflow is green again", "health": "cadence/ci", "caller_role": "operator"})
+    check("an equivalent task already open is a duplicate", not r.get("ok")
+          and r.get("duplicate"), str(r))
+    fn, counts, begin, ts, hs = _health_filing()
+    begin(key)
+    hs.record("e", "ci", H.result(H.FAIL, "e failing", ["e: failure"], fingerprint="e@1"), now)
+    r = fn({"key": key, "goal": "Fix the quokka renderer that broke CI on main", "health": "e/ci"})
+    check("a health fix is a proposal even from a person who did not ask for one",
+          r.get("ok") and r.get("state") == "proposed"
+          and ts.get(r["id"])["state"] == "proposed", str(r))
+    hs.record("h", "ci", H.result(H.FAIL, "h failing", ["h: failure"], fingerprint="h@1"), now)
+    short_goal = fn({"key": key, "goal": "fix", "health": "h/ci"})
+    check("the operator's own words are held to the length rules, evidence aside",
+          not short_goal.get("ok") and "at least" in short_goal.get("error", ""), str(short_goal))
+    # Dedup ignores the check's own alarms, closed ones included.
+    fn, counts, begin, ts, hs = _health_filing()
+    begin(key)
+    hs.record("f", "ci", H.result(H.FAIL, "Tests failed at aaaa", ["failing: WidgetTests"],
+                                  "https://x/9", "1@aaaa"), now - 3 * 86400)
+    H.surface(hs, ts, "f", "ci")
+    old_item = hs.get("f", "ci")["attention"]
+    hs.record("f", "ci", H.result(H.OK, "fine"), now - 2 * 86400)
+    H.surface(hs, ts, "f", "ci")
+    hs.record("f", "ci", H.result(H.FAIL, "Tests failed at bbbb", ["failing: WidgetTests"],
+                                  "https://x/9", "1@bbbb"), now)
+    H.surface(hs, ts, "f", "ci")
+    r = fn({"key": key, "goal": "Fix the failing WidgetTests on main so Tests is green again",
+            "health": "f/ci"})
+    check("a fix is not a duplicate of the check's earlier, closed alarm",
+          ts.get(old_item)["state"] == "done" and r.get("ok"), str(r))
+    # A proposal nobody accepted is dismissed when its check passes again.
+    hs.record("f", "ci", H.result(H.OK, "fine"), now + 60)
+    H.surface(hs, ts, "f", "ci")
+    check("an unaccepted fix proposal is dismissed once the check passes",
+          ts.get(r["id"])["state"] == "cancelled", str(ts.get(r["id"])["state"]))
+    acc = ts.create("Fix g", state="queued", role="implementor", project="g",
+                    source_ref=H.proposal_ref("g", "ci"))
+    hs.record("g", "ci", H.result(H.FAIL, "red", fingerprint="1@g"), now)
+    H.link_proposal(hs, "g", "ci", acc["id"], now)
+    hs.record("g", "ci", H.result(H.OK, "fine"), now + 60)
+    H.surface(hs, ts, "g", "ci")
+    check("but one already accepted is work under way, and left alone",
+          ts.get(acc["id"])["state"] == "queued")
+    bad = fn({"key": key, "goal": "Fix something real on the main branch", "health": "cadence"})
+    check("--health names project/check", not bad.get("ok") and "<project>/<check>" in bad["error"])
+    check("and a check that never ran is refused",
+          "no such health check" in fn({"key": key, "goal": "Fix something real on main",
+                                         "health": "nope/ci"}).get("error", ""))
+
+    do_file_task, sent = _cli_file_task_impl()
+    os.environ["SILKWORM_THREAD"] = key
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            do_file_task(["--propose", "--health", "cadence/ci", "Fix", "the", "tests"])
+    finally:
+        os.environ.pop("SILKWORM_THREAD", None)
+    check("`silkworm task --health` sends the check", sent and sent[-1][1].get("health")
+          == "cadence/ci" and sent[-1][1].get("goal") == "Fix the tests", str(sent))
+
+
+def test_health_action_says_what_is_done_or_decided():
+    import health as H
+    print("\nhealth actions: eligible, watching, held, proposal, decision")
+    reg = _brief_registry()
+    hs, ts, _d = _health_stores()
+    now = time.time()
+    hs.record("t", "ci", H.result(H.FAIL, "broken", fingerprint="f1"), now)
+    check("a fresh failure is eligible", H.action(hs.get("t", "ci"), ts, now, registry=reg)[0]
+          == "eligible")
+    H.hold_proposal(hs, "t", "ci", "the backlog is full", now)
+    check("a held one says why", H.action(hs.get("t", "ci"), ts, now, registry=reg)
+          == ("held", "fix proposal held: the backlog is full"))
+    hs.record("t", "ci", H.result(H.FAIL, "broken", fingerprint="f1"), now + 86400)
+    check("and the hold lapses at the next pass, offering it again",
+          H.action(hs.get("t", "ci"), ts, now + 86400, registry=reg)[0] == "eligible")
+    hs.record("t", "healthcheck", H.result(H.WARN, "late"), now - 86400)
+    k, w = H.action(hs.get("t", "healthcheck"), ts, now, registry=reg)
+    check("a young warning is watched, with the days left", k == "watching" and "in 2d" in w, w)
+    hs.record("m", "disk", H.result(H.WARN, "x: 10 GB free of 494 GB (2%)"), now)
+    check("disk is the owner's", H.action(hs.get("m", "disk"), ts, now, registry=reg)[0]
+          == "decision")
+    hs.record("x", "ci", H.unknown("gh is not installed"), now)
+    check("an unknown without a decision has nothing to act on",
+          H.action(hs.get("x", "ci"), ts, now, registry=reg)[0] == "looking")
+    ctx = H.context_section(hs.all(), now, actions=lambda r: H.action(r, ts, now,
+                                                                      registry=reg)[1])
+    check("the operator's context says it under each check",
+          "→ a fix may be proposed (once)" in ctx and "→ decide: free" in ctx
+          and "→ watching" in ctx, ctx)
+    bot = (BASE / "bot.py").read_text()
+    check("and the bot gives it the exact command where one may be filed",
+          "task --propose --health " in bot and "health_actions=health_action" in bot)
+
+
+def test_mini_is_a_registered_project_that_is_never_clobbered():
+    import health as H
+    import projects as P
+    import workspaces as W
+    print("\nthe mini: a real, repo-less project, registered once, never overwritten")
+    d = Path(tempfile.mkdtemp())
+    ps = P.ProjectStore(d / "p.json")
+    made = ps.register_if_absent("mini", "Mac mini", {"cwd": "/w/Silkworm"})
+    rec = ps.get("mini")
+    check("registered with its title and Silkworm's checkout as its home",
+          made and rec["title"] == "Mac mini" and rec["scope"] == {"cwd": "/w/Silkworm"}
+          and not rec["scope"].get("repo"), str(rec))
+    ps.update("mini", scope={"cwd": "/elsewhere"}, auto_merge=False)
+    stamp = ps.get("mini")["updated"]
+    again = ps.register_if_absent("mini", "Mac mini", {"cwd": "/w/Silkworm"})
+    check("a second registration changes nothing, not even its updated stamp",
+          again is None and ps.get("mini")["scope"] == {"cwd": "/elsewhere"}
+          and ps.get("mini")["updated"] == stamp, str(ps.get("mini")))
+    ps2 = P.ProjectStore(d / "p2.json")
+    ps2.ensure("box", initial={"title": "Mac mini"})
+    check("a project already titled Mac mini is not shadowed by a second",
+          ps2.register_if_absent("mini", "Mac mini", {"cwd": "/w"}) is None
+          and ps2.get("mini") is None)
+    check("reloaded, it is still one record", len(P.ProjectStore(d / "p.json").all()) == 1)
+    P_ = _probes()
+    recs = P_.projects_with_mini(ps.all())
+    check("the health pass uses the registered record, not a stand-in beside it",
+          [r["slug"] for r in recs].count("mini") == 1
+          and next(r for r in recs if r["slug"] == "mini")["scope"] == {"cwd": "/elsewhere"})
+    check("and still has the stand-in before registration",
+          [r["slug"] for r in P_.projects_with_mini([])] == ["mini"])
+    # Two projects at Silkworm's checkout: the repository wins the tie.
+    both = [{"slug": "mini", "title": "Mac mini", "scope": {"cwd": "/w/Silkworm"}},
+            {"slug": "silkworm", "title": "Silkworm",
+             "scope": {"cwd": "/w/Silkworm", "repo": "github.com/x/Silkworm"}}]
+    for order in (both, both[::-1]):
+        check("work in Silkworm's checkout is still Silkworm's, whichever sorts first",
+              W.project_for("/w/Silkworm/bot.py", order) == "silkworm")
+    check("and a deeper project still beats both",
+          W.project_for("/w/Silkworm/x/y", both + [{"slug": "deep", "scope": {"cwd": "/w/Silkworm/x"}}])
+          == "deep")
+    hs, ts, _ = _health_stores()
+    hs.record("mini", "disk", H.result(H.FAIL, "disk nearly full"))
+    H.surface(hs, ts, "mini", "disk", scope=ps.scope_for("mini"))
+    item = ts.get(hs.get("mini", "disk")["attention"])
+    check("its needs-you items take its scope, so a reply runs somewhere real",
+          item["project"] == "mini" and item["scope"] == {"cwd": "/elsewhere"}, str(item)[:200])
+    bot = (BASE / "bot.py").read_text()
+    tree = ast.parse(bot)
+    main = next(n for n in tree.body if isinstance(n, ast.If) and "__main__" in ast.unparse(n.test))
+    check("registered at startup", "register_mini()" in ast.unparse(main))
+    reg = ast.unparse(next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                           and n.name == "register_mini"))
+    check("through register_if_absent only, with Silkworm's checkout",
+          "register_if_absent" in reg and "ensure(" not in reg and "BASE_DIR" in reg)
+
+
+def test_operator_knows_it_is_the_chief_of_staff():
+    import operator_role as O
+    import roles as R
+    print("\noperator prompt: chief of staff, decisions over work, never refile")
+    text = R.OPERATOR_SYSTEM
+    check("it knows its job", "chief of staff" in text)
+    check("health every turn", "Check Project health on every turn" in text)
+    check("decisions stated, not filed", "Prefer stating a decision over filing work" in text
+          and "never file it as a task" in text)
+    check("one proposal per check, never refiled",
+          "--health <project>/<check>" in text and "never refile" in text)
+    check("its refusals unchanged", "Not yours, and refused in code" in text
+          and "releases, publishing where publish" in text)
+    check("the sweep goal and note carry it", "--health" in O.SWEEP_GOAL
+          and "do not repeat it" in O.SWEEP_NOTE)
 
 
 # --- project health probes (health_probes.py) -------------------------------------
@@ -27648,7 +28174,8 @@ def test_probe_mini_is_checked_and_the_cli_can_probe_now():
           "import health_probes" in (BASE / "bot.py").read_text())
     check("projects_with_mini never doubles it",
           [r["slug"] for r in P.projects_with_mini([{"slug": "mini"}, {"slug": "a"}])]
-          == ["a", "mini"])
+          == ["mini", "a"]
+          and [r["slug"] for r in P.projects_with_mini([{"slug": "a"}])] == ["a", "mini"])
     reg = {"disk": H.Check("disk", lambda rec, gh: H.result(H.WARN, "disk 12% free"),
                            applies=lambda rec: rec["slug"] == "mini"),
            "x": H.Check("x", lambda rec, gh: H.result(H.OK, "fine"),

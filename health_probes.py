@@ -69,7 +69,11 @@ HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "health.toml"
 
 #: The pseudo-project the machine's own checks are filed under.
-MINI = {"slug": "mini", "title": "This Mac mini", "scope": {}}
+#: Registered as a real, repo-less project at startup (bot.register_mini), so
+#: its items render on the board and a reply to one runs in Silkworm's
+#: checkout, where the credential and disk tooling lives; this is the record
+#: a pass uses only until then.
+MINI = {"slug": "mini", "title": "Mac mini", "scope": {}}
 
 #: Seconds one probe may spend in total, across all its calls.
 PROBE_BUDGET_S = 90
@@ -1131,17 +1135,99 @@ def register_all(sys: System = SYSTEM, config: dict | None = None,
     ]
     for name, probe, applies, about in probes:
         probe = scrubbed(probe)
+        decide, short = DECISIONS.get(name), SHORT.get(name)
         if registry is None:
-            health.register(name, probe, applies, about)
+            health.register(name, probe, applies, about, decision=decide, short=short)
         else:
-            target[name] = health.Check(name, probe, applies, about)
+            target[name] = health.Check(name, probe, applies, about, decide, short)
     return target
+
+
+# --- what the brief says about each --------------------------------------------------
+#
+# Which troubles are the owner's to settle and which are code work, decided
+# here per check rather than by the operator per morning. A release, an Apple
+# review, a login or a credential is a decision -- stated, with the exact thing
+# to do -- never a task: an implementor cannot release a backend or hurry App
+# Review, and a proposal that asks it to only costs a dismissal. What is left
+# (CI, the trader's dispatch and its own healthcheck) is code work, and may get
+# one fix proposal.
+
+def _decide_drift(rec) -> str:
+    slug, summ, st = rec.get("project"), rec.get("summary") or "", rec.get("status")
+    if st in (WARN, FAIL):
+        return f"release {slug} backend (`!release {slug} backend`), or tell me it waits"
+    if "no migration history" in summ:
+        return (f"baseline the {slug} migrations (`sb migration repair --status applied …`) "
+                "so drift can be read, or tell me to leave it")
+    if "no credentials" in summ:
+        return f"add the {slug} Supabase credential file, or tell me to drop the check"
+    return ""
+
+
+def _decide_app_store(rec) -> str:
+    summ = rec.get("summary") or ""
+    if rec.get("status") == WARN and "review" in summ:
+        return ("App Review is slow — wait, or send Apple a status inquiry "
+                "(developer.apple.com/contact/app-store/)")
+    if rec.get("status") in (WARN, FAIL):
+        return "act on it in App Store Connect"
+    return ""
+
+
+def _decide_testflight(rec) -> str:
+    if rec.get("status") in (WARN, FAIL):
+        return "look at the build in App Store Connect; re-upload it if it is stuck"
+    return ""
+
+
+def _decide_credentials(rec) -> str:
+    if rec.get("status") in (WARN, FAIL):
+        return "renew it (only you can); details above"
+    return ""
+
+
+def _decide_disk(rec) -> str:
+    if rec.get("status") in (WARN, FAIL):
+        return "free some space on the mini"
+    return ""
+
+
+def _decide_gateway(rec) -> str:
+    if rec.get("status") in (WARN, FAIL):
+        return ("check IB Gateway: logged in, and its API socket setting toggled off "
+                "then on if the port stays unbound")
+    return ""
+
+
+DECISIONS = {"backend-drift": _decide_drift, "app-store": _decide_app_store,
+             "testflight": _decide_testflight, "credentials": _decide_credentials,
+             "disk": _decide_disk, "gateway": _decide_gateway}
+
+
+def _short_testflight(rec) -> str:
+    return "TF " + (rec.get("summary") or "").split(" valid")[0].split(" (")[0]
+
+
+def _short_disk(rec) -> str:
+    m = re.search(r"\((\d+%)\)", rec.get("summary") or "")
+    return f"disk {m.group(1)} free" if m else "disk ok"
+
+
+SHORT = {"backend-drift": lambda rec: "backend current",
+         "app-store": lambda rec: (rec.get("summary") or "").split(";")[-1].strip(),
+         "testflight": _short_testflight, "dispatching": lambda rec: "dispatching",
+         "gateway": lambda rec: "Gateway up", "healthcheck": lambda rec: "healthcheck passes",
+         "credentials": lambda rec: "credentials good", "disk": _short_disk}
 
 
 def projects_with_mini(recs) -> list[dict]:
     """The project records a health pass runs over: the real ones, plus the
-    machine itself."""
-    recs = [r for r in recs if (r.get("slug") or "") != MINI["slug"]]
+    machine itself -- its registered record when there is one (so its items
+    take that record's scope), else the stand-in."""
+    recs = list(recs)
+    if any((r.get("slug") or "") == MINI["slug"] for r in recs):
+        return recs
     return recs + [dict(MINI)]
 
 

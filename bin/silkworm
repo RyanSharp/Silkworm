@@ -14,7 +14,7 @@
     silkworm task <goal>            file scoped work as a task (from inside a turn)
     silkworm watching               scheduled wake-ups and when they fire
     silkworm status --json          the board, branches, revision, drain and wake-ups, as JSON
-    silkworm health [--project P] [--json] [--probe]  the latest project health checks (CI, …),
+    silkworm health [--project P] [--json] [--probe] [--brief]  the latest project health checks (CI, …),
                                     as the bot's own probes last found them (read-only)
     silkworm accept <id>            queue a proposal               } the dashboard's
     silkworm dismiss <id> [--round R]  cancel it                   } buttons, through
@@ -586,7 +586,24 @@ def do_tailscale(argv: list) -> int:
 PUSH_ACTIONS = ("status", "test", "forget-all")
 
 
-HEALTH_USAGE = "usage: silkworm health [--project P] [--json] [--probe]"
+HEALTH_USAGE = "usage: silkworm health [--project P] [--json] [--probe] [--brief]"
+
+
+class _ReadTasks:
+    """tasks.json as health.brief reads it -- get and all -- loaded without
+    repairing, and never saved: the bot owns the file."""
+
+    def __init__(self, path):
+        import jsonstore as _js
+        data = _js.load(Path(path), default={}, strict=False, repair=False)
+        self._data = data if isinstance(data, dict) else {}
+
+    def get(self, tid):
+        rec = self._data.get(tid)
+        return dict(rec) if isinstance(rec, dict) else None
+
+    def all(self):
+        return {k: v for k, v in self._data.items() if isinstance(v, dict)}
 
 
 def do_health(argv: list, path=None, now=None) -> int:
@@ -598,11 +615,13 @@ def do_health(argv: list, path=None, now=None) -> int:
     checks have run", not "all healthy"; one that cannot be read exits 1.
     """
     import health as _health
-    project, as_json, probe, rest = "", False, False, list(argv)
+    project, as_json, probe, brief, rest = "", False, False, False, list(argv)
     while rest:
         a = rest.pop(0)
         if a == "--json":
             as_json = True
+        elif a == "--brief":
+            brief = True
         elif a == "--probe":
             probe = True
         elif a == "--project" and rest and not rest[0].startswith("-"):
@@ -623,6 +642,17 @@ def do_health(argv: list, path=None, now=None) -> int:
             print(f"refused: health.json cannot be read: {e}", file=sys.stderr)
             return EXIT_REFUSED
         rows = [r for r in store.all() if not project or r.get("project") == project]
+    if brief:
+        # The brief the operator's sweep posts, from the same store and
+        # tasks.json, both read-only. Its probes are imported for their
+        # decisions and short forms only; nothing is run.
+        import health_probes  # noqa: F401 - registers decisions and short forms
+        print(_health.brief(rows, _ReadTasks(Path(path).parent / "tasks.json" if path
+                                             else REPO / "tasks.json"),
+                            now, warn_after=_health.warn_days(env_file_value("HEALTH_WARN_DAYS")),
+                            checked_on=("" if not path else
+                                        (f"last pass {store.pass_on()}" if store.pass_on() else ""))))
+        return EXIT_OK
     if as_json:
         print(json.dumps({"ok": True, "ran": probe or path.exists(), "checks": rows,
                           "overall": _health.overall(rows) if rows else None},
@@ -951,7 +981,7 @@ def do_file_task(argv) -> None:
     if not key:
         print("no thread — `task` only works from inside a Silkworm turn")
         raise SystemExit(1)
-    project, role, goal, propose = "", "", [], False
+    project, role, goal, propose, check = "", "", [], False, ""
     i = 0
     while i < len(argv):
         if argv[i] == "--propose":
@@ -960,14 +990,20 @@ def do_file_task(argv) -> None:
             project = argv[i + 1]; i += 2
         elif argv[i] == "--role" and i + 1 < len(argv):
             role = argv[i + 1]; i += 2
+        elif argv[i] == "--health" and i + 1 < len(argv):
+            check = argv[i + 1]; i += 2
         else:
             goal.append(argv[i]); i += 1
     goal = " ".join(goal).strip()
     if not goal:
         print('usage: silkworm task [--propose] [--project <slug>] '
-              '[--role implementor|assistant|researcher] "<goal>"')
+              '[--role implementor|assistant|researcher] '
+              '[--health <project>/<check>] "<goal>"')
         raise SystemExit(2)
     r = bot_call("/file-task", {"key": key, "goal": goal, "propose": propose,
+                                # A fix for this health check: proposed, once
+                                # per (project, check), its evidence attached.
+                                "health": check,
                                 "project": project, "role": role or "implementor",
                                 # What this run *is*, from the environment the
                                 # bot set up for it, not from anything the turn

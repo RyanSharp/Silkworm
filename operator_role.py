@@ -3,7 +3,11 @@
 It is not a router in front of every message. You talk to it in its own thread
 (claimed with `!operator`) when you want coordination, and once a day it wakes
 on its own, after the digest, to work the routine pile and post one message:
-what it did, and what needs you.
+the morning's health brief, what it did, and what needs you. It is the
+owner's chief of staff: health checks run just before it wakes, and it reads
+them first -- stating the decisions that are the owner's, and filing at most
+one fix proposal per (project, check) for the code work (health.py's
+proposal_refusal holds it to that).
 
 Three things here keep it honest, and none of them is the prompt.
 
@@ -293,13 +297,16 @@ class State:
 
     # the sweep
     def sweep_due(self, now: datetime, at: str, digest_last_on: str = "",
-                  digest_on: bool = True, grace_min: int = DIGEST_GRACE_MIN) -> bool:
+                  digest_on: bool = True, grace_min: int = DIGEST_GRACE_MIN,
+                  health_last_on: str = "", health_on: bool = False) -> bool:
         """Whether today's sweep should be filed now: its time has passed, it
-        has not been filed today, and the digest has gone out first (unless the
-        digest is off). The wall-clock catch-up projects.due_for_ideation uses.
+        has not been filed today, and the digest and today's health pass have
+        both finished first (each unless it is off). The wall-clock catch-up
+        projects.due_for_ideation uses.
 
-        If the digest still has not gone out `grace_min` minutes after `at`,
-        the sweep is due without it (see digest_missed), rather than skipped."""
+        If either still has not finished `grace_min` minutes after `at`, the
+        sweep is due without it (see digest_missed), rather than skipped: a
+        brief from yesterday's results, said to be, beats no sweep."""
         if not self.thread():
             return False
         today = now.strftime("%Y-%m-%d")
@@ -307,7 +314,9 @@ class State:
             return False
         if now.strftime("%H:%M") < at:
             return False
-        if digest_on and digest_last_on != today:
+        waiting = ((digest_on and digest_last_on != today)
+                   or (health_on and health_last_on != today))
+        if waiting:
             return now.strftime("%H:%M") >= _plus_minutes(at, grace_min)
         return True
 
@@ -563,7 +572,7 @@ def tail(path, lines: int = 12) -> list[str]:
 
 def context(project_recs, brief_for, status: dict | None, landings, deploys,
             holds: dict, released: dict, notes: str,
-            budget: int = CONTEXT_MAX, health_rows=None) -> str:
+            budget: int = CONTEXT_MAX, health_rows=None, health_actions=None) -> str:
     """What an operator turn is told about the world, within `budget` chars.
 
     Sections in the order they matter. When the whole is over budget the
@@ -590,7 +599,7 @@ def context(project_recs, brief_for, status: dict | None, landings, deploys,
     # go fetching them. None is "could not be read", not "all healthy".
     sections.append(("Project health (probes Silkworm ran; non-ok checks in detail)",
                      "(could not be read this turn)" if health_rows is None
-                     else health.context_section(health_rows)))
+                     else health.context_section(health_rows, actions=health_actions)))
     sections.append(("Landings in the last two days", "\n".join(landings) or "(none)"))
     sections.append(("Bases failing their own tests (work held for them)",
                      "\n".join(f"- {s}: {json.dumps(v)[:240]}" for s, v in holds.items())
@@ -627,7 +636,16 @@ def context(project_recs, brief_for, status: dict | None, landings, deploys,
 # --- the sweep -----------------------------------------------------------------
 
 SWEEP_GOAL = (
-    "Morning sweep. Work the routine pile, then report.\n\n"
+    "Morning sweep. Read Project health first, then work the routine pile, "
+    "then report.\n\n"
+    "Health, as chief of staff: every check that is not ok says under it "
+    "what is being done (→). Where it says a fix may be proposed, file at "
+    "most one proposal for it: `{bin} task --propose --health "
+    "<project>/<check> \"<what to fix and what done looks like>\"` (its "
+    "evidence is attached for you; the caps and dedup still apply, and a "
+    "refusal is final for today). Where it says `decide:`, that is the "
+    "user's, not code work: never file it, put it in Needs you as the "
+    "decision. Never refile a check that already has a proposal.\n\n"
     "Routine, yours to do without asking: land or retry refused landings; drop "
     "branches `{bin} operator contained <id>` proves are already on their "
     "base; retry tasks that failed on quota or overload; rework conflicted "
@@ -642,11 +660,15 @@ SWEEP_GOAL = (
 
 SWEEP_NOTE = (
     "This is your daily sweep, filed by the scheduler, not a message from the "
-    "user. Your reply is posted to your thread as exactly one message, so make "
-    "it one: first what you did (one line per action, with task ids), then "
-    "*Needs you:* one line per item with the specific question to answer or "
-    "the exact `!approve …` to send. If nothing needs them, say so in one "
-    "line. Do not schedule a wake-up for this.")
+    "user. Silkworm puts a per-project health brief above your reply (one "
+    "line per project, what changed, and the proposal or decision each "
+    "problem has), so do not repeat it. Your reply is posted beneath it, in "
+    "the same single message, and is read on a phone: first what you did "
+    "(one short line per action, with task ids -- fix proposals you filed "
+    "for health checks included), then *Needs you:* one line per item with "
+    "the specific decision or question, or the exact `!approve …` to send. "
+    "If nothing needs them, say so in one line. Do not schedule a wake-up "
+    "for this.")
 
 
 def one_message(text: str, limit: int) -> str:
@@ -665,16 +687,53 @@ def one_message(text: str, limit: int) -> str:
     return text[:keep_head] + mark + text[len(text) - keep_tail:]
 
 
+#: The share of the one message the health brief may take when the reply
+#: needs the rest: half, so neither the brief nor what the operator did and
+#: what needs you is ever cut to nothing by the other.
+BRIEF_SHARE = 0.5
+
+
+def _clip_lines(text: str, limit: int) -> str:
+    """`text` cut at a line boundary to at most `limit` chars, saying how many
+    lines were left out and where the rest is."""
+    if len(text) <= limit:
+        return text
+    lines, out = text.splitlines(), []
+    for i, line in enumerate(lines):
+        mark = f"\n…({len(lines) - i} more line(s): `silkworm health`)"
+        if len("\n".join(out + [line])) + len(mark) > limit:
+            return ("\n".join(out) + mark)[:limit]
+        out.append(line)
+    return "\n".join(out)[:limit]
+
+
+def compose_sweep(brief: str, reply: str, limit: int) -> str:
+    """The sweep's one message: the health brief, then the operator's reply
+    (what it did, then what needs you), within `limit` chars together.
+
+    The brief gets what the reply does not need, and at least BRIEF_SHARE of
+    the message; past that it is cut by whole lines, and the reply by
+    one_message, which keeps its end -- where the questions are."""
+    brief = (brief or "").strip()
+    if not brief:
+        return one_message(reply, limit)
+    reply = (reply or "").strip() or "(the sweep said nothing)"
+    room = max(int(limit * BRIEF_SHARE), limit - len(reply) - 2)
+    head = _clip_lines(brief, min(room, limit - 200))
+    return head + "\n\n" + one_message(reply, limit - len(head) - 2)
+
+
 def post_sweep(client, channel: str, thread_ts: str, progress_ts, text: str,
-               footer: str = "", limit: int = 3800) -> int:
-    """Post the sweep's reply into its thread as exactly one message.
+               footer: str = "", limit: int = 3800, brief: str = "") -> int:
+    """Post the sweep's report into its thread as exactly one message: the
+    health brief (if any), then its reply.
 
     Into the "working…" placeholder when there is one (so the thread does not
     keep a stale placeholder beside the report); as a new message when there
     is none, or it could not be edited. Returns how many messages it posted
     or edited: 1, or 0 if Slack refused both.
     """
-    body = one_message(text, max(200, limit - len(footer))) + footer
+    body = compose_sweep(brief, text, max(400, limit - len(footer))) + footer
     if progress_ts:
         try:
             client.chat_update(channel=channel, ts=progress_ts, text=body)

@@ -204,6 +204,24 @@ class ProjectStore:
             self._save()
             return dict(rec)
 
+    def register_if_absent(self, slug: str, title: str, scope: dict) -> dict | None:
+        """Create the project `slug` with this title and scope if -- and only
+        if -- nothing answers to it yet: not the slug, and not a title that
+        resolves to another project. Returns the new record, or None when one
+        was already there, which is left exactly as it is (not even its
+        `updated` stamp moves). For records Silkworm itself needs to exist,
+        made at every startup: a scope you have since changed is yours."""
+        with self._lock:
+            if slug in self._data or self._resolve(title) in self._data:
+                return None
+            rec = {f: default(f) for f in FIELDS}
+            rec.update(slug=slug, v=VERSION, title=title.strip(), scope=dict(scope or {}),
+                       created=time.time(), updated=time.time())
+            self._data[slug] = rec
+            self._save()
+            log.info("project %s registered (%s)", slug, title)
+            return dict(rec)
+
     def _resolve(self, name: str) -> str:
         """The slug `name` means: a slug that exists, else an existing
         project's title, else the slug a new project would get.

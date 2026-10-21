@@ -74,7 +74,7 @@ def project_for(cwd, records, scratch=None) -> str:
         return ""
     here = _key(cwd)
     fence = _key(scratch) if scratch else ""
-    best, depth = "", -1
+    best, depth, best_repo = "", -1, False
     for rec in records:
         if rec.get("archived"):
             continue
@@ -86,8 +86,13 @@ def project_for(cwd, records, scratch=None) -> str:
             continue
         if fence and _inside(here, fence) and (there == fence or not _inside(there, fence)):
             continue
-        if len(there) > depth:
-            best, depth = rec["slug"], len(there)
+        # A tie -- two projects at the one directory -- goes to the one that
+        # is the repository there: the pseudo-project "mini" lives in
+        # Silkworm's checkout (for its tooling), and work in that checkout is
+        # Silkworm's, whichever record happens to sort first.
+        has_repo = bool((rec.get("scope") or {}).get("repo"))
+        if len(there) > depth or (len(there) == depth and has_repo and not best_repo):
+            best, depth, best_repo = rec["slug"], len(there), has_repo
     return best
 
 

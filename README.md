@@ -151,7 +151,8 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `REVIEW_WORKERS` | `1` | How many reviews run at once, alongside the task workers; `0` hands reviews back to the task workers |
 | `DIGEST_AT` | `08:00` | Local time to post the daily digest (last 24h per project: landed, released, refused, failed or held, reran, stuck, waiting on you, unmerged, cost) to your DM; once a day, caught up after a restart; `off` to stop |
 | `OPERATOR_SWEEP_AT` | `08:30` | Local time of the operator's daily sweep, once the digest has gone out; caught up after a restart; `off` to stop (see [The operator](#the-operator)) |
-| `HEALTH_EVERY` | `1h` | How often project health checks run (health.py; first check `ci`: the latest GitHub Actions run of each workflow on the base branch, via `gh`). A failing check is one needs-you item per project and check, closed when it passes; `unknown` (gh missing, offline, rate-limited) never pages. Project-specific probes (health_probes.py, mapped by the explicit table in `health.toml`): trader `dispatching`, `gateway`, `healthcheck`; Supabase `backend-drift`; App Store `app-store`, `testflight`; and the pseudo-project `mini`'s `credentials` and `disk`. Results in the digest, the dashboard, the operator's context and `silkworm health` (`--probe` runs them now without recording; refused to restricted roles); `off` to stop |
+| `HEALTH_LEAD` | `15m` | Project health checks run once a day, this long before `OPERATOR_SWEEP_AT` (08:15 by default), so the sweep's brief reads that morning's results; still at that time when the sweep is off (anchored to the default sweep time); caught up after a restart, and the resolved schedule is logged at startup. `0` runs them at the sweep's own time, `off` stops them. Replaces `HEALTH_EVERY`, which is no longer read (a leftover one is warned about at startup). Checks (health.py; first `ci`: the latest GitHub Actions run of each workflow on the base branch, via `gh`): a failing one is one needs-you item per project and check, closed when it passes; `unknown` (gh missing, offline, rate-limited) never pages. Project-specific probes (health_probes.py, mapped by the explicit table in `health.toml`): trader `dispatching`, `gateway`, `healthcheck`; Supabase `backend-drift`; App Store `app-store`, `testflight`; and the project `mini` (Mac mini, registered at startup if absent, home Silkworm's checkout)'s `credentials` and `disk`. Results in the sweep's brief, the digest, the dashboard, the operator's context and `silkworm health` (`--probe` runs them now without recording, refused to restricted roles; `--brief` prints the sweep's brief) |
+| `HEALTH_WARN_DAYS` | `3` | A check warning this long may get one fix proposal from the operator (`silkworm task --propose --health <project>/<check>`); a failing one may at once. Once per (project, check) and trouble, never while one is open, and through the ordinary proposed gate, caps and dedup. Checks whose trouble is the owner's decision (a backend release, App Review, a credential, a login, disk) are stated as decisions and never filed |
 | `MAX_OPEN_PROPOSALS` | `4` | Untriaged proposals a project may hold before its nightly review pauses |
 
 ## Authentication for headless turns
@@ -962,7 +963,22 @@ the web chat, not the bot, and there is no route for it.
 operator wakes in its thread — a wake-up like any other, so it runs in the wake
 lane and catches up after a restart — works the routine pile, and posts exactly
 one message: what it did, then what needs you, with the question to answer or
-the `!approve` to send for each.
+the `!approve` to send for each. It also waits for that morning's health pass
+(`HEALTH_LEAD` earlier), with the same three-hour grace as the digest.
+
+**Chief of staff.** The sweep's message opens with a per-project health brief
+Silkworm writes from the store (`silkworm health --brief` prints it): one line
+per project — `🟢 *cadence* — CI green, backend current, 1.1.0 live` — and,
+under a project, one line per check that is not ok saying how long it has been
+so and what changed since yesterday, then either what is being done (a fix
+proposal, `proposal tsk_x open since Tuesday`; a proposal held by the caps,
+and why) or the exact decision it needs from you (`decide: release cadence
+backend`). Then the operator's own report: routine work, then needs you — all
+in one Slack message, the brief cut by whole lines if it must be. For code
+work (CI, the trader's dispatch and healthcheck) the operator may file one
+fix proposal per check and trouble (`task --propose --health`), which waits
+for you like any proposal; the check records the link, so it is never filed
+twice.
 
 ## Moving a thread to the terminal
 

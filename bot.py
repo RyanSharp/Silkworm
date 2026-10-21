@@ -2201,9 +2201,16 @@ DIGEST_AT = os.environ.get("DIGEST_AT", digest.DEFAULT_AT).strip()
 OPERATOR = operator_role.State(BASE_DIR / "operator.json")
 OPERATOR_NOTES = BASE_DIR / "operator_notes.md"
 OPERATOR_SWEEP_AT = os.environ.get("OPERATOR_SWEEP_AT", operator_role.DEFAULT_SWEEP_AT).strip()
-# Project health checks (health.py): how often they run ("off" to stop), and
-# where their latest results live. Unreadable, health is off -- not the bot.
-HEALTH_EVERY = os.environ.get("HEALTH_EVERY", health.DEFAULT_EVERY).strip()
+# Project health checks (health.py): once a day, HEALTH_LEAD before the
+# operator's sweep ("off" to stop), so its brief reads that morning's results;
+# a warning HEALTH_WARN_DAYS old may get a fix proposal. Where the latest
+# results live: unreadable, health is off -- not the bot.
+HEALTH_LEAD = os.environ.get("HEALTH_LEAD", health.DEFAULT_LEAD).strip()
+HEALTH_WARN_DAYS = health.warn_days(os.environ.get("HEALTH_WARN_DAYS"))
+#: Set while a pass runs, so a sweep due meanwhile waits for its results.
+HEALTH_BUSY = threading.Event()
+HEALTH_AT, HEALTH_SCHEDULE = health.schedule(OPERATOR_SWEEP_AT, HEALTH_LEAD,
+                                             operator_role.DEFAULT_SWEEP_AT, projects.parse_at)
 try:
     HEALTH = health.HealthStore(BASE_DIR / "health.json")
 except Exception:
@@ -3474,10 +3481,37 @@ def handle_file_task(payload: dict) -> dict:
     parent = research_parent(caller_role, (payload.get("caller_task") or "").strip(), key)
     from_research = parent is not None or caller_role == research.ROLE
     propose = bool(payload.get("propose")) or restricted or from_research
+
+    # A fix for a health check (`task --health <project>/<check>`): always a
+    # proposal, always under the check's project, with the check's evidence
+    # attached -- and once per (project, check) and trouble, which
+    # health.proposal_refusal decides before any of the ordinary caps and
+    # dedup below, which it does not replace. A decision that is the owner's
+    # (a release, an App Review) is refused here: it is said, not filed.
+    hrec, now, title = None, time.time(), goal[:70]
+    hkey = str(payload.get("health") or "").strip().lower()
+    if hkey:
+        slug_check = hkey.split("/", 1)
+        if len(slug_check) != 2 or not all(slug_check):
+            return {"ok": False, "error": f"--health takes <project>/<check>, not {hkey!r}"}
+        if HEALTH is None:
+            return {"ok": False, "error": "health.json cannot be read, so no check can be proposed for"}
+        hrec = HEALTH.get(*slug_check)
+        err = health.proposal_refusal(hrec, task_store, now, warn_after=HEALTH_WARN_DAYS)
+        if err:
+            log.info("refused a health proposal for %s from %s: %s", hkey, key, err)
+            return {"ok": False, "error": err}
+        propose, parent, from_research = True, None, False
     state = tasks.PROPOSED if propose else tasks.QUEUED
 
     def held(err: str) -> None:
-        """A refused next step, kept on the research task so it is said."""
+        """A refused next step, kept on the research task so it is said --
+        or a refused health fix, kept on the check so the brief says why."""
+        if hrec:
+            try:
+                health.hold_proposal(HEALTH, hrec["project"], hrec["check"], err)
+            except Exception:
+                log.exception("could not record a held health proposal for %s", hkey)
         if not parent:
             return
         try:
@@ -3505,6 +3539,8 @@ def handle_file_task(payload: dict) -> dict:
         proj = fixing.get("project") or proj
     else:
         fixing = None
+    if hrec:
+        proj, fixing = hrec["project"], None
     slug = project_store.slug_for(proj) if proj else ""
 
     # Proposals are also bounded across passes, not just within one: the
@@ -3522,6 +3558,10 @@ def handle_file_task(payload: dict) -> dict:
     if err:
         held(err)
         return {"ok": False, "error": err}
+    if hrec:
+        # Attached only now: the length rules above judged the operator's own
+        # words, which the evidence would have made long enough whatever they were.
+        goal = health.proposal_goal(goal, hrec, now)
 
     # A proposal the board already holds is refused, naming what it matched,
     # so the ideator's reply says "already open as X" instead of the morning
@@ -3533,10 +3573,15 @@ def handle_file_task(payload: dict) -> dict:
         # weighs a review's followups against the task reviewed: a next step
         # shares that task's vocabulary by construction, and was refused as a
         # duplicate of the question it answers.
+        # Nor a health fix against the check's own needs-you item, which
+        # carries the same evidence by construction: it is the alarm, not
+        # the work. Any other task like it is still a duplicate.
         err = dedup.duplicate(goal, task_store.by_project(slug), unmerged_survey,
-                              title=goal[:70],
+                              title=title,
                               exclude=({parent["id"], parent.get("root") or parent["id"]}
-                                       if parent else ()))
+                                       if parent else
+                                       health.own_items(task_store, hrec["project"],
+                                                        hrec["check"]) if hrec else ()))
         if err:
             log.info("refused a proposal from %s: %s", key, err)
             held(err)
@@ -3558,7 +3603,7 @@ def handle_file_task(payload: dict) -> dict:
 
     scope = project_store.scope_for(proj) or {"cwd": entry.get("cwd") or str(CLAUDE_CWD)}
     task = task_store.create(
-        goal, title=goal[:70], role=role, project=proj,
+        goal, title=title, role=role, project=proj,
         # Work scoped with you is queued: it was already reviewed by the person
         # the proposed gate exists to ask. A proposal nobody has seen is not.
         state=state, driver="queue",
@@ -3574,9 +3619,19 @@ def handle_file_task(payload: dict) -> dict:
         **({"parent": parent["id"], "root": parent.get("root") or parent["id"],
             "source_ref": parent["id"]} if parent else
            {"parent": fixing["id"], "root": fixing.get("root") or fixing["id"]}
-           if fixing else {}),
+           if fixing else
+           {"source_ref": health.proposal_ref(hrec["project"], hrec["check"])}
+           if hrec else {}),
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
+    if hrec:
+        # The check -> task link the brief reads ("proposal tsk_x open since
+        # Tuesday"). Should it fail to save, proposal_of still finds the task
+        # by its source_ref, so it is not filed twice.
+        try:
+            health.link_proposal(HEALTH, hrec["project"], hrec["check"], task["id"], now)
+        except Exception:
+            log.exception("could not link %s to health check %s", task["id"], hkey)
     log.info("filed task %s from %s (project=%s role=%s state=%s%s%s)",
              task["id"], key, proj or "-", role, state,
              " restricted-caller" if restricted else "",
@@ -4469,8 +4524,16 @@ def execute_task(task: dict) -> None:
         if role_name == roles.OPERATOR and operator_role.is_sweep(task):
             # The sweep promises one message: what it did, what needs you.
             # Never swallowed as "nothing yet", never chunked into several.
+            # Beneath the health brief, which is Silkworm's to write: what
+            # the probes found is not the model's to paraphrase.
+            try:
+                brief = health_brief()
+            except Exception:
+                log.exception("operator: building the health brief failed")
+                brief = "*Project health:* the brief could not be built (see the bot log)."
             operator_role.post_sweep(app.client, channel, thread_ts, progress.ts,
-                                     to_mrkdwn(result.text), footer, SLACK_MSG_LIMIT)
+                                     to_mrkdwn(result.text), footer, SLACK_MSG_LIMIT,
+                                     brief=brief)
             task_store.update(tid, session_id=result.session_id,
                               result={"text": result.text[:4000],
                                       **costs.add_run(task_store.get(tid), turn_cost),
@@ -6395,30 +6458,57 @@ def run_health() -> list[dict]:
 
 
 def _health_scheduler() -> None:
-    """Run the health checks every HEALTH_EVERY (default hourly, "off" to
-    stop). A failing pass is logged and swallowed; the next one is on time."""
-    try:
-        every = health.parse_every(HEALTH_EVERY)
-    except ValueError as e:
-        log.error("health checks off: %s", e)
+    """Run the health checks once a day at HEALTH_AT -- HEALTH_LEAD before the
+    operator's sweep -- or as soon after as the bot is up: the same wall-clock
+    catch-up as the digest and the sweep. The day is marked only once a pass
+    has finished, so one that raised is tried again on the next beat."""
+    if HEALTH_AT is None or HEALTH is None:
+        log.info("health checks %s", HEALTH_SCHEDULE if HEALTH is not None
+                 else "off: health.json cannot be read")
         return
-    if every is None or HEALTH is None:
-        log.info("health checks off (HEALTH_EVERY=%s)", HEALTH_EVERY or '""')
-        return
-    time.sleep(180)                     # let startup recovery settle first
+    time.sleep(120)            # after startup recovery; before the sweep's first beat
     while True:
         try:
-            run_health()
+            now = datetime.now()
+            if health.pass_due(now, HEALTH_AT, HEALTH.pass_on()):
+                HEALTH_BUSY.set()
+                try:
+                    run_health()
+                    HEALTH.mark_pass(now)
+                finally:
+                    HEALTH_BUSY.clear()
         except Exception:
             log.exception("health checks failed")
-        time.sleep(every)
+        time.sleep(300)
 
 
 def health_enabled() -> bool:
-    try:
-        return HEALTH is not None and health.parse_every(HEALTH_EVERY) is not None
-    except ValueError:
-        return False
+    return HEALTH is not None and HEALTH_AT is not None
+
+
+def health_brief(now: float | None = None) -> str:
+    """The sweep's per-project health brief, from the store as it is now --
+    after the operator's turn, so a proposal it just filed is in it."""
+    if HEALTH is None:
+        return health.brief(None, task_store)
+    if HEALTH_AT is None:
+        return "*Project health:* checks are off (HEALTH_LEAD)."
+    on = HEALTH.pass_on()
+    today = datetime.now().strftime("%Y-%m-%d")
+    return health.brief(health_rows(), task_store, now, warn_after=HEALTH_WARN_DAYS,
+                        checked_on=("this morning" if on == today else
+                                    f"last on {on} — today's pass has not run" if on
+                                    else ""))
+
+
+def health_action(rec: dict) -> str:
+    """What is being done about one non-ok check, for the operator's context:
+    and, where it may file a fix, the exact command."""
+    kind, words = health.action(rec, task_store, warn_after=HEALTH_WARN_DAYS)
+    if kind == "eligible":
+        return (f"{words}: `{SILKWORM_BIN} task --propose --health "
+                f"{rec.get('project')}/{rec.get('check')} \"<goal>\"`")
+    return words
 
 
 # --- the operator (operator_role.py) -------------------------------------------
@@ -6550,7 +6640,7 @@ def operator_context(now: float | None = None) -> str:
         operator_role.recent_landings(records, now),
         operator_role.tail(BASE_DIR / "logs" / "deploy-after-turn.log"),
         holds, released, operator_role.read_notes(OPERATOR_NOTES),
-        health_rows=health_rows())
+        health_rows=health_rows(), health_actions=health_action)
 
 
 def operator_note(task: dict | None = None) -> str:
@@ -6630,6 +6720,25 @@ def approve_command(text: str, user: str, event: dict) -> str:
             f"{operator_role.GUARDS[guard]} — `{item}`.")
 
 
+def register_mini() -> dict | None:
+    """Make the pseudo-project "mini" a real, repo-less project, if absent.
+
+    Health files the machine's own items (credentials, disk) under it; as a
+    name with no record it rendered nowhere and a reply to one ran in the
+    scratch folder. Its home is Silkworm's checkout, where the credential and
+    disk tooling lives. Created once, at startup; an existing record -- its
+    scope included -- is never touched."""
+    try:
+        made = project_store.register_if_absent(
+            health_probes.MINI["slug"], health_probes.MINI["title"], {"cwd": str(BASE_DIR)})
+    except Exception:
+        log.exception("could not register the %s project", health_probes.MINI["slug"])
+        return None
+    if made:
+        log.info("registered project %s (%s) at %s", made["slug"], made["title"], BASE_DIR)
+    return made
+
+
 def file_operator_sweep(now: datetime, digest_missed: bool = False) -> str:
     """File today's sweep as a wake-up on the operator's thread. Its id.
 
@@ -6673,7 +6782,15 @@ def _operator_scheduler() -> None:
             now = datetime.now()
             digest_on = DIGEST_AT.lower() not in digest.OFF
             last_on = digest.Schedule(DIGEST_STATE).last_on
-            if OPERATOR.sweep_due(now, at, last_on, digest_on):
+            health_on = health_enabled()
+            if HEALTH_BUSY.is_set():
+                # A pass under way (a late restart, past the grace): this
+                # morning's results are minutes off, so the sweep waits for them.
+                time.sleep(60)
+                continue
+            if OPERATOR.sweep_due(now, at, last_on, digest_on,
+                                  health_last_on=HEALTH.pass_on() if health_on else "",
+                                  health_on=health_on):
                 missed = OPERATOR.digest_missed(now, last_on, digest_on)
                 if missed:
                     log.warning("today's digest has not posted %d min after the "
@@ -7282,6 +7399,7 @@ if __name__ == "__main__":
     correct_costs_once()
     reconcile_checkouts()
     install_git_guards()
+    register_mini()
     # Every long-lived loop is started through daemons.start, so /status can
     # tell when one has stopped. forever=False marks a startup pass that is
     # meant to finish; a feature switched off in .env returns at once on
@@ -7320,6 +7438,14 @@ if __name__ == "__main__":
              " · wake workers: %d",
              f"{CLAUDE_TIMEOUT}s" if CLAUDE_TIMEOUT else "none",
              CLAUDE_IDLE_TIMEOUT, TASK_WORKERS, REVIEW_WORKERS, WAKE_WORKERS)
+    # The resolved schedule, for the same reason: "when does health run now?"
+    # answered by what this process read, not by what .env says.
+    log.info("health checks: %s", HEALTH_SCHEDULE if HEALTH is not None
+             else "off: health.json cannot be read")
+    if os.environ.get("HEALTH_EVERY") is not None:
+        log.warning("HEALTH_EVERY=%s is no longer read: health runs once a day before "
+                    "the operator's sweep (HEALTH_LEAD); remove it from .env",
+                    os.environ.get("HEALTH_EVERY"))
     # Same reason as the line above, one level down: a landed fix is not a
     # running fix, and this is the only place the answer is written down at the
     # moment it is still true. Everything else asks git, which by then is
