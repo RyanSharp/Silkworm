@@ -28009,6 +28009,141 @@ def test_probe_backend_drift_compares_production_with_the_base_branch():
           and "alpha" in r["summary"], r["summary"])
 
 
+def test_probe_backend_drift_measures_a_release_by_ancestry():
+    P = _probes()
+    import health as H
+    print("\nbackend-drift: a deploy a release explains is measured by what landed since its tag")
+    day = 86400
+    now = _PROBE_NOW
+    cfg = {"supabase": {"cadence": {"ref": "refabc", "dir": "supabase"}}}
+    base_files = {"supabase/functions/alpha/index.ts": "a1",
+                  "supabase/functions/_shared/util.ts": "s1",
+                  "supabase/migrations/20261001000001_first.sql": "select 1;",
+                  ".silkworm/release.toml": '[targets.backend]\npaths = ["supabase/"]\n'
+                                            'ship = "command"\ncommands = ["true"]\n\n'
+                                            '[targets.ios]\npaths = ["ios/"]\nship = "tag"\n'}
+    applied = [{"version": "20261001000001", "name": "first"}]
+    api = lambda funcs: {"/functions": (200, json.dumps(funcs)),       # noqa: E731
+                         "/database/migrations": (200, json.dumps(applied))}
+    ident = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(repo, *args, authored=None, committed=None):
+        env = {**os.environ, **ident}
+        if authored is not None:
+            env["GIT_AUTHOR_DATE"] = f"@{int(authored)} +0000"
+        if committed is not None:
+            env["GIT_COMMITTER_DATE"] = f"@{int(committed)} +0000"
+        subprocess.run(["git", "-C", str(repo), *args], check=True, env=env)
+
+    def land(repo, path, text, authored, landed):
+        # A rebase-landing: authored when written, committed when it landed.
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "land", authored=authored, committed=landed)
+
+    def release(repo, tag, at):
+        git(repo, "tag", "-a", tag, "-m", tag, committed=at)       # tagger date = at
+
+    def run(repo, funcs):
+        rec = {"slug": "cadence", "scope": {"cwd": str(repo)}}
+        s = _probe_sys(home=_supabase_home() / "home", now=now, http=api(funcs))
+        return _run_probe(P.make_backend_drift(s, cfg), rec)
+
+    # (a) Authored day -5, waiting in review; a sibling's !release redeploys
+    # alpha on day -4 from a tree without it; it lands day -3. Author time is
+    # older than the deploy, so author time alone reads this as current.
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    release(repo, "backend/v1.0.0", now - 20 * day)
+    land(repo, "supabase/functions/beta/index.ts", "b", now - 4 * day - 600, now - 4 * day - 600)
+    release(repo, "backend/v1.0.1", now - 4 * day + 60)
+    land(repo, "supabase/functions/alpha/index.ts", "a2", now - 5 * day, now - 3 * day)
+    r = run(repo, [_deployed("alpha", 5, now - 4 * day), _deployed("beta", 1, now - 4 * day)])
+    check("authored before a release's redeploy, landed after it: drift",
+          r["status"] == H.WARN and "alpha" in r["summary"] and "beta" not in r["summary"]
+          and "stale:alpha:5" == r["fingerprint"], r["summary"])
+    check("the line names the release and when the change landed",
+          any("alpha" in e and "backend/v1.0.1" in e and "1 commit(s)" in e
+              and P._iso(now - 3 * day) in e for e in r["evidence"]), r["evidence"])
+    check("aged from the landing, not the authoring", "oldest 3d" in r["summary"], r["summary"])
+    land(repo, "supabase/functions/_shared/util.ts", "s2", now - 6 * day, now - 2 * day)
+    r = run(repo, [_deployed("alpha", 5, now - 4 * day), _deployed("beta", 1, now - 4 * day)])
+    check("shared code landed after the release drifts every function built with it",
+          r["status"] == H.WARN and "alpha" in r["fingerprint"] and "beta" in r["fingerprint"],
+          r["summary"])
+
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    land(repo, "supabase/functions/alpha/index.ts", "a2", now - 5 * day, now - 4 * day - 900)
+    release(repo, "backend/v1.0.0", now - 4 * day + 60)
+    land(repo, "ios/App.swift", "x", now - day, now - day)
+    r = run(repo, [_deployed("alpha", 5, now - 4 * day)])
+    check("nothing of the function's landed since its release: current, naming the tag",
+          r["status"] == H.OK and any("as backend/v1.0.0" in e for e in r["evidence"]),
+          r["evidence"])
+    release(repo, "ios/v1.2.0", now - 3 * day)
+    r = run(repo, [_deployed("alpha", 5, now - 3 * day)])
+    check("another target's tag does not explain a backend deploy", r["status"] == H.OK
+          and not any("ios/v1.2.0" in e for e in r["evidence"]), r["evidence"])
+
+    # (b) Deployed by hand from the task's worktree on day -2, landed day -1:
+    # no release was cut with that deploy, so author time still decides. The
+    # older release tag says nothing about what this deploy contained.
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    release(repo, "backend/v1.0.0", now - 10 * day)
+    land(repo, "supabase/functions/alpha/index.ts", "a2", now - 3 * day, now - day)
+    r = run(repo, [_deployed("alpha", 6, now - 2 * day)])
+    check("deployed from the worktree before landing, an older release tag present: current",
+          r["status"] == H.OK and any("current with main" in e and "as " not in e
+                                      for e in r["evidence"]), r["evidence"])
+    land(repo, "supabase/functions/alpha/index.ts", "a3", now - 3600, now - 3600)
+    r = run(repo, [_deployed("alpha", 6, now - 2 * day)])
+    check("and a change authored after that deploy still drifts by author time",
+          r["status"] == H.WARN and "alpha" in r["summary"], r["summary"])
+    # A release at 12:00, then a hand deploy from a worktree at 12:05: the tag
+    # came before the deploy, so it did not make it.
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    release(repo, "backend/v1.0.0", now - 2 * day - 300)
+    land(repo, "supabase/functions/alpha/index.ts", "a2", now - 3 * day, now - day)
+    r = run(repo, [_deployed("alpha", 6, now - 2 * day)])
+    check("a release tag from just before a worktree deploy does not explain it: current",
+          r["status"] == H.OK and not any("as backend" in e for e in r["evidence"]),
+          r["evidence"])
+
+    # A release whose later commands ran 20 minutes after this function
+    # deployed: the tag is still that release's.
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    release(repo, "backend/v1.0.0", now - 4 * day + 1200)
+    land(repo, "supabase/functions/alpha/index.ts", "a2", now - 5 * day, now - 3 * day)
+    r = run(repo, [_deployed("alpha", 5, now - 4 * day)])
+    check("a release running past DRIFT_SLACK_S still explains its deploys: drift",
+          r["status"] == H.WARN and any("as backend/v1.0.0" in e for e in r["evidence"]),
+          r["summary"])
+
+    # Merged on the forge with a merge commit: the branch's own commits keep
+    # their committer time, from before the deploy; it landed at the merge.
+    repo = _drift_repo([(now - 20 * day, base_files)])
+    git(repo, "checkout", "-qb", "feature")
+    land(repo, "supabase/functions/alpha/index.ts", "a2", now - 5 * day, now - 5 * day)
+    git(repo, "checkout", "-q", "main")
+    release(repo, "backend/v1.0.0", now - 4 * day + 60)
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge", "feature", committed=now - 3 * day)
+    r = run(repo, [_deployed("alpha", 5, now - 4 * day)])
+    check("a merge-commit landing is drift, aged from the merge",
+          r["status"] == H.WARN and "oldest 3d" in r["summary"], r["summary"])
+
+    broken = dict(base_files, **{".silkworm/release.toml": "[targets.backend\npaths = 1"})
+    repo = _drift_repo([(now - 20 * day, broken)])
+    release(repo, "backend/v1.0.0", now - 19 * day)
+    r = run(repo, [_deployed("alpha", 3, now - 19 * day)])
+    check("a release.toml that does not parse falls back to author time, not unknown",
+          r["status"] == H.OK, r["summary"])
+    odd = dict(base_files, **{".silkworm/release.toml": 'targets = "x"\n'})
+    repo = _drift_repo([(now - 20 * day, odd)])
+    r = run(repo, [_deployed("alpha", 3, now - 19 * day)])
+    check("nor does one whose targets are not tables", r["status"] == H.OK, r["summary"])
+
+
 def test_probe_mini_credentials_and_disk():
     P = _probes()
     import health as H

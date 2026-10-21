@@ -61,6 +61,7 @@ from pathlib import Path
 import credentials
 import envfile
 import health
+import releases
 from health import FAIL, OK, UNKNOWN, WARN, result, unknown
 
 log = logging.getLogger("silkworm.health")
@@ -90,6 +91,9 @@ DRIFT_FAIL_D = 7
 #: A deploy within this long before a commit still counts as of that commit
 #: (a function deployed from the branch moments before it landed).
 DRIFT_SLACK_S = 600
+#: Clock skew allowed between Supabase's updated_at and a release tag cut on
+#: this machine, when matching a deploy to the release that made it.
+RELEASE_SKEW_S = 60
 
 
 class Unavailable(Exception):
@@ -669,6 +673,27 @@ def _drift(sys: System, rec, ref, sub, known) -> dict:
                    budget=budget).strip()
         return float(out) if out else 0.0
 
+    releases = _release_tags(sys, repo, branch, budget)
+
+    def release_for(path, at) -> str | None:
+        # The release tag cut with this deploy. releases.py runs every
+        # command, then tags, so the tag comes after the functions it pushed
+        # -- by up to the rest of the release, each command allowed
+        # COMMAND_TIMEOUT_S. A tag from before the deploy did not make it.
+        # The first tag after the deploy wins.
+        after = [(when, tag) for when, tag, covers, longest in releases
+                 if covers(path) and at - RELEASE_SKEW_S <= when <= at + longest]
+        return min(after)[1] if after else None
+
+    def landed_since(tag, *paths) -> list[float]:
+        # Ancestry, not time: whatever reached the base after the tag was not
+        # in the tree the release deployed, however long ago it was authored.
+        # First parent, so a merge landing is dated by the merge, not by its
+        # branch's commits; committer time, which a rebase landing sets.
+        out = _git(sys, repo, "log", "--first-parent", "--format=%ct", f"{tag}..{branch}",
+                   "--", *paths, budget=budget).split()
+        return sorted(float(t) for t in out)
+
     def added(path) -> float:
         out = _git(sys, repo, "log", "--diff-filter=A", "--format=%at", branch, "--", path,
                    budget=budget).split()
@@ -686,8 +711,24 @@ def _drift(sys: System, rec, ref, sub, known) -> dict:
             drift.append((now, f"function {fn}: deployed but {dep.get('status')}",
                           f"status:{fn}:{dep.get('status')}"))
             continue
-        changed = last_touch(path, *shared)
         at = float(dep.get("updated_at") or 0) / 1000
+        tag = release_for(path, at)
+        if tag:
+            missing = landed_since(tag, path, *shared)
+            if missing:
+                drift.append((missing[0], f"function {fn}: deployed v{dep.get('version')} "
+                                          f"{_iso(at)} as {tag}; {len(missing)} commit(s) "
+                                          f"touching it landed on {short} since, first "
+                                          f"{_iso(missing[0])}",
+                              f"stale:{fn}:{dep.get('version')}"))
+            else:
+                evidence.append(f"function {fn}: v{dep.get('version')} deployed {_iso(at)} "
+                                f"as {tag}, current with {short}")
+            continue
+        # No release explains the deploy (a manual one, or from a task's
+        # worktree before it landed): the newest change's author time is all
+        # there is to go on.
+        changed = last_touch(path, *shared)
         if changed > at + DRIFT_SLACK_S:
             drift.append((changed, f"function {fn}: deployed v{dep.get('version')} "
                                    f"{_iso(at)}; {short} changed it {_iso(changed)}",
@@ -729,6 +770,47 @@ def _drift(sys: System, rec, ref, sub, known) -> dict:
                       lines, link)
     return result(OK, f"{len(functions)} function(s) and {len(migrations)} migration(s) "
                       f"match {short}", lines, link)
+
+
+def _release_tags(sys: System, repo, branch, budget) -> list:
+    """(tagger date, tag, covers(path), longest) for every `<target>/vX.Y.Z`
+    release tag of the targets in the base branch's `.silkworm/release.toml`
+    (the format releases.py writes). covers(path) says whether a path is one
+    of that target's; longest is how long its release can run. Empty when the
+    project declares no targets, or declares them in a form releases.py would
+    refuse -- drift then falls back to author time."""
+    rc, text, _ = sys.run(["git", "-C", str(repo), "show",
+                           f"{branch}:.silkworm/release.toml"], timeout=budget.left(15))
+    if rc != 0:
+        return []
+    try:
+        targets = tomllib.loads(text).get("targets") or {}
+    except tomllib.TOMLDecodeError:
+        return []
+    if not isinstance(targets, dict):
+        return []
+    out = []
+    for name, t in targets.items():
+        if not isinstance(t, dict) or not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            continue
+        paths = t.get("paths") if isinstance(t.get("paths"), list) else []
+        prefixes = [p.removeprefix("./").strip("/") for p in paths if isinstance(p, str)]
+        prefixes = [p for p in prefixes if p]
+        if not prefixes:
+            continue
+        commands = t.get("commands") if isinstance(t.get("commands"), list) else []
+        longest = max(len(commands), 1) * releases.COMMAND_TIMEOUT_S
+
+        def covers(path, prefixes=prefixes):
+            return any(path == p or path.startswith(p + "/") for p in prefixes)
+        listing = _git(sys, repo, "for-each-ref",
+                       "--format=%(creatordate:unix) %(refname:short)",
+                       f"refs/tags/{name}/", budget=budget)
+        for row in listing.splitlines():
+            when, _, tag = row.strip().partition(" ")
+            if when.isdigit() and re.fullmatch(rf"{re.escape(name)}/v\d+\.\d+\.\d+", tag):
+                out.append((float(when), tag, covers, longest))
+    return out
 
 
 def _has_path(sys: System, repo, branch, path, budget) -> bool:
