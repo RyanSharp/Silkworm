@@ -653,9 +653,11 @@ SWEEP_GOAL = (
     "finished checkouts whose only changes are generated files; and, if "
     "Silkworm's main is ahead of the running revision and nothing is running, "
     "`{bin} deploy --after-turn`. Keep your notes current.\n\n"
-    "Not yours, whatever you are asked: accepting proposals, approving flagged "
-    "work, releases, publishing, trader's live configuration, deleting anything "
-    "not proven redundant. Those are refused unless the user approved that one "
+    "Not yours, whatever you are asked: deciding on proposals, reviewed work "
+    "or research findings either way -- accepting, approving, dismissing, "
+    "closing or digging on them -- dismissing or cancelling a queued, blocked, "
+    "failed or running task that is not your own, releases, publishing, "
+    "trader's live configuration, deleting anything not proven redundant. Those are refused unless the user approved that one "
     "item -- ask them for it.")
 
 SWEEP_NOTE = (

@@ -27439,6 +27439,12 @@ def test_operator_knows_it_is_the_chief_of_staff():
           and "releases, publishing where publish" in text)
     check("the sweep goal and note carry it", "--health" in O.SWEEP_GOAL
           and "do not repeat it" in O.SWEEP_NOTE)
+    # The sweep's own "Not yours" list must not be shorter than the main
+    # prompt's: every decision the accept guard refuses is named in both.
+    for verb in ("accepting", "approving", "dismissing", "closing", "digging",
+                 "cancelling", "not your own"):
+        check(f"both 'Not yours' lists name {verb!r}",
+              verb in text and verb in O.SWEEP_GOAL.split("Not yours", 1)[-1])
 
 
 # --- project health probes (health_probes.py) -------------------------------------
