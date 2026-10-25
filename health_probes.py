@@ -18,6 +18,12 @@ outside it, each a lesson already paid for:
   mini     credentials  -- claude's credential, Apple certificates/profiles,
                            the App Store Connect key.
            disk         -- free space on the data volume.
+           tailscale    -- the phone can reach the dashboard: tailscaled
+                           running and logged in, MagicDNS and HTTPS on, serve
+                           forwarding this machine's name to the visualizer,
+                           Funnel off. On 2026-10-25 the phone showed the
+                           offline page three days after a reboot and nothing
+                           here had noticed.
 
 Rules every probe keeps, because a monitor that breaks them is worse than
 none:
@@ -62,6 +68,7 @@ import credentials
 import envfile
 import health
 import releases
+import tailnet
 from health import FAIL, OK, UNKNOWN, WARN, result, unknown
 
 log = logging.getLogger("silkworm.health")
@@ -109,6 +116,9 @@ _SECRETS = [
     re.compile(r"xox[abposr]-[A-Za-z0-9-]{8,}"),         # Slack
     re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),  # a JWT
     re.compile(r"(?i)(bearer\s+)[^\s\"']+"),
+    re.compile(r"\b(?:nodekey|mkey|discokey|nlpub|privkey):[0-9a-f]{8,}"),  # Tailscale keys
+    re.compile(r"tskey-[A-Za-z0-9-]{8,}"),               # a Tailscale auth key
+    re.compile(r"(login\.tailscale\.com/a/)[A-Za-z0-9]+"),  # a login link
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
 ]
 
@@ -1160,6 +1170,85 @@ def make_disk(sys: System = SYSTEM, config: dict | None = None):
     return probe
 
 
+#: Tailscale's states that mean the daemon is between states, not wrong.
+TAILSCALE_PASSING = ("Starting", "NoState")
+
+
+def make_tailscale(sys: System = SYSTEM, config: dict | None = None, find_bin=None):
+    """The phone dashboard's path, as `silkworm tailscale status` reads it --
+    tailnet.py is both -- minus the .env login, which is configuration this
+    machine's reboot cannot change. `find_bin()` -> the CLI or "" (tests)."""
+    def probe(rec, gh):
+        port = str(sys.env("SILKWORM_VIZ_PORT") or "8790")
+        ts = (find_bin or tailnet.tailscale_bin)()
+        if not ts:
+            return unknown("the tailscale CLI is not installed here")
+        budget = Budget(sys)
+
+        def run(argv, timeout):
+            return sys.run(argv, budget.left(timeout))
+
+        try:
+            st = tailnet.tailscale_call(ts, "status", run=run)
+        except Unavailable as e:
+            return unknown(f"could not ask tailscale: {e}")
+        except tailnet.TailscaleError as e:
+            if e.daemon_down:
+                return result(FAIL, "tailscaled is not running on the mini — the phone "
+                              "cannot reach the dashboard",
+                              [f"tailscale status: {e.text[:240]}"], fingerprint="down")
+            return unknown(f"tailscale status failed (exit {e.rc}): {e.text[:160]}")
+        try:
+            serve = tailnet.tailscale_call(ts, "serve", "status", run=run)
+        except Unavailable as e:
+            return unknown(f"could not ask tailscale serve: {e}")
+        except tailnet.TailscaleError as e:
+            return unknown(f"tailscale serve status failed (exit {e.rc}): {e.text[:160]}")
+        if not st.get("BackendState"):
+            return unknown("tailscale status said nothing about its backend state")
+        f = tailnet.facts_from(st, serve)
+        state, dns = f["state"], f["dns"]
+        hosts = tailnet.viz_hosts(f, port)
+        evidence = [f"backend {state}" + (f", {dns}" if dns else ""),
+                    f"MagicDNS {'on' if f['magicdns'] else 'off'}, HTTPS certificates "
+                    f"{'on' if f['https'] else 'off'}",
+                    "serve: " + (", ".join(f"{h} -> {t}" for t, hs in sorted(f["hosts"].items())
+                                          for h in hs) or "nothing"),
+                    f"Funnel {'ON' if f['funnel'] else 'off'}"]
+        if state in TAILSCALE_PASSING:
+            return result(UNKNOWN, f"tailscale is {state}; look again later", evidence)
+        bad, fps = [], []
+        # First: summaries are cut at 300 characters, and this one must survive.
+        if f["funnel"]:
+            bad.append("Funnel is on — the public internet can reach it")
+            fps.append("funnel")
+        if state == "Stopped":
+            bad.append("tailscale is stopped (logged in, not connected)")
+        elif state in ("NeedsLogin", "NeedsMachineAuth"):
+            bad.append(f"tailscale is logged out ({state})")
+        elif state != "Running":
+            bad.append(f"tailscale is {state}")
+        if state != "Running":
+            fps.append(state)
+        if state == "Running" and not (f["magicdns"] and f["https"]):
+            bad.append("MagicDNS or HTTPS certificates are off")
+            fps.append("dns")
+        if not hosts:
+            bad.append(f"serve does not forward to the dashboard (:{port})")
+            fps.append("serve-missing")
+        elif dns and dns not in hosts:
+            bad.append(f"serve forwards {', '.join(hosts)}, but this machine is now {dns}")
+            fps.append("serve-renamed:" + dns)
+        others = [p for p in f["proxies"] if not tailnet.serves_viz([p], port)] + f["other"]
+        if others:
+            bad.append(f"serve also exposes {', '.join(others)[:120]}")
+            fps.append("serve-extra")
+        if bad:
+            return result(FAIL, "; ".join(bad), evidence, fingerprint=",".join(fps))
+        return result(OK, f"dashboard served at https://{dns}/ to the tailnet only", evidence)
+    return probe
+
+
 # --- registration -------------------------------------------------------------------
 
 def _in(section: str):
@@ -1214,6 +1303,8 @@ def register_all(sys: System = SYSTEM, config: dict | None = None,
          "claude's credential, Apple certificates/profiles and the ASC key"),
         ("disk", make_disk(sys, config), _is_mini,
          "free space on the mini's data volume"),
+        ("tailscale", make_tailscale(sys, config), _is_mini,
+         "the phone can reach the dashboard over Tailscale serve, tailnet-only"),
     ]
     for name, probe, applies, about in probes:
         probe = scrubbed(probe)
@@ -1282,9 +1373,38 @@ def _decide_gateway(rec) -> str:
     return ""
 
 
+#: What the owner does on the mini, by the trouble a tailscale summary names.
+TAILSCALE_ACTIONS = (
+    ("not running", "on the mini, open the Tailscale app and connect "
+                    "(Homebrew: sudo brew services start tailscale)"),
+    ("is stopped", "on the mini, open the Tailscale app and connect (or `tailscale up`)"),
+    ("logged out", "on the mini, open the Tailscale app and sign in"),
+    ("tailscale is ", "on the mini, open the Tailscale app and connect"),
+    ("MagicDNS", "turn on MagicDNS and HTTPS Certificates at "
+                 "https://login.tailscale.com/admin/dns"),
+    ("this machine is now", "on the mini, run `silkworm tailscale on` (the phone needs the new name), "
+             "or rename the machine back in the Tailscale admin console"),
+    ("does not forward", "on the mini, run `silkworm tailscale on`"),
+    ("also exposes", "on the mini, run `tailscale serve reset`, then `silkworm tailscale on`"),
+    ("Funnel is on", "on the mini, run `tailscale funnel reset` now"),
+)
+
+
+def _decide_tailscale(rec) -> str:
+    if rec.get("status") not in (WARN, FAIL):
+        return ""
+    summ, out = rec.get("summary") or "", []
+    for marker, action in TAILSCALE_ACTIONS:
+        if marker in summ and action not in out and not (
+                marker == "tailscale is " and out):
+            out.append(action)
+    return "; ".join(out) or "on the mini, run `silkworm tailscale status` and fix what it shows"
+
+
 DECISIONS = {"backend-drift": _decide_drift, "app-store": _decide_app_store,
              "testflight": _decide_testflight, "credentials": _decide_credentials,
-             "disk": _decide_disk, "gateway": _decide_gateway}
+             "disk": _decide_disk, "gateway": _decide_gateway,
+             "tailscale": _decide_tailscale}
 
 
 def _short_testflight(rec) -> str:
@@ -1300,7 +1420,8 @@ SHORT = {"backend-drift": lambda rec: "backend current",
          "app-store": lambda rec: (rec.get("summary") or "").split(";")[-1].strip(),
          "testflight": _short_testflight, "dispatching": lambda rec: "dispatching",
          "gateway": lambda rec: "Gateway up", "healthcheck": lambda rec: "healthcheck passes",
-         "credentials": lambda rec: "credentials good", "disk": _short_disk}
+         "credentials": lambda rec: "credentials good", "disk": _short_disk,
+         "tailscale": lambda rec: "dashboard reachable"}
 
 
 def projects_with_mini(recs) -> list[dict]:

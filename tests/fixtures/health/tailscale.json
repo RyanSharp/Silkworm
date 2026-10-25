@@ -1,0 +1,322 @@
+{
+ "_derived": "status_stopped and serve_funnel are derived; see record_tailscale.py",
+ "_recorded": "Captured on the mini, 2026-10-25, tailscale 1.104.1 (Homebrew):",
+ "daemon_down_stderr": "failed to connect to local tailscaled (which appears to be running as tailscaled, pid 0). Got error: Failed to connect to local Tailscale daemon for /localapi/v0/status; not running? Error: dial unix /tmp/tsfix/ts.sock: connect: no such file or directory",
+ "serve_empty": {},
+ "serve_funnel": {
+  "AllowFunnel": {
+   "ryans-mini-2.tail0000.ts.net:443": true
+  },
+  "TCP": {
+   "443": {
+    "HTTPS": true
+   }
+  },
+  "Web": {
+   "ryans-mini-2.tail0000.ts.net:443": {
+    "Handlers": {
+     "/": {
+      "Proxy": "http://127.0.0.1:8790"
+     }
+    }
+   }
+  }
+ },
+ "serve_live": {
+  "TCP": {
+   "443": {
+    "HTTPS": true
+   }
+  },
+  "Web": {
+   "ryans-mini-2.tail0000.ts.net:443": {
+    "Handlers": {
+     "/": {
+      "Proxy": "http://127.0.0.1:8790"
+     }
+    }
+   }
+  }
+ },
+ "status_needs_login": {
+  "AuthURL": "",
+  "BackendState": "NeedsLogin",
+  "CertDomains": null,
+  "ClientVersion": null,
+  "CurrentTailnet": null,
+  "ExtraRecords": null,
+  "Health": [
+   "Tailscale is stopped."
+  ],
+  "MagicDNSSuffix": "",
+  "Peer": null,
+  "Self": {
+   "Active": false,
+   "Addrs": [],
+   "Created": "0001-01-01T00:00:00Z",
+   "CurAddr": "",
+   "DNSName": "",
+   "ExitNode": false,
+   "ExitNodeOption": false,
+   "HostName": "Ryans-Mini-2.home",
+   "ID": "",
+   "InEngine": false,
+   "InMagicSock": false,
+   "InNetworkMap": false,
+   "LastHandshake": "0001-01-01T00:00:00Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "LastWrite": "0001-01-01T00:00:00Z",
+   "NoFileSharingReason": "",
+   "NodeID": 0,
+   "OS": "macOS",
+   "Online": false,
+   "PeerAPIURL": null,
+   "PeerRelay": "",
+   "PublicKey": "nodekey:[redacted]",
+   "Relay": "",
+   "RxBytes": 0,
+   "TaildropTarget": 0,
+   "TailscaleIPs": null,
+   "TxBytes": 0,
+   "UserID": 0
+  },
+  "TUN": false,
+  "TailscaleIPs": null,
+  "User": null,
+  "Version": "1.104.1-t9a522a978"
+ },
+ "status_running": {
+  "AuthURL": "",
+  "BackendState": "Running",
+  "CertDomains": [
+   "ryans-mac-mini-2.tail0000.ts.net"
+  ],
+  "ClientVersion": null,
+  "CurrentTailnet": {
+   "MagicDNSEnabled": true,
+   "MagicDNSSuffix": "tail0000.ts.net",
+   "Name": "example.github",
+   "StableID": "[id]"
+  },
+  "ExtraRecords": null,
+  "HaveNodeKey": true,
+  "Health": [],
+  "MagicDNSSuffix": "tail0000.ts.net",
+  "Peer": {
+   "nodekey:[redacted]": {
+    "Active": false,
+    "Addrs": null,
+    "AllowedIPs": [],
+    "Created": "2026-10-14T17:31:38.998012183Z",
+    "CurAddr": "",
+    "DNSName": "iphone182.tail0000.ts.net.",
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "HostName": "localhost",
+    "ID": "[id]",
+    "InEngine": false,
+    "InMagicSock": true,
+    "InNetworkMap": true,
+    "KeyExpiry": "2027-04-12T17:31:38Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "NoFileSharingReason": "",
+    "NodeID": 0,
+    "OS": "iOS",
+    "Online": true,
+    "PeerAPIURL": [],
+    "PeerRelay": "",
+    "PublicKey": "nodekey:[redacted]",
+    "Relay": "",
+    "RxBytes": 0,
+    "TaildropTarget": 1,
+    "TailscaleIPs": [
+     "100.64.0.1"
+    ],
+    "TxBytes": 0,
+    "UserID": 0
+   }
+  },
+  "Self": {
+   "Active": false,
+   "Addrs": [],
+   "AllowedIPs": [],
+   "CapMap": {},
+   "Capabilities": [
+    "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+    "default-auto-update",
+    "https",
+    "https://tailscale.com/cap/file-sharing",
+    "https://tailscale.com/cap/is-admin",
+    "https://tailscale.com/cap/is-owner",
+    "https://tailscale.com/cap/ssh",
+    "https://tailscale.com/cap/tailnet-lock",
+    "probe-udp-lifetime",
+    "ssh-behavior-v1",
+    "ssh-env-vars",
+    "store-appc-routes",
+    "tailnet-display-name"
+   ],
+   "Created": "2026-10-14T17:33:10.442260027Z",
+   "CurAddr": "",
+   "DNSName": "ryans-mac-mini-2.tail0000.ts.net.",
+   "ExitNode": false,
+   "ExitNodeOption": false,
+   "HostName": "Ryans-Mac-mini-2",
+   "ID": "[id]",
+   "InEngine": false,
+   "InMagicSock": false,
+   "InNetworkMap": true,
+   "KeyExpiry": "2027-04-12T17:33:10Z",
+   "LastHandshake": "0001-01-01T00:00:00Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "LastWrite": "0001-01-01T00:00:00Z",
+   "NoFileSharingReason": "",
+   "NodeID": 0,
+   "OS": "macOS",
+   "Online": true,
+   "PeerAPIURL": [],
+   "PeerRelay": "",
+   "PublicKey": "nodekey:[redacted]",
+   "Relay": "",
+   "RxBytes": 0,
+   "TaildropTarget": 0,
+   "TailscaleIPs": [
+    "100.64.0.1"
+   ],
+   "TxBytes": 0,
+   "UserID": 0
+  },
+  "TUN": true,
+  "TailscaleIPs": [
+   "100.64.0.1"
+  ],
+  "User": {
+   "0": {
+    "DisplayName": "[redacted]",
+    "ID": 0,
+    "LoginName": "owner@example.com",
+    "ProfilePicURL": "[redacted]"
+   }
+  },
+  "Version": "1.104.1-t9a522a978"
+ },
+ "status_stopped": {
+  "AuthURL": "",
+  "BackendState": "Stopped",
+  "CertDomains": [
+   "ryans-mac-mini-2.tail0000.ts.net"
+  ],
+  "ClientVersion": null,
+  "CurrentTailnet": {
+   "MagicDNSEnabled": true,
+   "MagicDNSSuffix": "tail0000.ts.net",
+   "Name": "example.github",
+   "StableID": "[id]"
+  },
+  "ExtraRecords": null,
+  "HaveNodeKey": true,
+  "Health": [],
+  "MagicDNSSuffix": "tail0000.ts.net",
+  "Peer": {
+   "nodekey:[redacted]": {
+    "Active": false,
+    "Addrs": null,
+    "AllowedIPs": [],
+    "Created": "2026-10-14T17:31:38.998012183Z",
+    "CurAddr": "",
+    "DNSName": "iphone182.tail0000.ts.net.",
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "HostName": "localhost",
+    "ID": "[id]",
+    "InEngine": false,
+    "InMagicSock": true,
+    "InNetworkMap": true,
+    "KeyExpiry": "2027-04-12T17:31:38Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "NoFileSharingReason": "",
+    "NodeID": 0,
+    "OS": "iOS",
+    "Online": true,
+    "PeerAPIURL": [],
+    "PeerRelay": "",
+    "PublicKey": "nodekey:[redacted]",
+    "Relay": "",
+    "RxBytes": 0,
+    "TaildropTarget": 1,
+    "TailscaleIPs": [
+     "100.64.0.1"
+    ],
+    "TxBytes": 0,
+    "UserID": 0
+   }
+  },
+  "Self": {
+   "Active": false,
+   "Addrs": [],
+   "AllowedIPs": [],
+   "CapMap": {},
+   "Capabilities": [
+    "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+    "default-auto-update",
+    "https",
+    "https://tailscale.com/cap/file-sharing",
+    "https://tailscale.com/cap/is-admin",
+    "https://tailscale.com/cap/is-owner",
+    "https://tailscale.com/cap/ssh",
+    "https://tailscale.com/cap/tailnet-lock",
+    "probe-udp-lifetime",
+    "ssh-behavior-v1",
+    "ssh-env-vars",
+    "store-appc-routes",
+    "tailnet-display-name"
+   ],
+   "Created": "2026-10-14T17:33:10.442260027Z",
+   "CurAddr": "",
+   "DNSName": "ryans-mac-mini-2.tail0000.ts.net.",
+   "ExitNode": false,
+   "ExitNodeOption": false,
+   "HostName": "Ryans-Mac-mini-2",
+   "ID": "[id]",
+   "InEngine": false,
+   "InMagicSock": false,
+   "InNetworkMap": true,
+   "KeyExpiry": "2027-04-12T17:33:10Z",
+   "LastHandshake": "0001-01-01T00:00:00Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "LastWrite": "0001-01-01T00:00:00Z",
+   "NoFileSharingReason": "",
+   "NodeID": 0,
+   "OS": "macOS",
+   "Online": true,
+   "PeerAPIURL": [],
+   "PeerRelay": "",
+   "PublicKey": "nodekey:[redacted]",
+   "Relay": "",
+   "RxBytes": 0,
+   "TaildropTarget": 0,
+   "TailscaleIPs": [
+    "100.64.0.1"
+   ],
+   "TxBytes": 0,
+   "UserID": 0
+  },
+  "TUN": true,
+  "TailscaleIPs": [
+   "100.64.0.1"
+  ],
+  "User": {
+   "0": {
+    "DisplayName": "[redacted]",
+    "ID": 0,
+    "LoginName": "owner@example.com",
+    "ProfilePicURL": "[redacted]"
+   }
+  },
+  "Version": "1.104.1-t9a522a978"
+ }
+}

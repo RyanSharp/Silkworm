@@ -447,9 +447,6 @@ def unmerged_row(r: dict) -> str:
 
 # --- tailscale serve ------------------------------------------------------------
 
-#: The Mac app ships its CLI inside the bundle; Homebrew's puts it on PATH.
-TAILSCALE_APP = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
-
 TAILSCALE_INSTALL = """Tailscale is not installed on this machine. To reach the dashboard from
 your phone or laptop over your tailnet:
 
@@ -463,69 +460,13 @@ your phone or laptop over your tailnet:
 """
 
 
-def tailscale_bin() -> str:
-    """The tailscale CLI, or "" when Tailscale is not installed."""
-    found = shutil.which("tailscale")
-    if found:
-        return found
-    return str(TAILSCALE_APP) if TAILSCALE_APP.exists() else ""
-
-
-def tailscale_json(ts: str, *args) -> dict:
-    """`tailscale <args> --json`, parsed; {} when it fails or says nothing."""
-    try:
-        out = subprocess.run([ts, *args, "--json"], capture_output=True, text=True,
-                             timeout=15)
-        return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return {}
-
-
-def serve_entries(cfg: dict) -> tuple:
-    """Everything a `tailscale serve status --json` config exposes: web
-    proxy targets, and descriptions of anything else (raw TCP forwards, file
-    or text handlers), and whether Funnel is on -- including foreground
-    sessions and Services, which nest whole configs of their own. A raw TCP
-    forward to the dashboard would skip the identity gate: serve adds no
-    headers to it."""
-    proxies, other, funnel = [], [], any((cfg.get("AllowFunnel") or {}).values())
-    for port, tcp in (cfg.get("TCP") or {}).items():
-        if (tcp or {}).get("TCPForward"):
-            other.append(f"tcp:{port} -> {tcp['TCPForward']}")
-    for host, web in (cfg.get("Web") or {}).items():
-        for path, h in ((web or {}).get("Handlers") or {}).items():
-            if (h or {}).get("Proxy"):
-                proxies.append(h["Proxy"])
-            else:
-                other.append(f"{host}{path} -> {', '.join(sorted(h or {})) or 'handler'}")
-    for nested in [*(cfg.get("Foreground") or {}).values(), *(cfg.get("Services") or {}).values()]:
-        p, o, f = serve_entries(nested or {})
-        proxies += p; other += o; funnel = funnel or f
-    return proxies, other, funnel
-
-
-def tailscale_facts(ts: str) -> dict:
-    """What `tailscale status` and `tailscale serve status` say, boiled down."""
-    st = tailscale_json(ts, "status")
-    me = st.get("Self") or {}
-    user = (st.get("User") or {}).get(str(me.get("UserID", "")), {})
-    proxies, other, funnel = serve_entries(tailscale_json(ts, "serve", "status"))
-    return {"state": st.get("BackendState", ""),
-            "login": user.get("LoginName", ""),
-            "dns": (me.get("DNSName") or "").rstrip("."),
-            "https": bool(st.get("CertDomains")),
-            "proxies": proxies, "other": other, "funnel": funnel}
-
-
-def serves_viz(proxies: list, port: str) -> bool:
-    """Serve hands tailnet requests to the dashboard's loopback port."""
-    targets = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
-    return any(p.rstrip("/") in targets for p in proxies)
+# tailscale_bin, tailscale_facts, serves_viz and the rest live in tailnet.py,
+# shared with the mini's `tailscale` health probe.
 
 
 def tailscale_status(ts: str) -> bool:
     """Every check `silkworm tailscale status` prints; True when all pass."""
-    f = tailscale_facts(ts)
+    f = tailnet.tailscale_facts(ts)
     # .env, not the shell: the installed visualizer sees only PATH, so a
     # login exported here but missing from .env would let nobody in.
     port, login = viz_port(), (env_file_value("VIZ_TAILSCALE_LOGIN") or "").strip()
@@ -536,9 +477,15 @@ def tailscale_status(ts: str) -> bool:
                 "enable MagicDNS and HTTPS Certificates at "
                 "https://login.tailscale.com/admin/dns")
     ok &= check(f"tailscale serve points at the dashboard (:{port})",
-                serves_viz(f["proxies"], port),
+                tailnet.serves_viz(f["proxies"], port),
                 f"serving {', '.join(f['proxies']) or 'nothing'} — silkworm tailscale on")
-    others = [p for p in f["proxies"] if not serves_viz([p], port)] + f["other"]
+    hosts = tailnet.viz_hosts(f, port)
+    if f["dns"] and hosts:
+        ok &= check(f"serve answers under this machine's name ({f['dns']})", f["dns"] in hosts,
+                    f"serve is set up for {', '.join(hosts)}, a name this machine no longer "
+                    "has — silkworm tailscale on (serves it under this name; the phone needs "
+                    "the new URL), or rename the machine back in the admin console")
+    others = [p for p in f["proxies"] if not tailnet.serves_viz([p], port)] + f["other"]
     ok &= check("serve exposes nothing else", not others,
                 f"also serving {', '.join(others)} — the bot's port trusts every "
                 "local caller; tailscale serve reset, then silkworm tailscale on")
@@ -552,7 +499,7 @@ def tailscale_status(ts: str) -> bool:
                     f"({f['login'] or 'unknown'})",
                     login.lower() == f["login"].lower(),
                     f"it is {login}; only that login will be let in")
-    if f["dns"] and serves_viz(f["proxies"], port):
+    if f["dns"] in hosts:
         print(f"  dashboard: https://{f['dns']}/")
     return ok
 
@@ -563,7 +510,7 @@ def do_tailscale(argv: list) -> int:
     if sub not in ("status", "on", "off"):
         print("usage: silkworm tailscale [status | on | off]", file=sys.stderr)
         return 2
-    ts = tailscale_bin()
+    ts = tailnet.tailscale_bin()
     print(f"{WORM} tailscale {sub}")
     if not ts:
         print(TAILSCALE_INSTALL.format(port=viz_port()))
@@ -912,6 +859,7 @@ import git_guard                                     # noqa: E402
 import jsonstore                                     # noqa: E402
 import workspaces                                    # noqa: E402
 import operator_role                                 # noqa: E402
+import tailnet                                       # noqa: E402
 
 
 def check_unregistered(path: Path | None = None, roots=None) -> list[str]:

@@ -23523,7 +23523,8 @@ exit 0
     saved_env = {k: os.environ.get(k) for k in ("PATH", "VIZ_TAILSCALE_LOGIN", "SILKWORM_VIZ_PORT")}
     dotenv = {}                                  # stands in for .env
     cli.env_file_value = lambda name: dotenv.get(name)
-    cli.TAILSCALE_APP = tmp / "NoSuch.app" / "Tailscale"
+    saved_app = cli.tailnet.TAILSCALE_APP
+    cli.tailnet.TAILSCALE_APP = tmp / "NoSuch.app" / "Tailscale"
 
     def run(*argv):
         buf = io.StringIO()
@@ -23610,7 +23611,15 @@ exit 0
         src = (BASE / "bin" / "silkworm").read_text()
         check("main dispatches `tailscale` with the args after the subcommand",
               'sys.exit(do_tailscale(args[1:]))' in src)
+        world(Web={"old-name.tail1234.ts.net:443": {"Handlers": {
+            "/": {"Proxy": "http://127.0.0.1:8790"}}}})
+        rc, out = run("status")
+        check("serve under a name this machine no longer has fails, naming both",
+              rc == 1 and "old-name.tail1234.ts.net" in out
+              and "this machine's name (mini.tail1234.ts.net)" in out
+              and "dashboard: https://" not in out, out)
     finally:
+        cli.tailnet.TAILSCALE_APP = saved_app
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -27503,11 +27512,13 @@ def _probe_sys(**kw):
 
     class Sys(P.System):
         def __init__(self, home, now=_PROBE_NOW, asc=None, trader=None, lsof=None,
-                     netstat=None, http=None, env=None, disk=None, tick=0.0):
+                     netstat=None, http=None, env=None, disk=None, tick=0.0,
+                     tailscale=None):
             self._home, self._now = Path(home), now
             self.asc, self.trader, self.lsof, self.netstat = asc or {}, trader, lsof, netstat
             self.http, self.envs, self.disk, self.tick = http or {}, env or {}, disk, tick
             self.calls, self._clock = [], 0.0
+            self.tailscale = tailscale
 
         def home(self):
             return self._home
@@ -27545,6 +27556,8 @@ def _probe_sys(**kw):
                 return self._answer(self.lsof, argv)
             if name == "netstat":
                 return self._answer(self.netstat, argv)
+            if name == "tailscale" and self.tailscale is not None:
+                return self._answer(self.tailscale, argv)
             raise P.Unavailable(f"{name} is not installed here")
 
         def http_get(self, url, headers, timeout):
@@ -28383,6 +28396,191 @@ def test_probe_mini_is_checked_and_the_cli_can_probe_now():
           and "_save" not in seg and "repair=False" in seg)
 
 
+def _ts_fixture():
+    return json.loads((BASE / "tests" / "fixtures" / "health" / "tailscale.json").read_text())
+
+
+def _ts_world(status, serve):
+    """A `tailscale` responder: `status` and `serve` are each a dict (printed
+    as JSON, exit 0), an (rc, out, err) tuple, or an exception to raise."""
+    def answer(part):
+        if isinstance(part, Exception):
+            raise part
+        return part if isinstance(part, tuple) else (0, json.dumps(part), "")
+
+    def respond(argv):
+        return answer(serve if argv[1:3] == ["serve", "status"] else status)
+    return respond
+
+
+def test_probe_tailscale_reads_the_phone_dashboards_path():
+    P = _probes()
+    import health as H
+    print("\ntailscale: the phone's way to the dashboard, from statuses recorded on the mini")
+    F = _ts_fixture()
+    MINI = P.MINI
+    running, live = F["status_running"], F["serve_live"]
+    dns = running["Self"]["DNSName"].rstrip(".")
+    stale = next(iter(live["Web"])).rsplit(":", 1)[0]
+    current = {"TCP": live["TCP"], "Web": {f"{dns}:443": next(iter(live["Web"].values()))}}
+
+    def run(status, serve=current, find=lambda: "/opt/homebrew/bin/tailscale", env=None):
+        s = _probe_sys(home=_probe_home(), tailscale=_ts_world(status, serve), env=env)
+        # Scrubbed, as register_all registers every probe.
+        res = _run_probe(P.scrubbed(P.make_tailscale(s, {}, find_bin=find)), MINI)
+        return res, P._decide_tailscale(res), s
+
+    check("the recording is the live one: the node is renamed, serve still has the old name",
+          stale != dns and stale.startswith("ryans-mini-2.") and dns.startswith("ryans-mac-mini-2."),
+          (stale, dns))
+    r, d, s = run(running)
+    check("Running, logged in, MagicDNS and HTTPS on, serve forwarding this name to :8790, "
+          "Funnel off: ok", r["status"] == H.OK and f"https://{dns}/" in r["summary"], r)
+    check("ok has no decision", d == "")
+    check("it asks `status --json` and `serve status --json`, bounded",
+          [c[0][1:] for c in s.calls] == [["status", "--json"], ["serve", "status", "--json"]]
+          and all(0 < c[1] <= 15 for c in s.calls), s.calls)
+    r, d, _ = run(running, env={"SILKWORM_VIZ_PORT": "9000"})
+    check("the dashboard's port is the visualizer's own (SILKWORM_VIZ_PORT)",
+          r["status"] == H.FAIL and "does not forward to the dashboard (:9000)" in r["summary"]
+          and "also exposes http://127.0.0.1:8790" in r["summary"], r["summary"])
+
+    r, d, _ = run(running, live)
+    check("the mini as it was on 2026-10-25: serve under a name it no longer has fails",
+          r["status"] == H.FAIL and stale in r["summary"] and f"now {dns}" in r["summary"],
+          r["summary"])
+    check("decide: run `silkworm tailscale on` on the mini, or rename it back",
+          "silkworm tailscale on" in d and "rename" in d, d)
+
+    r, d, _ = run(F["status_stopped"])
+    check("stopped (logged in, disconnected) fails, saying so",
+          r["status"] == H.FAIL and "stopped" in r["summary"] and r["fingerprint"] == "Stopped",
+          r)
+    check("decide: open the Tailscale app on the mini and connect",
+          "open the Tailscale app and connect" in d and "on the mini" in d, d)
+
+    r, d, _ = run(F["status_needs_login"], F["serve_empty"])
+    check("logged out (NeedsLogin, recorded from a fresh tailscaled) fails",
+          r["status"] == H.FAIL and "logged out (NeedsLogin)" in r["summary"], r["summary"])
+    check("and its serve config, empty, is named too",
+          "does not forward to the dashboard (:8790)" in r["summary"], r["summary"])
+    check("decide: sign in, then `silkworm tailscale on`",
+          "sign in" in d and "silkworm tailscale on" in d, d)
+
+    r, d, _ = run(running, F["serve_empty"])
+    check("serve config missing fails", r["status"] == H.FAIL
+          and r["summary"] == "serve does not forward to the dashboard (:8790)", r["summary"])
+    check("decide: `silkworm tailscale on`", d == "on the mini, run `silkworm tailscale on`", d)
+
+    funnel = dict(current, AllowFunnel={f"{dns}:443": True})
+    r, d, _ = run(running, funnel)
+    check("Funnel on fails, even with serve otherwise right",
+          r["status"] == H.FAIL and "Funnel is on" in r["summary"], r["summary"])
+    check("decide: `tailscale funnel reset`", "tailscale funnel reset" in d, d)
+    r, _, _ = run(running, F["serve_funnel"])
+    check("the recorded serve config with Funnel turned on fails on both counts",
+          "Funnel is on" in r["summary"] and "now " in r["summary"], r["summary"])
+
+    no_dns = json.loads(json.dumps(running))
+    no_dns["CurrentTailnet"]["MagicDNSEnabled"] = False
+    no_https = dict(running, CertDomains=None)
+    for label, st in (("MagicDNS off", no_dns), ("HTTPS certificates off", no_https)):
+        r, d, _ = run(st)
+        check(f"{label} fails; decide names the admin console",
+              r["status"] == H.FAIL and "MagicDNS or HTTPS" in r["summary"]
+              and "login.tailscale.com/admin/dns" in d, (r["summary"], d))
+
+    r, d, _ = run((1, "", F["daemon_down_stderr"]))
+    check("no tailscaled answering (recorded with its daemon killed) fails, not unknown",
+          r["status"] == H.FAIL and "tailscaled is not running" in r["summary"]
+          and r["fingerprint"] == "down", r)
+    check("decide: start Tailscale on the mini", "open the Tailscale app" in d, d)
+
+    r, _, s = run(running, find=lambda: "")
+    check("no tailscale CLI: unknown, and nothing run",
+          r["status"] == H.UNKNOWN and "not installed" in r["summary"] and not s.calls, r)
+    r, d, _ = run(P.Unavailable("tailscale timed out after 15s"))
+    check("a timeout is unknown, never fail", r["status"] == H.UNKNOWN
+          and "timed out" in r["summary"] and d == "", r)
+    r, _, _ = run(running, P.Unavailable("tailscale timed out after 15s"))
+    check("a serve status timeout is unknown too", r["status"] == H.UNKNOWN, r)
+    r, _, _ = run((1, "", "some new error"))
+    check("an error that is not 'no daemon' is unknown: could not look",
+          r["status"] == H.UNKNOWN, r)
+    r, _, _ = run((0, "", ""))
+    check("a status that prints nothing is unknown, not a state", r["status"] == H.UNKNOWN, r)
+    r, d, _ = run(dict(running, BackendState="Stopped"),
+                  dict(current, AllowFunnel={f"{dns}:443": True},
+                       TCP={str(p): {"TCPForward": f"127.0.0.1:{p}"} for p in range(8000, 8012)},
+                       Web={f"old-{i}.example.ts.net:443": {"Handlers": {
+                           "/": {"Proxy": "http://127.0.0.1:8790"}}} for i in range(4)}))
+    check("with many troubles at once, Funnel still leads the summary and the decision",
+          r["summary"].startswith("Funnel is on") and "tailscale funnel reset" in d, r["summary"])
+    r, _, _ = run(dict(running, BackendState="Starting"))
+    check("Starting is unknown: between states, not wrong", r["status"] == H.UNKNOWN, r)
+
+    # Keys: whatever tailscale prints, the result never carries one.
+    leaky = json.loads(json.dumps(running))
+    leaky["Self"]["PublicKey"] = "nodekey:" + "9c" * 32
+    leaky["AuthURL"] = "https://login.tailscale.com/a/1a2b3c4d5e6f"
+    secrets = ["9c" * 32, "1a2b3c4d5e6f", "tskey-auth-kAbCdEf123CNTRL-zzzzzzzzzzzz"]
+    outs = [run(leaky)[0],
+            run((1, "", f"{secrets[2]} To authenticate, visit: {leaky['AuthURL']} "
+                        f"nodekey:{'9c' * 32}"))[0],
+            run((1, "", f"failed to connect to local tailscaled: {leaky['AuthURL']} "
+                        f"{secrets[2]}"))[0]]
+    blob = json.dumps(outs)
+    check("no node key, auth key or login link in any result",
+          not [x for x in secrets if x in blob], blob)
+    check("and the recorded fixtures carry none either",
+          not _re.search(r"nodekey:[0-9a-f]{8}|tskey-|login\.tailscale\.com/a/",
+                         json.dumps(F)))
+
+    src = (BASE / "health_probes.py").read_text()
+    cli_src = (BASE / "bin" / "silkworm").read_text()
+    defs = lambda text: {n.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef)}
+    check("one implementation: tailnet.py's helpers, used by both, defined by neither",
+          not {"tailscale_bin", "tailscale_json", "tailscale_facts", "serve_entries",
+               "serves_viz"} & (defs(src) | defs(cli_src))
+          and "tailnet.tailscale_call(" in src and "tailnet.tailscale_bin" in src
+          and "tailnet.tailscale_facts(" in cli_src and "tailnet.tailscale_bin()" in cli_src)
+    check("tailscale_facts and the probe boil down through the same facts_from",
+          "facts_from(tailscale_json(" in (BASE / "tailnet.py").read_text()
+          and "tailnet.facts_from(" in src)
+
+    # It is the mini's, and `silkworm health --project mini` shows it.
+    reg = P.register_all(_probe_sys(home=_probe_home(), tailscale=_ts_world(running, live),
+                                    disk=types.SimpleNamespace(free=500, total=1000)),
+                         {"mini": {"disk": "/x"}}, registry={})
+    check("registered for the mini only",
+          [s for s in ("mini", "cadence", "trader") if reg["tailscale"].applies({"slug": s})]
+          == ["mini"])
+    cli = _load_cli()
+    old = os.environ.pop("SILKWORM_TASK_ROLE", None)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows = cli.probe_now("mini", recs=[{"slug": "cadence"}],
+                                 registry={"tailscale": reg["tailscale"]})
+    finally:
+        if old is not None:
+            os.environ["SILKWORM_TASK_ROLE"] = old
+    check("`silkworm health --probe --project mini` runs it",
+          [(r["project"], r["check"], r["status"]) for r in rows]
+          == [("mini", "tailscale", "fail")], rows)
+    path = Path(tempfile.mkdtemp()) / "health.json"
+    hs = H.HealthStore(path)
+    hs.record("mini", "tailscale", rows[0]["result"] if "result" in rows[0] else
+              {k: rows[0][k] for k in ("status", "summary", "evidence", "link", "fingerprint")})
+    hs.record("cadence", "ci", H.result(H.OK, "green"))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = cli.do_health(["--project", "mini"], path=path)
+    text = out.getvalue()
+    check("`silkworm health --project mini` lists it with its evidence, and only the mini",
+          rc == 0 and "tailscale" in text and stale in text and "Funnel off" in text
+          and "cadence" not in text, text)
+
+
 def test_probe_config_maps_projects_explicitly():
     P = _probes()
     print("\nhealth.toml: an explicit table, read by every probe that needs one")
@@ -28399,7 +28597,7 @@ def test_probe_config_maps_projects_explicitly():
     reg = P.register_all(registry={})
     check("every probe registered under its name",
           sorted(reg) == ["app-store", "backend-drift", "credentials", "disk", "dispatching",
-                          "gateway", "healthcheck", "testflight"])
+                          "gateway", "healthcheck", "tailscale", "testflight"])
     applies = {n: [s for s in ("trader", "cadence", "saga", "mondays", "fathom", "silkswing",
                                "silkworm", "mini") if reg[n].applies({"slug": s})]
                for n in reg}
@@ -28408,7 +28606,8 @@ def test_probe_config_maps_projects_explicitly():
                       "testflight": ["cadence", "saga", "mondays", "fathom", "silkswing"],
                       "backend-drift": ["cadence", "saga", "mondays"],
                       "dispatching": ["trader"], "gateway": ["trader"],
-                      "healthcheck": ["trader"], "credentials": ["mini"], "disk": ["mini"]},
+                      "healthcheck": ["trader"], "credentials": ["mini"], "disk": ["mini"],
+                      "tailscale": ["mini"]},
           applies)
 
 
