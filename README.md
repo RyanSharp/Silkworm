@@ -837,6 +837,8 @@ the board with commands it can be allowlisted for rather than raw `curl`:
 ```sh
 silkworm accept <id>                       # queue a proposal
 silkworm dismiss <id> [--round R]          # cancel it
+silkworm approve <id>                      # approve reviewed work, and land it (Approve)
+silkworm cancel <id>                       # end unfinished work, stopping it if it runs
 silkworm land <id>                         # land a finished task's branch
 silkworm drop <id>                         # delete that branch, tagging its tip first
 silkworm edit <id> [--goal G] [--title T]  # change work that has not run yet
@@ -847,6 +849,9 @@ silkworm retry <id>                        # requeue failed or cancelled work (R
 silkworm run-next <id>                     # put queued work first (Run next)
 silkworm tidy <checkout path>              # remove a finished task's checkout (an hour
                                            #   old+) holding only generated files
+silkworm release <project> [<target>|all] [--level patch|minor]
+                                           # the Release button: its plan, then a start
+                                           #   with that plan's confirmation
 silkworm status --json                     # the board as one JSON document
 ```
 
@@ -855,7 +860,12 @@ so it runs the same handler and the same `transition()`, and is refused for
 exactly the same reasons — the CLI checks nothing of its own beyond its
 arguments. `--round` is the research round a findings action was read for
 (`round` in `status --json`), so a stale command is refused like a stale click.
-`--by NAME` (default `cli`) is who the task's event log says acted.
+`--by NAME` (default `cli`) is who the task's event log says acted, and
+`--notes` what was decided (the operator must give it to act on your word; see
+[The operator](#the-operator)). `release` makes the button's two requests, so it
+is refused for the button's reasons too — a release already running, a deploy
+draining, nothing pending — under the same lock; major and exact versions stay
+with `!release` and the button, where the plan is read first.
 
 Exit codes are stable: **0** done (one line on stdout, e.g.
 `ok: accept tsk_… -> queued`), **1** refused (the bot's reason on stderr, e.g.
@@ -957,6 +967,23 @@ names the approval that lifts it. You give one with your own Slack message:
 An approval covers that one item, is used up by the action it allows, and
 lapses after a day. Only an allowlisted person's Slack message makes one — not
 the web chat, not the bot, and there is no route for it.
+
+**Or just tell it.** In a turn you start yourself — your own Slack message in
+its home thread — the operator may carry out what you decided: accept,
+approve, dismiss, cancel, close, dig, rework, land, edit, drop, file straight
+to the queue, and release (`silkworm release <project> [<target>|all]
+[--level patch|minor]`), on the items you named. Each action must carry
+`--notes` quoting or paraphrasing what you said (refused without it), and the
+task records it: an event naming your Slack message, and `result.decided_by`
+= `user via operator` with `decided_ts`, kept across reruns and compaction. It
+reports each action with its id, and asks when it is unclear which items you
+mean. This rests on a grant the bot makes for that turn alone and forgets when
+it ends, handed to the turn's CLI in its environment and checked against the
+turn and thread it was made for — so the daily sweep, a wake-up, a deploy
+note or the web chat, none of which you started, carries none, and is refused
+as before. Even on your word: publishing where publish is off and trader's
+live configuration still need `!approve`, a running task is cancelled only if
+your message named it, and dismissing never deletes a branch.
 
 **The daily sweep.** Once a day at `OPERATOR_SWEEP_AT` (default `08:30`, or
 `off`), and only after the digest has gone out (unless the digest is off), the

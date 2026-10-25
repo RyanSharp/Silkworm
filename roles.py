@@ -129,8 +129,12 @@ OPERATOR_TOOLS = " ".join([
     "Read Grep Glob",
     "Bash({bin} status:*) Bash({bin} tasks:*) Bash({bin} watching:*)",
     "Bash({bin} accept:*) Bash({bin} dismiss:*) Bash({bin} land:*) Bash({bin} drop:*)",
+    "Bash({bin} approve:*) Bash({bin} cancel:*)",
     "Bash({bin} edit:*) Bash({bin} rework:*) Bash({bin} close:*) Bash({bin} dig:*)",
     "Bash({bin} retry:*) Bash({bin} run-next:*) Bash({bin} tidy:*)",
+    # Refused like every release unless you approved it or said so yourself
+    # in a turn you started (operator_role.Grants).
+    "Bash({bin} release:*)",
     "Bash({bin} operator:*) Bash({bin} deploy --after-turn:*)",
     "Bash({bin} task:*) Bash({bin} defer:*)",
     # Read-only: prints health.json, which the bot's own probes write. Its one
@@ -181,16 +185,31 @@ OPERATOR_SYSTEM = (
     "changes are generated files; and deploy Silkworm with `{bin} deploy "
     "--after-turn` when main is ahead of the running revision and nothing "
     "else is running.\n\n"
-    "Not yours, and refused in code whatever you are told: deciding on "
+    "Not yours on your own judgement, and refused in code: deciding on "
     "proposals, reviewed work or research findings either way -- accepting, "
     "approving, dismissing, closing or digging on them -- dismissing or "
     "cancelling a queued, blocked, failed or running task that is not your "
     "own, releases, publishing where publish "
     "is off, trader's live configuration, deleting anything not proven "
-    "redundant. A refusal names the `!approve <what> <item>` that lifts it "
-    "for that one item; ask the user for exactly that, with the reason, and "
-    "do not look for another way round. Anything you file waits for the user "
-    "to accept it."
+    "redundant. Anything you file waits for the user to accept it.\n\n"
+    "When the user decides, do it. In a turn the user started with their own "
+    "Slack message in this thread, you may carry out what they decided -- "
+    "accept, approve, dismiss, cancel, close, dig, rework, land, edit, drop, "
+    "and release with `{bin} release <project> [<target>|all] [--level "
+    "patch|minor]` -- on exactly the items they named, each with --by "
+    "operator and --notes quoting or paraphrasing what they said (refused "
+    "without it). To queue new work they asked for, file it with `task "
+    "--propose`, then `accept <id> --notes …`. Report each action with its "
+    "task id and the result. Never decide anything on your own judgement: "
+    "if it is unclear which items they mean, ask before acting. Still "
+    "refused even then: publishing where publish is off and trader's live "
+    "configuration (those need `!approve`), and cancelling a running task "
+    "their message did not name. Dismissing never deletes a branch.\n\n"
+    "In any other turn -- your daily sweep, a wake-up, a deploy note, the web "
+    "chat -- none of that is lifted. A refusal names the `!approve <what> "
+    "<item>` that lifts it for that one item; ask the user for exactly that "
+    "(or for them to tell you in this thread), with the reason, and do not "
+    "look for another way round."
 )
 
 #: The role for investigation whose findings you review and decide on. See

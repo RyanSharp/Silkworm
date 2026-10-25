@@ -564,6 +564,8 @@ def claude_env(key: str = "", defers: int = 0, role: str = "", task_id: str = ""
     # the ones written below. Everything else this builds an env for -- naming,
     # summaries, a Slack turn -- is not a task, and must not be judged as one.
     env = git_guard.strip(dict(os.environ))
+    # A grant is only ever the one handle_prompt hands its own turn.
+    env.pop(operator_role.GRANT_VAR, None)
     env["SILKWORM_BOT"] = "1"  # lets the global session_hook ignore our own runs
     # So a turn can schedule a wake-up against its own thread rather than
     # holding itself open until whatever it is watching finishes.
@@ -1104,7 +1106,7 @@ HELP = """*Commands* (send inside a thread):
 • `!sessions` — list all active thread sessions
 • `!help` — this message
 • `!operator` — make this thread the operator's home: Silkworm's head agent, which works the routine pile (and sweeps daily); `!operator where` says which thread it is
-• `!approve <accept|release|publish|trader-config|delete> <task id or project>` — let the operator do that one held-back thing, once (within a day); `!approve` lists what is approved
+• `!approve <accept|release|publish|trader-config|delete> <task id or project>` — let the operator do that one held-back thing, once (within a day); `!approve` lists what is approved (or just tell the operator what you decided, in its thread)
 • `!project <name>` — file this thread's tasks under a project
 • `!project github create` — make a private GitHub repo for this thread's project and push it
 • `!project new <Name> [path] [--github] [--adopt] -- <purpose>` — make (or adopt) a project's directory, git repo and CLAUDE.md, register it, and move this thread there; `--github` also creates a private GitHub repo
@@ -1509,6 +1511,7 @@ def handle_releases(payload: dict) -> dict:
     action = payload.get("action", "plan")
     # Asked only of a request made from inside a turn (the CLI stamps those);
     # the dashboard and your own CLI never carry the stamp.
+    payload.pop("_user_grant", None)
     if payload.get("caller_role") or payload.get("caller_thread"):
         refused = operator_refused("releases", action, payload)
         if refused:
@@ -2200,6 +2203,9 @@ DIGEST_AT = os.environ.get("DIGEST_AT", digest.DEFAULT_AT).strip()
 # approvals; the notes it keeps; and when its daily sweep runs ("off" to stop).
 OPERATOR = operator_role.State(BASE_DIR / "operator.json")
 OPERATOR_NOTES = BASE_DIR / "operator_notes.md"
+#: The turns you started in the operator's home thread, while they run
+#: (operator_role.Grants): what lets it act on what you said.
+OPERATOR_GRANTS = operator_role.Grants()
 OPERATOR_SWEEP_AT = os.environ.get("OPERATOR_SWEEP_AT", operator_role.DEFAULT_SWEEP_AT).strip()
 # Project health checks (health.py): once a day, HEALTH_LEAD before the
 # operator's sweep ("off" to stop), so its brief reads that morning's results;
@@ -2717,18 +2723,30 @@ def edit_task(payload: dict) -> dict:
     return {"ok": True, "task": t, "held": held_reason(t)}
 
 
-def handle_tasks(payload: dict) -> dict:
-    """Route for /tasks — read and triage tasks (localhost-trusted)."""
+def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
+    """Route for /tasks — read and triage tasks (localhost-trusted).
+
+    `_decided` is never a request's: the grant operator_refused let this go
+    ahead on, when it runs the action and then records who decided it."""
     action = payload.get("action", "list")
-    # The state the operator's guard judged is ours to record, never the
-    # caller's to supply (operator_refused stamps it).
-    payload.pop("_guard_state", None)
-    # Asked only of a request made from inside a turn (the CLI stamps those);
-    # the dashboard and your own CLI never carry the stamp.
-    if payload.get("caller_role") or payload.get("caller_thread"):
-        refused = operator_refused("tasks", action, payload)
-        if refused:
-            return refused
+    if _decided is None:
+        # The state the operator's guard judged, and the grant it went ahead
+        # on, are ours to record, never the caller's to supply
+        # (operator_refused stamps them).
+        payload.pop("_guard_state", None)
+        payload.pop("_user_grant", None)
+        # Asked only of a request made from inside a turn (the CLI stamps
+        # those); the dashboard and your own CLI never carry the stamp.
+        if payload.get("caller_role") or payload.get("caller_thread"):
+            refused = operator_refused("tasks", action, payload)
+            if refused:
+                return refused
+            grant = payload.pop("_user_grant", None)
+            if grant:
+                # On your word: the action itself, then the record of who
+                # decided it, on what it was done to.
+                return record_user_decision(grant, action, payload,
+                                            handle_tasks(payload, _decided=grant))
     project = payload.get("project") or ""
     def _filter(items):
         return [t for t in items if not project or (t.get("project") or "") == project]
@@ -3909,6 +3927,13 @@ def handle_prompt(event: dict, say, client) -> None:
             # The outbox dir is shared by every turn in this thread, so its
             # whole lifecycle (create -> upload -> remove) stays inside the lock.
             outbox.mkdir(parents=True, exist_ok=True)
+            # Your own message in the operator's thread: for this turn only,
+            # it may do what you told it (operator_role.Grants), and nothing
+            # else's turn -- a sweep, a wake-up, the web chat -- carries this.
+            grant = (OPERATOR_GRANTS.open(key, msg_ts, user, text, task_id)
+                     if role_name == roles.OPERATOR and user_started(event, user) else "")
+            if grant:
+                kwargs["env"][operator_role.GRANT_VAR] = grant
             try:
                 try:
                     result = run_turn(prompt, session_id=session_id, **kwargs)
@@ -3954,6 +3979,7 @@ def handle_prompt(event: dict, say, client) -> None:
                     ACTIVE_SESSIONS[result.session_id] = (channel, thread_ts)
                 uploaded = upload_outbox(client, outbox, channel, thread_ts, key)
             finally:
+                OPERATOR_GRANTS.close(grant)
                 shutil.rmtree(outbox, ignore_errors=True)
 
         total = (store.get(key) or {}).get("cost", 0.0)
@@ -6543,6 +6569,43 @@ def task_live_paths(task: dict) -> list:
                                             task_base(task) or "HEAD", prefixes)
 
 
+def user_started(event: dict, user: str) -> bool:
+    """Whether a turn is one a person started with their own Slack message:
+    not the web chat, not the bot or another app, and someone on the
+    allowlist -- who approve_command lets give an approval."""
+    return bool(user and not event.get("_web") and not event.get("bot_id")
+                and user != BOT_USER_ID
+                and (not ALLOWED_USERS or user in ALLOWED_USERS))
+
+
+def user_grant(payload: dict) -> dict | None:
+    """The live grant a request carries, if it is from the turn you started
+    in the operator's home thread that holds it, or None."""
+    payload = payload or {}
+    key = str(payload.get("caller_thread") or "")
+    if not key or key != OPERATOR.thread():
+        return None
+    return OPERATOR_GRANTS.get(str(payload.get("caller_grant") or ""), key,
+                               str(payload.get("caller_task") or ""))
+
+
+def record_user_decision(grant: dict, action: str, payload: dict, out: dict) -> dict:
+    """After an action the operator took on your word went ahead: the task
+    it was on (or the one it filed) records your message and decided_by."""
+    if not (out or {}).get("ok"):
+        return out
+    tid = str(payload.get("id") or "") or str(((out.get("task") or {}).get("id")) or "")
+    if tid and tid != "new":
+        try:
+            task_store.record_decision(tid, operator_role.decision_note(grant, action, payload),
+                                       operator_role.DECIDED_BY, grant["ts"])
+        except Exception:
+            # The action happened; failing to say who decided must not
+            # report it as not done.
+            log.exception("could not record the user's decision on %s", tid)
+    return out
+
+
 def operator_refused(route: str, action: str, payload: dict) -> dict | None:
     """The bot's half of the operator's policy: a refusal, or None to go on.
 
@@ -6554,6 +6617,7 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
     """
     if not operator_role.caller_is_operator(payload, OPERATOR.thread()):
         return None
+    rec = None
     if route == "tasks":
         rec = task_store.get(str(payload.get("id") or ""))
         if rec:
@@ -6566,10 +6630,31 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         guard = operator_role.projects_guard(action, payload)
     else:
         guard = operator_role.releases_guard(action, payload)
+    # Your own words, in a turn you started in its home thread, lift what
+    # SAID_GUARDS covers -- before any approval is looked at, so one you gave
+    # for something else is not spent on what you just said.
+    said = ""
+    grant = user_grant(payload) if guard and guard[0] in operator_role.SAID_GUARDS else None
+    if grant:
+        said = operator_role.said_refusal(
+            action, payload, dict(rec, id=payload.get("id")) if rec else None, grant,
+            live_paths=task_live_paths if route == "tasks" else None)
+        if not said:
+            payload["_user_grant"] = grant
+            if route == "releases":
+                payload["by"] = f"operator, for {grant['user']} (Slack message {grant['ts']})"
+            log.info("operator: %s %s on the word of %s (message %s): %s", route, action,
+                     grant["user"], grant["ts"], str(payload.get("notes") or "")[:200])
+            return None
+    if said and said == operator_role.refusal("trader-config", str(payload.get("id") or "")):
+        # Refused on your word for trader's live configuration: what could
+        # still lift it is an approval of that, not one of the accept guard
+        # the request first hit -- left over, that would land it unasked.
+        guard = ("trader-config", str(payload.get("id") or ""))
     why = operator_role.check(OPERATOR, guard, consume=True)
     if why:
         log.info("operator refused: %s %s (%s)", route, action, guard)
-        return {"ok": False, "error": why, "refused": guard[0]}
+        return {"ok": False, "error": said or why, "refused": guard[0]}
     if guard:
         log.info("operator: %s %s went ahead on your approval of %s %s",
                  route, action, *guard)
@@ -6689,8 +6774,9 @@ def operator_command(arg: str, key: str) -> str:
     return (":compass: This thread is now the operator's home: messages here go to "
             "Silkworm's head agent, with live state rebuilt into every turn." + sweep
             + moved + " It may land, retry, rework, drop proven-redundant branches, "
-            "tidy and deploy on its own; accepting, releasing, publishing, trader's "
-            "live config and real deletions wait for your `!approve`.")
+            "tidy and deploy on its own; accepting, releasing and real deletions "
+            "wait for you to tell it here (or `!approve`), and publishing and "
+            "trader's live config for your `!approve`.")
 
 
 def approve_command(text: str, user: str, event: dict) -> str:

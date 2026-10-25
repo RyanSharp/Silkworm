@@ -18,6 +18,7 @@
                                     as the bot's own probes last found them (read-only)
     silkworm accept <id>            queue a proposal               } the dashboard's
     silkworm dismiss <id> [--round R]  cancel it                   } buttons, through
+    silkworm approve <id> / cancel <id>  approve reviewed work / end work   }
     silkworm land <id>              land a finished task's branch  } the same handlers:
     silkworm drop <id>              delete it, tagging its tip     } a refusal prints
     silkworm edit <id> [--goal G] [--title T]  change unrun work   } the bot's reason
@@ -25,6 +26,8 @@
     silkworm close <id> [--round R] close research findings        }
     silkworm dig <id> --notes N [--round R]  research: dig deeper  }
     silkworm retry <id> / run-next <id>   requeue failed work / put it first
+    silkworm release <project> [<target>|all] [--level patch|minor]
+                                    the Release button: plan, then start it
     silkworm tidy <checkout path>   remove a finished checkout holding only generated files
     silkworm operator notes [--set T] | contained <id> | approvals | git …   the operator's own
     silkworm discard <branch>...    delete task branches, keeping their tips
@@ -50,7 +53,8 @@
 The action commands (accept … dig) and `status --json` are a stable interface
 for scripts and agents: exit 0 on success with one line, 1 when the bot refuses
 (its reason on stderr), 2 on a usage error, 3 when the bot cannot be reached.
-Each accepts --by NAME (default "cli") for the task's event log.
+Each accepts --by NAME (default "cli") for the task's event log, and --notes
+for what was decided (the operator must give it to act on your word).
 
 Runs on macOS today (launchd LaunchAgents); Linux (systemd user units) planned —
 the ServiceManager below is the only platform-specific part. Stdlib only.
@@ -1078,6 +1082,14 @@ def caller(payload: dict) -> dict:
         out["caller_role"] = role
     if thread:
         out["caller_thread"] = thread
+    # A turn you started in the operator's thread: its grant, and which turn
+    # it is, which the bot checks against the grant it made for that turn.
+    grant = os.environ.get(operator_role.GRANT_VAR, "")
+    task = os.environ.get("SILKWORM_TASK_ID", "")
+    if grant:
+        out["caller_grant"] = grant
+    if task:
+        out["caller_task"] = task
     return out
 
 
@@ -1106,23 +1118,30 @@ def bot_ask(path: str, payload: dict, timeout: float = 30) -> dict:
 
 #: command -> (the /tasks action, {flag: payload key}, flags it must have).
 #: The action names are the dashboard's (visualizer taskAction / handle_tasks).
+#: --notes on accept … edit: what the user decided, in their words or yours,
+#: which an operator acting on their word must give (operator_role.said_refusal)
+#: and the task's event log keeps.
 TASK_ACTIONS = {
-    "accept":  ("accept",  {}, ()),
-    "dismiss": ("dismiss", {"--round": "round"}, ()),
-    "land":    ("land",    {}, ()),
-    "drop":    ("drop",    {}, ()),
-    "edit":    ("edit",    {"--goal": "goal", "--title": "title"}, ()),
+    "accept":  ("accept",  {"--notes": "notes"}, ()),
+    # Approve lands reviewed work (approve_task); cancel ends unfinished work,
+    # stopping it if it runs. The dashboard's Approve and Cancel.
+    "approve": ("approve", {"--notes": "notes"}, ()),
+    "cancel":  ("cancel",  {"--notes": "notes"}, ()),
+    "dismiss": ("dismiss", {"--round": "round", "--notes": "notes"}, ()),
+    "land":    ("land",    {"--notes": "notes"}, ()),
+    "drop":    ("drop",    {"--notes": "notes"}, ()),
+    "edit":    ("edit",    {"--goal": "goal", "--title": "title", "--notes": "notes"}, ()),
     # The send-back with notes. The route would take none, and send the work
     # back with only "another pass" -- a rerun of the same goal, which is
     # never what a command typed on purpose means. So the CLI asks for them.
     "rework":  ("rework",  {"--notes": "notes"}, ("--notes",)),
-    "close":   ("close",   {"--round": "round"}, ()),
+    "close":   ("close",   {"--round": "round", "--notes": "notes"}, ()),
     # A blank question is the bot's to refuse, and it does.
     "dig":     ("dig",     {"--notes": "notes", "--round": "round"}, ()),
     # The dashboard's Retry and Run next. Tidy takes a checkout's path, not a
     # task id: it removes a finished task's checkout holding only generated
     # files, and refuses one holding anything else.
-    "retry":    ("retry",    {}, ()),
+    "retry":    ("retry",    {"--notes": "notes"}, ()),
     "run-next": ("run-next", {}, ()),
     "tidy":     ("tidy",     {}, ()),
 }
@@ -1193,8 +1212,17 @@ def operator_refusal(action: str, payload: dict, state=None) -> str:
     """
     if os.environ.get("SILKWORM_ROLE") != operator_role.ROLE:
         return ""
+    guard = operator_role.tasks_guard(action, payload, None)
+    if (guard and guard[0] in operator_role.SAID_GUARDS
+            and os.environ.get(operator_role.GRANT_VAR)):
+        # A turn you started: only the bot knows whether its grant is live,
+        # so it decides -- but a decision with nothing said is refused here.
+        if not str(payload.get("notes") or "").strip():
+            return ("acting on the user's word needs --notes quoting or "
+                    "paraphrasing what they decided")
+        return ""
     state = state or operator_role.State(operator_state_path(), readonly=True)
-    return operator_role.check(state, operator_role.tasks_guard(action, payload, None))
+    return operator_role.check(state, guard)
 
 
 def do_task_action(cmd: str, argv: list, ask=None) -> int:
@@ -1225,6 +1253,87 @@ def do_task_action(cmd: str, argv: list, ask=None) -> int:
         line += f" -> {task['state']}"
     extra = "; ".join(x for x in (r.get("note"), r.get("held")) if x)
     print(line + (f" ({extra})" if extra else ""))
+    return EXIT_OK
+
+
+RELEASE_USAGE = ("usage: silkworm release <project> [<target>|all] "
+                 "[--level patch|minor] [--notes N] [--by <name>]")
+
+
+def parse_release(argv: list) -> dict:
+    """The /releases payload for `silkworm release`, from the arguments after
+    the subcommand. Raises ValueError with the usage line."""
+    payload, pos = {"by": default_by(), "level": "patch"}, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--level", "--notes", "--by"):
+            if i + 1 >= len(argv) or not argv[i + 1].strip():
+                raise ValueError(f"{a} needs a value\n{RELEASE_USAGE}")
+            payload[a[2:]] = argv[i + 1].strip()
+            i += 2
+        elif a.startswith("-"):
+            raise ValueError(f"unknown option {a}\n{RELEASE_USAGE}")
+        else:
+            pos.append(a)
+            i += 1
+    if not 1 <= len(pos) <= 2:
+        raise ValueError(RELEASE_USAGE)
+    if payload["level"] not in ("patch", "minor"):
+        # Major and exact versions are a decision about one target, made with
+        # `!release` or the Release button, where the plan is read first.
+        raise ValueError(f"--level is patch or minor\n{RELEASE_USAGE}")
+    payload["slug"] = pos[0].lower()
+    payload["targets"] = [] if len(pos) == 1 or pos[1] == "all" else [pos[1]]
+    return payload
+
+
+def do_release(argv: list, ask=None, state=None) -> int:
+    """`silkworm release`: the Release button, from a script or the operator.
+
+    The button's two requests, in its order: the plan, which says what would
+    ship and gives its confirmation, then a start carrying that confirmation
+    -- so the same refusals apply (a release already running, a deploy
+    draining, nothing pending) under the same lock (bot.start_release). It
+    starts the release and returns; the release posts its own progress.
+    """
+    ask = ask or bot_ask
+    try:
+        payload = parse_release(argv)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_USAGE
+    slug = payload["slug"]
+    if os.environ.get("SILKWORM_ROLE") == operator_role.ROLE:
+        if os.environ.get(operator_role.GRANT_VAR):
+            why = ("" if payload.get("notes") else
+                   "acting on the user's word needs --notes quoting or "
+                   "paraphrasing what they decided")
+        else:
+            state = state or operator_role.State(operator_state_path(), readonly=True)
+            why = operator_role.check(state, operator_role.releases_guard("start", payload))
+        if why:
+            print(f"refused: release {slug}: {why}", file=sys.stderr)
+            return EXIT_REFUSED
+    try:
+        plan = ask("/releases", {**payload, "action": "plan"}, timeout=120)
+        if not plan.get("ok") or plan.get("blocked"):
+            why = plan.get("error") or plan.get("blocked") or "the bot gave no reason"
+            print(f"refused: release {slug}: {why}", file=sys.stderr)
+            return EXIT_REFUSED
+        r = ask("/releases", {**payload, "action": "start", "confirm": plan["confirm"]},
+                timeout=120)
+    except BotUnreachable as e:
+        print(f"not done: {e}", file=sys.stderr)
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        print(f"refused: release {slug}: {r.get('error') or 'the bot gave no reason'}",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    steps = ", ".join(f"{s['target']} → {s['tag']}" for s in plan.get("steps") or []
+                      if s.get("commits"))
+    print(f"ok: release {slug} started ({steps or 'as planned'}); "
+          "it posts its progress to its own thread")
     return EXIT_OK
 
 
@@ -1551,7 +1660,8 @@ def run_suite() -> int:
     # one (deploy --after-turn), the turn's variables would make the suite's
     # own CLI runs behave as that turn -- an operator's, refused.
     env = git_guard.strip(dict(os.environ))
-    for k in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_DEFERS", "SILKWORM_BOT"):
+    for k in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_DEFERS", "SILKWORM_BOT",
+              operator_role.GRANT_VAR):
         env.pop(k, None)
     return subprocess.run([py, str(REPO / "tests" / "test_invariants.py")],
                           capture_output=True, text=True, env=env).returncode
@@ -2488,6 +2598,8 @@ def main() -> None:
         sys.exit(do_task_action(cmd, args[1:]))   # args[0] is the subcommand
     elif cmd == "operator":
         sys.exit(do_operator(args[1:]))           # args[0] is the subcommand
+    elif cmd == "release":
+        sys.exit(do_release(args[1:]))            # args[0] is the subcommand
     elif cmd == "tailscale":
         sys.exit(do_tailscale(args[1:]))          # args[0] is the subcommand
     elif cmd == "push":

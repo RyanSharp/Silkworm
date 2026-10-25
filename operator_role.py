@@ -32,6 +32,17 @@ lifted for exactly one item by an approval you create with your own Slack
 message (`!approve <what> <item>`), used once and gone within a day. A model
 can ask you for one; it cannot make one -- no route writes them, only a Slack
 message from a person does.
+
+Or by saying so. A turn you start yourself, with a Slack message in its home
+thread, carries a grant (`Grants`): a token the bot made for that one turn,
+handed to its CLI in the environment and forgotten when the turn ends. While
+it lives, the operator may do what you told it -- accept, dismiss, close,
+dig, rework, land, drop, file, release -- on the items you named, each with
+--notes saying what you decided (`said_refusal`), and the task records your
+message and `decided_by`. A sweep, a wake-up, a deploy note or the web chat
+starts no turn of yours and carries none. Publishing where it is off and
+trader's live configuration still wait for `!approve`, and a running task is
+cancelled only if your message named it.
 """
 
 from __future__ import annotations
@@ -39,7 +50,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +96,15 @@ GUARDS = {
     "trader-config": "changing trader's live configuration",
     "delete": "deleting something not proven redundant",
 }
+
+#: The guards your own words lift, in a turn you started in its home thread
+#: (`Grants`). Not publish or trader-config: those stay `!approve`-only.
+SAID_GUARDS = frozenset({"accept", "release", "delete"})
+#: Where a turn you started finds its grant: set by the bot for that turn
+#: alone, sent back by bin/silkworm as `caller_grant`.
+GRANT_VAR = "SILKWORM_USER_GRANT"
+#: `result.decided_by` on a task the operator acted on because you said so.
+DECIDED_BY = "user via operator"
 
 #: Per project, the paths that are its live configuration: a branch touching
 #: one of these is not the operator's to land. Prefixes end in "/".
@@ -179,6 +201,78 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
     if action == "land" and task and live_paths and live_paths(task):
         return "trader-config", tid
     return None
+
+
+def said_refusal(action: str, payload: dict, task: dict | None, grant: dict,
+                 live_paths=None) -> str:
+    """Why a guarded request still may not go ahead on your own words, or ""
+    if it may: the guard it hit is one SAID_GUARDS lifts, and `grant` is the
+    live grant of the turn you started (Grants.get).
+
+    It must say what you decided (--notes, recorded on the task); a running
+    task is cancelled only if your message named it; and a landing -- Land,
+    or Approve, which lands -- never carries a project's live configuration.
+    """
+    payload = payload or {}
+    tid = str(payload.get("id") or "")
+    if not str(payload.get("notes") or "").strip():
+        return ("refused for the operator: acting on the user's word needs --notes "
+                "quoting or paraphrasing what they decided")
+    if (action in ("dismiss", "cancel") and (task or {}).get("state") == "running"
+            and tid.lower() not in str(grant.get("text") or "").lower()):
+        return (f"refused for the operator: {tid} is running, and cancelling it "
+                "kills its child; the user's message has to name it")
+    # Approving lands too (bot.approve_task).
+    if action in ("land", "approve") and task and live_paths and live_paths(task):
+        return refusal("trader-config", tid)
+    return ""
+
+
+class Grants:
+    """The turns you started in the operator's home thread, while they run.
+
+    In memory, in the bot, and nowhere else: a token per turn, made when your
+    Slack message's turn starts and dropped when it ends. The turn's CLI is
+    handed its token in the environment (SILKWORM_USER_GRANT) and sends it
+    back; nothing else can have it. A restart forgets every one, which is
+    right -- the turns went with it.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._live: dict[str, dict] = {}
+
+    def open(self, key: str, ts: str, user: str, text: str, task_id: str) -> str:
+        if not (key and ts and user and task_id):
+            raise ValueError("a grant names its thread, message, person and turn")
+        token = secrets.token_hex(16)
+        with self._lock:
+            self._live[token] = {"key": key, "ts": ts, "user": user,
+                                 "text": text or "", "task": task_id, "at": time.time()}
+        return token
+
+    def close(self, token: str) -> None:
+        with self._lock:
+            self._live.pop(token or "", None)
+
+    def get(self, token: str, key: str, task_id: str) -> dict | None:
+        """The live grant `token` names, if it is the turn of `task_id` in
+        thread `key` -- both as the request says and as the grant recorded."""
+        if not token:
+            return None
+        with self._lock:
+            g = self._live.get(token)
+            g = dict(g) if g else None
+        if not g or not key or g["key"] != key or not task_id or g["task"] != task_id:
+            return None
+        return g
+
+
+def decision_note(grant: dict, action: str, payload: dict) -> str:
+    """The event a task gets when the operator acted on your word."""
+    by = grant.get("user") or "the user"
+    notes = " ".join(str((payload or {}).get("notes") or "").split())
+    return f"{action} decided by {by} (Slack message {grant.get('ts')}) via operator: {notes}"
 
 
 def _landing_refused(task: dict) -> bool:
@@ -658,7 +752,8 @@ SWEEP_GOAL = (
     "closing or digging on them -- dismissing or cancelling a queued, blocked, "
     "failed or running task that is not your own, releases, publishing, "
     "trader's live configuration, deleting anything not proven redundant. Those are refused unless the user approved that one "
-    "item -- ask them for it.")
+    "item -- ask them for it. This sweep is not a turn the user started, so "
+    "nothing the user said earlier lifts them now.")
 
 SWEEP_NOTE = (
     "This is your daily sweep, filed by the scheduler, not a message from the "
@@ -668,7 +763,8 @@ SWEEP_NOTE = (
     "the same single message, and is read on a phone: first what you did "
     "(one short line per action, with task ids -- fix proposals you filed "
     "for health checks included), then *Needs you:* one line per item with "
-    "the specific decision or question, or the exact `!approve …` to send. "
+    "the specific decision or question, or the exact `!approve …` to send "
+    "(or that they can simply tell you in this thread). "
     "If nothing needs them, say so in one line. Do not schedule a wake-up "
     "for this.")
 

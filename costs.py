@@ -61,8 +61,9 @@ def add_run(rec: dict | None, usd, now: float | None = None) -> dict:
         runs = [[_previous_end(rec), prior]]
     out = {"cost": prior + usd, "cost_runs": runs + [[now, usd]]}
     # A rerun rewrites `result` whole; what the startup correction kept of
-    # the earlier runs (turncost.py) must survive it, or it is lost.
-    for kept in ("cost_uncorrected", "cost_runs_uncorrected"):
+    # the earlier runs (turncost.py) must survive it, or it is lost -- and so
+    # must who decided the work should run (tasks.record_decision).
+    for kept in ("cost_uncorrected", "cost_runs_uncorrected", "decided_by", "decided_ts"):
         if kept in result:
             out[kept] = result[kept]
     return out

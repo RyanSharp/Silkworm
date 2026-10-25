@@ -71,7 +71,8 @@ def bot_functions(*names, **globals_):
 #: work back is one mechanism shared by the dashboard and the review gate.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
-                  "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows")
+                  "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows",
+                  "user_grant", "record_user_decision")
 
 
 def _helper_modules(nodes, ns) -> None:
@@ -87,6 +88,16 @@ def _helper_modules(nodes, ns) -> None:
         import operator_role as _op
         ns.setdefault("operator_role", _op)
         ns.setdefault("OPERATOR", types.SimpleNamespace(thread=lambda: ""))
+    # claude_env strips any grant it would otherwise inherit (GRANT_VAR).
+    if any(n.name == "claude_env" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import operator_role as _op
+        ns.setdefault("operator_role", _op)
+    # user_grant asks the bot's live grants; a test that made none has none,
+    # so nothing it asks for is on the user's word.
+    if any(n.name == "user_grant" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import operator_role as _op
+        ns.setdefault("operator_role", _op)
+        ns.setdefault("OPERATOR_GRANTS", _op.Grants())
     # health_rows reads the bot's health store; a test that set none up has
     # none, which reads as "could not be read", never as "all healthy".
     if any(n.name == "health_rows" for n in nodes if isinstance(n, ast.FunctionDef)):
@@ -22310,14 +22321,19 @@ def _operator_bot(repo=None):
                                  statefile=tmp / "operator.json")
 
 
-def _op_cli(bot, *argv, role="operator", thread="D1:1.0"):
+def _op_cli(bot, *argv, role="operator", thread="D1:1.0", grant="", task=""):
     env = {k: v for k, v in os.environ.items()
-           if k not in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_TASK_ID")}
+           if k not in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_TASK_ID",
+                        "SILKWORM_USER_GRANT")}
     env.update(SILKWORM_BOT_PORT=str(bot.port), SILKWORM_OPERATOR_STATE=str(bot.statefile))
     if role:
         env["SILKWORM_ROLE"] = role
     if thread:
         env["SILKWORM_THREAD"] = thread
+    if grant:
+        env["SILKWORM_USER_GRANT"] = grant
+    if task:
+        env["SILKWORM_TASK_ID"] = task
     return subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), *argv],
                           capture_output=True, text=True, env=env, timeout=60)
 
@@ -23263,12 +23279,15 @@ def test_operator_turns_do_not_hold_the_checkout_and_deploy_tests_run_clean():
         return types.SimpleNamespace(returncode=0)
     ns = {"venv_python": lambda: sys.executable, "sys": sys, "REPO": BASE, "os": os,
           "git_guard": __import__("git_guard"), "str": str,
+          "operator_role": __import__("operator_role"),
           "subprocess": types.SimpleNamespace(run=fake_run)}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "silkworm", "exec"), ns)
     saved = {k: os.environ.get(k) for k in ("SILKWORM_ROLE", "SILKWORM_THREAD",
-                                             "SILKWORM_TASK_ROLE", "SILKWORM_TASK_ID")}
+                                             "SILKWORM_TASK_ROLE", "SILKWORM_TASK_ID",
+                                             "SILKWORM_USER_GRANT")}
     os.environ.update(SILKWORM_ROLE="operator", SILKWORM_THREAD="D1:1.0",
-                      SILKWORM_TASK_ROLE="operator", SILKWORM_TASK_ID="tsk_x")
+                      SILKWORM_TASK_ROLE="operator", SILKWORM_TASK_ID="tsk_x",
+                      SILKWORM_USER_GRANT="f00d")
     try:
         ns["run_suite"]()
     finally:
@@ -27435,7 +27454,7 @@ def test_operator_knows_it_is_the_chief_of_staff():
           and "never file it as a task" in text)
     check("one proposal per check, never refiled",
           "--health <project>/<check>" in text and "never refile" in text)
-    check("its refusals unchanged", "Not yours, and refused in code" in text
+    check("its refusals unchanged", "Not yours on your own judgement, and refused in code" in text
           and "releases, publishing where publish" in text)
     check("the sweep goal and note carry it", "--health" in O.SWEEP_GOAL
           and "do not repeat it" in O.SWEEP_NOTE)
@@ -28391,6 +28410,489 @@ def test_probe_config_maps_projects_explicitly():
                       "dispatching": ["trader"], "gateway": ["trader"],
                       "healthcheck": ["trader"], "credentials": ["mini"], "disk": ["mini"]},
           applies)
+
+
+# --- the operator acts on your word, in a turn you started ---------------------
+# "I should just be able to tell you" (2026-10-21, 10-23/24): a decision stated
+# in plain words in the operator's thread is carried out, without `!approve`.
+
+HOME = "D1:1.0"
+
+
+def _said_bot():
+    """_operator_bot with its home thread claimed, a turn of yours open in it,
+    and the discard path watched (a dismiss must never reach it)."""
+    bot = _operator_bot()
+    # Its own, not left to user_grant's lifting: a mutation that stops asking
+    # for grants must fail these checks, not crash them.
+    import operator_role as O
+    bot.ns.setdefault("OPERATOR_GRANTS", O.Grants())
+    bot.state.set_thread(HOME)
+    bot.dropped = []
+    bot.ns["discard"] = types.SimpleNamespace(
+        drop=lambda repo, br: bot.dropped.append(br) or (True, "discarded/x", ""))
+    bot.turn = "tsk_turn_mine"
+    return bot
+
+
+def _say(bot, text, turn=None):
+    """Open a grant as handle_prompt does for your Slack message."""
+    return bot.ns["OPERATOR_GRANTS"].open(HOME, "1761300000.000100", "U_ME", text,
+                                          turn or bot.turn)
+
+
+def _as_user(bot, grant, *argv, turn=None):
+    return _op_cli(bot, *argv, "--by", "operator", thread=HOME, grant=grant,
+                   task=turn or bot.turn)
+
+
+def _as_sweep(bot, *argv):
+    """The same command from a turn you did not start: the daily sweep, a
+    wake-up -- the operator's role and thread, and no grant."""
+    return _op_cli(bot, *argv, "--by", "operator", thread=HOME, task="tsk_sweep")
+
+
+def _decided(st, tid, ts="1761300000.000100"):
+    rec = st.get(tid) or {}
+    ev = [e for e in rec.get("events") or [] if e.get("kind") == "decided"]
+    return ((rec.get("result") or {}).get("decided_by") == "user via operator"
+            and (rec.get("result") or {}).get("decided_ts") == ts
+            and bool(ev) and ts in ev[-1]["detail"])
+
+
+def _proposal(st, title, **kw):
+    import tasks as T
+    return st.create(title, state=T.PROPOSED, role="implementor", project="alpha", **kw)["id"]
+
+
+def test_operator_on_your_word_accepts_and_approves():
+    import tasks as T
+    print("\nthe operator, on your word: accept and approve in a turn you started; "
+          "refused in a sweep")
+    bot = _said_bot()
+    st = bot.store
+    a = _proposal(st, "Add an appearance preference to Settings")
+    b = _proposal(st, "Cache the release plan per checkout")
+    g = _say(bot, f"accept {a} and {b}")
+    r = _as_sweep(bot, "accept", a, "--notes", "user said accept it")
+    check("a sweep's accept is still refused, naming !approve",
+          r.returncode == 1 and "!approve accept" in r.stderr
+          and st.get(a)["state"] == T.PROPOSED, r.stdout + r.stderr)
+    r = _as_user(bot, g, "accept", a, "--notes", "you said: accept the appearance one")
+    check("in your turn, accept goes ahead", r.returncode == 0
+          and st.get(a)["state"] == T.QUEUED, r.stdout + r.stderr)
+    check("and records your message and decided_by", _decided(st, a), st.get(a))
+    out = bot.ns["handle_tasks"]({"action": "accept", "id": b, "caller_role": "operator",
+                                  "caller_thread": HOME, "caller_grant": g,
+                                  "caller_task": "tsk_some_wakeup", "notes": "accept"})
+    check("a grant sent from another turn (a wake-up's) lifts nothing",
+          not out["ok"] and out.get("refused") == "accept"
+          and st.get(b)["state"] == T.PROPOSED, str(out))
+    w = st.create("Tidy the sync retry loop in SyncEngine", role="implementor")["id"]
+    st.transition(w, T.RUNNING); st.transition(w, T.AWAITING_APPROVAL)
+    out = bot.ns["handle_tasks"]({"action": "approve", "id": w, "caller_role": "operator",
+                                  "caller_thread": HOME, "by": "operator"})
+    check("a sweep's approve is refused", not out["ok"]
+          and st.get(w)["state"] == T.AWAITING_APPROVAL, str(out))
+    out = bot.ns["handle_tasks"]({"action": "approve", "id": w, "caller_role": "operator",
+                                  "caller_thread": HOME, "caller_grant": g,
+                                  "caller_task": bot.turn, "by": "operator",
+                                  "notes": "approve the retry loop tidy"})
+    check("in your turn, approve goes ahead",
+          out["ok"] and st.get(w)["state"] != T.AWAITING_APPROVAL and _decided(st, w), str(out))
+    w2 = st.create("Tidy the sync backoff", role="implementor")["id"]
+    st.transition(w2, T.RUNNING); st.transition(w2, T.AWAITING_APPROVAL)
+    r = _as_sweep(bot, "approve", w2, "--notes", "approve it")
+    check("`silkworm approve` from a sweep is refused",
+          r.returncode == 1 and st.get(w2)["state"] == T.AWAITING_APPROVAL, r.stdout + r.stderr)
+    r = _as_user(bot, g, "approve", w2, "--notes", "you said approve the backoff tidy")
+    check("and goes ahead in your turn", r.returncode == 0
+          and st.get(w2)["state"] != T.AWAITING_APPROVAL and _decided(st, w2),
+          r.stdout + r.stderr)
+    away = bot.ns["OPERATOR_GRANTS"].open("D9:9.0", "1761300000.000200", "U_ME",
+                                          f"accept {b}", bot.turn)
+    out = bot.ns["handle_tasks"]({"action": "accept", "id": b, "caller_role": "operator",
+                                  "caller_thread": "D9:9.0", "caller_grant": away,
+                                  "caller_task": bot.turn, "notes": "accept"})
+    check("a grant from a thread that is not the operator's home lifts nothing",
+          not out["ok"] and st.get(b)["state"] == T.PROPOSED, str(out))
+    bot.ns["OPERATOR_GRANTS"].close(g)
+    r = _as_user(bot, g, "accept", b, "--notes", "accept it")
+    check("once your turn has ended its grant is gone",
+          r.returncode == 1 and st.get(b)["state"] == T.PROPOSED, r.stdout + r.stderr)
+
+
+def test_operator_on_your_word_dismisses_and_cancels():
+    import tasks as T
+    print("\nthe operator, on your word: dismiss and cancel; a running task only if you named it")
+    bot = _said_bot()
+    st = bot.store
+    stopped = []
+    bot.ns["stop_task"] = lambda tid: stopped.append(tid) or True
+    prop = _proposal(st, "Add an appearance preference to Settings")
+    st.update(prop, branch="silkworm/" + prop)
+    queued = st.create("Retry sync on 5xx", role="implementor", project="alpha")["id"]
+    run_named = st.create("Retry sync on 4xx", role="implementor", project="alpha")["id"]
+    st.transition(run_named, T.RUNNING)
+    run_other = st.create("Retry sync offline", role="implementor", project="alpha")["id"]
+    st.transition(run_other, T.RUNNING)
+    g = _say(bot, f"dismiss {prop}, cancel {queued} and stop {run_named}; leave the rest")
+    for tid in (prop, queued):
+        r = _as_sweep(bot, "dismiss", tid, "--notes", "the user said so")
+        check(f"a sweep's dismiss of {st.get(tid)['state']} work is refused",
+              r.returncode == 1 and st.get(tid)["state"] != T.CANCELLED, r.stdout + r.stderr)
+    r = _as_user(bot, g, "dismiss", prop, "--notes", "you said dismiss the appearance one")
+    check("in your turn, dismiss goes ahead and is recorded",
+          r.returncode == 0 and st.get(prop)["state"] == T.CANCELLED and _decided(st, prop),
+          r.stdout + r.stderr)
+    check("and deletes no branch", bot.dropped == [], bot.dropped)
+    me = {"caller_role": "operator", "caller_thread": HOME, "caller_grant": g,
+          "caller_task": bot.turn, "by": "operator", "notes": "you said cancel these"}
+    out = bot.ns["handle_tasks"]({"action": "cancel", "id": queued, "caller_role": "operator",
+                                  "caller_thread": HOME, "by": "operator", "notes": "x"})
+    check("a sweep's cancel of queued work is refused",
+          not out["ok"] and st.get(queued)["state"] == T.QUEUED, str(out))
+    r = _as_user(bot, g, "cancel", queued, "--notes", f"you said cancel {queued}")
+    check("in your turn, `silkworm cancel` goes ahead", r.returncode == 0
+          and st.get(queued)["state"] == T.CANCELLED and _decided(st, queued),
+          r.stdout + r.stderr)
+    out = bot.ns["handle_tasks"]({**me, "action": "cancel", "id": run_other})
+    check("a running task your message did not name is not cancelled, nor its child killed",
+          not out["ok"] and st.get(run_other)["state"] == T.RUNNING
+          and run_other not in stopped and "name it" in out["error"], str(out))
+    out = bot.ns["handle_tasks"]({**me, "action": "cancel", "id": run_named})
+    check("the running task you named is cancelled and stopped",
+          out["ok"] and st.get(run_named)["state"] == T.CANCELLED
+          and stopped == [run_named], str(out))
+
+
+def test_operator_on_your_word_closes_and_digs():
+    import tasks as T
+    print("\nthe operator, on your word: close and dig on research's findings")
+    bot = _said_bot()
+    st = bot.store
+
+    def parked(q):
+        t = st.create(q, role="researcher", project="alpha")["id"]
+        st.transition(t, T.RUNNING); st.transition(t, T.NEEDS_INPUT, "findings")
+        return t
+    shut, deeper = parked("Why does sync stall on cold launch?"), parked("Is the widget too eager?")
+    g = _say(bot, f"close {shut}; on {deeper} dig into iOS 26 too")
+    r = _as_sweep(bot, "close", shut, "--notes", "close it")
+    check("a sweep's close is refused", r.returncode == 1
+          and st.get(shut)["state"] == T.NEEDS_INPUT, r.stdout + r.stderr)
+    r = _as_sweep(bot, "dig", deeper, "--notes", "and iOS 26?")
+    check("a sweep's dig is refused", r.returncode == 1
+          and st.get(deeper)["state"] == T.NEEDS_INPUT, r.stdout + r.stderr)
+    r = _as_user(bot, g, "close", shut, "--notes", "you said close the cold-launch findings")
+    check("in your turn, close goes ahead", r.returncode == 0
+          and st.get(shut)["state"] == T.DONE and _decided(st, shut), r.stdout + r.stderr)
+    r = _as_user(bot, g, "dig", deeper, "--notes", "you asked: check iOS 26 too")
+    check("in your turn, dig goes ahead", r.returncode == 0
+          and st.get(deeper)["state"] != T.NEEDS_INPUT and _decided(st, deeper),
+          r.stdout + r.stderr)
+
+
+def test_operator_on_your_word_reworks_lands_edits_and_drops():
+    import tasks as T
+    print("\nthe operator, on your word: rework, land, edit and drop")
+    repo = _op_repo()
+    bot = _said_bot()
+    st = bot.store
+
+    def finished(name, state=T.DONE):
+        t = st.create(f"Work for {name}", role="implementor", project="alpha",
+                      scope={"cwd": str(repo), "repo": str(repo)})["id"]
+        st.update(t, branch=f"silkworm/{name}")
+        st.transition(t, T.RUNNING); st.transition(t, state)
+        return t
+    redo = finished("tsk_same", T.AWAITING_APPROVAL)
+    land = finished("tsk_new", T.CANCELLED)          # dismissed from review
+    drop = finished("tsk_new")
+    unrun = st.create("Retry sync on 5xx", role="implementor", project="alpha")["id"]
+    g = _say(bot, f"send {redo} back to handle iPad, land {land}, reword {unrun}, drop {drop}")
+    for argv in (("rework", redo, "--notes", "handle iPad"), ("land", land),
+                 ("edit", unrun, "--goal", "Retry sync on 5xx and 429"), ("drop", drop)):
+        before = st.get(argv[1])
+        r = _as_sweep(bot, *argv)
+        check(f"a sweep's {argv[0]} is refused",
+              r.returncode == 1 and st.get(argv[1])["state"] == before["state"]
+              and st.get(argv[1])["goal"] == before["goal"], r.stdout + r.stderr)
+    check("and nothing was landed or dropped", not bot.landings and not bot.dropped)
+    r = _as_user(bot, g, "rework", redo, "--notes", "you said: handle iPad too")
+    check("in your turn, rework goes ahead", r.returncode == 0
+          and st.get(redo)["state"] == T.QUEUED and _decided(st, redo), r.stdout + r.stderr)
+    r = _as_user(bot, g, "land", land, "--notes", f"you said land {land}")
+    check("in your turn, landing work dismissed from review goes ahead",
+          r.returncode == 0 and land in bot.landings and _decided(st, land), r.stdout + r.stderr)
+    r = _as_user(bot, g, "edit", unrun, "--goal", "Retry sync on 5xx and 429",
+                 "--notes", "you said include 429")
+    check("in your turn, an edit of the goal goes ahead",
+          r.returncode == 0 and st.get(unrun)["goal"] == "Retry sync on 5xx and 429"
+          and _decided(st, unrun), r.stdout + r.stderr)
+    r = _as_user(bot, g, "drop", drop, "--notes", f"you said drop {drop}")
+    check("in your turn, dropping an unproven branch goes ahead",
+          r.returncode == 0 and bot.dropped and _decided(st, drop), r.stdout + r.stderr)
+
+
+def test_operator_on_your_word_files_and_takes_a_release_step():
+    import tasks as T
+    print("\nthe operator, on your word: filing straight to the queue, and a release step")
+    bot = _said_bot()
+    st = bot.store
+    bot.ns["project_store"] = types.SimpleNamespace(
+        ensure=lambda n, **kw: {"slug": n}, home=lambda n, create=False: None,
+        scope_for=lambda slug: {"branch": "main"}, get=lambda slug: None)
+    step = st.create("Cut a TestFlight build", role="implementor", project="cadence")["id"]
+    st.transition(step, T.RUNNING); st.transition(step, T.NEEDS_INPUT)
+    g = _say(bot, f"queue the 429 retry work, and release {step}")
+    sweep = {"caller_role": "operator", "caller_thread": HOME, "by": "operator",
+             "notes": "the user wants it"}
+    mine = {**sweep, "caller_grant": g, "caller_task": bot.turn,
+            "notes": "you said queue the 429 retry"}
+    filing = {"action": "create", "project": "alpha", "scope": {"cwd": str(bot.tmp)},
+              "goal": "Retry sync on 429 with the server's Retry-After"}
+    out = bot.ns["handle_tasks"]({**sweep, **filing})
+    check("a sweep filing straight into the queue is refused",
+          not out["ok"] and out.get("refused") == "accept", str(out))
+    out = bot.ns["handle_tasks"]({**mine, **filing})
+    made = (out.get("task") or {}).get("id", "")
+    check("in your turn it is filed queued, and records who decided",
+          out["ok"] and (st.get(made) or {}).get("state") == T.QUEUED
+          and _decided(st, made), str(out))
+    out = bot.ns["handle_tasks"]({**sweep, "action": "release", "id": step})
+    check("a sweep's release step is refused",
+          not out["ok"] and out.get("refused") == "release" and not bot.steps, str(out))
+    out = bot.ns["handle_tasks"]({**mine, "action": "release", "id": step,
+                                  "notes": "you said release it"})
+    check("in your turn it is taken", out["ok"] and bot.steps == [step] and _decided(st, step),
+          str(out))
+
+
+def test_operator_on_your_word_needs_notes():
+    import tasks as T
+    print("\nthe operator, on your word: never without --notes saying what you decided")
+    bot = _said_bot()
+    st = bot.store
+    a = _proposal(st, "Add an appearance preference to Settings")
+    g = _say(bot, f"accept {a}")
+    r = _as_user(bot, g, "accept", a, "--notes", "   ")
+    check("blank --notes is refused by the CLI as a usage error",
+          r.returncode == 2 and st.get(a)["state"] == T.PROPOSED, r.stdout + r.stderr)
+    r = _as_user(bot, g, "accept", a)
+    check("no --notes is refused, and says why",
+          r.returncode == 1 and "--notes" in r.stderr and st.get(a)["state"] == T.PROPOSED,
+          r.stdout + r.stderr)
+    dead = types.SimpleNamespace(port=1, statefile=bot.statefile, turn=bot.turn)
+    r = _as_user(dead, g, "accept", a)
+    check("the CLI refuses that itself, before asking any bot (1, not 3)",
+          r.returncode == 1 and "--notes" in r.stderr, r.stdout + r.stderr)
+    out = bot.ns["handle_tasks"]({"action": "accept", "id": a, "caller_role": "operator",
+                                  "caller_thread": HOME, "caller_grant": g,
+                                  "caller_task": bot.turn, "notes": " \n "})
+    check("and by the bot, for a request that never went through this CLI",
+          not out["ok"] and "--notes" in out["error"] and st.get(a)["state"] == T.PROPOSED,
+          str(out))
+    r = _as_user(bot, g, "accept", a, "--notes", "you said accept it")
+    said = [e for e in st.get(a)["events"] if e["kind"] == "decided"]
+    check("with them, it goes ahead and keeps them",
+          r.returncode == 0 and said and "you said accept it" in said[-1]["detail"],
+          r.stdout + r.stderr)
+
+
+def test_operator_on_your_word_never_publishes_or_touches_trader():
+    print("\nthe operator, on your word: publishing where it is off and trader's live "
+          "config still need !approve")
+    import tasks as T
+    repo = _op_repo()
+    bot = _said_bot()
+    st = bot.store
+    g = _say(bot, "turn publish on for cadence, set trader's base, and land the trader fix")
+    me = {"caller_role": "operator", "caller_thread": HOME, "caller_grant": g,
+          "caller_task": bot.turn, "by": "operator", "notes": "you said so"}
+    refused = bot.ns["operator_refused"]
+    out = refused("projects", "publish", {**me, "slug": "cadence", "on": True})
+    check("publish where it is off is refused", out and out["refused"] == "publish", str(out))
+    out = refused("projects", "base", {**me, "slug": "trader"})
+    check("trader's settings are refused", out and out["refused"] == "trader-config", str(out))
+    live = st.create("Work for tsk_live", role="implementor", project="trader",
+                     scope={"cwd": str(repo), "repo": str(repo)})["id"]
+    st.update(live, branch="silkworm/tsk_live")
+    st.transition(live, T.RUNNING); st.transition(live, T.CANCELLED)
+    r = _as_user(bot, g, "land", live, "--notes", "you said land the trader fix")
+    check("landing dismissed trader work that touches its live config is refused",
+          r.returncode == 1 and "trader-config" in r.stderr and live not in bot.landings,
+          r.stdout + r.stderr)
+    flagged = st.create("Work for tsk_live again", role="implementor", project="trader",
+                        scope={"cwd": str(repo), "repo": str(repo)})["id"]
+    st.update(flagged, branch="silkworm/tsk_live")
+    st.transition(flagged, T.RUNNING); st.transition(flagged, T.AWAITING_APPROVAL)
+    r = _as_user(bot, g, "approve", flagged, "--notes", "you said approve the trader fix")
+    check("so is approving it, which lands it too",
+          r.returncode == 1 and "trader-config" in r.stderr and flagged not in bot.landings
+          and st.get(flagged)["state"] == T.AWAITING_APPROVAL, r.stdout + r.stderr)
+    bot.state.approve("accept", live, by="U_ME")
+    r = _as_user(bot, g, "land", live, "--notes", "you said land the trader fix")
+    check("a left-over accept approval does not lift it either",
+          r.returncode == 1 and "trader-config" in r.stderr and live not in bot.landings
+          and bot.state.has("accept", live), r.stdout + r.stderr)
+    bot.state.approve("trader-config", live, by="U_ME")
+    r = _as_user(bot, g, "land", live, "--notes", "you said land the trader fix")
+    check("an !approve trader-config of it does, once", r.returncode == 0
+          and live in bot.landings and not bot.state.has("trader-config", live),
+          r.stdout + r.stderr)
+    bot.state.approve("trader-config", "trader", by="U_ME")
+    check("an !approve still lifts it, as before",
+          refused("projects", "base", {**me, "slug": "trader"}) is None)
+
+
+def test_operator_grant_is_made_only_for_your_own_message():
+    import operator_role as O
+    print("\nthe operator's grant: made for your Slack message's turn in its thread, and no other")
+    ns = bot_functions("user_started", BOT_USER_ID="UBOT", ALLOWED_USERS={"U_ME"})
+    started = ns["user_started"]
+    check("your Slack message starts a turn of yours", started({"ts": "1.0"}, "U_ME"))
+    check("the web chat does not", not started({"_web": True}, "U_ME"))
+    check("nor the bot, another app, or someone off the allowlist",
+          not started({}, "UBOT") and not started({"bot_id": "B1"}, "U_ME")
+          and not started({}, "U_STRANGER") and not started({}, ""))
+    gs = O.Grants()
+    t = gs.open("D1:1.0", "5.0", "U_ME", "accept tsk_1", "tsk_turn")
+    check("a grant answers only for its own thread and turn",
+          gs.get(t, "D1:1.0", "tsk_turn") and not gs.get(t, "D2:2.0", "tsk_turn")
+          and not gs.get(t, "D1:1.0", "tsk_sweep") and not gs.get("", "D1:1.0", "tsk_turn")
+          and not gs.get("f" * 32, "D1:1.0", "tsk_turn"))
+    gs.close(t)
+    check("and not after it is closed", not gs.get(t, "D1:1.0", "tsk_turn"))
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    opens = [n for f in tree.body if isinstance(f, ast.FunctionDef)
+             for n in ast.walk(f) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "open"
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "OPERATOR_GRANTS"]
+    owners = {f.name for f in tree.body if isinstance(f, ast.FunctionDef)
+              for n in ast.walk(f) if n in opens}
+    check("only handle_prompt makes one -- never the queue runner, a sweep or a route",
+          len(opens) == 1 and owners == {"handle_prompt"}, owners)
+    hp = next(f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "handle_prompt")
+    seg = ast.get_source_segment(src, hp)
+    check("for the operator's thread, on user_started, and closed when the turn ends",
+          "role_name == roles.OPERATOR and user_started(event, user)" in seg
+          and "OPERATOR_GRANTS.close(grant)" in seg)
+    ce = next(f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "claude_env")
+    check("no other turn's environment inherits one",
+          "env.pop(operator_role.GRANT_VAR, None)" in ast.get_source_segment(src, ce))
+
+
+def test_operator_your_word_outlives_the_run_it_queued():
+    import costs, tasks as T
+    print("\nwho decided survives the run it queued, and compaction")
+    tmp = Path(tempfile.mkdtemp())
+    st = T.TaskStore(tmp / "t.json")
+    t = st.create("Retry sync on 429", role="implementor")["id"]
+    st.record_decision(t, "accept decided by U_ME (Slack message 9.1) via operator: yes",
+                       "user via operator", "9.1")
+    st.transition(t, T.RUNNING)
+    st.update(t, result={"text": "done", **costs.add_run(st.get(t), 0.5)})
+    res = st.get(t)["result"]
+    check("a run rewriting result keeps decided_by and its message",
+          res.get("decided_by") == "user via operator" and res.get("decided_ts") == "9.1", res)
+    check("compaction keeps them", {"decided_by", "decided_ts"} <= set(T.RESULT_KEEPS))
+
+
+def test_operator_release_cli_is_the_release_button():
+    import operator_role as O
+    import tasks as T
+    from localserver import LocalServer
+    import socket as _socket
+    print("\n`silkworm release`: the Release button's plan-then-start, on your word only")
+    fx = _release_fixture()
+    tmp = Path(tempfile.mkdtemp())
+    state = O.State(tmp / "operator.json")
+    state.set_thread(HOME)
+    grants = O.Grants()
+    fx.ns.update(operator_role=O, OPERATOR=state, OPERATOR_GRANTS=grants,
+                 task_store=T.TaskStore(tmp / "t.json"))
+    _bot_fns({"operator_refused", "user_grant", "task_contained", "task_live_paths"}, fx.ns)
+    asked = []
+    hr = fx.ns["handle_releases"]
+
+    def route(payload):
+        asked.append(payload.get("action"))
+        return hr(payload)
+    with _socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = LocalServer(port)
+    server.route("/releases", route)
+    server.start()
+    bot = types.SimpleNamespace(port=port, statefile=tmp / "operator.json")
+    tags = lambda: sorted(fx.g("tag", "-l").stdout.split())
+
+    r = _op_cli(bot, "release", "alpha", "backend", "--notes", "release it", thread=HOME,
+                task="tsk_sweep")
+    check("a sweep's release is refused by the CLI before asking", r.returncode == 1
+          and "!approve release alpha" in r.stderr and not asked, r.stdout + r.stderr)
+    out = hr({"action": "start", "slug": "alpha", "caller_role": "operator",
+              "caller_thread": HOME, "confirm": "x", "notes": "release"})
+    check("and by the bot", not out["ok"] and out.get("refused") == "release", str(out))
+    g = grants.open(HOME, "1761300000.000100", "U_ME", "release alpha's backend", "tsk_turn")
+    r = _op_cli(bot, "release", "alpha", "backend", "--level", "major", "--notes", "x",
+                thread=HOME, grant=g, task="tsk_turn")
+    check("major is not a CLI release (one target, read first: !release or the button)",
+          r.returncode == 2, r.stdout + r.stderr)
+    r = _op_cli(bot, "release", "alpha", "backend", thread=HOME, grant=g, task="tsk_turn")
+    check("without --notes it is refused", r.returncode == 1 and "--notes" in r.stderr
+          and not asked, r.stdout + r.stderr)
+
+    fx.ns["DRAIN"].start(600, "deploy")
+    r = _op_cli(bot, "release", "alpha", "backend", "--notes", "you said release backend",
+                thread=HOME, grant=g, task="tsk_turn")
+    check("while a deploy drains it is refused, as the button is",
+          r.returncode == 1 and "draining" in r.stderr and tags() == [], r.stdout + r.stderr)
+    fx.ns["DRAIN"].stop()
+    fx.ns["_releasing"].add("alpha")
+    r = _op_cli(bot, "release", "alpha", "backend", "--notes", "you said release backend",
+                thread=HOME, grant=g, task="tsk_turn")
+    check("while one runs it is refused, by the same _releasing lock",
+          r.returncode == 1 and "already running" in r.stderr, r.stdout + r.stderr)
+    fx.ns["_releasing"].discard("alpha")
+    asked.clear()
+    r = _op_cli(bot, "release", "alpha", "backend", "--notes", "you said release backend",
+                thread=HOME, grant=g, task="tsk_turn")
+    check("in your turn it starts", r.returncode == 0 and "started" in r.stdout,
+          r.stdout + r.stderr)
+    check("as the button does: the plan, then a start carrying its confirmation",
+          asked == ["plan", "start"], asked)
+    st = _wait_release(hr, "alpha")
+    check("and releases what was planned, through start_release and run_release",
+          st["run"] and st["run"]["released"] == ["backend/v1.0.0"]
+          and "backend/v1.0.0" in tags(), st)
+    check("its thread says it was on your word, with your message",
+          "for U_ME (Slack message 1761300000.000100)" in (st["run"] or {}).get("by", ""),
+          st["run"])
+    src = (BASE / "bin" / "silkworm").read_text()
+    check("`release` is a CLI subcommand on the operator's allowlist",
+          'elif cmd == "release":' in src
+          and "Bash(/s release:*)" in __import__("roles").permission_args(
+              "operator", [], bin="/s")[1])
+
+
+def test_operator_prompts_say_to_do_what_you_decided():
+    import operator_role as O, roles
+    print("\nthe operator's prompts: in your turn do what you decided; in a sweep, nothing lifts")
+    text = roles.system_prompt(O.ROLE, bin="/s")
+    check("the home-thread brief says to carry out what the user decided",
+          "When the user decides, do it" in text and "--notes" in text
+          and "/s release <project>" in text, text)
+    check("report each action with its id, never decide alone, ask when unclear",
+          "with its\ntask id" not in text and "task id" in text
+          and "Never decide anything on your own judgement" in text
+          and "ask before acting" in text)
+    check("and that a sweep or wake-up lifts nothing",
+          "your daily sweep, a wake-up" in text)
+    check("the sweep keeps its 'Not yours' list and says nothing said earlier lifts it",
+          "Not yours" in O.SWEEP_GOAL and "nothing the user said earlier lifts them" in O.SWEEP_GOAL)
 
 
 if __name__ == "__main__":
