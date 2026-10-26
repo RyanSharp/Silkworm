@@ -147,6 +147,12 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
     """
     tid = str((payload or {}).get("id") or "")
     state = (task or {}).get("state")
+    # A landing that carries a project's live configuration needs that
+    # approved, before anything else: Approve lands (bot.approve_task), and so
+    # does Land on work you never accepted. Answering "accept" first let an
+    # `!approve accept` land trader's live config unasked.
+    if action in ("land", "approve") and task and live_paths and live_paths(task):
+        return "trader-config", tid
     if action in ("accept", "approve"):
         return "accept", tid
     # Every other way into the queue for work you never accepted is
@@ -198,8 +204,6 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
         ok, _why = contained(task) if contained else (False, "")
         if not ok:
             return "delete", tid
-    if action == "land" and task and live_paths and live_paths(task):
-        return "trader-config", tid
     return None
 
 

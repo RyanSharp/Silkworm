@@ -22520,6 +22520,48 @@ def test_operator_drop_and_trader_landing_need_proof_or_approval():
     check("you can land it yourself", r.returncode == 0 and live in bot.landings, r.stderr)
 
 
+def test_operator_approve_accept_does_not_land_trader_live_config():
+    import tasks as T
+    print("\nthe operator: an `!approve accept` of trader work does not land its live config")
+    repo = _op_repo()
+    bot = _operator_bot()
+    st = bot.store
+
+    def flagged(tid_name):
+        t = st.create(f"Work for {tid_name}", role="implementor", project="trader",
+                      scope={"cwd": str(repo), "repo": str(repo)})
+        st.update(t["id"], branch=f"silkworm/{tid_name}")
+        st.transition(t["id"], T.RUNNING); st.transition(t["id"], T.AWAITING_APPROVAL)
+        return t["id"]
+
+    live, new = flagged("tsk_live"), flagged("tsk_new")
+    bot.state.approve("accept", live, by="U_ME")
+    r = _op_cli(bot, "approve", live)
+    check("approving reviewed trader work that changes paper_trade.py is refused, "
+          "though accept was approved",
+          r.returncode == 1 and "trader-config" in r.stderr and live not in bot.landings
+          and st.get(live)["state"] == T.AWAITING_APPROVAL, r.stdout + r.stderr)
+    check("and that accept approval is left unspent", bot.state.has("accept", live))
+    bot.state.approve("accept", new, by="U_ME")
+    r = _op_cli(bot, "approve", new)
+    check("approving trader work that does not touch it still goes on an accept approval",
+          r.returncode == 0 and new in bot.landings, r.stdout + r.stderr)
+    bot.state.approve("trader-config", live, by="U_ME")
+    r = _op_cli(bot, "approve", live)
+    check("an !approve trader-config of it lands it, once",
+          r.returncode == 0 and live in bot.landings
+          and not bot.state.has("trader-config", live), r.stdout + r.stderr)
+    cancelled = st.create("Work for tsk_live, dismissed", role="implementor", project="trader",
+                          scope={"cwd": str(repo), "repo": str(repo)})["id"]
+    st.update(cancelled, branch="silkworm/tsk_live")
+    st.transition(cancelled, T.RUNNING); st.transition(cancelled, T.CANCELLED)
+    bot.state.approve("accept", cancelled, by="U_ME")
+    r = _op_cli(bot, "land", cancelled)
+    check("nor does an accept approval land dismissed work that touches it",
+          r.returncode == 1 and "trader-config" in r.stderr
+          and cancelled not in bot.landings, r.stdout + r.stderr)
+
+
 def test_operator_approvals_come_only_from_a_person_in_slack():
     import operator_role as O
     print("\n!approve: one item, one use, from an allowlisted person's own Slack message")
