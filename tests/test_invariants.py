@@ -29136,6 +29136,612 @@ def test_operator_prompts_say_to_do_what_you_decided():
           "Not yours" in O.SWEEP_GOAL and "nothing the user said earlier lifts them" in O.SWEEP_GOAL)
 
 
+# --- named ops: the operator runs what it used to hand you ---------------------
+# 2026-10-26: "You should be able to run these yourself." `silkworm tailscale
+# on`, reinstalling trader's pooldata launchd job, and trader's one-off refetch
+# with --apply were all handed to the owner as shell steps. Now they are named
+# entries in ops.py, run by the bot from their exact argv, on your word.
+
+def _ops_world():
+    """A trader checkout, fake programs on PATH (each logging its argv), and a
+    bot serving /ops -- handle_ops and user_grant as shipped -- on a free port.
+    """
+    import socket as _socket
+    import plistlib
+    import git_guard
+    import ops as OPS
+    import operator_role as O
+    from localserver import LocalServer
+    tmp = Path(tempfile.mkdtemp())
+    calls = tmp / "calls.log"
+    calls.write_text("")
+    fakebin = tmp / "fakebin"
+    fakebin.mkdir()
+
+    def fake(path, body="exit 0"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'#!/bin/sh\necho "{path.name} $*" >> "{calls}"\n{body}\n')
+        path.chmod(0o755)
+
+    fake(fakebin / "tailscale", 'case "$*" in *--json*) echo "{}";; esac\nexit 0')
+    fake(fakebin / "launchctl",
+         'case "$1" in bootout) exit "${FAKE_BOOTOUT:-0}";; '
+         'bootstrap) exit "${FAKE_BOOTSTRAP:-0}";; esac\nexit 0')
+    fake(fakebin / "plutil", 'exec /usr/bin/plutil "$@"')
+    fake(fakebin / "cp", 'exec /bin/cp "$@"')
+    fake(fakebin / "runtests", 'echo "12 passed, 0 failed"\nexit "${FAKE_TESTS:-0}"')
+    trader = tmp / "trader"
+    (trader / "ops").mkdir(parents=True)
+    (trader / "scripts").mkdir()
+    fake(trader / ".venv" / "bin" / "python3", 'echo "plan: 3 symbols revised"')
+    for label, file in (("com.traderjoe.pooldata", "com.traderjoe.pooldata"),
+                        ("com.traderjoe.other", "com.traderjoe.mislabel")):
+        with open(trader / "ops" / f"{file}.plist", "wb") as f:
+            plistlib.dump({"Label": label, "ProgramArguments": ["/bin/true"]}, f)
+    outside = tmp / "elsewhere.plist"
+    with open(outside, "wb") as f:
+        plistlib.dump({"Label": "com.traderjoe.link"}, f)
+    (trader / "ops" / "com.traderjoe.link.plist").symlink_to(outside)
+    # Committed, as trader's are: the reinstall installs only what is.
+    for args in (["init", "-q"], ["add", "-A"],
+                 ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "ops"]):
+        subprocess.run(["git", "-C", str(trader), *args], check=True,
+                       capture_output=True, env=git_guard.strip(dict(os.environ)))
+    alpha = tmp / "alpha"
+    alpha.mkdir()
+    agents = tmp / "LaunchAgents"
+    agents.mkdir()
+    projects_ = {"trader": {"slug": "trader", "scope": {"cwd": str(trader)}},
+                 "alpha": {"slug": "alpha", "scope": {"cwd": str(alpha)},
+                           "test_cmd": f"{fakebin}/runtests --quick"},
+                 "beta": {"slug": "beta", "scope": {"cwd": str(alpha)}, "test_cmd": ""}}
+    state = O.State(tmp / "operator.json")
+    state.set_thread("D1:1.0")
+    ns = bot_functions("handle_ops", "ops_context", "user_grant",
+                       ops=OPS, OPS_LOG=tmp / "ops.jsonl", sys=sys, os=os, Path=Path,
+                       git_guard=git_guard, operator_role=O, OPERATOR=state,
+                       OPERATOR_GRANTS=O.Grants(), SILKWORM_BIN=str(BASE / "bin" / "silkworm"),
+                       project_store=types.SimpleNamespace(get=lambda s: projects_.get(s)))
+    real_context = ns["ops_context"]
+    ctx = OPS.Context(project=lambda s: projects_.get(s), python=sys.executable,
+                      silkworm_bin=str(BASE / "bin" / "silkworm"), uid=501,
+                      launch_agents=agents)
+    ns["ops_context"] = lambda: ctx
+    with _socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = LocalServer(port)
+    server.route("/ops", ns["handle_ops"])
+    server.start()
+    w = types.SimpleNamespace(tmp=tmp, calls=calls, fakebin=fakebin, trader=trader,
+                              agents=agents, ns=ns, ctx=ctx, port=port, state=state,
+                              log=tmp / "ops.jsonl", real_context=real_context,
+                              grants=ns["OPERATOR_GRANTS"], statefile=tmp / "operator.json",
+                              projects=projects_)
+    return w
+
+
+@contextlib.contextmanager
+def _fake_path(w, **env):
+    """The fakes first on PATH -- for the bot in this process and the CLI it
+    serves -- and any FAKE_* switches, put back after."""
+    saved = {k: os.environ.get(k) for k in ("PATH", *env)}
+    os.environ["PATH"] = f"{w.fakebin}:{saved['PATH']}"
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _calls(w):
+    return [line for line in w.calls.read_text().splitlines() if line.strip()]
+
+
+def _ops_cli(w, *argv, role="operator", thread="D1:1.0", grant="", task=""):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_TASK_ID",
+                        "SILKWORM_USER_GRANT")}
+    env.update(SILKWORM_BOT_PORT=str(w.port), SILKWORM_OPS_LOG=str(w.log))
+    for k, v in (("SILKWORM_ROLE", role), ("SILKWORM_THREAD", thread),
+                 ("SILKWORM_USER_GRANT", grant), ("SILKWORM_TASK_ID", task)):
+        if v:
+            env[k] = v
+    return subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "ops", *argv],
+                          capture_output=True, text=True, env=env, timeout=120)
+
+
+def _ops_turn(w, text, turn="tsk_turn_mine"):
+    """Open the grant handle_prompt opens for your own Slack message."""
+    return w.grants.open("D1:1.0", "1761400000.000100", "U_ME", text, turn)
+
+
+def _ops_as_user(w, grant, *argv, turn="tsk_turn_mine"):
+    return _ops_cli(w, "run", *argv, "--by", "operator", grant=grant, task=turn)
+
+
+def _ops_as_sweep(w, *argv):
+    return _ops_cli(w, "run", *argv, "--by", "operator", task="tsk_sweep")
+
+
+def _ops_ask(w, payload):
+    """handle_ops called directly, as the route would; a handler that raises
+    reads as not done (the server answers {}), and fails a check cleanly."""
+    try:
+        return w.ns["handle_ops"](payload)
+    except Exception as e:
+        return {"ok": None, "error": f"raised {e!r}"}
+
+
+def test_ops_each_runs_its_exact_argv():
+    import ops as OPS
+    print("\nnamed ops: each builds exactly the argv its entry says, and runs it with no shell")
+    w = _ops_world()
+    py, sw = sys.executable, str(BASE / "bin" / "silkworm")
+    p = OPS.plan("tailscale-status", [], w.ctx)
+    check("tailscale-status is `silkworm tailscale status`, reading only",
+          [s.argv for s in p.steps] == [[py, sw, "tailscale", "status"]] and p.read_only,
+          [s.argv for s in p.steps])
+    p = OPS.plan("tailscale-on", [], w.ctx)
+    check("tailscale-on is `silkworm tailscale on` -- serve, never funnel -- and changes things",
+          [s.argv for s in p.steps] == [[py, sw, "tailscale", "on"]] and not p.read_only)
+    src = str((w.trader / "ops" / "com.traderjoe.pooldata.plist").resolve())
+    dst = str(w.agents / "com.traderjoe.pooldata.plist")
+    p = OPS.plan("trader-launchd-reinstall", ["com.traderjoe.pooldata"], w.ctx)
+    check("trader-launchd-reinstall lints, copies, boots out and bootstraps that plist",
+          [s.argv for s in p.steps] == [
+              ["plutil", "-lint", src], ["cp", src, dst],
+              ["launchctl", "bootout", "gui/501/com.traderjoe.pooldata"],
+              ["launchctl", "bootstrap", "gui/501", dst]]
+          and [s.may_fail for s in p.steps] == [False, False, True, False]
+          and p.cwd == str(w.trader) and not p.read_only, [s.argv for s in p.steps])
+    tpy = str(w.trader / ".venv" / "bin" / "python3")
+    p = OPS.plan("trader-refetch-revisions",
+                 ["--apply", "--symbols", "BRK.A", "cat", "GLW", "--dividends"], w.ctx)
+    check("trader-refetch-revisions passes --symbols, --dividends and --apply to the script",
+          [s.argv for s in p.steps] == [[tpy, "scripts/refetch_revisions.py", "--symbols",
+                                         "BRK.A", "CAT", "GLW", "--dividends", "--apply"]]
+          and p.cwd == str(w.trader) and not p.read_only, [s.argv for s in p.steps])
+    p = OPS.plan("trader-refetch-revisions", ["--symbols", "CRWD"], w.ctx)
+    check("without --apply the refetch is a plan, and reads only",
+          p.read_only and [s.argv for s in p.steps]
+          == [[tpy, "scripts/refetch_revisions.py", "--symbols", "CRWD"]])
+    p = OPS.plan("project-test", ["alpha"], w.ctx)
+    check("project-test runs the project's test_cmd, split as verify splits it, under its "
+          "lock -- in the live checkout, so it counts as changing things",
+          [s.argv for s in p.steps] == [[f"{w.fakebin}/runtests", "--quick"]]
+          and p.cwd == w.projects["alpha"]["scope"]["cwd"] and p.lock == "alpha"
+          and not p.read_only)
+    seen = []
+    rec = OPS.run(OPS.plan("project-test", ["alpha"], w.ctx),
+                  runner=lambda argv, **kw: seen.append((argv, kw)) or types.SimpleNamespace(
+                      returncode=0, stdout="ok", stderr=""))
+    check("and runs each step's argv as a list, never through a shell",
+          seen and seen[0][0] == [f"{w.fakebin}/runtests", "--quick"]
+          and "shell" not in seen[0][1] and seen[0][1]["cwd"] == p.cwd and rec["ok"], seen)
+    tree = ast.parse((BASE / "ops.py").read_text())
+    shells = [k for n in ast.walk(tree) if isinstance(n, ast.Call)
+              for k in n.keywords if k.arg == "shell"]
+    check("ops.py passes shell= nowhere", not shells)
+    real = w.real_context()
+    check("the bot's context is this machine's: its uid, its LaunchAgents, its silkworm",
+          real.uid == os.getuid() and real.launch_agents == Path.home() / "Library" / "LaunchAgents"
+          and real.silkworm_bin == str(BASE / "bin" / "silkworm"))
+
+
+def test_ops_refuse_unknown_ops_bad_args_and_shell():
+    import ops as OPS
+    print("\nnamed ops: an unknown op, arguments it does not take, and shell are refused")
+    w = _ops_world()
+
+    def refused(name, args):
+        try:
+            OPS.plan(name, args, w.ctx)
+        except OPS.Refused as e:
+            return str(e)
+        return ""
+
+    check("an op that is not in the registry", "no op 'rm'" in refused("rm", ["-rf", "/"]))
+    for bad in ("a;b", "a|b", "a&b", "$(id)", "`id`", "a b", "a>b", "a<b", "x'y", 'x"y',
+                "a\nb", "~/x", "*", "a\\b", "(x)", "{x}"):
+        check(f"shell metacharacters in {bad!r}", "never shell" in refused(
+            "project-test", [bad]), refused("project-test", [bad]))
+    check("an empty argument", "empty" in refused("project-test", [""]))
+    check("tailscale ops take no arguments",
+          "takes no arguments" in refused("tailscale-on", ["--funnel"])
+          and "takes no arguments" in refused("tailscale-status", ["x"]))
+    check("a job label that walks out of ops/",
+          "not a launchd job label" in refused("trader-launchd-reinstall", ["../../etc/evil"]))
+    check("a plist trader's ops/ does not have, naming what it does have",
+          "no ops/com.traderjoe.nope.plist" in refused("trader-launchd-reinstall",
+                                                       ["com.traderjoe.nope"])
+          and "com.traderjoe.pooldata" in refused("trader-launchd-reinstall",
+                                                  ["com.traderjoe.nope"]))
+    check("one that is a symlink out of ops/",
+          "no ops/com.traderjoe.link.plist" in refused("trader-launchd-reinstall",
+                                                       ["com.traderjoe.link"]))
+    check("one whose Label is not its name",
+          "Label is 'com.traderjoe.other'" in refused("trader-launchd-reinstall",
+                                                     ["com.traderjoe.mislabel"]))
+    check("a job that is not trader's (com.traderjoe.*)",
+          "not one of trader's jobs" in refused("trader-launchd-reinstall",
+                                                ["com.silkworm.bot"]))
+    plist = w.trader / "ops" / "com.traderjoe.pooldata.plist"
+    good = plist.read_bytes()
+    plist.write_bytes(good.replace(b"/bin/true", b"/tmp/anything"))
+    check("a plist edited in the checkout and not committed",
+          "not committed as it stands" in refused("trader-launchd-reinstall",
+                                                  ["com.traderjoe.pooldata"]))
+    plist.write_bytes(good)
+    import plistlib
+    with open(w.trader / "ops" / "com.traderjoe.fresh.plist", "wb") as f:
+        plistlib.dump({"Label": "com.traderjoe.fresh"}, f)
+    check("or one never committed at all",
+          "not committed as it stands" in refused("trader-launchd-reinstall",
+                                                  ["com.traderjoe.fresh"]))
+    (w.agents / "com.traderjoe.pooldata.plist").symlink_to(w.tmp / "victim")
+    check("a destination that is a symlink is not written through",
+          "symlink" in refused("trader-launchd-reinstall", ["com.traderjoe.pooldata"]))
+    (w.agents / "com.traderjoe.pooldata.plist").unlink()
+    elsewhere = w.tmp / "trader2"
+    elsewhere.mkdir()
+    shutil.copytree(w.trader, elsewhere / "t", symlinks=True)
+    shutil.rmtree(elsewhere / "t" / "ops")
+    (elsewhere / "t" / "ops").symlink_to(w.trader / "ops")
+    w.projects["trader"]["scope"]["cwd"] = str(elsewhere / "t")
+    check("nor a checkout whose ops/ is a symlink",
+          "symlink" in refused("trader-launchd-reinstall", ["com.traderjoe.pooldata"]))
+    w.projects["trader"]["scope"]["cwd"] = str(w.trader)
+    check("reinstall takes exactly one job",
+          refused("trader-launchd-reinstall", []) and refused(
+              "trader-launchd-reinstall", ["com.traderjoe.pooldata", "x"]))
+    check("a refetch without symbols", "say which symbols" in refused(
+        "trader-refetch-revisions", ["--apply"]))
+    check("a refetch option it does not pass on",
+          "not an option" in refused("trader-refetch-revisions", ["--symbols", "CAT", "--start",
+                                                                  "2020-01-01"])
+          and "not an option" in refused("trader-refetch-revisions", ["CAT"]))
+    check("a symbol that is not a ticker",
+          "not a ticker" in refused("trader-refetch-revisions", ["--symbols", "../x"])
+          and "not a ticker" in refused("trader-refetch-revisions", ["--symbols", "A.B.C"]))
+    check("project-test of an unknown project, or one with no test command",
+          "no project 'nope'" in refused("project-test", ["nope"])
+          and "no test command" in refused("project-test", ["beta"])
+          and refused("project-test", []))
+    with _fake_path(w):
+        port, w.port = w.port, 1      # no bot: only the CLI can refuse
+        r = _ops_cli(w, "run", "project-test", "alpha;reboot", role="", thread="")
+        check("the CLI refuses shell before asking, exit 1",
+              r.returncode == 1 and "never shell" in r.stderr, r.stderr)
+        r = _ops_cli(w, "run", "nope", role="", thread="")
+        check("and an unknown op", r.returncode == 1 and "no op 'nope'" in r.stderr)
+        w.port = port
+        out = w.ns["handle_ops"]({"action": "run", "name": "project-test",
+                                  "args": ["alpha", "$(id)"]})
+        check("the bot refuses them again on its own", not out["ok"]
+              and out.get("refused") == "args", out)
+        out = w.ns["handle_ops"]({"action": "run", "name": "project-test", "args": "alpha"})
+        check("args that are not a list", not out["ok"] and "list" in out["error"], out)
+        r = _ops_cli(w, "run", "trader-refetch-revisions", "--symbols", "CAT", "--notes",
+                     "--apply", role="", thread="")
+        check("--notes never swallows an option (--apply): a usage error",
+              r.returncode == 2, r.stdout + r.stderr)
+    check("nothing ran for any of it", _calls(w) == [], _calls(w))
+
+
+def test_ops_run_through_the_bot_with_fakes():
+    print("\nnamed ops: run by the bot, each step's argv, exit code and output in the "
+          "reply and the ops log")
+    w = _ops_world()
+    with _fake_path(w):
+        r = _ops_cli(w, "run", "tailscale-status", role="", thread="")
+        check("tailscale-status asks tailscale, never serve or funnel",
+              any(c.startswith("tailscale status") for c in _calls(w))
+              and not any("serve --bg" in c or "funnel" in c for c in _calls(w)),
+              _calls(w))
+        check("its reply quotes the command and exit code",
+              "tailscale status" in r.stdout and "[exit" in r.stdout, r.stdout + r.stderr)
+        w.calls.write_text("")
+        g = _ops_turn(w, "the phone can't reach the dashboard -- run tailscale on")
+        r = _ops_as_user(w, g, "tailscale-on", "--notes", "user: run tailscale on")
+        serves = [c for c in _calls(w) if c.startswith("tailscale serve")
+                  and not c.startswith("tailscale serve status")]
+        check("tailscale-on serves the dashboard's port in the background, and nothing else",
+              serves == [f"tailscale serve --bg {os.environ.get('SILKWORM_VIZ_PORT', '8790')}"]
+              and not any("funnel" in c for c in _calls(w)), _calls(w))
+        w.calls.write_text("")
+        g = _ops_turn(w, "reinstall the pooldata job now that the fix landed")
+        r = _ops_as_user(w, g, "trader-launchd-reinstall", "com.traderjoe.pooldata",
+                         "--notes", "user: reinstall pooldata")
+        check("the reinstall runs plutil, cp and launchctl, in order",
+              [c.split()[0] + " " + c.split()[1] for c in _calls(w)]
+              == ["plutil -lint", "cp " + str((w.trader / "ops").resolve()
+                                              / "com.traderjoe.pooldata.plist"),
+                  "launchctl bootout", "launchctl bootstrap"]
+              and r.returncode == 0, _calls(w) + [r.stdout, r.stderr])
+        check("and the plist is in LaunchAgents",
+              (w.agents / "com.traderjoe.pooldata.plist").read_bytes()
+              == (w.trader / "ops" / "com.traderjoe.pooldata.plist").read_bytes())
+        check("the reply has each step's command and exit code",
+              r.stdout.count("[exit 0]") == 4 and "launchctl bootstrap gui/501" in r.stdout,
+              r.stdout)
+    with _fake_path(w, FAKE_BOOTOUT="113"):
+        w.calls.write_text("")
+        g = _ops_turn(w, "reinstall com.traderjoe.pooldata")
+        r = _ops_as_user(w, g, "trader-launchd-reinstall", "com.traderjoe.pooldata",
+                         "--notes", "user: reinstall it")
+        check("a job that was not loaded (bootout fails) still gets bootstrapped",
+              r.returncode == 0 and _calls(w)[-1].startswith("launchctl bootstrap"),
+              _calls(w) + [r.stdout, r.stderr])
+    with _fake_path(w, FAKE_BOOTSTRAP="5"):
+        g = _ops_turn(w, "reinstall com.traderjoe.pooldata")
+        r = _ops_as_user(w, g, "trader-launchd-reinstall", "com.traderjoe.pooldata",
+                         "--notes", "user: reinstall it")
+        check("a bootstrap that fails is a failed run, exit 1, saying exit 5",
+              r.returncode == 1 and "[exit 5]" in r.stdout and "failed" in r.stderr,
+              r.stdout + r.stderr)
+    with _fake_path(w):
+        w.calls.write_text("")
+        g = _ops_turn(w, "after the close, run refetch_revisions for BRK.A and CAT with "
+                         "--dividends --apply")
+        r = _ops_as_user(w, g, "trader-refetch-revisions", "--symbols", "BRK.A", "CAT",
+                         "--dividends", "--apply", "--notes", "user: refetch, apply")
+        check("the refetch runs trader's python on the script with exactly those arguments",
+              _calls(w) == ["python3 scripts/refetch_revisions.py --symbols BRK.A CAT "
+                            "--dividends --apply"]
+              and "plan: 3 symbols revised" in r.stdout and r.returncode == 0,
+              _calls(w) + [r.stdout, r.stderr])
+        r = _ops_cli(w, "run", "project-test", "alpha", role="", thread="")
+        check("project-test runs the suite and quotes its tail",
+              r.returncode == 0 and "12 passed, 0 failed" in r.stdout, r.stdout + r.stderr)
+    with _fake_path(w, FAKE_TESTS="1"):
+        r = _ops_cli(w, "run", "project-test", "alpha", role="", thread="")
+        check("a failing suite is exit 1, its exit code said",
+              r.returncode == 1 and "[exit 1]" in r.stdout, r.stdout + r.stderr)
+    import ops as OPS
+    runs = OPS.read_log(w.log, 50)
+    re_ = next((x for x in runs if x.get("op") == "trader-refetch-revisions"), {})
+    check("the ops log has each run: argv, exit code, tail, who and on whose word",
+          re_.get("steps") and re_["steps"][0]["argv"][1:] == [
+              "scripts/refetch_revisions.py", "--symbols", "BRK.A", "CAT", "--dividends",
+              "--apply"]
+          and re_.get("exit") == 0 and "plan: 3 symbols" in re_.get("tail", "")
+          and re_.get("decided_by") == "U_ME" and re_.get("decided_ts") == "1761400000.000100"
+          and re_.get("notes") == "user: refetch, apply" and re_.get("by") == "operator", re_)
+    r = _ops_cli(w, "log", "-n", "50", role="", thread="")
+    check("`silkworm ops log` reads it back, with the bot not asked",
+          "trader-refetch-revisions --symbols BRK.A CAT" in r.stdout
+          and "for U_ME (Slack message 1761400000.000100)" in r.stdout, r.stdout)
+    r = _ops_cli(w, "list", "--json", role="", thread="")
+    names = [d["name"] for d in json.loads(r.stdout)]
+    check("`silkworm ops list` names every op", names == list(OPS.REGISTRY), names)
+
+
+def test_ops_that_change_things_need_your_word():
+    import ops as OPS
+    print("\nnamed ops: reading is always allowed; changing needs your word, never a sweep's")
+    w = _ops_world()
+    with _fake_path(w):
+        r = _ops_as_sweep(w, "tailscale-status")
+        check("a read-only op runs in a sweep", r.returncode == 0 or "[exit" in r.stdout,
+              r.stdout + r.stderr)
+        r = _ops_as_sweep(w, "trader-refetch-revisions", "--symbols", "CAT")
+        check("and so does a refetch plan (no --apply)",
+              r.returncode == 0 and "plan: 3 symbols" in r.stdout, r.stdout + r.stderr)
+        w.calls.write_text("")
+        for argv in (["tailscale-on", "--notes", "x"],
+                     ["trader-launchd-reinstall", "com.traderjoe.pooldata", "--notes", "x"],
+                     ["trader-refetch-revisions", "--symbols", "CAT", "--apply",
+                      "--notes", "x"]):
+            r = _ops_as_sweep(w, *argv)
+            check(f"a sweep's {argv[0]}{' --apply' if '--apply' in argv else ''} is refused",
+                  r.returncode == 1 and "never in a sweep" in r.stderr, r.stderr)
+        for argv in (["tailscale-on"], ["trader-refetch-revisions", "--symbols", "CAT",
+                                        "--apply"]):
+            out = _ops_ask(w, {"action": "run", "name": argv[0], "args": argv[1:],
+                                      "caller_role": "operator", "caller_thread": "D1:1.0",
+                                      "caller_task": "tsk_sweep", "notes": "x"})
+            check(f"and refused by the bot itself ({argv[0]})",
+                  not out["ok"] and out.get("refused") == "grant", out)
+        g = _ops_turn(w, "run tailscale on please")
+        out = _ops_ask(w, {"action": "run", "name": "tailscale-on", "args": [],
+                                  "caller_role": "operator", "caller_thread": "D1:1.0",
+                                  "caller_grant": g, "caller_task": "tsk_a_wakeup",
+                                  "notes": "x"})
+        check("your grant, sent from another turn (a wake-up's), lifts nothing",
+              not out["ok"] and out.get("refused") == "grant", out)
+        out = _ops_ask(w, {"action": "run", "name": "tailscale-on", "args": [],
+                                  "caller_role": "assistant", "caller_thread": "C9:9.0",
+                                  "caller_task": "tsk_x", "notes": "x"})
+        check("nor does any other turn -- an assistant's -- run one", not out["ok"], out)
+        check("none of those ran anything", not any(
+            c.startswith(("tailscale serve", "launchctl", "cp ", "python3")) for c in _calls(w)),
+            _calls(w))
+        r = _ops_as_user(w, g, "tailscale-on")
+        check("in your turn, without --notes, refused", r.returncode == 1
+              and "--notes" in r.stderr, r.stderr)
+        out = _ops_ask(w, {"action": "run", "name": "tailscale-on", "args": [],
+                                  "caller_role": "operator", "caller_thread": "D1:1.0",
+                                  "caller_grant": g, "caller_task": "tsk_turn_mine"})
+        check("and by the bot", not out["ok"] and "--notes" in out["error"], out)
+        g2 = _ops_turn(w, "fix the dashboard on my phone")
+        r = _ops_as_user(w, g2, "tailscale-on", "--notes", "user: fix the dashboard")
+        check("tailscale-on only when your message named it (tailscale)",
+              r.returncode == 1 and "has to name it" in r.stderr, r.stderr)
+        g3 = _ops_turn(w, "reinstall the dataupdate job")
+        r = _ops_as_user(w, g3, "trader-launchd-reinstall", "com.traderjoe.pooldata",
+                         "--notes", "user: reinstall")
+        check("a trader op only when your message named it -- another job is not this one",
+              r.returncode == 1 and "trader's live configuration" in r.stderr, r.stderr)
+        for text in ("is tailscale still broken? just look", "check the tailscale-only setup"):
+            g6 = _ops_turn(w, text)
+            r = _ops_as_user(w, g6, "tailscale-on", "--notes", "x")
+            check(f"tailscale-on is not named by {text!r}",
+                  r.returncode == 1 and "has to name it" in r.stderr, r.stderr)
+        g6 = _ops_turn(w, "refetch CAT --apply")
+        r = _ops_as_user(w, g6, "trader-refetch-revisions", "--symbols", "CAT", "--apply",
+                         "--notes", "x")
+        check("a bare 'refetch' does not name trader-refetch-revisions",
+              r.returncode == 1 and "has to name it" in r.stderr, r.stderr)
+        import ops as _O
+        check("whole words: a short last segment never names a job, the full label does",
+              _O.named(("trader-launchd-reinstall", "com.traderjoe.a"), "do a reinstall")
+              is False
+              and "a" not in _O._names(_O.REGISTRY["trader-launchd-reinstall"],
+                                       ["com.traderjoe.a"])
+              and _O.named(("com.traderjoe.a",), "reinstall com.traderjoe.a please")
+              and _O.named(("trader-refetch-revisions", "refetch_revisions"),
+                           "run the refetch revisions script")
+              and not _O.named(("pooldata",), "the pooldatafeed job"))
+        r = _ops_as_sweep(w, "project-test", "alpha")
+        check("project-test (a suite in the live checkout) is refused in a sweep",
+              r.returncode == 1 and "never in a sweep" in r.stderr, r.stderr)
+        g7 = _ops_turn(w, "run alpha's tests")
+        r = _ops_as_user(w, g7, "project-test", "alpha", "--notes", "user: run alpha's tests")
+        check("and runs on your word, without having to name the op",
+              r.returncode == 0 and "12 passed" in r.stdout, r.stdout + r.stderr)
+        g4 = _ops_turn(w, "accept tsk_1 and land tsk_2")
+        r = _ops_as_user(w, g4, "trader-refetch-revisions", "--symbols", "CAT", "--apply",
+                         "--notes", "x")
+        check("a refetch --apply your message never mentioned is refused",
+              r.returncode == 1 and "has to name it" in r.stderr, r.stderr)
+        check("still nothing ran", not any(
+            c.startswith(("tailscale serve", "launchctl", "cp ", "python3")) for c in _calls(w)),
+            _calls(w))
+        g5 = _ops_turn(w, "run tailscale-on")
+        r = _ops_as_user(w, g5, "tailscale-on", "--notes", "user: run tailscale-on")
+        check("named, with notes, in your turn: it runs", any(
+            c.startswith("tailscale serve --bg") for c in _calls(w)), r.stdout + r.stderr)
+        w.grants.close(g5)
+        w.calls.write_text("")
+        r = _ops_as_user(w, g5, "tailscale-on", "--notes", "user: run tailscale-on")
+        check("once your turn has ended its grant runs nothing",
+              r.returncode == 1 and not _calls(w), r.stderr)
+        r = _ops_cli(w, "run", "tailscale-on", role="", thread="")
+        check("your own terminal (no turn) runs it", any(
+            c.startswith("tailscale serve --bg") for c in _calls(w)), r.stdout + r.stderr)
+    refusals = [x for x in OPS.read_log(w.log, 100) if x.get("refused")]
+    check("each refusal is in the ops log, with who asked",
+          len(refusals) >= 6 and all(x.get("by") and x.get("op") for x in refusals),
+          len(refusals))
+    # The CLI's half alone: with no bot to ask, a sweep's mutating op is
+    # refused (1), not "could not reach the bot" (3).
+    env_bot = w.port
+    w.port = 1
+    r = _ops_as_sweep(w, "tailscale-on", "--notes", "x")
+    check("the CLI refuses a sweep's mutating op before asking the bot",
+          r.returncode == 1 and "never in a sweep" in r.stderr, r.stderr)
+    r = _ops_as_user(w, "f" * 32, "tailscale-on")
+    check("and one with a grant but no --notes", r.returncode == 1 and "--notes" in r.stderr,
+          r.stderr)
+    w.port = env_bot
+
+
+def test_ops_one_run_at_a_time_and_within_its_timeout():
+    import ops as OPS
+    print("\nnamed ops: one run of an op at a time, and each within its timeout")
+    w = _ops_world()
+    p = OPS.plan("project-test", ["alpha"], w.ctx)
+    p.timeout = 1
+
+    def slow(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+    rec = OPS.run(p, runner=slow)
+    check("a step out of time is a failed run with no exit code, saying so",
+          not rec["ok"] and rec["exit"] is None and "timed out" in rec["tail"], rec)
+    entered, release = __import__("threading").Event(), __import__("threading").Event()
+
+    def held(argv, **kw):
+        entered.set()
+        release.wait(5)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    p = OPS.plan("tailscale-status", [], w.ctx)
+    t = __import__("threading").Thread(target=OPS.run, args=(p,), kwargs={"runner": held})
+    t.start()
+    entered.wait(5)
+    try:
+        OPS.run(OPS.plan("tailscale-status", [], w.ctx), runner=held)
+        second = ""
+    except OPS.Refused as e:
+        second = str(e)
+    release.set()
+    t.join(5)
+    check("a second run while the first is going is refused", "already running" in second,
+          second)
+    rec = OPS.run(OPS.plan("tailscale-status", [], w.ctx),
+                  runner=lambda a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+    check("and runs once the first is done", rec["ok"], rec)
+    import verify
+    ran = []
+    said = []
+
+    def attempt():
+        try:
+            OPS.run(OPS.plan("project-test", ["alpha"], w.ctx),
+                    runner=lambda a, **k: ran.append(a) or types.SimpleNamespace(
+                        returncode=0, stdout="", stderr=""))
+            said.append("")
+        except OPS.Refused as e:
+            said.append(str(e))
+    # In a thread, bounded: an op that waited on the lock would otherwise
+    # hang this test rather than fail it.
+    with verify.project_lock("alpha"):
+        t = __import__("threading").Thread(target=attempt, daemon=True)
+        t.start()
+        t.join(5)
+        busy = said[0] if said else "it waited on the lock"
+        ran_while_held = list(ran)
+    t.join(5)
+    ran = ran_while_held
+    check("project-test while that suite is running (a verify, a landing) is refused at once,"
+          " not left waiting past the CLI's patience", "already running" in busy and not ran,
+          busy)
+    rec = OPS.run(OPS.plan("project-test", ["alpha"], w.ctx),
+                  runner=lambda a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+    with verify.project_lock("alpha", wait=False):
+        released = True
+    check("and the lock is let go after a run", rec["ok"] and released)
+    rec = OPS.run(OPS.plan("tailscale-status", [], w.ctx),
+                  runner=lambda a, **k: types.SimpleNamespace(
+                      returncode=0, stdout="key nodekey:0123456789abcdef", stderr=""))
+    check("output is scrubbed of credentials", "0123456789abcdef" not in rec["tail"], rec["tail"])
+
+
+def test_ops_on_the_operators_allowlist_and_in_its_prompts():
+    import ops as OPS
+    import operator_role as O
+    import roles
+    print("\nnamed ops: on the operator's allowlist by exact prefix, and in both its prompts")
+    args = roles.permission_args(O.ROLE, ["--dangerously-skip-permissions"], bin="/abs/silkworm")
+    tools = args[args.index("--allowedTools") + 1].split(") ")
+    tools = [t if t.endswith(")") else t + ")" for t in tools]
+    check("`ops run`, `ops list` and `ops log` at the CLI's absolute path",
+          {"Bash(/abs/silkworm ops run:*)", "Bash(/abs/silkworm ops list:*)",
+           "Bash(/abs/silkworm ops log:*)"} <= set(tools), tools)
+    check("and no wider ops entry, raw tailscale, launchctl or shell",
+          not any(t in tools for t in ("Bash(/abs/silkworm ops:*)", "Bash")) and not any(
+              ("tailscale" in t or "launchctl" in t or "plutil" in t or "python" in t)
+              for t in tools), tools)
+    text = roles.system_prompt(O.ROLE, bin="/s")
+    check("its prompt lists every op", all(f"`{n}" in text for n in OPS.REGISTRY))
+    check("and says to run them rather than hand the user a shell step",
+          "Commands on this machine: never hand the user a shell step you have an op for"
+          in text
+          and "/s ops run <name>" in text)
+    check("only on the user's word for one that changes things, never a sweep",
+          "never\nin a sweep" not in text and "never in a sweep or a wake-up" in text
+          and "only when their message named it" in text)
+    goal = O.SWEEP_GOAL.format(bin="/s")
+    check("the sweep may read, and asks before changing anything",
+          "/s ops run tailscale-status" in goal and "is never run in a sweep" in goal
+          and all(n in goal for n, op in OPS.REGISTRY.items() if op.read_only is False)
+          and "ask the user to tell you to run it in this thread" in goal, goal)
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

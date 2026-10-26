@@ -39,6 +39,8 @@
     silkworm status                 health check: services, bot, visualizer, hooks
     silkworm restart                restart the services
     silkworm tailscale [status|on|off]  serve the dashboard to your tailnet (never Funnel)
+    silkworm ops list | log | run <name> [args] [--notes N]   named operations on this
+                                    machine (ops.py): the operator runs these on your word
     silkworm push [status|test|forget-all]  phone notifications: what is set up, send a
                                     test to every subscribed device, or drop them all
     silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
@@ -859,6 +861,7 @@ import git_guard                                     # noqa: E402
 import jsonstore                                     # noqa: E402
 import workspaces                                    # noqa: E402
 import operator_role                                 # noqa: E402
+import ops                                           # noqa: E402
 import tailnet                                       # noqa: E402
 
 
@@ -1283,6 +1286,145 @@ def do_release(argv: list, ask=None, state=None) -> int:
     print(f"ok: release {slug} started ({steps or 'as planned'}); "
           "it posts its progress to its own thread")
     return EXIT_OK
+
+
+OPS_USAGE = ("usage: silkworm ops list [--json] | log [-n N] [--json] | "
+             "run <name> [args …] [--notes TEXT] [--by NAME]")
+#: Beyond an op's own timeout, how long the CLI waits on the bot's answer.
+OPS_SLACK_S = 60
+
+
+def ops_log_path() -> Path:
+    # SILKWORM_OPS_LOG for the tests, as SILKWORM_OPERATOR_STATE is.
+    return Path(os.environ.get("SILKWORM_OPS_LOG") or LOGS / "ops.jsonl")
+
+
+def parse_ops_run(argv: list) -> dict:
+    """The /ops run payload, from the arguments after `run`. --notes and --by
+    are this command's, wherever they sit; every other argument is the op's,
+    in order. Raises ValueError with the usage line."""
+    payload, rest, i = {"action": "run", "by": default_by()}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--notes", "--by"):
+            # Never an option: `--notes --apply` would swallow the --apply
+            # and quietly run something other than what was asked.
+            if (i + 1 >= len(argv) or not argv[i + 1].strip()
+                    or argv[i + 1].startswith("--")):
+                raise ValueError(f"{a} needs a value\n{OPS_USAGE}")
+            payload[a[2:]] = argv[i + 1].strip()
+            i += 2
+        else:
+            rest.append(a)
+            i += 1
+    if not rest:
+        raise ValueError(OPS_USAGE)
+    payload["name"], payload["args"] = rest[0], rest[1:]
+    return payload
+
+
+def ops_cli_refusal(payload: dict) -> str:
+    """What the CLI refuses before asking the bot (which refuses it again):
+    an unknown op or arguments that look like shell, for anyone; and from
+    inside a turn, an op that changes something without a grant to show or
+    --notes saying what the user asked for. Whether the grant is live, and
+    named the op, only the bot knows."""
+    try:
+        ops.lookup(payload["name"])
+    except ops.Refused as e:
+        return str(e)
+    why = ops.arg_refusal(payload["args"])
+    if why:
+        return why
+    in_turn = bool(os.environ.get("SILKWORM_ROLE") or os.environ.get("SILKWORM_THREAD"))
+    if not in_turn or not ops.mutating(payload["name"], payload["args"]):
+        return ""
+    if not os.environ.get(operator_role.GRANT_VAR):
+        return (f"`{payload['name']}` changes something on this machine, so from inside a "
+                "turn it runs only on the user's word, in a turn they started in the "
+                "operator's thread -- never in a sweep or a wake-up")
+    if not str(payload.get("notes") or "").strip():
+        return "acting on the user's word needs --notes quoting or paraphrasing what they asked for"
+    return ""
+
+
+def do_ops(argv: list, ask=None) -> int:
+    """`silkworm ops list | log | run`: the named operations (ops.py).
+
+    `list` and `log` read locally -- the registry is code, the log a file --
+    so they answer with the bot down. `run` asks the bot, which builds the
+    exact argv from the registry and runs it, and prints each step's argv and
+    exit code and the tail of its output: exit 0 when it succeeded, 1 refused
+    or failed, 2 usage, 3 the bot could not be reached.
+    """
+    ask = ask or bot_ask
+    sub, rest = (argv[0] if argv else "list"), list(argv[1:])
+    if sub == "list":
+        if "--json" in rest:
+            print(json.dumps(ops.describe(), indent=2))
+            return EXIT_OK
+        for d in ops.describe():
+            kind = ("reads only" if d["read_only"] is True else
+                    "changes things" if d["read_only"] is False else d["read_only"])
+            print(f"{d['name']} {d['usage']}".rstrip()
+                  + f"  [{d['project'] or 'any project'}; {kind}"
+                  + ("; your message must name it" if d["named"] else "")
+                  + f"; {d['timeout']}s]\n    {d['description']}")
+        return EXIT_OK
+    if sub == "log":
+        n = 10
+        if "-n" in rest:
+            try:
+                n = int(rest[rest.index("-n") + 1])
+            except (IndexError, ValueError):
+                print(OPS_USAGE, file=sys.stderr)
+                return EXIT_USAGE
+        runs = ops.read_log(ops_log_path(), n)
+        if "--json" in rest:
+            print(json.dumps(runs, indent=2))
+            return EXIT_OK
+        for r in runs:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.get("at") or 0))
+            who = r.get("by") or "?"
+            if r.get("decided_by"):
+                who += f", for {r['decided_by']} (Slack message {r.get('decided_ts')})"
+            head = f"{when} {r.get('op')} {' '.join(r.get('args') or [])}".rstrip()
+            if r.get("refused"):
+                print(f"{head} — refused ({who}): {r['refused']}")
+            else:
+                print(f"{head} — exit {r.get('exit')} ({who})\n{ops.format_run(r)}")
+        return EXIT_OK
+    if sub != "run":
+        print(OPS_USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        payload = parse_ops_run(rest)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_USAGE
+    why = ops_cli_refusal(payload)
+    if why:
+        print(f"refused: ops run {payload['name']}: {why}", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        r = ask("/ops", payload, timeout=ops.REGISTRY[payload["name"]].timeout + OPS_SLACK_S)
+    except BotUnreachable as e:
+        print(f"not done: {e} (a run the bot did start finishes anyway; "
+              "`silkworm ops log` shows it)", file=sys.stderr)
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        why = r.get("error") or ("the bot gave no reason (its handler may have failed; "
+                                 "see silkworm logs)")
+        print(f"refused: ops run {payload['name']}: {why}", file=sys.stderr)
+        return EXIT_REFUSED
+    run = r.get("run") or {}
+    print(ops.format_run(run))
+    head = f"{run.get('op')} {' '.join(run.get('args') or [])}".rstrip()
+    if run.get("ok"):
+        print(f"ok: {head} (exit 0, {run.get('seconds')}s)")
+        return EXIT_OK
+    print(f"failed: {head} (exit {run.get('exit')}, {run.get('seconds')}s)", file=sys.stderr)
+    return EXIT_REFUSED
 
 
 OPERATOR_USAGE = ("usage: silkworm operator notes [--set TEXT] | "
@@ -2550,6 +2692,8 @@ def main() -> None:
         sys.exit(do_release(args[1:]))            # args[0] is the subcommand
     elif cmd == "tailscale":
         sys.exit(do_tailscale(args[1:]))          # args[0] is the subcommand
+    elif cmd == "ops":
+        sys.exit(do_ops(args[1:]))                # args[0] is the subcommand
     elif cmd == "push":
         sys.exit(do_push(args[1:]))               # args[0] is the subcommand
     elif cmd == "health":

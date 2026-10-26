@@ -69,6 +69,7 @@ import releases
 import retry
 import merge
 import operator_role
+import ops
 import summaries
 import turncost
 import verify
@@ -3697,6 +3698,7 @@ server.route("/releases", handle_releases)
 server.route("/titles", handle_titles)
 server.route("/tasks", handle_tasks)
 server.route("/projects", handle_projects)
+server.route("/ops", handle_ops)
 server.route("/defer", handle_defer)
 server.route("/file-task", handle_file_task)
 server.route("/hide", handle_hide)
@@ -6659,6 +6661,74 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         log.info("operator: %s %s went ahead on your approval of %s %s",
                  route, action, *guard)
     return None
+
+
+#: Every run of a named op (ops.py), and every refusal of a well-formed one.
+OPS_LOG = BASE_DIR / "logs" / "ops.jsonl"
+
+
+def ops_context() -> "ops.Context":
+    return ops.Context(project=lambda slug: project_store.get(slug),
+                       python=sys.executable, silkworm_bin=SILKWORM_BIN,
+                       uid=os.getuid(), launch_agents=Path.home() / "Library" / "LaunchAgents")
+
+
+def handle_ops(payload: dict) -> dict:
+    """Route for /ops: the named operations of ops.py -- `list`, `log`, and
+    `run` (name, args, by, notes).
+
+    The bot runs them, not the CLI: your grant lives here, and so does a
+    process no turn's sandbox confines. A request from inside a turn (the CLI
+    stamps those) may run an op that changes something only with the live
+    grant of the turn you started in the operator's home thread (user_grant)
+    -- so never from a sweep or a wake-up. One from your own terminal or the
+    dashboard carries no stamp, and is you.
+    """
+    payload = payload or {}
+    action = str(payload.get("action") or "list")
+    if action == "list":
+        return {"ok": True, "ops": ops.describe()}
+    if action == "log":
+        try:
+            n = max(1, min(200, int(payload.get("n") or 20)))
+        except (TypeError, ValueError):
+            n = 20
+        return {"ok": True, "runs": ops.read_log(OPS_LOG, n)}
+    if action != "run":
+        return {"ok": False, "error": f"unknown action {action!r}"}
+    name = str(payload.get("name") or "")
+    args = payload.get("args") or []
+    if not isinstance(args, list):
+        return {"ok": False, "error": "args is a list", "refused": "args"}
+    try:
+        plan = ops.plan(name, args, ops_context())
+    except ops.Refused as e:
+        return {"ok": False, "error": str(e), "refused": "args"}
+    in_turn = bool(payload.get("caller_role") or payload.get("caller_thread"))
+    grant = user_grant(payload) if in_turn else None
+    notes = str(payload.get("notes") or "")
+    record = {"by": str(payload.get("by") or ("operator" if in_turn else "cli")),
+              "notes": " ".join(notes.split())[:500],
+              "caller_role": str(payload.get("caller_role") or ""),
+              "thread": str(payload.get("caller_thread") or ""),
+              "task": str(payload.get("caller_task") or "")}
+    if grant:
+        record.update(decided_by=grant["user"], decided_ts=grant["ts"])
+    why = ops.refusal(plan, in_turn=in_turn, grant=grant, notes=notes)
+    if why:
+        log.info("ops: %s refused (%s)", plan.name, why[:120])
+        ops.append_log(OPS_LOG, dict(record, at=time.time(), op=plan.name, args=plan.args,
+                                     refused=why))
+        return {"ok": False, "error": why, "refused": "grant"}
+    env = git_guard.strip(dict(os.environ))
+    env.pop(operator_role.GRANT_VAR, None)
+    log.info("ops: running %s %s for %s%s", plan.name, plan.args, record["by"],
+             f" on the word of {grant['user']} ({grant['ts']})" if grant else "")
+    try:
+        rec = ops.run(plan, env=env, log_path=OPS_LOG, record=record)
+    except ops.Refused as e:
+        return {"ok": False, "error": str(e), "refused": "busy"}
+    return {"ok": True, "run": rec}
 
 
 _CLI = {}

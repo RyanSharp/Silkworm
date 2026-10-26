@@ -925,8 +925,8 @@ kept, and anything cut says so.
 
 **What it can run.** An allowlist, not `--dangerously-skip-permissions`: the
 action commands above, `silkworm operator contained <id>` and `operator notes`,
-`deploy --after-turn`, `task` (which files proposals) and `defer`, and
-Read/Grep/Glob. No `curl`, so it reaches the bot only through `bin/silkworm`,
+`deploy --after-turn`, `task` (which files proposals) and `defer`, the named
+ops (`silkworm ops run|list|log`, below), and Read/Grep/Glob. No `curl`, so it reaches the bot only through `bin/silkworm`,
 which stamps every request with the role and thread the bot gave the turn. No
 raw git either — `git log --output=<file>` writes any file, its own approvals
 included, and an allowlist prefix cannot exclude a flag — so it reads history
@@ -984,6 +984,38 @@ note or the web chat, none of which you started, carries none, and is refused
 as before. Even on your word: publishing where publish is off and trader's
 live configuration still need `!approve`, a running task is cancelled only if
 your message named it, and dismissing never deletes a branch.
+
+**Named ops: what it runs instead of telling you to.** Where the fix is a
+command on the mini, the operator runs a named op rather than handing you a
+shell step: `silkworm ops run <name> [args] --by operator --notes "…"` (its
+allowlist has `ops run`, `ops list` and `ops log` — still no shell). The ops
+are a fixed registry in code (`ops.py`); each names its project, the directory
+it runs in, the exact argv it runs, a timeout and whether it changes anything.
+The bot builds the argv and runs it with no shell; arguments are validated per
+op, and any argument with a character outside `A-Za-z0-9._,:=@+/-` is refused
+outright.
+
+| Op | Runs | Changes things? |
+| --- | --- | --- |
+| `tailscale-status` | `silkworm tailscale status` | no |
+| `tailscale-on` | `silkworm tailscale on` — serve to the tailnet under this machine's current name, never Funnel | yes; your message must name it ("tailscale on") |
+| `trader-launchd-reinstall <job>` | `plutil -lint ops/<job>.plist`, copy it to `~/Library/LaunchAgents`, `launchctl bootout gui/<uid>/<job>` (may fail: not loaded), `launchctl bootstrap gui/<uid> …` — only one of trader's own jobs (`com.traderjoe.*`), from its own `ops/` (no symlinks), committed and unchanged, whose `Label` is `<job>` | yes; your message must name the op or the job (its label, or a last part of six letters or more: "pooldata") |
+| `trader-refetch-revisions --symbols S … [--dividends] [--apply]` | trader's `.venv/bin/python3 scripts/refetch_revisions.py` with those arguments; its own guards stay (refuses while the market is open, takes `update_data`'s lock, backs up first) | only with `--apply`; your message must name it ("refetch revisions") |
+| `project-test <project>` | the project's `test_cmd`, split as verification splits it, in its live checkout, under that suite's lock (refused, not queued, while another run holds it) | yes: a suite can write into the checkout |
+
+One that only reads runs in any turn, the daily sweep included. One that
+changes something runs from inside a turn only on your word — the grant of a
+turn you started in its home thread, with `--notes` — and never in a sweep or a
+wake-up (the sweep names the op under *Needs you* and asks you to tell it).
+Trader's (its live configuration) and `tailscale-on` (exposure) also need your
+message to name them, as whole words. Your own terminal and the dashboard carry no turn and
+are you: `silkworm ops run tailscale-on` works there as it is. The CLI refuses
+first, and the bot again. Every run and refusal is appended to
+`logs/ops.jsonl` — who, on whose Slack message, each step's argv, exit code and
+the tail of its output (credentials scrubbed) — which `silkworm ops log` reads;
+the operator quotes the same in its reply. `silkworm ops list` shows the
+registry. A long op (a test suite, a refetch) keeps running in the bot if the
+CLI gives up waiting, and lands in the log.
 
 **The daily sweep.** Once a day at `OPERATOR_SWEEP_AT` (default `08:30`, or
 `off`), and only after the digest has gone out (unless the digest is off), the

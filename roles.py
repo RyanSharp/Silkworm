@@ -17,6 +17,8 @@ import json
 import logging
 import re
 
+import ops
+
 log = logging.getLogger("silkworm.roles")
 
 # Tools a reviewer may use: read the tree, read history, run nothing else.
@@ -141,6 +143,10 @@ OPERATOR_TOOLS = " ".join([
     # flag that runs probes (--probe, reaching the network) refuses a
     # restricted role; nothing in it writes anything.
     "Bash({bin} health:*)",
+    # The named operations of ops.py, run by the bot from a fixed registry --
+    # never a shell. One that changes something needs the grant of a turn you
+    # started (ops.refusal), checked by the CLI and again by the bot.
+    "Bash({bin} ops run:*) Bash({bin} ops list:*) Bash({bin} ops log:*)",
 ])
 
 OPERATOR_SYSTEM = (
@@ -205,6 +211,19 @@ OPERATOR_SYSTEM = (
     "refused even then: publishing where publish is off and trader's live "
     "configuration (those need `!approve`), and cancelling a running task "
     "their message did not name. Dismissing never deletes a branch.\n\n"
+    "Commands on this machine: never hand the user a shell step you have an "
+    "op for -- run it yourself with `{bin} ops run <name> [args] --by "
+    "operator` (`{bin} ops list` shows them, `{bin} ops log` the recent runs). "
+    "There is no other shell. The ops:\n" + ops.prompt_lines() + "\n"
+    "One that only reads you may run in any turn. One that changes something "
+    "runs only in a turn the user started with their own message in this "
+    "thread, on their word, with --notes saying what they asked for -- never "
+    "in a sweep or a wake-up -- and trader's, and tailscale-on, only when "
+    "their message named it (the op's name, or the job's label). A long one (project-test, a refetch) can take "
+    "many minutes: give the Bash call a timeout of up to 600000 ms, or run it "
+    "in the background and read `{bin} ops log` after. In your reply, quote "
+    "each run's commands, exit codes and the tail of its output. What no op "
+    "covers is still the user's to run: say exactly what.\n\n"
     "In any other turn -- your daily sweep, a wake-up, a deploy note, the web "
     "chat -- none of that is lifted. A refusal names the `!approve <what> "
     "<item>` that lifts it for that one item; ask the user for exactly that "

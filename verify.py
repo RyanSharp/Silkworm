@@ -164,8 +164,12 @@ _project_locks: dict[str, threading.Lock] = {}
 _project_locks_guard = threading.Lock()
 
 
+class Busy(Exception):
+    """project_lock(wait=False) found the project's suite already running."""
+
+
 @contextlib.contextmanager
-def project_lock(project):
+def project_lock(project, wait: bool = True):
     """Hold `project`'s suite for one run, so two runs of it queue, not overlap.
 
     A suite is not always self-contained. Cadence's pins one named simulator,
@@ -187,6 +191,10 @@ def project_lock(project):
     with _project_locks_guard:
         lock = _project_locks.setdefault(str(project), threading.Lock())
     if not lock.acquire(blocking=False):
+        if not wait:
+            # A caller with someone waiting on its answer (a named op) says
+            # so now rather than waiting out another run's half hour.
+            raise Busy(f"{project}'s tests are already running")
         # Visible, because a run waiting thirty minutes on another is
         # otherwise indistinguishable from a wedged one.
         log.info("tests for %s waiting on another run of the same suite", project)
