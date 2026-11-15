@@ -94,14 +94,15 @@ cd ~/workspace/Silkworm
 (it stops and tells you exactly where to paste the two Slack tokens, then you
 re-run it), installs the session hooks, and installs **two login services**
 (`com.silkworm.bot`, `com.silkworm.viz`) so the bot and visualizer start at
-login and restart on crash. Service definitions are generated from your actual
-paths at install time — clone anywhere.
+login and restart on crash, plus the **watchdog** (`com.silkworm.watchdog`,
+below). Service definitions are generated from your actual paths at install
+time — clone anywhere.
 
 Day-to-day management (macOS today; Linux/systemd planned):
 
 ```sh
 silkworm status      # services, bot, visualizer, hooks, revision — one health check
-silkworm deploy      # load new code without killing work: drain, wait, restart, confirm
+silkworm deploy      # promote HEAD without killing work: drain, wait, restart, confirm — or roll back
 silkworm restart     # bounce both services now, killing whatever turn is running
 silkworm logs        # tail the bot log
 silkworm uninstall   # remove the services (repo and sessions untouched)
@@ -110,19 +111,84 @@ silkworm uninstall   # remove the services (repo and sessions untouched)
 `silkworm deploy` is the one to load new code with. It refuses unless the
 checkout is clean on its base branch and `silkworm test` passes, then asks the
 bot to drain (the queue runner claims nothing new; running turns carry on),
-waits until nothing has been running for 30s, restarts, and checks the bot is
-back, connected to Slack, and running the checkout's HEAD. It gives up without
-restarting after `--max-wait` (default 2h); `--now` skips the wait. A queued
-task a restart does interrupt is resumed in its own session and checkout when
-it next runs, rather than started over.
+waits until nothing has been running for 30s, promotes HEAD (below), and
+checks the bot is back, connected to Slack, and running HEAD. It gives up
+without restarting after `--max-wait` (default 2h); `--now` skips the wait. A
+queued task a restart does interrupt is resumed in its own session and
+checkout when it next runs, rather than started over.
+
+### Promotion: what runs is a pinned commit, and a bad one rolls itself back
+
+On 2026-10-26 a deploy restarted the bot onto a commit whose `bot.py` raised
+`NameError` at import (a route registered before its handler was defined).
+The suite passed — it lifts functions out of `bot.py`, nothing booted it — the
+deploy saw "not answering after 90s" and stopped, and its failure note sat in
+`outbox/` because the bot is what posts. Silkworm was down for 18 days. So:
+
+- **Every change must boot before it lands.** `silkworm test` starts `bot.py`
+  and `visualizer.py` as real processes (`smoke.py`): a scratch state
+  directory (`SILKWORM_HOME`), spare ports, a loopback stand-in for Slack
+  (`SILKWORM_OFFLINE=1`, which refuses anything but loopback) and tokens that
+  are not tokens. It passes only when `/status` answers with the revision it
+  booted and the dashboard answers; an import error, crash or timeout fails
+  with the tail of stderr. The landing gate and the deploy preflight both run
+  the suite, so both run this. A static check also refuses any name the
+  module level reads before it is defined. `python smoke.py [dir]` runs the
+  boot on its own.
+- **The services run a pinned checkout, not this one.** `bot.py` and
+  `visualizer.py` run from a detached git worktree beside the install —
+  `~/workspace/.Silkworm-live` (`SILKWORM_LIVE_DIR` overrides) — that only a
+  promotion moves. Landings, turns and hand edits in the main checkout change
+  nothing that runs. launchd passes `SILKWORM_HOME` so state files, `.env`,
+  `logs/` and `workspace/` stay in the main checkout. `live.json` records what
+  is pinned and the **last known good** revision.
+- **deploy promotes, and rolls back.** After the drain, deploy first boots
+  HEAD exactly as committed in a throwaway worktree (so an untracked file in
+  this tree cannot make it pass) and refuses — nothing restarted, drain lifted
+  — if that does not come up. Then it checks HEAD out in the pinned checkout
+  and restarts onto it — the boot on the real port,
+  once the old process has let go. If it answers `/status`, reconnects to
+  Slack and reports HEAD within 90s it becomes the last known good. If not,
+  the pin goes back to the last known good (or, the first time, whatever was
+  running before), which is restarted and confirmed in turn. Both outcomes are
+  printed and posted, and the outage — start, end, the bot's stderr tail, what
+  was rolled back — is written to `outages.json`. A deploy's note to its
+  thread goes straight to Slack with the bot token (and to your phone) when
+  the bot cannot post it; only failing that, to `outbox/`.
+- **The watchdog notices what nothing else would.** `com.silkworm.watchdog`
+  is a launchd `StartInterval` job (every 2 minutes, not `KeepAlive`, not part
+  of `bot.py`, stdlib only) running `watchdog.py` from the main checkout. When
+  `/status` has not answered for 3 checks in a row (`WATCHDOG_DOWN_CHECKS`),
+  or answers with a new pid every check (a crash loop), it records the
+  outage, rolls the pin back to the last known good (or, when the last known
+  good is what is failing — it passed its deploy and broke later — the one
+  before it) and kickstarts the services — once per outage, never onto the revision already running, never
+  twice in a day, and never while a deploy holds its lock — then tells you
+  directly: `chat.postMessage` to your home DM with the bot token, plus a web
+  push. It repeats at most every 6 hours while still down, and says when the
+  bot is back. Its own log is `logs/watchdog.log`.
+- **Outages are reported once the bot is up.** The daily digest opens with
+  any outage in its window, `silkworm status` shows the pin, the watchdog and
+  the last outage (read from files, so it works with the bot down), and
+  `status --json` carries `live`, `outages` and `outage_open`. The mini's
+  `revision` health check warns when the bot runs uncommitted code, code that
+  is no commit, or anything other than the pin.
+
+The first `silkworm deploy` (or `silkworm install`) after this creates the
+pinned checkout at HEAD and rewrites the service definitions to run it; the
+restart also adds the watchdog job if it is missing. That first deploy has no
+known good revision to fall back on (the bot running before it booted from an
+uncommitted tree, whose commit cannot boot), so the clean boot of HEAD is its
+only guard. `deploy --skip-tests` skips the suite's boot test, not the clean
+boot of HEAD, and the rollback still applies.
 
 Tip: put it on your PATH — `ln -s ~/workspace/Silkworm/bin/silkworm /usr/local/bin/silkworm`.
 
 `silkworm status` reports the git revision the bot is *running*, not the one in
 the checkout, and fails when the two differ. Silkworm auto-merges onto its own
-main and nothing restarts it, so a landed fix can sit in the tree for days
-while the live process serves the revision it booted with — which is not
-otherwise visible from anywhere. The dashboard's alert bar says the same thing.
+main and nothing restarts it, so a landed fix sits in the main checkout until
+`silkworm deploy` promotes it — which is not otherwise visible from anywhere.
+The dashboard's alert bar says the same thing.
 
 Reboots are a non-event: sessions and thread mappings live on disk, the
 services come back at login, and the bot releases any terminal checkouts that

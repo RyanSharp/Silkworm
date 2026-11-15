@@ -32,12 +32,16 @@ import jsonstore
 import procs
 import slacklinks
 
-BASE_DIR = Path(__file__).resolve().parent
+#: Where this code is (assets), and where the install is (state, .env). The
+#: same place unless launchd runs this from the pinned release checkout and
+#: passes SILKWORM_HOME -- see live.py.
+CODE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.environ.get("SILKWORM_HOME") or CODE_DIR).expanduser().resolve()
 
 
 #: Read once: it is a kilobyte and never changes while the server runs.
 try:
-    FAVICON = (BASE_DIR / "assets" / "favicon.svg").read_bytes()
+    FAVICON = (CODE_DIR / "assets" / "favicon.svg").read_bytes()
 except OSError:
     FAVICON = b""
 
@@ -61,7 +65,7 @@ ICONS = {
 ICON_BYTES = {}
 for _path, (_name, _size) in ICONS.items():
     try:
-        ICON_BYTES[_path] = (BASE_DIR / "assets" / "icons" / _name).read_bytes()
+        ICON_BYTES[_path] = (CODE_DIR / "assets" / "icons" / _name).read_bytes()
     except OSError:
         pass
 
@@ -3077,7 +3081,7 @@ function alertParts(sessions, slack, revision) {
   const stale = revision && revision.state && revision.state !== "current";
   const parts = [];
   if (stale) parts.push(`<span class="alert ${revision.state === "stale" ? "bad" : "warn"}">⚠ ${
-    esc(revision.message || "running revision unknown")} — silkworm restart</span>`);
+    esc(revision.message || "running revision unknown")} — silkworm deploy</span>`);
   if (down) parts.push(`<span class="alert bad">⚠ not connected to Slack${
     slack.down_for ? " · " + dur(slack.down_for) : ""} — restarting itself</span>`);
   if (stalled.length) parts.push(

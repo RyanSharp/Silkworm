@@ -72,7 +72,7 @@ def bot_functions(*names, **globals_):
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
                   "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows",
-                  "user_grant", "record_user_decision")
+                  "user_grant", "record_user_decision", "outage_summary")
 
 
 def _helper_modules(nodes, ns) -> None:
@@ -98,6 +98,20 @@ def _helper_modules(nodes, ns) -> None:
         import operator_role as _op
         ns.setdefault("operator_role", _op)
         ns.setdefault("OPERATOR_GRANTS", _op.Grants())
+    # handle_status reports the outage log and the pinned checkout (outages.py,
+    # live.py) and when this process booted; a test that set none up reads an
+    # empty install.
+    if any(n.name == "handle_status" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import live as _live, outages as _outages
+        ns.setdefault("BOOTED", 0.0)
+        ns.setdefault("CODE_DIR", BASE)
+        ns.setdefault("live", _live)
+        ns.setdefault("outages", _outages)
+    # send_digest reads the outage log from the install.
+    if any(n.name == "send_digest" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import outages as _outages
+        ns.setdefault("outages", _outages)
+        ns.setdefault("BASE_DIR", Path(tempfile.mkdtemp()))
     # health_rows reads the bot's health store; a test that set none up has
     # none, which reads as "could not be read", never as "all healthy".
     if any(n.name == "health_rows" for n in nodes if isinstance(n, ast.FunctionDef)):
@@ -1386,7 +1400,7 @@ def test_favicon():
     check("it is served", '"/favicon.svg", "/favicon.ico"' in viz,
           "browsers request /favicon.ico unprompted; a 404 for it is log noise")
     check("with an image content type", '"image/svg+xml"' in viz)
-    check("and read once rather than per request", "FAVICON = (BASE_DIR" in viz)
+    check("and read once rather than per request", "FAVICON = (CODE_DIR" in viz)
     check("a missing file does not break the dashboard", "FAVICON = b\"\"" in viz)
 
 
@@ -4132,7 +4146,8 @@ def test_defer():
     check("outside a turn it refuses rather than guessing a thread",
           r.returncode == 1 and "inside a Silkworm turn" in r.stdout + r.stderr)
     check("an absolute path is handed to the model, not a bare name",
-          "SILKWORM_BIN = str(Path(__file__).resolve().parent" in bot,
+          'SILKWORM_BIN = str(BASE_DIR / "bin" / "silkworm")' in bot
+          and "BASE_DIR = Path(os.environ.get(\"SILKWORM_HOME\") or CODE_DIR).expanduser().resolve()" in bot,
           "a turn's PATH is not ours to assume")
 
 
@@ -7491,10 +7506,11 @@ def test_atomic_persistence():
                 saves += 1
                 offenders += [f"{mod}:{n.lineno}" for n in ast.walk(node)
                               if writes_in_place(n)]
-    # Eight: the four stores, the task board's message pointer (home.Board),
+    # Ten: the four stores, the task board's message pointer (home.Board),
     # the operator's state (operator_role.State), push subscriptions
-    # (push.PushStore), and health results (health.HealthStore).
-    check("every store's _save was found to check", saves == 8, f"found {saves}")
+    # (push.PushStore), health results (health.HealthStore), the outage log
+    # (outages.py) and the watchdog's counters (watchdog.py).
+    check("every store's _save was found to check", saves == 10, f"found {saves}")
     check("and every module was looked at", scanned > 20, f"{scanned}")
     check("nothing writes a state file in place", not offenders, f"at {offenders}")
 
@@ -9363,8 +9379,10 @@ def test_revision_drift():
     assigns = [n for n in tree.body if isinstance(n, ast.Assign)
                and any(getattr(t, "id", "") == "REVISION" for t in n.targets)]
     check("bot.py resolves its revision once, at import", len(assigns) == 1)
+    # CODE_DIR, not BASE_DIR: since the pinned release checkout (live.py) the
+    # code runs from one tree and the install (state, landings) is another.
     check("from the checkout it was loaded from, not the workspace",
-          assigns and "BASE_DIR" in ast.dump(assigns[0].value)
+          assigns and "CODE_DIR" in ast.dump(assigns[0].value)
           and "revision" in ast.dump(assigns[0].value))
     check("startup logs it", 'log.info("revision: %s%s on %s%s"' in src)
     check("/status reports it",
@@ -9384,7 +9402,7 @@ def test_revision_drift():
           guarded and any(isinstance(n, ast.AugAssign) for n in guarded[0].body),
           "the shipit line must survive")
     check("saying the running bot is still the old one",
-          guarded and "silkworm restart" in ast.dump(guarded[0]),
+          guarded and "silkworm deploy" in ast.dump(guarded[0]),
           "the warning has to name the remedy")
 
     # And the predicate itself, run rather than read.
@@ -9923,11 +9941,17 @@ def _outage_harness():
     hold = R.Hold()
     calls = []
 
+    # A reset hours from now, whenever this runs. It was a fixed "resets 6pm",
+    # which just before 6pm is a hold of seconds -- and "the runner is held,
+    # not merely slowed" then failed on the clock, not on the code.
+    at = datetime.now() + timedelta(hours=3)
+    resets = f"{at.hour % 12 or 12}{'am' if at.hour < 12 else 'pm'}"
+
     def run_turn(goal, **kw):
         calls.append(goal)
         if "does work" in goal:
             kw["on_activity"]("Bash", {"command": "make"})
-        raise ClaudeError("You've hit your session limit · resets 6pm")
+        raise ClaudeError(f"You've hit your session limit · resets {resets}")
 
     fail_or_retry = _bot_func("fail_or_retry", task_store=st, retry=R, tasks=T,
                               RUNNER_HOLD=hold, log=logging.getLogger("test"),
@@ -21375,7 +21399,8 @@ def test_action_cli():
           r.returncode == 0 and s.get("ok") is True and len(r.stdout.strip().splitlines()) == 1,
           r.stdout[:300] + r.stderr)
     check("its top-level shape is the documented one",
-          set(s) == {"ok", "errors", "bot", "needs_you", "tasks", "unlanded", "watching"},
+          set(s) == {"ok", "errors", "bot", "needs_you", "tasks", "unlanded", "watching",
+                     "live", "outages", "outage_open"},
           str(sorted(s)))
     ny = s.get("needs_you") or {}
     check("needs-you items are grouped by project, then state",
@@ -28639,7 +28664,7 @@ def test_probe_config_maps_projects_explicitly():
     reg = P.register_all(registry={})
     check("every probe registered under its name",
           sorted(reg) == ["app-store", "backend-drift", "credentials", "disk", "dispatching",
-                          "gateway", "healthcheck", "tailscale", "testflight"])
+                          "gateway", "healthcheck", "revision", "tailscale", "testflight"])
     applies = {n: [s for s in ("trader", "cadence", "saga", "mondays", "fathom", "silkswing",
                                "silkworm", "mini") if reg[n].applies({"slug": s})]
                for n in reg}
@@ -28649,7 +28674,7 @@ def test_probe_config_maps_projects_explicitly():
                       "backend-drift": ["cadence", "saga", "mondays"],
                       "dispatching": ["trader"], "gateway": ["trader"],
                       "healthcheck": ["trader"], "credentials": ["mini"], "disk": ["mini"],
-                      "tailscale": ["mini"]},
+                      "tailscale": ["mini"], "revision": ["mini"]},
           applies)
 
 
@@ -29740,6 +29765,921 @@ def test_ops_on_the_operators_allowlist_and_in_its_prompts():
           "/s ops run tailscale-status" in goal and "is never run in a sweep" in goal
           and all(n in goal for n, op in OPS.REGISTRY.items() if op.read_only is False)
           and "ask the user to tell you to run it in this thread" in goal, goal)
+
+
+# --- boot, promotion and rollback: Silkworm must not go down unnoticed again --------
+# 2026-10-26: 793f119 registered server.route("/ops", handle_ops) three thousand
+# lines above `def handle_ops`. The suite passed (it lifts functions; nothing
+# booted bot.py), deploy restarted onto it, bot.py raised NameError at import,
+# and the deploy's failure note went to outbox/ because the bot is the sender.
+# Down 18.5 days, until bot.py was hand-patched in the live tree.
+
+#: The commits each _code_copy made, oldest first, by directory.
+_SHAS: dict = {}
+
+
+def _code_copy(apply=None, extra_commits=()) -> Path:
+    """This checkout's code (tracked and new files, as they are on disk) in a
+    fresh git repo, committed. `apply(dir)` edits it before the first commit;
+    each of `extra_commits` is (message, apply) committed after, in order."""
+    d = Path(tempfile.mkdtemp(prefix="sw-code-"))
+    names = subprocess.run(["git", "-C", str(BASE), "ls-files", "-co", "--exclude-standard"],
+                           capture_output=True, text=True, check=True).stdout.splitlines()
+    for n in names:
+        src = BASE / n
+        if src.is_file() and not n.startswith(("tests/", "assets/screens")):
+            (d / n).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, d / n)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    env = {k: v for k, v in env.items() if not k.startswith("SILKWORM_")}
+
+    def commit(msg):
+        subprocess.run(["git", "-C", str(d), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(d), "commit", "-qm", msg, "--no-verify"],
+                       check=True, env=env)
+        return subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+
+    subprocess.run(["git", "-C", str(d), "init", "-q", "-b", "main"], check=True, env=env)
+    if apply:
+        apply(d)
+    shas = [commit("good")]
+    for msg, fn in extra_commits:
+        fn(d)
+        shas.append(commit(msg))
+    _SHAS[d] = shas
+    return d
+
+
+def _the_793f119_ordering(d: Path) -> None:
+    """Put bot.py back the way 793f119 had it: the /ops route registered at
+    module level, its handler defined far below."""
+    p = d / "bot.py"
+    s = p.read_text()
+    start = s.index("#: Every run of a named op (ops.py)")
+    end = s.index("server = LocalServer(APPROVAL_PORT)")
+    block, s = s[start:end], s[:start] + s[end:]
+    at = s.index("_CLI = {}\n")
+    p.write_text(s[:at] + block + s[at:])
+
+
+def _raise_at_import(d: Path) -> None:
+    p = d / "bot.py"
+    s = p.read_text()
+    at = s.index("server = LocalServer(APPROVAL_PORT)")
+    p.write_text(s[:at] + 'raise RuntimeError("smoke: this revision cannot boot")\n' + s[at:])
+
+
+def test_bot_and_visualizer_boot_for_real():
+    import smoke
+    print("\nbot.py and visualizer.py boot, as processes, from this checkout")
+    r = smoke.boot(BASE)
+    check("bot.py answers /status and the visualizer answers", r["ok"], smoke.describe(r))
+    head = subprocess.run(["git", "-C", str(BASE), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    rev = (r.get("status") or {}).get("revision") or {}
+    check("and reports the revision it booted", rev.get("started") == head, json.dumps(rev))
+    check("Slack was the loopback stand-in, which it really called",
+          "auth.test" in r.get("slack_calls", []), r.get("slack_calls"))
+    st = r.get("status") or {}
+    check("/status says where the code runs from and when it booted",
+          st.get("code_dir") == str(BASE) and st.get("pid") and st.get("booted"),
+          {k: st.get(k) for k in ("code_dir", "pid", "booted")})
+    env = smoke.boot_env(Path("/tmp/x"), "http://127.0.0.1:1/api/", 1, 2,
+                         base={"SLACK_BOT_TOKEN": "xoxb-real", "CLAUDE_CODE_OAUTH_TOKEN": "sk",
+                               "SILKWORM_THREAD": "C1:1", "PATH": "/bin"})
+    check("no real token or turn variable reaches the booted processes",
+          env["SLACK_BOT_TOKEN"] == "xoxb-smoke-not-a-token"
+          and "CLAUDE_CODE_OAUTH_TOKEN" not in env and "SILKWORM_THREAD" not in env
+          and env["SILKWORM_OFFLINE"] == "1" and env["PATH"] == "/bin", env)
+
+
+def test_boot_smoke_fails_on_the_793f119_ordering():
+    import smoke
+    print("\nthe boot smoke test fails on the code that took Silkworm down")
+    bad = _code_copy(_the_793f119_ordering)
+    r = smoke.boot(bad, timeout=60)
+    check("it does not boot", not r["ok"], smoke.describe(r))
+    check("and says why: bot.py died before answering",
+          "bot.py exited" in r["why"], r["why"])
+    check("with the NameError from stderr",
+          "NameError" in r["stderr"] and "handle_ops" in r["stderr"], r["stderr"][-400:])
+    good = _code_copy()
+    r = smoke.boot(good, timeout=60, expect_sha=_SHAS[good][0])
+    check("the same tree with the fix boots, at the expected revision", r["ok"],
+          smoke.describe(r))
+    r = smoke.boot(good, timeout=60, expect_sha="f" * 40)
+    check("a different revision than expected fails", not r["ok"] and "expected" in r["why"],
+          r["why"])
+    # The switch cannot point a real install's token anywhere but loopback.
+    env = smoke.boot_env(Path(tempfile.mkdtemp()), "https://evil.example/api/", 1, 2)
+    p = subprocess.run([sys.executable, str(good / "bot.py")], env=env, cwd=env["HOME"],
+                       capture_output=True, text=True, timeout=60)
+    check("SILKWORM_OFFLINE refuses a stand-in that is not on loopback",
+          p.returncode != 0 and "loopback" in p.stderr, p.stderr[-300:])
+
+
+def _late_names(src: str) -> list:
+    """Names a module's top level reads before anything has bound them --
+    793f119's bug, found without running anything. Function and lambda bodies
+    run later and are skipped; comprehension variables are their own."""
+    import builtins
+    tree = ast.parse(src)
+    bound = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
+    out = []
+
+    def binds(node):
+        names = set()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return {node.name}
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return {(a.asname or a.name).split(".")[0] for a in node.names}
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                names.add(n.id)
+            elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                names.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                names |= {(a.asname or a.name).split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                names.add(n.name)
+        return names
+
+    def evaluated(node):
+        stack, seen = [node], []
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Lambda):
+                stack.extend(n.args.defaults)
+                continue
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend(n.decorator_list + n.args.defaults
+                             + [d for d in n.args.kw_defaults if d])
+                continue
+            if isinstance(n, ast.ClassDef):
+                stack.extend(n.decorator_list + n.bases)
+                continue
+            if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                local = {t.id for g in n.generators for t in ast.walk(g.target)
+                         if isinstance(t, ast.Name)}
+                seen += [x for x in evaluated_all(n) if x.id not in local]
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                seen.append(n)
+            stack.extend(ast.iter_child_nodes(n))
+        return seen
+
+    def evaluated_all(comp):
+        out_ = []
+        for child in ast.iter_child_nodes(comp):
+            out_ += evaluated(child)
+        return out_
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.If) and "__main__" in ast.unparse(stmt.test):
+            continue
+        local = binds(stmt) if isinstance(stmt, (ast.For, ast.With, ast.If, ast.Try)) else set()
+        out += [(n.lineno, n.id) for n in evaluated(stmt)
+                if n.id not in bound and n.id not in local]
+        bound |= binds(stmt)
+    return out
+
+
+def test_module_level_reads_nothing_defined_below_it():
+    print("\nbot.py and visualizer.py read nothing at import that is defined further down")
+    for name in ("bot.py", "visualizer.py"):
+        late = _late_names((BASE / name).read_text())
+        check(f"{name}: every name its top level uses is bound above it", not late, late[:5])
+    bad = _code_copy(_the_793f119_ordering)
+    late = _late_names((bad / "bot.py").read_text())
+    check("793f119's ordering is caught statically too",
+          [n for _, n in late] == ["handle_ops"], late)
+    check("a name used inside a function body is not (it runs later)",
+          not _late_names("def f():\n    return g()\ndef g():\n    return 1\n"))
+    check("nor a comprehension's own variable",
+          not _late_names("xs = [1]\nys = [x * 2 for x in xs]\n"))
+
+
+class _ProcManager:
+    """launchd, for a test: restart() stops the bot and starts bot.py from the
+    pinned checkout, logs where launchd would put them, and waits for it to
+    answer (as LaunchdManager._report_up does). Slack is the stand-in."""
+
+    def __init__(self, home: Path, port: int, slack_url: str, wait: float = 40):
+        import smoke
+        self.home, self.port, self.wait = home, port, wait
+        self.env = smoke.boot_env(home, slack_url, port, smoke.spare_port())
+        self.proc = None
+        self.started = []
+
+    def restart(self) -> bool:
+        import live as L
+        import smoke
+        smoke._stop(self.proc)
+        logs = self.home / "logs"
+        logs.mkdir(exist_ok=True)
+        code = L.code_dir(self.home)
+        with open(logs / "bot.log", "ab") as so, open(logs / "bot.err.log", "ab") as se:
+            self.proc = subprocess.Popen([sys.executable, str(code / "bot.py")],
+                                         cwd=str(self.home), env=self.env, stdout=so, stderr=se,
+                                         stdin=subprocess.DEVNULL, start_new_session=True)
+        self.started.append(L.head(code))
+        try:
+            smoke._wait(self.proc, lambda: smoke._post(self.port, "/status").get("online"),
+                        self.wait)
+        except Exception:
+            pass
+        return self.proc.poll() is None and self._answers()
+
+    def _answers(self) -> bool:
+        import smoke
+        try:
+            return bool(smoke._post(self.port, "/status").get("online"))
+        except Exception:
+            return False
+
+    def stop(self):
+        import smoke
+        smoke._stop(self.proc)
+
+
+def test_a_promotion_that_does_not_boot_is_rolled_back():
+    import live as L
+    import outages as O
+    import smoke
+    cli = _load_cli()
+    print("\na deploy onto a revision that raises at import rolls itself back")
+    home = _code_copy(extra_commits=[("bad", _raise_at_import)])
+    good, bad = _SHAS[home]
+    old_live = os.environ.get("SILKWORM_LIVE_DIR")
+    os.environ["SILKWORM_LIVE_DIR"] = str(Path(tempfile.mkdtemp()) / "live")
+    slack = smoke.FakeSlack()
+    port = smoke.spare_port()
+    mgr = _ProcManager(home, port, slack.url)
+
+    def call(path, payload):
+        try:
+            ans = smoke._post(port, path, timeout=5) if path == "/status" else {}
+        except Exception:
+            return {}
+        # Offline on purpose (no Socket Mode): a boot that answered counts
+        # as connected here; the revision it reports is the real one.
+        if ans.get("online"):
+            ans.setdefault("slack", {})["connected"] = True
+        return ans
+    try:
+        ok, _ = L.checkout(home, good, why="test")
+        check("the good revision is pinned and boots", ok and mgr.restart(), L.read(home))
+        L.mark_good(home, good, "test")
+        real = L.Pin(home)
+        ok, detail = real.boot(bad, timeout=60)
+        check("the real clean-checkout boot refuses the bad commit before any restart",
+              not ok and "cannot boot" in detail and mgr.started == [good], detail[-300:])
+        ok, detail = real.boot(good, timeout=60)
+        check("and passes the good one", ok, detail)
+
+        class PassesCleanBoot(L.Pin):
+            # One that boots alone and fails on the real port (its config,
+            # its port, its Slack): the rollback is the guard for that.
+            def boot(self, sha, timeout=90):
+                return True, "booted"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, why = cli.deploy_onto(call, bad, now=True, max_wait=60, manager=mgr,
+                                        pin=PassesCleanBoot(home), confirm_s=15)
+        text = out.getvalue()
+        check("the deploy fails", code == 1, why)
+        check("and says both outcomes: the bad one did not come up, the good one is back",
+              f"{bad[:8]} did not come up" in why
+              and f"rolled back to {good[:8]}, which is answering again" in why, why)
+        check("the bad revision was really started, then the good one again",
+              mgr.started[-2:] == [bad, good], mgr.started)
+        st = call("/status", {})
+        check("the old revision is answering again",
+              (st.get("revision") or {}).get("started") == good, json.dumps(st.get("revision")))
+        rec = L.read(home)
+        check("the pin is back on it, still the last known good",
+              rec.get("live") == good and rec.get("last_good") == good, rec)
+        rows = O.load(home)
+        check("the outage is recorded: ended, why, and what was rolled back",
+              len(rows) == 1 and rows[0]["end"] and rows[0]["seen_by"] == "deploy"
+              and "smoke: this revision cannot boot" in rows[0]["cause"]
+              and rows[0]["rolled_back"] == {**rows[0]["rolled_back"], "from": bad,
+                                             "to": good, "ok": True}, rows)
+        check("the terminal shows the traceback", "cannot boot" in text, text[-500:])
+    finally:
+        mgr.stop()
+        slack.close()
+        if old_live is None:
+            os.environ.pop("SILKWORM_LIVE_DIR", None)
+        else:
+            os.environ["SILKWORM_LIVE_DIR"] = old_live
+
+
+class _Pin:
+    def __init__(self, good="g" * 40, fail_checkout=(), fail_boot=()):
+        self.good, self.fail_checkout = good, set(fail_checkout)
+        self.fail_boot = set(fail_boot)
+        self.checked, self.marked, self.outages, self.booted = [], [], [], []
+
+    def boot(self, sha, timeout=90):
+        self.booted.append(sha)
+        return (sha not in self.fail_boot), "did not boot: bot.py exited\n    NameError: x"
+
+    def checkout(self, sha, why=""):
+        self.checked.append(sha)
+        return (sha not in self.fail_checkout), "/live"
+
+    def last_good(self):
+        return self.good
+
+    def mark_good(self, sha, by="deploy"):
+        self.marked.append(sha)
+
+    def record_outage(self, entry):
+        self.outages.append(entry)
+
+    def stderr_tail(self, n=20):
+        return "Traceback\nNameError: boom"
+
+
+def test_deploy_rollback_paths():
+    cli = _load_cli()
+    print("\ndeploy: promote, confirm, or roll back -- every branch")
+    new, good = "n" * 40, "g" * 40
+
+    def bot(running_after, before=good):
+        state = {"running": before, "drained": False, "stops": 0}
+
+        def call(path, payload):
+            if path == "/status":
+                if state["running"] is None:
+                    return {}
+                return {"online": True, "slack": {"connected": True},
+                        "revision": {"started": state["running"]}}
+            if path == "/drain":
+                if payload.get("action") == "start":
+                    state["drained"] = True
+                if payload.get("action") == "stop":
+                    state["stops"] += 1
+                return {"ok": True, "draining": state["drained"], "running": []}
+            return {}
+        seq = list(running_after)
+
+        def restart():
+            state["running"] = seq.pop(0) if seq else None
+            return state["running"] is not None
+        return call, types.SimpleNamespace(restart=restart), state
+
+    def run(running_after, pin):
+        call, mgr, state = bot(running_after)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code, why = cli.deploy_onto(call, new, now=True, max_wait=60, manager=mgr, pin=pin,
+                                        confirm_s=0, sleep=lambda s: None)
+        return code, why, state
+
+    pin = _Pin()
+    code, why, _ = run([new], pin)
+    check("a revision that comes up is promoted and becomes last known good",
+          code == 0 and pin.checked == [new] and pin.marked == [new] and not pin.outages, why)
+
+    pin = _Pin()
+    code, why, _ = run([None, good], pin)
+    check("one that never answers is rolled back to the last known good, which answers",
+          code == 1 and pin.checked == [new, good] and "answering again" in why
+          and pin.outages and pin.outages[0]["end"], why)
+
+    pin = _Pin()
+    code, why, _ = run([good, good], pin)
+    check("one that answers but runs the wrong revision is rolled back too",
+          code == 1 and pin.checked == [new, good] and "rolled back" in why, why)
+
+    pin = _Pin()
+    code, why, _ = run([None, None], pin)
+    check("a rollback that fails too is reported as down, and the outage left open",
+          code == 1 and "failed too" in why and "Silkworm is down" in why
+          and pin.outages and pin.outages[0]["end"] is None, why)
+
+    pin = _Pin(good="")
+    call, mgr, _ = bot([None], before="")
+    with contextlib.redirect_stdout(io.StringIO()):
+        code, why = cli.deploy_onto(call, new, now=True, max_wait=60, manager=mgr, pin=pin,
+                                    confirm_s=0, sleep=lambda s: None)
+    check("with nothing known good it says so rather than inventing a target",
+          code == 1 and "no known good revision" in why and pin.checked == [new]
+          and pin.outages and pin.outages[0]["end"] is None, why)
+    # (the running revision -- `good` from /status -- would have been the
+    # target; this bot reports none once restart has taken it down, so the
+    # deploy read it before restarting: covered below.)
+    pin = _Pin(good="")
+    call, mgr, _ = bot([None, good])
+    with contextlib.redirect_stdout(io.StringIO()):
+        code, why = cli.deploy_onto(call, new, now=True, max_wait=60, manager=mgr, pin=pin,
+                                    confirm_s=0, sleep=lambda s: None)
+    check("with no record, what was running before the restart is the fallback",
+          pin.checked == [new, good] and "answering again" in why, why)
+
+    pin = _Pin(good="")
+    call, mgr, _ = bot([None])
+    dirty = lambda path, payload: (dict(call(path, payload), revision={
+        "started": good, "dirty": True}) if path == "/status" and call(path, payload) else
+        call(path, payload))
+    with contextlib.redirect_stdout(io.StringIO()):
+        code, why = cli.deploy_onto(dirty, new, now=True, max_wait=60, manager=mgr, pin=pin,
+                                    confirm_s=0, sleep=lambda s: None)
+    check("but never a revision that booted from a dirty tree: its commit is not what ran",
+          pin.checked == [new] and "no known good revision" in why, why)
+
+    pin = _Pin(fail_boot=[new])
+    code, why, state = run([new], pin)
+    check("a commit that does not boot on its own is never pinned or restarted onto",
+          code == 1 and "does not boot" in why and pin.booted == [new] and not pin.checked
+          and state["running"] == good and state["stops"] == 1, why)
+
+    pin = _Pin(fail_checkout=[new])
+    code, why, state = run([new], pin)
+    check("a pin that cannot be checked out restarts nothing and lifts the drain",
+          code == 1 and "could not pin" in why and state["stops"] == 1
+          and state["running"] == good, why)
+
+    # The real entry point promotes through the install's pin; a test that
+    # injects only a manager gets none, so it never touches a real checkout.
+    src = (BASE / "bin" / "silkworm").read_text()
+    check("do_deploy pins only when it is driving the real services",
+          "if pin is None and manager is None:\n        pin = live.Pin(repo)" in src)
+    check("the detached deploy pins too, and can alert directly",
+          "pin=live.Pin(REPO)," in src and "alerts.owner(" in src.split(
+              "def do_after_turn_detached", 1)[1])
+
+
+def _wd_world(home, status_seq, *, installed=True, deploying=False):
+    import watchdog as W
+
+    class World(W.World):
+        def __init__(self):
+            super().__init__(home)
+            self.t = 1_000_000.0
+            self.calls, self.alerts, self.checkouts = [], [], []
+            self.seq = list(status_seq)
+
+        def now(self):
+            return self.t
+
+        def status(self):
+            return self.seq.pop(0) if self.seq else None
+
+        def launchctl(self, *args):
+            self.calls.append(args)
+            if args[0] == "print":
+                return (0 if installed else 113), ""
+            return 0, ""
+
+        def deploying(self):
+            return deploying
+
+        def checkout(self, sha):
+            self.checkouts.append(sha)
+            import live as L
+            rec = L.read(home)
+            rec["live"] = sha
+            L.write(home, rec)
+            return True, "/live"
+
+        def stderr_tail(self, n=20):
+            return "Traceback (most recent call last):\nNameError: name 'handle_ops' is not defined"
+
+        def alert(self, text):
+            self.alerts.append(text)
+            return {"slack": True, "push": True}
+
+        def log(self, line):
+            pass
+    return World()
+
+
+def test_watchdog_rolls_back_once_and_alerts():
+    import live as L
+    import outages as O
+    import watchdog as W
+    print("\nthe watchdog: down for N checks -> outage, one rollback, one alert")
+    home = Path(tempfile.mkdtemp())
+    live_dir = Path(tempfile.mkdtemp()) / "live"
+    (live_dir / ".git").mkdir(parents=True)
+    (live_dir / "bot.py").write_text("")
+    old_live = os.environ.get("SILKWORM_LIVE_DIR")
+    os.environ["SILKWORM_LIVE_DIR"] = str(live_dir)
+    try:
+        bad, good = "b" * 40, "a" * 40
+        L.write(home, {"live": bad, "last_good": good})
+        up = {"online": True, "pid": 7, "revision": {"started": good}}
+        w = _wd_world(home, [up, None, None, None, None, None])
+        r = [W.check(home, w, n=3)]
+        check("an answering bot is healthy", r[0]["state"] == "up" and not w.alerts, r)
+        for _ in range(2):
+            w.t += 120
+            r.append(W.check(home, w, n=3))
+        check("one or two missed checks are only suspicion -- nothing done",
+              [x["state"] for x in r[1:]] == ["suspect", "suspect"]
+              and not w.checkouts and not w.alerts and not O.load(home), r)
+        w.t += 120
+        r.append(W.check(home, w, n=3))
+        kick = [c for c in w.calls if c[0] == "kickstart"]
+        check("the third rolls back to the last known good and restarts both services",
+              w.checkouts == [good] and len(kick) == 2
+              and all(c[1] == "-k" for c in kick), (w.checkouts, w.calls))
+        rows = O.load(home)
+        check("and records the outage from the first failed check, with the traceback",
+              len(rows) == 1 and rows[0]["start"] == 1_000_120.0 and rows[0]["end"] is None
+              and "handle_ops" in rows[0]["cause"]
+              and rows[0]["rolled_back"]["to"] == good, rows)
+        check("and alerts the owner, saying what it did",
+              len(w.alerts) == 1 and "Silkworm is down" in w.alerts[0]
+              and f"→ {good[:8]}" in w.alerts[0] and "handle_ops" in w.alerts[0], w.alerts)
+        for _ in range(4):
+            w.t += 120
+            W.check(home, w, n=3)
+        check("still down: never a second rollback, and no repeat alert inside the window",
+              w.checkouts == [good] and len(w.alerts) == 1, (w.checkouts, w.alerts))
+        w.t += W.REALERT_S
+        w.seq = [None]
+        W.check(home, w, n=3)
+        check("past the window it says so again (still no second rollback)",
+              len(w.alerts) == 2 and w.checkouts == [good])
+        w.t += 120
+        w.seq = [dict(up, pid=8)]
+        res = W.check(home, w, n=3)
+        rows = O.load(home)
+        check("back up: the outage is closed and the owner told",
+              res["state"] == "up" and rows[-1]["end"] == w.t and len(w.alerts) == 3
+              and "answering again" in w.alerts[-1], (rows, w.alerts))
+        st = W._load(home)
+        check("and its counters reset for the next outage",
+              not st.get("down") and not st.get("rolled_back") and not st.get("alerted_at"), st)
+
+        # Already on the last known good: nothing to roll back to.
+        w2 = _wd_world(home, [None, None, None])
+        for _ in range(3):
+            w2.t += 120
+            W.check(home, w2, n=3)
+        check("down on the last known good itself: alerts, does not roll back",
+              not w2.checkouts and len(w2.alerts) == 1
+              and "is the last known good revision already" in w2.alerts[0], w2.alerts)
+        O.close(home, end=w2.t, how="test")
+        W._save(home, {})
+
+        # A deploy in progress owns its own rollback.
+        L.write(home, {"live": bad, "last_good": good})
+        w3 = _wd_world(home, [None] * 3, deploying=True)
+        for _ in range(3):
+            w3.t += 120
+            res = W.check(home, w3, n=3)
+        check("while a deploy holds its lock it leaves the bot to the deploy",
+              res["state"] == "deploy-running" and not w3.checkouts and not w3.alerts, res)
+        W._save(home, {})
+
+        # Uninstalled is not down.
+        w4 = _wd_world(home, [None] * 5, installed=False)
+        for _ in range(5):
+            res = W.check(home, w4, n=3)
+        check("with the services not loaded there is nothing to watch",
+              res["state"] == "not-installed" and not w4.alerts and not w4.checkouts)
+
+        # A rollback whose checkout fails leaves the pin where it was: the
+        # once-per-outage rule, not the "already there" one, stops a retry.
+        W._save(home, {})
+        L.write(home, {"live": bad, "last_good": good})
+        w6 = _wd_world(home, [None] * 6)
+        w6.checkout = lambda sha: (w6.checkouts.append(sha), (False, "git said no"))[1]
+        gap, W.ROLLBACK_GAP_S = W.ROLLBACK_GAP_S, 0     # this rule alone, not the day's gap
+        try:
+            for _ in range(6):
+                w6.t += 120
+                W.check(home, w6, n=3)
+        finally:
+            W.ROLLBACK_GAP_S = gap
+        check("a rollback that failed is not retried every check",
+              w6.checkouts == [good] and "that failed" in w6.alerts[0], (w6.checkouts, w6.alerts))
+        O.close(home, end=w6.t, how="test")
+
+        # Up again, then down again within the day: still only one rollback.
+        w7 = _wd_world(home, [up] + [None] * 3)
+        w7.t = w6.t + 120
+        for _ in range(4):
+            W.check(home, w7, n=3)
+            w7.t += 120
+        check("a second outage within a day of a rollback does not roll back again",
+              not w7.checkouts and "within the last day" in w7.alerts[-1], w7.alerts)
+        O.close(home, end=w7.t, how="test")
+
+        # A revision that passed its deploy (so last_good is it) and fails
+        # later: back to the one good before it.
+        W._save(home, {})
+        older = "c" * 40
+        L.write(home, {"live": good, "last_good": good, "previous_good": older})
+        w8 = _wd_world(home, [None] * 3)
+        w8.t = w7.t + 2 * W.ROLLBACK_GAP_S
+        for _ in range(3):
+            w8.t += 120
+            W.check(home, w8, n=3)
+        check("one that passed its deploy and failed later goes back to the one before it",
+              w8.checkouts == [older], (w8.checkouts, w8.alerts))
+        O.close(home, end=w8.t, how="test")
+        L.write(home, {"live": bad, "last_good": good})
+
+        # A crash loop: it answers, but a new process every check.
+        W._save(home, {})
+        loop = [dict(up, pid=p) for p in (10, 11, 12, 13)]
+        w5 = _wd_world(home, loop)
+        for _ in range(4):
+            w5.t += 120
+            res = W.check(home, w5, n=3)
+        check("a bot restarting every check is treated as down",
+              res["state"] == "down" and "crash loop" in res["what"] and w5.checkouts == [good],
+              res)
+    finally:
+        if old_live is None:
+            os.environ.pop("SILKWORM_LIVE_DIR", None)
+        else:
+            os.environ["SILKWORM_LIVE_DIR"] = old_live
+
+
+def test_watchdog_alerts_reach_slack_and_push_without_the_bot():
+    import alerts as A
+    import smoke
+    import watchdog as W
+    print("\nthe watchdog's alert goes straight to Slack and the phone")
+    home = Path(tempfile.mkdtemp())
+    (home / ".env").write_text("SLACK_BOT_TOKEN=xoxb-from-env-file\n")
+    (home / "sessions.json").write_text(json.dumps(
+        {"D0OLD:1.0": {"updated": 1}, "D0NEW:2.0": {"updated": 5}, "C0CHAN:3.0": {"updated": 9}}))
+    check("the home DM is the most recently active DM, as the bot picks it",
+          A.home_channel(home) == "D0NEW")
+    (home / ".env").write_text("SLACK_BOT_TOKEN=xoxb-from-env-file\nSILKWORM_HOME_CHANNEL=D0SET\n")
+    check("unless SILKWORM_HOME_CHANNEL names one", A.home_channel(home) == "D0SET")
+
+    # chat.postMessage, for real, against a loopback stand-in.
+    got = []
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading as _t
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            got.append((self.path, self.headers.get("Authorization"),
+                        json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    _t.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/api/chat.postMessage"
+    pushed = []
+    res = A.owner(home, "Silkworm is down", post=lambda tok, ch, text, ts="": A.slack_post(
+        tok, ch, text, ts, url=url), push=lambda h, t, b: pushed.append((t, b)) or (True, "1"))
+    srv.shutdown()
+    check("it posts with the bot token from the install's .env, to the home DM",
+          res["slack"] and got and got[0][1] == "Bearer xoxb-from-env-file"
+          and got[0][2]["channel"] == "D0SET" and got[0][2]["text"] == "Silkworm is down", got)
+    check("and pushes to the phone", pushed == [("Silkworm", "Silkworm is down")], pushed)
+    res = A.owner(home, "x", thread="C9:1.5", post=lambda tok, ch, text, ts="": (
+        got.append((ch, ts)) or (True, "")), push=lambda *a: (False, ""))
+    check("a deploy's note goes to its own thread instead", got[-1] == ("C9", "1.5"))
+    check("a Slack post that cannot connect is reported, not raised",
+          A.slack_post("xoxb-x", "D1", "t", url=f"http://127.0.0.1:{smoke.spare_port()}/x")[0]
+          is False)
+
+    ran = []
+    ok, _ = A.push_send(home, "T", "B", run=lambda argv, **k: ran.append(argv) or
+                        types.SimpleNamespace(returncode=0, stdout="sent 1", stderr=""))
+    check("the push is push.py's own direct send, in its own process",
+          ok and ran[0][1].endswith("push.py") and ran[0][2:] ==
+          ["alert", "--home", str(home), "--title", "T", "--body", "B"], ran)
+
+    # push.py alert, for real: one subscription, a fake push service.
+    import push
+    vapid = Path(tempfile.mkdtemp())
+    old = os.environ.get("SILKWORM_VAPID_DIR")
+    os.environ["SILKWORM_VAPID_DIR"] = str(vapid)
+    try:
+        push.ensure_keys(vapid)
+        priv, sub = _ua_subscription()
+        push.PushStore(home / "push.json").add(sub)
+        sent = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = push.alert_main(["--home", str(home), "--title", "Silkworm is down",
+                                  "--body", "rolled back"],
+                                 sender=lambda ep, body, auth, urg: sent.append(body) or 201)
+        check("push.py alert sends to every subscribed device without the bot",
+              rc == 0 and len(sent) == 1 and json.loads(
+                  _ua_decrypt(sent[0], priv, sub["keys"]["auth"]))["title"] == "Silkworm is down")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = push.alert_main(["--home", str(Path(tempfile.mkdtemp())), "--body", "x"])
+        check("with no device it says so and exits non-zero", rc == 1)
+    finally:
+        if old is None:
+            os.environ.pop("SILKWORM_VAPID_DIR", None)
+        else:
+            os.environ["SILKWORM_VAPID_DIR"] = old
+
+    # The real World's launchctl calls, with launchctl faked.
+    calls = []
+
+    class Fake(W.World):
+        def launchctl(self, *a):
+            calls.append(a)
+            return 0, ""
+    w = Fake(home)
+    w.restart()
+    w.installed()
+    check("a rollback kickstarts -k the bot and the visualizer",
+          [c[:2] for c in calls[:2]] == [("kickstart", "-k")] * 2
+          and calls[0][2].endswith("/com.silkworm.bot") and calls[1][2].endswith("/com.silkworm.viz"),
+          calls)
+    check("and 'installed' is launchctl print of the bot's job",
+          calls[2][0] == "print" and calls[2][1].endswith("/com.silkworm.bot"), calls)
+    lock = home / "logs" / "deploy-after-turn.lock"
+    lock.parent.mkdir(exist_ok=True)
+    lock.write_text(json.dumps({"pid": os.getpid()}))
+    check("a deploy lock held by a live process is a deploy running", w.deploying())
+    lock.write_text(json.dumps({"pid": 2 ** 22 + 12345}))
+    check("one whose process is gone is not", not w.deploying())
+
+
+def test_watchdog_is_its_own_launchd_job():
+    cli = _load_cli()
+    print("\nthe watchdog is a StartInterval job of its own, and the services run the pin")
+    mgr = cli.LaunchdManager()
+    wd = mgr._watchdog_plist()
+    check("StartInterval, not KeepAlive", "<key>StartInterval</key><integer>120</integer>" in wd
+          and "KeepAlive" not in wd, wd)
+    check("it runs watchdog.py from the install, not from the pinned checkout",
+          f"<string>{cli.REPO / 'watchdog.py'}</string>" in wd)
+    bot_plist = mgr._plist("com.silkworm.bot", "bot.py")
+    check("the bot's job is told where the install is (SILKWORM_HOME)",
+          f"<key>SILKWORM_HOME</key><string>{cli.REPO}</string>" in bot_plist)
+    import live as L
+    check("and runs the pinned checkout once there is one",
+          f"<string>{L.code_dir(cli.REPO) / 'bot.py'}</string>" in bot_plist)
+    if shutil.which("plutil"):
+        d = Path(tempfile.mkdtemp())
+        ok = True
+        for name, text in (("w.plist", wd), ("b.plist", bot_plist)):
+            (d / name).write_text(text)
+            ok &= subprocess.run(["plutil", "-lint", str(d / name)],
+                                 capture_output=True).returncode == 0
+        check("both are valid plists", ok)
+    src = (BASE / "watchdog.py").read_text()
+    tree = ast.parse(src)
+    imported = ({a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
+                 for a in n.names}
+                | {n.module.split(".")[0] for n in ast.walk(tree)
+                   if isinstance(n, ast.ImportFrom) and n.module})
+    allowed = set(sys.stdlib_module_names) | {"alerts", "live", "outages", "jsonstore",
+                                               "envfile", "smoke", "__future__"}
+    check("it imports only the stdlib and this checkout's stdlib-only modules",
+          imported <= allowed, imported - allowed)
+    for mod in ("alerts", "live", "outages", "jsonstore", "envfile", "smoke"):
+        src = (BASE / f"{mod}.py").read_text()
+        imp = {n.names[0].name.split(".")[0] for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.Import)} | {n.module.split(".")[0] for n in
+                                                ast.walk(ast.parse(src))
+                                                if isinstance(n, ast.ImportFrom) and n.module}
+        check(f"{mod}.py needs nothing outside the stdlib", imp <= allowed, imp - allowed)
+    check("bot.py is not where it lives", "import watchdog" not in
+          (BASE / "bot.py").read_text())
+
+
+def test_pinned_checkout_moves_only_by_promotion():
+    import live as L
+    print("\nthe pinned checkout: created, moved, cleaned, read back")
+    home = _code_copy(extra_commits=[("two", lambda d: (d / "NEWFILE").write_text("x"))])
+    one, two = _SHAS[home]
+    old = os.environ.get("SILKWORM_LIVE_DIR")
+    pin_dir = Path(tempfile.mkdtemp()) / "live"
+    os.environ["SILKWORM_LIVE_DIR"] = str(pin_dir)
+    try:
+        check("before any promotion the install runs from itself",
+              L.code_dir(home) == home and not L.read(home))
+        ok, d = L.checkout(home, one)
+        check("the first checkout creates it, detached at the revision",
+              ok and L.head(pin_dir) == one and L.code_dir(home) == pin_dir, d)
+        (pin_dir / "stray.py").write_text("edit")
+        (pin_dir / "bot.py").write_text("hand patched")
+        ok, _ = L.checkout(home, two)
+        check("moving it discards hand edits and strays, so what runs is the commit",
+              ok and L.head(pin_dir) == two and not (pin_dir / "stray.py").exists()
+              and (pin_dir / "bot.py").read_text() == (home / "bot.py").read_text())
+        st = subprocess.run(["git", "-C", str(pin_dir), "status", "--porcelain"],
+                            capture_output=True, text=True).stdout
+        check("and it is clean", st == "", st)
+        ok, why = L.checkout(home, "e" * 40)
+        check("an unknown revision is refused and the pin stays put",
+              not ok and L.head(pin_dir) == two and L.read(home)["live"] == two, why)
+
+        def lying_git(cwd, *args, timeout=0):
+            # Says yes to the checkout, and HEAD is still where it was.
+            return (0, two, "") if args[:1] == ("rev-parse",) else (0, "", "")
+        ok, why = L.checkout(home, one, git=lying_git)
+        check("a checkout git claims but HEAD does not show is refused, unrecorded",
+              not ok and "not " + one[:8] in why and L.read(home)["live"] == two, why)
+        L.mark_good(home, one)
+        L.mark_good(home, two)
+        rec = L.read(home)
+        check("last known good and the one before it are recorded",
+              rec["last_good"] == two and rec["previous_good"] == one
+              and [h["sha"] for h in rec["history"]] == [one, two], rec)
+        main_head = subprocess.run(["git", "-C", str(home), "rev-parse", "--abbrev-ref", "HEAD"],
+                                   capture_output=True, text=True).stdout.strip()
+        check("the install's own checkout is untouched (still on main)", main_head == "main")
+    finally:
+        if old is None:
+            os.environ.pop("SILKWORM_LIVE_DIR", None)
+        else:
+            os.environ["SILKWORM_LIVE_DIR"] = old
+
+
+def test_outages_reach_status_digest_and_health():
+    import digest as D
+    import outages as O
+    cli = _load_cli()
+    print("\noutages: recorded by whoever saw them, reported once the bot is back")
+    home = Path(tempfile.mkdtemp())
+    now = time.time()
+    O.open_(home, start=now - 3 * 86400, cause="NameError: x xoxb-123456789-abc",
+            seen_by="watchdog", revision="b" * 40)
+    again = O.open_(home, start=now, cause="other", seen_by="watchdog")
+    check("one outage, however many see it", len(O.load(home)) == 1 and again["cause"] != "other")
+    check("tokens are scrubbed from the cause", "xoxb-123" not in json.dumps(O.load(home)))
+    O.update_open(home, rolled_back={"from": "b" * 40, "to": "a" * 40, "ok": True})
+    O.close(home, end=now - 3600, how="watchdog")
+    line = O.describe(O.load(home)[0], now)
+    check("described: how long, why, what was rolled back",
+          "down 3.0d" in line and "NameError" in line and "bbbbbbbb → aaaaaaaa" in line, line)
+    text = D.render([], now, outages=O.load(home))
+    lines = text.splitlines()
+    check("the digest says it first, even on a day with nothing else",
+          len(lines) > 1 and lines[1].startswith(":rotating_light: Silkworm was down"), text)
+    check("an outage that ended before the window is not repeated",
+          "down" not in D.render([], now + 2 * 86400, outages=O.load(home)))
+    rec = cli.install_record(home)
+    check("status reads it from the install, so it works with the bot down",
+          rec["outages"] and not rec["outage_open"] and "NameError" in rec["outages"][-1]["line"])
+    out = io.StringIO()
+
+    def unreachable(path, payload, timeout=10):
+        raise cli.BotUnreachable("did not answer")
+    with contextlib.redirect_stdout(out):
+        rc = cli.do_status_json(ask=unreachable, home=home)
+    doc = json.loads(out.getvalue())
+    check("status --json with the bot down still carries the outages and the pin",
+          rc == cli.EXIT_UNREACHABLE and doc["outages"] and "live" in doc, doc)
+
+
+def test_health_warns_on_uncommitted_running_code():
+    P = _probes()
+    from health import OK, WARN
+    print("\nthe mini's health: running uncommitted code is a warning")
+    sha = "a" * 40
+
+    def run(r):
+        return P.make_revision(running=lambda: r)({"slug": "mini"}, None)
+    res = run({"sha": sha, "dirty": True, "code_dir": "/x"})
+    check("a dirty boot warns (the hand-patched live tree)", res["status"] == WARN
+          and "uncommitted" in res["summary"], res)
+    res = run({"sha": "", "dirty": False})
+    check("no commit at all warns", res["status"] == WARN, res)
+    res = run({"sha": sha, "dirty": False, "live": {"live": "b" * 40}})
+    check("running something other than the pin warns", res["status"] == WARN
+          and "pinned" in res["summary"], res)
+    res = run({"sha": sha, "dirty": False, "home": "/i", "code_dir": "/i", "live": {}})
+    check("running from the install itself, unpinned, warns", res["status"] == WARN, res)
+    res = run({"sha": sha, "dirty": False, "home": "/i", "code_dir": "/l",
+               "live": {"live": sha}})
+    check("a clean commit from the pin is ok", res["status"] == OK, res)
+    check("bot.py hands the probe what it booted",
+          "health_probes.RUNNING = lambda: {**REVISION" in (BASE / "bot.py").read_text())
+
+
+def test_deploy_outcome_goes_direct_when_the_bot_cannot_post():
+    cli = _load_cli()
+    print("\na deploy's outcome is posted directly when the bot will not take it")
+    box = Path(tempfile.mkdtemp())
+    sent = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        where = cli.report_outcome(lambda p, b: {}, "C1:2.0", "deploy failed", outbox=box,
+                                   sleep=lambda s: None,
+                                   direct=lambda th, t: sent.append((th, t)) or {"slack": True})
+    check("straight to the thread, not left in outbox/",
+          where == "direct" and sent == [("C1:2.0", "deploy failed")] and not any(box.iterdir()))
+    with contextlib.redirect_stdout(io.StringIO()):
+        where = cli.report_outcome(lambda p, b: {}, "C1:2.0", "x", outbox=box,
+                                   sleep=lambda s: None, direct=lambda th, t: {"slack": False})
+    check("and only when that fails too, the outbox", where == "outbox")
 
 
 if __name__ == "__main__":

@@ -70,6 +70,8 @@ import retry
 import merge
 import operator_role
 import ops
+import outages
+import live
 import summaries
 import turncost
 import verify
@@ -80,7 +82,16 @@ from learnings import TYPES as LEARNING_TYPES, LearningStore, render_block
 from localserver import LocalServer
 from store import SessionStore
 
-load_dotenv()
+#: The code that is running: the pinned release checkout `silkworm deploy`
+#: promotes into (live.py), or wherever this file is when run by hand.
+CODE_DIR = Path(__file__).resolve().parent
+#: The install: state files, .env, logs, workspace/, and the checkout Silkworm
+#: lands onto. Not the code's directory, because the code runs from a pinned
+#: checkout that landings never write into -- launchd passes SILKWORM_HOME.
+#: Unset (run by hand from the main checkout), the two are the same place.
+BASE_DIR = Path(os.environ.get("SILKWORM_HOME") or CODE_DIR).expanduser().resolve()
+
+load_dotenv(BASE_DIR / ".env")
 # This process lands, verifies and releases, and none of that is a task's
 # turn. Were it ever started from inside one (a deploy run by hand from a task
 # shell), it would inherit the implementor's role and its own landing would
@@ -90,13 +101,15 @@ git_guard.strip(os.environ)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("silkworm")
 
-BASE_DIR = Path(__file__).resolve().parent
-
 #: Resolved once, at import, because it is a fact about *this process* and the
 #: checkout keeps moving underneath it -- Silkworm auto-merges onto its own
 #: main, so asking git later answers a different question than "what am I
 #: running". Everything that reports drift compares against this.
-REVISION = revision.of(BASE_DIR)
+REVISION = revision.of(CODE_DIR)
+# The mini's "revision" health check asks this process, not git: it is about
+# what booted, which a check run later from the checkout cannot see.
+health_probes.RUNNING = lambda: {**REVISION, "code_dir": str(CODE_DIR),
+                                 "home": str(BASE_DIR), "live": live.read(BASE_DIR)}
 
 # --- Claude config ---------------------------------------------------------
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -137,7 +150,9 @@ REVIEW_ROLES = frozenset({"reviewer"})
 # own thread, never on unrelated work. 0 hands them back to the task workers.
 WAKE_WORKERS = int(os.environ.get("WAKE_WORKERS", "1"))
 #: Absolute, because a turn's PATH is not ours to assume.
-SILKWORM_BIN = str(Path(__file__).resolve().parent / "bin" / "silkworm")
+#: The install's CLI, not the pinned checkout's: it reads the install's .env
+#: and logs, and they are the install's.
+SILKWORM_BIN = str(BASE_DIR / "bin" / "silkworm")
 NAMING_MODEL = os.environ.get("NAMING_MODEL", "haiku")  # empty string disables
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "haiku")  # empty string disables
 HARVEST_MODEL = os.environ.get("HARVEST_MODEL", "sonnet")
@@ -221,7 +236,7 @@ ARTIFACTS_ROOT = BASE_DIR / "artifacts"
 # usually a git repo, and writing screenshots into it leaves untracked noise in
 # `git status` that is one careless `git add -A` from being committed.
 UPLOADS_ROOT = BASE_DIR / "uploads"
-HOOK_PATH = BASE_DIR / "approval_hook.py"
+HOOK_PATH = CODE_DIR / "approval_hook.py"
 
 CLAUDE_CWD.mkdir(parents=True, exist_ok=True)
 OUTBOX_ROOT.mkdir(exist_ok=True)
@@ -567,6 +582,9 @@ def claude_env(key: str = "", defers: int = 0, role: str = "", task_id: str = ""
     env = git_guard.strip(dict(os.environ))
     # A grant is only ever the one handle_prompt hands its own turn.
     env.pop(operator_role.GRANT_VAR, None)
+    # The install's path is the bot's business: a turn running a test suite
+    # would otherwise point a fresh visualizer import at the live state.
+    env.pop("SILKWORM_HOME", None)
     env["SILKWORM_BOT"] = "1"  # lets the global session_hook ignore our own runs
     # So a turn can schedule a wake-up against its own thread rather than
     # holding itself open until whatever it is watching finishes.
@@ -1864,11 +1882,39 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
 
 # --- Main handler ---------------------------------------------------------------
 
-app = App(token=os.environ["SLACK_BOT_TOKEN"])
+#: The boot smoke test's switch (smoke.py), never set in a real install: Slack
+#: is a stand-in on loopback and Socket Mode is not started, so bot.py can be
+#: booted for real -- every import, store and route -- with no real token. It
+#: refuses anything but a loopback stand-in, so it cannot quietly point a real
+#: token somewhere else, and a deploy onto it fails its Slack check.
+OFFLINE = os.environ.get("SILKWORM_OFFLINE", "") == "1"
+if OFFLINE:
+    _slack_api = os.environ.get("SILKWORM_SLACK_API", "").strip()
+    if not _slack_api.startswith(("http://127.0.0.1:", "http://localhost:")):
+        raise SystemExit("SILKWORM_OFFLINE=1 needs SILKWORM_SLACK_API on loopback")
+    from slack_sdk import WebClient
+    app = App(client=WebClient(token=os.environ["SLACK_BOT_TOKEN"], base_url=_slack_api))
+else:
+    app = App(token=os.environ["SLACK_BOT_TOKEN"])
 _AUTH = app.client.auth_test()
 BOT_USER_ID = _AUTH["user_id"]
 # The workspace URL, for linking a task to its thread from the Home tab.
 TEAM_URL = _AUTH.get("url", "")
+
+BOOTED = time.time()
+
+
+def outage_summary() -> dict:
+    """The open outage (none while this answers, unless one is mid-close) and
+    the latest few, described -- see outages.py."""
+    try:
+        rows = outages.load(BASE_DIR)
+    except Exception:
+        log.exception("reading outages.json failed")
+        return {"error": "outages.json could not be read"}
+    return {"open": next((r for r in reversed(rows) if not r.get("end")), None),
+            "recent": [dict(r, line=outages.describe(r)) for r in rows[-3:]]}
+
 
 def handle_status(payload: dict) -> dict:
     """Route for /status — thread runtime state for the visualizer."""
@@ -1895,7 +1941,12 @@ def handle_status(payload: dict) -> dict:
     # and a dead thread logs nothing further. Say which ones are gone.
     # A held runner looks exactly like an idle one from the board -- queued
     # work, not moving -- so say that it is holding, and why.
-    return {"online": True, "threads": threads,
+    # Where the code runs from and what the last outage was: the watchdog
+    # tells a crash loop from a restart by the pid, and an outage the bot
+    # could not report while it was down is reported here once it is up.
+    return {"online": True, "threads": threads, "pid": os.getpid(), "booted": BOOTED,
+            "code_dir": str(CODE_DIR), "live": live.read(BASE_DIR),
+            "outages": outage_summary(),
             "slack": slack.status(time.time()), "auth": auth,
             "revision": revision.state(BASE_DIR, REVISION),
             "daemons": daemons.status(),
@@ -3680,6 +3731,75 @@ def handle_hide(payload: dict) -> dict:
         return {"ok": False, "error": "unknown thread"}
     ok = store.set_hidden(key, action != "unhide")
     return {"ok": ok, "key": key, "hidden": action != "unhide"}
+
+
+#: Every run of a named op (ops.py), and every refusal of a well-formed one.
+OPS_LOG = BASE_DIR / "logs" / "ops.jsonl"
+
+
+def ops_context() -> "ops.Context":
+    return ops.Context(project=lambda slug: project_store.get(slug),
+                       python=sys.executable, silkworm_bin=SILKWORM_BIN,
+                       uid=os.getuid(), launch_agents=Path.home() / "Library" / "LaunchAgents")
+
+
+def handle_ops(payload: dict) -> dict:
+    """Route for /ops: the named operations of ops.py -- `list`, `log`, and
+    `run` (name, args, by, notes).
+
+    The bot runs them, not the CLI: your grant lives here, and so does a
+    process no turn's sandbox confines. A request from inside a turn (the CLI
+    stamps those) may run an op that changes something only with the live
+    grant of the turn you started in the operator's home thread (user_grant)
+    -- so never from a sweep or a wake-up. One from your own terminal or the
+    dashboard carries no stamp, and is you.
+    """
+    payload = payload or {}
+    action = str(payload.get("action") or "list")
+    if action == "list":
+        return {"ok": True, "ops": ops.describe()}
+    if action == "log":
+        try:
+            n = max(1, min(200, int(payload.get("n") or 20)))
+        except (TypeError, ValueError):
+            n = 20
+        return {"ok": True, "runs": ops.read_log(OPS_LOG, n)}
+    if action != "run":
+        return {"ok": False, "error": f"unknown action {action!r}"}
+    name = str(payload.get("name") or "")
+    args = payload.get("args") or []
+    if not isinstance(args, list):
+        return {"ok": False, "error": "args is a list", "refused": "args"}
+    try:
+        plan = ops.plan(name, args, ops_context())
+    except ops.Refused as e:
+        return {"ok": False, "error": str(e), "refused": "args"}
+    in_turn = bool(payload.get("caller_role") or payload.get("caller_thread"))
+    grant = user_grant(payload) if in_turn else None
+    notes = str(payload.get("notes") or "")
+    record = {"by": str(payload.get("by") or ("operator" if in_turn else "cli")),
+              "notes": " ".join(notes.split())[:500],
+              "caller_role": str(payload.get("caller_role") or ""),
+              "thread": str(payload.get("caller_thread") or ""),
+              "task": str(payload.get("caller_task") or "")}
+    if grant:
+        record.update(decided_by=grant["user"], decided_ts=grant["ts"])
+    why = ops.refusal(plan, in_turn=in_turn, grant=grant, notes=notes)
+    if why:
+        log.info("ops: %s refused (%s)", plan.name, why[:120])
+        ops.append_log(OPS_LOG, dict(record, at=time.time(), op=plan.name, args=plan.args,
+                                     refused=why))
+        return {"ok": False, "error": why, "refused": "grant"}
+    env = git_guard.strip(dict(os.environ))
+    env.pop(operator_role.GRANT_VAR, None)
+    log.info("ops: running %s %s for %s%s", plan.name, plan.args, record["by"],
+             f" on the word of {grant['user']} ({grant['ts']})" if grant else "")
+    try:
+        rec = ops.run(plan, env=env, log_path=OPS_LOG, record=record)
+    except ops.Refused as e:
+        return {"ok": False, "error": str(e), "refused": "busy"}
+    return {"ok": True, "run": rec}
+
 
 
 server = LocalServer(APPROVAL_PORT)
@@ -5934,7 +6054,7 @@ def land_and_record(task_id: str, channel: str = "", thread_ts: str = "",
         # so here, where the claim is made, rather than leaving it to be discovered.
         if outcome.get("landed") and _is_own_checkout((task.get("scope") or {}).get("cwd")):
             text += "\n:warning: _This is Silkworm's own checkout — the running bot is still on `" \
-                    f"{REVISION['sha'][:8] or 'unknown'}`. Run `silkworm restart` to pick it up._"
+                    f"{REVISION['sha'][:8] or 'unknown'}`. Run `silkworm deploy` to pick it up._"
         try:
             app.client.chat_postMessage(channel=channel, thread_ts=thread_ts,
                                         text=text)
@@ -6399,7 +6519,7 @@ def send_digest(schedule, now: datetime) -> dict:
         red = {}
     text = digest.render(records, time.time(), branch_rows=rows, released=released,
                          when=now, failing=red, health=health_rows() or (),
-                         unregistered=found)
+                         outages=outages.load(BASE_DIR), unregistered=found)
     try:
         board_id = BOARD.channel(app.client)
     except Exception:
@@ -6661,74 +6781,6 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         log.info("operator: %s %s went ahead on your approval of %s %s",
                  route, action, *guard)
     return None
-
-
-#: Every run of a named op (ops.py), and every refusal of a well-formed one.
-OPS_LOG = BASE_DIR / "logs" / "ops.jsonl"
-
-
-def ops_context() -> "ops.Context":
-    return ops.Context(project=lambda slug: project_store.get(slug),
-                       python=sys.executable, silkworm_bin=SILKWORM_BIN,
-                       uid=os.getuid(), launch_agents=Path.home() / "Library" / "LaunchAgents")
-
-
-def handle_ops(payload: dict) -> dict:
-    """Route for /ops: the named operations of ops.py -- `list`, `log`, and
-    `run` (name, args, by, notes).
-
-    The bot runs them, not the CLI: your grant lives here, and so does a
-    process no turn's sandbox confines. A request from inside a turn (the CLI
-    stamps those) may run an op that changes something only with the live
-    grant of the turn you started in the operator's home thread (user_grant)
-    -- so never from a sweep or a wake-up. One from your own terminal or the
-    dashboard carries no stamp, and is you.
-    """
-    payload = payload or {}
-    action = str(payload.get("action") or "list")
-    if action == "list":
-        return {"ok": True, "ops": ops.describe()}
-    if action == "log":
-        try:
-            n = max(1, min(200, int(payload.get("n") or 20)))
-        except (TypeError, ValueError):
-            n = 20
-        return {"ok": True, "runs": ops.read_log(OPS_LOG, n)}
-    if action != "run":
-        return {"ok": False, "error": f"unknown action {action!r}"}
-    name = str(payload.get("name") or "")
-    args = payload.get("args") or []
-    if not isinstance(args, list):
-        return {"ok": False, "error": "args is a list", "refused": "args"}
-    try:
-        plan = ops.plan(name, args, ops_context())
-    except ops.Refused as e:
-        return {"ok": False, "error": str(e), "refused": "args"}
-    in_turn = bool(payload.get("caller_role") or payload.get("caller_thread"))
-    grant = user_grant(payload) if in_turn else None
-    notes = str(payload.get("notes") or "")
-    record = {"by": str(payload.get("by") or ("operator" if in_turn else "cli")),
-              "notes": " ".join(notes.split())[:500],
-              "caller_role": str(payload.get("caller_role") or ""),
-              "thread": str(payload.get("caller_thread") or ""),
-              "task": str(payload.get("caller_task") or "")}
-    if grant:
-        record.update(decided_by=grant["user"], decided_ts=grant["ts"])
-    why = ops.refusal(plan, in_turn=in_turn, grant=grant, notes=notes)
-    if why:
-        log.info("ops: %s refused (%s)", plan.name, why[:120])
-        ops.append_log(OPS_LOG, dict(record, at=time.time(), op=plan.name, args=plan.args,
-                                     refused=why))
-        return {"ok": False, "error": why, "refused": "grant"}
-    env = git_guard.strip(dict(os.environ))
-    env.pop(operator_role.GRANT_VAR, None)
-    log.info("ops: running %s %s for %s%s", plan.name, plan.args, record["by"],
-             f" on the word of {grant['user']} ({grant['ts']})" if grant else "")
-    try:
-        rec = ops.run(plan, env=env, log_path=OPS_LOG, record=record)
-    except ops.Refused as e:
-        return {"ok": False, "error": str(e), "refused": "busy"}
-    return {"ok": True, "run": rec}
 
 
 _CLI = {}
@@ -7609,6 +7661,9 @@ if __name__ == "__main__":
     log.info("revision: %s%s on %s%s", REVISION["sha"][:8] or "unknown",
              " (dirty)" if REVISION["dirty"] else "",
              REVISION["branch"] or "detached HEAD", f" · {BASE_DIR}")
+    if OFFLINE:
+        log.warning("SILKWORM_OFFLINE: not connecting to Slack (boot smoke test)")
+        threading.Event().wait()
     slack_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     daemons.start(_slack_watchdog, "slack-health", args=(slack_handler,))
     slack_handler.start()

@@ -27,3 +27,6 @@ uploads/
 cost_correction.json
 push.json
 health.json
+live.json
+outages.json
+watchdog.json

@@ -43,6 +43,7 @@ import logging
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 import urllib.error
@@ -584,3 +585,39 @@ def handle(payload: dict, store: PushStore | None, notifier: Notifier,
         return dict(out, ok=out["sent"] > 0, subscriptions=store.count())
     except (Unavailable, BadSubscription) as e:
         return {"ok": False, "error": str(e)}
+
+
+# --- a direct send, for when the bot is the thing that is down -------------------
+
+def alert_main(argv: list, sender=None) -> int:
+    """`python push.py alert --home DIR --title T --body B`: send one
+    notification to every subscribed device without the bot.
+
+    The watchdog (via alerts.push_send) runs this when the bot is not
+    answering, so it is the bot's own store and keys read directly. Exit 0
+    when at least one device took it.
+    """
+    opts = {"--home": "", "--title": "Silkworm", "--body": ""}
+    i = 0
+    while i + 1 < len(argv) and argv[i] in opts:
+        opts[argv[i]] = argv[i + 1]
+        i += 2
+    if i != len(argv) or not opts["--home"] or not opts["--body"]:
+        print("usage: push.py alert --home DIR --title T --body B", file=sys.stderr)
+        return 2
+    store = PushStore(Path(opts["--home"]) / "push.json")
+    if not store.count():
+        print("no subscribed devices")
+        return 1
+    out = Notifier(store, sender=sender).send_all(
+        {"title": _line(opts["--title"], 60), "body": _line(opts["--body"], BODY_MAX),
+         "url": "/", "tag": "silkworm-down"})
+    print(f"sent {out['sent']}, failed {out['failed']}, pruned {out['pruned']}")
+    return 0 if out["sent"] else 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["alert"]:
+        sys.exit(alert_main(sys.argv[2:]))
+    print("usage: push.py alert --home DIR --title T --body B", file=sys.stderr)
+    sys.exit(2)

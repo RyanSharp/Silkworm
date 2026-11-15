@@ -297,6 +297,36 @@ that stays `is_connected()` while delivering nothing. A second signal (age of
 the last received event) would catch that, but on an idle workspace it is
 indistinguishable from quiet, so it is not worth the false alarms yet.
 
+## A process that never starts is watched from outside
+
+Everything above watches a bot that is running. On 2026-10-26 the deploy of
+793f119 restarted it onto code that raised `NameError` at import, so there was
+nothing running to watch: `KeepAlive` restarted it into the same traceback for
+18 days, the deploy stopped at "not answering" without undoing anything, and
+its failure note waited in `outbox/` for the bot that posts outboxes. The suite
+had passed, because it lifts functions out of `bot.py` and never boots it.
+
+Four pieces, each covering a hole the others leave (README, "Promotion"):
+
+- `smoke.py` boots `bot.py` and `visualizer.py` as processes in `silkworm test`
+  — so in the landing gate and the deploy preflight — against a scratch
+  `SILKWORM_HOME` and a loopback Slack, and fails on anything short of `/status`
+  answering with its revision.
+- The services run a pinned checkout (`live.py`) that only a promotion moves,
+  so what runs is always a commit and there is always something to go back to;
+  `live.json` names the last known good.
+- `deploy` treats its own restart as the smoke on the real port: a revision
+  that does not answer and reconnect is rolled back to the last known good,
+  restarted and confirmed, and both outcomes are reported.
+- `watchdog.py` is a launchd `StartInterval` job, not part of the bot and not
+  kept alive with it, that rolls back once per outage and alerts the owner
+  directly (bot token, home DM, web push). It never rolls back onto what is
+  already running, never twice in a day, and never under a running deploy, so
+  a bad last-known-good cannot become a rollback loop.
+
+Outages are written to `outages.json` by whoever saw them and read back by the
+digest and `/status` once the bot is up.
+
 ## Coming back is more than reconnecting
 
 Socket Mode does not queue. A message sent while the link is down is not

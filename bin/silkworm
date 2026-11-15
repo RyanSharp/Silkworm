@@ -141,28 +141,42 @@ def bot_call(path: str, payload: dict, timeout: float = 3) -> dict:
 # --- service management (platform-specific) -----------------------------------
 
 class LaunchdManager:
-    """macOS: per-user LaunchAgents, started at login, kept alive."""
+    """macOS: per-user LaunchAgents, started at login, kept alive.
+
+    The bot and the visualizer run the pinned release checkout (live.py),
+    not this one: landings write into this checkout, and what runs changes
+    only when `silkworm deploy` promotes a commit. SILKWORM_HOME points them
+    back here for state, .env and logs. The watchdog is a third job, run
+    every WATCHDOG_INTERVAL by StartInterval rather than kept alive.
+    """
 
     AGENTS = Path.home() / "Library" / "LaunchAgents"
     SERVICES = {
         "com.silkworm.bot": ["bot.py"],
         "com.silkworm.viz": ["visualizer.py"],
     }
+    WATCHDOG = "com.silkworm.watchdog"
+    WATCHDOG_INTERVAL = 120
+
+    @staticmethod
+    def _path_env() -> str:
+        claude_dir = os.path.dirname(shutil.which("claude") or "/opt/homebrew/bin/claude")
+        return ":".join(dict.fromkeys(
+            [claude_dir, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))
 
     def _plist(self, label: str, script: str) -> str:
-        claude_dir = os.path.dirname(shutil.which("claude") or "/opt/homebrew/bin/claude")
-        path_env = ":".join(dict.fromkeys(
-            [claude_dir, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]))
+        code = live.code_dir(REPO)
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
-    <array><string>{VENV_PY}</string><string>{REPO / script}</string></array>
+    <array><string>{VENV_PY}</string><string>{code / script}</string></array>
     <key>WorkingDirectory</key><string>{REPO}</string>
     <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>{path_env}</string></dict>
+    <dict><key>PATH</key><string>{self._path_env()}</string>
+          <key>SILKWORM_HOME</key><string>{REPO}</string></dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>{LOGS / (label.split('.')[-1] + '.log')}</string>
@@ -170,6 +184,48 @@ class LaunchdManager:
 </dict>
 </plist>
 """
+
+    def _watchdog_plist(self) -> str:
+        """Runs once per interval and exits -- StartInterval, not KeepAlive:
+        a check that lived as long as the bot could die with it. From this
+        checkout, not the pinned one: it is what rolls the pinned one back."""
+        py = VENV_PY    # the bot's own: jsonstore is not Python 3.9 (/usr/bin/python3)
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{self.WATCHDOG}</string>
+    <key>ProgramArguments</key>
+    <array><string>{py}</string><string>{REPO / 'watchdog.py'}</string>
+           <string>--home</string><string>{REPO}</string></array>
+    <key>WorkingDirectory</key><string>{REPO}</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>{self._path_env()}</string></dict>
+    <key>StartInterval</key><integer>{self.WATCHDOG_INTERVAL}</integer>
+    <key>RunAtLoad</key><false/>
+    <key>StandardOutPath</key><string>{LOGS / 'watchdog.log'}</string>
+    <key>StandardErrorPath</key><string>{LOGS / 'watchdog.log'}</string>
+</dict>
+</plist>
+"""
+
+    def _write_plists(self) -> None:
+        for label, (script,) in ((k, tuple(v)) for k, v in self.SERVICES.items()):
+            (self.AGENTS / f"{label}.plist").write_text(self._plist(label, script))
+
+    def _ensure_pinned(self) -> bool:
+        """A pinned checkout to run, made at this checkout's HEAD the first
+        time -- HEAD, not the working tree: uncommitted edits are not pinned."""
+        if live.is_checkout(live.live_dir(REPO)):
+            return True
+        code, head = git_out(REPO, "rev-parse", "HEAD")
+        ok, detail = live.checkout(REPO, head, why="install") if code == 0 and head \
+            else (False, "could not resolve HEAD")
+        if ok:
+            print(f"  {G}✔{N} pinned {head[:8]} in {detail} — what the services run")
+        else:
+            print(f"  {R}✘{N} could not make the pinned checkout: {detail}")
+        return ok
 
     def _domain(self) -> str:
         return f"gui/{os.getuid()}"
@@ -205,20 +261,33 @@ class LaunchdManager:
     def install(self) -> bool:
         LOGS.mkdir(exist_ok=True)
         self.AGENTS.mkdir(parents=True, exist_ok=True)
-        for label, (script,) in ((k, tuple(v)) for k, v in self.SERVICES.items()):
-            plist = self.AGENTS / f"{label}.plist"
+        if not self._ensure_pinned():
+            return False
+        for label in self.SERVICES:
             self._stop(label)
-            plist.write_text(self._plist(label, script))
+        self._write_plists()
         self._free_ports()
         held = self._wait_ports_free()
         for label in self.SERVICES:
             self._start(self.AGENTS / f"{label}.plist")
+        self._install_watchdog()
         if self._held(held):
             return False
-        return self._report_up("installed and started")
+        up = self._report_up("installed and started")
+        rec = live.read(REPO)
+        if up and rec.get("live") and not rec.get("last_good"):
+            live.mark_good(REPO, rec["live"], "install")
+        return up
+
+    def _install_watchdog(self) -> None:
+        plist = self.AGENTS / f"{self.WATCHDOG}.plist"
+        self._stop(self.WATCHDOG)
+        plist.write_text(self._watchdog_plist())
+        self._start(plist)
+        print(f"  {G}✔{N} {self.WATCHDOG} checks the bot every {self.WATCHDOG_INTERVAL}s")
 
     def uninstall(self) -> None:
-        for label in self.SERVICES:
+        for label in (*self.SERVICES, self.WATCHDOG):
             self._stop(label)
             (self.AGENTS / f"{label}.plist").unlink(missing_ok=True)
             print(f"  {G}✔{N} {label} removed")
@@ -229,12 +298,17 @@ class LaunchdManager:
                 print(f"  {R}✘{N} {label} not installed — run: silkworm install")
                 return False
             self._stop(label)
+        # Rewritten each time, so they always run what is pinned now (an
+        # install from before the pinned checkout ran this one).
+        self._write_plists()
         self._free_ports()
         held = self._wait_ports_free()
         for label in self.SERVICES:
             self._start(self.AGENTS / f"{label}.plist")
         if self._held(held):
             return False
+        if not (self.AGENTS / f"{self.WATCHDOG}.plist").exists():
+            self._install_watchdog()      # an install from before the watchdog
         return self._report_up("restarted")
 
     # launchctl returning says launchd accepted the job, not that anything is
@@ -768,7 +842,23 @@ def do_status() -> None:
             check("revision", False, rev.get("message") or "could not resolve it")
         else:
             check(f"revision — {rev.get('message', '')}",
-                  rev.get("state") == "current", "run: silkworm restart")
+                  rev.get("state") == "current", "run: silkworm deploy")
+    # What runs is the pinned checkout (live.py); what it falls back to is the
+    # last known good. Read from files, so it says something with the bot down.
+    rec = install_record()
+    pinned = rec["live"].get("live") or ""
+    check(f"pinned checkout — {live.describe(REPO)}", bool(pinned),
+          "run: silkworm deploy (pins HEAD, keeps a revision to roll back to)")
+    if pinned and bot.get("online"):
+        running = (bot.get("revision") or {}).get("started") or ""
+        check("the bot runs the pinned revision", running == pinned,
+              f"running {running[:8] or '?'}, pinned {pinned[:8]} — silkworm restart")
+    check(f"watchdog {mgr.WATCHDOG} loaded", mgr.loaded(mgr.WATCHDOG),
+          "run: silkworm install (checks every 2m, rolls back once, alerts you)")
+    last = rec["outages"][-1] if rec["outages"] else None
+    if last:
+        check(f"last outage: {last['line'][:150]}", bool(last.get("end")),
+              "it has not ended — silkworm logs")
 
     # A stale credential kills every turn and says nothing until you notice the
     # failures, so it gets checked rather than discovered.
@@ -859,6 +949,9 @@ import credentials                                   # noqa: E402
 import envfile                                       # noqa: E402
 import git_guard                                     # noqa: E402
 import jsonstore                                     # noqa: E402
+import alerts                                        # noqa: E402
+import live                                          # noqa: E402
+import outages                                       # noqa: E402
 import workspaces                                    # noqa: E402
 import operator_role                                 # noqa: E402
 import ops                                           # noqa: E402
@@ -1568,13 +1661,25 @@ def status_summary(ask) -> dict:
     return out
 
 
-def do_status_json(ask=None) -> int:
+def install_record(home: Path = REPO) -> dict:
+    """What runs and what went wrong, read from the install's files -- so it
+    is there when the bot is the thing that is down: the pinned checkout
+    (live.json) and the latest outages (outages.json)."""
+    rows = outages.load(home)
+    return {"live": live.read(home),
+            "outages": [dict(r, line=outages.describe(r)) for r in rows[-5:]],
+            "outage_open": any(not r.get("end") for r in rows)}
+
+
+def do_status_json(ask=None, home: Path = REPO) -> int:
     ask = ask or bot_ask
     try:
         out = status_summary(ask)
     except BotUnreachable as e:
-        print(json.dumps({"ok": False, "errors": [str(e)], "bot": {"online": False}}))
+        print(json.dumps({"ok": False, "errors": [str(e)], "bot": {"online": False},
+                          **install_record(home)}))
         return EXIT_UNREACHABLE
+    out.update(install_record(home))
     print(json.dumps(out))
     return EXIT_OK if out["ok"] else EXIT_REFUSED
 
@@ -1848,8 +1953,14 @@ DEPLOY_USAGE = ("usage: silkworm deploy [--now] [--skip-tests] [--max-wait 2h]\n
 def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
               suite=run_suite, clock=time.monotonic, sleep=time.sleep,
               confirm_s: float = DEPLOY_CONFIRM_S, handoff=None, lock_path=None,
-              log_path=None, alive=None) -> int:
-    """Restart the bot onto this checkout without killing work. Exit status."""
+              log_path=None, alive=None, pin=None) -> int:
+    """Promote this checkout's HEAD without killing work. Exit status.
+
+    Real runs (no `manager` injected) promote through the pinned checkout,
+    live.Pin(repo), and roll back if HEAD does not come up. A test injecting a
+    manager gets no checkout handling unless it injects a pin too."""
+    if pin is None and manager is None:
+        pin = live.Pin(repo)
     call = call or (lambda path, payload: bot_call(path, payload, timeout=10))
     now, skip_tests, after_turn, max_wait = False, False, False, DEPLOY_MAX_WAIT_S
     i = 0
@@ -1921,7 +2032,7 @@ def do_deploy(argv, *, repo: Path = REPO, call=None, manager=None, git=git_out,
         return 1
     try:
         code, _why = deploy_onto(call, head, now=now, max_wait=max_wait, manager=manager,
-                                 clock=clock, sleep=sleep, confirm_s=confirm_s)
+                                 clock=clock, sleep=sleep, confirm_s=confirm_s, pin=pin)
     finally:
         release_deploy_lock(lock_path, me)
     return code
@@ -1958,8 +2069,8 @@ def operator_deploy_refusal(call, after_turn: bool, skip_tests: bool) -> str:
 def deploy_onto(call, head: str, *, now: bool, max_wait: float, manager=None,
                 clock=time.monotonic, sleep=time.sleep,
                 confirm_s: float = DEPLOY_CONFIRM_S, ignore=(),
-                before_restart=None) -> tuple[int, str]:
-    """Drain, wait for quiet, restart, confirm `head` is what runs.
+                before_restart=None, pin=None) -> tuple[int, str]:
+    """Drain, wait for quiet, promote `head`, confirm it, or roll back.
 
     (exit status, why it failed or ""). The one implementation of a deploy:
     `deploy` runs it in the terminal, `deploy --after-turn` in the process it
@@ -1967,6 +2078,14 @@ def deploy_onto(call, head: str, *, now: bool, max_wait: float, manager=None,
     process holds them -- the turn that asked for an after-turn deploy, whose
     record can lag its process by a moment and must not hold this forever.
     `before_restart`, given, says why not to restart after all ("" to go on).
+
+    `pin` is the pinned release checkout (live.Pin): `head` is checked out
+    there and the services restarted onto it -- the smoke on the real port,
+    once the old process has drained. If it does not answer /status, connect
+    to Slack and report `head` within `confirm_s`, the pin goes back to the
+    last known good revision (else whatever was running), which is restarted
+    and confirmed in turn; both outcomes are reported and the outage recorded.
+    Without a pin (tests driving only the restart) the checkout is untouched.
     """
     drained = False
     drain_s = max_wait + DEPLOY_DRAIN_MARGIN_S
@@ -2030,20 +2149,111 @@ def deploy_onto(call, head: str, *, now: bool, max_wait: float, manager=None,
             print(f"  {R}✘{N} {stop} — drain lifted")
             return 1, stop + "; drain lifted"
 
-    mgr = manager or service_manager()
-    if not mgr.restart():
-        # A restart can fail before stopping anything (a missing plist) or
-        # leave the old process holding its port. Either way the old bot may
-        # still be the one running, and it must not stay drained for hours.
-        if drained and call("/drain", {"action": "stop"}).get("ok"):
-            print(f"  {Y}·{N} the old bot is still answering — drain lifted")
-        print(f"  {R}✘{N} restart failed — see above; silkworm logs")
-        return 1, "the restart failed"
+    target = ""
+    if pin is not None:
+        # What was running is the fallback only if it was a commit: a bot
+        # booted from a dirty tree (the hand-patched one that ended the
+        # 2026-11 outage) reports a sha whose commit is not what it ran --
+        # 793f119, which cannot boot.
+        rev = (status or {}).get("revision") or {}
+        running = "" if rev.get("dirty") else (rev.get("started") or "")
+        target = pin.last_good() or running
+        # Boot the exact commit -- not this working tree, which may hold an
+        # untracked module HEAD lacks -- before the pin or the running bot is
+        # touched. On the first deploy there is nothing to roll back to, so
+        # this is the check that matters most.
+        ok, detail = pin.boot(head)
+        if not ok:
+            if drained:
+                call("/drain", {"action": "stop"})
+            print(f"  {R}✘{N} {head[:8]} does not boot on its own — not restarted; drain lifted")
+            print("\n".join(f"      {line}" for line in detail.splitlines()[-12:]))
+            return 1, f"{head[:8]} does not boot ({detail.splitlines()[0][:200]}); not restarted"
+        print(f"  {G}✔{N} {head[:8]} boots from a clean checkout of the commit")
+        if not target:
+            print(f"  {Y}·{N} no known good revision yet: if {head[:8]} does not come up "
+                  f"there is nothing to roll back to")
+        ok, detail = pin.checkout(head, "deploy")
+        if not ok:
+            if drained:
+                call("/drain", {"action": "stop"})
+            print(f"  {R}✘{N} could not pin {head[:8]}: {detail} — not restarted; drain lifted")
+            return 1, f"could not pin {head[:8]} ({detail}), so it did not restart; drain lifted"
+        print(f"  {G}✔{N} pinned {head[:8]} in {detail}")
 
-    why: list = []
-    if confirm_deploy(call, head, confirm_s=confirm_s, clock=clock, sleep=sleep, why=why):
-        return 0, ""
-    return 1, "; ".join(why) or "the restarted bot could not be confirmed"
+    mgr = manager or service_manager()
+    started_at = time.time()
+    raised = ""
+    try:
+        restarted = mgr.restart()
+    except Exception as e:                       # noqa: BLE001 - launchctl refusing, say
+        raised = f"the restart raised {type(e).__name__}: {e}"
+        print(f"  {R}✘{N} {raised}")
+        restarted = False
+    if not restarted:
+        if pin is None:
+            # A restart can fail before stopping anything (a missing plist) or
+            # leave the old process holding its port. Either way the old bot may
+            # still be the one running, and it must not stay drained for hours.
+            if drained and call("/drain", {"action": "stop"}).get("ok"):
+                print(f"  {Y}·{N} the old bot is still answering — drain lifted")
+            print(f"  {R}✘{N} restart failed — see above; silkworm logs")
+            return 1, raised or "the restart failed"
+        why = [raised or "the restart failed: it did not answer"]
+    else:
+        why = []
+        if confirm_deploy(call, head, confirm_s=confirm_s, clock=clock, sleep=sleep, why=why):
+            if pin is not None:
+                pin.mark_good(head)
+                print(f"  {G}✔{N} {head[:8]} is now the last known good revision")
+            return 0, ""
+        if pin is None:
+            return 1, "; ".join(why) or "the restarted bot could not be confirmed"
+    return roll_back(call, mgr, pin, head, target, "; ".join(why) or "not confirmed",
+                     started_at=started_at, confirm_s=confirm_s, clock=clock, sleep=sleep)
+
+
+def roll_back(call, mgr, pin, head: str, target: str, failed: str, *, started_at: float,
+              confirm_s: float = DEPLOY_CONFIRM_S, clock=time.monotonic,
+              sleep=time.sleep) -> tuple[int, str]:
+    """`head` did not come up: put `target` back, restart, confirm it.
+    (1, both outcomes in one sentence). Recorded as an outage either way."""
+    cause = pin.stderr_tail()
+    print(f"  {R}✘{N} {head[:8]} did not come up: {failed}")
+    if cause:
+        print("\n".join(f"      {line}" for line in cause.splitlines()[-12:]))
+    entry = {"start": started_at, "end": None, "cause": f"{failed}\n{cause}",
+             "seen_by": "deploy", "revision": head, "rolled_back": None}
+    if not target or target == head:
+        pin.record_outage(entry)
+        print(f"  {R}✘{N} nothing known good to roll back to — Silkworm may be down; "
+              f"silkworm logs")
+        return 1, (f"{head[:8]} did not come up ({failed}), and there is no known good "
+                   f"revision to roll back to — Silkworm may be down")
+    print(f"  {Y}·{N} rolling back to {target[:8]}, the last known good revision…")
+    ok, detail = pin.checkout(target, f"rollback from {head[:8]}")
+    back: list = []
+    try:
+        up = ok and mgr.restart() and confirm_deploy(call, target, confirm_s=confirm_s,
+                                                     clock=clock, sleep=sleep, why=back)
+    except Exception as e:                       # noqa: BLE001
+        up, back = False, [f"restart raised {type(e).__name__}: {e}"]
+    # Whatever answers now must not stay drained: a fresh process is not, but
+    # an old one that never let go of its port would be, for hours.
+    call("/drain", {"action": "stop"})
+    entry["rolled_back"] = {"from": head, "to": target, "ok": bool(up), "at": time.time()}
+    if up:
+        entry["end"] = time.time()
+        pin.mark_good(target)
+        print(f"  {G}✔{N} rolled back: {target[:8]} is answering again")
+        pin.record_outage(entry)
+        return 1, (f"{head[:8]} did not come up ({failed}); rolled back to {target[:8]}, "
+                   f"which is answering again")
+    reason = detail if not ok else ("; ".join(back) or "it did not come up either")
+    pin.record_outage(entry)
+    print(f"  {R}✘{N} the rollback to {target[:8]} failed too: {reason} — Silkworm is down")
+    return 1, (f"{head[:8]} did not come up ({failed}); the rollback to {target[:8]} "
+               f"failed too ({reason}) — Silkworm is down")
 
 
 def confirm_deploy(call, head: str, *, confirm_s: float = DEPLOY_CONFIRM_S,
@@ -2371,12 +2581,14 @@ def wait_for_caller(call, thread: str, task: str, *, limit: float = AFTER_TURN_C
 
 
 def report_outcome(call, thread: str, text: str, *, outbox: Path,
-                   sleep=time.sleep, tries: int = 3) -> str:
-    """Tell the calling thread. Where it went: thread, outbox or log.
+                   sleep=time.sleep, tries: int = 3, direct=None) -> str:
+    """Tell the calling thread. Where it went: thread, direct, outbox or log.
 
-    Through the bot when it answers; a bot that never came back cannot post,
-    so the note goes in the thread's outbox, which the bot uploads to the
-    thread at the end of its next turn there.
+    Through the bot when it answers. A bot that never came back cannot post --
+    on 2026-10-26 that left the only word of an 18-day outage in outbox/ -- so
+    then straight to Slack with the bot's token and a push (`direct`, which is
+    alerts.owner), and only failing that the thread's outbox, which the bot
+    uploads at the end of its next turn there.
     """
     print(text)
     if not thread:
@@ -2386,6 +2598,14 @@ def report_outcome(call, thread: str, text: str, *, outbox: Path,
             return "thread"
         if n + 1 < tries:
             sleep(10)
+    if direct is not None:
+        try:
+            res = direct(thread, text) or {}
+        except Exception as e:                       # noqa: BLE001
+            res = {"slack_error": f"{type(e).__name__}: {e}"}
+        if res.get("slack"):
+            print(f"  {Y}·{N} the bot did not take the message — posted it directly")
+            return "direct"
     try:
         box = outbox / thread.replace(":", "__")
         box.mkdir(parents=True, exist_ok=True)
@@ -2425,7 +2645,7 @@ def after_turn_run(head: str, thread: str, task: str, max_wait: float, *, call,
                    clock=time.monotonic, sleep=time.sleep,
                    confirm_s: float = DEPLOY_CONFIRM_S,
                    caller_s: float = AFTER_TURN_CALLER_S,
-                   repo: Path = REPO, git=git_out) -> int:
+                   repo: Path = REPO, git=git_out, pin=None, direct=None) -> int:
     """What the detached process does: wait for the caller, deploy, say how it
     went, let go of the lock. Exit status."""
     me = os.getpid()
@@ -2448,7 +2668,7 @@ def after_turn_run(head: str, thread: str, task: str, max_wait: float, *, call,
                 pass
             code, why = deploy_onto(call, head, now=False, max_wait=max_wait,
                                     manager=manager, clock=clock, sleep=sleep,
-                                    confirm_s=confirm_s, ignore=ids,
+                                    confirm_s=confirm_s, ignore=ids, pin=pin,
                                     before_restart=lambda: still_checked(repo, head, git))
     except Exception as e:
         code, why = 1, f"{type(e).__name__}: {e}"
@@ -2459,7 +2679,7 @@ def after_turn_run(head: str, thread: str, task: str, max_wait: float, *, call,
         else:
             text = f":x: Deploy of `{head[:8]}` did not complete: {why}. Log: `{log_path}`"
         try:
-            report_outcome(call, thread, text, outbox=outbox, sleep=sleep)
+            report_outcome(call, thread, text, outbox=outbox, sleep=sleep, direct=direct)
         finally:
             release_deploy_lock(lock_path, me)
     return code
@@ -2484,7 +2704,9 @@ def do_after_turn_detached(argv) -> int:
                           float(opts["--max-wait"]),
                           call=lambda path, payload: bot_call(path, payload, timeout=10),
                           lock_path=Path(opts["--lock"]), log_path=Path(opts["--log"]),
-                          outbox=REPO / "outbox")
+                          outbox=REPO / "outbox", pin=live.Pin(REPO),
+                          direct=lambda thread, text: alerts.owner(
+                              REPO, text, title="Silkworm deploy", thread=thread))
 
 
 def do_launch(args: list[str]) -> None:

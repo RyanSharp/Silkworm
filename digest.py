@@ -324,12 +324,31 @@ def unregistered_line(repos) -> str:
             "`!project new <Name> <path>` registers one")
 
 
+def outage_lines(rows, now: float) -> list:
+    """One line per outage going on at any point in the window (outages.py):
+    when, how long, why and what was rolled back. Said first, above every
+    project: the bot being down is the one thing the rest of the digest
+    could not have told you about at the time."""
+    import outages as _outages
+    since = now - WINDOW_S
+    out = []
+    for r in rows or ():
+        if r.get("end") and r["end"] < since:
+            continue
+        out.append(f":rotating_light: Silkworm was down — {_esc(_outages.describe(r, now))}")
+    return out
+
+
 def render(records, now: float, *, branch_rows=(), released=None,
            when: datetime | None = None, unregistered=(), failing=None,
-           health=()) -> str:
+           health=(), outages=()) -> str:
     """The digest as one compact Slack message."""
     text = _render(records, now, branch_rows=branch_rows, released=released, when=when,
                    failing=failing, health=health)
+    down = outage_lines(outages, now)
+    if down:
+        head, _, rest = text.partition("\n")
+        text = "\n".join([head, *down] + ([rest] if rest else []))
     line = unregistered_line(unregistered)
     return f"{text}\n{line}" if line else text
 

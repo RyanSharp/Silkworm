@@ -1249,6 +1249,64 @@ def make_tailscale(sys: System = SYSTEM, config: dict | None = None, find_bin=No
     return probe
 
 
+# --- the running revision ------------------------------------------------------------
+
+#: What the running bot booted: {"sha", "dirty", "branch"} (revision.of) plus
+#: "code_dir", "home" and "live" (live.json). The bot sets this to its own at
+#: import; anywhere else (`silkworm health --probe`) it asks the bot.
+RUNNING = None
+
+
+def _ask_running(sys: System) -> dict:
+    port = sys.env("APPROVAL_PORT") or "8787"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/status", data=b"{}",
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as f:
+            st = json.loads(f.read() or b"{}")
+    except Exception as e:                        # noqa: BLE001 - unknown, not ok
+        raise Unavailable(f"the bot did not answer /status ({type(e).__name__})")
+    rev = st.get("revision") or {}
+    return {"sha": rev.get("started") or "", "dirty": bool(rev.get("dirty")),
+            "code_dir": st.get("code_dir") or "", "live": st.get("live") or {},
+            "home": ""}
+
+
+def make_revision(sys: System = SYSTEM, running=None):
+    """The bot runs a commit, from the pinned checkout. Running uncommitted
+    code -- the hand-patched live tree that brought Silkworm back on
+    2026-11-14 -- or a tree with no commit at all is a warning: it is code no
+    test or review ever saw, and nothing can roll back to it."""
+    def probe(rec, gh):
+        try:
+            r = (running or RUNNING or (lambda: _ask_running(sys)))()
+        except Unavailable as e:
+            return unknown(str(e))
+        sha = r.get("sha") or ""
+        ev = [f"running {sha[:12] or 'no revision'}"
+              + (" with uncommitted changes" if r.get("dirty") else "")
+              + (f" from {r['code_dir']}" if r.get("code_dir") else "")]
+        if not sha:
+            return result(WARN, "the bot is running code that is not a git commit", ev,
+                          fingerprint="no-commit")
+        if r.get("dirty"):
+            return result(WARN, f"the bot is running {sha[:8]} plus uncommitted changes "
+                                "-- commit them, then silkworm deploy", ev,
+                          fingerprint="dirty")
+        pinned = (r.get("live") or {}).get("live") or ""
+        if pinned and pinned != sha:
+            return result(WARN, f"the bot runs {sha[:8]}, but the pinned checkout is at "
+                                f"{pinned[:8]} -- silkworm deploy", ev,
+                          fingerprint="unpinned")
+        if r.get("home") and r.get("code_dir") and r["home"] == r["code_dir"]:
+            return result(WARN, f"running {sha[:8]} from the main checkout, not a pinned "
+                                "one: nothing to roll back to -- silkworm deploy pins it", ev,
+                          fingerprint="no-pin")
+        return result(OK, f"running {sha[:8]}, a commit"
+                          + (", from the pinned checkout" if pinned else ""), ev)
+    return probe
+
+
 # --- registration -------------------------------------------------------------------
 
 def _in(section: str):
@@ -1305,6 +1363,8 @@ def register_all(sys: System = SYSTEM, config: dict | None = None,
          "free space on the mini's data volume"),
         ("tailscale", make_tailscale(sys, config), _is_mini,
          "the phone can reach the dashboard over Tailscale serve, tailnet-only"),
+        ("revision", make_revision(sys), _is_mini,
+         "the bot runs a commit (not uncommitted edits) from its pinned checkout"),
     ]
     for name, probe, applies, about in probes:
         probe = scrubbed(probe)
@@ -1401,7 +1461,14 @@ def _decide_tailscale(rec) -> str:
     return "; ".join(out) or "on the mini, run `silkworm tailscale status` and fix what it shows"
 
 
-DECISIONS = {"backend-drift": _decide_drift, "app-store": _decide_app_store,
+def _decide_revision(rec) -> str:
+    if rec.get("status") in (WARN, FAIL):
+        return ("commit what the live tree runs (or drop it), then `silkworm deploy`; "
+                "details above")
+    return ""
+
+
+DECISIONS = {"revision": _decide_revision, "backend-drift": _decide_drift, "app-store": _decide_app_store,
              "testflight": _decide_testflight, "credentials": _decide_credentials,
              "disk": _decide_disk, "gateway": _decide_gateway,
              "tailscale": _decide_tailscale}
@@ -1421,7 +1488,8 @@ SHORT = {"backend-drift": lambda rec: "backend current",
          "testflight": _short_testflight, "dispatching": lambda rec: "dispatching",
          "gateway": lambda rec: "Gateway up", "healthcheck": lambda rec: "healthcheck passes",
          "credentials": lambda rec: "credentials good", "disk": _short_disk,
-         "tailscale": lambda rec: "dashboard reachable"}
+         "tailscale": lambda rec: "dashboard reachable",
+         "revision": lambda rec: "runs a commit"}
 
 
 def projects_with_mini(recs) -> list[dict]:
