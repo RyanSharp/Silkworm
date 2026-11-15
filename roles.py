@@ -219,7 +219,7 @@ OPERATOR_SYSTEM = (
     "runs only in a turn the user started with their own message in this "
     "thread, on their word, with --notes saying what they asked for -- never "
     "in a sweep or a wake-up -- and trader's, and tailscale-on, only when "
-    "their message named it (the op's name, or the job's label). A long one (project-test, a refetch) can take "
+    "their message named it (the op's name, the job's label, or the .env key). A long one (project-test, a refetch) can take "
     "many minutes: give the Bash call a timeout of up to 600000 ms, or run it "
     "in the background and read `{bin} ops log` after. In your reply, quote "
     "each run's commands, exit codes and the tail of its output. What no op "

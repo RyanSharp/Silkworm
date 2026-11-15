@@ -28,6 +28,14 @@ Who may run what (`refusal`):
   are its live configuration, which otherwise waits for `!approve`) and the
   one that exposes the dashboard on the tailnet.
 
+On 2026-11-14 two more of the owner's decisions needed shell steps: retiring
+trader's cash-secured-put shadow job (com.traderjoe.shadowoptions) and switching
+its momentum sleeve to the point-in-time universe (MOMENTUM_UNIVERSE=pit in
+trader's .env). trader-launchd-retire and trader-env-set carry those out: the
+first moves the plist to a dated backup, never deletes it; the second sets only
+keys in ENV_KEYS, to values listed there, backs .env up first, and never prints
+another line of it.
+
 Every run, and every refusal of a well-formed one, is appended to the ops log
 (logs/ops.jsonl): who, on whose word, the argv of each step, exit codes and
 the tail of the output.
@@ -42,6 +50,7 @@ import plistlib
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -52,7 +61,7 @@ from typing import Callable
 #: quotes, `;|&$<>()` and the rest -- is refused before any op reads it. No
 #: shell ever sees an argument, but an argument that looks like shell is a
 #: sign of someone reaching for one, and is never what an entry wants.
-SAFE_ARG = re.compile(r"^[A-Za-z0-9._,:=@+/-]+$")
+SAFE_ARG = re.compile(r"[A-Za-z0-9._,:=@+/-]+")   # fullmatch: `$` lets "x\n" through
 #: Per argument, and in all.
 MAX_ARG = 64
 MAX_ARGS = 60
@@ -70,6 +79,12 @@ class Step:
     #: A failure here does not stop the run (launchctl bootout of a job that
     #: is not loaded exits non-zero, and that is fine).
     may_fail: bool = False
+    #: The step succeeds only if the command fails (exits non-zero): `launchctl
+    #: print` of a job that should be gone.
+    must_fail: bool = False
+    #: Its output is not kept (`launchctl print` of a loaded job lists its
+    #: environment, which can hold credentials): only its exit code.
+    quiet: bool = False
 
 
 @dataclass
@@ -85,6 +100,9 @@ class Plan:
     #: Words any one of which, in your message, names this run. Empty: the op
     #: need not be named (Op.named is False).
     names: tuple = ()
+    #: Words every one of which your message must also hold: trader-env-set's
+    #: value, so "what is the momentum universe on?" names no change.
+    also: tuple = ()
     #: verify.project_lock's project: a test run shares the lock every other
     #: run of that project's suite takes.
     lock: str = ""
@@ -173,7 +191,7 @@ def _launchd_reinstall(op, args, ctx):
     if len(args) != 1:
         raise Refused(f"usage: {op.name} {op.usage}")
     job = args[0][:-len(".plist")] if args[0].endswith(".plist") else args[0]
-    if not _LABEL.match(job):
+    if not _LABEL.fullmatch(job):
         raise Refused(f"`{args[0]}` is not a launchd job label (e.g. com.traderjoe.pooldata)")
     if not job.startswith(LAUNCHD_PREFIX):
         # Trader's own jobs only: a plist named for another (Silkworm's own
@@ -216,6 +234,180 @@ def _launchd_reinstall(op, args, ctx):
     ], cwd
 
 
+def _job_arg(op, args) -> str:
+    """The one job label a launchd op takes ("…plist" allowed), checked to be
+    a label and one of trader's."""
+    if len(args) != 1:
+        raise Refused(f"usage: {op.name} {op.usage}")
+    job = args[0][:-len(".plist")] if args[0].endswith(".plist") else args[0]
+    if not _LABEL.fullmatch(job):
+        raise Refused(f"`{args[0]}` is not a launchd job label (e.g. com.traderjoe.pooldata)")
+    if not job.startswith(LAUNCHD_PREFIX):
+        # Trader's own jobs only: retiring another (Silkworm's own agent,
+        # say) is not trader's to do.
+        raise Refused(f"`{job}` is not one of trader's jobs ({LAUNCHD_PREFIX}…)")
+    return job
+
+
+#: Where a retired job's plist goes, inside trader's checkout (data/ is
+#: gitignored there): moved, never deleted, so retiring is undone by moving it
+#: back and running trader-launchd-reinstall.
+RETIRED_DIR = "data/retired-launchd"
+
+
+def _stamp(clock=time.time) -> str:
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(clock()))
+
+
+def _free(path: Path) -> Path:
+    """`path`, or with -1, -2, ... before its suffix if something is there:
+    never over an earlier backup when two runs fall in one second."""
+    path, n = Path(path), 0
+    cand = path
+    while cand.exists() or cand.is_symlink():
+        n += 1
+        cand = path.with_name(f"{path.stem}-{n}{path.suffix}")
+    return cand
+
+
+def _launchd_retire(op, args, ctx):
+    job = _job_arg(op, args)
+    cwd = _cwd(_project_rec(ctx, op.project), op.project)
+    agents = Path(ctx.launch_agents)
+    src = agents / f"{job}.plist"
+    if src.is_symlink() or not src.is_file():
+        have = sorted(p.stem for p in agents.glob(f"{LAUNCHD_PREFIX}*.plist")
+                      if p.is_file() and not p.is_symlink()) if agents.is_dir() else []
+        raise Refused(f"no installed {job} ({src} is not a plain file)"
+                      + (f"; installed: {', '.join(have)}" if have else ""))
+    try:
+        with open(src, "rb") as f:
+            label = (plistlib.load(f) or {}).get("Label")
+    except Exception as e:
+        raise Refused(f"{src} does not parse as a plist: {e}") from e
+    if label != job:
+        # bootout and print would name another job, both "fail" as fine,
+        # and the plist would move with the real job still loaded.
+        raise Refused(f"{src}'s Label is {label!r}, not {job!r}; retire it by hand")
+    data = Path(cwd) / "data"
+    if not data.is_dir():
+        raise Refused(f"{op.project} has no data/ in {cwd} to keep the retired plist in")
+    retired = data.resolve() / "retired-launchd"
+    if (data / "retired-launchd").is_symlink():
+        raise Refused(f"{cwd}/{RETIRED_DIR} is a symlink; refusing to write through it")
+    dst = _free(retired / f"{job}.{_stamp()}.plist")
+    return [
+        # May fail: a job already not loaded has nothing to boot out.
+        Step(["launchctl", "bootout", f"gui/{ctx.uid}/{job}"], may_fail=True),
+        # But it must be gone before its plist is: a job left loaded with its
+        # plist moved away keeps running, unseen, until the next login.
+        Step(["launchctl", "print", f"gui/{ctx.uid}/{job}"], must_fail=True, quiet=True),
+        Step(["mkdir", "-p", str(retired)]),
+        # -n: never over anything; the plan checked nothing is there.
+        Step(["mv", "-n", str(src), str(dst)]),
+        # mv -n exits 0 even when it did not move: make sure it did.
+        Step(["test", "-f", str(dst)]),
+    ], cwd
+
+
+#: The keys of trader's .env an op may set, each with the values it may take.
+#: Anything else in that file -- its credentials -- is never read out or
+#: changed.
+ENV_KEYS: dict = {
+    # Which universe the momentum sleeve trades (trader/research/
+    # deployed_universe.py): the hand-built list, or the point-in-time one.
+    "MOMENTUM_UNIVERSE": ("static", "pit"),
+}
+#: Where .env backups go, inside trader's (gitignored) data/.
+ENV_BACKUPS = "data/env-backups"
+
+
+def _env_set(op, args, ctx):
+    if len(args) != 2:
+        raise Refused(f"usage: {op.name} {op.usage}")
+    key, value = args
+    if key not in ENV_KEYS:
+        raise Refused(f"`{key}` is not a key {op.name} sets; it sets: "
+                      + ", ".join(ENV_KEYS))
+    if value not in ENV_KEYS[key]:
+        raise Refused(f"`{value}` is not a value {key} takes: one of "
+                      + ", ".join(ENV_KEYS[key]))
+    cwd = _cwd(_project_rec(ctx, op.project), op.project)
+    env = Path(cwd) / ".env"
+    if env.is_symlink() or not env.is_file():
+        raise Refused(f"{cwd}/.env is not a plain file")
+    data = Path(cwd) / "data"
+    if not data.is_dir():
+        raise Refused(f"{op.project} has no data/ in {cwd} to back .env up into")
+    if (data / "env-backups").is_symlink():
+        raise Refused(f"{cwd}/{ENV_BACKUPS} is a symlink; refusing to write through it")
+    backup = data.resolve() / "env-backups" / f"env.{_stamp()}.bak"
+    return [Step([ctx.python, "-I", str(Path(__file__).resolve()), "env-set",
+                  str(env), str(backup), key, value])], cwd
+
+
+def env_set(env_path, backup_path, key: str, value: str) -> tuple:
+    """Set `key` to `value` in the .env at env_path, after copying it (mode
+    0600) to backup_path. Changes only that key's line, or adds one; every
+    other byte stays. Returns (old value or None, the line printed). Never
+    returns or prints any other line: the file holds secrets."""
+    if key not in ENV_KEYS or value not in ENV_KEYS[key]:
+        raise Refused(f"{key}={value} is not allowed")
+    env_path, backup_path = Path(env_path), Path(backup_path)
+    if env_path.is_symlink() or not env_path.is_file():
+        raise Refused(f"{env_path} is not a plain file")
+    raw = env_path.read_bytes()
+    text = raw.decode("utf-8")
+    # Lines end at \n and only there, as dotenv reads them. splitlines() also
+    # splits at \f, a lone \r, \u2028 and the like -- rewriting one of those
+    # "lines" would join the key's line to the next, which may be a secret.
+    odd = set("\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029\ufeff") & set(text)
+    if odd or re.search(r"\r(?!\n)", text):
+        raise Refused(".env holds line breaks other than \\n (or a BOM); fix it by hand")
+    lines = re.split(r"(?<=\n)", text)
+    if lines and lines[-1] == "":
+        lines.pop()
+    pat = re.compile(r"^(\s*(?:export\s+)?)" + re.escape(key) + r"\s*=(.*?)(\r?\n)?$")
+    hits = [i for i, line in enumerate(lines) if pat.match(line)]
+    if len(hits) > 1:
+        raise Refused(f"{key} is set on {len(hits)} lines of .env; fix that by hand")
+    old = None
+    if hits:
+        m = pat.match(lines[hits[0]])
+        old = m.group(2).split(" #", 1)[0].strip().strip("'\"")
+    shown = old if old is None or (SAFE_ARG.fullmatch(old) and len(old) <= MAX_ARG) else "(unprintable)"
+    if old == value:
+        return old, f"{key}: already {value}; .env unchanged, nothing backed up"
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = _free(backup_path)
+    fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+    if hits:
+        m = pat.match(lines[hits[0]])
+        lines[hits[0]] = f"{m.group(1)}{key}={value}{m.group(3) or ''}"
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f"{key}={value}\n")
+    tmp = env_path.with_name(f".env.ops-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                 env_path.stat().st_mode & 0o777)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write("".join(lines).encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, env_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return old, (f"{key}: {shown if old is not None else '(unset)'} -> {value} "
+                 f"(backup: {backup_path}). It takes effect at the trading daemon's next "
+                 "restart (the weekly Sunday restart); the daemon was not restarted")
+
+
 #: A ticker as trader's store spells them: BRK.A, BF-B, CRWD.
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9]{0,9}(?:[.-][A-Z0-9]{1,4})?$")
 
@@ -228,7 +420,7 @@ def _refetch(op, args, ctx):
             i += 1
             while i < len(args) and not args[i].startswith("--"):
                 s = args[i].upper()
-                if not _SYMBOL.match(s):
+                if not _SYMBOL.fullmatch(s):
                     raise Refused(f"`{args[i]}` is not a ticker")
                 syms.append(s)
                 i += 1
@@ -256,7 +448,7 @@ _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _project_test(op, args, ctx):
-    if len(args) != 1 or not _SLUG.match(args[0].lower()):
+    if len(args) != 1 or not _SLUG.fullmatch(args[0].lower()):
         raise Refused(f"usage: {op.name} {op.usage}")
     slug = args[0].lower()
     rec = _project_rec(ctx, slug)
@@ -280,10 +472,18 @@ SHORT_NAME_MIN = 6
 def _names(op, args) -> tuple:
     """What naming this run in your message looks like: the op, or for a
     reinstall the job it acts on. Matched as whole words (`named`)."""
+    if op.name == "trader-launchd-retire" and args:
+        # Retiring is not undone by running it again: only the op or the full
+        # label names it. A last part ("restart", "heartbeat") is a word said
+        # in passing.
+        job = args[0][:-len(".plist")] if args[0].endswith(".plist") else args[0]
+        return (op.name, job)
     if op.name == "trader-launchd-reinstall" and args:
         job = args[0][:-len(".plist")] if args[0].endswith(".plist") else args[0]
         short = job.rsplit(".", 1)[-1]
         return (op.name, job) + ((short,) if len(short) >= SHORT_NAME_MIN else ())
+    if op.name == "trader-env-set" and args:
+        return (op.name, args[0])
     if op.name == "trader-refetch-revisions":
         return (op.name, "refetch_revisions")
     return (op.name,)
@@ -324,6 +524,19 @@ REGISTRY: dict[str, Op] = {op.name: op for op in (
        "while the market is open; takes update_data's lock and backs up first)",
        "--symbols SYM [SYM …] [--dividends] [--apply]", 1800, None, _refetch,
        named=True, writes=lambda args: "--apply" in args),
+    Op("trader-launchd-retire", "trader",
+       "retire one of trader's installed launchd jobs: launchctl bootout, then move "
+       "~/Library/LaunchAgents/<job>.plist to a dated backup in trader's "
+       f"{RETIRED_DIR}/ (never deleted)",
+       "<job label, e.g. com.traderjoe.shadowoptions>", 60, False, _launchd_retire,
+       named=True),
+    Op("trader-env-set", "trader",
+       "set one allowed key of trader's .env (backed up first to "
+       f"{ENV_BACKUPS}/; only that line changes, no other line is shown): "
+       + "; ".join(f"{k} in {{{', '.join(v)}}}" for k, v in ENV_KEYS.items())
+       + ". Takes effect at the trading daemon's next restart (the weekly Sunday "
+       "restart); it does not restart the daemon",
+       "<KEY> <VALUE>", 30, False, _env_set, named=True),
     Op("project-test", "",
        "run a project's own test command (its test_cmd) in its checkout, under the "
        "lock every run of that suite takes",
@@ -360,8 +573,8 @@ def arg_refusal(args) -> str:
             return "an empty argument"
         if len(a) > MAX_ARG:
             return f"`{a[:MAX_ARG]}…` is longer than {MAX_ARG} characters"
-        if not SAFE_ARG.match(a):
-            bad = "".join(sorted({c for c in a if not SAFE_ARG.match(c)}))
+        if not SAFE_ARG.fullmatch(a):
+            bad = "".join(sorted({c for c in a if not SAFE_ARG.fullmatch(c)}))
             return (f"`{a}` holds characters an op never takes ({bad!r}): no "
                     "shell runs here, and an argument is never shell")
     return ""
@@ -392,8 +605,10 @@ def plan(name: str, args, ctx: Context) -> Plan:
     steps, cwd = op.build(op, args, ctx)
     project = op.project or (args[0].lower() if args else "")
     names = _names(op, args) if op.named else ()
+    # Setting a key needs its value said too.
+    also = (args[1],) if op.named and op.name == "trader-env-set" else ()
     return Plan(name=op.name, project=project, args=args, cwd=str(cwd), steps=steps,
-                timeout=op.timeout, read_only=not op.mutating(args), names=names,
+                timeout=op.timeout, read_only=not op.mutating(args), names=names, also=also,
                 lock=project if op.name == "project-test" else "")
 
 
@@ -422,6 +637,9 @@ def refusal(p: Plan, *, in_turn: bool, grant: dict | None, notes: str) -> str:
                     else "what is exposed on the tailnet")
             return (f"refused: `{p.name}` changes {what}, so the user's message has to "
                     f"name it (one of: {', '.join(p.names)}); ask them to say so")
+    if p.also and not all(named((a,), grant.get("text") or "") for a in p.also):
+        return (f"refused: `{p.name}` changes trader's live configuration, so the user's "
+                f"message has to say the value too ({', '.join(p.also)}); ask them to say so")
     return ""
 
 
@@ -487,9 +705,13 @@ def run(p: Plan, *, env: dict | None = None, runner=None, clock=time.monotonic,
                     rc, out = None, f"timed out after {p.timeout}s"
                 except (OSError, ValueError) as e:
                     rc, out = None, f"could not run it: {e}"
+                if step.quiet and rc is not None:
+                    out = "(output not kept)"
                 done.append({"argv": list(step.argv), "exit": rc, "tail": _tail(_scrub(out))})
-                if rc != 0 and not step.may_fail:
-                    code = rc
+                failed = (rc is None or rc == 0) if step.must_fail else rc != 0
+                if failed and not step.may_fail:
+                    # A must_fail step that exited 0 is a failed run: exit 1.
+                    code = (1 if rc == 0 else rc) if step.must_fail else rc
                     break
     finally:
         with _running_guard:
@@ -552,3 +774,23 @@ def format_run(rec: dict) -> str:
     if tail:
         lines.append(tail)
     return "\n".join(lines)
+
+
+def _main(argv) -> int:
+    """`python -I ops.py env-set <.env> <backup> <KEY> <VALUE>`: the one step
+    trader-env-set runs. Prints only the changed key's old -> new."""
+    if len(argv) != 5 or argv[0] != "env-set":
+        print("usage: ops.py env-set <.env> <backup> <KEY> <VALUE>", file=sys.stderr)
+        return 2
+    try:
+        _, line = env_set(*argv[1:])
+    except (Refused, OSError, UnicodeDecodeError) as e:
+        # The error names paths and the key, never a line of the file.
+        print(f"refused: {type(e).__name__}: {e}"[:300], file=sys.stderr)
+        return 1
+    print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

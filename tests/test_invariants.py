@@ -29191,7 +29191,12 @@ def _ops_world():
     fake(fakebin / "tailscale", 'case "$*" in *--json*) echo "{}";; esac\nexit 0')
     fake(fakebin / "launchctl",
          'case "$1" in bootout) exit "${FAKE_BOOTOUT:-0}";; '
-         'bootstrap) exit "${FAKE_BOOTSTRAP:-0}";; esac\nexit 0')
+         'bootstrap) exit "${FAKE_BOOTSTRAP:-0}";; '
+         'print) echo "environment = { FAKE_TOKEN => ${FAKE_PRINT_LEAK:-x} }"; '
+         'exit "${FAKE_PRINT:-113}";; esac\nexit 0')
+    fake(fakebin / "mkdir", 'exec /bin/mkdir "$@"')
+    fake(fakebin / "mv", 'exec /bin/mv "$@"')
+    fake(fakebin / "test", 'exec /bin/test "$@"')
     fake(fakebin / "plutil", 'exec /usr/bin/plutil "$@"')
     fake(fakebin / "cp", 'exec /bin/cp "$@"')
     fake(fakebin / "runtests", 'echo "12 passed, 0 failed"\nexit "${FAKE_TESTS:-0}"')
@@ -29216,6 +29221,19 @@ def _ops_world():
     alpha.mkdir()
     agents = tmp / "LaunchAgents"
     agents.mkdir()
+    # Installed jobs, and trader's gitignored data/ and .env -- made after the
+    # commit, as they are not trader's tracked files. The .env's secrets are
+    # built here in pieces, so no secret-shaped literal sits in this file.
+    for label in ("com.traderjoe.shadowoptions", "com.traderjoe.stocktwits"):
+        with open(agents / f"{label}.plist", "wb") as f:
+            plistlib.dump({"Label": label, "ProgramArguments": ["/bin/true"]}, f)
+    (agents / "com.silkworm.bot.plist").write_bytes(b"<plist/>")
+    (trader / "data").mkdir()
+    secrets = ["sk" + "-live-" + os.urandom(12).hex(), "ib" + "pw" + os.urandom(8).hex()]
+    env_text = (f"# trader settings\nBROKER_KEY={secrets[0]}\n"
+                f"export IB_PASSWORD='{secrets[1]}'\nALERT_CHANNEL=C123\n")
+    (trader / ".env").write_text(env_text)
+    (trader / ".env").chmod(0o600)
     projects_ = {"trader": {"slug": "trader", "scope": {"cwd": str(trader)}},
                  "alpha": {"slug": "alpha", "scope": {"cwd": str(alpha)},
                            "test_cmd": f"{fakebin}/runtests --quick"},
@@ -29242,7 +29260,7 @@ def _ops_world():
                               agents=agents, ns=ns, ctx=ctx, port=port, state=state,
                               log=tmp / "ops.jsonl", real_context=real_context,
                               grants=ns["OPERATOR_GRANTS"], statefile=tmp / "operator.json",
-                              projects=projects_)
+                              projects=projects_, secrets=secrets, env_text=env_text)
     return w
 
 
@@ -29734,6 +29752,318 @@ def test_ops_one_run_at_a_time_and_within_its_timeout():
                   runner=lambda a, **k: types.SimpleNamespace(
                       returncode=0, stdout="key nodekey:0123456789abcdef", stderr=""))
     check("output is scrubbed of credentials", "0123456789abcdef" not in rec["tail"], rec["tail"])
+
+
+def _no_secrets(w, *texts):
+    """None of the fake .env's secrets in any of `texts`, the ops log or the
+    calls log."""
+    hay = "\n".join([*texts, w.log.read_text() if w.log.exists() else "",
+                     w.calls.read_text()])
+    return not any(x in hay for x in w.secrets)
+
+
+def test_ops_trader_retire_and_env_set_run_their_exact_steps():
+    import ops as OPS
+    import stat as _stat
+    print("\nnamed ops: trader-launchd-retire and trader-env-set run exactly their steps")
+    w = _ops_world()
+    job = "com.traderjoe.shadowoptions"
+    src = w.agents / f"{job}.plist"
+    p = OPS.plan("trader-launchd-retire", [job], w.ctx)
+    retired = (w.trader / "data").resolve() / "retired-launchd"
+    dst = p.steps[-1].argv[-1]
+    check("retire: bootout (may fail), print (must fail, output not kept), mkdir, mv -n, test",
+          [s.argv for s in p.steps] == [
+              ["launchctl", "bootout", f"gui/501/{job}"],
+              ["launchctl", "print", f"gui/501/{job}"],
+              ["mkdir", "-p", str(retired)],
+              ["mv", "-n", str(src), dst], ["test", "-f", dst]]
+          and [(s.may_fail, s.must_fail, s.quiet) for s in p.steps]
+          == [(True, False, False), (False, True, True), (False, False, False),
+              (False, False, False), (False, False, False)]
+          and _re.fullmatch(_re.escape(str(retired / job)) + r"\.\d{8}-\d{6}\.plist", dst)
+          and p.cwd == str(w.trader) and not p.read_only, [s.argv for s in p.steps])
+    check("and is named only by the op or the full label -- never a last part like "
+          "'restart' or 'heartbeat', words said in passing",
+          p.names == ("trader-launchd-retire", job)
+          and OPS.plan("trader-launchd-retire", ["com.traderjoe.stocktwits"], w.ctx).names
+          == ("trader-launchd-retire", "com.traderjoe.stocktwits"), p.names)
+    p = OPS.plan("trader-env-set", ["MOMENTUM_UNIVERSE", "pit"], w.ctx)
+    check("env-set: one step, the ops.py helper under -I, with the .env, a dated backup "
+          "in data/env-backups, the key and the value",
+          len(p.steps) == 1 and p.steps[0].argv[:4] == [
+              sys.executable, "-I", str((BASE / "ops.py").resolve()), "env-set"]
+          and p.steps[0].argv[4] == str(w.trader / ".env")
+          and _re.fullmatch(_re.escape(str((w.trader / "data").resolve() / "env-backups"))
+                           + r"/env\.\d{8}-\d{6}\.bak", p.steps[0].argv[5])
+          and p.steps[0].argv[6:] == ["MOMENTUM_UNIVERSE", "pit"]
+          and not p.read_only and p.names == ("trader-env-set", "MOMENTUM_UNIVERSE")
+          and p.also == ("pit",),
+          [s.argv for s in p.steps])
+    with _fake_path(w):
+        g = _ops_turn(w, "lets address all 5 of these: retire com.traderjoe.shadowoptions")
+        r = _ops_as_user(w, g, "trader-launchd-retire", job, "--notes", "user: retire it")
+        check("through the bot: launchctl bootout, print, then mkdir, mv, test, in order",
+              [" ".join(c.split()[:2]) for c in _calls(w)]
+              == ["launchctl bootout", "launchctl print", "mkdir -p", "mv -n",
+                  f"test -f"] and r.returncode == 0, _calls(w) + [r.stdout, r.stderr])
+        moved = sorted(retired.glob(f"{job}.*.plist"))
+        check("the plist is gone from LaunchAgents and kept, byte for byte, in "
+              "data/retired-launchd",
+              not src.exists() and len(moved) == 1
+              and plistlib_load(moved[0]).get("Label") == job, moved)
+        check("the other jobs are untouched", (w.agents / "com.traderjoe.stocktwits.plist")
+              .exists() and (w.agents / "com.silkworm.bot.plist").exists())
+        check("the reply has each step and exit code",
+              r.stdout.count("[exit") == 5 and "launchctl bootout gui/501/" + job in r.stdout,
+              r.stdout)
+    with _fake_path(w, FAKE_BOOTOUT="3"):
+        w.calls.write_text("")
+        g = _ops_turn(w, "retire com.traderjoe.stocktwits")
+        r = _ops_as_user(w, g, "trader-launchd-retire", "com.traderjoe.stocktwits",
+                         "--notes", "user: retire stocktwits")
+        check("a job that was not loaded (bootout fails) is still retired",
+              r.returncode == 0 and not (w.agents / "com.traderjoe.stocktwits.plist").exists(),
+              r.stdout + r.stderr)
+    import plistlib
+    with open(w.agents / "com.traderjoe.stocktwits.plist", "wb") as f:
+        plistlib.dump({"Label": "com.traderjoe.stocktwits"}, f)
+    leak = "tok" + os.urandom(10).hex()
+    with _fake_path(w, FAKE_BOOTOUT="5", FAKE_PRINT="0", FAKE_PRINT_LEAK=leak):
+        w.calls.write_text("")
+        g = _ops_turn(w, "retire com.traderjoe.stocktwits")
+        r = _ops_as_user(w, g, "trader-launchd-retire", "com.traderjoe.stocktwits",
+                         "--notes", "user: retire stocktwits")
+        check("a job still loaded after bootout is not moved: a failed run, exit 1",
+              r.returncode == 1 and (w.agents / "com.traderjoe.stocktwits.plist").exists()
+              and not any(c.startswith(("mkdir", "mv")) for c in _calls(w)),
+              _calls(w) + [r.stdout, r.stderr])
+        check("and launchctl print's output (a job's environment) is not kept",
+              leak not in r.stdout + r.stderr + w.log.read_text()
+              and "(output not kept)" in r.stdout, r.stdout + r.stderr)
+    env = w.trader / ".env"
+    with _fake_path(w):
+        w.calls.write_text("")
+        g = _ops_turn(w, "switch the momentum universe to pit")
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                         "--notes", "user: MOMENTUM_UNIVERSE=pit")
+        text = env.read_text()
+        check("env-set adds a missing key as one line at the end, every other byte as it was",
+              r.returncode == 0 and text == w.env_text + "MOMENTUM_UNIVERSE=pit\n",
+              r.stdout + r.stderr)
+        backups = sorted((w.trader / "data" / "env-backups").iterdir())
+        check("after backing the old file up, mode 0600",
+              len(backups) == 1 and backups[0].read_text() == w.env_text
+              and _stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+              and _stat.S_IMODE(env.stat().st_mode) == 0o600, backups)
+        check("it reports old -> new, and that it waits for the daemon's next restart",
+              "MOMENTUM_UNIVERSE: (unset) -> pit" in r.stdout
+              and "next restart (the weekly Sunday restart)" in r.stdout
+              and "not restarted" in r.stdout, r.stdout)
+        check("restarting nothing: no launchctl, no other program",
+              _calls(w) == [], _calls(w))
+        g = _ops_turn(w, "actually set trader-env-set MOMENTUM_UNIVERSE back to static")
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "static",
+                         "--notes", "user: back to static")
+        check("a key already there is changed in place: pit -> static, still one line",
+              r.returncode == 0 and "MOMENTUM_UNIVERSE: pit -> static" in r.stdout
+              and env.read_text() == w.env_text + "MOMENTUM_UNIVERSE=static\n",
+              r.stdout + r.stderr)
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "static",
+                         "--notes", "user: back to static")
+        check("setting the value it has changes and backs up nothing",
+              r.returncode == 0 and "already static" in r.stdout
+              and len(list((w.trader / "data" / "env-backups").iterdir())) == 2, r.stdout)
+        g = _ops_turn(w, "set MOMENTUM_UNIVERSE to pit")
+        env.write_bytes(w.env_text.replace("ALERT_CHANNEL=C123\n",
+                                           "export MOMENTUM_UNIVERSE=\"static\"  # was\r\n"
+                                           "ALERT_CHANNEL=C123\n").encode())
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                         "--notes", "user: pit")
+        check("an `export KEY=\"value\"  # comment` line keeps its export and line ending",
+              r.returncode == 0 and "static -> pit" in r.stdout
+              and env.read_bytes() == w.env_text.replace(
+                  "ALERT_CHANNEL=C123\n", "export MOMENTUM_UNIVERSE=pit\r\nALERT_CHANNEL=C123\n"
+              ).encode(), repr(env.read_bytes()))
+        twice = w.env_text + "MOMENTUM_UNIVERSE=static\nMOMENTUM_UNIVERSE=pit\n"
+        env.write_text(twice)
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                         "--notes", "user: pit")
+        check("a key set on two lines is refused, the file untouched",
+              r.returncode == 1 and "2 lines" in r.stdout + r.stderr
+              and env.read_text() == twice, r.stdout + r.stderr)
+        for name, odd in (("a form feed", "\x0c"), ("a lone carriage return", "\r"),
+                          ("a line separator", "\u2028")):
+            body = (w.env_text + f"MOMENTUM_UNIVERSE=static{odd}SECRET_TWO=" + w.secrets[0]
+                    + "\n").encode()
+            env.write_bytes(body)
+            r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                             "--notes", "user: pit")
+            check(f"a .env with {name} inside a line is refused, not joined to the next "
+                  "line (a secret's)", r.returncode == 1 and "line breaks" in r.stdout + r.stderr
+                  and env.read_bytes() == body, r.stdout + r.stderr)
+        body = ("\ufeff" + "MOMENTUM_UNIVERSE=static\n" + w.env_text).encode()
+        env.write_bytes(body)
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                         "--notes", "user: pit")
+        check("so is one starting with a BOM (its first key would be missed, then added "
+              "twice)", r.returncode == 1 and env.read_bytes() == body, r.stdout + r.stderr)
+        check("no secret of the .env in any reply, the ops log or the calls",
+              _no_secrets(w, r.stdout, r.stderr), "")
+    runs = OPS.read_log(w.log, 50)
+    check("the ops log has the runs, each step's argv and exit code",
+          any(x.get("op") == "trader-env-set" and x.get("ok") for x in runs)
+          and any(x.get("op") == "trader-launchd-retire" and x.get("ok") for x in runs))
+
+
+def plistlib_load(path):
+    import plistlib
+    with open(path, "rb") as f:
+        return plistlib.load(f)
+
+
+def test_ops_trader_retire_and_env_set_refuse_what_they_do_not_take():
+    import ops as OPS
+    print("\nnamed ops: retire and env-set refuse unknown jobs, keys, values, shell, and "
+          "anyone's word but yours")
+    w = _ops_world()
+
+    def refused(name, args):
+        try:
+            OPS.plan(name, args, w.ctx)
+        except OPS.Refused as e:
+            return str(e)
+        except Exception as e:          # fails the check, not the whole test
+            return f"raised {e!r}"
+        return ""
+
+    R = "trader-launchd-retire"
+    check("a job that is not trader's", "not one of trader's jobs" in refused(
+        R, ["com.silkworm.bot"]))
+    check("one of trader's that is not installed, naming what is",
+          "no installed com.traderjoe.nope" in refused(R, ["com.traderjoe.nope"])
+          and "com.traderjoe.shadowoptions" in refused(R, ["com.traderjoe.nope"]))
+    check("a label that walks out of LaunchAgents",
+          "not a launchd job label" in refused(R, ["../com.traderjoe.x"])
+          and "not a launchd job label" in refused(R, ["com.traderjoe..x"]))
+    check("exactly one job", refused(R, []) and refused(
+        R, ["com.traderjoe.shadowoptions", "com.traderjoe.stocktwits"]))
+    (w.agents / "com.traderjoe.link.plist").symlink_to(w.agents / "com.traderjoe.stocktwits.plist")
+    check("an installed plist that is a symlink",
+          "no installed com.traderjoe.link" in refused(R, ["com.traderjoe.link"]))
+    import plistlib
+    with open(w.agents / "com.traderjoe.mislabel.plist", "wb") as f:
+        plistlib.dump({"Label": "com.traderjoe.other"}, f)
+    check("an installed plist whose Label is another job's",
+          "Label is 'com.traderjoe.other'" in refused(R, ["com.traderjoe.mislabel"]))
+    (w.agents / "com.traderjoe.junk.plist").write_bytes(b"not a plist")
+    check("or one that does not parse", "does not parse" in refused(R, ["com.traderjoe.junk"]))
+    (w.trader / "data" / "retired-launchd").symlink_to(w.tmp)
+    check("a retired-launchd that is a symlink",
+          "symlink" in refused(R, ["com.traderjoe.shadowoptions"]))
+    (w.trader / "data" / "retired-launchd").unlink()
+    E = "trader-env-set"
+    for key in ("BROKER_KEY", "IB_PASSWORD", "momentum_universe", "PATH"):
+        check(f"a key not on the list ({key})", "not a key" in refused(E, [key, "pit"]))
+    for value in ("PIT", "dynamic", "", "static,pit", "pit=1"):
+        why = refused(E, ["MOMENTUM_UNIVERSE", value])
+        check(f"a value MOMENTUM_UNIVERSE does not take ({value!r})",
+              "not a value" in why or "empty" in why, why)
+    for bad in ("pit;id", "$(id)", "pit x", "`id`", "pit\n", "pit|x"):
+        check(f"shell in a value ({bad!r})", "never shell" in refused(
+            E, ["MOMENTUM_UNIVERSE", bad]))
+        check(f"or in a label ({bad!r})", "never shell" in refused(R, [bad]))
+    check("one key and one value", refused(E, ["MOMENTUM_UNIVERSE"])
+          and refused(E, ["MOMENTUM_UNIVERSE", "pit", "x"]))
+    check("the helper itself refuses a key or value off the list",
+          "not allowed" in _refusal_of(lambda: OPS.env_set(w.trader / ".env", w.tmp / "b",
+                                                       "BROKER_KEY", "x"))
+          and "not allowed" in _refusal_of(lambda: OPS.env_set(
+              w.trader / ".env", w.tmp / "b", "MOMENTUM_UNIVERSE", "dynamic"))
+          and (w.trader / ".env").read_text() == w.env_text)
+    (w.trader / "data" / "env-backups").symlink_to(w.tmp)
+    check("an env-backups that is a symlink", "symlink" in refused(
+        E, ["MOMENTUM_UNIVERSE", "pit"]))
+    (w.trader / "data" / "env-backups").unlink()
+    real = w.trader / ".env"
+    moved = w.tmp / "real.env"
+    real.rename(moved)
+    real.symlink_to(moved)
+    check("a .env that is a symlink", "not a plain file" in refused(
+        E, ["MOMENTUM_UNIVERSE", "pit"]))
+    r = subprocess.run([sys.executable, "-I", str(BASE / "ops.py"), "env-set", str(real),
+                        str(w.tmp / "b2"), "MOMENTUM_UNIVERSE", "pit"],
+                       capture_output=True, text=True)
+    check("and the helper refuses it too, writing nothing",
+          r.returncode == 1 and moved.read_text() == w.env_text
+          and not (w.tmp / "b2").exists(), r.stderr)
+    real.unlink()
+    moved.rename(real)
+    with _fake_path(w):
+        w.calls.write_text("")
+        for argv in (["trader-launchd-retire", "com.traderjoe.shadowoptions"],
+                     ["trader-env-set", "MOMENTUM_UNIVERSE", "pit"]):
+            r = _ops_as_sweep(w, *argv, "--notes", "x")
+            check(f"a sweep's {argv[0]} is refused", r.returncode == 1
+                  and "never in a sweep" in r.stderr, r.stderr)
+            out = _ops_ask(w, {"action": "run", "name": argv[0], "args": argv[1:],
+                               "caller_role": "operator", "caller_thread": "D1:1.0",
+                               "caller_task": "tsk_sweep", "notes": "x"})
+            check(f"and by the bot itself ({argv[0]})",
+                  not out["ok"] and out.get("refused") == "grant", out)
+            g = _ops_turn(w, "do the five things from this morning")
+            r = _ops_as_user(w, g, *argv, "--notes", "user: do them")
+            check(f"your turn, but a message that never names {argv[0]}, its job or key",
+                  r.returncode == 1 and "trader's live configuration" in r.stderr
+                  and "has to name it" in r.stderr, r.stderr)
+            g = _ops_turn(w, f"run {argv[0]} please")
+            r = _ops_as_user(w, g, *argv)
+            check(f"named, but without --notes ({argv[0]})",
+                  r.returncode == 1 and "--notes" in r.stderr, r.stderr)
+        g = _ops_turn(w, "retire the stocktwits job")
+        r = _ops_as_user(w, g, "trader-launchd-retire", "com.traderjoe.shadowoptions",
+                         "--notes", "user: retire stocktwits")
+        check("naming another job does not name this one", r.returncode == 1
+              and "has to name it" in r.stderr, r.stderr)
+        for text in ("retire shadowoptions", "restart the heartbeat and shadowoptions jobs"):
+            g = _ops_turn(w, text)
+            r = _ops_as_user(w, g, "trader-launchd-retire", "com.traderjoe.shadowoptions",
+                             "--notes", "user: retire")
+            check(f"a job's last part alone does not name a retire ({text!r})",
+                  r.returncode == 1 and "has to name it" in r.stderr, r.stderr)
+        for text in ("what is the momentum universe on now?",
+                     "set MOMENTUM_UNIVERSE to static"):
+            g = _ops_turn(w, text)
+            r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                             "--notes", "user: pit")
+            check(f"the key without the value set does not name it ({text!r})",
+                  r.returncode == 1 and "say the value too" in r.stderr, r.stderr)
+        g = _ops_turn(w, "set the universe to pit")
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "pit",
+                         "--notes", "user: pit")
+        check("'universe' alone does not name MOMENTUM_UNIVERSE", r.returncode == 1
+              and "has to name it" in r.stderr, r.stderr)
+        out = _ops_ask(w, {"action": "run", "name": "trader-env-set",
+                           "args": ["MOMENTUM_UNIVERSE", "pit"], "caller_role": "assistant",
+                           "caller_thread": "C9:9.0", "caller_task": "tsk_x", "notes": "x"})
+        check("nor does any other turn's (an assistant's)", not out["ok"], out)
+        check("none of it ran anything or touched a file",
+              not _calls(w) and (w.trader / ".env").read_text() == w.env_text
+              and (w.agents / "com.traderjoe.shadowoptions.plist").exists()
+              and not (w.trader / "data" / "env-backups").exists(), _calls(w))
+        r = _ops_cli(w, "run", "trader-env-set", "MOMENTUM_UNIVERSE", "pit", role="",
+                     thread="")
+        check("your own terminal (no turn) runs it", r.returncode == 0
+              and "(unset) -> pit" in r.stdout, r.stdout + r.stderr)
+        check("no secret in any of it", _no_secrets(w, r.stdout, r.stderr))
+
+
+def _refusal_of(fn) -> str:
+    try:
+        fn()
+    except Exception as e:
+        return str(e)
+    return ""
 
 
 def test_ops_on_the_operators_allowlist_and_in_its_prompts():
