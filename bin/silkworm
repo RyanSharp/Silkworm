@@ -39,8 +39,12 @@
     silkworm status                 health check: services, bot, visualizer, hooks
     silkworm restart                restart the services
     silkworm tailscale [status|on|off]  serve the dashboard to your tailnet (never Funnel)
-    silkworm ops list | log | run <name> [args] [--notes N]   named operations on this
-                                    machine (ops.py): the operator runs these on your word
+    silkworm ops list | log | run <name> [args] [--notes N] [--plan-entry N]
+                                    named operations on this machine (ops.py): the
+                                    operator runs these on your word
+    silkworm ops plan <op> [args] [--op <op> [args]]… --by operator
+                                    record the ops the operator proposed, numbered, so
+                                    a plain "yes" or "do 2" from you runs them
     silkworm push [status|test|forget-all]  phone notifications: what is set up, send a
                                     test to every subscribed device, or drop them all
     silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
@@ -1030,10 +1034,15 @@ def do_file_task(argv) -> None:
         print("no thread — `task` only works from inside a Silkworm turn")
         raise SystemExit(1)
     project, role, goal, propose, check = "", "", [], False, ""
+    requested, notes = False, ""
     i = 0
     while i < len(argv):
         if argv[i] == "--propose":
             propose = True; i += 1
+        elif argv[i] == "--requested-by-user":
+            requested = True; i += 1
+        elif argv[i] == "--notes" and i + 1 < len(argv):
+            notes = argv[i + 1]; i += 2
         elif argv[i] == "--project" and i + 1 < len(argv):
             project = argv[i + 1]; i += 2
         elif argv[i] == "--role" and i + 1 < len(argv):
@@ -1046,8 +1055,12 @@ def do_file_task(argv) -> None:
     if not goal:
         print('usage: silkworm task [--propose] [--project <slug>] '
               '[--role implementor|assistant|researcher] '
-              '[--health <project>/<check>] "<goal>"')
+              '[--health <project>/<check>] '
+              '[--requested-by-user --notes "<the user\'s request>"] "<goal>"')
         raise SystemExit(2)
+    if requested and not notes.strip():
+        print("not filed: --requested-by-user needs --notes quoting what the user asked for")
+        raise SystemExit(1)
     r = bot_call("/file-task", {"key": key, "goal": goal, "propose": propose,
                                 # A fix for this health check: proposed, once
                                 # per (project, check), its evidence attached.
@@ -1062,11 +1075,18 @@ def do_file_task(argv) -> None:
                                 # next steps are filed under it. Only picks
                                 # between tasks the bot already sees running on
                                 # this thread; see bot.research_parent.
-                                "caller_task": os.environ.get("SILKWORM_TASK_ID", "")})
+                                "caller_task": os.environ.get("SILKWORM_TASK_ID", ""),
+                                # Filed on the user's explicit request: the bot
+                                # checks it against the grant of the turn they
+                                # started (bot.requested_filing), which
+                                # bot_call's caller() sends.
+                                **({"requested_by_user": True, "notes": notes.strip()}
+                                   if requested else {})})
     if not r.get("ok"):
         print(f"not filed: {r.get('error') or 'the bot did not answer'}")
         raise SystemExit(1)
     print(f"filed {r['id']} ({r.get('state', 'queued')}) as {r['role']}"
+          + (" on the user's request" if r.get("requested_by_user") else "")
           + (f" under {r['project']}" if r.get("project") else "")
           + f" in {r.get('cwd') or '?'} ({r['remaining']} more allowed this turn)")
 
@@ -1382,7 +1402,8 @@ def do_release(argv: list, ask=None, state=None) -> int:
 
 
 OPS_USAGE = ("usage: silkworm ops list [--json] | log [-n N] [--json] | "
-             "run <name> [args …] [--notes TEXT] [--by NAME]")
+             "run <name> [args …] [--notes TEXT] [--by NAME] [--plan-entry N] | "
+             "plan [<name> [args …] [--op <name> [args …]]… --by NAME] [--json]")
 #: Beyond an op's own timeout, how long the CLI waits on the bot's answer.
 OPS_SLACK_S = 60
 
@@ -1399,13 +1420,18 @@ def parse_ops_run(argv: list) -> dict:
     payload, rest, i = {"action": "run", "by": default_by()}, [], 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--notes", "--by"):
+        if a in ("--notes", "--by", "--plan-entry"):
             # Never an option: `--notes --apply` would swallow the --apply
             # and quietly run something other than what was asked.
             if (i + 1 >= len(argv) or not argv[i + 1].strip()
                     or argv[i + 1].startswith("--")):
                 raise ValueError(f"{a} needs a value\n{OPS_USAGE}")
-            payload[a[2:]] = argv[i + 1].strip()
+            if a == "--plan-entry":
+                if not argv[i + 1].strip().isdigit():
+                    raise ValueError(f"--plan-entry takes an entry number\n{OPS_USAGE}")
+                payload["plan_entry"] = int(argv[i + 1])
+            else:
+                payload[a[2:]] = argv[i + 1].strip()
             i += 2
         else:
             rest.append(a)
@@ -1413,6 +1439,34 @@ def parse_ops_run(argv: list) -> dict:
     if not rest:
         raise ValueError(OPS_USAGE)
     payload["name"], payload["args"] = rest[0], rest[1:]
+    return payload
+
+
+def parse_ops_plan(argv: list) -> dict:
+    """The /ops plan payload from the arguments after `plan`: entries split
+    at each --op, and --by. Raises ValueError with the usage line."""
+    payload, entries, cur, i = {"action": "plan", "by": default_by()}, [], [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--by":
+            if i + 1 >= len(argv) or not argv[i + 1].strip() or argv[i + 1].startswith("--"):
+                raise ValueError(f"--by needs a value\n{OPS_USAGE}")
+            payload["by"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if a == "--op":
+            if not cur:
+                raise ValueError(f"--op starts the next op; name the first one first\n{OPS_USAGE}")
+            entries.append(cur)
+            cur = []
+        else:
+            cur.append(a)
+        i += 1
+    if cur:
+        entries.append(cur)
+    if not entries:
+        raise ValueError(OPS_USAGE)
+    payload["entries"] = [{"name": e[0], "args": e[1:]} for e in entries]
     return payload
 
 
@@ -1442,7 +1496,7 @@ def ops_cli_refusal(payload: dict) -> str:
 
 
 def do_ops(argv: list, ask=None) -> int:
-    """`silkworm ops list | log | run`: the named operations (ops.py).
+    """`silkworm ops list | log | run | plan`: the named operations (ops.py).
 
     `list` and `log` read locally -- the registry is code, the log a file --
     so they answer with the bot down. `run` asks the bot, which builds the
@@ -1487,6 +1541,8 @@ def do_ops(argv: list, ask=None) -> int:
             else:
                 print(f"{head} — exit {r.get('exit')} ({who})\n{ops.format_run(r)}")
         return EXIT_OK
+    if sub == "plan":
+        return do_ops_plan(rest, ask)
     if sub != "run":
         print(OPS_USAGE, file=sys.stderr)
         return EXIT_USAGE
@@ -1518,6 +1574,56 @@ def do_ops(argv: list, ask=None) -> int:
         return EXIT_OK
     print(f"failed: {head} (exit {run.get('exit')}, {run.get('seconds')}s)", file=sys.stderr)
     return EXIT_REFUSED
+
+
+def do_ops_plan(rest: list, ask) -> int:
+    """`silkworm ops plan <op> [args] [--op <op> [args]]… --by operator`:
+    record the ops just proposed as the pending plan, numbered from 1, for the
+    user to answer with a plain "yes" or "do 2". With no op, print the live
+    plan. Only an operator turn in its home thread records one."""
+    as_json = "--json" in rest
+    rest = [a for a in rest if a != "--json"]
+    names = [a for a in rest if a != "--by"]
+    if not names or (len(rest) == 2 and rest[0] == "--by"):
+        payload = {"action": "show-plan"}
+    else:
+        try:
+            payload = parse_ops_plan(rest)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return EXIT_USAGE
+        for i, e in enumerate(payload["entries"], 1):
+            try:
+                ops.lookup(e["name"])
+            except ops.Refused as err:
+                print(f"refused: ops plan: entry {i}: {err}", file=sys.stderr)
+                return EXIT_REFUSED
+            why = ops.arg_refusal(e["args"])
+            if why:
+                print(f"refused: ops plan: entry {i}: {why}", file=sys.stderr)
+                return EXIT_REFUSED
+    try:
+        r = ask("/ops", payload)
+    except BotUnreachable as e:
+        print(f"not done: {e}", file=sys.stderr)
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        print(f"refused: ops plan: {r.get('error') or 'the bot gave no reason'}",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    if as_json:
+        print(json.dumps(r.get("plan"), indent=2))
+        return EXIT_OK
+    plan = r.get("plan")
+    if not plan:
+        print("no pending plan")
+        return EXIT_OK
+    head = ("recorded" if payload["action"] == "plan" else "pending") + f" plan {plan['id']}"
+    print(head + " -- show the user these, numbered; a plain 'yes' runs them all, "
+          "'do 2' just that one, 'all but 1' the rest:")
+    for line in r.get("lines") or []:
+        print(line)
+    return EXIT_OK
 
 
 OPERATOR_USAGE = ("usage: silkworm operator notes [--set TEXT] | "

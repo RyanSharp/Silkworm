@@ -1051,10 +1051,18 @@ as before. Even on your word: publishing where publish is off and trader's
 live configuration still need `!approve`, a running task is cancelled only if
 your message named it, and dismissing never deletes a branch.
 
+Work you ask it for in so many words it files with `silkworm task
+--requested-by-user --notes "<your request>" "<goal>"`: straight to the queue
+(or as a proposal, with `--propose`), past the project's `MAX_OPEN_PROPOSALS`
+cap, which rations ideas nobody asked for. Only in a turn you started in its
+thread (the grant); the task records `requested_by_user` — who, which message,
+your words and how full the board was. Its own ideas, the sweep's, ideation's
+and a review's follow-ups keep the cap.
+
 **Named ops: what it runs instead of telling you to.** Where the fix is a
 command on the mini, the operator runs a named op rather than handing you a
 shell step: `silkworm ops run <name> [args] --by operator --notes "…"` (its
-allowlist has `ops run`, `ops list` and `ops log` — still no shell). The ops
+allowlist has `ops run`, `ops list`, `ops log` and `ops plan` — still no shell). The ops
 are a fixed registry in code (`ops.py`); each names its project, the directory
 it runs in, the exact argv it runs, a timeout and whether it changes anything.
 The bot builds the argv and runs it with no shell; arguments are validated per
@@ -1074,9 +1082,27 @@ outright.
 One that only reads runs in any turn, the daily sweep included. One that
 changes something runs from inside a turn only on your word — the grant of a
 turn you started in its home thread, with `--notes` — and never in a sweep or a
-wake-up (the sweep names the op under *Needs you* and asks you to tell it).
-Trader's (its live configuration) and `tailscale-on` (exposure) also need your
-message to name them, as whole words. Your own terminal and the dashboard carry no turn and
+wake-up. Trader's (its live configuration) and `tailscale-on` (exposure) also
+need your message to name them, as whole words — or to approve them as entries
+of a plan.
+
+**Plans: say yes, not the command.** When the operator proposes ops (a sweep's
+*Needs you*, or a reply here), it records them with `silkworm ops plan <op>
+[args] [--op <op> [args]]… --by operator` and numbers them in its reply as that
+prints them. A plain answer in your next message in its thread runs them:
+"yes", "go", "do it", "run them" (all), "do 1 and 3", "just 2", "all but 2".
+The operator runs each with `ops run <op> <args> --plan-entry N`, and the bot
+checks that it is exactly that entry's op and arguments, that the entry has not
+run, that the plan was recorded before your message and is still the live one
+(a day at most, replaced by the next), that your message is the first one
+after it (a later "ok thanks" answers nothing), and that your words approve
+entry N — read by `operator_role.plan_approval`, fixed rules with tests, never
+a model. A question ("what does 2 do?"), a no, wait or later, a number that is
+not an entry, or any word beyond yes, entry numbers and the plan's own op
+words ("do it in 2 hours", "all except the trader ones") approves nothing; the
+operator answers, records the plan again and asks. An op not in the plan still needs naming. Each run
+records the plan id, the entry and your message's ts; `silkworm ops plan`
+alone shows the pending plan. Your own terminal and the dashboard carry no turn and
 are you: `silkworm ops run tailscale-on` works there as it is. The CLI refuses
 first, and the bot again. Every run and refusal is appended to
 `logs/ops.jsonl` — who, on whose Slack message, each step's argv, exit code and

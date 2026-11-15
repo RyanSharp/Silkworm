@@ -270,6 +270,10 @@ FIELDS: dict[str, tuple] = {
     # cap, or a duplicate), so the board can say so rather than drop them.
     # The ones that were filed are its children: `parent` names it.
     "next_steps_held": (list, "research next steps refused at filing, and why"),
+    # Filed by the operator on your explicit request, in a turn you started in
+    # its thread: past the open-proposal cap, maybe straight to the queue. Its
+    # own field, as `result` is rewritten by every run.
+    "requested_by_user": (None, "{by, ts, notes, at, open_proposals}: filed on your word, past the cap"),
     "verified":        (None,  "True/False from the test command, None = not run"),
     # Set while this task's tests fail only where its project's base fails
     # them too (basered.py): held rather than sent back, failed or refused,

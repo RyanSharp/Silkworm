@@ -43,6 +43,13 @@ message and `decided_by`. A sweep, a wake-up, a deploy note or the web chat
 starts no turn of yours and carries none. Publishing where it is off and
 trader's live configuration still wait for `!approve`, and a running task is
 cancelled only if your message named it.
+
+Your word can be plain. Ops it proposes are recorded as a numbered pending
+plan (`State.set_plan`), and a "yes" or "do 2" in your next message runs
+those entries (`plan_approval`, `plan_refusal`). Work you ask it for, in so
+many words, it files with `--requested-by-user`: past the open-proposal cap,
+straight to the queue, with your message recorded on the task
+(bot.requested_filing). Neither is open to a sweep, a wake-up or ideation.
 """
 
 from __future__ import annotations
@@ -81,6 +88,11 @@ NOTES_MAX = 4096
 CONTEXT_MAX = 16000
 #: How long an approval waits to be used.
 APPROVAL_TTL_S = 24 * 3600
+#: How long a pending plan of ops waits for your answer.
+PLAN_TTL_S = 24 * 3600
+#: At most this many ops in one plan: past that it is not a plan you can read
+#: on a phone and say "yes" to.
+MAX_PLAN = 10
 
 # --- what it may not do --------------------------------------------------------
 
@@ -246,13 +258,18 @@ class Grants:
         self._lock = threading.Lock()
         self._live: dict[str, dict] = {}
 
-    def open(self, key: str, ts: str, user: str, text: str, task_id: str) -> str:
+    def open(self, key: str, ts: str, user: str, text: str, task_id: str,
+             plan: dict | None = None) -> str:
+        """`plan`: the pending plan your message answers (State.plan_before),
+        snapshotted as the turn starts: one recorded during it was not one you
+        had seen."""
         if not (key and ts and user and task_id):
             raise ValueError("a grant names its thread, message, person and turn")
         token = secrets.token_hex(16)
         with self._lock:
             self._live[token] = {"key": key, "ts": ts, "user": user,
-                                 "text": text or "", "task": task_id, "at": time.time()}
+                                 "text": text or "", "task": task_id, "at": time.time(),
+                                 "plan": plan or None}
         return token
 
     def close(self, token: str) -> None:
@@ -277,6 +294,175 @@ def decision_note(grant: dict, action: str, payload: dict) -> str:
     by = grant.get("user") or "the user"
     notes = " ".join(str((payload or {}).get("notes") or "").split())
     return f"{action} decided by {by} (Slack message {grant.get('ts')}) via operator: {notes}"
+
+
+# --- your answer to a plan, in plain words ---------------------------------------
+#
+# On 2026-11-15 "go with your recommendations, and run the trader ops" was
+# refused for all four of trader's ops: it named none of them. Now the operator
+# records the ops it proposes as a numbered plan (State.set_plan), and your
+# next message in its thread approves them by saying yes -- "yes", "go", "do
+# it", "run them", "do 1 and 3", "all but 2". Read here, by rules a test pins
+# down, never by a model: fail closed, so a question ("what does 2 do?"), a
+# no, a wait, or a number that is not an entry approves nothing.
+
+_SLACK_YES = re.compile(r":(?:\+1|thumbsup|white_check_mark|heavy_check_mark|ok_hand|"
+                        r"ok)(?::skin-tone-\d:)?:")
+_SLACK_EMOJI = re.compile(r":[a-z0-9_+'-]+:")
+_ITEM = r"#?\d+(?:\s*(?:-|–|to)\s*\d+)?"
+_ITEMS = (rf"(?:(?:entries|entry|items|item|numbers|number|steps|step|ops|op|no\.)\s*)?"
+          rf"{_ITEM}(?:\s*(?:,|&|\band\b|\bor\b|\bplus\b)\s*{_ITEM})*")
+#: "all but 2", "except 1 and 3", "not 4", "skip 2": numbers left out.
+_EXCLUDE = re.compile(r"\b(?:but\s+not|but|except(?:\s+for)?|other\s+than|apart\s+from|"
+                      rf"minus|skip(?:ping)?|without|not)\s+({_ITEMS})")
+#: A request phrased as a question is still an approval: "can you run them?".
+_ASKED_TO = re.compile(r"^(?:please\s+)?(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+                       r"(?:go\s+ahead|run|do|execute|proceed|approve)\b")
+#: Words that say yes, or say to go ahead.
+_AFFIRM = frozenset({
+    "yes", "y", "yep", "yeah", "yea", "yup", "ya", "ok", "okay", "k", "kk", "sure",
+    "go", "proceed", "approved", "approve", "lgtm", "do", "run", "execute", "fine",
+    "agreed", "agree", "confirmed", "confirm", "absolutely", "definitely",
+    "affirmative", "correct", "yess", "yesss"})
+#: Words an approval may hold besides those: what it refers to, and how.
+#: Anything else -- "later", "first", "except the trader ones", "file a task",
+#: "thanks" -- means the message says more than yes, and it approves nothing:
+#: the operator asks again rather than reading a yes into it.
+_FILLER = frozenset({
+    ",", "&", "and", "or", "plus", "to", "with", "for", "on", "of", "ahead", "the",
+    "please", "pls", "just", "only", "also", "then", "now", "it", "them", "that", "this",
+    "those", "these", "all", "both", "everything", "entry", "entries", "item", "items",
+    "number", "numbers", "step", "steps", "op", "ops", "plan", "your", "recommendation",
+    "recommendations", "recommended", "sounds", "good", "great", "perfect"})
+_TOKEN = re.compile(r"#?\d+\s*(?:-|–|to)\s*\d+|#?\d+|[a-z]+(?:'[a-z]+)?|[,&]|[^\s.!]")
+
+
+def _numbers(item_text: str) -> list:
+    """The entry numbers in "1, 3-4 and #6"."""
+    out = []
+    for lo, hi in re.findall(r"#?(\d+)(?:\s*(?:-|–|to)\s*#?(\d+))?", item_text):
+        a, b = int(lo), int(hi or lo)
+        if b < a or b - a > 50:
+            out.append(-1)                 # a range that makes no sense: nothing
+        else:
+            out.extend(range(a, b + 1))
+    return out
+
+
+def plan_words(entries) -> frozenset:
+    """The words of a plan's own ops ("trader", "tailscale", "momentum",
+    "pit"): an approval may name what it approves."""
+    out = set()
+    for e in entries or []:
+        for part in [e.get("name") or "", *(e.get("args") or [])]:
+            out.update(w for w in re.split(r"[^a-z0-9]+", str(part).lower()) if w.isalpha())
+    return frozenset(out)
+
+
+def plan_approval(text: str, count: int, words=()) -> tuple[frozenset, str]:
+    """Which entries (1..count) of a pending plan your message approves, and,
+    if none, why. Deterministic, and fail closed.
+
+    Yes to all: "yes", "go", "ok", "do it", "run them", ":+1:", "go with your
+    recommendations and run the trader ops". Some: "do 1 and 3", "yes, 2",
+    "1-3", "just 2", "2". All but some: "all but 2", "yes except 1 and 3".
+    Nothing: a question ("what does 2 do?"), a no, wait, hold, later or
+    don't, a number that is not an entry, or any word beyond saying yes and
+    naming entries or the plan's ops (`words`) -- "ok thanks", "do it in 2
+    hours", "all except the trader ones", "yes, and file a task for X".
+    """
+    if count < 1:
+        return frozenset(), "there is no plan"
+    t = (text or "").lower().replace("\u2019", "'").replace("\u2018", "'")
+    t = _SLACK_YES.sub(" yes ", t)
+    t = _SLACK_EMOJI.sub(" ", t)
+    t = t.replace("\U0001f44d", " yes ").replace("\u2705", " yes ")
+    t = " ".join(t.split())
+    t = re.sub(r"\bsounds?\s+(?:good|great|right|fine)\b", "yes", t)
+    if not t:
+        return frozenset(), "the message is empty"
+    excluded = []
+    for m in _EXCLUDE.finditer(t):
+        excluded += _numbers(m.group(1))
+    rest = " ".join(_EXCLUDE.sub(" ", t).split())
+    asked = _ASKED_TO.match(rest)
+    if "?" in rest and not asked:
+        return frozenset(), "the message asks a question; it approves nothing"
+    if asked:
+        # "can you run them?" -- the request, without its question form.
+        rest = re.sub(r"^(?:please\s+)?(?:can|could|would|will)\s+you\s+", "", rest)
+    tokens = [tok for tok in _TOKEN.findall(rest) if tok not in ("?",)]
+    known = _AFFIRM | _FILLER | set(words or ())
+    other = sorted({tok for tok in tokens if not tok[-1].isdigit() and tok not in known})
+    if other:
+        return frozenset(), ("the message says more than yes ("
+                             + ", ".join(f"{w!r}" for w in other[:4])
+                             + "); it approves nothing -- ask them to answer the plan")
+    selected = [n for tok in tokens if tok[-1].isdigit() for n in _numbers(tok)]
+    # "all but 2": the exception says which, and "all" says yes to the rest.
+    affirmed = any(tok in _AFFIRM for tok in tokens) or (
+        bool(excluded) and any(tok in ("all", "everything", "them", "both") for tok in tokens))
+    only_numbers = bool(selected) and not affirmed and all(
+        tok[-1].isdigit() or tok in (",", "&", "and", "or", "plus", "just", "only")
+        for tok in tokens)
+    if not affirmed and not only_numbers:
+        return frozenset(), "the message does not say yes or name entries"
+    bad = sorted({n for n in selected + excluded if not 1 <= n <= count})
+    if bad:
+        named_ = ", ".join(str(n) for n in bad if n > 0) or "such entry"
+        return frozenset(), f"the plan has entries 1-{count}; there is no {named_}"
+    approved = (set(selected) if selected else set(range(1, count + 1))) - set(excluded)
+    if not approved:
+        return frozenset(), "the message leaves every entry out"
+    return frozenset(approved), ""
+
+
+def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> str:
+    """Why entry `n` of the plan your message answered may not run as `name
+    args`, or "" if it may. `live` is the pending plan now (State.plan): the
+    grant's must still be it -- not expired, not replaced."""
+    if not grant:
+        return ("refused: running an op from a plan needs the user's answer -- a turn "
+                "they started with their own Slack message in the operator's thread")
+    gp = grant.get("plan") or None
+    if not gp:
+        return ("refused: no plan was waiting for the user's message (none was recorded "
+                "before it, or an earlier message of theirs already answered it); record "
+                "one (`ops plan`) and ask them, or have their message name the op")
+    if not live or live.get("id") != gp.get("id"):
+        return (f"refused: the plan the user answered ({gp.get('id')}) has expired or "
+                "been replaced; ask them about the current one")
+    if str(live.get("answered") or "") != str(grant.get("ts") or ""):
+        return ("refused: the plan was answered by another of the user's messages, not "
+                "this one; record it again and ask")
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"refused: --plan-entry takes an entry number, not {n!r}"
+    entry = next((e for e in live.get("entries") or [] if e.get("n") == n), None)
+    if not entry:
+        return f"refused: the plan has no entry {n}"
+    if entry.get("used"):
+        return f"refused: entry {n} of the plan has already run"
+    want = f"{entry['name']} {' '.join(entry.get('args') or [])}".strip()
+    got = f"{name} {' '.join(args or [])}".strip()
+    if entry["name"] != name or list(entry.get("args") or []) != [str(a) for a in args or []]:
+        return (f"refused: entry {n} of the plan is `{want}`, not `{got}`; only exactly "
+                "what the user was shown runs on their yes")
+    ok, why = plan_approval(grant.get("text") or "", len(live.get("entries") or []),
+                            plan_words(live.get("entries")))
+    if n not in ok:
+        said = " ".join(str(grant.get("text") or "").split())[:120]
+        return (f"refused: the user's message ({said!r}) does not approve entry {n}"
+                + (f": {why}" if why else f" (it approves {', '.join(map(str, sorted(ok)))})"))
+    return ""
+
+
+def plan_lines(rec: dict) -> list:
+    """A plan's entries as the operator's reply numbers them."""
+    return [f"{e['n']}. `{' '.join([e['name'], *e.get('args', [])])}`"
+            + (" (ran)" if e.get("used") else "")
+            for e in (rec or {}).get("entries") or []]
 
 
 def _landing_refused(task: dict) -> bool:
@@ -326,6 +512,12 @@ def parse_approve(text: str) -> tuple[str, str, str]:
     return guard, item.strip("`").lower(), ""
 
 
+#: Every read-modify-write of operator.json holds this: one writer's stale
+#: copy (a sweep's mark, an approval used up) must never save over another's
+#: -- least of all over a plan entry marked run, which would let it run twice.
+_STATE_LOCK = threading.RLock()
+
+
 class State:
     """operator.json: its home thread, the sweep's day, and your approvals.
 
@@ -354,19 +546,21 @@ class State:
         return str(self._load().get("thread") or "")
 
     def set_thread(self, key: str, by: str = "") -> None:
-        data = self._load()
-        data.update(thread=key, claimed_by=by, claimed_at=time.time())
-        self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            data.update(thread=key, claimed_by=by, claimed_at=time.time())
+            self._save(data)
 
     # approvals
     def approve(self, guard: str, item: str, by: str, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         if guard not in GUARDS or not item or not by:
             raise ValueError("an approval names a guard, an item and who gave it")
-        data = self._load()
         rec = {"guard": guard, "item": item, "by": by, "at": now, "used": None}
-        data["approvals"] = [a for a in self._live(data, now)] + [rec]
-        self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            data["approvals"] = [a for a in self._live(data, now)] + [rec]
+            self._save(data)
         return rec
 
     @staticmethod
@@ -385,13 +579,119 @@ class State:
     def consume(self, guard: str, item: str, now: float | None = None) -> bool:
         """Use one approval up. True if there was one to use."""
         now = time.time() if now is None else now
-        data = self._load()
-        for a in self._live(data, now):
-            if a.get("guard") == guard and a.get("item") == item:
-                a["used"] = now
-                self._save(data)
-                return True
+        with _STATE_LOCK:
+            data = self._load()
+            for a in self._live(data, now):
+                if a.get("guard") == guard and a.get("item") == item:
+                    a["used"] = now
+                    self._save(data)
+                    return True
         return False
+
+    # the pending plan: ops it proposed, for you to answer in plain words
+    def set_plan(self, entries, by: str, thread: str, task: str = "",
+                 now: float | None = None) -> dict:
+        """Record the ops the operator just proposed, numbered from 1, as the
+        one pending plan: it replaces any earlier one. `entries` are
+        [{name, args}], already checked by the caller (bot.handle_ops)."""
+        now = time.time() if now is None else now
+        if not entries or not by or not thread:
+            raise ValueError("a plan names its ops, who recorded it and its thread")
+        rec = {"id": "plan_" + secrets.token_hex(5), "at": now, "by": by,
+               "thread": thread, "task": task,
+               "entries": [{"n": i, "name": str(e["name"]),
+                            "args": [str(a) for a in e.get("args") or []], "used": None}
+                           for i, e in enumerate(entries, 1)]}
+        with _STATE_LOCK:
+            data = self._load()
+            data["plan"] = rec
+            self._save(data)
+        return rec
+
+    def plan(self, now: float | None = None) -> dict | None:
+        """The pending plan, while it is live: recorded in the current home
+        thread less than PLAN_TTL_S ago, and with an entry not yet run."""
+        now = time.time() if now is None else now
+        data = self._load()
+        p = data.get("plan")
+        if not isinstance(p, dict) or not p.get("entries"):
+            return None
+        if now - float(p.get("at") or 0) >= PLAN_TTL_S:
+            return None
+        if not data.get("thread") or p.get("thread") != data.get("thread"):
+            return None
+        if all(e.get("used") for e in p["entries"]):
+            return None
+        return p
+
+    def plan_before(self, ts, now: float | None = None) -> dict | None:
+        """The live plan, if it was recorded before the Slack message sent at
+        `ts`: a message queued while the operator was still writing a plan
+        was not an answer to it."""
+        p = self.plan(now)
+        try:
+            sent = float(ts)
+        except (TypeError, ValueError):
+            return None
+        if not p or float(p.get("at") or 0) >= sent:
+            return None
+        return {"id": p["id"], "at": p["at"],
+                "entries": [{"n": e["n"], "name": e["name"], "args": list(e["args"])}
+                            for e in p["entries"]]}
+
+    def answer_plan(self, ts, now: float | None = None) -> dict | None:
+        """plan_before(ts), for the message that answers the plan: the first
+        message of yours after it was recorded, and only that one. Marks the
+        plan answered by `ts`, so a later message -- "ok thanks", a yes to
+        something else an hour on -- is no answer to it. The same message's
+        turn asking again (a retry) gets it again. To be asked again, the
+        operator records the plan again."""
+        with _STATE_LOCK:
+            snap = self.plan_before(ts, now)
+            if not snap:
+                return None
+            data = self._load()
+            answered = data["plan"].get("answered")
+            if answered and answered != str(ts):
+                return None
+            if not answered:
+                data["plan"]["answered"] = str(ts)
+                self._save(data)
+            return dict(snap, answered=str(ts))
+
+    def use_plan_entry(self, plan_id: str, n: int, run_by: str = "",
+                       now: float | None = None) -> bool:
+        """Mark entry `n` of plan `plan_id` run, if that plan is still the live
+        one and the entry has not run. True if it was claimed now."""
+        now = time.time() if now is None else now
+        with _STATE_LOCK:
+            data = self._load()
+            p = self.plan(now)
+            if not p or p.get("id") != plan_id:
+                return False
+            for e in data["plan"]["entries"]:
+                if e.get("n") == n:
+                    if e.get("used"):
+                        return False
+                    e["used"] = now
+                    e["used_by"] = run_by
+                    self._save(data)
+                    return True
+        return False
+
+    def release_plan_entry(self, plan_id: str, n: int) -> None:
+        """Undo a claim whose run never started (the op was already running)."""
+        with _STATE_LOCK:
+            data = self._load()
+            p = data.get("plan")
+            if not isinstance(p, dict) or p.get("id") != plan_id:
+                return
+            for e in p.get("entries") or []:
+                if e.get("n") == n:
+                    e["used"] = None
+                    e.pop("used_by", None)
+                    self._save(data)
+                    return
 
     # the sweep
     def sweep_due(self, now: datetime, at: str, digest_last_on: str = "",
@@ -424,9 +724,10 @@ class State:
         return digest_on and digest_last_on != now.strftime("%Y-%m-%d")
 
     def mark_sweep(self, now: datetime, task_id: str) -> None:
-        data = self._load()
-        data.update(sweep_on=now.strftime("%Y-%m-%d"), sweep_task=task_id)
-        self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            data.update(sweep_on=now.strftime("%Y-%m-%d"), sweep_task=task_id)
+            self._save(data)
 
 
 def _plus_minutes(at: str, minutes: int) -> str:
@@ -757,9 +1058,11 @@ SWEEP_GOAL = (
     "(tailscale-on, trader-launchd-reinstall, trader-launchd-retire, "
     "trader-env-set, a refetch with --apply, "
     "project-test, which runs a suite in the live checkout) is never run in a "
-    "sweep: under Needs you, name the op and its arguments, and ask the user "
-    "to tell you to run it in this thread -- not to run a command "
-    "themselves.\n\n"
+    "sweep: record the ones you propose as a plan (`{bin} ops plan <op> "
+    "[args] [--op <op> [args]]… --by operator`), list them under Needs you "
+    "numbered as it prints them, and say a plain \"yes\" in this thread "
+    "runs them (\"do 2\" one, \"all but 1\" the rest) -- never ask the user "
+    "to run a command themselves.\n\n"
     "Not yours, whatever you are asked: deciding on proposals, reviewed work "
     "or research findings either way -- accepting, approving, dismissing, "
     "closing or digging on them -- dismissing or cancelling a queued, blocked, "

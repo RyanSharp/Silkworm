@@ -147,6 +147,9 @@ OPERATOR_TOOLS = " ".join([
     # never a shell. One that changes something needs the grant of a turn you
     # started (ops.refusal), checked by the CLI and again by the bot.
     "Bash({bin} ops run:*) Bash({bin} ops list:*) Bash({bin} ops log:*)",
+    # Records the ops it proposes as a numbered plan you answer in plain
+    # words; recording runs nothing (operator_role.State.set_plan).
+    "Bash({bin} ops plan:*)",
 ])
 
 OPERATOR_SYSTEM = (
@@ -204,8 +207,12 @@ OPERATOR_SYSTEM = (
     "and release with `{bin} release <project> [<target>|all] [--level "
     "patch|minor]` -- on exactly the items they named, each with --by "
     "operator and --notes quoting or paraphrasing what they said (refused "
-    "without it). To queue new work they asked for, file it with `task "
-    "--propose`, then `accept <id> --notes …`. Report each action with its "
+    "without it). To queue new work they asked for in so many words, file "
+    "it with `{bin} task --requested-by-user --notes \"<their request, "
+    "quoted>\" \"<goal>\"`: it goes straight to the queue, past the "
+    "open-proposal cap, and records their message (refused in any turn they "
+    "did not start here; your own ideas stay `task --propose`, capped). "
+    "Report each action with its "
     "task id and the result. Never decide anything on your own judgement: "
     "if it is unclear which items they mean, ask before acting. Still "
     "refused even then: publishing where publish is off and trader's live "
@@ -219,7 +226,22 @@ OPERATOR_SYSTEM = (
     "runs only in a turn the user started with their own message in this "
     "thread, on their word, with --notes saying what they asked for -- never "
     "in a sweep or a wake-up -- and trader's, and tailscale-on, only when "
-    "their message named it (the op's name, the job's label, or the .env key). A long one (project-test, a refetch) can take "
+    "their message named it (the op's name, the job's label, or the .env "
+    "key) or approved it as an entry of your plan.\n\n"
+    "Whenever you propose ops that change something -- in a sweep or "
+    "here -- record them in that same turn as the pending plan: `{bin} ops "
+    "plan <op> [args] [--op <op> [args]]… --by operator`. Number them in "
+    "your reply exactly as it prints them, and tell the user a plain "
+    "\"yes\" in this thread runs them all (\"do 2\" just that one, \"all "
+    "but 1\" the rest). A new plan replaces the last; one lives a day. When "
+    "their next message approves, run each approved entry with `{bin} ops "
+    "run <op> <args> --plan-entry N --by operator --notes \"<their words>\"` "
+    "-- exactly that entry's op and arguments, nothing changed. Only their "
+    "first message after the plan answers it, and only a plain yes or "
+    "entry numbers: if their reply asks something, says more, or is "
+    "unclear, run nothing -- answer it, record the plan again and ask. An "
+    "op not in the plan still needs their message to name it.\n\n"
+    "A long one (project-test, a refetch) can take "
     "many minutes: give the Bash call a timeout of up to 600000 ms, or run it "
     "in the background and read `{bin} ops log` after. In your reply, quote "
     "each run's commands, exit codes and the tail of its output. What no op "

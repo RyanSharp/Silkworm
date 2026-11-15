@@ -3552,6 +3552,20 @@ def handle_file_task(payload: dict) -> dict:
     from_research = parent is not None or caller_role == research.ROLE
     propose = bool(payload.get("propose")) or restricted or from_research
 
+    # Work you asked for, in so many words, in a turn you started in the
+    # operator's thread: it files what you asked, past the open-proposal cap
+    # and straight to the queue -- the cap rations ideas nobody asked for, and
+    # on 2026-11-15 it refused one you did. Only there: the grant is the turn
+    # you started (user_grant), so a sweep, a wake-up, ideation or a review's
+    # follow-ups -- none of which you started -- never carry it.
+    requested = None
+    if payload.get("requested_by_user"):
+        requested, why = requested_filing(payload, key, caller_role, parent, from_research)
+        if why:
+            log.info("refused a requested filing from %s: %s", key, why)
+            return {"ok": False, "error": why, "refused": "requested"}
+        propose = bool(payload.get("propose"))
+
     # A fix for a health check (`task --health <project>/<check>`): always a
     # proposal, always under the check's project, with the check's evidence
     # attached -- and once per (project, check) and trouble, which
@@ -3622,9 +3636,13 @@ def handle_file_task(payload: dict) -> dict:
     # and pooling those would refuse an unrelated filing over a count no
     # project panel can show. The nightly pass always names its project.
     open_now = (scoping.open_proposals(task_store.by_project(slug))
-                if propose and slug else 0)
+                if (propose or requested is not None) and slug else 0)
+    if requested is not None:
+        # Recorded, so the task says how full the board it skipped was.
+        requested["open_proposals"] = open_now
     err = scoping.validate(goal, _filed_this_turn.get(key, 0), propose=propose,
-                           open_now=open_now, slug=slug, research=from_research)
+                           open_now=0 if requested is not None else open_now,
+                           slug=slug, research=from_research)
     if err:
         held(err)
         return {"ok": False, "error": err}
@@ -3682,6 +3700,8 @@ def handle_file_task(payload: dict) -> dict:
         # Who filed it, so the operator may dismiss its own proposals and no
         # one else's (operator_role.tasks_guard).
         filed_by=filer_role({"caller_role": caller_role, "caller_thread": key}),
+        # On your explicit request: past the cap, and whose word it was.
+        **({"requested_by_user": requested} if requested is not None else {}),
         # Filed work, not the conversation that scoped it: whoever runs it
         # starts fresh, so it gets its own checkout.
         isolate=True,
@@ -3694,6 +3714,14 @@ def handle_file_task(payload: dict) -> dict:
            if hrec else {}),
     )
     _filed_this_turn[key] = _filed_this_turn.get(key, 0) + 1
+    if requested is not None:
+        try:
+            task_store.record_decision(
+                task["id"], f"filed on the request of {requested['by']} (Slack message "
+                f"{requested['ts']}) via operator: {requested['notes']}",
+                operator_role.DECIDED_BY, requested["ts"])
+        except Exception:
+            log.exception("could not record the request %s was filed on", task["id"])
     if hrec:
         # The check -> task link the brief reads ("proposal tsk_x open since
         # Tuesday"). Should it fail to save, proposal_of still finds the task
@@ -3708,7 +3736,36 @@ def handle_file_task(payload: dict) -> dict:
              f" next step of {parent['id']}" if parent else "")
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
+            "requested_by_user": requested is not None,
             "remaining": scoping.limit_for(propose, from_research) - _filed_this_turn[key]}
+
+
+def requested_filing(payload: dict, key: str, caller_role: str, parent, from_research
+                     ) -> tuple[dict | None, str]:
+    """({by, ts, notes, at}, "") for a filing the operator makes on your
+    explicit request (`task --requested-by-user --notes "<your words>"`), or
+    (None, why not).
+
+    It must be the operator, in its home thread, in a turn you started there
+    with your own Slack message (the live grant: user_grant), quoting what
+    you asked for. Never a health fix (that has its own once-per-check rule)
+    or a research run's next steps."""
+    if filer_role({"caller_role": caller_role, "caller_thread": key}) != operator_role.ROLE:
+        return None, ("--requested-by-user is the operator's, filing what the user asked "
+                      "for in its own thread")
+    if str(payload.get("health") or "").strip() or parent or from_research:
+        return None, "--requested-by-user files the user's own request, not a health fix or research step"
+    grant = user_grant({"caller_thread": key, "caller_grant": payload.get("caller_grant"),
+                        "caller_task": payload.get("caller_task")})
+    if not grant:
+        return None, ("--requested-by-user only in a turn the user started with their own "
+                      "Slack message in the operator's thread -- never a sweep, a wake-up "
+                      "or ideation; file it as a proposal (the cap applies) or ask them")
+    notes = " ".join(str(payload.get("notes") or "").split())
+    if not notes:
+        return None, "--requested-by-user needs --notes quoting what the user asked for"
+    return {"by": grant["user"], "ts": grant["ts"], "notes": notes[:500],
+            "at": time.time()}, ""
 
 
 def handle_hide(payload: dict) -> dict:
@@ -3764,6 +3821,11 @@ def handle_ops(payload: dict) -> dict:
         except (TypeError, ValueError):
             n = 20
         return {"ok": True, "runs": ops.read_log(OPS_LOG, n)}
+    if action == "plan":
+        return record_ops_plan(payload)
+    if action == "show-plan":
+        live = OPERATOR.plan()
+        return {"ok": True, "plan": live, "lines": operator_role.plan_lines(live)}
     if action != "run":
         return {"ok": False, "error": f"unknown action {action!r}"}
     name = str(payload.get("name") or "")
@@ -3784,7 +3846,23 @@ def handle_ops(payload: dict) -> dict:
               "task": str(payload.get("caller_task") or "")}
     if grant:
         record.update(decided_by=grant["user"], decided_ts=grant["ts"])
-    why = ops.refusal(plan, in_turn=in_turn, grant=grant, notes=notes)
+    # An entry of the plan the operator showed you, which your message
+    # approved in plain words ("yes", "do 2"): that names it for you. Exactly
+    # that entry, with exactly its arguments, once.
+    entry_n, plan_id, why = payload.get("plan_entry"), "", ""
+    if entry_n not in (None, ""):
+        live = OPERATOR.plan() if in_turn else None
+        why = (operator_role.plan_refusal(grant, entry_n, plan.name, plan.args, live)
+               if in_turn else "refused: --plan-entry is for a turn answering a plan")
+        if not why:
+            plan_id, entry_n = live["id"], int(entry_n)
+            record.update(plan_id=plan_id, plan_entry=entry_n)
+    if not why:
+        why = ops.refusal(plan, in_turn=in_turn, grant=grant, notes=notes,
+                          planned=bool(plan_id))
+    if not why and plan_id and not OPERATOR.use_plan_entry(plan_id, entry_n,
+                                                            run_by=record["task"]):
+        why = f"refused: entry {entry_n} of the plan has already run, or the plan changed"
     if why:
         log.info("ops: %s refused (%s)", plan.name, why[:120])
         ops.append_log(OPS_LOG, dict(record, at=time.time(), op=plan.name, args=plan.args,
@@ -3797,8 +3875,51 @@ def handle_ops(payload: dict) -> dict:
     try:
         rec = ops.run(plan, env=env, log_path=OPS_LOG, record=record)
     except ops.Refused as e:
+        if plan_id:
+            # Never started: the entry is still there to run.
+            OPERATOR.release_plan_entry(plan_id, entry_n)
         return {"ok": False, "error": str(e), "refused": "busy"}
     return {"ok": True, "run": rec}
+
+
+def record_ops_plan(payload: dict) -> dict:
+    """/ops plan: the ops the operator just proposed to you, recorded as the
+    one pending plan (operator_role.State.set_plan), numbered from 1.
+
+    Only an operator turn in its home thread records one -- a sweep's
+    included: it proposes, and nothing runs until a turn you start answers it.
+    Each entry is checked as a run would be (ops.plan), and must change
+    something: what only reads needs no one's yes."""
+    thread = OPERATOR.thread()
+    # Its home thread is where only its turns run (caller_is_operator reads
+    # the thread as the operator's), and where your answer will come.
+    if not thread or str(payload.get("caller_thread") or "") != thread:
+        return {"ok": False, "refused": "plan",
+                "error": "only an operator turn in its home thread records a plan"}
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return {"ok": False, "error": "a plan names at least one op", "refused": "args"}
+    if len(entries) > operator_role.MAX_PLAN:
+        return {"ok": False, "refused": "args",
+                "error": f"at most {operator_role.MAX_PLAN} ops in one plan"}
+    clean = []
+    for i, e in enumerate(entries, 1):
+        if not isinstance(e, dict) or not isinstance(e.get("args") or [], list):
+            return {"ok": False, "error": f"entry {i} is not {{name, args}}", "refused": "args"}
+        try:
+            p = ops.plan(str(e.get("name") or ""), list(e.get("args") or []), ops_context())
+        except ops.Refused as err:
+            return {"ok": False, "error": f"entry {i}: {err}", "refused": "args"}
+        if p.read_only:
+            return {"ok": False, "refused": "args",
+                    "error": f"entry {i} (`{p.name}`) only reads: run it, it needs no yes"}
+        clean.append({"name": p.name, "args": list(p.args)})
+    by = str(payload.get("by") or "operator")
+    rec = OPERATOR.set_plan(clean, by=by, thread=thread,
+                            task=str(payload.get("caller_task") or ""))
+    log.info("ops: plan %s recorded by %s: %s", rec["id"], by,
+             "; ".join(operator_role.plan_lines(rec)))
+    return {"ok": True, "plan": rec, "lines": operator_role.plan_lines(rec)}
 
 
 
@@ -4052,7 +4173,8 @@ def handle_prompt(event: dict, say, client) -> None:
             # Your own message in the operator's thread: for this turn only,
             # it may do what you told it (operator_role.Grants), and nothing
             # else's turn -- a sweep, a wake-up, the web chat -- carries this.
-            grant = (OPERATOR_GRANTS.open(key, msg_ts, user, text, task_id)
+            grant = (OPERATOR_GRANTS.open(key, msg_ts, user, text, task_id,
+                                          plan=pending_plan(msg_ts))
                      if role_name == roles.OPERATOR and user_started(event, user) else "")
             if grant:
                 kwargs["env"][operator_role.GRANT_VAR] = grant
@@ -6698,6 +6820,18 @@ def user_started(event: dict, user: str) -> bool:
     return bool(user and not event.get("_web") and not event.get("bot_id")
                 and user != BOT_USER_ID
                 and (not ALLOWED_USERS or user in ALLOWED_USERS))
+
+
+def pending_plan(msg_ts) -> dict | None:
+    """The plan of ops your message answers: the live one, recorded before
+    you sent it, and answered by no earlier message of yours
+    (operator_role.State.answer_plan, which marks it answered by this one).
+    None if it cannot be read -- your turn still runs, it approves no plan."""
+    try:
+        return OPERATOR.answer_plan(msg_ts)
+    except Exception:
+        log.exception("operator: could not read the pending plan")
+        return None
 
 
 def user_grant(payload: dict) -> dict | None:

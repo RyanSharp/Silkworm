@@ -26,7 +26,18 @@ Who may run what (`refusal`):
   are you.
 * An op marked `named` must also be named in that message -- trader's (they
   are its live configuration, which otherwise waits for `!approve`) and the
-  one that exposes the dashboard on the tailnet.
+  one that exposes the dashboard on the tailnet -- unless it is an entry of
+  the pending plan the operator showed you and your message approved it.
+
+On 2026-11-15 "go with your recommendations, and run the trader ops" was
+refused for all four of trader's ops, because it named none of them. So the
+operator records the ops it proposes as a numbered plan (`ops plan`,
+operator_role.State.set_plan), and a plain "yes", "do 2" or "all but 1" in
+your next message runs exactly those entries, each once, with exactly the
+arguments you were shown (operator_role.plan_refusal; the words are read by
+operator_role.plan_approval, deterministically, never by a model). A plan
+lives a day, is replaced by the next, and is never answered by a sweep or a
+wake-up, which carry no grant.
 
 On 2026-11-14 two more of the owner's decisions needed shell steps: retiring
 trader's cash-secured-put shadow job (com.traderjoe.shadowoptions) and switching
@@ -612,13 +623,17 @@ def plan(name: str, args, ctx: Context) -> Plan:
                 lock=project if op.name == "project-test" else "")
 
 
-def refusal(p: Plan, *, in_turn: bool, grant: dict | None, notes: str) -> str:
+def refusal(p: Plan, *, in_turn: bool, grant: dict | None, notes: str,
+            planned: bool = False) -> str:
     """Why this run may not go ahead, or "" if it may.
 
     `in_turn`: the request came from inside a turn (the CLI stamped it with a
     role or thread). Your terminal and the dashboard carry none: they are you.
     `grant`: the live grant of the turn you started in the operator's home
     thread (bot.user_grant), or None.
+    `planned`: this exact run is an entry of the plan your message approved
+    (operator_role.plan_refusal found nothing wrong), which names it for you:
+    the plan showed you the op and its arguments, and you said yes.
     """
     if p.read_only or not in_turn:
         return ""
@@ -631,6 +646,8 @@ def refusal(p: Plan, *, in_turn: bool, grant: dict | None, notes: str) -> str:
     if not str(notes or "").strip():
         return ("refused: acting on the user's word needs --notes quoting or "
                 "paraphrasing what they asked for")
+    if planned:
+        return ""
     if p.names:
         if not named(p.names, grant.get("text") or ""):
             what = ("trader's live configuration" if p.name.startswith("trader-")

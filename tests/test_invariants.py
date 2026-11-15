@@ -29240,7 +29240,7 @@ def _ops_world():
                  "beta": {"slug": "beta", "scope": {"cwd": str(alpha)}, "test_cmd": ""}}
     state = O.State(tmp / "operator.json")
     state.set_thread("D1:1.0")
-    ns = bot_functions("handle_ops", "ops_context", "user_grant",
+    ns = bot_functions("handle_ops", "ops_context", "user_grant", "record_ops_plan",
                        ops=OPS, OPS_LOG=tmp / "ops.jsonl", sys=sys, os=os, Path=Path,
                        git_guard=git_guard, operator_role=O, OPERATOR=state,
                        OPERATOR_GRANTS=O.Grants(), SILKWORM_BIN=str(BASE / "bin" / "silkworm"),
@@ -30094,7 +30094,16 @@ def test_ops_on_the_operators_allowlist_and_in_its_prompts():
     check("the sweep may read, and asks before changing anything",
           "/s ops run tailscale-status" in goal and "is never run in a sweep" in goal
           and all(n in goal for n, op in OPS.REGISTRY.items() if op.read_only is False)
-          and "ask the user to tell you to run it in this thread" in goal, goal)
+          and "record the ones you propose as a plan (`/s ops plan" in goal
+          and 'a plain "yes" in this thread runs them' in goal
+          and "never ask the user to run a command themselves" in goal, goal)
+    check("`ops plan` is on its allowlist, and its prompt says to record and number a plan",
+          "Bash(/abs/silkworm ops plan:*)" in tools
+          and "/s ops plan <op> [args] [--op <op> [args]]… --by operator" in text
+          and "--plan-entry N" in text and 'plain "yes"' in text, text)
+    check("and to file what the user asked for with --requested-by-user, not propose+accept",
+          "/s task --requested-by-user --notes" in text
+          and "file it with `task --propose`, then `accept" not in text, text)
 
 
 # --- boot, promotion and rollback: Silkworm must not go down unnoticed again --------
@@ -31010,6 +31019,433 @@ def test_deploy_outcome_goes_direct_when_the_bot_cannot_post():
         where = cli.report_outcome(lambda p, b: {}, "C1:2.0", "x", outbox=box,
                                    sleep=lambda s: None, direct=lambda th, t: {"slack": False})
     check("and only when that fails too, the outbox", where == "outbox")
+
+
+
+# --- your word in plain words: a numbered plan of ops, and filing past the cap ------
+# 2026-11-15: "go with your recommendations, and run the trader ops" was refused
+# for all four of trader's ops -- the message named none of them -- and work you
+# had explicitly asked for was refused by MAX_OPEN_PROPOSALS. "I don't like
+# having to send these exact commands."
+
+def test_plan_approval_reads_plain_words():
+    import operator_role as O
+    print("\nyour answer to a plan: plain words, read by rules, failing closed")
+    cases = {
+        "yes": {1, 2, 3}, "Yes!": {1, 2, 3}, "go": {1, 2, 3}, "do it": {1, 2, 3},
+        "run them": {1, 2, 3}, "ok": {1, 2, 3}, "go ahead": {1, 2, 3}, "lgtm": {1, 2, 3},
+        ":+1:": {1, 2, 3}, "sure, run them all": {1, 2, 3},
+        "can you run them?": {1, 2, 3}, "sounds good": {1, 2, 3},
+        "do 1 and 3": {1, 3}, "do 2": {2}, "yes, run 2": {2}, "2": {2}, "1 and 3": {1, 3},
+        "1-2": {1, 2}, "yes 1, 3": {1, 3}, "go ahead with 2": {2}, "just 2": {2},
+        "yes to 1": {1}, "all but 2": {1, 3}, "yes except 1 and 3": {2},
+        "yes but not 2": {1, 3}, "do it, all but #3": {1, 2},
+    }
+    words = O.plan_words([{"name": "trader-env-set", "args": ["MOMENTUM_UNIVERSE", "pit"]},
+                          {"name": "tailscale-on", "args": []}])
+    # The words of the plan's own ops may name what is approved -- the very
+    # message refused on 2026-11-15.
+    cases.update({"go with your recommendations, and run the trader ops": {1, 2, 3},
+                  "yes, set the momentum universe to pit": {1, 2, 3}})
+    for text, want in cases.items():
+        got, why = O.plan_approval(text, 3, words)
+        check(f"{text!r} approves {sorted(want)}", set(got) == want and not why, (got, why))
+    check("without the plan's words, 'trader ops' is more than a yes",
+          not O.plan_approval("go with your recommendations, and run the trader ops", 3)[0])
+    for text in ("what does 2 do?", "which one is 2", "is 2 safe", "no", "not yet",
+                 "wait", "hold off on 2", "don't", "do it later", "thanks", "",
+                 "do 5", "all but 4", "yes, 0", "do 3-9", "all but 1, 2 and 3",
+                 "yes? what is 2", "hmm, 2", "what if we run 2", "should I do 2",
+                 # Saying more than yes is not a yes (found in review).
+                 "all except the trader ones", "all but the last one", "do the first two",
+                 "do it in 2 hours", "go for it tomorrow", "run them once I am back",
+                 "sure, but first explain 2", "ok so 3 is the risky one",
+                 "yes, file a task for the login bug", "ok thanks", "approve 1, 2 is wrong",
+                 "do 1. 2 seems wrong", "the 3 failing checks are fine, yes run them",
+                 "skip 2", "all", "the plan", "run them?", "do 2?", "yes?",
+                 "nope", "never", "do not run them", "no 2", "do it, then wait"):
+        got, why = O.plan_approval(text, 3, words)
+        check(f"{text!r} approves nothing, and says why", not got and why, (got, why))
+    check("no plan, nothing approved", not O.plan_approval("yes", 0)[0])
+    live = {"id": "plan_a", "answered": "1.0", "entries": [
+        {"n": 1, "name": "tailscale-on", "args": [], "used": 1.0},
+        {"n": 2, "name": "trader-env-set", "args": ["MOMENTUM_UNIVERSE", "pit"], "used": None}]}
+    grant = {"text": "yes", "ts": "1.0", "plan": {"id": "plan_a", "entries": live["entries"]}}
+    check("plan_refusal: an entry that ran is refused on its own",
+          "already run" in O.plan_refusal(grant, 1, "tailscale-on", [], live))
+    check("plan_refusal: the other runs, exactly as planned",
+          O.plan_refusal(grant, 2, "trader-env-set", ["MOMENTUM_UNIVERSE", "pit"], live) == "")
+    check("plan_refusal: not with another value",
+          "only exactly" in O.plan_refusal(grant, 2, "trader-env-set",
+                                           ["MOMENTUM_UNIVERSE", "static"], live))
+    check("plan_refusal: a grant from another plan is refused",
+          "replaced" in O.plan_refusal(dict(grant, plan={"id": "plan_b"}), 2, "trader-env-set",
+                                       ["MOMENTUM_UNIVERSE", "pit"], live))
+    check("plan_refusal: a bad entry number is refused, not raised",
+          "entry number" in O.plan_refusal(grant, "x", "tailscale-on", [], live))
+    check("plan_refusal: a plan another message answered is refused",
+          "answered by another" in O.plan_refusal(
+              dict(grant, ts="2.0"), 2, "trader-env-set", ["MOMENTUM_UNIVERSE", "pit"],
+              live))
+
+
+def _plan_turn(w, text, turn="tsk_turn_mine", ts=None):
+    """Your message's turn, with the plan it answers attached as handle_prompt
+    attaches it (bot.pending_plan -> State.answer_plan)."""
+    ts = ts or f"{time.time() + 1:.6f}"
+    return w.grants.open("D1:1.0", ts, "U_ME", text, turn, plan=w.state.answer_plan(ts))
+
+
+def _plan_record(w, *argv, task="tsk_sweep"):
+    return _ops_cli(w, "plan", *argv, "--by", "operator", task=task)
+
+
+def _plan_run(w, grant, n, *argv, notes="user: yes", turn="tsk_turn_mine"):
+    return _ops_cli(w, "run", *argv, "--plan-entry", str(n), "--by", "operator",
+                    "--notes", notes, grant=grant, task=turn)
+
+
+def _env_value(w, key):
+    for line in (w.trader / ".env").read_text().splitlines():
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def test_ops_plan_runs_on_a_plain_yes():
+    import ops as OPS
+    import operator_role as O
+    print("\nnamed ops: a plan the operator showed you runs on 'yes' or 'do 2', exactly as shown")
+    w = _ops_world()
+    PLAN = ("trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on",
+            "--op", "trader-launchd-retire", "com.traderjoe.shadowoptions")
+    with _fake_path(w):
+        r = _plan_record(w, *PLAN)
+        check("a sweep records a plan, numbered as the reply shows it",
+              r.returncode == 0 and "1. `trader-env-set MOMENTUM_UNIVERSE pit`" in r.stdout
+              and "2. `tailscale-on`" in r.stdout
+              and "3. `trader-launchd-retire com.traderjoe.shadowoptions`" in r.stdout
+              and "plain 'yes'" in r.stdout, r.stdout + r.stderr)
+        r = _ops_cli(w, "plan", task="tsk_sweep")
+        check("and `ops plan` alone shows the pending one",
+              r.returncode == 0 and "pending plan plan_" in r.stdout and "2. `tailscale-on`"
+              in r.stdout, r.stdout + r.stderr)
+        r = _plan_run(w, "", 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("the sweep itself cannot run an entry (no grant)",
+              r.returncode == 1 and "never in a sweep" in r.stderr
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, r.stderr)
+        out = _ops_ask(w, {"action": "run", "name": "trader-env-set",
+                           "args": ["MOMENTUM_UNIVERSE", "pit"], "plan_entry": 1,
+                           "caller_role": "operator", "caller_thread": "D1:1.0",
+                           "caller_task": "tsk_sweep", "notes": "x"})
+        check("nor through the bot", not out["ok"], out)
+
+        g = _plan_turn(w, "yes")
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("'yes' runs entry 1 -- trader's .env, though the message named no op",
+              r.returncode == 0 and _env_value(w, "MOMENTUM_UNIVERSE") == "pit",
+              r.stdout + r.stderr)
+        w.calls.write_text("")
+        r = _plan_run(w, g, 2, "tailscale-on")
+        check("and entry 2 (its own checks fail against the fakes; it ran)", any(
+            c.startswith("tailscale serve --bg") for c in _calls(w)), r.stdout + r.stderr)
+        w.calls.write_text("")
+        r = _plan_run(w, g, 2, "tailscale-on")
+        check("an entry runs once", r.returncode == 1 and "already run" in r.stderr
+              and not _calls(w), r.stderr)
+        r = _plan_run(w, g, 3, "trader-launchd-retire", "com.traderjoe.stocktwits")
+        check("args can't differ from the plan's",
+              r.returncode == 1 and "only exactly what the user was shown" in r.stderr
+              and (w.agents / "com.traderjoe.stocktwits.plist").exists(), r.stderr)
+        r = _plan_run(w, g, 3, "trader-launchd-reinstall", "com.traderjoe.pooldata")
+        check("nor the op", r.returncode == 1 and "not `trader-launchd-reinstall" in r.stderr,
+              r.stderr)
+        r = _ops_as_user(w, g, "trader-launchd-reinstall", "com.traderjoe.pooldata",
+                         "--notes", "user: yes")
+        check("an op not in the plan still has to be named",
+              r.returncode == 1 and "has to name it" in r.stderr, r.stderr)
+        r = _plan_run(w, g, 7, "tailscale-on")
+        check("and there is no entry 7", r.returncode == 1 and "no entry 7" in r.stderr, r.stderr)
+        r = _plan_run(w, g, 3, "trader-launchd-retire", "com.traderjoe.shadowoptions",
+                      notes="")
+        check("--notes still needed", r.returncode != 0, r.stderr)
+        r = _plan_run(w, g, 3, "trader-launchd-retire", "com.traderjoe.shadowoptions")
+        check("entry 3, exactly as planned, runs",
+              r.returncode == 0 and not (w.agents / "com.traderjoe.shadowoptions.plist").exists(),
+              r.stdout + r.stderr)
+        runs = [x for x in OPS.read_log(w.log, 100) if x.get("plan_entry") and not x.get("refused")]
+        check("each run records its plan id, entry and your message's ts",
+              len(runs) == 3 and all(x.get("plan_id", "").startswith("plan_")
+                                     and x.get("decided_ts") and x.get("decided_by") == "U_ME"
+                                     for x in runs)
+              and [x["plan_entry"] for x in runs] == [1, 2, 3], runs)
+        check("a plan whose every entry ran is no longer pending", w.state.plan() is None)
+
+        # 'do 2': that one only.
+        (w.trader / ".env").write_text(w.env_text)
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op",
+                     "trader-env-set", "MOMENTUM_UNIVERSE", "static")
+        g = _plan_turn(w, "do 2")
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("'do 2' does not run entry 1",
+              r.returncode == 1 and "does not approve entry 1" in r.stderr
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, r.stderr)
+        r = _plan_run(w, g, 2, "trader-env-set", "MOMENTUM_UNIVERSE", "static")
+        check("and runs entry 2", r.returncode == 0
+              and _env_value(w, "MOMENTUM_UNIVERSE") == "static", r.stdout + r.stderr)
+
+        # Not an approval.
+        _plan_record(w, "tailscale-on")
+        w.calls.write_text("")
+        g = _plan_turn(w, "what does 1 do?")
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("a question approves nothing",
+              r.returncode == 1 and "asks a question" in r.stderr and not _calls(w), r.stderr)
+        g = _plan_turn(w, "ok, yes")
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("only the first message after a plan answers it: a later 'yes' is no answer",
+              r.returncode == 1 and "no plan was waiting" in r.stderr and not _calls(w),
+              r.stderr)
+        _plan_record(w, "tailscale-on")
+        g = _plan_turn(w, "no, hold off")
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("nor does a no", r.returncode == 1 and not _calls(w), r.stderr)
+        _plan_record(w, "tailscale-on")
+        ts_ = f"{time.time() + 1:.6f}"
+        first = w.state.answer_plan(ts_)
+        check("the answering message's own turn, asked again (a retry), still gets it",
+              first and (w.state.answer_plan(ts_) or {}).get("id") == first["id"]
+              and w.state.answer_plan(f"{time.time() + 2:.6f}") is None)
+
+        # A message sent before the plan was recorded answers none.
+        _plan_record(w, "tailscale-on")
+        g = _plan_turn(w, "yes", ts=f"{time.time() - 60:.6f}")
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("a message sent before the plan existed is no answer to it",
+              r.returncode == 1 and "no plan was waiting" in r.stderr
+              and not _calls(w), r.stderr)
+
+        # Replaced, then expired.
+        _plan_record(w, "tailscale-on")
+        g = _plan_turn(w, "yes")
+        _plan_record(w, "tailscale-on")
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("a plan replaced after you answered runs nothing",
+              r.returncode == 1 and "expired or been replaced" in r.stderr
+              and not _calls(w), r.stderr)
+        g = _plan_turn(w, "yes")
+        data = json.loads(w.statefile.read_text())
+        data["plan"]["at"] -= O.PLAN_TTL_S + 5
+        w.statefile.write_text(json.dumps(data))
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("an expired plan runs nothing",
+              r.returncode == 1 and "expired or been replaced" in r.stderr
+              and not _calls(w), r.stderr)
+        g = _plan_turn(w, "yes")
+        check("and a message after it expired carries no plan", (w.grants.get(
+            g, "D1:1.0", "tsk_turn_mine") or {}).get("plan") is None)
+        check("plan_before reads a day-old plan as gone",
+              w.state.plan_before(f"{time.time() + 1:.6f}") is None)
+
+        # Who may record one, and what.
+        r = _ops_cli(w, "plan", "tailscale-on", "--by", "x", role="assistant",
+                     thread="C9:9.0", task="tsk_x")
+        check("only an operator turn in its home thread records a plan",
+              r.returncode == 1 and "home thread" in r.stderr, r.stderr)
+        r = _ops_cli(w, "plan", "tailscale-on", "--by", "operator", thread="C9:9.0",
+                     task="tsk_x")
+        check("not even an operator turn in another thread",
+              r.returncode == 1 and "home thread" in r.stderr, r.stderr)
+        r = _plan_record(w, "tailscale-status")
+        check("an op that only reads is not planned", r.returncode == 1
+              and "only reads" in r.stderr, r.stderr)
+        r = _plan_record(w, "tailscale-on", "--op", "trader-env-set", "MOMENTUM_UNIVERSE", "x")
+        check("each entry is checked as a run would be", r.returncode == 1
+              and "entry 2" in r.stderr, r.stderr)
+        r = _plan_record(w, "no-such-op")
+        check("an unknown op is refused", r.returncode == 1 and "no op" in r.stderr, r.stderr)
+        r = _plan_record(w, "tailscale-on", "--op", "trader-launchd-reinstall", "a;b")
+        check("and shell is refused before the bot is asked", r.returncode == 1, r.stderr)
+        out = w.ns["record_ops_plan"]({"entries": [{"name": "tailscale-on", "args": []}] * 11,
+                                       "caller_role": "operator", "caller_thread": "D1:1.0"})
+        check(f"at most {O.MAX_PLAN} ops in a plan", not out["ok"], out)
+
+
+def _requested_world():
+    """handle_file_task as shipped, with the operator's home thread, its live
+    grants, and a project already holding a full board of proposals."""
+    import operator_role as O
+    import projects as P, roles as R, scoping as S, tasks as T
+    from tasks import TaskStore
+    tmp = Path(tempfile.mkdtemp())
+    ts = TaskStore(tmp / "t.json")
+    for i in range(S.max_open_proposals()):
+        ts.create(f"an idea nobody asked for, number {i}", project="alpha",
+                  state=T.PROPOSED, driver="queue")
+    state = O.State(tmp / "operator.json")
+    state.set_thread("D5:5.0")
+    grants = O.Grants()
+    ns = bot_functions(
+        "handle_file_task", "filed_by_restricted_role", "begin_turn", "research_parent",
+        "requested_filing",
+        _filed_this_turn={}, re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
+        dedup=__import__("dedup"), branches=__import__("branches"),
+        research=__import__("research"), basered=__import__("basered"),
+        health=__import__("health"), HEALTH=None, HEALTH_WARN_DAYS=3,
+        task_store=ts, operator_role=O, OPERATOR=state, OPERATOR_GRANTS=grants,
+        CLAUDE_CWD=tmp, store=types.SimpleNamespace(get=lambda k: {}),
+        project_store=types.SimpleNamespace(
+            ensure=lambda n, **kw: {"slug": n}, slug_for=lambda n: P.slugify(n),
+            home=lambda n, create=False: None, scope_for=lambda n: {"cwd": str(tmp)}))
+    return types.SimpleNamespace(file=ns["handle_file_task"], ts=ts, state=state,
+                                 grants=grants, ns=ns)
+
+
+def test_requested_filing_passes_a_full_cap_and_a_sweep_does_not():
+    import operator_role as O
+    import scoping as S
+    import tasks as T
+    print("\nfiling: work you asked for passes a full proposal cap; a sweep's does not")
+    w = _requested_world()
+    HOME = "D5:5.0"
+    goal = "Rebuild trader's momentum universe point-in-time, as the user asked today"
+
+    def file(**kw):
+        payload = {"key": HOME, "goal": goal, "project": "alpha",
+                   "caller_role": "operator", "caller_task": "tsk_turn", **kw}
+        try:
+            return w.file(payload)
+        except Exception as e:
+            return {"ok": None, "error": f"raised {e!r}"}
+
+    check("the board is full", S.backlog_full(S.open_proposals(w.ts.by_project("alpha"))))
+    out = file(propose=True, caller_task="tsk_sweep")
+    check("a sweep's filing is refused by the cap", not out["ok"]
+          and "standing limit" in out["error"], out)
+    out = file(requested_by_user=True, notes="user: please rebuild it",
+               caller_task="tsk_sweep")
+    check("and claiming the user asked, with no grant, is refused",
+          not out["ok"] and "turn the user started" in out["error"], out)
+    g = w.grants.open(HOME, "1763200000.000100", "U_ME", "file the universe rebuild", "tsk_turn")
+    out = file(requested_by_user=True, caller_grant=g, notes="  ")
+    check("in your turn, without --notes, refused", not out["ok"]
+          and "--notes" in out["error"], out)
+    out = file(requested_by_user=True, caller_grant=g, notes="user: please rebuild it",
+               caller_task="tsk_other")
+    check("your grant from another turn lifts nothing", not out["ok"], out)
+    out = file(requested_by_user=True, caller_grant=g, notes="user: x",
+               health="alpha/ci")
+    check("nor files a health fix", not out["ok"]
+          and "not a health fix" in out["error"], out)
+    out = w.file({"key": "C9:9.0", "goal": goal, "project": "alpha", "caller_role": "assistant",
+                  "requested_by_user": True, "caller_grant": g, "notes": "x"})
+    check("only the operator files on your request", not out["ok"]
+          and "--requested-by-user is the operator's" in out["error"], out)
+    before = len(w.ts.by_project("alpha"))
+    check("none of those filed anything", before == S.max_open_proposals())
+    out = file(requested_by_user=True, caller_grant=g,
+               notes="user: 'file the universe rebuild'")
+    check("your explicit request passes the full cap, straight to the queue",
+          out.get("ok") and out.get("state") == T.QUEUED and out.get("requested_by_user"), out)
+    rec = w.ts.get(out.get("id") or "") or {}
+    rq = rec.get("requested_by_user") or {}
+    check("the task records the exemption: whose word, which message, what they said",
+          rq.get("by") == "U_ME" and rq.get("ts") == "1763200000.000100"
+          and rq.get("notes") == "user: 'file the universe rebuild'"
+          and rq.get("open_proposals") == S.max_open_proposals()
+          and (rec.get("result") or {}).get("decided_by") == O.DECIDED_BY
+          and any("filed on the request of U_ME" in e.get("detail", "")
+                  for e in rec.get("events") or []), rec)
+    out = file(requested_by_user=True, caller_grant=g, propose=True,
+               goal="A proposal the user asked for, to look at before it runs",
+               notes="user: propose it")
+    check("asked for as a proposal, it is one, past the cap",
+          out.get("ok") and out.get("state") == T.PROPOSED, out)
+    out = file(propose=True, goal="Another idea of its own, while the board is full")
+    check("in the same turn, its own idea is still capped",
+          not out["ok"] and "standing limit" in out["error"], out)
+    w.grants.close(g)
+    out = file(requested_by_user=True, caller_grant=g, notes="user: x",
+               goal="One more after the turn has ended, which must be refused")
+    check("once your turn has ended, refused", not out["ok"], out)
+
+
+def test_cli_task_requested_by_user_sends_notes():
+    print("\n`silkworm task --requested-by-user` sends the request and refuses without --notes")
+    cli_file_task, sent = _cli_file_task_impl()
+    saved = {k: os.environ.get(k) for k in ("SILKWORM_THREAD",)}
+    os.environ["SILKWORM_THREAD"] = "D5:5.0"
+    try:
+        cli_file_task(["--requested-by-user", "--notes", "user: do it", "rebuild the universe"])
+        check("it sends requested_by_user and the notes, and the goal alone as goal",
+              sent and sent[-1][1].get("requested_by_user") is True
+              and sent[-1][1].get("notes") == "user: do it"
+              and sent[-1][1].get("goal") == "rebuild the universe", sent)
+        n = len(sent)
+        try:
+            cli_file_task(["--requested-by-user", "rebuild the universe"])
+            code = 0
+        except SystemExit as e:
+            code = e.code
+        check("without --notes it asks nothing and exits 1", code == 1 and len(sent) == n)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+
+def test_your_turn_carries_the_plan_you_answered():
+    print("\nyour turn's grant carries the pending plan recorded before your message")
+    tree = ast.parse((BASE / "bot.py").read_text())
+    opens = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "open"
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "OPERATOR_GRANTS"]
+    plan_kw = [k for c in opens for k in c.keywords if k.arg == "plan"]
+    check("handle_prompt opens your grant with plan=pending_plan(msg_ts)",
+          len(opens) == 1 and len(plan_kw) == 1 and isinstance(plan_kw[0].value, ast.Call)
+          and getattr(plan_kw[0].value.func, "id", "") == "pending_plan"
+          and [getattr(a, "id", "") for a in plan_kw[0].value.args] == ["msg_ts"],
+          ast.dump(plan_kw[0]) if plan_kw else "no plan= keyword")
+    import operator_role as O
+    ns = bot_functions("pending_plan", OPERATOR=types.SimpleNamespace(
+        answer_plan=lambda ts: (_ for _ in ()).throw(OSError("unreadable"))))
+    check("a plan that cannot be read costs your turn nothing: no plan, no raise",
+          ns["pending_plan"]("1.0") is None)
+    st = O.State(Path(tempfile.mkdtemp()) / "operator.json")
+    st.set_thread("D1:1.0")
+    st.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
+    ns = bot_functions("pending_plan", OPERATOR=st)
+    check("and a readable one is attached", (ns["pending_plan"](f"{time.time() + 1:.6f}")
+                                             or {}).get("entries", [{}])[0].get("name")
+          == "tailscale-on")
+    st.set_thread("D2:2.0")
+    check("a plan from a thread that is no longer its home is not pending", st.plan() is None)
+
+
+
+def test_operator_state_writes_hold_one_lock():
+    print("\noperator.json: every read-modify-write holds the one lock")
+    tree = ast.parse((BASE / "operator_role.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "State")
+    bad = []
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name == "_save":
+            continue
+        saves = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                 and isinstance(c.func, ast.Attribute) and c.func.attr == "_save"]
+        locked = [w for w in ast.walk(fn) if isinstance(w, ast.With) and any(
+            getattr(i.context_expr, "id", "") == "_STATE_LOCK" for i in w.items)]
+        inside = {id(c) for w in locked for c in ast.walk(w)}
+        if any(id(c) not in inside for c in saves):
+            bad.append(fn.name)
+    check("no State method saves outside _STATE_LOCK (a stale copy would undo a run "
+          "entry's mark, and it would run twice)", not bad, bad)
+    import operator_role as O
+    check("and it is one lock for every State, not one each",
+          isinstance(O._STATE_LOCK, type(__import__("threading").RLock())))
 
 
 if __name__ == "__main__":
