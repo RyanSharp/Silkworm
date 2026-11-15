@@ -29426,6 +29426,18 @@ def test_ops_refuse_unknown_ops_bad_args_and_shell():
     check("or one never committed at all",
           "not committed as it stands" in refused("trader-launchd-reinstall",
                                                   ["com.traderjoe.fresh"]))
+    retired = w.trader / "data" / "retired-launchd"
+    retired.mkdir(parents=True, exist_ok=True)
+    gone = retired / "com.traderjoe.pooldata.20261115-093000-1.plist"
+    gone.write_bytes(good)
+    (retired / "com.traderjoe.pool.20261115-093000.plist").write_bytes(good)
+    msg = refused("trader-launchd-reinstall", ["com.traderjoe.pooldata"])
+    check("a job retired into data/retired-launchd, though its plist is still in ops/: "
+          "a retired job stays retired", "was retired" in msg and gone.name in msg, msg)
+    gone.unlink()
+    check("and once that copy is moved out, it reinstalls -- another job's retired "
+          "copy, whose name only starts the same, does not count",
+          OPS.plan("trader-launchd-reinstall", ["com.traderjoe.pooldata"], w.ctx).steps)
     (w.agents / "com.traderjoe.pooldata.plist").symlink_to(w.tmp / "victim")
     check("a destination that is a symlink is not written through",
           "symlink" in refused("trader-launchd-reinstall", ["com.traderjoe.pooldata"]))

@@ -209,6 +209,14 @@ def _launchd_reinstall(op, args, ctx):
         # agent, say) would replace it.
         raise Refused(f"`{job}` is not one of trader's jobs ({LAUNCHD_PREFIX}…)")
     cwd = _cwd(_project_rec(ctx, op.project), op.project)
+    retired = _retired_copies(cwd, job)
+    if retired:
+        # A job retired on your word stays retired: its source plist is still
+        # committed in ops/, so a reinstall would quietly bring it back.
+        # Undoing a retirement is moving its copy out of data/retired-launchd
+        # by hand first -- a deliberate step, not a side effect.
+        raise Refused(f"{job} was retired ({', '.join(retired)} in {RETIRED_DIR}); "
+                      "move that out by hand first to bring it back")
     if (Path(cwd) / "ops").is_symlink():
         raise Refused(f"{op.project}'s ops/ is a symlink; only its own directory counts")
     ops_dir = (Path(cwd) / "ops").resolve()
@@ -261,9 +269,20 @@ def _job_arg(op, args) -> str:
 
 
 #: Where a retired job's plist goes, inside trader's checkout (data/ is
-#: gitignored there): moved, never deleted, so retiring is undone by moving it
-#: back and running trader-launchd-reinstall.
+#: gitignored there): moved, never deleted. trader-launchd-reinstall refuses a
+#: job with a copy here, so retiring is undone only by moving that copy out
+#: by hand, then reinstalling.
 RETIRED_DIR = "data/retired-launchd"
+
+
+def _retired_copies(cwd, job: str) -> list:
+    """The file names in trader's data/retired-launchd that retired `job`
+    (`<job>.<date-time>[-n].plist`, as _launchd_retire names them)."""
+    d = Path(cwd) / RETIRED_DIR
+    if not d.is_dir():
+        return []
+    stamp = re.compile(re.escape(job) + r"\.\d{8}-\d{6}(?:-\d+)?\.plist")
+    return sorted(p.name for p in d.iterdir() if stamp.fullmatch(p.name))
 
 
 def _stamp(clock=time.time) -> str:
@@ -526,7 +545,7 @@ REGISTRY: dict[str, Op] = {op.name: op for op in (
     Op("trader-launchd-reinstall", "trader",
        "reinstall one of trader's launchd jobs from its ops/<job>.plist after it "
        "changed: plutil -lint, copy to ~/Library/LaunchAgents, launchctl bootout "
-       "then bootstrap",
+       "then bootstrap (refused for a job retired into data/retired-launchd)",
        "<job label, e.g. com.traderjoe.pooldata>", 120, False, _launchd_reinstall,
        named=True),
     Op("trader-refetch-revisions", "trader",
