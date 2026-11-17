@@ -3701,7 +3701,7 @@ def test_credentials_check():
     # The token branch of `silkworm status` had never executed until a token was
     # actually configured, and it called ok() -- which does not exist; only
     # check(label, ok, hint) does. Driven for real rather than grepped.
-    env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-fake"}
+    env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-" + "oat01-fake"}
     r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "status"],
                        capture_output=True, text=True, env=env, timeout=60)
     blob = r.stdout + r.stderr
@@ -10898,7 +10898,7 @@ version = {{ file = "ios/project.yml", key = "CFBundleShortVersionString" }}
     check("unpushed commits block a release: ship only what origin has", ok)
     g("push", "-q", "origin", "main")
 
-    _os.environ["SLACK_BOT_TOKEN"] = "xoxb-should-not-reach-a-deploy"
+    _os.environ["SLACK_BOT_TOKEN"] = "xoxb-" + "should-not-reach-a-deploy"
     try:
         r = R.release(repo, "backend")
     finally:
@@ -10988,7 +10988,7 @@ version = { file = "ios/project.yml", key = "CFBundleShortVersionString" }
     g("push", "-q", "origin", "main")
     gen = ["ios/Cadence/Info.plist"]
     plist = repo / "ios/Cadence/Info.plist"
-    injected = "<plist>SUPABASE_KEY=sb_secret_local</plist>\n"
+    injected = "<plist>SUPABASE_KEY=sb_secret_" + "local</plist>\n"
     plist.write_text(injected)
     g("add", "ios/Cadence/Info.plist")        # staged, the worst case
 
@@ -28320,7 +28320,7 @@ def test_probe_results_never_carry_a_secret():
     import health as H
     print("\nhealth probes: no secret in any summary, evidence line, link, fingerprint or log")
     R = _recorded()
-    secrets = {"sbp": "sbp_" + "f00dfeed" * 5, "jwt": "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJ4In0.c2lnbmF0dXJlLXNpZw",
+    secrets = {"sbp": "sbp_" + "f00dfeed" * 5, "jwt": ".".join(("eyJ" + "hbGciOiJFUzI1NiJ9", "eyJ" + "pc3MiOiJ4In0", "c2lnbmF0dXJlLXNpZw")),
                "anth": "sk-ant-oat01-" + "Q" * 30, "dbpass": "dbpassSECRET123",
                "sbsecret": "sb_secret_" + "k" * 24}
     home = _supabase_home(token=secrets["sbp"])
@@ -28590,7 +28590,7 @@ def test_probe_tailscale_reads_the_phone_dashboards_path():
     leaky = json.loads(json.dumps(running))
     leaky["Self"]["PublicKey"] = "nodekey:" + "9c" * 32
     leaky["AuthURL"] = "https://login.tailscale.com/a/1a2b3c4d5e6f"
-    secrets = ["9c" * 32, "1a2b3c4d5e6f", "tskey-auth-kAbCdEf123CNTRL-zzzzzzzzzzzz"]
+    secrets = ["9c" * 32, "1a2b3c4d5e6f", "tskey-" + "auth-kAbCdEf123CNTRL-" + "z" * 12]
     outs = [run(leaky)[0],
             run((1, "", f"{secrets[2]} To authenticate, visit: {leaky['AuthURL']} "
                         f"nodekey:{'9c' * 32}"))[0],
@@ -29762,7 +29762,7 @@ def test_ops_one_run_at_a_time_and_within_its_timeout():
     check("and the lock is let go after a run", rec["ok"] and released)
     rec = OPS.run(OPS.plan("tailscale-status", [], w.ctx),
                   runner=lambda a, **k: types.SimpleNamespace(
-                      returncode=0, stdout="key nodekey:0123456789abcdef", stderr=""))
+                      returncode=0, stdout="key nodekey:" + "0123456789abcdef", stderr=""))
     check("output is scrubbed of credentials", "0123456789abcdef" not in rec["tail"], rec["tail"])
 
 
@@ -30198,10 +30198,10 @@ def test_bot_and_visualizer_boot_for_real():
           st.get("code_dir") == str(BASE) and st.get("pid") and st.get("booted"),
           {k: st.get(k) for k in ("code_dir", "pid", "booted")})
     env = smoke.boot_env(Path("/tmp/x"), "http://127.0.0.1:1/api/", 1, 2,
-                         base={"SLACK_BOT_TOKEN": "xoxb-real", "CLAUDE_CODE_OAUTH_TOKEN": "sk",
+                         base={"SLACK_BOT_TOKEN": "xoxb-" + "real", "CLAUDE_CODE_OAUTH_TOKEN": "sk",
                                "SILKWORM_THREAD": "C1:1", "PATH": "/bin"})
     check("no real token or turn variable reaches the booted processes",
-          env["SLACK_BOT_TOKEN"] == "xoxb-smoke-not-a-token"
+          env["SLACK_BOT_TOKEN"] == "xoxb-" + "smoke-not-a-token"
           and "CLAUDE_CODE_OAUTH_TOKEN" not in env and "SILKWORM_THREAD" not in env
           and env["SILKWORM_OFFLINE"] == "1" and env["PATH"] == "/bin", env)
 
@@ -30761,12 +30761,12 @@ def test_watchdog_alerts_reach_slack_and_push_without_the_bot():
     import watchdog as W
     print("\nthe watchdog's alert goes straight to Slack and the phone")
     home = Path(tempfile.mkdtemp())
-    (home / ".env").write_text("SLACK_BOT_TOKEN=xoxb-from-env-file\n")
+    (home / ".env").write_text("SLACK_BOT_TOKEN=xoxb-" + "from-env-file\n")
     (home / "sessions.json").write_text(json.dumps(
         {"D0OLD:1.0": {"updated": 1}, "D0NEW:2.0": {"updated": 5}, "C0CHAN:3.0": {"updated": 9}}))
     check("the home DM is the most recently active DM, as the bot picks it",
           A.home_channel(home) == "D0NEW")
-    (home / ".env").write_text("SLACK_BOT_TOKEN=xoxb-from-env-file\nSILKWORM_HOME_CHANNEL=D0SET\n")
+    (home / ".env").write_text("SLACK_BOT_TOKEN=xoxb-" + "from-env-file\nSILKWORM_HOME_CHANNEL=D0SET\n")
     check("unless SILKWORM_HOME_CHANNEL names one", A.home_channel(home) == "D0SET")
 
     # chat.postMessage, for real, against a loopback stand-in.
@@ -30794,14 +30794,14 @@ def test_watchdog_alerts_reach_slack_and_push_without_the_bot():
         tok, ch, text, ts, url=url), push=lambda h, t, b: pushed.append((t, b)) or (True, "1"))
     srv.shutdown()
     check("it posts with the bot token from the install's .env, to the home DM",
-          res["slack"] and got and got[0][1] == "Bearer xoxb-from-env-file"
+          res["slack"] and got and got[0][1] == "Bearer xoxb-" + "from-env-file"
           and got[0][2]["channel"] == "D0SET" and got[0][2]["text"] == "Silkworm is down", got)
     check("and pushes to the phone", pushed == [("Silkworm", "Silkworm is down")], pushed)
     res = A.owner(home, "x", thread="C9:1.5", post=lambda tok, ch, text, ts="": (
         got.append((ch, ts)) or (True, "")), push=lambda *a: (False, ""))
     check("a deploy's note goes to its own thread instead", got[-1] == ("C9", "1.5"))
     check("a Slack post that cannot connect is reported, not raised",
-          A.slack_post("xoxb-x", "D1", "t", url=f"http://127.0.0.1:{smoke.spare_port()}/x")[0]
+          A.slack_post("xoxb-" + "x", "D1", "t", url=f"http://127.0.0.1:{smoke.spare_port()}/x")[0]
           is False)
 
     ran = []
@@ -30961,11 +30961,11 @@ def test_outages_reach_status_digest_and_health():
     print("\noutages: recorded by whoever saw them, reported once the bot is back")
     home = Path(tempfile.mkdtemp())
     now = time.time()
-    O.open_(home, start=now - 3 * 86400, cause="NameError: x xoxb-123456789-abc",
+    O.open_(home, start=now - 3 * 86400, cause="NameError: x xoxb-" + "123456789-abc",
             seen_by="watchdog", revision="b" * 40)
     again = O.open_(home, start=now, cause="other", seen_by="watchdog")
     check("one outage, however many see it", len(O.load(home)) == 1 and again["cause"] != "other")
-    check("tokens are scrubbed from the cause", "xoxb-123" not in json.dumps(O.load(home)))
+    check("tokens are scrubbed from the cause", "xoxb-" + "123" not in json.dumps(O.load(home)))
     O.update_open(home, rolled_back={"from": "b" * 40, "to": "a" * 40, "ok": True})
     O.close(home, end=now - 3600, how="watchdog")
     line = O.describe(O.load(home)[0], now)
@@ -31458,6 +31458,92 @@ def test_operator_state_writes_hold_one_lock():
     import operator_role as O
     check("and it is one lock for every State, not one each",
           isinstance(O._STATE_LOCK, type(__import__("threading").RLock())))
+
+
+# Shapes GitHub secret scanning (and its partners) recognise. Kept a little
+# looser than the real patterns so a fake that *nearly* matches is caught here
+# rather than by an alert on the public repo. Each regex is written so that
+# its own source text never matches itself.
+_SECRET_SHAPES = {
+    "Tailscale key": r"tskey-[A-Za-z0-9]+-[A-Za-z0-9_-]{4,}",
+    "Tailscale node key": r"nodekey:[0-9a-f]{16,}",
+    "Anthropic key": r"sk-ant-[a-z]+[0-9]{2}-[A-Za-z0-9_-]{4,}",
+    "Slack token": r"xox[abposre]-[0-9]{3,}-[A-Za-z0-9-]+",
+    "Slack app token": r"xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-f0-9]+",
+    "Slack webhook": r"hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+",
+    "Supabase secret key": r"sb_secret_[A-Za-z0-9_-]{8,}",
+    "Supabase access token": r"sbp_[a-f0-9]{32,}",
+    "JWT": r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{8,}",
+    "GitHub token": r"gh[pousr]_[A-Za-z0-9]{20,}",
+    "GitHub fine-grained token": r"github_pat_[A-Za-z0-9_]{20,}",
+    "AWS access key id": r"(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}",
+    "AWS secret key": r"aws_?secret_?access_?key[\"' :=]+[A-Za-z0-9/+]{40}",
+    "private key": r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----",
+}
+
+
+def _secret_shaped_literals(root):
+    """(path, line, kind) for every secret-shaped run of text in root's tracked files."""
+    import re as _re
+    shapes = {k: _re.compile(v, _re.IGNORECASE if k == "AWS secret key" else 0)
+              for k, v in _SECRET_SHAPES.items()}
+    names = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True,
+                           check=True).stdout.decode().split("\0")
+    hits = []
+    for name in filter(None, names):
+        path = Path(root) / name
+        if not path.is_file() or path.is_symlink():
+            continue
+        data = path.read_bytes()
+        if b"\0" in data[:8192]:
+            continue                       # binary: icons and the like
+        for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+            hits += [(name, n, k) for k, rx in shapes.items() if rx.search(line)]
+    return hits, len(names)
+
+
+def test_no_secret_shaped_literal_in_tracked_source():
+    print("\nsecret scanning: no tracked file carries a literal a scanner would flag")
+    # 2e3ef9e put a fake 'tskey-auth-…' in this file; it was fake, but it was
+    # the shape of a real one, and GitHub raised an alert on the public repo.
+    # Fakes are assembled at runtime ("tskey-" + "auth-…") so the source holds
+    # no contiguous match.
+    hits, scanned = _secret_shaped_literals(BASE)
+    check("the scan actually looked at the tree", scanned > 20, scanned)
+    check("no secret-shaped literal anywhere in tracked source", not hits, hits[:20])
+
+    # And it catches one: each shape, planted in a scratch repo, is found.
+    plants = {
+        "Tailscale key": "tskey-" + "auth-kAbCdEf123CNTRL-" + "z" * 12,
+        "Tailscale node key": "nodekey:" + "9c" * 32,
+        "Anthropic key": "sk-ant-" + "api03-" + "Q" * 40,
+        "Slack token": "xoxb-" + "123456789012-123456789012-" + "a" * 24,
+        "Slack app token": "xapp-" + "1-A0123ABCD-1234567890-" + "ab" * 32,
+        "Slack webhook": "https://hooks.slack" + ".com/services/T0123ABCD/B0123ABCD/" + "x" * 24,
+        "Supabase secret key": "sb_secret_" + "k" * 24,
+        "Supabase access token": "sbp_" + "f00dfeed" * 5,
+        "JWT": ".".join(("eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxIn0", "c" * 30)),
+        "GitHub token": "ghp_" + "A1" * 18,
+        "GitHub fine-grained token": "github_pat_" + "B2" * 20,
+        "AWS access key id": "AKIA" + "ABCDEFGHIJ234567",
+        "AWS secret key": "aws_secret_access_key = " + "wJalrXUtnFEMI/K7MDENG/" + "b" * 18,
+        "private key": "-----BEGIN " + "RSA PRIVATE KEY-----",
+    }
+    check("every shape has a plant that exercises it", set(plants) == set(_SECRET_SHAPES),
+          set(_SECRET_SHAPES) ^ set(plants))
+    scratch = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-q", str(scratch)], check=True)
+    for i, (kind, text) in enumerate(plants.items()):
+        (scratch / f"f{i}.py").write_text(f"x = {text!r}\n")
+    (scratch / "blob.bin").write_bytes(b"\0" + plants["Tailscale key"].encode())
+    (scratch / "split.py").write_text('x = "tskey-" + "auth-kAbCdEf123CNTRL-" + "z" * 12\n')
+    subprocess.run(["git", "-C", str(scratch), "add", "-A"], check=True)
+    found, _ = _secret_shaped_literals(scratch)
+    got = {k for _, _, k in found}
+    check("each planted literal is caught", got >= set(plants), set(plants) - got)
+    check("binaries are skipped, and a fake assembled at runtime is not a hit",
+          not [f for f, _, _ in found if f in ("blob.bin", "split.py")], found)
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 if __name__ == "__main__":
