@@ -1091,6 +1091,10 @@ of a plan.
 [args] [--op <op> [args]]… --by operator` and numbers them in its reply as that
 prints them. A plain answer in your next message in its thread runs them:
 "yes", "go", "do it", "run them" (all), "do 1 and 3", "just 2", "all but 2".
+Phone typing reads the same: curly quotes, an ellipsis, dashes, 👍/✅, trailing
+punctuation and case are normalised first, and you may open by naming the plan
+("for trader… “yes”", "trader: do 1 and 3", "re the ops: yes") — a lead-in
+naming anything but the plan's own ops leaves the message refused.
 The operator runs each with `ops run <op> <args> --plan-entry N`, and the bot
 checks that it is exactly that entry's op and arguments, that the entry has not
 run, that the plan was recorded before your message and is still the live one

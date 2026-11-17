@@ -31309,6 +31309,95 @@ def test_plan_approval_reads_plain_words():
               live))
 
 
+
+def test_plan_approval_reads_phone_typing():
+    import operator_role as O
+    print("\nyour answer to a plan as a phone types it: curly quotes, ellipses, a lead-in")
+    # The plan answered on 2026-11-16 (plan_7ca85c43df) was trader's ops.
+    words = O.plan_words([
+        {"name": "trader-launchd-retire", "args": ["com.trader.momentum"]},
+        {"name": "trader-env-set", "args": ["MOMENTUM_UNIVERSE", "pit"]},
+        {"name": "trader-launchd-reinstall", "args": []},
+        {"name": "trader-refetch-revisions", "args": ["--apply"]},
+        {"name": "tailscale-on", "args": []}])
+    yes5 = {1, 2, 3, 4, 5}
+    cases = {
+        # The exact message refused on 2026-11-16.
+        "for trader\u2026 \u201cyes\u201d": yes5,
+        "\u201cyes\u201d": yes5, "\u2018yes\u2019": yes5, '"yes"': yes5, "Yes.": yes5,
+        "YES!!": yes5, "yes \U0001f44d": yes5, "yes \U0001f44d\U0001f3fd": yes5,
+        "\U0001f44d": yes5, "\u2705": yes5, "yes \u2714\ufe0f": yes5, "yes \U0001f64f": yes5,
+        "  yes\u00a0 ": yes5, "yes;": yes5, "yes\u2026": yes5, "go ahead \u2014 run them": yes5,
+        "for trader: do 1 and 3": {1, 3}, "trader: do 1 and 3": {1, 3},
+        "re the ops: yes": yes5, "re the ops, yes": yes5, "about the trader ops \u2014 yes": yes5,
+        "for the plan: all but 2": {1, 3, 4, 5}, "for trader\u2026 do 1\u20133": {1, 2, 3},
+        "all but 5\u2026": {1, 2, 3, 4}, "all but 5.": {1, 2, 3, 4},
+        "yes but not 4": {1, 2, 3, 5}, "Yes \u2014 but not 4": {1, 2, 3, 5},
+        "do 1 \u2013 3": {1, 2, 3}, "yes \u2014 except 2": {1, 3, 4, 5},
+        "yes :pray:": yes5, "yes 2\ufe0f\u20e3": {2}, "yes: 2": {2}, "2: yes": {2},
+    }
+    for text, want in cases.items():
+        got, why = O.plan_approval(text, 5, words)
+        check(f"{text!r} approves {sorted(want)}", set(got) == want and not why, (got, why))
+    refusals = (
+        "yes?", "\u201cyes?\u201d", "yes\uff1f", "yes \u2753", "\U0001f914", "what does 2 do",
+        "what does 2 do\u2026", "yes but not 4 yet", "yes but 4 later", "yes if 2 passes",
+        "no", "No.", "nope", "not yet", "Not yet\u2026", "don't", "don\u2019t",
+        "don\u2019t run 2", "\U0001f44e", "\u274c", "yes, but wait", "hold off \u2014 not yet",
+        "do 7", "yes to 6", "all but 9", "for trader: do 6",
+        # A lead-in naming something that is not this plan is not a lead-in.
+        "for cadence: yes", "re mondays: yes", "re 2: yes", "for the other plan, yes but",
+        "about tomorrow: yes", "trader? yes",
+        # Numbers joined by dots are a range, a list or a decimal: not guessed.
+        "do 1.2", "1\u20263", "do 1. 2 seems wrong",
+        "it\u2019s fine, run them", "\u201cyes\u201d she said no",
+        # A dash before a number may mean "minus": not read as a list (found
+        # in review -- "yes all - 2" had approved only 2).
+        "yes all - 2", "yes, all \u2014 2", "everything \u2013 2",
+        # ...nor stripped through as a lead-in's end (found in review: these
+        # had approved only 2).
+        "the plan - 2", "ops - 2", "trader ops - 2", "for trader - 2",
+        "the plan \u2014 2", "re the ops \u2013 2", "trader -- 2",
+        # Slack shortcodes that say no or ask, and ones we cannot read.
+        "yes :x:", "yes :-1:", "yes :thumbsdown:", "yes :no_entry:", "yes :raised_hand:",
+        "yes :question:", "yes :thinking_face:", "yes :eyes:", "yes :skull:",
+    )
+    for text in refusals:
+        got, why = O.plan_approval(text, 5, words)
+        check(f"{text!r} approves nothing, and says why", not got and why, (got, why))
+    check("a negation is named as one",
+          "says no" in O.plan_approval("not yet", 5, words)[1]
+          and "says no" in O.plan_approval("don\u2019t", 5, words)[1])
+    # The normaliser alone, pinned so each rule is seen to do its part.
+    for raw, want in {
+            "for trader\u2026 \u201cyes\u201d": "for trader... yes",
+            "\u2018yes\u2019": "yes", "don\u2019t": "don't", "Yes.": "yes", "yes!!!": "yes",
+            "yes \U0001f44d\U0001f3fb": "yes yes", "ok \u2705": "ok yes", "do 1\u20133": "do 1-3",
+            "do 1 \u2014 3": "do 1-3", "go \u2014 run": "go , run", "yes - run": "yes , run",
+            "  YES \u00a0 ": "yes", "yes\u2026": "yes", "1\u20263": "1...3",
+            "yes \U0001f64f": "yes", "\u274c": "no", "yes\u200b": "yes",
+            "is that ok?": "is that ok?"}.items():
+        got = O.normalise_answer(raw)
+        check(f"normalise_answer({raw!r}) == {want!r}", got == want, got)
+    for raw, want in {
+            "for trader: yes": "yes", "re the ops, do 2": "do 2", "trader: yes": "yes",
+            "for the trader ops... yes": "yes", "about the plan , yes": "yes",
+            "trader ops yes": "trader ops yes", "for cadence: yes": "for cadence: yes",
+            "re 2: yes": "re 2: yes", "for trader:": "for trader:",
+            "the plan - 2": "the plan - 2", "ops - 2": "ops - 2",
+            "re the ops": "re the ops"}.items():
+        got = O.strip_lead_in(raw, words)
+        check(f"strip_lead_in({raw!r}) == {want!r}", got == want, got)
+    check("Slack's no and question shortcodes are read as such, not as unknown words",
+          "says no" in O.plan_approval("yes :x:", 5, words)[1]
+          and "says no" in O.plan_approval("yes :thumbsdown:", 5, words)[1]
+          and "question" in O.plan_approval("yes :thinking_face:", 5, words)[1])
+    check("a refusal word in an op's name is never a lead-in",
+          not O.plan_approval("hold: yes", 2, O.plan_words([{"name": "trader-hold"}]))[0])
+    check("with no plan words, only the plan itself is a subject",
+          O.strip_lead_in("re the ops: yes", ()) == "yes"
+          and O.strip_lead_in("for trader: yes", ()) == "for trader: yes")
+
 def _plan_turn(w, text, turn="tsk_turn_mine", ts=None):
     """Your message's turn, with the plan it answers attached as handle_prompt
     attaches it (bot.pending_plan -> State.answer_plan)."""

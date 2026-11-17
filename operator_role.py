@@ -61,6 +61,7 @@ import secrets
 import subprocess
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -377,6 +378,11 @@ _FILLER = frozenset({
     "those", "these", "all", "both", "everything", "entry", "entries", "item", "items",
     "number", "numbers", "step", "steps", "op", "ops", "plan", "your", "recommendation",
     "recommendations", "recommended", "sounds", "good", "great", "perfect"})
+#: Words that say no or not now. ("but not 2" is read as an exception
+#: before these are looked for, so it never reaches them.)
+_NEGATE = frozenset({
+    "no", "nope", "nah", "not", "don't", "dont", "never", "wait", "hold", "stop",
+    "cancel", "later", "nevermind", "nvm", "negative", "n"})
 _TOKEN = re.compile(r"#?\d+\s*(?:-|–|to)\s*\d+|#?\d+|[a-z]+(?:'[a-z]+)?|[,&]|[^\s.!]")
 
 
@@ -402,6 +408,113 @@ def plan_words(entries) -> frozenset:
     return frozenset(out)
 
 
+# How a phone types it. On 2026-11-16 the answer 'for trader… “yes”' was
+# refused for every entry: iOS had curled the quotes and folded the three
+# dots into an ellipsis, and the user had said which plan they meant. So the
+# message is normalised first (normalise_answer) and may open by naming the
+# plan (strip_lead_in) -- still by rules, still failing closed.
+
+#: Emoji that say yes, read as the word; skin tones and variation selectors
+#: are dropped first, so 👍🏽 and ✔️ count.
+_EMOJI_YES = ("\U0001f44d", "\u2705", "\u2714", "\u2611", "\U0001f44c", "\U0001f197",
+              "\U0001f4af")
+#: Emoji that decorate a message without saying anything else.
+_EMOJI_NOISE = ("\U0001f64f", "\U0001f642", "\U0001f60a", "\U0001f600", "\U0001f604",
+                "\U0001f680", "\U0001f525", "\U0001f389", "\u263a")
+#: Slack shortcodes that ask or say no, read as words so they refuse, and
+#: ones that only decorate. Any other shortcode is left in the message, and
+#: refuses: an emoji we cannot read is not a yes.
+_SLACK_WORDS = {
+    "x": " no ", "-1": " no ", "thumbsdown": " no ", "no_entry": " no ",
+    "no_entry_sign": " no ", "octagonal_sign": " no ", "stop_sign": " no ",
+    "raised_hand": " wait ", "hand": " wait ", "question": " ? ", "grey_question": " ? ",
+    "thinking_face": " ? ", "eyes": " ? "}
+_SLACK_NOISE = frozenset({
+    "pray", "tada", "rocket", "fire", "smile", "slightly_smiling_face", "blush",
+    "grinning", "raised_hands", "muscle", "sunglasses"})
+#: Emoji that ask or say no: kept as words, so they refuse.
+_EMOJI_WORDS = {"\u2753": " ? ", "\u2754": " ? ", "\U0001f914": " ? ",
+                "\U0001f44e": " no ", "\u274c": " no ", "\U0001f6d1": " no ",
+                "\u270b": " wait "}
+_EMOJI_MODIFIERS = re.compile("[\U0001f3fb-\U0001f3ff\ufe0e\ufe0f\u200d\u200b\u200c\u2060\ufeff\u20e3]")
+
+
+def _slack_word(m) -> str:
+    name = m.group(0).strip(":")
+    if name in _SLACK_WORDS:
+        return _SLACK_WORDS[name]
+    return " " if name in _SLACK_NOISE else f" {name} "
+
+
+def normalise_answer(text: str) -> str:
+    """Your answer as a keyboard without autocorrect would have typed it:
+    lower case, straight apostrophes, no quotation marks, dots for an
+    ellipsis, a comma for a dash between words (a hyphen between numbers, so
+    "1–3" stays a range), approving emoji as "yes", single spaces, and no
+    punctuation trailing the end. Nothing here can turn a refusal into a yes:
+    a "?" or a word it does not know survives it."""
+    t = unicodedata.normalize("NFKC", text or "").lower()
+    t = _EMOJI_MODIFIERS.sub("", t)
+    t = _SLACK_YES.sub(" yes ", t)
+    t = _SLACK_EMOJI.sub(_slack_word, t)
+    for e in _EMOJI_YES:
+        t = t.replace(e, " yes ")
+    for e in _EMOJI_NOISE:
+        t = t.replace(e, " ")
+    for e, word in _EMOJI_WORDS.items():
+        t = t.replace(e, word)
+    # Apostrophes and single quotes: an apostrophe inside a word ("don't")
+    # stays one; a quote around one ("'yes'") goes.
+    t = re.sub("[\u2018\u2019\u201a\u201b\u2032`\u00b4]", "'", t)
+    t = re.sub(r"(?<![a-z])'|'(?![a-z])", " ", t)
+    t = re.sub("[\"\u201c\u201d\u201e\u201f\u2033\u00ab\u00bb\u2039\u203a]", " ", t)
+    # Dashes: a range between numbers, a pause between words.
+    t = re.sub(r"(?<=\d)\s*[\u2010-\u2015\u2212-]\s*(?=#?\d)", "-", t)
+    # Before a number, though, a dash may mean "minus" ("all - 2"): it stays,
+    # and refuses.
+    t = re.sub(r"(?:[\u2010-\u2015\u2212]|(?<!\S)-(?!\S)|(?<!\S)--+|--+(?!\S))(?!\s*#?\d)",
+               " , ", t)
+    t = t.replace(";", ",")
+    t = re.sub(r":(?=\s)", " ,", t)
+    t = " ".join(t.split())
+    t = re.sub(r"(?:\s*[.!,:~])+$", "", t)
+    t = re.sub(r"^(?:[.!,:~]\s*)+", "", t)
+    return t
+
+
+#: "for trader", "re the ops", "trader:", "about the trader ops -- ": a
+#: short opening naming what the answer is about. The subject must be the
+#: plan's own (its op words) or the plan itself; a lead-in naming anything
+#: else is left in place, and so refuses.
+_LEAD_PREP = r"(?:(?:for|re|about|regarding|as\s+for|on)\s+)"
+#: No dash: the normaliser has already made a dash between words a comma,
+#: so a dash that reaches here stands before a number and may mean "minus"
+#: ("the plan - 2"); stripping through it would read "2". It stays, and refuses.
+_LEAD_SEP = r"(?:\s*(?::|,|\.{2,})\s*|\s+)"
+_LEAD_GENERIC = ("ops", "op", "plan", "ones")
+
+
+def strip_lead_in(t: str, words=()) -> str:
+    """`t` (normalised) without a lead-in naming the plan it answers, or
+    unchanged when it has none. At most three subject words, and something
+    must follow."""
+    subject = sorted({w for w in words if w.isalpha() and w not in _NEGATE
+                      and w not in _AFFIRM} | set(_LEAD_GENERIC), key=len,
+                     reverse=True)
+    if not subject:
+        return t
+    subj = "(?:" + "|".join(re.escape(w) for w in subject) + ")"
+    m = re.match(rf"^{_LEAD_PREP}?(?:the\s+)?{subj}(?:\s+{subj}){{0,2}}{_LEAD_SEP}(?=\S)", t)
+    if not m:
+        return t
+    head = m.group(0)
+    # Without "for/re/..." or a separator, a bare subject word is just a
+    # word of the answer ("trader ops yes"): leave it for the filler rules.
+    if not re.match(_LEAD_PREP, head) and not re.search(r"[:,.]\s*$", head):
+        return t
+    return t[m.end():]
+
+
 def plan_approval(text: str, count: int, words=()) -> tuple[frozenset, str]:
     """Which entries (1..count) of a pending plan your message approves, and,
     if none, why. Deterministic, and fail closed.
@@ -413,17 +526,18 @@ def plan_approval(text: str, count: int, words=()) -> tuple[frozenset, str]:
     don't, a number that is not an entry, or any word beyond saying yes and
     naming entries or the plan's ops (`words`) -- "ok thanks", "do it in 2
     hours", "all except the trader ones", "yes, and file a task for X".
+    Phone typing is normalised first (normalise_answer) and a lead-in naming
+    the plan is dropped (strip_lead_in): 'for trader\u2026 \u201cyes\u201d' is a yes.
     """
     if count < 1:
         return frozenset(), "there is no plan"
-    t = (text or "").lower().replace("\u2019", "'").replace("\u2018", "'")
-    t = _SLACK_YES.sub(" yes ", t)
-    t = _SLACK_EMOJI.sub(" ", t)
-    t = t.replace("\U0001f44d", " yes ").replace("\u2705", " yes ")
-    t = " ".join(t.split())
+    t = strip_lead_in(normalise_answer(text), words)
     t = re.sub(r"\bsounds?\s+(?:good|great|right|fine)\b", "yes", t)
     if not t:
         return frozenset(), "the message is empty"
+    if re.search(r"\d\s*\.+\s*#?\d", t):
+        # "1.2", "1...3": a range, a list, or a decimal -- not for us to guess.
+        return frozenset(), "the message joins numbers with dots; say which entries plainly"
     excluded = []
     for m in _EXCLUDE.finditer(t):
         excluded += _numbers(m.group(1))
@@ -435,6 +549,10 @@ def plan_approval(text: str, count: int, words=()) -> tuple[frozenset, str]:
         # "can you run them?" -- the request, without its question form.
         rest = re.sub(r"^(?:please\s+)?(?:can|could|would|will)\s+you\s+", "", rest)
     tokens = [tok for tok in _TOKEN.findall(rest) if tok not in ("?",)]
+    said_no = sorted(set(tokens) & _NEGATE)
+    if said_no:
+        return frozenset(), (f"the message says no or not yet ({', '.join(map(repr, said_no))});"
+                             " it approves nothing")
     known = _AFFIRM | _FILLER | set(words or ())
     other = sorted({tok for tok in tokens if not tok[-1].isdigit() and tok not in known})
     if other:
