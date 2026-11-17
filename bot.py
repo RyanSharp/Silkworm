@@ -3764,6 +3764,11 @@ def requested_filing(payload: dict, key: str, caller_role: str, parent, from_res
     notes = " ".join(str(payload.get("notes") or "").split())
     if not notes:
         return None, "--requested-by-user needs --notes quoting what the user asked for"
+    # The notes are the record that you asked: they must quote your message,
+    # or the operator could file anything and say you wanted it.
+    why = operator_role.request_quote_refusal(notes, grant.get("text") or "")
+    if why:
+        return None, why
     return {"by": grant["user"], "ts": grant["ts"], "notes": notes[:500],
             "at": time.time()}, ""
 

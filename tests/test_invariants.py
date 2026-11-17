@@ -31353,6 +31353,10 @@ def test_requested_filing_passes_a_full_cap_and_a_sweep_does_not():
                   "requested_by_user": True, "caller_grant": g, "notes": "x"})
     check("only the operator files on your request", not out["ok"]
           and "--requested-by-user is the operator's" in out["error"], out)
+    out = file(requested_by_user=True, caller_grant=g,
+               notes="user: please rebuild the whole momentum universe tonight")
+    check("in your turn, notes claiming words you never wrote are refused",
+          not out["ok"] and "quoting the user's own message" in out["error"], out)
     before = len(w.ts.by_project("alpha"))
     check("none of those filed anything", before == S.max_open_proposals())
     out = file(requested_by_user=True, caller_grant=g,
@@ -31370,7 +31374,7 @@ def test_requested_filing_passes_a_full_cap_and_a_sweep_does_not():
                   for e in rec.get("events") or []), rec)
     out = file(requested_by_user=True, caller_grant=g, propose=True,
                goal="A proposal the user asked for, to look at before it runs",
-               notes="user: propose it")
+               notes="as a proposal -- user: 'file the universe rebuild'")
     check("asked for as a proposal, it is one, past the cap",
           out.get("ok") and out.get("state") == T.PROPOSED, out)
     out = file(propose=True, goal="Another idea of its own, while the board is full")
@@ -31380,6 +31384,25 @@ def test_requested_filing_passes_a_full_cap_and_a_sweep_does_not():
     out = file(requested_by_user=True, caller_grant=g, notes="user: x",
                goal="One more after the turn has ended, which must be refused")
     check("once your turn has ended, refused", not out["ok"], out)
+
+
+def test_request_quote_refusal_needs_the_users_own_words():
+    import operator_role as O
+    print("\nfiling on your request: --notes must quote your message, not invent it")
+    said = "Please file the universe rebuild for trader, it's overdue."
+    ok = lambda n: O.request_quote_refusal(n, said) == ""
+    check("the whole message, case and punctuation aside", ok("please FILE the universe rebuild, for trader"))
+    check("after a leading label", ok("user: the universe rebuild for trader"))
+    check("a quoted part among paraphrase", ok('they want it now: "file the universe rebuild"'))
+    check("curly quotes too", ok("asked \u201cuniverse rebuild for trader\u201d today"))
+    check("an apostrophe in the quote", ok("user: trader, it\u2019s overdue"))
+    check("words never said are refused", not ok("user: rebuild the momentum universe tonight"))
+    check("a quote too short to be the request is refused", not ok("user: 'the universe'"))
+    check("scattered words of the message are not a quote", not ok("user: trader universe file rebuild"))
+    check("a short message may be quoted whole", O.request_quote_refusal("user: 'do it'", "do it") == "")
+    check("but not by a fragment of it",
+          O.request_quote_refusal("user: 'do'", "do it now") != "")
+    check("an empty message quotes nothing", O.request_quote_refusal("user: x", "") != "")
 
 
 def test_cli_task_requested_by_user_sends_notes():

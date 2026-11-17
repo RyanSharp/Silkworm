@@ -289,6 +289,49 @@ class Grants:
         return g
 
 
+#: The fewest words of your message --notes must quote for a filing made on
+#: your request (`request_quote_refusal`), unless the message is shorter.
+QUOTE_MIN_WORDS = 4
+
+_QUOTED = re.compile(r'"([^"]+)"|\u201c([^\u201d]+)\u201d|\u2018([^\u2019]+)\u2019|'
+                     r"(?<![a-z0-9])'([^']+)'(?![a-z0-9])", re.I)
+
+
+def _words(text: str) -> list:
+    return re.findall(r"[a-z0-9]+", str(text or "").lower().replace("\u2019", "'"))
+
+
+def _within(needle: list, hay: list) -> bool:
+    n = len(needle)
+    return any(hay[i:i + n] == needle for i in range(len(hay) - n + 1))
+
+
+def request_quote_refusal(notes: str, text: str) -> str:
+    """"" when --notes for a `task --requested-by-user` filing quotes your
+    message (the grant's text), or why not.
+
+    The notes are the record of what you asked for, so they must come from
+    what you said, not what the operator says you said: the whole of them, the
+    part after a leading label ("user: ..."), or a quoted part, has to appear
+    word for word (case, spacing and punctuation aside) in your message -- at
+    least QUOTE_MIN_WORDS words of it, or all of it if it is shorter."""
+    said = _words(text)
+    if not said:
+        return "the user's message has no words to quote"
+    need = min(QUOTE_MIN_WORDS, len(said))
+    notes = str(notes or "")
+    candidates = [notes]
+    if ":" in notes:
+        candidates.append(notes.split(":", 1)[1])
+    candidates += [next(g for g in m.groups() if g) for m in _QUOTED.finditer(notes)]
+    for c in candidates:
+        w = _words(c)
+        if len(w) >= need and _within(w, said):
+            return ""
+    return (f"--requested-by-user needs --notes quoting the user's own message, word for "
+            f"word (at least {need} words of it); it does not contain what the notes say")
+
+
 def decision_note(grant: dict, action: str, payload: dict) -> str:
     """The event a task gets when the operator acted on your word."""
     by = grant.get("user") or "the user"
