@@ -23,7 +23,11 @@ import ops
 log = logging.getLogger("silkworm.roles")
 
 # Tools a reviewer may use: read the tree, read history, run nothing else.
-REVIEWER_TOOLS = "Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git status:*)"
+# `tasks show` reads one task and changes nothing; a restricted run that
+# means to look one up should have the command for it, not reach for
+# `task show <id>` -- which filed that as a goal on 2026-11-18.
+REVIEWER_TOOLS = ("Read Grep Glob Bash(git diff:*) Bash(git log:*) Bash(git status:*)"
+                  " Bash({bin} tasks show:*)")
 
 # An ideator reads the same way, and may file proposals -- nothing else. It
 # runs unattended at night, so it must not be able to change anything: every
@@ -94,6 +98,9 @@ IDEATOR_SYSTEM = (
     "through it, and propose specific work that would make the project "
     "better in that way.\n\n"
     + ideation.SHARED_RULES + "\n\n"
+    # On 2026-11-18 a pass ran `task show <id>` to read a task and filed that.
+    "To read a task the board names, run `{bin} tasks show <id>` -- `{bin} "
+    "task` only ever files new work.\n\n"
     "Say briefly what you looked at and what you filed."
 )
 

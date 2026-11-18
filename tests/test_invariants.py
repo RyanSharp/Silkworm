@@ -34095,6 +34095,162 @@ def test_viz_tool_calls_and_inline_files():
         V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR = saved
 
 
+
+#: Real goals filed through scoping.validate in the 60 days to 2026-11-18,
+#: from tasks.json: the two shortest the dashboard ever took, the opening of
+#: the commonest kinds (the nightly pass, a conversation's, a review's
+#: follow-up, the operator's), and ones that start with a lookup verb or name
+#: task ids without being lookups. Every one must still be filed.
+REAL_GOALS = (
+    "Release latest changes to test flight",
+    "Test flight build doesn't have latest updates to the code base. We should release these.",
+    "Look over the Trader project and propose work worth doing.\n\nRead what is actually there before suggesting anything.",
+    "Make SupabaseSyncService.push() testable, and stop it swallowing every error it hits",
+    "--by operator Keep an ops plan open until the user actually answers it",
+    "From review: Land silkworm/tsk_76e96e9d9c (stops the daemon writing halt markers) once main has it",
+    "Decide whether to drop silkworm/tsk_343f6af22a and silkworm/tsk_7b290f1a2c after tsk_5ea770d699 lands",
+    "cadence: give the widget a fallback card when there is nothing due today",
+    "Show the streak count on the widget",
+    "Open the invite page in Safari when the app is not installed",
+    "List every Supabase function whose deployed source differs from main",
+    # Half ids is still an instruction; only more than half is refused.
+    "Land tsk_aaaa1111, tsk_bbbb2222 and tsk_cccc3333 tonight",
+)
+
+
+def test_a_mistyped_lookup_is_not_filed():
+    import scoping as S
+    print("\nfiling: a lookup typed at `silkworm task` is refused, with where it belonged")
+    w = _requested_world()
+    before = dict(w.ts.all())
+    # The exact filing of 2026-11-18 02:05: Cadence's nightly ideator ran
+    # `silkworm task show tsk_ad4681bd92` and got a proposal back.
+    out = w.file({"key": "D7:7.0", "goal": "show tsk_ad4681bd92", "propose": True,
+                  "project": "alpha", "caller_role": "ideator", "caller_task": "tsk_night"})
+    check("the 2026-11-18 input is refused", not out["ok"], out)
+    check("as a lookup, pointing at the command that reads a task",
+          "reads as a lookup" in out.get("error", "")
+          and "silkworm tasks show <id>" in out.get("error", "")
+          and "silkworm tasks [state]" in out.get("error", "")
+          and "silkworm status --json" in out.get("error", ""), out)
+    check("and files nothing", w.ts.all() == before)
+
+    # The CLI says the bot's refusal and exits 1: the same check, not its own.
+    cli = _load_cli()
+    sent = []
+    cli.bot_call = lambda path, payload, timeout=3: (sent.append((path, payload)) or
+                                                     w.file(dict(payload, key="D7:7.0")))
+    env = {"SILKWORM_THREAD": "D7:7.0", "SILKWORM_ROLE": "ideator"}
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                cli.do_file_task(["show", "tsk_ad4681bd92"])
+                code = 0
+            except SystemExit as e:
+                code = e.code
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("from the CLI it goes to the shared route and is refused there",
+          sent and sent[0][0] == "/file-task" and code == 1
+          and "silkworm tasks show <id>" in buf.getvalue(), (code, buf.getvalue()))
+    check("still nothing filed", w.ts.all() == before)
+
+    # Every way of filing asks the same check: the dashboard's create and an
+    # edit go through scoping.validate as /file-task does.
+    ns, ts, ps, found = _edit_routes()
+    r = ns["handle_tasks"]({"action": "create", "goal": "view tsk_ad4681bd92", "project": "alpha"})
+    check("the dashboard's create refuses it too", not r["ok"]
+          and "reads as a lookup" in r["error"] and ts.all() == {}, r)
+
+
+def test_goal_shape_rules_each_refuse_their_own_case():
+    import scoping as S
+    print("\nfiling: each goal-shape rule refuses its own case, and real goals pass")
+    for goal in REAL_GOALS:
+        check(f"a real goal is filed: {goal[:50]!r}", S.validate(goal) == "", S.validate(goal))
+    # Each case is caught by its own rule and said in that rule's words, so
+    # disabling any one rule fails exactly its own checks.
+    for goal in ("show tsk_ad4681bd92", "describe tsk_aaaa1111 tsk_bbbb2222",
+                 "STATUS: tsk_ad4681bd92", "list", "help", "cat silkworm/tsk_ad4681bd92",
+                 "open dashboard"):
+        check(f"lookup {goal!r} refused as a lookup",
+              "reads as a lookup" in S.validate(goal), S.validate(goal))
+    for goal in ("Look at tsk_aaaa1111 tsk_bbbb2222 tsk_cccc3333 tsk_dddd4444",
+                 "tsk_aaaa1111, tsk_bbbb2222, silkworm/tsk_cccc3333 and these"):
+        check(f"{goal[:40]!r} refused as mostly ids",
+              "mostly task ids" in S.validate(goal), S.validate(goal))
+    check("a goal under the character floor is refused (enough words)",
+          f"at least {S.MIN_GOAL_CHARS} characters" in S.validate("Fix a b c d e"),
+          S.validate("Fix a b c d e"))
+    check("a goal under the word floor is refused (enough characters)",
+          f"at least {S.MIN_GOAL_CHARS} characters" in S.validate("Refactor everything-in-the-importer now"),
+          S.validate("Refactor everything-in-the-importer now"))
+    check("the length refusal also says where a lookup belongs",
+          "silkworm tasks show <id>" in S.validate("Fix a b c d e"))
+    exact = "word " * (S.MIN_GOAL_WORDS - 1) + "x" * (S.MIN_GOAL_CHARS - 5 * (S.MIN_GOAL_WORDS - 1))
+    check("exactly the floors is filed", len(exact) == S.MIN_GOAL_CHARS
+          and len(exact.split()) == S.MIN_GOAL_WORDS and S.validate(exact) == "", exact)
+    check("the floors sit below the shortest real goal",
+          S.MIN_GOAL_CHARS <= len(REAL_GOALS[0]) and S.MIN_GOAL_WORDS <= len(REAL_GOALS[0].split()))
+
+
+def test_tasks_show_prints_one_task_and_changes_nothing():
+    import roles as R
+    print("\ntasks show: one task's title, state, goal and result, read-only")
+    ns, ts, ps, found = _edit_routes()
+    rec = ts.create("Build the importer for the new feed format, with tests",
+                    title="Importer", project="alpha", role="implementor", driver="queue")
+    ts.update(rec["id"], result={"text": "Wrote importer.py and its tests; 12 pass.",
+                                 "review": {"ok": True, "summary": "does what it says",
+                                            "findings": []},
+                                 "landed": "a" * 40})
+    path = Path(ts._path)
+    raw = path.read_bytes() if path and path.exists() else None
+    snapshot = json.dumps(ts.all(), sort_keys=True)
+    cli = _load_cli()
+    sent = []
+    cli.bot_call = lambda p, payload, timeout=3: (sent.append((p, dict(payload))) or
+                                                  ns["handle_tasks"](dict(payload)))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.do_tasks_show([rec["id"]])
+    out = buf.getvalue()
+    check("it exits 0", code == 0, out)
+    check("it prints the title, state, goal and the result summary",
+          "Importer" in out and "state: queued" in out
+          and "Build the importer for the new feed format, with tests" in out
+          and "review passed: does what it says" in out and "landed: " + "a" * 40 in out
+          and "12 pass" in out, out)
+    check("through the read action the dashboard opens a card with",
+          [p for p, _ in sent] == ["/tasks"] and sent[0][1].get("action") == "task", sent)
+    check("and nothing about the task changed",
+          json.dumps(ts.all(), sort_keys=True) == snapshot
+          and (raw is None or path.read_bytes() == raw))
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        code = cli.do_tasks_show(["tsk_nope000000"])
+    check("an unknown id is refused, exit 1", code == 1 and "unknown task" in buf.getvalue())
+    with contextlib.redirect_stderr(io.StringIO()):
+        check("no id is a usage error, exit 2", cli.do_tasks_show([]) == 2)
+    r = subprocess.run([sys.executable, str(BASE / "bin" / "silkworm"), "tasks", "show"],
+                       capture_output=True, text=True, timeout=30)
+    check("the CLI routes `tasks show` to it, not to a list of state 'show'",
+          r.returncode == 2 and "usage: silkworm tasks show" in r.stderr, r.stdout + r.stderr)
+    for role in ("ideator", "reviewer"):
+        tools = R.permission_args(role, [], bin="/x/bin/silkworm")[1]
+        check(f"a restricted {role} may run it", "Bash(/x/bin/silkworm tasks show:*)" in tools,
+              tools)
+    check("the ideator is told it is the way to read a task",
+          "/x/bin/silkworm tasks show <id>" in R.system_prompt("ideator", "/x/bin/silkworm"))
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

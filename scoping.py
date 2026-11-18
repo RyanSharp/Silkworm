@@ -84,8 +84,34 @@ def max_open_proposals() -> int:
     return _env_int("MAX_OPEN_PROPOSALS", DEFAULT_OPEN_PROPOSALS)
 
 
-#: Long enough to act on without the implementor guessing what you meant.
-MIN_GOAL_CHARS = 15
+#: Long enough to act on without the implementor guessing what you meant,
+#: in characters and in words. Measured against tasks.json on 2026-11-18:
+#: of the 903 goals filed through this check in the previous 60 days (the
+#: nightly pass, conversations, research, health, reviews' follow-ups, the
+#: dashboard), the shortest real one was "Release latest changes to test
+#: flight" -- 37 characters, 6 words -- and the only one shorter was the junk
+#: below, "show tsk_ad4681bd92" (19, 2). The floor sits well under every real
+#: goal, so it refuses lookups and fragments, not terse work.
+MIN_GOAL_CHARS = 25
+MIN_GOAL_WORDS = 4
+
+#: First words that make a goal a lookup typed at the wrong command. On
+#: 2026-11-18 Cadence's ideator ran `silkworm task show tsk_ad4681bd92`
+#: meaning to read a task, and filed a proposal whose whole goal was
+#: "show tsk_ad4681bd92". Refused only when nothing but task ids or a single
+#: token follows, so "Show the streak count on the widget" is still work.
+LOOKUP_VERBS = frozenset({"show", "view", "list", "get", "status", "cat",
+                          "help", "open", "describe"})
+
+#: A task id, or a task's branch, as a whole word.
+_TASK_ID = re.compile(r"(?:silkworm/)?tsk_[0-9a-f]{4,}")
+_PUNCT = "`'\".,;:!?()[]{}<>"
+
+#: Where a lookup belongs, said in every refusal below: each of them is what a
+#: mistyped lookup looks like, and the caller should be told what it meant.
+VIEW_POINTER = ("`silkworm task` files new work. To read a task use "
+                "`silkworm tasks show <id>`; `silkworm tasks [state]` lists "
+                "tasks and `silkworm status --json` gives the whole board")
 MAX_GOAL_CHARS = 4000
 #: A title is a card's label; the goal is where the detail goes.
 MAX_TITLE_CHARS = 120
@@ -154,6 +180,37 @@ def backlog_refusal(slug: str, open_now: int) -> str:
             "worth more than another idea on top of it.")
 
 
+def _is_task_id(word: str) -> bool:
+    return bool(_TASK_ID.fullmatch(word.strip(_PUNCT).lower()))
+
+
+def shape_refusal(goal: str) -> str:
+    """Why this goal is not work anyone could pick up, or ''.
+
+    A lookup (a viewing verb and nothing but ids or one token after it), a
+    goal that is mostly task ids, and one too short to act on. Part of
+    `validate`, so every way of filing -- the CLI, /file-task, the dashboard,
+    an edit, a review's follow-ups -- refuses the same things.
+    """
+    words = (goal or "").split()
+    if words:
+        rest = words[1:]
+        if (words[0].strip(_PUNCT).lower() in LOOKUP_VERBS
+                and (len(rest) <= 1 or all(_is_task_id(w) for w in rest))):
+            return (f"not filed: {goal[:60]!r} reads as a lookup, not work to "
+                    f"do. {VIEW_POINTER}.")
+        # More than half, not half: "Land tsk_a, tsk_b and tsk_c" is work.
+        ids = sum(1 for w in words if _is_task_id(w))
+        if ids * 2 > len(words):
+            return (f"not filed: {goal[:60]!r} is mostly task ids, not a goal "
+                    f"anyone could act on. {VIEW_POINTER}.")
+    if len(goal or "") < MIN_GOAL_CHARS or len(words) < MIN_GOAL_WORDS:
+        return (f"a task needs a goal of at least {MIN_GOAL_CHARS} characters "
+                f"and {MIN_GOAL_WORDS} words — whoever picks it up has only "
+                f"this to go on. {VIEW_POINTER}.")
+    return ""
+
+
 def validate(goal: str, filed_already: int = 0, propose: bool = False,
              open_now: int = 0, slug: str = "", research: bool = False) -> str:
     """Returns an error message, or '' if this task may be filed.
@@ -164,11 +221,12 @@ def validate(goal: str, filed_already: int = 0, propose: bool = False,
     wrong filing.
     """
     goal = (goal or "").strip()
-    if len(goal) < MIN_GOAL_CHARS:
-        return (f"a task needs a goal of at least {MIN_GOAL_CHARS} characters — "
-                "whoever picks it up has only this to go on")
+    # The ceiling first: an enormous goal is one to split, whatever its shape.
     if len(goal) > MAX_GOAL_CHARS:
         return f"that goal is over {MAX_GOAL_CHARS} characters; split it"
+    err = shape_refusal(goal)
+    if err:
+        return err
     if propose and backlog_full(open_now):
         return backlog_refusal(slug, open_now)
     limit = limit_for(propose, research)

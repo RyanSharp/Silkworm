@@ -9,6 +9,7 @@
     silkworm summarize [--force]    (re)generate thread context summaries
     silkworm titles [--force]       name threads from their summaries
     silkworm tasks [state]          list tasks (default: what needs you)
+    silkworm tasks show <id>        one task: title, state, goal and what came of it (read-only)
     silkworm email                  scan Gmail now and propose tasks
     silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
     silkworm task <goal>            file scoped work as a task (from inside a turn)
@@ -1025,6 +1026,66 @@ def creds_state() -> dict:
 
 def keychain_item_present() -> bool:
     return credentials.keychain_item_present()
+
+
+def task_text(rec: dict) -> str:
+    """One task as `tasks show` prints it: what it is, where it got to, the
+    whole goal, and what came of it -- the review, the landing, anything left
+    for you, and the tail of the reply. Read-only, from the bot's own detail."""
+    result = rec.get("result") or {}
+    lines = [f"{rec.get('id', '?')}  {rec.get('title') or ''}".rstrip(),
+             f"state: {rec.get('state') or '?'}  role: {rec.get('role') or '?'}"
+             f"  project: {rec.get('project') or '-'}  source: {rec.get('source') or '-'}"]
+    if rec.get("parent"):
+        lines.append(f"parent: {rec['parent']}")
+    lines += ["", "goal:", (rec.get("goal") or "").rstrip(), "", "result:"]
+    told = False
+    review = result.get("review") or {}
+    if review:
+        verdict = "passed" if review.get("ok") else "flagged"
+        lines.append(f"  review {verdict}: {review.get('summary') or ''}".rstrip())
+        for f in review.get("findings") or []:
+            lines.append(f"    - {str(f)[:300]}")
+        told = True
+    if result.get("landed"):
+        lines.append(f"  landed: {result['landed']}")
+        told = True
+    elif (result.get("landing") or {}).get("stage"):
+        landing = result["landing"]
+        lines.append(f"  landing: {landing.get('stage')} — {str(landing.get('detail') or '')[:300]}")
+        told = True
+    needs = rec.get("needs_user") or {}
+    if needs.get("action"):
+        lines.append(f"  needs you: {needs['action']}" + (f" ({needs['why']})" if needs.get("why") else ""))
+        told = True
+    text = (result.get("text") or "").strip()
+    if text:
+        tail = text if len(text) <= 1500 else "…" + text[-1500:]
+        lines += ["  reply:", *("    " + ln for ln in tail.splitlines())]
+        told = True
+    if not told:
+        lines.append("  nothing yet")
+    return "\n".join(lines)
+
+
+def do_tasks_show(argv) -> int:
+    """`silkworm tasks show <id>`: print one task. Reads only -- the same
+    /tasks `task` action the dashboard opens a card with -- so a restricted
+    role may run it (roles.REVIEWER_TOOLS)."""
+    ids = [a for a in argv if not a.startswith("-")]
+    if len(ids) != 1:
+        print("usage: silkworm tasks show <id>", file=sys.stderr)
+        return 2
+    # Generous: an uncached board survey runs git across every task.
+    r = bot_call("/tasks", {"action": "task", "id": ids[0]}, timeout=60)
+    if not r:
+        print("bot unreachable — is it running?", file=sys.stderr)
+        return 3
+    if not r.get("ok"):
+        print(r.get("error") or "refused", file=sys.stderr)
+        return 1
+    print(task_text(r.get("task") or {}))
+    return 0
 
 
 def do_file_task(argv) -> None:
@@ -2868,6 +2929,8 @@ def main() -> None:
                   f"{r.get('skipped', 0)} skipped · {r.get('failed', 0)} failed")
         else:
             print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+    elif cmd == "tasks" and len(args) > 1 and args[1] == "show":
+        sys.exit(do_tasks_show(args[2:]))
     elif cmd == "tasks":
         state = args[1] if len(args) > 1 else ""
         r = bot_call("/tasks", {"action": "list", "state": state} if state
