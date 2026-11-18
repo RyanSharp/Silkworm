@@ -45,8 +45,9 @@ trader's live configuration still wait for `!approve`, and a running task is
 cancelled only if your message named it.
 
 Your word can be plain. Ops it proposes are recorded as a numbered pending
-plan (`State.set_plan`), and a "yes" or "do 2" in your next message runs
-those entries (`plan_approval`, `plan_refusal`). Work you ask it for, in so
+plan (`State.set_plan`), and a "yes" or "do 2" in the message of yours that
+answers it runs those entries (`plan_approval`, `plan_refusal`); a message
+that is no answer to it ("file it") leaves it waiting (`plan_answer`). Work you ask it for, in so
 many words, it files with `--requested-by-user`: past the open-proposal cap,
 straight to the queue, with your message recorded on the task
 (bot.requested_filing). Neither is open to a sweep, a wake-up or ideation.
@@ -345,8 +346,9 @@ def decision_note(grant: dict, action: str, payload: dict) -> str:
 # On 2026-11-15 "go with your recommendations, and run the trader ops" was
 # refused for all four of trader's ops: it named none of them. Now the operator
 # records the ops it proposes as a numbered plan (State.set_plan), and your
-# next message in its thread approves them by saying yes -- "yes", "go", "do
-# it", "run them", "do 1 and 3", "all but 2". Read here, by rules a test pins
+# message in its thread that answers it approves them by saying yes -- "yes",
+# "go", "do it", "run them", "do 1 and 3", "all but 2" (plan_answer: a message
+# that is no answer leaves it waiting). Read here, by rules a test pins
 # down, never by a model: fail closed, so a question ("what does 2 do?"), a
 # no, a wait, or a number that is not an entry approves nothing.
 
@@ -578,6 +580,69 @@ def plan_approval(text: str, count: int, words=()) -> tuple[frozenset, str]:
     return frozenset(approved), ""
 
 
+# Is it an answer? On 2026-11-17 the operator recorded plan_4d88248842 and
+# the user's next message was "file it" -- another request. That message used
+# the plan up, and their "yes" after it was refused. Now only a message that
+# answers the plan spends it: one that approves entries (plan_approval) or
+# says no to it (plan_declines). Anything else -- "file it", "what does 3
+# do?", "thanks" -- leaves it waiting for the next one.
+
+#: Words that turn a plan down, or put it off, besides _NEGATE's. Any of
+#: them in a message that approves no entry makes it a decline, and spends
+#: the plan: a no fails toward spent, never toward still runnable. "no,
+#: don't run 3", "absolutely not", "stop the trader" (a request that only
+#: sounds like no) all spend it -- the operator records it again and asks.
+_DECLINE = _NEGATE | frozenset({
+    "nah", "skip", "pass", "scrap", "forget", "abort", "decline", "declined",
+    "cancelled", "canceled", "won't", "wont", "can't", "cant", "shouldn't",
+    "shouldnt", "mustn't", "neither", "nor", "nothing"})
+#: Words that acknowledge as readily as they approve. Once a message has
+#: passed a plan by without answering it ("file it"), the operator's reply
+#: is about that, and your "ok" or "sure" after it is about that too: these
+#: alone answer the plan no longer. "yes", "go", "run them", entry numbers
+#: still do.
+_ACK = frozenset({"ok", "okay", "k", "kk", "sure", "fine", "correct", "agreed",
+                  "agree", "confirmed", "confirm"})
+
+
+def plan_declines(text: str, words=()) -> bool:
+    """Whether your message says no to the plan, or not now: it holds a
+    word of _DECLINE -- "no", "not now", "skip it", "cancel the plan",
+    "don't", "wait", "later", 👎 (read as "no" by normalise_answer).
+    Called only for a message that approves no entry (plan_answer), and
+    loose by design: anything that sounds like no spends the plan."""
+    return bool(set(_TOKEN.findall(normalise_answer(text))) & _DECLINE)
+
+
+def _only_acknowledges(text: str, words=()) -> bool:
+    """Whether the yes in your message is only a word that acknowledges
+    anything (_ACK): "ok", "sure thanks", 👍 -- no number, no "yes", "go" or
+    "run". "sounds good" acknowledges too. An approving emoji is Slack's
+    commonest acknowledgement, so here it reads as "ok", not "yes"."""
+    t = unicodedata.normalize("NFKC", text or "")
+    t = _SLACK_YES.sub(" ok ", _EMOJI_MODIFIERS.sub("", t.lower()))
+    for e in _EMOJI_YES:
+        t = t.replace(e, " ok ")
+    t = strip_lead_in(normalise_answer(t), words)
+    tokens = set(_TOKEN.findall(t))
+    if any(tok[-1].isdigit() for tok in tokens):
+        return False
+    return not (tokens & (_AFFIRM - _ACK))
+
+
+def plan_answer(text: str, entries, passed: bool = False) -> str:
+    """"approve" if your message approves any entry of the plan, "decline"
+    if it says no to it (plan_declines), else "": it is no answer to the
+    plan (a question, another request), which keeps waiting for one.
+    `passed`: a message has already passed the plan by unanswered, so a
+    bare acknowledgement ("ok", "sure") no longer approves it."""
+    words = plan_words(entries)
+    approved, _ = plan_approval(text, len(entries or []), words)
+    if approved and not (passed and _only_acknowledges(text, words)):
+        return "approve"
+    return "decline" if plan_declines(text, words) else ""
+
+
 def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> str:
     """Why entry `n` of the plan your message answered may not run as `name
     args`, or "" if it may. `live` is the pending plan now (State.plan): the
@@ -588,8 +653,10 @@ def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> s
     gp = grant.get("plan") or None
     if not gp:
         return ("refused: no plan was waiting for the user's message (none was recorded "
-                "before it, or an earlier message of theirs already answered it); record "
-                "one (`ops plan`) and ask them, or have their message name the op")
+                "before it, an earlier message of theirs already answered it, or this "
+                "one is no answer to it -- it neither says yes or entry numbers nor "
+                "says no); record one (`ops plan`) and ask them, or have their message "
+                "name the op")
     if not live or live.get("id") != gp.get("id"):
         return (f"refused: the plan the user answered ({gp.get('id')}) has expired or "
                 "been replaced; ask them about the current one")
@@ -800,13 +867,17 @@ class State:
                 "entries": [{"n": e["n"], "name": e["name"], "args": list(e["args"])}
                             for e in p["entries"]]}
 
-    def answer_plan(self, ts, now: float | None = None) -> dict | None:
+    def answer_plan(self, ts, text: str, now: float | None = None) -> dict | None:
         """plan_before(ts), for the message that answers the plan: the first
-        message of yours after it was recorded, and only that one. Marks the
-        plan answered by `ts`, so a later message -- "ok thanks", a yes to
-        something else an hour on -- is no answer to it. The same message's
-        turn asking again (a retry) gets it again. To be asked again, the
-        operator records the plan again."""
+        message of yours after it was recorded that approves entries of it or
+        says no to it (plan_answer), and only that one. Marks the plan
+        answered by `ts`, so after it no message is an answer to it. A
+        message that is no answer ("file it", "what does 3 do?") leaves it
+        waiting and gets None: its turn runs no entry. It is noted in the
+        plan's `passed`, and from then on a bare "ok" or "sure" -- likely
+        about what that message asked -- answers it no longer (_ACK). The same message's turn asking
+        again (a retry) gets it again. To be asked again, the operator
+        records the plan again."""
         with _STATE_LOCK:
             snap = self.plan_before(ts, now)
             if not snap:
@@ -816,6 +887,14 @@ class State:
             if answered and answered != str(ts):
                 return None
             if not answered:
+                if not plan_answer(text, snap["entries"],
+                                   passed=bool(data["plan"].get("passed"))):
+                    # No answer: the plan waits -- but a bare "ok" after
+                    # this is about this, not the plan (_ACK).
+                    if str(ts) not in data["plan"].setdefault("passed", []):
+                        data["plan"]["passed"].append(str(ts))
+                        self._save(data)
+                    return None
                 data["plan"]["answered"] = str(ts)
                 self._save(data)
             return dict(snap, answered=str(ts))

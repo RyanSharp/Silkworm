@@ -31402,7 +31402,7 @@ def _plan_turn(w, text, turn="tsk_turn_mine", ts=None):
     """Your message's turn, with the plan it answers attached as handle_prompt
     attaches it (bot.pending_plan -> State.answer_plan)."""
     ts = ts or f"{time.time() + 1:.6f}"
-    return w.grants.open("D1:1.0", ts, "U_ME", text, turn, plan=w.state.answer_plan(ts))
+    return w.grants.open("D1:1.0", ts, "U_ME", text, turn, plan=w.state.answer_plan(ts, text))
 
 
 def _plan_record(w, *argv, task="tsk_sweep"):
@@ -31508,23 +31508,31 @@ def test_ops_plan_runs_on_a_plain_yes():
         w.calls.write_text("")
         g = _plan_turn(w, "what does 1 do?")
         r = _plan_run(w, g, 1, "tailscale-on")
-        check("a question approves nothing",
-              r.returncode == 1 and "asks a question" in r.stderr and not _calls(w), r.stderr)
+        check("a question approves nothing: it is no answer to the plan",
+              r.returncode == 1 and "no answer to it" in r.stderr and not _calls(w), r.stderr)
         g = _plan_turn(w, "ok, yes")
         r = _plan_run(w, g, 1, "tailscale-on")
-        check("only the first message after a plan answers it: a later 'yes' is no answer",
-              r.returncode == 1 and "no plan was waiting" in r.stderr and not _calls(w),
-              r.stderr)
+        check("a question is no answer, so the plan waits: the 'yes' after it runs it "
+              "(its own checks fail against the fakes; it ran)", any(c.startswith("tailscale serve --bg")
+                                        for c in _calls(w)), r.stdout + r.stderr)
+        _plan_record(w, "tailscale-on", "--op", "tailscale-on")
+        w.calls.write_text("")
+        g = _plan_turn(w, "do 1")
+        g = _plan_turn(w, "ok, yes")
+        r = _plan_run(w, g, 2, "tailscale-on")
+        check("only the first message that answers a plan spends it: a later 'yes' is "
+              "no answer", r.returncode == 1 and "no plan was waiting" in r.stderr
+              and not _calls(w), r.stderr)
         _plan_record(w, "tailscale-on")
         g = _plan_turn(w, "no, hold off")
         r = _plan_run(w, g, 1, "tailscale-on")
         check("nor does a no", r.returncode == 1 and not _calls(w), r.stderr)
         _plan_record(w, "tailscale-on")
         ts_ = f"{time.time() + 1:.6f}"
-        first = w.state.answer_plan(ts_)
+        first = w.state.answer_plan(ts_, "yes")
         check("the answering message's own turn, asked again (a retry), still gets it",
-              first and (w.state.answer_plan(ts_) or {}).get("id") == first["id"]
-              and w.state.answer_plan(f"{time.time() + 2:.6f}") is None)
+              first and (w.state.answer_plan(ts_, "yes") or {}).get("id") == first["id"]
+              and w.state.answer_plan(f"{time.time() + 2:.6f}", "yes") is None)
 
         # A message sent before the plan was recorded answers none.
         _plan_record(w, "tailscale-on")
@@ -31578,6 +31586,178 @@ def test_ops_plan_runs_on_a_plain_yes():
         out = w.ns["record_ops_plan"]({"entries": [{"name": "tailscale-on", "args": []}] * 11,
                                        "caller_role": "operator", "caller_thread": "D1:1.0"})
         check(f"at most {O.MAX_PLAN} ops in a plan", not out["ok"], out)
+
+
+def test_plan_answer_reads_answers_only():
+    import operator_role as O
+    print("\nplans: only a message that answers the plan (yes, entries, or no) spends it")
+    E = [{"name": "trader-env-set", "args": ["MOMENTUM_UNIVERSE", "pit"]},
+         {"name": "tailscale-on", "args": []},
+         {"name": "trader-launchd-retire", "args": ["com.traderjoe.stocktwits"]}]
+    for t in ("yes", "go", "do 1 and 3", "all but 2", "2", "for trader… “yes”", "👍"):
+        check(f"{t!r} approves: an answer", O.plan_answer(t, E) == "approve")
+    for t in ("no", "No.", "nope", "not now", "not yet", "skip it", "cancel the plan",
+              "no thanks", "don't run them", "do not do it", "hold off", "nah, not today",
+              "👎", ":x:", "for trader: no", "never mind", "forget it", "cancel the trader ops",
+              "re the ops: no", "regarding trader: skip it",
+              # found in review: each had left the plan runnable by a later "ok"
+              "do not", "No. Do not.", "absolutely not", "okay no", "ok, cancel", "no go",
+              "no way", "hell no", "nope, not doing that", "no, leave it", "let's not",
+              "don't bother", "not interested", "dont run anything",
+              "not yet, ask me tomorrow", "nah I'll do it myself", "no, don't run 3",
+              "do NOT run 1", "wait", "wait, what does 3 do?", "no?", "not 3", "skip 2",
+              "no, do it", "later today we'll see", "stop the trader daemon",
+              "yes but not 4 yet", "won't need those"):
+        check(f"{t!r} says no: it spends the plan", O.plan_answer(t, E) == "decline", t)
+    for t in ("file it", "what does 3 do?", "thanks", "ok thanks", "", "   ",
+              "file a task for the trader bars", "can you look at cadence",
+              "how long does 1 take?", "what's the momentum universe now"):
+        check(f"{t!r} is no answer: the plan waits", O.plan_answer(t, E) == "", t)
+    check("an empty plan is never answered", O.plan_answer("yes", []) == "")
+    # Once a message has passed the plan by, a bare acknowledgement is about
+    # that message's reply, not the plan.
+    for t in ("ok", "okay", "sure", "k", "fine", "sounds good", "ok!", "👍 sure", "👍",
+              "👍🏽", ":+1:", "✅", "for trader: ok"):
+        check(f"after a passed-by message, {t!r} no longer answers",
+              O.plan_answer(t, E, passed=True) == "" and (
+                  t == "sounds good" or O.plan_answer(t, E) == "approve"), t)
+    for t in ("yes", "go", "run them", "do 1 and 3", "ok, do 2", "2", "yes please",
+              "ok yes", "yes 👍", "👍 do 2"):
+        check(f"but {t!r} still does", O.plan_answer(t, E, passed=True) == "approve", t)
+    check("and a no still spends it", O.plan_answer("ok no", E, passed=True) == "decline")
+    st = O.State(Path(tempfile.mkdtemp()) / "operator.json")
+    st.set_thread("D1:1.0")
+    st.set_plan(E, by="operator", thread="D1:1.0")
+    t1, t2, t3 = (f"{time.time() + i:.6f}" for i in (1, 2, 3))
+    check("'file it' gets no plan and leaves it unanswered",
+          st.answer_plan(t1, "file it") is None and not st.plan().get("answered")
+          and st.plan().get("passed") == [t1])
+    check("and the 'ok' after it (about the filing) gets none either",
+          st.answer_plan(f"{time.time() + 1.5:.6f}", "ok") is None
+          and not st.plan().get("answered"))
+    got = st.answer_plan(t2, "yes")
+    check("the 'yes' after it answers it", got and got.get("answered") == t2
+          and st.plan().get("answered") == t2)
+    check("and is the plan's only answer", st.answer_plan(t3, "yes") is None
+          and st.answer_plan(t1, "yes") is None)
+    st.set_plan(E, by="operator", thread="D1:1.0")
+    check("a no answers it too, so a yes after it gets nothing",
+          st.answer_plan(f"{time.time() + 4:.6f}", "no") is not None
+          and st.answer_plan(f"{time.time() + 5:.6f}", "yes") is None)
+
+
+def test_ops_plan_waits_through_an_unrelated_message():
+    import ops as OPS
+    import operator_role as O
+    print("\nplans: an unrelated message between the plan and your yes leaves it waiting")
+    w = _ops_world()
+    PLAN = ("trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on",
+            "--op", "trader-launchd-retire", "com.traderjoe.stocktwits")
+    plist = w.agents / "com.traderjoe.stocktwits.plist"
+    tailscale = lambda: any(c.startswith("tailscale serve --bg") for c in _calls(w))
+
+    def reset():
+        (w.trader / ".env").write_text(w.env_text)
+        if not plist.exists():
+            import plistlib
+            with open(plist, "wb") as f:
+                plistlib.dump({"Label": "com.traderjoe.stocktwits",
+                               "ProgramArguments": ["/bin/true"]}, f)
+        w.calls.write_text("")
+
+    def ran():
+        return (_env_value(w, "MOMENTUM_UNIVERSE") == "pit", tailscale(), not plist.exists())
+
+    def run_all(g):
+        _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        _plan_run(w, g, 2, "tailscale-on")
+        _plan_run(w, g, 3, "trader-launchd-retire", "com.traderjoe.stocktwits")
+        return ran()
+
+    with _fake_path(w):
+        # 2026-11-17: 'file it', then 'yes'.
+        reset()
+        _plan_record(w, *PLAN)
+        g = _plan_turn(w, "file it")
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("'file it' runs nothing: it is no answer to the plan",
+              r.returncode == 1 and "no answer to it" in r.stderr and ran() == (False,) * 3,
+              r.stderr)
+        g = _plan_turn(w, "ok")
+        check("nor does the 'ok' that acknowledges the filing", run_all(g) == (False,) * 3,
+              ran())
+        g = _plan_turn(w, "yes")
+        check("and the 'yes' after it runs the whole plan", run_all(g) == (True,) * 3, ran())
+        runs = [x for x in OPS.read_log(w.log, 100) if x.get("plan_entry")
+                and not x.get("refused")]
+        yes_ts = (w.grants.get(g, "D1:1.0", "tsk_turn_mine") or {}).get("ts")
+        check("each run records the plan id, its entry and the yes's ts",
+              [x["plan_entry"] for x in runs] == [1, 2, 3]
+              and all(x.get("plan_id", "").startswith("plan_") and x.get("decided_ts") == yes_ts
+                      for x in runs), runs)
+
+        # 'what does 3 do?', then 'do 1 and 3'.
+        reset()
+        _plan_record(w, *PLAN)
+        g = _plan_turn(w, "what does 3 do?")
+        r = _plan_run(w, g, 3, "trader-launchd-retire", "com.traderjoe.stocktwits")
+        check("a question runs nothing", r.returncode == 1 and plist.exists(), r.stderr)
+        g = _plan_turn(w, "do 1 and 3")
+        check("and 'do 1 and 3' after it runs 1 and 3, not 2",
+              run_all(g) == (True, False, True), ran())
+
+        # 'no', then 'yes'.
+        reset()
+        _plan_record(w, *PLAN)
+        g = _plan_turn(w, "no")
+        check("'no' runs nothing", run_all(g) == (False,) * 3, ran())
+        g = _plan_turn(w, "yes")
+        r = _plan_run(w, g, 2, "tailscale-on")
+        check("and spends the plan: the 'yes' after it runs nothing",
+              run_all(g) == (False,) * 3 and "no plan was waiting" in r.stderr, r.stderr)
+
+        # A new plan replaces the waiting one.
+        reset()
+        _plan_record(w, *PLAN)
+        old = w.state.plan()["id"]
+        g = _plan_turn(w, "file it")
+        _plan_record(w, "tailscale-on")
+        g = _plan_turn(w, "yes")
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("a new plan replaces the waiting one: its entry 1 is the new plan's",
+              w.state.plan() is not None and w.state.plan()["id"] != old
+              and r.returncode == 1 and "is `tailscale-on`" in r.stderr
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, r.stderr)
+        r = _plan_run(w, g, 1, "tailscale-on")
+        check("and the yes runs the new plan (its checks fail against the fakes; it ran)",
+              tailscale(),
+              r.stdout + r.stderr)
+
+        # After a day, 'yes' is refused.
+        reset()
+        _plan_record(w, *PLAN)
+        g = _plan_turn(w, "file it")
+        data = json.loads(w.statefile.read_text())
+        data["plan"]["at"] -= O.PLAN_TTL_S + 5
+        w.statefile.write_text(json.dumps(data))
+        g = _plan_turn(w, "yes")
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("a plan left waiting still expires after a day: 'yes' then runs nothing",
+              run_all(g) == (False,) * 3 and "no plan was waiting" in r.stderr, r.stderr)
+
+        # A sweep never runs it, waiting or not.
+        reset()
+        _plan_record(w, *PLAN)
+        _plan_turn(w, "file it")
+        r = _plan_run(w, "", 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", turn="tsk_sweep")
+        out = _ops_ask(w, {"action": "run", "name": "tailscale-on", "args": [],
+                           "plan_entry": 2, "caller_role": "operator",
+                           "caller_thread": "D1:1.0", "caller_task": "tsk_sweep",
+                           "notes": "x"})
+        check("a sweep turn never runs a waiting plan", r.returncode == 1 and not out["ok"]
+              and ran() == (False,) * 3, r.stderr + str(out))
+        g = _plan_turn(w, "yes")
+        check("and it is still there for your yes", run_all(g) == (True,) * 3, ran())
 
 
 def _requested_world():
@@ -31736,21 +31916,21 @@ def test_your_turn_carries_the_plan_you_answered():
              and isinstance(n.func, ast.Attribute) and n.func.attr == "open"
              and isinstance(n.func.value, ast.Name) and n.func.value.id == "OPERATOR_GRANTS"]
     plan_kw = [k for c in opens for k in c.keywords if k.arg == "plan"]
-    check("handle_prompt opens your grant with plan=pending_plan(msg_ts)",
+    check("handle_prompt opens your grant with plan=pending_plan(msg_ts, text)",
           len(opens) == 1 and len(plan_kw) == 1 and isinstance(plan_kw[0].value, ast.Call)
           and getattr(plan_kw[0].value.func, "id", "") == "pending_plan"
-          and [getattr(a, "id", "") for a in plan_kw[0].value.args] == ["msg_ts"],
+          and [getattr(a, "id", "") for a in plan_kw[0].value.args] == ["msg_ts", "text"],
           ast.dump(plan_kw[0]) if plan_kw else "no plan= keyword")
     import operator_role as O
     ns = bot_functions("pending_plan", OPERATOR=types.SimpleNamespace(
-        answer_plan=lambda ts: (_ for _ in ()).throw(OSError("unreadable"))))
+        answer_plan=lambda ts, text: (_ for _ in ()).throw(OSError("unreadable"))))
     check("a plan that cannot be read costs your turn nothing: no plan, no raise",
-          ns["pending_plan"]("1.0") is None)
+          ns["pending_plan"]("1.0", "yes") is None)
     st = O.State(Path(tempfile.mkdtemp()) / "operator.json")
     st.set_thread("D1:1.0")
     st.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
     ns = bot_functions("pending_plan", OPERATOR=st)
-    check("and a readable one is attached", (ns["pending_plan"](f"{time.time() + 1:.6f}")
+    check("and a readable one is attached", (ns["pending_plan"](f"{time.time() + 1:.6f}", "yes")
                                              or {}).get("entries", [{}])[0].get("name")
           == "tailscale-on")
     st.set_thread("D2:2.0")

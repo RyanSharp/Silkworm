@@ -1089,7 +1089,7 @@ of a plan.
 **Plans: say yes, not the command.** When the operator proposes ops (a sweep's
 *Needs you*, or a reply here), it records them with `silkworm ops plan <op>
 [args] [--op <op> [args]]… --by operator` and numbers them in its reply as that
-prints them. A plain answer in your next message in its thread runs them:
+prints them. A plain answer in its thread runs them:
 "yes", "go", "do it", "run them" (all), "do 1 and 3", "just 2", "all but 2".
 Phone typing reads the same: curly quotes, an ellipsis, dashes, 👍/✅, trailing
 punctuation and case are normalised first, and you may open by naming the plan
@@ -1099,12 +1099,20 @@ The operator runs each with `ops run <op> <args> --plan-entry N`, and the bot
 checks that it is exactly that entry's op and arguments, that the entry has not
 run, that the plan was recorded before your message and is still the live one
 (a day at most, replaced by the next), that your message is the first one
-after it (a later "ok thanks" answers nothing), and that your words approve
+after it that answers it, and that your words approve
 entry N — read by `operator_role.plan_approval`, fixed rules with tests, never
 a model. A question ("what does 2 do?"), a no, wait or later, a number that is
 not an entry, or any word beyond yes, entry numbers and the plan's own op
 words ("do it in 2 hours", "all except the trader ones") approves nothing; the
-operator answers, records the plan again and asks. An op not in the plan still needs naming. Each run
+operator answers, records the plan again and asks. Only an answer spends a plan:
+a yes, entry numbers, or a plain no ("no", "not now", "skip it", "cancel the
+plan", "absolutely not", 👎 — any word that sounds like no, `plan_declines`).
+A message that is none of those ("file it", "what does 3 do?") leaves it
+waiting, so your yes after it still runs it (`plan_answer`), and the operator
+says in its reply that the plan is still waiting; from then on a bare "ok" or
+"sure" (likely about that reply) no longer answers it — say "yes" or the
+entries. Once answered, a later "ok thanks" or "yes" answers nothing.
+An op not in the plan still needs naming. Each run
 records the plan id, the entry and your message's ts; `silkworm ops plan`
 alone shows the pending plan. Your own terminal and the dashboard carry no turn and
 are you: `silkworm ops run tailscale-on` works there as it is. The CLI refuses

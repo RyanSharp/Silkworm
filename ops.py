@@ -33,7 +33,8 @@ On 2026-11-15 "go with your recommendations, and run the trader ops" was
 refused for all four of trader's ops, because it named none of them. So the
 operator records the ops it proposes as a numbered plan (`ops plan`,
 operator_role.State.set_plan), and a plain "yes", "do 2" or "all but 1" in
-your next message runs exactly those entries, each once, with exactly the
+the message of yours that answers it runs exactly those entries (one that is
+no answer -- "file it" -- leaves it waiting; a no spends it), each once, with exactly the
 arguments you were shown (operator_role.plan_refusal; the words are read by
 operator_role.plan_approval, deterministically, never by a model). A plan
 lives a day, is replaced by the next, and is never answered by a sweep or a

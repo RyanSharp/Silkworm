@@ -4186,7 +4186,7 @@ def handle_prompt(event: dict, say, client) -> None:
             # it may do what you told it (operator_role.Grants), and nothing
             # else's turn -- a sweep, a wake-up, the web chat -- carries this.
             grant = (OPERATOR_GRANTS.open(key, msg_ts, user, text, task_id,
-                                          plan=pending_plan(msg_ts))
+                                          plan=pending_plan(msg_ts, text))
                      if role_name == roles.OPERATOR and user_started(event, user) else "")
             if grant:
                 kwargs["env"][operator_role.GRANT_VAR] = grant
@@ -6834,13 +6834,15 @@ def user_started(event: dict, user: str) -> bool:
                 and (not ALLOWED_USERS or user in ALLOWED_USERS))
 
 
-def pending_plan(msg_ts) -> dict | None:
+def pending_plan(msg_ts, text: str) -> dict | None:
     """The plan of ops your message answers: the live one, recorded before
-    you sent it, and answered by no earlier message of yours
-    (operator_role.State.answer_plan, which marks it answered by this one).
-    None if it cannot be read -- your turn still runs, it approves no plan."""
+    you sent it, answered by no earlier message of yours, and answered by
+    this one -- it approves entries or says no (operator_role.State.answer_plan,
+    which marks it answered by this one). A message that is no answer to it
+    gets None and leaves it waiting. None too if it cannot be read -- your
+    turn still runs, it approves no plan."""
     try:
-        return OPERATOR.answer_plan(msg_ts)
+        return OPERATOR.answer_plan(msg_ts, text)
     except Exception:
         log.exception("operator: could not read the pending plan")
         return None
