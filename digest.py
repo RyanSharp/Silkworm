@@ -243,6 +243,14 @@ def sections(records, now: float, *, branch_rows=(), released=None,
                 add(proj, "held", _esc(str(finding).strip().splitlines()[0][:70]
                                        if str(finding).strip() else "?"))
 
+        # What the operator did on your word, and which of your messages --
+        # Slack, or the dashboard's chat with the login and device it vouched.
+        for e in _events(rec):
+            if e.get("kind") == "decided" and e["at"] >= since:
+                what = str(e.get("detail") or "").split(" ", 1)[0] or "decided"
+                via = str(e.get("via") or "") or "Slack message"
+                add(proj, "decided", f"{_title(rec)} — {_esc(what)}, {_esc(via[:120])}")
+
         runs = [e for e in _events(rec) if e.get("kind") == tasks.RUNNING and e["at"] >= since]
         if runs and (rec.get("attempts") or 0) > 1:
             add(proj, "reran", f"{_title(rec)} ({rec['attempts']} runs)")
@@ -329,6 +337,7 @@ ORDER = (("red", "main is failing", False), ("health", "health", False),
          ("todo", "yours to do", False),
          ("landed", "landed", True), ("released", "released", False),
          ("refused", "landing refused", False), ("failed", "failed or held", False),
+         ("decided", "done on your word", False),
          ("reran", "ran more than once", True), ("stuck", "stuck", False),
          ("held", "review findings held at the proposal cap", True),
          ("nightly", "nightly review", False),

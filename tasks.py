@@ -72,9 +72,10 @@ DRIVERS = ("inline", "queue")
 #: replaced -- dropping those would lose exactly what "nothing is lost" kept.
 #: `decided_by` and `decided_ts` say a person decided it, and by which message
 #: (record_decision): two short strings, and the only record of who.
+#: `decided_via` says where that message came from (Slack or the dashboard).
 RESULT_KEEPS = ("cost", "review", "landed", "landing",
                 "cost_runs", "cost_reported_total", "cost_uncorrected",
-                "cost_runs_uncorrected", "decided_by", "decided_ts")
+                "cost_runs_uncorrected", "decided_by", "decided_ts", "decided_via")
 
 #: States a blocker never comes back from on its own. A task waiting on one of
 #: these will never be released by it, so the store releases it instead; see
@@ -957,20 +958,25 @@ class TaskStore:
             self._save_or_restore(tid, prior)
             return dict(rec)
 
-    def record_decision(self, tid: str, detail: str, decided_by: str, ts: str) -> dict | None:
+    def record_decision(self, tid: str, detail: str, decided_by: str, ts: str,
+                        via: str = "") -> dict | None:
         """Note on a task that a person decided what was just done to it:
-        an event naming their message, and `result.decided_by` / `decided_ts`,
-        in one save. None if there is no such task."""
+        an event naming their message, and `result.decided_by` / `decided_ts`
+        (and `decided_via`, where the message came from: "Slack message <ts>"
+        or "dashboard message <ts> (<login> on <device>)"), in one save. None
+        if there is no such task."""
         with self._lock:
             rec = self._data.get(tid)
             if rec is None:
                 return None
             prior = copy.deepcopy(rec)
             rec["result"] = {**(rec.get("result") or {}),
-                             "decided_by": decided_by, "decided_ts": ts}
+                             "decided_by": decided_by, "decided_ts": ts,
+                             **({"decided_via": via[:200]} if via else {})}
             rec["updated"] = time.time()
             events = rec.setdefault("events", [])
-            events.append({"at": time.time(), "kind": "decided", "detail": detail[:200]})
+            events.append({"at": time.time(), "kind": "decided", "detail": detail[:200],
+                           **({"via": via[:200]} if via else {})})
             del events[:-50]
             self._save_or_restore(tid, prior)
             return dict(rec)

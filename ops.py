@@ -19,9 +19,10 @@ Who may run what (`refusal`):
 
 * An op that only reads runs for anyone, any turn, the daily sweep included.
 * One that changes something runs from inside a turn only on your word: the
-  grant of a turn you started with your own Slack message in the operator's
-  home thread (operator_role.Grants), with --notes saying what you asked for.
-  A sweep, a wake-up, the web chat or any other turn has no grant and is
+  grant of a turn you started with your own message in the operator's home
+  thread -- in Slack, or in the dashboard's chat when it vouches it is you
+  (dashowner.verify) -- (operator_role.Grants), with --notes saying what you
+  asked for. A sweep, a wake-up or any other turn has no grant and is
   refused. Your own terminal and the dashboard, which carry no turn at all,
   are you.
 * An op marked `named` must also be named in that message -- trader's (they
@@ -660,7 +661,8 @@ def refusal(p: Plan, *, in_turn: bool, grant: dict | None, notes: str,
     if not grant:
         return (f"refused: `{p.name}` changes something on this machine, so from "
                 "inside a turn it runs only on the user's word -- a turn they started "
-                "with their own Slack message in the operator's thread -- never in a "
+                "with their own message (Slack or the dashboard) in the operator's "
+                "thread -- never in a "
                 "sweep, a wake-up or any other turn. Ask them to tell you to run it "
                 f"there, or to run `silkworm ops run {p.name}` themselves")
     if not str(notes or "").strip():

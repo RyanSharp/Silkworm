@@ -15,6 +15,7 @@ import json
 import os
 import socket
 import socketserver
+import sys
 import threading
 import time
 import urllib.error
@@ -27,6 +28,7 @@ from urllib.parse import urlparse, parse_qs
 import email.header
 import secrets
 
+import dashowner
 import envfile
 import jsonstore
 import procs
@@ -266,6 +268,17 @@ def cross_site_refusal(headers) -> str:
         if urlparse(origin).netloc.lower() != host.lower():
             return f"Refused: a POST from {origin}, not this dashboard."
     return ""
+
+#: The machine as dashowner.verify reads it (tests stand in for it).
+OWNER_PROBE = dashowner.Probe()
+
+
+def log_owner_refusal(why: str) -> None:
+    """A proxied message the dashboard would not vouch for, said once on
+    stderr (the service's log), so a grant that did not open can be traced."""
+    print(f"dashboard: not vouching for this message as the owner's: {why}",
+          file=sys.stderr, flush=True)
+
 
 # Silent past twice the bot's idle limit -- which should have stopped it at
 # once -- a turn is not slow, it is stuck. Silence, not age: a run writing to
@@ -944,6 +957,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send(401, b"unauthorized", "text/plain")
         return False
 
+    def _owner(self) -> tuple:
+        """(owner, "") when this request is verifiably the owner's -- through
+        serve, as VIZ_TAILSCALE_LOGIN, past the cross-site checks, from
+        another tailnet device, on a connection tailscaled opened -- else
+        (None, why not). See dashowner.verify."""
+        try:
+            raw = self.headers.get("Tailscale-User-Login") or ""
+            server = self.connection.getsockname()[:2]
+            return dashowner.verify(
+                self.headers, tuple(self.client_address[:2]), tuple(server),
+                allowed=tailscale_login(), forged=cross_site_refusal(self.headers),
+                proxied=proxied(self.headers),
+                login=_decode_login(raw) if raw.strip() else "", probe=OWNER_PROBE)
+        except Exception as e:
+            # Not knowing is not yours: the message still goes, with no grant.
+            return None, f"could not check: {e!r}"
+
     def _cookie_token(self) -> str:
         raw = self.headers.get("Cookie", "")
         for part in raw.split(";"):
@@ -1034,6 +1064,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             payload = {}
         if url.path == "/api/send":
+            # Only this route vouches for who sent it: the bot opens your
+            # grant for a message to the operator only on what is said here,
+            # never on what the page sent (dashowner.verify).
+            payload.pop("dashboard_owner", None)
+            owner, why = self._owner()
+            if owner:
+                payload["dashboard_owner"] = owner
+            elif proxied(self.headers):
+                log_owner_refusal(why)
             # A !command is waited on for its replies (bot.WEB_COMMAND_WAIT_S),
             # and attached files travel inside the request.
             answer = bot_call("/web-message", payload, timeout=SEND_WAIT_S)

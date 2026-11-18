@@ -1087,6 +1087,7 @@ def do_file_task(argv) -> None:
         raise SystemExit(1)
     print(f"filed {r['id']} ({r.get('state', 'queued')}) as {r['role']}"
           + (" on the user's request" if r.get("requested_by_user") else "")
+          + (f" ({r['decided_via']})" if r.get("decided_via") else "")
           + (f" under {r['project']}" if r.get("project") else "")
           + f" in {r.get('cwd') or '?'} ({r['remaining']} more allowed this turn)")
 
@@ -1315,7 +1316,9 @@ def do_task_action(cmd: str, argv: list, ask=None) -> int:
     line = f"ok: {cmd} {payload['id']}"
     if task.get("state"):
         line += f" -> {task['state']}"
-    extra = "; ".join(x for x in (r.get("note"), r.get("held")) if x)
+    extra = "; ".join(x for x in (r.get("note"), r.get("held"),
+                                  r.get("decided_via") and f"on the user's word: {r['decided_via']}")
+                      if x)
     print(line + (f" ({extra})" if extra else ""))
     return EXIT_OK
 
@@ -1534,7 +1537,8 @@ def do_ops(argv: list, ask=None) -> int:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.get("at") or 0))
             who = r.get("by") or "?"
             if r.get("decided_by"):
-                who += f", for {r['decided_by']} (Slack message {r.get('decided_ts')})"
+                who += (f", for {r['decided_by']} ("
+                        f"{r.get('decided_via') or 'Slack message ' + str(r.get('decided_ts'))})")
             head = f"{when} {r.get('op')} {' '.join(r.get('args') or [])}".rstrip()
             if r.get("refused"):
                 print(f"{head} — refused ({who}): {r['refused']}")

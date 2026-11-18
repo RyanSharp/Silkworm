@@ -63,6 +63,8 @@ import tasks
 import procs
 import push
 import webthread
+import envfile
+import dashowner
 import projects
 import workspaces
 import recovery
@@ -2108,6 +2110,7 @@ def deliver_web_message(payload: dict) -> dict:
     text = (payload.get("text") or "").strip()
     new = bool(payload.get("new"))
     key = "" if new else str(payload.get("key") or "")
+    owner = payload.get("dashboard_owner") if isinstance(payload.get("dashboard_owner"), dict) else None
     project = str(payload.get("project") or "").strip()
     command = text.startswith("!")
     if not new and not THREAD_KEY_RE.fullmatch(key):
@@ -2181,7 +2184,10 @@ def deliver_web_message(payload: dict) -> dict:
             if not new and not command:
                 say(webthread.echo(text, names))
             event = {"channel": channel, "ts": msg_ts, "thread_ts": thread_ts,
-                     "user": "", "text": text, "_web": True, "_web_files": saved}
+                     "user": "", "text": text, "_web": True, "_web_files": saved,
+                     # Who the dashboard vouched sent it, if it could
+                     # (dashowner.verify); checked again in dashboard_owner.
+                     "_web_owner": owner}
             handle_prompt(event, say, app.client)
         except Exception:
             log.exception("web message failed for %s", key)
@@ -3754,9 +3760,9 @@ def handle_file_task(payload: dict) -> dict:
     if requested is not None:
         try:
             task_store.record_decision(
-                task["id"], f"filed on the request of {requested['by']} (Slack message "
-                f"{requested['ts']}) via operator: {requested['notes']}",
-                operator_role.DECIDED_BY, requested["ts"])
+                task["id"], f"filed on the request of {requested['by']} "
+                f"({requested['source']}) via operator: {requested['notes']}",
+                operator_role.DECIDED_BY, requested["ts"], via=requested["source"])
         except Exception:
             log.exception("could not record the request %s was filed on", task["id"])
     if hrec:
@@ -3774,6 +3780,7 @@ def handle_file_task(payload: dict) -> dict:
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
             "role": role, "cwd": scope.get("cwd", ""),
             "requested_by_user": requested is not None,
+            **({"decided_via": requested["source"]} if requested is not None else {}),
             "remaining": scoping.limit_for(propose, from_research) - _filed_this_turn[key]}
 
 
@@ -3784,7 +3791,7 @@ def requested_filing(payload: dict, key: str, caller_role: str, parent, from_res
     (None, why not).
 
     It must be the operator, in its home thread, in a turn you started there
-    with your own Slack message (the live grant: user_grant), quoting what
+    with your own message, Slack or dashboard (the live grant: user_grant), quoting what
     you asked for. Never a health fix (that has its own once-per-check rule)
     or a research run's next steps."""
     if filer_role({"caller_role": caller_role, "caller_thread": key}) != operator_role.ROLE:
@@ -3796,7 +3803,7 @@ def requested_filing(payload: dict, key: str, caller_role: str, parent, from_res
                         "caller_task": payload.get("caller_task")})
     if not grant:
         return None, ("--requested-by-user only in a turn the user started with their own "
-                      "Slack message in the operator's thread -- never a sweep, a wake-up "
+                      "message (Slack or the dashboard) in the operator's thread -- never a sweep, a wake-up "
                       "or ideation; file it as a proposal (the cap applies) or ask them")
     notes = " ".join(str(payload.get("notes") or "").split())
     if not notes:
@@ -3807,6 +3814,7 @@ def requested_filing(payload: dict, key: str, caller_role: str, parent, from_res
     if why:
         return None, why
     return {"by": grant["user"], "ts": grant["ts"], "notes": notes[:500],
+            "source": operator_role.grant_source(grant), "via": grant.get("via") or "",
             "at": time.time()}, ""
 
 
@@ -3887,7 +3895,8 @@ def handle_ops(payload: dict) -> dict:
               "thread": str(payload.get("caller_thread") or ""),
               "task": str(payload.get("caller_task") or "")}
     if grant:
-        record.update(decided_by=grant["user"], decided_ts=grant["ts"])
+        record.update(decided_by=grant["user"], decided_ts=grant["ts"],
+                      decided_via=operator_role.grant_source(grant))
     # An entry of the plan the operator showed you, which your message
     # approved in plain words ("yes", "do 2"): that names it for you. Exactly
     # that entry, with exactly its arguments, once.
@@ -4212,12 +4221,16 @@ def handle_prompt(event: dict, say, client) -> None:
             # The outbox dir is shared by every turn in this thread, so its
             # whole lifecycle (create -> upload -> remove) stays inside the lock.
             outbox.mkdir(parents=True, exist_ok=True)
-            # Your own message in the operator's thread: for this turn only,
+            # Your own message in the operator's thread -- Slack, or the
+            # dashboard's chat when it vouched it was you: for this turn only,
             # it may do what you told it (operator_role.Grants), and nothing
-            # else's turn -- a sweep, a wake-up, the web chat -- carries this.
-            grant = (OPERATOR_GRANTS.open(key, msg_ts, user, text, task_id,
-                                          plan=pending_plan(msg_ts, text))
-                     if role_name == roles.OPERATOR and user_started(event, user) else "")
+            # else's turn -- a sweep, a wake-up, an unvouched web message --
+            # carries this.
+            grant = ""
+            if role_name == roles.OPERATOR and user_started(event, user):
+                who, via = grant_starter(event, user)
+                grant = OPERATOR_GRANTS.open(key, msg_ts, who, text, task_id,
+                                             plan=pending_plan(msg_ts, text), via=via)
             if grant:
                 kwargs["env"][operator_role.GRANT_VAR] = grant
             try:
@@ -6887,12 +6900,38 @@ def task_live_paths(task: dict) -> list:
 
 
 def user_started(event: dict, user: str) -> bool:
-    """Whether a turn is one a person started with their own Slack message:
-    not the web chat, not the bot or another app, and someone on the
-    allowlist -- who approve_command lets give an approval."""
-    return bool(user and not event.get("_web") and not event.get("bot_id")
+    """Whether a turn is one you started with your own message: a Slack
+    message from someone on the allowlist (who approve_command lets give an
+    approval), not the bot or another app -- or one typed in the dashboard's
+    chat that the dashboard vouched is you (dashboard_owner)."""
+    if event.get("_web"):
+        return dashboard_owner(event) is not None
+    return bool(user and not event.get("bot_id")
                 and user != BOT_USER_ID
                 and (not ALLOWED_USERS or user in ALLOWED_USERS))
+
+
+def dashboard_owner(event: dict) -> dict | None:
+    """{login, peer, node} of a dashboard message the dashboard vouched is
+    yours (visualizer: dashowner.verify -- through tailscale serve as
+    VIZ_TAILSCALE_LOGIN, past its cross-site checks, from another tailnet
+    device, on a connection tailscaled opened), read again against
+    VIZ_TAILSCALE_LOGIN here; None for any other message."""
+    if not event.get("_web"):
+        return None
+    allowed = (os.environ.get("VIZ_TAILSCALE_LOGIN")
+               or envfile.value(BASE_DIR / ".env", "VIZ_TAILSCALE_LOGIN") or "").strip()
+    return dashowner.owner(event.get("_web_owner"), allowed)
+
+
+def grant_starter(event: dict, user: str) -> tuple[str, dict]:
+    """(who, provenance) for the grant of a turn user_started says you
+    started: your Slack user and "slack", or your Tailscale login and the
+    dashboard's word for where it came from."""
+    owner = dashboard_owner(event)
+    if owner:
+        return owner["login"], dict(owner, via=operator_role.VIA_DASHBOARD)
+    return user, {"via": operator_role.VIA_SLACK}
 
 
 def pending_plan(msg_ts, text: str) -> dict | None:
@@ -6922,14 +6961,17 @@ def user_grant(payload: dict) -> dict | None:
 
 def record_user_decision(grant: dict, action: str, payload: dict, out: dict) -> dict:
     """After an action the operator took on your word went ahead: the task
-    it was on (or the one it filed) records your message and decided_by."""
+    it was on (or the one it filed) records your message, where it came
+    from, and decided_by -- and the reply says whose word it went ahead on."""
     if not (out or {}).get("ok"):
         return out
+    out = dict(out, decided_via=operator_role.grant_source(grant))
     tid = str(payload.get("id") or "") or str(((out.get("task") or {}).get("id")) or "")
     if tid and tid != "new":
         try:
             task_store.record_decision(tid, operator_role.decision_note(grant, action, payload),
-                                       operator_role.DECIDED_BY, grant["ts"])
+                                       operator_role.DECIDED_BY, grant["ts"],
+                                       via=operator_role.grant_source(grant))
         except Exception:
             # The action happened; failing to say who decided must not
             # report it as not done.
@@ -6973,7 +7015,7 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         if not said:
             payload["_user_grant"] = grant
             if route == "releases":
-                payload["by"] = f"operator, for {grant['user']} (Slack message {grant['ts']})"
+                payload["by"] = f"operator, for {grant['user']} ({operator_role.grant_source(grant)})"
             log.info("operator: %s %s on the word of %s (message %s): %s", route, action,
                      grant["user"], grant["ts"], str(payload.get("notes") or "")[:200])
             return None

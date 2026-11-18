@@ -33,14 +33,18 @@ message (`!approve <what> <item>`), used once and gone within a day. A model
 can ask you for one; it cannot make one -- no route writes them, only a Slack
 message from a person does.
 
-Or by saying so. A turn you start yourself, with a Slack message in its home
-thread, carries a grant (`Grants`): a token the bot made for that one turn,
+Or by saying so. A turn you start yourself, with your message in its home
+thread -- a Slack message, or one typed in the dashboard's chat that the
+dashboard vouches is you (dashowner.verify: through tailscale serve, as
+VIZ_TAILSCALE_LOGIN, from another tailnet device, never from the mini) --
+carries a grant (`Grants`): a token the bot made for that one turn,
 handed to its CLI in the environment and forgotten when the turn ends. While
 it lives, the operator may do what you told it -- accept, dismiss, close,
 dig, rework, land, drop, file, release -- on the items you named, each with
 --notes saying what you decided (`said_refusal`), and the task records your
-message and `decided_by`. A sweep, a wake-up, a deploy note or the web chat
-starts no turn of yours and carries none. Publishing where it is off and
+message, where it came from, and `decided_by`. A sweep, a wake-up, a deploy
+note, or a dashboard message it cannot vouch for starts no turn of yours and
+carries none. Publishing where it is off and
 trader's live configuration still wait for `!approve`, and a running task is
 cancelled only if your message named it.
 
@@ -250,7 +254,7 @@ class Grants:
     """The turns you started in the operator's home thread, while they run.
 
     In memory, in the bot, and nowhere else: a token per turn, made when your
-    Slack message's turn starts and dropped when it ends. The turn's CLI is
+    message's turn starts (Slack, or the dashboard vouching for you) and dropped when it ends. The turn's CLI is
     handed its token in the environment (SILKWORM_USER_GRANT) and sends it
     back; nothing else can have it. A restart forgets every one, which is
     right -- the turns went with it.
@@ -261,17 +265,18 @@ class Grants:
         self._live: dict[str, dict] = {}
 
     def open(self, key: str, ts: str, user: str, text: str, task_id: str,
-             plan: dict | None = None) -> str:
+             plan: dict | None = None, via: dict | None = None) -> str:
         """`plan`: the pending plan your message answers (State.plan_before),
         snapshotted as the turn starts: one recorded during it was not one you
-        had seen."""
+        had seen. `via`: where your message came from (`provenance`) -- a
+        Slack message unless the dashboard vouched for it."""
         if not (key and ts and user and task_id):
             raise ValueError("a grant names its thread, message, person and turn")
         token = secrets.token_hex(16)
         with self._lock:
             self._live[token] = {"key": key, "ts": ts, "user": user,
                                  "text": text or "", "task": task_id, "at": time.time(),
-                                 "plan": plan or None}
+                                 "plan": plan or None, **provenance(via)}
         return token
 
     def close(self, token: str) -> None:
@@ -289,6 +294,33 @@ class Grants:
         if not g or not key or g["key"] != key or not task_id or g["task"] != task_id:
             return None
         return g
+
+
+#: Where your message came from: your own Slack message, or the dashboard's
+#: chat when it vouched it was you (dashowner.verify).
+VIA_SLACK, VIA_DASHBOARD = "slack", "dashboard"
+
+
+def provenance(via: dict | None) -> dict:
+    """A grant's provenance fields: {"via": "slack"}, or {"via": "dashboard",
+    "login", "node", "peer"} for a message the dashboard vouched for."""
+    via = via or {}
+    if via.get("via") != VIA_DASHBOARD:
+        return {"via": VIA_SLACK}
+    return {"via": VIA_DASHBOARD, "login": str(via.get("login") or ""),
+            "node": str(via.get("node") or ""), "peer": str(via.get("peer") or "")}
+
+
+def grant_source(grant: dict | None) -> str:
+    """Your message, as the record names it: "Slack message <ts>", or
+    "dashboard message <ts> (<login> on <device>, <peer>)"."""
+    g = grant or {}
+    ts = g.get("ts") or g.get("decided_ts") or "?"
+    if g.get("via") != VIA_DASHBOARD:
+        return f"Slack message {ts}"
+    where = ", ".join(x for x in (g.get("node"), g.get("peer")) if x)
+    return (f"dashboard message {ts} ({g.get('login') or '?'}"
+            + (f" on {where}" if where else "") + ")")
 
 
 #: The fewest words of your message --notes must quote for a filing made on
@@ -338,7 +370,7 @@ def decision_note(grant: dict, action: str, payload: dict) -> str:
     """The event a task gets when the operator acted on your word."""
     by = grant.get("user") or "the user"
     notes = " ".join(str((payload or {}).get("notes") or "").split())
-    return f"{action} decided by {by} (Slack message {grant.get('ts')}) via operator: {notes}"
+    return f"{action} decided by {by} ({grant_source(grant)}) via operator: {notes}"
 
 
 # --- your answer to a plan, in plain words ---------------------------------------
@@ -649,7 +681,8 @@ def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> s
     grant's must still be it -- not expired, not replaced."""
     if not grant:
         return ("refused: running an op from a plan needs the user's answer -- a turn "
-                "they started with their own Slack message in the operator's thread")
+                "they started with their own message (Slack or the dashboard) in the "
+                "operator's thread")
     gp = grant.get("plan") or None
     if not gp:
         return ("refused: no plan was waiting for the user's message (none was recorded "

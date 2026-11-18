@@ -72,7 +72,8 @@ def bot_functions(*names, **globals_):
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
                   "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows",
-                  "user_grant", "record_user_decision", "outage_summary")
+                  "user_grant", "record_user_decision", "outage_summary",
+                  "dashboard_owner", "grant_starter")
 
 
 def _helper_modules(nodes, ns) -> None:
@@ -97,6 +98,17 @@ def _helper_modules(nodes, ns) -> None:
         ns.setdefault("OPERATOR", types.SimpleNamespace(thread=lambda: ""))
     # claude_env strips any grant it would otherwise inherit (GRANT_VAR).
     if any(n.name == "claude_env" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import operator_role as _op
+        ns.setdefault("operator_role", _op)
+    # dashboard_owner reads what the dashboard vouched for against
+    # VIZ_TAILSCALE_LOGIN (the environment, else .env -- here, none).
+    if any(n.name == "dashboard_owner" for n in nodes if isinstance(n, ast.FunctionDef)):
+        import dashowner as _do, envfile as _ef
+        ns.setdefault("dashowner", _do)
+        ns.setdefault("envfile", _ef)
+        ns.setdefault("os", os)
+        ns.setdefault("BASE_DIR", Path(tempfile.mkdtemp()))
+    if any(n.name == "grant_starter" for n in nodes if isinstance(n, ast.FunctionDef)):
         import operator_role as _op
         ns.setdefault("operator_role", _op)
     # user_grant asks the bot's live grants; a test that made none has none,
@@ -29653,7 +29665,8 @@ def test_operator_grant_is_made_only_for_your_own_message():
     ns = bot_functions("user_started", BOT_USER_ID="UBOT", ALLOWED_USERS={"U_ME"})
     started = ns["user_started"]
     check("your Slack message starts a turn of yours", started({"ts": "1.0"}, "U_ME"))
-    check("the web chat does not", not started({"_web": True}, "U_ME"))
+    check("the web chat does not, unless the dashboard vouched it was you",
+          not started({"_web": True}, "U_ME"))
     check("nor the bot, another app, or someone off the allowlist",
           not started({}, "UBOT") and not started({"bot_id": "B1"}, "U_ME")
           and not started({}, "U_STRANGER") and not started({}, ""))
@@ -32721,6 +32734,493 @@ def test_a_review_closes_with_its_task():
               "'retry'" not in out[0] and "x is cancelled" in out[0]
               and "'dismiss'" in out[0], out[0])
         check("dashboard: Retry when it is", "'retry')\">Retry" in out[1], out[1])
+
+
+# --- your word, typed in the dashboard's chat ----------------------------------
+# 2026-11-17: the owner's dashboard instructions to the operator were relayed
+# with no grant, so it could not accept, file on request or run a planned op,
+# and asked for everything again in Slack. The dashboard now vouches for a
+# message that is verifiably the owner's (dashowner.verify), and the bot opens
+# the same grant a Slack message does -- recording which it was.
+
+OWNER = "Owner@Example.com"
+PHONE, MINI = "100.123.15.15", "100.99.197.50"
+
+
+class _FakeProbe:
+    """The machine, as dashowner.verify reads it: the mini's own tailnet
+    addresses, who Tailscale says a peer is, and who opened the socket."""
+
+    def __init__(self, mine=(MINI, "fd7a:115c:a1e0::e52f:c533"), conn=None, whois=None):
+        self.mine = frozenset(mine)
+        self.conn = ({"pid": 321, "uid": 0, "name": "tailscaled",
+                      "path": "/opt/tailscale/bin/tailscaled"} if conn is None else conn)
+        self.who = {PHONE: {"login": "owner@example.com", "node": "iphone182"},
+                    MINI: {"login": "owner@example.com", "node": "ryans-mac-mini-2"}
+                    } if whois is None else whois
+        self.asked = []
+
+    def cli_beside(self, path):
+        self.asked.append(("cli", path))
+        return path.rsplit("/", 1)[0] + "/tailscale" if path.startswith("/opt/") else ""
+
+    def self_ips(self, ts):
+        self.asked.append(("self", ts))
+        return self.mine
+
+    def connector(self, client, server):
+        self.asked.append(("conn", client, server))
+        return dict(self.conn)
+
+    def whois(self, ip, ts):
+        self.asked.append(("whois", ip, ts))
+        return dict(self.who.get(ip) or {})
+
+
+def _serve_headers(login=OWNER, peer=PHONE, **extra):
+    h = {"X-Forwarded-For": peer, "X-Forwarded-Host": "mini.tail1234.ts.net",
+         "X-Forwarded-Proto": "https", "Content-Type": "application/json",
+         "Origin": "https://mini.tail1234.ts.net", "Sec-Fetch-Site": "same-origin"}
+    if login is not None:
+        h["Tailscale-User-Login"] = login
+    h.update(extra)
+    return {k: v for k, v in h.items() if v is not None}
+
+
+def _verify(headers, probe=None, allowed=OWNER):
+    """dashowner.verify, fed by the visualizer's own gates as _owner feeds it."""
+    import dashowner as D
+    import visualizer as V
+    saved = os.environ.get("VIZ_TAILSCALE_LOGIN")
+    os.environ["VIZ_TAILSCALE_LOGIN"] = allowed
+    try:
+        raw = headers.get("Tailscale-User-Login") or ""
+        return D.verify(headers, ("127.0.0.1", 55072), ("127.0.0.1", 8790),
+                        allowed=allowed, forged=V.cross_site_refusal(headers), proxied=V.proxied(headers),
+                        login=V._decode_login(raw) if raw.strip() else "",
+                        probe=probe or _FakeProbe())
+    finally:
+        if saved is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved
+
+
+def test_dashboard_vouches_only_for_the_owner_from_another_device():
+    print("\nthe dashboard vouches for a message as yours only via serve, as you, "
+          "from another tailnet device, on tailscaled's connection")
+    owner, why = _verify(_serve_headers())
+    check("your login, through serve, from your phone: vouched for, with its device",
+          owner == {"login": OWNER, "peer": PHONE, "node": "iphone182"} and not why,
+          (owner, why))
+    owner, why = _verify(_serve_headers(peer=MINI))
+    check("the same login from the mini's own tailnet address is not (an agent's)",
+          owner is None and "this machine itself" in why, why)
+    owner, why = _verify(_serve_headers(peer="fd7a:115c:a1e0::e52f:c533"))
+    check("nor from its v6 address", owner is None and "this machine itself" in why, why)
+    owner, why = _verify({"Content-Type": "application/json"})
+    check("a loopback request with no Tailscale identity is not",
+          owner is None and "not through tailscale serve" in why, why)
+    owner, why = _verify(_serve_headers(login=None))
+    check("nor a proxied one missing a login", owner is None and why, why)
+    owner, why = _verify(_serve_headers(login="intruder@example.com"))
+    check("nor a mismatched login", owner is None and why, why)
+    owner, why = _verify(_serve_headers(), allowed="")
+    check("nor anything while VIZ_TAILSCALE_LOGIN is unset", owner is None and why, why)
+    for label, extra in (("not JSON", {"Content-Type": "text/plain"}),
+                         ("cross-site", {"Sec-Fetch-Site": "cross-site"}),
+                         ("from another origin", {"Origin": "https://evil.example"})):
+        owner, why = _verify(_serve_headers(**extra))
+        check(f"nor one that failed the cross-site checks ({label})",
+              owner is None and why.startswith("Refused"), why)
+    probe = _FakeProbe(conn={"pid": 4242, "uid": 501, "name": "python3",
+                             "path": "/opt/tailscale/bin/python3"})
+    owner, why = _verify(_serve_headers(), probe)
+    check("nor one whose connection a user process opened (headers typed on the mini)",
+          owner is None and "tailscaled" in why, why)
+    owner, why = _verify(_serve_headers(), _FakeProbe(conn={
+        "pid": 9, "uid": 501, "name": "tailscaled", "path": "/opt/tailscale/bin/tailscaled"}))
+    check("nor a tailscaled not running as root", owner is None and "tailscaled" in why, why)
+    owner, why = _verify(_serve_headers(), _FakeProbe(conn={}))
+    check("nor one whose connection's owner can't be found",
+          owner is None and "not opened by tailscaled" in why, why)
+    probe = _FakeProbe(conn={"pid": 321, "uid": 0, "name": "tailscaled",
+                             "path": "/Users/me/.local/bin/tailscaled"})
+    owner, why = _verify(_serve_headers(), probe)
+    check("nor one with no tailscale CLI beside the root tailscaled (never PATH's)",
+          owner is None and "CLI beside" in why, why)
+    probe = _FakeProbe()
+    _verify(_serve_headers(), probe)
+    check("whois and the mini's addresses are asked of the CLI beside tailscaled",
+          ("self", "/opt/tailscale/bin/tailscale") in probe.asked
+          and ("whois", PHONE, "/opt/tailscale/bin/tailscale") in probe.asked, probe.asked)
+    owner, why = _verify(_serve_headers(), _FakeProbe(mine=()))
+    check("nor any while the mini's own addresses can't be read",
+          owner is None and "own tailnet addresses" in why, why)
+    owner, why = _verify(_serve_headers(), _FakeProbe(whois={PHONE: {
+        "login": "someone@else.com", "node": "theirs"}}))
+    check("nor one Tailscale says is another user's device", owner is None and why, why)
+    for peer in ("192.168.1.20", "127.0.0.1", f"{PHONE}, 100.64.0.1", ""):
+        owner, why = _verify(_serve_headers(peer=peer or None))
+        check(f"nor one whose peer is {peer or 'missing'!r}", owner is None and why, why)
+    probe = _FakeProbe()
+    _verify(_serve_headers(login="intruder@example.com"), probe)
+    _verify(_serve_headers(peer="192.168.1.20"), probe)
+    check("the machine is probed only for a request that is yours on its face "
+          "(your login, from a tailnet address)", probe.asked == [], probe.asked)
+    yes = _FakeProbe(whois=types.SimpleNamespace(
+        get=lambda ip: {"login": "owner@example.com", "node": "anything"}))
+    owner, why = _verify(_serve_headers(peer="192.168.1.20"), yes)
+    check("a peer off the tailnet is refused even if whois would answer for it",
+          owner is None and "tailnet peer" in why, why)
+
+
+def test_dashboard_reads_the_socket_owner_from_netstat():
+    import dashowner as D
+    print("\ndashowner: the connection's opener, read off netstat -anv")
+    out = (
+        "Active Internet connections (including servers)\n"
+        "Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)   "
+        "rxbytes txbytes rhiwat shiwat process:pid state options\n"
+        "tcp4       0      0  127.0.0.1.8790         127.0.0.1.55072        ESTABLISHED "
+        "362 1442 408192 146988 Python:28252  02031 00000004 0000000000863884 00000080 01000800 2 0 000000\n"
+        "tcp4       0      0  127.0.0.1.55072        127.0.0.1.8790         ESTABLISHED "
+        "1442 362 408192 146988 tailscaled:321  00182 00000008 0000000000863883 00000080 04000900 2 0 000000\n"
+        "tcp4       0      0  127.0.0.1.55099        127.0.0.1.8790         ESTABLISHED "
+        "10 10 1 1 Google Chrome H:777  02031 00000004 0000000000863885 00000080 01000800 2 0 000000\n")
+    check("the client end's pid, not the server's",
+          D.socket_owner(out, ("127.0.0.1", 55072), ("127.0.0.1", 8790)) == 321)
+    check("a name with spaces still gives its pid",
+          D.socket_owner(out, ("127.0.0.1", 55099), ("127.0.0.1", 8790)) == 777)
+    forged = ("tcp4 0 0 127.0.0.1.60000 127.0.0.1.8790 ESTABLISHED 0 461 408300 146988 "
+              "c:321 d:4242 00182 00000008 0000000000863883 00000080 04000900 2 0 000000\n")
+    check("a binary named to print a fake :pid first gives its own pid, not tailscaled's",
+          D.socket_owner(forged, ("127.0.0.1", 60000), ("127.0.0.1", 8790)) == 4242)
+    check("a connection in another state is not read",
+          D.socket_owner(out.replace("ESTABLISHED", "CLOSE_WAIT"),
+                         ("127.0.0.1", 55072), ("127.0.0.1", 8790)) == 0)
+    check("no such connection: 0",
+          D.socket_owner(out, ("127.0.0.1", 1), ("127.0.0.1", 8790)) == 0)
+    calls = []
+
+    def run(argv, timeout):
+        calls.append(argv)
+        if argv[0] == D.NETSTAT:
+            return 0, out, ""
+        return 0, "    0 /opt/homebrew/opt/tailscale/bin/tailscaled\n", ""
+    got = D.Probe(run=run).connector(("127.0.0.1", 55072), ("127.0.0.1", 8790))
+    check("Probe.connector names the process, its uid and path from ps",
+          got == {"pid": 321, "uid": 0, "name": "tailscaled",
+                  "path": "/opt/homebrew/opt/tailscale/bin/tailscaled"}
+          and calls[-1] == [D.PS, "-o", "uid=,comm=", "-p", "321"], (got, calls))
+    if True:
+        def ts_run(argv, timeout):
+            seen.append(argv)
+            if argv[1] == "whois":
+                return 0, json.dumps({"Node": {"Name": "iphone182.tail.ts.net.",
+                                               "ComputedName": "iphone182"},
+                                      "UserProfile": {"LoginName": "owner@example.com"}}), ""
+            return 0, json.dumps({"Self": {"TailscaleIPs": [MINI, "not-an-ip"]}}), ""
+        seen = []
+        pr = D.Probe(run=ts_run)
+        who = pr.whois(PHONE, "/x/tailscale")
+        check("whois asks `tailscale whois --json <ip>` -- the flag before the address, "
+              "which tailscale otherwise reads as a second peer",
+              ["/x/tailscale", "whois", "--json", PHONE] in seen
+              and who == {"login": "owner@example.com", "node": "iphone182"}, (seen, who))
+        check("and the mini's own addresses come from `tailscale status --json`",
+              pr.self_ips("/x/tailscale") == frozenset({MINI}))
+        check("a non-address is never handed to whois", pr.whois("-x", "/x/tailscale") == {}
+              and not any("-x" in a for a in seen))
+        odd = D.Probe(run=lambda a, t: (0, json.dumps({"Self": "x", "Node": [1],
+                                                       "UserProfile": 3}), ""))
+        check("odd JSON shapes answer nothing rather than raising",
+              odd.self_ips("/x/tailscale") == frozenset() and odd.whois(PHONE, "/x/t") == {})
+    tdir = Path(tempfile.mkdtemp())
+    (tdir / "tailscaled").write_text("")
+    (tdir / "tailscale").write_text("#!/bin/sh\n")
+    (tdir / "tailscale").chmod(0o755)
+    check("cli_beside finds the CLI next to the daemon, and nothing for a relative path",
+          D.Probe.cli_beside(str(tdir / "tailscaled")) == str(tdir / "tailscale")
+          and D.Probe.cli_beside(str(tdir / "sub" / "tailscaled")) == "")
+    here = os.getcwd()
+    try:
+        os.chdir(tdir)       # a "tailscale" right here must not answer for a bare name
+        check("nor for a relative daemon path, whatever is in the current directory",
+              D.Probe.cli_beside("tailscaled") == "")
+    finally:
+        os.chdir(here)
+    got = D.Probe(run=lambda a, t: (1, "", "boom")).connector(("127.0.0.1", 55072),
+                                                               ("127.0.0.1", 8790))
+    check("and nothing when netstat fails", got == {}, got)
+
+
+def test_viz_send_vouches_for_the_owner_only():
+    import threading
+    import urllib.error
+    import urllib.request
+    import visualizer as V
+    print("\n/api/send: says the owner sent it only when dashowner.verify does, "
+          "and never what the page claims")
+    saved_env = os.environ.get("VIZ_TAILSCALE_LOGIN")
+    saved = (V.LOOPBACK, V.TOKEN, V.bot_call, V.OWNER_PROBE)
+    sent = []
+    srv = None
+    try:
+        os.environ["VIZ_TAILSCALE_LOGIN"] = OWNER
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.bot_call = lambda path, payload, timeout=1.0: sent.append((path, payload)) or {"ok": True}
+        probe = _FakeProbe()
+        V.OWNER_PROBE = probe
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        V.Handler.__init__  # the class the server serves
+
+        def send(headers, body=None):
+            sent.clear()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/send", headers=headers, method="POST",
+                data=json.dumps(body or {"key": "D1:1.0", "text": "accept tsk_1"}).encode())
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            return code, (sent[-1][1] if sent else None)
+
+        code, payload = send(_serve_headers())
+        check("from your phone through serve: relayed with who sent it",
+              code == 200 and payload and payload.get("dashboard_owner")
+              == {"login": OWNER, "peer": PHONE, "node": "iphone182"}, (code, payload))
+        conn = [a for a in probe.asked if isinstance(a, tuple) and a[0] == "conn"]
+        check("the socket asked about is this request's own",
+              conn and conn[-1][2] == ("127.0.0.1", port) and conn[-1][1][0] == "127.0.0.1",
+              conn)
+        code, payload = send(_serve_headers(peer=MINI))
+        check("from the mini's own tailnet address: relayed, vouched for by no one",
+              code == 200 and payload is not None and "dashboard_owner" not in payload,
+              payload)
+        forged = {"key": "D1:1.0", "text": "accept tsk_1",
+                  "dashboard_owner": {"login": OWNER, "peer": PHONE, "node": "x"}}
+        code, payload = send({"Content-Type": "application/json"}, forged)
+        check("a loopback request claiming the owner in its body: the claim is dropped",
+              code == 200 and payload is not None and "dashboard_owner" not in payload,
+              payload)
+        code, payload = send(_serve_headers(peer=MINI), forged)
+        check("so is one from the mini through serve", payload is not None
+              and "dashboard_owner" not in payload, payload)
+        code, payload = send(_serve_headers(**{"Sec-Fetch-Site": "cross-site"}))
+        check("a cross-site POST never reaches the bot at all", code == 403 and payload is None,
+              (code, payload))
+        V.OWNER_PROBE = _FakeProbe(conn={"pid": 4242, "uid": 501, "name": "python3"})
+        code, payload = send(_serve_headers())
+        check("the owner's headers on a connection a user process opened: not vouched for",
+              code == 200 and payload is not None and "dashboard_owner" not in payload,
+              payload)
+
+        class Broken(_FakeProbe):
+            def connector(self, client, server):
+                raise RuntimeError("netstat went away")
+        V.OWNER_PROBE = Broken()
+        code, payload = send(_serve_headers())
+        check("a probe that raises: the message still goes, vouched for by no one",
+              code == 200 and payload is not None and "dashboard_owner" not in payload,
+              (code, payload))
+    finally:
+        V.LOOPBACK, V.TOKEN, V.bot_call, V.OWNER_PROBE = saved
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+        if saved_env is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved_env
+
+
+def test_bot_opens_your_grant_for_a_vouched_dashboard_message():
+    import operator_role as O
+    print("\nthe bot: a dashboard message the dashboard vouched for starts a turn of "
+          "yours; any other does not")
+    saved = os.environ.get("VIZ_TAILSCALE_LOGIN")
+    os.environ["VIZ_TAILSCALE_LOGIN"] = OWNER
+    try:
+        ns = bot_functions("user_started", "grant_starter", BOT_USER_ID="UBOT",
+                           ALLOWED_USERS={"U_ME"})
+        started, starter = ns["user_started"], ns["grant_starter"]
+        vouched = {"login": "owner@example.com", "peer": PHONE, "node": "iphone182"}
+        ev = {"_web": True, "_web_owner": vouched}
+        check("a vouched dashboard message starts a turn of yours", started(ev, ""))
+        check("its grant is your login, from the dashboard, with the device",
+              starter(ev, "") == ("owner@example.com", {
+                  "via": "dashboard", "login": "owner@example.com", "peer": PHONE,
+                  "node": "iphone182"}), starter(ev, ""))
+        check("a Slack message's grant says Slack",
+              starter({"ts": "1.0"}, "U_ME") == ("U_ME", {"via": "slack"}))
+        check("even one carrying the dashboard's field (only a dashboard message is vouched for)",
+              starter({"ts": "1.0", "_web_owner": vouched}, "U_ME") == ("U_ME", {"via": "slack"}))
+        check("an unvouched dashboard message does not start one",
+              not started({"_web": True}, ""))
+        check("nor one vouched for another login",
+              not started({"_web": True, "_web_owner": dict(vouched, login="x@y.z")}, ""))
+        check("nor one whose peer is not a tailnet address",
+              not started({"_web": True, "_web_owner": dict(vouched, peer="10.0.0.2")}, ""))
+        check("nor a Slack event carrying the dashboard's field",
+              not started({"_web_owner": vouched}, "U_STRANGER"))
+        os.environ["VIZ_TAILSCALE_LOGIN"] = ""
+        check("nor any while VIZ_TAILSCALE_LOGIN is unset", not started(ev, ""))
+    finally:
+        if saved is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    fn = lambda name: next(f for f in tree.body if isinstance(f, ast.FunctionDef)
+                           and f.name == name)
+    dw = ast.get_source_segment(src, fn("deliver_web_message"))
+    check("the bot reads who sent it only from the dashboard's dashboard_owner field",
+          'payload.get("dashboard_owner")' in dw and '"_web_owner": owner' in dw)
+    hp = ast.get_source_segment(src, fn("handle_prompt"))
+    check("handle_prompt opens the grant with grant_starter's who and provenance",
+          "who, via = grant_starter(event, user)" in hp and "via=via" in hp)
+    gs = O.Grants()
+    t = gs.open("D1:1.0", "5.0", "owner@example.com", "accept tsk_1", "tsk_turn",
+                via={"via": "dashboard", "login": "owner@example.com", "node": "iphone182",
+                     "peer": PHONE})
+    g = gs.get(t, "D1:1.0", "tsk_turn")
+    check("a dashboard grant records where it came from",
+          g["via"] == "dashboard" and g["node"] == "iphone182" and g["peer"] == PHONE
+          and O.grant_source(g) == f"dashboard message 5.0 (owner@example.com on "
+                                   f"iphone182, {PHONE})", O.grant_source(g))
+    t2 = gs.open("D1:1.0", "6.0", "U_ME", "accept tsk_1", "tsk_turn")
+    check("a Slack one says so", gs.get(t2, "D1:1.0", "tsk_turn")["via"] == "slack"
+          and O.grant_source(gs.get(t2, "D1:1.0", "tsk_turn")) == "Slack message 6.0")
+    check("a page can't smuggle extra fields through provenance",
+          O.provenance({"via": "dashboard", "login": "a", "key": "x", "task": "y"}).keys()
+          == {"via", "login", "node", "peer"})
+
+
+def _dash_say(bot, text, turn=None, ts="1763400000.000100"):
+    """Open a grant as handle_prompt does for a dashboard message it vouched for."""
+    return bot.ns["OPERATOR_GRANTS"].open(
+        HOME, ts, "owner@example.com", text, turn or bot.turn,
+        via={"via": "dashboard", "login": "owner@example.com", "node": "iphone182",
+             "peer": PHONE})
+
+
+def test_dashboard_grant_accepts_and_records_where_it_came_from():
+    import tasks as T
+    print("\nyour word from the dashboard: accept goes through, and says it was the dashboard")
+    bot = _said_bot()
+    st = bot.store
+    a = _proposal(st, "Add an appearance preference to Settings")
+    g = _dash_say(bot, f"accept {a}")
+    r = _as_sweep(bot, "accept", a, "--notes", "user said accept it")
+    check("a sweep's accept is still refused", r.returncode == 1
+          and st.get(a)["state"] == T.PROPOSED, r.stdout + r.stderr)
+    r = _as_user(bot, g, "accept", a, "--notes", "user: accept it")
+    rec = st.get(a) or {}
+    res = rec.get("result") or {}
+    ev = [e for e in rec.get("events") or [] if e.get("kind") == "decided"]
+    check("your dashboard message lets the accept through",
+          r.returncode == 0 and rec.get("state") != T.PROPOSED, r.stdout + r.stderr)
+    check("the reply says whose word, from where",
+          "dashboard message 1763400000.000100 (owner@example.com on iphone182" in r.stdout,
+          r.stdout)
+    check("the task records decided_by, its message and the dashboard provenance",
+          res.get("decided_by") == "user via operator"
+          and res.get("decided_ts") == "1763400000.000100"
+          and "dashboard message" in (res.get("decided_via") or "")
+          and ev and "dashboard message" in ev[-1]["detail"]
+          and "iphone182" in ev[-1].get("via", ""), rec)
+    check("compaction keeps where it came from", "decided_via" in T.RESULT_KEEPS)
+    import costs
+    st.update(a, result={"text": "done", **costs.add_run(st.get(a), 0.5)})
+    check("and a run rewriting result keeps it",
+          "dashboard message" in ((st.get(a).get("result") or {}).get("decided_via") or ""),
+          st.get(a).get("result"))
+    bot.ns["OPERATOR_GRANTS"].close(g)
+    b = _proposal(st, "Cache the release plan per checkout")
+    r = _as_user(bot, g, "accept", b, "--notes", "user: accept it")
+    check("once the turn ends, its grant lifts nothing",
+          r.returncode == 1 and st.get(b)["state"] == T.PROPOSED, r.stdout + r.stderr)
+
+
+def test_dashboard_grant_files_on_request():
+    import tasks as T
+    print("\nyour word from the dashboard: a requested filing passes the cap, recorded as such")
+    w = _requested_world()
+    HOME_ = "D5:5.0"
+    g = w.grants.open(HOME_, "1763400000.000200", "owner@example.com",
+                      "file the universe rebuild", "tsk_turn",
+                      via={"via": "dashboard", "login": "owner@example.com",
+                           "node": "iphone182", "peer": PHONE})
+    out = w.file({"key": HOME_, "goal": "Rebuild the universe point-in-time", "project": "alpha",
+                  "caller_role": "operator", "caller_task": "tsk_turn", "caller_grant": g,
+                  "requested_by_user": True, "notes": "user: 'file the universe rebuild'"})
+    rec = w.ts.get(out.get("id") or "") or {}
+    rq = rec.get("requested_by_user") or {}
+    check("filed straight to the queue past the full board",
+          out.get("ok") and out.get("state") == T.QUEUED, out)
+    check("the reply and the record name the dashboard message",
+          "dashboard message 1763400000.000200" in (out.get("decided_via") or "")
+          and rq.get("via") == "dashboard" and "iphone182" in rq.get("source", "")
+          and any("dashboard message" in e.get("detail", "") for e in rec.get("events") or []),
+          (out, rec))
+    out = w.file({"key": HOME_, "goal": "Another", "project": "alpha",
+                  "caller_role": "operator", "caller_task": "tsk_sweep",
+                  "requested_by_user": True, "notes": "user: 'file the universe rebuild'"})
+    check("a sweep still can't claim it", not out.get("ok"), out)
+
+
+def test_dashboard_grant_answers_an_ops_plan():
+    import ops as OPS
+    print("\nyour word from the dashboard: 'yes' runs the planned op; unplanned trader "
+          "config is still refused")
+    w = _ops_world()
+    with _fake_path(w):
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        ts = f"{time.time() + 1:.6f}"
+        g = w.grants.open("D1:1.0", ts, "owner@example.com", "yes", "tsk_turn_mine",
+                          plan=w.state.answer_plan(ts, "yes"),
+                          via={"via": "dashboard", "login": "owner@example.com",
+                               "node": "iphone182", "peer": PHONE})
+        r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "static",
+                         "--notes", "user: yes")
+        check("an op not in the plan, and not named, is still refused",
+              r.returncode == 1 and _env_value(w, "MOMENTUM_UNIVERSE") is None, r.stderr)
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("'yes' from the dashboard runs the entry",
+              r.returncode == 0 and _env_value(w, "MOMENTUM_UNIVERSE") == "pit",
+              r.stdout + r.stderr)
+        runs = [x for x in OPS.read_log(w.log, 100) if x.get("plan_entry") and not x.get("refused")]
+        check("the ops log records it was the dashboard, and which device",
+              runs and "dashboard message" in runs[-1].get("decided_via", "")
+              and "iphone182" in runs[-1]["decided_via"], runs)
+        r = _ops_cli(w, "log")
+        check("and `silkworm ops log` shows it", "dashboard message" in r.stdout, r.stdout)
+        r = _plan_run(w, "", 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("a sweep (no grant) still can't", r.returncode == 1, r.stderr)
+
+
+def test_digest_says_which_message_decided():
+    import digest as D
+    import tasks as T
+    print("\nthe digest: what was done on your word, and whether by Slack or the dashboard")
+    tmp = Path(tempfile.mkdtemp())
+    st = T.TaskStore(tmp / "t.json")
+    a = st.create("Add an appearance preference", project="alpha")["id"]
+    b = st.create("Retry sync on 429", project="alpha")["id"]
+    st.record_decision(a, "accept decided by owner@example.com (dashboard message 9.1 "
+                       "(owner@example.com on iphone182, 100.123.15.15)) via operator: yes",
+                       "user via operator", "9.1",
+                       via="dashboard message 9.1 (owner@example.com on iphone182, 100.123.15.15)")
+    st.record_decision(b, "dismiss decided by U_ME (Slack message 9.2) via operator: no",
+                       "user via operator", "9.2", via="Slack message 9.2")
+    text = D.render(st.all().values(), time.time())
+    check("each is listed under what was done on your word, with where it came from",
+          "done on your word" in text and "accept, dashboard message 9.1" in text
+          and "iphone182" in text and "dismiss, Slack message 9.2" in text, text)
 
 
 if __name__ == "__main__":
