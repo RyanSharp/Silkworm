@@ -706,6 +706,16 @@ other work. That is the whole loop, and every part of it except the schedule
 already existed. `proposed` in particular was built for exactly this and had
 never once been used.
 
+Each pass looks through one **lens** (ideation.py): *features*, *quality* or
+*correctness*. One generic goal, under a system prompt about "a real gap, a real
+inconsistency, a real risk", made every night's proposals fixes. The lens is
+chosen from the date and the project -- deterministic, so a restart cannot
+repeat it and a skipped night moves on -- unless the project names its own
+cycle (`ideate_lenses`, validated when set). It is written on the ideation
+task and, read off the bot's own record of the pass running on the thread, on
+every proposal that pass files, so acceptance can later be read per lens. The
+system prompt keeps only the rules every lens shares.
+
 The ideator is **read-only**, enforced rather than requested: it runs unattended
 in the middle of the night, so it can read the tree and history and file
 proposals, and nothing else. It gets a fresh session each time — a nightly look

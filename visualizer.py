@@ -3541,7 +3541,7 @@ async function renderTasks() {
       <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
-          esc(t.id)} · ${esc(t.source)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
+          esc(t.id)} · ${esc(t.source)}${t.lens ? ` · lens: ${esc(t.lens)}` : ""}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
           age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${findings(t)}${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
   }).join(""));
@@ -3891,7 +3891,7 @@ function boardCard(t) {
   return `<div class="bcard" data-id="${esc(t.id)}" onclick="openCard('${esc(t.id)}')">
     <div class="tt">${esc(t.title || t.id)}</div>
     <div class="sub">${t.project && boardProject === "" ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
-      esc(t.role)}${t.state === "blocked" || t.state === "proposed" || t.state === "failed"
+      esc(t.role)}${t.lens ? ` · <span class="lens" title="the nightly review lens it came from">${esc(t.lens)}</span>` : ""}${t.state === "blocked" || t.state === "proposed" || t.state === "failed"
         || t.state === "needs_input" || t.state === "awaiting_approval"
         ? ` · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>` : ""} · ${
       age(t.created)}${cost ? ` · <span title="API list-price equivalent, not billed">${cost}</span>` : ""}${
@@ -4006,7 +4006,7 @@ function renderDetail(t) {
   const l = (t.result || {}).landing;
   return `<button class="ghost" style="float:right" onclick="closeDetail()">✕</button>
     <h3>${esc(t.title || t.id)}</h3>
-    <div class="sub">${esc(t.id)} · ${esc(t.role || "")} · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>${
+    <div class="sub">${esc(t.id)} · ${esc(t.role || "")}${t.lens ? ` · lens: ${esc(t.lens)}` : ""} · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>${
       t.project ? ` · ${esc(t.project)}` : " · unfiled"} · ${esc(t.source || "")} · ${age(t.created)}${costText(t)}${
       t.branch ? ` · ${esc(t.branch)}${t.commits ? ` (${t.commits})` : ""}` : ""}</div>
     <div class="acts" style="margin-top:8px">${cardButtons(t)}${t.thread_link
@@ -4466,6 +4466,8 @@ async function projectSettings(slug) {
     <div class="line"><label style="margin:0"><input type="checkbox" id="pspublish"${p.publish ? " checked" : ""}
       onchange="setPublish('${esc(slug)}',this.checked)"> publish</label><span class="note">push the base to origin after each landing</span></div>
     <label>nightly review</label><div class="line"><input type="text" id="psideate" value="${esc(p.ideate_at || "")}" placeholder="off — or 02:00, 2am">${save("saveIdeate")}
+    <label>review lenses</label><div class="line"><input type="text" id="pslenses" value="${esc((p.ideate_lenses || []).join(", "))}" placeholder="all — features, quality, correctness">${save("saveLenses")}
+    <div class="note">What each night looks for, one lens a night in turn. Blank rotates all three.</div>
     <label>base branch</label><div class="line"><input type="text" id="psbase" value="${esc(r.base || "")}" placeholder="the default branch">${save("saveBase")}
     <div class="note">What its tasks build on and land onto. Blank is the repository's default branch.</div>
     <label>generated paths</label><div class="line"><input type="text" id="psgenerated" value="${esc((p.generated || []).join(", "))}" placeholder="none — e.g. ios/App/Info.plist">${save("saveGenerated")}
@@ -4527,6 +4529,11 @@ async function saveIdeate(slug) {
   if (!off && !confirm(`Review ${slug} every night at ${at}?\n\nAn agent reads the project unattended `
                        + "and files proposals for you to accept.")) return;
   await settingsCall({action: "ideate", slug, at: off ? "off" : at}, off ? "Nightly review off" : "Nightly review set");
+}
+async function saveLenses(slug) {
+  const lenses = document.getElementById("pslenses").value.trim();
+  await settingsCall({action: "ideate-lenses", slug, lenses},
+                     lenses ? "Review lenses saved" : "Review lenses: all");
 }
 async function saveBase(slug) {
   const branch = document.getElementById("psbase").value.trim();

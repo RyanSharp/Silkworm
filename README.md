@@ -568,6 +568,17 @@ scheduled for — click one to set a time or turn it off. Or from Slack:
 
     !project ideate 02:00      # or 2am; `!project ideate off` to stop
 
+Each night looks through one lens, in turn: **features** (new capabilities
+grounded in the project's brief and docs, each saying who it is for, how big it
+is and what it costs to run), **quality** (refactors, tests on risky code,
+tooling, drifted docs) or **correctness** (bugs, security, data integrity). The
+rotation follows the date, so a skipped night moves on rather than repeating.
+To look through only some of them:
+
+    !project ideate lenses features,correctness   # `!project ideate lenses default` for all
+
+The lens is in the pass's title, on each proposal it files, and in the digest.
+
 Each night it reads the code, history and tests, and files what it finds as
 **proposed** tasks — on your board, waiting. Accept the ones worth doing and
 they queue like any other work, running in their own checkouts with a reviewer

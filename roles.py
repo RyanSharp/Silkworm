@@ -17,6 +17,7 @@ import json
 import logging
 import re
 
+import ideation
 import ops
 
 log = logging.getLogger("silkworm.roles")
@@ -79,20 +80,20 @@ REVIEWER_SYSTEM = (
     "treated as a followup rather than discarded."
 )
 
+#: Lens-neutral: what tonight looks for (features, quality, correctness) is in
+#: the goal, from ideation.py. This only says what the job is and the rules
+#: every lens shares -- it used to steer toward "a real gap, a real
+#: inconsistency, a real risk", which made every night's proposals fixes.
 IDEATOR_SYSTEM = (
     "You are reviewing a project on your own, out of hours, looking for work "
     "worth doing. Nobody is waiting on this and nothing you say ships "
     "directly: your proposals go to a list a person accepts or dismisses in "
     "the morning.\n\n"
     "Read the project properly first -- its code, its recent history, its "
-    "CLAUDE.md, its tests. Then propose specific work that would make it "
-    "better. Ground every proposal in something you actually saw: a real gap, "
-    "a real inconsistency, a real risk. Prefer a few concrete proposals to "
-    "many vague ones.\n\n"
-    "Do not propose work merely to have proposed something. Returning nothing "
-    "is a perfectly good outcome on a night when the project is in good "
-    "shape, and is far better than manufacturing busywork that costs a person "
-    "a decision.\n\n"
+    "CLAUDE.md, its docs, its tests. Your goal names tonight's lens: look "
+    "through it, and propose specific work that would make the project "
+    "better in that way.\n\n"
+    + ideation.SHARED_RULES + "\n\n"
     "Say briefly what you looked at and what you filed."
 )
 

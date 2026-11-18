@@ -355,6 +355,10 @@ FIELDS: dict[str, tuple] = {
     # Its own field rather than inside `result`, which the reviewer's verdict
     # and compaction both rewrite. See roles.parse_needs_user.
     "needs_user":  (None,  "{action, why, release} a step the run left for you"),
+    # The nightly review's lens (ideation.py): features, quality or
+    # correctness, on the ideation task and on each proposal it filed, so the
+    # acceptance rate per lens can be read off the board. "" for everything else.
+    "lens":        ("",    "nightly review lens: features | quality | correctness, or empty"),
     # "Run next" from the dashboard. claim() takes the highest first and the
     # oldest among equals, so zero -- every task nobody pinned -- is the plain
     # oldest-first queue it always was. Spent by the claim it asked for: it

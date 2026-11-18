@@ -47,6 +47,7 @@ import harvester
 import health
 import health_probes  # noqa: F401 - registers the project-specific probes
 import home
+import ideation
 import discard
 import holding
 import jsonstore
@@ -1635,10 +1636,28 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                 say(text="File this thread under a project first: `!project <name>`.",
                     thread_ts=thread_ts)
             elif not when:
-                cur = (project_store.get(slug) or {}).get("ideate_at") or ""
-                say(text=(f"*{slug}* is reviewed nightly at *{cur}*." if cur
+                rec = project_store.get(slug) or {}
+                cur = rec.get("ideate_at") or ""
+                lenses = " → ".join(ideation.cycle(rec.get("ideate_lenses") or ()))
+                say(text=(f"*{slug}* is reviewed nightly at *{cur}*, looking for "
+                          f"{lenses} in turn." if cur
                           else f"*{slug}* has no nightly review. "
                                "`!project ideate 02:00` to add one."),
+                    thread_ts=thread_ts)
+            elif when.lower() == "lenses":
+                # Asking, not setting: the bare word shows the cycle rather
+                # than resetting a choice someone typed it to look at.
+                rec = project_store.get(slug) or {}
+                mine = ideation.cycle(rec.get("ideate_lenses") or ())
+                say(text=(f"*{slug}*'s nightly review rotates {' → '.join(mine)}"
+                          + ("" if rec.get("ideate_lenses") else " (the default)")
+                          + ". `!project ideate lenses features,correctness` to choose, "
+                          "`!project ideate lenses default` for all."),
+                    thread_ts=thread_ts)
+            elif when.lower().startswith("lenses "):
+                # Which lenses the nightly review rotates through; "default"
+                # is all of them. A typo is refused, not stored.
+                say(text=set_ideate_lenses(slug, when[6:].strip())["message"],
                     thread_ts=thread_ts)
             elif when.lower() in ("off", "none", "stop", "clear"):
                 project_store.ensure(slug, ideate_at="")
@@ -3309,6 +3328,12 @@ def handle_projects(payload: dict) -> dict:
         except ValueError as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "project": project_store.ensure(slug, ideate_at=at)}
+    if action == "ideate-lenses":
+        # The nightly review's lens override, from the dashboard. Same
+        # validation as Slack's `!project ideate lenses ...`.
+        slug = (payload.get("slug") or "").strip()
+        out = set_ideate_lenses(slug, payload.get("lenses"))
+        return {k: v for k, v in out.items() if k != "message"}
     if action == "brief":
         slug = payload.get("slug", "")
         if "brief" in payload:
@@ -3697,8 +3722,13 @@ def handle_file_task(payload: dict) -> dict:
         project_store.home(proj, create=True)
 
     scope = project_store.scope_for(proj) or {"cwd": entry.get("cwd") or str(CLAUDE_CWD)}
+    # Filed by a nightly review, a proposal carries the lens that review looked
+    # through, so what is accepted can be counted per lens. Read off the
+    # ideation task the bot has running on this thread, never from the caller.
+    lens = (ideation.filed_under(task_store, (payload.get("caller_task") or "").strip(), key)
+            if propose and not parent and not hrec else "")
     task = task_store.create(
-        goal, title=title, role=role, project=proj,
+        goal, title=title, role=role, project=proj, lens=lens,
         # Work scoped with you is queued: it was already reviewed by the person
         # the proposed gate exists to ask. A proposal nobody has seen is not.
         state=state, driver="queue",
@@ -6523,6 +6553,29 @@ def _credential_watcher() -> None:
         time.sleep(3600)
 
 
+def set_ideate_lenses(slug: str, want) -> dict:
+    """Set the lenses `slug`'s nightly review rotates through.
+
+    `want` is "features,correctness", a list, or empty / "default" for the
+    default cycle. An unknown lens name is refused with the ones that exist;
+    nothing is written then. Returns {ok, project?, error?, message}.
+    """
+    if not project_store.get(slug):
+        return {"ok": False, "error": f"unknown project {slug!r}",
+                "message": f":warning: unknown project {slug!r}"}
+    try:
+        lenses = ideation.parse(want)
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "message": f":warning: {e}"}
+    rec = project_store.ensure(slug, ideate_lenses=lenses)
+    shown = " → ".join(ideation.cycle(lenses))
+    return {"ok": True, "project": rec,
+            "message": (f":crescent_moon: *{slug}*'s nightly review now rotates "
+                        f"{shown}." if lenses else
+                        f":crescent_moon: *{slug}*'s nightly review rotates the "
+                        f"default lenses, {shown}.")}
+
+
 def run_ideation(slug: str) -> dict:
     """File the nightly look at one project as a task the runner will pick up.
 
@@ -6550,9 +6603,16 @@ def run_ideation(slug: str) -> dict:
                 "limit": scoping.max_open_proposals()}
 
     scope = project_store.scope_for(slug) or {"cwd": str(CLAUDE_CWD)}
+    # Tonight's lens: features, quality or correctness, rotated by project and
+    # date (ideation.lens_for) unless the project names its own. One generic
+    # goal under a prompt about gaps and risks made every night a night of
+    # fixes; the lens is recorded on the task, and on each proposal it files,
+    # so what gets accepted can be read per lens.
+    lens = ideation.lens_for(slug, datetime.now(), rec.get("ideate_lenses") or ())
     goal = (
         f"Look over the {rec.get('title') or slug} project and propose work "
         "worth doing.\n\n"
+        + ideation.goal_lens(lens) + "\n\n"
         "Read what is actually there before suggesting anything: the code, "
         "recent commits, the tests, CLAUDE.md. Then file each proposal with\n"
         f"    {SILKWORM_BIN} task --propose --project {slug} \"<goal>\"\n"
@@ -6581,16 +6641,17 @@ def run_ideation(slug: str) -> dict:
     if note:
         goal += "\n\n" + note
 
-    task = task_store.create(goal, title=f"Nightly review: {rec.get('title') or slug}",
+    task = task_store.create(goal, title=ideation.title(lens, rec.get('title') or slug),
                              role="ideator", project=slug, state=tasks.QUEUED,
+                             lens=lens,
                              # Unattended work of its own, though the ideator
                              # being read-only means it is denied a checkout
                              # anyway -- one empty branch a night otherwise.
                              driver="queue", source="ideation", isolate=True,
                              scope=scope)
     project_store.ensure(slug, ideate_on=datetime.now().strftime("%Y-%m-%d"))
-    log.info("filed nightly ideation %s for %s", task["id"], slug)
-    return {"ok": True, "id": task["id"]}
+    log.info("filed nightly ideation %s (%s) for %s", task["id"], lens, slug)
+    return {"ok": True, "id": task["id"], "lens": lens}
 
 
 def _ideation_scheduler() -> None:

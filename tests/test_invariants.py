@@ -79,6 +79,13 @@ def _helper_modules(nodes, ns) -> None:
     """The real modules a lifted shared helper reads, unless a test supplied
     its own. unreviewed_role asks roles.needs_review; a test lifting a landing
     path for another reason should not have to know that."""
+    # The nightly review's lenses (ideation.py) are pure: any lifted function
+    # that reads them -- run_ideation, the filing route tagging a proposal
+    # with its lens, the lens override -- gets the real module.
+    if any(isinstance(x, ast.Name) and x.id == "ideation"
+           for n in nodes for x in ast.walk(n)):
+        import ideation as _ideation
+        ns.setdefault("ideation", _ideation)
     if any(n.name == "unreviewed_role" for n in nodes if isinstance(n, ast.FunctionDef)):
         import roles as _roles
         ns.setdefault("roles", _roles)
@@ -2483,7 +2490,7 @@ def _run_ideation_impl():
     mod = types.ModuleType("ideating")
     mod.__dict__.update(
         scoping=S, tasks=T, task_store=ts, project_store=ps, datetime=datetime, projects=P,
-        time=time,
+        time=time, ideation=__import__("ideation"),
         log=logging.getLogger("test"), CLAUDE_CWD=root, SILKWORM_BIN="silkworm",
         branches=types.SimpleNamespace(survey=lambda _t, **_: []))
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<ideating>", "exec"),
@@ -2550,6 +2557,219 @@ def test_a_deep_board_costs_no_session():
           out.get("id") and not out.get("skipped"), f"got {out}")
 
 
+def test_nightly_review_rotates_its_lens():
+    """Each night looks through one lens -- features, quality, correctness --
+    rotated by project and date, overridable per project, and recorded on the
+    pass and on what it files.
+
+    One generic goal under a prompt about gaps and risks made every night's
+    proposals fixes; nothing on the board said which kind of night produced
+    what, so acceptance could not be read per kind.
+    """
+    import ideation as I, roles as R, tasks as T, digest, projects
+    from datetime import date
+    print("\nthe nightly review rotates features, quality and correctness")
+
+    # Rotation, from the date: three nights in a row are three lenses, for
+    # every project, and the projects do not all share tonight's.
+    for slug in ("silkworm", "trader", "cadence", "mondays", ""):
+        d = date(2026, 11, 17)
+        three = [I.lens_for(slug, d + timedelta(days=i)) for i in range(3)]
+        check(f"three consecutive nights give three lenses ({slug or 'no slug'})",
+              sorted(three) == sorted(I.LENSES), f"got {three}")
+        check(f"and the cycle is features -> quality -> correctness ({slug or 'no slug'})",
+              all(I.LENSES[(I.LENSES.index(a) + 1) % 3] == b
+                  for a, b in zip(three, three[1:])), f"got {three}")
+        check(f"a skipped night does not repeat its lens ({slug or 'no slug'})",
+              I.lens_for(slug, d) != I.lens_for(slug, d + timedelta(days=2)),
+              "the night after a skip must move on, not look again the same way")
+        check(f"a restart the same night gives the same lens ({slug or 'no slug'})",
+              I.lens_for(slug, datetime(2026, 11, 17, 2, 0))
+              == I.lens_for(slug, datetime(2026, 11, 17, 23, 59)))
+    tonight = {I.lens_for(s, date(2026, 11, 17)) for s in
+               ("silkworm", "trader", "cadence", "mondays", "saga", "odin")}
+    check("projects reviewed the same night do not all share one lens",
+          len(tonight) > 1, f"all {tonight}")
+
+    # The override: its own cycle, still by date; a single lens is every night.
+    d = date(2026, 11, 17)
+    two = [I.lens_for("trader", d + timedelta(days=i), ["features", "correctness"])
+           for i in range(4)]
+    check("an override is honoured", set(two) == {"features", "correctness"}, f"got {two}")
+    check("and still rotates night by night", two[0] != two[1] and two[1] != two[2],
+          f"got {two}")
+    check("a single-lens override looks through it every night",
+          {I.lens_for("trader", d + timedelta(days=i), ["quality"]) for i in range(5)}
+          == {"quality"})
+    check("an empty override is the default",
+          [I.lens_for("trader", d + timedelta(days=i), []) for i in range(3)]
+          == [I.lens_for("trader", d + timedelta(days=i)) for i in range(3)])
+    check("a stored override with a typo falls back rather than raising in the scheduler",
+          I.cycle(["featurs"]) == I.LENSES)
+
+    # Names are validated, not stored on trust.
+    check("lens names parse from a comma list",
+          I.parse("features, correctness") == ["features", "correctness"]
+          and I.parse("Quality") == ["quality"] and I.parse(["quality", "quality"]) == ["quality"])
+    check("and default, off or empty mean the default cycle",
+          I.parse("") == [] and I.parse("default") == [] and I.parse(None) == [])
+    for bad in ("featurs", "features,security", "bugs", ["features", 3]):
+        try:
+            I.parse(bad)
+            check(f"{bad!r} is refused", False, "an unknown lens was accepted")
+        except ValueError as e:
+            check(f"{bad!r} is refused, naming the lenses there are",
+                  "features" in str(e) or "text" in str(e), str(e))
+
+    # The route, from Slack and the dashboard: refused with a reason, and
+    # nothing written.
+    root = Path(tempfile.mkdtemp())
+    ps = projects.ProjectStore(root / "p.json")
+    ps.ensure("Trader", test_cmd="pytest", auto_merge=True)
+    hp = {"projects": projects, "project_store": ps, "log": logging.getLogger("test")}
+    _bot_fns({"handle_projects", "set_ideate_lenses"}, hp)
+    r = hp["handle_projects"]({"action": "ideate-lenses", "slug": "trader",
+                               "lenses": "features,correctness"})
+    check("the dashboard can set a project's lenses",
+          r.get("ok") and ps.get("trader")["ideate_lenses"] == ["features", "correctness"], str(r))
+    r = hp["handle_projects"]({"action": "ideate-lenses", "slug": "trader", "lenses": "featurs"})
+    check("a bad lens name is refused with a reason",
+          r.get("ok") is False and "unknown lens" in r.get("error", ""), str(r))
+    check("and the stored lenses are left as they were",
+          ps.get("trader")["ideate_lenses"] == ["features", "correctness"])
+    r = hp["handle_projects"]({"action": "ideate-lenses", "slug": "trader", "lenses": ""})
+    check("an empty override puts the default back",
+          r.get("ok") and ps.get("trader")["ideate_lenses"] == [], str(r))
+    r = hp["handle_projects"]({"action": "ideate-lenses", "slug": "nope", "lenses": "quality"})
+    check("an unknown project is refused", r.get("ok") is False, str(r))
+    bot = (BASE / "bot.py").read_text()
+    cmd = bot[bot.index('elif arg.lower().startswith("ideate"):'):
+              bot.index('elif arg.lower() == "test" or arg.lower().startswith("test "):')]
+    check("Slack's `!project ideate lenses ...` goes through the same validation",
+          'when.lower().startswith("lenses ")' in cmd
+          and "set_ideate_lenses(slug, when[6:].strip())" in cmd)
+
+    # The goal: each lens's paragraph and the shared rules, and the lens on
+    # the task -- driven through the real run_ideation.
+    run_ideation, ts, ps2 = _run_ideation_impl()
+    ps2.ensure("Silkworm", ideate_at="02:00", test_cmd="true", auto_merge=True)
+    for lens in I.LENSES:
+        ps2.ensure("silkworm", ideate_on="", ideate_lenses=[lens])
+        out = run_ideation("silkworm")
+        rec = ts.get(out.get("id") or "") or {}
+        goal = rec.get("goal") or ""
+        check(f"a {lens} night's goal carries its paragraph", I.PARAGRAPHS[lens] in goal)
+        check(f"and the shared rules ({lens})", I.SHARED_RULES in goal)
+        check(f"and no other lens's paragraph ({lens})",
+              not any(I.PARAGRAPHS[o] in goal for o in I.LENSES if o != lens))
+        check(f"and still how to file, at most MAX_PROPOSALS ({lens})",
+              "task --propose --project silkworm" in goal
+              and f"at most {_max_proposals()} of them" in goal)
+        check(f"the lens is recorded on the task ({lens})",
+              rec.get("lens") == lens and out.get("lens") == lens, f"got {rec.get('lens')!r}")
+        check(f"and named in its title ({lens})",
+              rec.get("title") == f"Nightly review ({lens}): Silkworm", rec.get("title"))
+    ps2.ensure("silkworm", ideate_on="", ideate_lenses=[])
+    out = run_ideation("silkworm")
+    check("with no override, tonight's lens is the rotation's",
+          ts.get(out["id"])["lens"] == I.lens_for("silkworm", datetime.now()))
+    check("the features paragraph asks who, why, how big and what it costs to run",
+          all(w in I.PARAGRAPHS["features"] for w in
+              ("who it is for", "why they", "how big", "costs to run", "privacy policy")))
+    check("the system prompt is lens-neutral",
+          "a real gap, a real inconsistency, a real risk" not in R.IDEATOR_SYSTEM
+          and I.SHARED_RULES in R.IDEATOR_SYSTEM
+          and R.get("ideator")["system"] == R.IDEATOR_SYSTEM)
+
+    # The proposals it files carry its lens -- read off the bot's own record
+    # of the pass running on the thread, never off the caller.
+    file_task, filed_this_turn, _begin, fts, _made = _file_task_impl()
+    KEY = "C1:1785644289.000200"
+    night = fts.create("Look over saga", title="Nightly review (quality): saga",
+                       role="ideator", source="ideation", thread=KEY, lens="quality",
+                       state=T.QUEUED, driver="queue", project="saga")
+    fts.transition(night["id"], T.RUNNING)
+    r = file_task({"key": KEY, "goal": "Split the sync engine out of AppModel.swift",
+                   "caller_role": "ideator", "caller_task": night["id"], "propose": True,
+                   "project": "saga", "lens": "features"})
+    rec = fts.get(r.get("id") or "") or {}
+    check("a proposal filed by the nightly pass carries its lens",
+          r.get("ok") and rec.get("lens") == "quality", f"{r} / {rec.get('lens')!r}")
+    check("and the caller cannot name a different one", rec.get("lens") != "features")
+    filed_this_turn.clear()
+    r = file_task({"key": "C1:1785644289.000300", "goal": "Add CSV export of the week",
+                   "propose": True, "project": "saga"})
+    check("a proposal filed from any other thread carries no lens",
+          r.get("ok") and fts.get(r["id"]).get("lens") == "", str(r))
+    filed_this_turn.clear()
+    other = "C1:1785644289.000400"
+    turn = fts.create("a conversation", role="assistant", source="slack", thread=other,
+                      lens="features", state=T.QUEUED, project="saga")
+    fts.transition(turn["id"], T.RUNNING)
+    r = file_task({"key": other, "goal": "Add a weekly summary screen to saga",
+                   "propose": True, "project": "saga", "caller_task": turn["id"]})
+    check("only an ideation pass lends its lens, not any running task",
+          r.get("ok") and fts.get(r["id"]).get("lens") == "", str(r))
+    check("no lens when no pass is running there",
+          I.filed_under(fts, "", "C9:1.0") == "" and I.filed_under(fts, night["id"], "") == "")
+
+    # Shown: the digest says which lens each night looked through and what it
+    # filed; the dashboard draws it on cards, rows and the detail view.
+    now = time.time()
+    rows = [dict(fts.get(night["id"]), created=now - 3600),
+            dict(fts.get(r["id"]), created=now - 60)]
+    for p in [x for x in fts.all().values() if x.get("lens") == "quality"
+              and x.get("role") != "ideator"]:
+        rows.append(dict(p, created=now - 1800))
+    sec = digest.sections(rows, now).get("saga") or {}
+    check("the digest names the night's lens and what it proposed",
+          sec.get("nightly") == ["quality, 1 proposed"], str(sec.get("nightly")))
+    text = digest.render(rows, now)
+    check("under its own heading", "nightly review: quality, 1 proposed" in text, text)
+    import board
+    check("the dashboard's slim rows carry the lens", "lens" in board.ROW_FIELDS)
+    viz = (BASE / "visualizer.py").read_text()
+    check("the dashboard draws it", viz.count("t.lens ?") >= 3)
+    check("and project settings can set the lenses",
+          'action: "ideate-lenses"' in viz and 'id="pslenses"' in viz)
+    check("the task and project records declare their fields",
+          "lens" in T.FIELDS and "ideate_lenses" in projects.FIELDS)
+
+    # Two passes in one window (a late catch-up, then the next night), both
+    # quality: each counts only what it filed, not the other's too.
+    two = [{"id": "n1", "role": "ideator", "source": "ideation", "lens": "quality",
+            "project": "saga", "state": "done", "created": now - 20 * 3600},
+           {"id": "p1", "role": "implementor", "source": "ideation", "lens": "quality",
+            "project": "saga", "state": "proposed", "created": now - 19 * 3600},
+           {"id": "n2", "role": "ideator", "source": "ideation", "lens": "quality",
+            "project": "saga", "state": "done", "created": now - 2 * 3600},
+           {"id": "p2", "role": "implementor", "source": "ideation", "lens": "quality",
+            "project": "saga", "state": "proposed", "created": now - 3600}]
+    got = (digest.sections(two, now).get("saga") or {}).get("nightly")
+    check("two passes in one window each count only their own proposals",
+          got == ["quality, 1 proposed", "quality, 1 proposed"], str(got))
+
+    # A hand-edited record must not raise in the scheduler thread, where it
+    # would skip every project after it, every five minutes, all night.
+    for junk in (5, True, {"x": 1}, "featurs"):
+        try:
+            ok = I.cycle(junk) == I.LENSES
+        except Exception as e:
+            ok = f"raised {e!r}"
+        check(f"a malformed stored override ({junk!r}) falls back to the default", ok is True, str(ok))
+    check("a stored string override is read as one",
+          I.cycle("quality") == ("quality",) and I.cycle("features, quality") == ("features", "quality"))
+    check("typing `!project ideate lenses` alone shows the cycle, not resets it",
+          'elif when.lower() == "lenses":' in cmd
+          and "set_ideate_lenses" not in cmd[cmd.index('elif when.lower() == "lenses":'):
+                                             cmd.index('elif when.lower().startswith("lenses ")')])
+
+
+def _max_proposals():
+    import scoping
+    return scoping.MAX_PROPOSALS
+
+
 def _file_task_impl():
     """Load handle_file_task out of bot.py without importing it.
 
@@ -2587,6 +2807,7 @@ def _file_task_impl():
         re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
         dedup=__import__("dedup"), branches=__import__("branches"),
         research=__import__("research"), basered=__import__("basered"), time=time,
+        ideation=__import__("ideation"),
         task_store=ts, operator_role=__import__("operator_role"),
         OPERATOR=types.SimpleNamespace(thread=lambda: "D5:5.0"),
         log=logging.getLogger("test"), CLAUDE_CWD=Path(tempfile.mkdtemp()),

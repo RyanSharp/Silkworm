@@ -88,6 +88,10 @@ FIELDS: dict[str, tuple] = {
     # late.
     "ideate_at": ("",   "local HH:MM to look for improvements, or off"),
     "ideate_on": ("",   "YYYY-MM-DD the night was decided: run or skipped"),
+    # Which lenses the nightly review rotates through (ideation.py). Empty is
+    # the default cycle, features -> quality -> correctness; set, it is the
+    # project's own cycle, still rotated by date. Validated when set.
+    "ideate_lenses": (list, "nightly review lenses to rotate through; empty = all"),
     # Files the project's own build rewrites, which therefore never count as
     # uncommitted work: a task checkout holding only these is released (and
     # they are put back as committed first), and the base checkout is not

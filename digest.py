@@ -272,6 +272,31 @@ def sections(records, now: float, *, branch_rows=(), released=None,
                 f"{_title(rec)} — `{_esc(str(asks['action'])[:120])}`"
                 + (f" ({why})" if why else ""))
 
+    # Each nightly review in the window, with the lens it looked through and
+    # how many proposals it filed under it, so what each lens produces -- and,
+    # over time, what of it is accepted -- can be seen.
+    # A pass's proposals are those with its lens made between it and the
+    # project's next pass, so two passes in one window (a late catch-up, then
+    # the next night) do not both count the second one's.
+    passes: dict = {}
+    for rec in records:
+        if rec.get("role") == "ideator" and rec.get("source") == "ideation":
+            passes.setdefault(_project_of(rec, by_id), []).append(rec)
+    for proj, runs in passes.items():
+        runs.sort(key=lambda r: r.get("created") or 0)
+        for rec, nxt in zip(runs, runs[1:] + [None]):
+            start = rec.get("created") or 0
+            if start < since:
+                continue
+            end = (nxt.get("created") or 0) if nxt else float("inf")
+            lens = rec.get("lens") or ""
+            filed = sum(1 for r in records
+                        if r.get("role") != "ideator" and r.get("source") == "ideation"
+                        and lens and r.get("lens") == lens
+                        and _project_of(r, by_id) == proj
+                        and start <= (r.get("created") or 0) < end)
+            add(proj, "nightly", f"{_esc(lens)}, {filed} proposed" if lens else "no lens")
+
     waiting: dict = {}
     for rec in records:
         # A failing base's item, and a failing check's, have their own lines.
@@ -306,6 +331,7 @@ ORDER = (("red", "main is failing", False), ("health", "health", False),
          ("refused", "landing refused", False), ("failed", "failed or held", False),
          ("reran", "ran more than once", True), ("stuck", "stuck", False),
          ("held", "review findings held at the proposal cap", True),
+         ("nightly", "nightly review", False),
          ("waiting", "waiting on you", False), ("unmerged", "unmerged", False))
 
 

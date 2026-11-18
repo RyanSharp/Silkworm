@@ -228,7 +228,7 @@ ROW_RESULT = ("review", "landing", "landed")
 #: The rest of what a task panel row reads, copied as they are.
 ROW_FIELDS = ("id", "title", "state", "role", "project", "source", "attempts",
               "created", "thread", "thread_link", "cost_total", "needs_user",
-              "findings", "round", "research", "no_retry")
+              "findings", "round", "research", "no_retry", "lens")
 
 
 def panel_row(t: dict) -> dict:
