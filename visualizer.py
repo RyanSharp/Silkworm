@@ -1360,14 +1360,14 @@ PAGE = r"""<!doctype html>
   .cdetail .msg { margin-bottom: 10px; max-width: 100%; }
   .cdetail .msg .who { font-size: 10px; }
   .cdetail pre { max-height: 360px; overflow: auto; }
-  /* new items rise in; the working bubble likewise */
+  /* new items rise in; the working bubble breathes */
   @keyframes rise { from { opacity: 0; transform: translateY(var(--rise)); }
                     to { opacity: 1; transform: none; } }
   .citem.enter { animation: rise var(--t) var(--ease) both; }
-  .typing { flex-direction: row; align-items: center; gap: 8px; margin: 0 0 var(--chat-gap);
-            animation: rise var(--t) var(--ease) both; }
+  .typing { flex-direction: row; align-items: center; gap: 8px; margin: 0 0 var(--chat-gap); }
   .typing .bubble { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px;
-                    background: var(--panel); border: 1px solid var(--line); }
+                    background: var(--panel); border: 1px solid var(--line);
+                    border-bottom-left-radius: var(--bubble-tail); }
   .tdots { display: inline-flex; gap: 4px; }
   .tdots i { width: 6px; height: 6px; border-radius: 50%; background: var(--gold);
              animation: breathe 1.2s ease-in-out infinite; }
@@ -1405,8 +1405,11 @@ PAGE = r"""<!doctype html>
               background: var(--panel); color: var(--ink); border: 1px solid var(--gold);
               border-radius: 18px; min-height: 34px; padding: 0 14px; font: inherit;
               font-size: 13px; box-shadow: 0 4px 14px #0008; white-space: nowrap; cursor: pointer;
-              transition: opacity var(--t) var(--ease), transform var(--t) var(--ease); }
-  #jumppill.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+              visibility: hidden;      /* hidden is out of the tab order and the a11y tree */
+              transition: opacity var(--t) var(--ease), transform var(--t) var(--ease),
+                          visibility 0s linear var(--t); }
+  #jumppill.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto;
+                   visibility: visible; transition-delay: 0s; }
 
   /* composer: pinned to the bottom of the thread, clear of the home indicator */
   #composer { flex: none; display: none; flex-direction: column; gap: 6px; padding-top: 10px;
@@ -2005,7 +2008,7 @@ PAGE = r"""<!doctype html>
       <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div><div id="tfiles"></div></div>
     </div>
     <div id="composer">
-      <button id="jumppill" onclick="toEnd(true)" aria-label="scroll to the newest messages">↓ New messages</button>
+      <button id="jumppill" onclick="toEnd(true)">↓ New messages</button>
       <div id="chips"></div>
       <div class="crow">
         <label class="ghost attach" title="attach files or photos">📎<input type="file" id="attach" multiple onchange="addFiles(this.files, 'reply'); this.value = ''"></label>
@@ -2564,13 +2567,26 @@ function drawChat(msgs, messages, sessionId) {
     setHTML(div, chatHtml(it));
     return div;
   });
+  // Only what is new is appended: moving an element takes it out of the
+  // page and back, which drops a selection or focus inside it.
   const now = [...(msgs.children || [])];
-  if (now.length !== divs.length || divs.some((d, i) => now[i] !== d))
-    for (const d of divs) msgs.appendChild(d);
+  let k = 0;
+  while (k < now.length && k < divs.length && now[k] === divs[k]) k++;
+  if (k === now.length) for (const d of divs.slice(k)) msgs.appendChild(d);
+  else for (const d of divs) msgs.appendChild(d);   // reordered: rare (a reset)
 }
 function redrawChat() {
   if (active && tview.key === active.key)
     drawChat(document.getElementById("tmsgs"), tview.msgs || [], tview.sid);
+}
+// Redraws, putting focus back on the line's button if it had it: the button
+// is part of the markup a redraw replaces.
+function redrawKeepFocus(id) {
+  const div = chatEls.get(id), a = typeof document !== "undefined" && document.activeElement;
+  const had = !!(div && a && div.contains && div.contains(a));
+  redrawChat();
+  const b = had && div.querySelector && div.querySelector(".ctl");
+  if (b && b.focus) b.focus();
 }
 function toggleTools(id) {
   const div = () => chatEls.get(id);
@@ -2579,11 +2595,13 @@ function toggleTools(id) {
     chatShown.delete(id);
     chatOpen.delete(id);
     if (div()) div().classList.remove("open");
-    afterFold(() => { if (!chatOpen.has(id)) redrawChat(); });
+    afterFold(() => { if (!chatOpen.has(id)) redrawKeepFocus(id); });
     return;
   }
+  // Opened, it is being read: the next poll must not scroll it away.
+  pinned = false;
   chatOpen.add(id);
-  redrawChat();                                     // drawn, still folded
+  redrawKeepFocus(id);                              // drawn, still folded
   nextFrame(() => {
     if (!chatOpen.has(id)) return;
     chatShown.add(id);
@@ -2604,8 +2622,11 @@ function atEnd() {
 function toEnd(smooth) {
   const m = scroller();
   pinned = true;
-  if (m && smooth && !reducedMotion() && typeof m.scrollTo === "function")
+  gliding = 0;
+  if (m && smooth && !reducedMotion() && typeof m.scrollTo === "function") {
+    gliding = Date.now();          // the glide's own scroll events are not the reader's
     m.scrollTo({top: m.scrollHeight, behavior: "smooth"});
+  }
   else if (m) m.scrollTop = m.scrollHeight;
   showJump(false);
 }
@@ -2617,8 +2638,10 @@ function showJump(on) {
 // by toEnd), not measured at draw time -- the page can grow between draws
 // (the stats above the thread, a redraw from the top), which would read a
 // reader still at the end as one who had scrolled up.
-let pinned = true;
+let pinned = true, gliding = 0;
 function onScroll() {
+  if (gliding && Date.now() - gliding < 1000 && !atEnd()) return;
+  gliding = 0;
   pinned = atEnd();
   if (pinned) showJump(false);
 }
@@ -2628,7 +2651,10 @@ function onScroll() {
 function keepEnd(fn, force) {
   const was = pinned || atEnd(), m = scroller(), before = m ? m.scrollHeight : 0;
   fn();
-  if (force || was) toEnd();
+  const grew = !m || m.scrollHeight !== before;
+  // Following: only when the draw changed something -- a draw that changed
+  // nothing leaves a reader who opened something near the end where they are.
+  if (force || (was && grew)) toEnd();
   else if (m && m.scrollHeight > before) showJump(true);
 }
 // The open thread's own header on a phone, stuck to the top: back to the
@@ -2865,11 +2891,13 @@ function liveHtml(s, live, items) {
       h += outBubble({kind: "prompt", text: t.title, files: []}, QUEUED_NOTE, false,
                      t.source === "slack" ? "you · slack" : "you · queued");
   // Working: a reply-shaped bubble of three breathing dots where the reply
-  // will be, which the reply's own bubble takes the place of. Its markup
-  // never changes while the turn runs (how long it has run is in the
-  // header and the turn bar), so a poll does not redraw it.
+  // will be, which the reply's own bubble -- rising in -- takes the place
+  // of. Its markup never changes while the turn runs (how long it has run
+  // is in the header and the turn bar), so a poll alone does not redraw it;
+  // it does not rise in itself, since #tlive is rewritten whole whenever
+  // anything in it changes, and it would rise again each time.
   if (live.running)
-    h += `<div class="cmsg assistant typing" role="status"><div class="bubble"><span class="tdots" aria-hidden="true"><i></i><i></i><i></i></span><span class="tword">Working</span></div>
+    h += `<div class="cmsg typing" role="status"><div class="bubble"><span class="tdots" aria-hidden="true"><i></i><i></i><i></i></span><span class="tword">Working</span></div>
       <button class="ghost tstop" onclick="cmdSend('!stop')">■ Stop</button></div>`;
   const ended = turns.filter(t => t.state !== "queued" && t.state !== "running");
   const last = ended[ended.length - 1];

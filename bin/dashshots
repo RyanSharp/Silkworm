@@ -370,13 +370,13 @@ def main():
         proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port)
         base = f"http://127.0.0.1:{port}"
         procs, targets = [proc], [("", base)]
-        if a.before:
-            btmp = tmp / "before"
-            btmp.mkdir()
-            bport = free_port()
-            procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport))
-            targets = [("-before", f"http://127.0.0.1:{bport}"), ("-after", base)]
         try:
+            if a.before:
+                btmp = tmp / "before"
+                btmp.mkdir()
+                bport = free_port()
+                procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport))
+                targets = [("-before", f"http://127.0.0.1:{bport}"), ("-after", base)]
             ex = pick_examples(base, a.project)
             shots = views(ex, a.project)
             if a.views:

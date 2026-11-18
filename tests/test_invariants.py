@@ -24470,9 +24470,25 @@ out.forced = [main.scrollTop, byId("jumppill").classList.contains("show")];
 // did not see (the stats above the thread): the next draw still follows.
 main.scrollTop = main.scrollHeight - main.clientHeight;   // at the end, as a browser clamps it
 P.onScroll();
+// Following the end, a poll that changed nothing moves nothing -- a reader
+// who opened something near the end is not scrolled past it.
+main.scrollTop -= 30;                                    // still within the slack: pinned
+const stillAt = main.scrollTop;
+P.keepEnd(() => {});
+out.unchangedPoll = main.scrollTop === stillAt;
+P.onScroll();
 main.scrollHeight += 400;
 P.keepEnd(() => { main.scrollHeight += 50; });
 out.grewBetween = [main.scrollTop === main.scrollHeight, byId("jumppill").classList.contains("show")];
+// Tapping the pill glides down; the glide's own scroll events, short of the
+// end, do not count as the reader scrolling up -- a poll meanwhile follows.
+main.scrollTo = () => {};
+Object.assign(main, {scrollHeight: 3000, clientHeight: 500, scrollTop: 100});
+P.toEnd(true);
+main.scrollTop = 1500; P.onScroll();                     // mid-glide
+P.keepEnd(() => { main.scrollHeight = 3200; });
+out.glide = [main.scrollTop, byId("jumppill").classList.contains("show")];
+delete main.scrollTo;
 out.filesCompact = P.filesHtml([{direction: "in", exists: true, path: "/p/a.png", name: "a.png", size: 2048}], true);
 out.filesGone = P.filesHtml([{direction: "out", exists: false, pruned: 1700000000, name: "old.log", size: 10}]);
 // On a laptop too: the same chat, and the same pill when read further up.
@@ -24516,12 +24532,29 @@ P.drawChat(box2, msgs.slice(0, 2), "s");
 out.firstDrawEnter = box2.children.map(c => c.classList.contains("enter"));
 P.drawChat(box2, msgs.slice(0, 8), "s");
 out.laterEnter = box2.children.map(c => c.classList.contains("enter"));
+// A grown thread appends only what is new: moving an element drops a
+// selection or focus inside it.
+let moved = [];
+const realAppend = box2.appendChild;
+box2.appendChild = function (c) { moved.push(this.children.indexOf(c)); return realAppend.call(this, c); };
+P.drawChat(box2, msgs, "s");
+out.appendedOnly = moved;
+box2.appendChild = realAppend;
+P.drawChat(box2, msgs.slice(0, 8), "s");                // back as it was for what follows
 out.kinds = box2.children.map(c => c.classList.contains("ctools") ? "tools" : c.classList.contains("cbubble") ? "bubble" : "?");
 const toolsId = P.chatItems(msgs.slice(0, 8))[1].id;
 const toolsEl = () => P.chatEls.get(toolsId);
 P.setTview({key: "k", sid: "s", msgs: msgs.slice(0, 8), live: null});
 // toggleTools redraws #tmsgs; point the check at what it draws there
 P.chatEls.clear(); P.drawChat(byId("tmsgs"), msgs.slice(0, 8), "s");
+// Opening a line is reading it: the next poll that grows the thread does not
+// scroll it away, and offers the pill instead.
+Object.assign(main, {scrollHeight: 2000, clientHeight: 500, scrollTop: 1500}); P.onScroll();
+P.toggleTools(toolsId);
+main.scrollHeight = 2300;                                // the detail unfolded below
+P.keepEnd(() => { main.scrollHeight = 2400; });
+out.openedNotYanked = [main.scrollTop, byId("jumppill").classList.contains("show")];
+P.toggleTools(toolsId); for (const [f] of later.splice(0)) f(); runFrames();
 P.toggleTools(toolsId);
 out.openBeforeFrame = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>")];
 runFrames();
@@ -24697,10 +24730,20 @@ def test_viz_phone_chat():
           o["pillTapReduced"][0] is None and o["pillTapReduced"][1] == 1500, str(o["pillTapReduced"]))
     rl = o["runningLive"]
     check("while a turn runs: a working bubble where the reply will be, announced, with Stop",
-          'class="cmsg assistant typing" role="status"' in rl and 'class="tdots"' in rl
+          'class="cmsg typing" role="status"' in rl and 'class="tdots"' in rl
           and "Working" in rl and "■ Stop" in rl, rl)
     check("its markup is the same however long the turn has run (a poll leaves it be)",
           o["runningSteady"] is True)
+    check("following the end, a poll that changed nothing moves nothing", o["unchangedPoll"] is True)
+    check("a tools line opened near the end is not scrolled away by the next poll; the pill is offered",
+          o["openedNotYanked"] == [1500, True], str(o["openedNotYanked"]))
+    check("mid-glide to the end, a poll still follows (the glide is not the reader scrolling up)",
+          o["glide"] == [3200, False], str(o["glide"]))
+    check("a grown thread appends only its new items, moving none already there",
+          o["appendedOnly"] == [-1, -1, -1], str(o["appendedOnly"]))
+    check("the hidden pill is out of the tab order and the accessibility tree",
+          re.search(r"#jumppill \{[^}]*visibility: hidden;", css) is not None
+          and re.search(r"#jumppill\.show \{[^}]*visibility: visible;", css) is not None)
     check("the turn over, the indicator is gone", "typing" not in o["idleLive"] and "Working" not in o["idleLive"],
           o["idleLive"])
     check("the thread's first draw does not animate", o["firstDrawEnter"] == [False, False],
@@ -25390,7 +25433,7 @@ function el(id) {
   return {id, textContent: "", value: "", title: "", className: "", style: {}, dataset: {},
     children: [], _inner: "", parent: null,
     get innerHTML() { return this._inner + this.children.map(c => c.innerHTML).join(""); },
-    set innerHTML(v) { this._inner = v; this.children.length = 0; },
+    set innerHTML(v) { this._inner = v; for (const c of this.children) c.parent = null; this.children.length = 0; },
     classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
     appendChild(c) {
       if (c.parent) c.parent.children.splice(c.parent.children.indexOf(c), 1);
