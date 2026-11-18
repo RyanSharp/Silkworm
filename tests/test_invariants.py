@@ -21240,6 +21240,8 @@ def test_task_panel_slim_rows():
 LIVE_DRIVER = r"""
 // The session list, transcript and polling, against a stub DOM that keeps real
 // children and counts writes -- the point being what a poll does NOT touch.
+// As a browser's, an element's innerHTML is its own markup and its children's,
+// and setting it drops the children.
 const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
 process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
@@ -21247,8 +21249,12 @@ let writes = 0, appends = 0;
 function el(id) {
   const o = {id, textContent: "", value: "", title: "", className: "", style: {}, disabled: false,
     dataset: {}, children: [], _inner: "", parent: null,
-    get innerHTML() { return this._inner; },
-    set innerHTML(v) { writes++; this._inner = v; },
+    get innerHTML() { return this._inner + this.children.map(c => c.innerHTML).join(""); },
+    set innerHTML(v) {
+      writes++; this._inner = v;
+      for (const c of this.children) c.parent = null;
+      this.children.length = 0;
+    },
     classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
     appendChild(c) {
       appends++;
@@ -24319,10 +24325,16 @@ globalThis.document = {getElementById: byId, addEventListener(){}, querySelector
                      toggle: (c, on) => { if (on === undefined ? !bodyCls.has(c) : on) bodyCls.add(c); else bodyCls.delete(c); }}}};
 globalThis.history = {state: null, replaceState(){}, pushState(){}, back(){}};
 globalThis.window = {addEventListener(){}, history: globalThis.history, location: {search: ""}};
-globalThis.matchMedia = q => ({matches: !wide && q === "(max-width: 700px)"});
+let reduce = false;
+globalThis.matchMedia = q => ({matches: (!wide && q === "(max-width: 700px)")
+                                       || (reduce && q === "(prefers-reduced-motion: reduce)")});
+// Frames and timers are held, and run only when a check says so.
+const frames = [], later = [];
+globalThis.requestAnimationFrame = f => frames.push(f);
+const runFrames = () => { while (frames.length) frames.shift()(); };
 Object.defineProperty(globalThis, "navigator", {value: {}, configurable: true});
 globalThis.localStorage = {getItem: () => null, setItem(){}};
-globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;
+globalThis.setInterval = () => 0; globalThis.setTimeout = (f, ms) => { later.push([f, ms]); return 0; };
 globalThis.fetch = () => new Promise(() => {});
 globalThis.getComputedStyle = () => ({lineHeight: "22px", paddingTop: "10px", paddingBottom: "10px",
                                       borderTopWidth: "1px", borderBottomWidth: "1px"});
@@ -24333,7 +24345,7 @@ globalThis.getComputedStyle = () => ({lineHeight: "22px", paddingTop: "10px", pa
   answeredAgo: s => readCache.set("/api/sessions", {etag: "x", data: {}, at: Date.now() - s * 1000}),
   forgetAnswer: () => readCache.delete("/api/sessions"),
   setLast: s => { lastSessions = s; }, getActive: () => active, setActive: a => { active = a; },
-  setTview: t => { tview = t; }};`);
+  setTview: t => { tview = t; }, drawLive, liveHtml, toEnd, atEnd, onScroll};`);
 const P = globalThis.__p, out = {};
 const T = (role, ...blocks) => ({role, ts: "2026-10-15T10:00:00Z", blocks});
 const U = {in: 10, out: 20, cache_read: 900, cache_create: 5};
@@ -24432,9 +24444,9 @@ try { out.stallBar = (P.transcriptHead(Object.assign(stuck(), {resume_cmd: "x", 
 catch (e) { out.stallBar = "threw: " + e.message; }
 out.stallOld = P.cardHtml({key: "o", turn: {age_s: 600, stalled: true, child_alive: false}});
 // Between full answers the page counts the silence on, as it does the age.
-const later = {sessions: [stuck()]};
-P.answeredAgo(3600); P.freshAges(later);
-out.stallLater = [later.sessions[0].turn.age_s, later.sessions[0].turn.silent_s];
+const answer = {sessions: [stuck()]};
+P.answeredAgo(3600); P.freshAges(answer);
+out.stallLater = [answer.sessions[0].turn.age_s, answer.sessions[0].turn.silent_s];
 P.forgetAnswer();
 // Composer: grows to six lines, then scrolls.
 const reply = byId("reply");
@@ -24449,12 +24461,91 @@ const main = byId("__main");
 Object.assign(main, {scrollHeight: 1000, clientHeight: 500, scrollTop: 500});
 P.keepEnd(() => { main.scrollHeight = 1300; });
 out.followed = [main.scrollTop, byId("jumppill").classList.contains("show")];
-main.scrollTop = 100;
+main.scrollTop = 100; P.onScroll();                  // the reader scrolls up
 P.keepEnd(() => { main.scrollHeight = 1600; });
 out.stayed = [main.scrollTop, byId("jumppill").classList.contains("show")];
 P.keepEnd(() => {}, true);
 out.forced = [main.scrollTop, byId("jumppill").classList.contains("show")];
+// Following the end, the page grows by more than the slack somewhere a draw
+// did not see (the stats above the thread): the next draw still follows.
+main.scrollTop = main.scrollHeight - main.clientHeight;   // at the end, as a browser clamps it
+P.onScroll();
+main.scrollHeight += 400;
+P.keepEnd(() => { main.scrollHeight += 50; });
+out.grewBetween = [main.scrollTop === main.scrollHeight, byId("jumppill").classList.contains("show")];
 out.filesCompact = P.filesHtml([{direction: "in", exists: true, path: "/p/a.png", name: "a.png", size: 2048}], true);
+out.filesGone = P.filesHtml([{direction: "out", exists: false, pruned: 1700000000, name: "old.log", size: 10}]);
+// On a laptop too: the same chat, and the same pill when read further up.
+wide = true;
+byId("jumppill").classList.toggle("show", false);
+Object.assign(main, {scrollHeight: 1000, clientHeight: 500, scrollTop: 100}); P.onScroll();
+P.keepEnd(() => { main.scrollHeight = 1400; });
+out.wideStayed = [main.scrollTop, byId("jumppill").classList.contains("show")];
+Object.assign(main, {scrollTop: 900}); P.onScroll();
+P.keepEnd(() => { main.scrollHeight = 1500; });
+out.wideFollowed = [main.scrollTop, byId("jumppill").classList.contains("show")];
+let smooth = null;
+main.scrollTo = o => { smooth = o; };
+byId("jumppill").classList.toggle("show", true);
+P.toEnd(true);
+out.pillTap = [smooth && smooth.behavior, byId("jumppill").classList.contains("show")];
+reduce = true; smooth = null; P.toEnd(true);
+out.pillTapReduced = [smooth, main.scrollTop];
+reduce = false; delete main.scrollTo;
+wide = false;
+// The working indicator: while a turn runs, a reply-shaped bubble; its
+// markup the same however long it has run, so a poll does not redraw it.
+const tl = byId("tlive");
+const sRun = {key: "k", title: "K", turn: {age_s: 58}};
+P.setActive(sRun);
+P.setTview({key: "k", sid: "s", msgs: [], live: {running: true, turns: [{ref: "r0", state: "running"}]}});
+P.drawLive();
+out.runningLive = tl.innerHTML;
+const runningMarkup = P.liveHtml(sRun, {running: true, turns: []}, []);
+out.runningSteady = runningMarkup === P.liveHtml(Object.assign({}, sRun, {turn: {age_s: 125}}),
+                                                {running: true, turns: []}, []);
+P.setTview({key: "k", sid: "s", msgs: [], live: {running: false, turns: [{ref: "r0", state: "done"}]}});
+P.drawLive();
+out.idleLive = tl.innerHTML;
+// Motion: an item arriving after the first draw rises in; a tools line
+// unfolds a frame after its detail is drawn, and folds before it is dropped.
+const box2 = byId("tmsgs2");
+P.chatEls.clear(); P.chatOpen.clear();
+P.setTview({key: "k", sid: "s", msgs: msgs.slice(0, 2), live: null});
+P.drawChat(box2, msgs.slice(0, 2), "s");
+out.firstDrawEnter = box2.children.map(c => c.classList.contains("enter"));
+P.drawChat(box2, msgs.slice(0, 8), "s");
+out.laterEnter = box2.children.map(c => c.classList.contains("enter"));
+out.kinds = box2.children.map(c => c.classList.contains("ctools") ? "tools" : c.classList.contains("cbubble") ? "bubble" : "?");
+const toolsId = P.chatItems(msgs.slice(0, 8))[1].id;
+const toolsEl = () => P.chatEls.get(toolsId);
+P.setTview({key: "k", sid: "s", msgs: msgs.slice(0, 8), live: null});
+// toggleTools redraws #tmsgs; point the check at what it draws there
+P.chatEls.clear(); P.drawChat(byId("tmsgs"), msgs.slice(0, 8), "s");
+P.toggleTools(toolsId);
+out.openBeforeFrame = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>")];
+runFrames();
+out.openAfterFrame = toolsEl().classList.contains("open");
+later.length = 0;
+P.toggleTools(toolsId);
+out.closing = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>"),
+               later.map(l => l[1])];
+for (const [f] of later.splice(0)) f();
+out.closed2 = toolsEl()._inner.includes("<pre>ls</pre>");
+// Reduced motion: nothing rises; open and closed at once, no frame or timer waited on.
+reduce = true;
+const box3 = byId("tmsgs3");
+P.chatEls.clear(); P.chatOpen.clear();
+P.drawChat(box3, msgs.slice(0, 2), "s");
+P.drawChat(box3, msgs.slice(0, 8), "s");
+out.reducedEnter = box3.children.some(c => c.classList.contains("enter"));
+P.chatEls.clear(); P.drawChat(byId("tmsgs"), msgs.slice(0, 8), "s");
+frames.length = 0; later.length = 0;
+P.toggleTools(toolsId);
+out.reducedOpen = [toolsEl().classList.contains("open"), frames.length];
+P.toggleTools(toolsId);
+out.reducedClose = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>"), later.length];
+reduce = false;
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -24468,8 +24559,11 @@ def test_viz_phone_chat():
     css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
     at = css.index("@media (max-width: 700px)")
     desktop, phone = css[:at], css[at:]
-    check("a laptop never sees the chat's header, alert count, sheet or pill",
-          "#alertslot, #chathead, #jumppill, #alertsheet { display: none; }" in desktop)
+    check("a laptop never sees the phone's thread header, alert count or sheet",
+          "#alertslot, #chathead, #alertsheet { display: none; }" in desktop)
+    check("the new-messages pill is the laptop's too: shown by opacity, untappable while hidden",
+          re.search(r"#jumppill \{[^}]*opacity: 0;[^}]*pointer-events: none;", desktop) is not None
+          and re.search(r"#jumppill\.show \{[^}]*opacity: 1;[^}]*pointer-events: auto;", desktop) is not None)
     check("on a phone the alerts are never a bar above anything", "#alertbar { display: none; }" in phone)
     check("an open thread on a phone has the screen: no app header, its own sticky one",
           "body.reading header { display: none; }" in phone
@@ -24478,6 +24572,29 @@ def test_viz_phone_chat():
           "body { height: var(--vvh, 100dvh); }" in phone and "visualViewport" in V.PAGE)
     check("the list header has ✏️ new thread on a phone",
           'onclick="newThreadForm()" title="new thread"' in V.PAGE)
+    # Motion: transform and opacity only, and none of it under reduced motion.
+    frames = dict(re.findall(r"@keyframes (\w+) \{(.*?\})\s*\}", css, re.S))
+    props = {k: set(re.findall(r"([a-z-]+)\s*:", v)) for k, v in frames.items()}
+    check("the chat's keyframes exist: rise and breathe", {"rise", "breathe"} <= set(frames), str(set(frames)))
+    check("every keyframe moves only transform and opacity",
+          all(v <= {"transform", "opacity"} for v in props.values()), str(props))
+    rm = css.rfind("@media (prefers-reduced-motion: reduce)")
+    tail = css[rm:]
+    check("reduced motion turns every animation and transition off, last so it wins",
+          rm > css.rfind("@media (max-width: 380px)") and "animation: none !important" in tail
+          and "transition: none !important" in tail and "--t: 0ms" in tail, tail[:300])
+    check("one shared set of chat measures, declared once at the root",
+          desktop.count("--chat-fs:") == 1 and desktop.count("--bubble-r:") == 1
+          and desktop.count("--t-fold:") == 1 and "var(--chat-fs)" in desktop)
+    check("FOLD_MS in the script is the CSS's --t-fold",
+          "--t-fold: 240ms" in desktop and "const FOLD_MS = 240;" in V.PAGE)
+    check("code in a bubble scrolls inside itself, not the page",
+          re.search(r"\.bubble pre \{[^}]*overflow-x: auto;", desktop) is not None
+          and re.search(r"\.bubble \{[^}]*overflow-wrap: anywhere;", desktop) is not None)
+    check("the composer is pinned to the bottom at every width, clear of the home indicator",
+          re.search(r"#composer \{[^}]*position: sticky; bottom: 0;[^}]*env\(safe-area-inset-bottom\)",
+                    desktop) is not None)
+    check("Send gives way when pressed", "#composer .crow button.act:active { transform: scale(" in desktop)
 
     node = shutil.which("node")
     if not node:
@@ -24558,9 +24675,50 @@ def test_viz_phone_chat():
     check("read further up, it stays put and offers the way down",
           o["stayed"] == [100, True], str(o["stayed"]))
     check("what the owner just sent is brought into view", o["forced"] == [1600, False], str(o["forced"]))
+    check("a reader following the end keeps following when the page grew between draws",
+          o["grewBetween"] == [True, False], str(o["grewBetween"]))
     check("the files are one line that opens onto the list",
           o["filesCompact"].startswith('<details class="cfiles"><summary>📎 1 file</summary>')
           and "a.png" in o["filesCompact"], o["filesCompact"][:200])
+    check("each file a compact chip: direction, name, size, linked to its download",
+          '<a class="fchip" href="/download?path=%2Fp%2Fa.png"' in o["filesCompact"]
+          and 'class="fname">a.png<' in o["filesCompact"] and "2.0kB" in o["filesCompact"],
+          o["filesCompact"])
+    check("a file no longer on disk is a muted chip that says why",
+          'class="fchip gone"' in o["filesGone"] and "the copy is in Slack" in o["filesGone"]
+          and "<a " not in o["filesGone"], o["filesGone"])
+    check("on a laptop, read further up, the chat stays put and shows the pill",
+          o["wideStayed"] == [100, True], str(o["wideStayed"]))
+    check("on a laptop, read at the end, it follows and the pill goes",
+          o["wideFollowed"] == [1500, False], str(o["wideFollowed"]))
+    check("tapping the pill scrolls smoothly down and hides it",
+          o["pillTap"] == ["smooth", False], str(o["pillTap"]))
+    check("under reduced motion the pill jumps straight down",
+          o["pillTapReduced"][0] is None and o["pillTapReduced"][1] == 1500, str(o["pillTapReduced"]))
+    rl = o["runningLive"]
+    check("while a turn runs: a working bubble where the reply will be, announced, with Stop",
+          'class="cmsg assistant typing" role="status"' in rl and 'class="tdots"' in rl
+          and "Working" in rl and "■ Stop" in rl, rl)
+    check("its markup is the same however long the turn has run (a poll leaves it be)",
+          o["runningSteady"] is True)
+    check("the turn over, the indicator is gone", "typing" not in o["idleLive"] and "Working" not in o["idleLive"],
+          o["idleLive"])
+    check("the thread's first draw does not animate", o["firstDrawEnter"] == [False, False],
+          str(o["firstDrawEnter"]))
+    check("what arrives after it rises in, and only that",
+          o["laterEnter"] == [False, False, True] and o["kinds"] == ["bubble", "tools", "bubble"],
+          f'{o["laterEnter"]} {o["kinds"]}')
+    check("a tools line's detail is drawn folded, then unfolds a frame later (height animates)",
+          o["openBeforeFrame"] == [False, True] and o["openAfterFrame"] is True,
+          f'{o["openBeforeFrame"]} {o["openAfterFrame"]}')
+    check("closing folds it at once and drops the detail after the fold",
+          o["closing"][0] is False and o["closing"][1] is True and o["closing"][2] == [240]
+          and o["closed2"] is False, f'{o["closing"]} {o["closed2"]}')
+    check("reduced motion: nothing rises in", o["reducedEnter"] is False)
+    check("reduced motion: a tools line opens at once, waiting on no frame",
+          o["reducedOpen"] == [True, 0], str(o["reducedOpen"]))
+    check("reduced motion: and closes at once, its detail dropped with no timer",
+          o["reducedClose"] == [False, False, 0], str(o["reducedClose"]))
 
 
 # --- conversation threads from the dashboard --------------------------------------
@@ -25223,16 +25381,21 @@ def test_viz_reads_a_thread_by_its_key():
 COMPOSER_DRIVER = r"""
 // The composer and the open thread's live end, against a stub DOM: a message
 // shows at once, is followed to queued and running by its ref, gives way to the
-// transcript, and a command's replies are drawn under it.
+// transcript, and a command's replies are drawn under it. An element's
+// innerHTML is its own markup and its children's, as in a browser.
 const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
 process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
 function el(id) {
   return {id, textContent: "", value: "", title: "", className: "", style: {}, dataset: {},
     children: [], _inner: "", parent: null,
-    get innerHTML() { return this._inner; }, set innerHTML(v) { this._inner = v; },
+    get innerHTML() { return this._inner + this.children.map(c => c.innerHTML).join(""); },
+    set innerHTML(v) { this._inner = v; this.children.length = 0; },
     classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
-    appendChild(c) { c.parent = this; this.children.push(c); return c; },
+    appendChild(c) {
+      if (c.parent) c.parent.children.splice(c.parent.children.indexOf(c), 1);
+      c.parent = this; this.children.push(c); return c;
+    },
     remove() {}, addEventListener() {}, insertAdjacentHTML(_, h) { this._inner += h; },
     focus() {}, scrollIntoView() {}, querySelector() { return null; },
     querySelectorAll() { return []; }, getBoundingClientRect() { return {bottom: 0}; }};

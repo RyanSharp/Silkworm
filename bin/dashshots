@@ -2,13 +2,18 @@
 """Screenshots of every dashboard view, on a phone and a laptop.
 
     bin/dashshots [--out DIR] [--views sessions,board,...] [--widths 375,430,1280]
-                  [--source DIR] [--wait 5] [--list]
+                  [--source DIR] [--before DIR] [--wait 5] [--list]
 
 Mobile Safari in an iOS Simulator for the phone widths (375: iPhone SE (3rd
 generation), 430: iPhone 16 Plus), and WebKit itself (a WKWebView snapshot,
 the engine desktop Safari uses) for the laptop width. Each view is opened by
 URL -- the dashboard's own deep links, ?view= ?modal= ?thread= ?task= ?card= -- since
 the simulator has no tap automation. Files are DIR/<view>-<width>.png.
+
+--before DIR runs a second copy, of DIR's code (an export of main, say),
+beside --source's, on the same data, and shoots each view in both, one right
+after the other: DIR/<view>-<width>-before.png and -after.png, seconds apart,
+so what changed between them is the code and not a live thread moving on.
 
 Nothing here can change Silkworm's state. The dashboard is a copy of
 --source's code run from a temp directory against a copy of sessions.json,
@@ -291,7 +296,7 @@ def device_for(width: int) -> str:
     return simctl("create", name, t["identifier"], rt["identifier"]).strip()
 
 
-def shoot_phone(width: int, base: str, shots, out: Path, wait: float):
+def shoot_phone(width: int, targets, shots, out: Path, wait: float):
     udid = device_for(width)
     name = DEVICES[width][0]
     print(f"  {name} ({udid})")
@@ -304,13 +309,15 @@ def shoot_phone(width: int, base: str, shots, out: Path, wait: float):
         simctl("bootstatus", udid, "-b")
         simctl("ui", udid, "appearance", "dark", check=False)
         # Safari's first open of a page is slow on a fresh boot.
-        simctl("openurl", udid, base + "/")
-        time.sleep(wait * 2)
+        for _, base in targets:
+            simctl("openurl", udid, base + "/")
+            time.sleep(wait * 2)
         for view, path in shots:
-            simctl("openurl", udid, base + path)
-            time.sleep(wait)
-            simctl("io", udid, "screenshot", str(out / f"{view}-{width}.png"))
-            print(f"    {view}-{width}.png")
+            for suffix, base in targets:
+                simctl("openurl", udid, base + path)
+                time.sleep(wait)
+                simctl("io", udid, "screenshot", str(out / f"{view}-{width}{suffix}.png"))
+                print(f"    {view}-{width}{suffix}.png")
     finally:
         simctl("shutdown", udid, check=False)
 
@@ -327,13 +334,14 @@ def snapper(tmp: Path) -> Path:
     return exe
 
 
-def shoot_desktop(base: str, shots, out: Path, wait: float, tmp: Path):
+def shoot_desktop(targets, shots, out: Path, wait: float, tmp: Path):
     exe = snapper(tmp)
     for view, path in shots:
-        dest = out / f"{view}-{DESKTOP}.png"
-        r = subprocess.run([str(exe), base + path, str(dest), str(DESKTOP), "860", str(wait)],
-                           capture_output=True, text=True, timeout=120)
-        print(f"    {dest.name}" + ("" if r.returncode == 0 else f"  FAILED {r.stdout}{r.stderr}"))
+        for suffix, base in targets:
+            dest = out / f"{view}-{DESKTOP}{suffix}.png"
+            r = subprocess.run([str(exe), base + path, str(dest), str(DESKTOP), "860", str(wait)],
+                               capture_output=True, text=True, timeout=120)
+            print(f"    {dest.name}" + ("" if r.returncode == 0 else f"  FAILED {r.stdout}{r.stderr}"))
 
 
 def main():
@@ -342,6 +350,8 @@ def main():
     ap.add_argument("--views", default="")
     ap.add_argument("--widths", default="375,430,1280")
     ap.add_argument("--source", default=str(REPO), help="checkout whose visualizer.py is shot")
+    ap.add_argument("--before", default="",
+                    help="also shoot this checkout's visualizer.py, each view right before --source's")
     ap.add_argument("--project", default="silkworm")
     ap.add_argument("--wait", type=float, default=5.0, help="seconds per view to settle")
     ap.add_argument("--list", action="store_true", help="print the views and exit")
@@ -359,6 +369,13 @@ def main():
         port = free_port()
         proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port)
         base = f"http://127.0.0.1:{port}"
+        procs, targets = [proc], [("", base)]
+        if a.before:
+            btmp = tmp / "before"
+            btmp.mkdir()
+            bport = free_port()
+            procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport))
+            targets = [("-before", f"http://127.0.0.1:{bport}"), ("-after", base)]
         try:
             ex = pick_examples(base, a.project)
             shots = views(ex, a.project)
@@ -373,13 +390,14 @@ def main():
             for w in [int(x) for x in a.widths.split(",") if x]:
                 if w == DESKTOP:
                     print(f"  desktop {DESKTOP}px (WKWebView)")
-                    shoot_desktop(base, shots, out, a.wait, tmp)
+                    shoot_desktop(targets, shots, out, a.wait, tmp)
                 elif w in DEVICES:
-                    shoot_phone(w, base, shots, out, a.wait)
+                    shoot_phone(w, targets, shots, out, a.wait)
                 else:
                     raise SystemExit(f"no device for width {w}; use {sorted(DEVICES)} or {DESKTOP}")
         finally:
-            proc.terminate()
+            for pr in procs:
+                pr.terminate()
             bot.shutdown()
 
 

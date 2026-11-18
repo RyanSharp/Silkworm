@@ -1102,6 +1102,15 @@ PAGE = r"""<!doctype html>
     --ink: #F2E8F1; --muted: #B49BB6; --gold: #ECB22E; --silk: #F6EEDF;
     --c-cache: #C08A1C; --c-fresh: #2D9FD0; --c-out: #D8517F;
     --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    /* The chat's one set of measures and motion, phone and laptop alike
+       (the phone block below only re-sizes a few). */
+    --chat-max: 780px;               /* the conversation's column */
+    --chat-gap: 12px;                /* between one item and the next */
+    --chat-fs: 14.5px; --chat-lh: 1.5;
+    --bubble-r: 16px; --bubble-tail: 6px; --bubble-pad: 9px 14px;
+    --meta-fs: 11px; --quiet: #B49BB6B3;  /* times, figures, tool lines */
+    --ease: cubic-bezier(.2, .7, .2, 1);
+    --t-fast: 120ms; --t: 220ms; --t-fold: 240ms; --rise: 8px;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -1220,7 +1229,9 @@ PAGE = r"""<!doctype html>
                 gap: 10px; flex-wrap: wrap; }
   .card .meta b { color: var(--gold); font-weight: 600; }
 
-  main { flex: 1; overflow-y: auto; padding: 18px 22px; min-width: 0;
+  /* No bottom padding: the composer, stuck to main's bottom, brings its own,
+     and a padded scroller would hold it up with the thread showing under it. */
+  main { flex: 1; overflow-y: auto; padding: 18px 22px 0; min-width: 0;
          display: flex; flex-direction: column; }
   #content { flex: 1; }
 
@@ -1276,10 +1287,15 @@ PAGE = r"""<!doctype html>
   .msg { max-width: 800px; margin: 0 0 14px; }
   .msg .who { font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
               color: var(--muted); margin-bottom: 4px; }
-  .bubble { border-radius: 12px; padding: 10px 14px; word-break: break-word; }
+  /* Long code and prose stay inside their bubble: a code block scrolls
+     sideways within itself, never the page; a long word or URL wraps. */
+  .bubble { border-radius: 12px; padding: 10px 14px; min-width: 0; max-width: 100%;
+            overflow-wrap: anywhere; }
   .bubble p { margin: 0 0 8px; } .bubble p:last-child { margin: 0; }
-  .bubble pre { background: #1E0620; border-radius: 8px; padding: 10px;
-                overflow-x: auto; font-size: 12.5px; font-family: var(--mono); }
+  .bubble pre { background: #1E0620; border-radius: 8px; padding: 10px; margin: 6px 0;
+                max-width: 100%; overflow-x: auto; overflow-wrap: normal;
+                -webkit-overflow-scrolling: touch;
+                font-size: 12.5px; line-height: 1.45; font-family: var(--mono); }
   .user .bubble pre { background: #E3D5BE; color: #33203B; }
   .bubble code { font-family: var(--mono); font-size: .92em; background: #00000030;
                  border-radius: 4px; padding: 1px 5px; }
@@ -1303,9 +1319,103 @@ PAGE = r"""<!doctype html>
   .artifacts .f { display: flex; gap: 10px; font-family: var(--mono); font-size: 12px;
                   padding: 3px 0; color: var(--muted); }
 
-  /* composer */
-  #composer { flex: none; display: none; flex-direction: column; gap: 6px; padding-top: 12px;
-              border-top: 1px solid var(--line); margin-top: 8px; }
+  /* --- the chat (both widths) -----------------------------------------
+     Bubbles on one column; each run of tool calls is a quiet line that
+     unfolds; times and figures small and dim. */
+  #tmsgs, #tlive, #tfiles { max-width: var(--chat-max); }
+  .citem { margin: 0 0 var(--chat-gap); }
+  .cmsg { display: flex; flex-direction: column; align-items: flex-start; max-width: 88%;
+          min-width: 0; }
+  .cmsg.user { margin-left: auto; align-items: flex-end; max-width: 82%; }
+  .cmsg .bubble { font-size: var(--chat-fs); line-height: var(--chat-lh);
+                  border-radius: var(--bubble-r); padding: var(--bubble-pad); }
+  .cmsg.user .bubble { border-bottom-right-radius: var(--bubble-tail); }
+  .cmsg.assistant .bubble { border-bottom-left-radius: var(--bubble-tail); }
+  .cmeta { font-size: var(--meta-fs); color: var(--quiet); margin: 3px 10px 0;
+           font-variant-numeric: tabular-nums; }
+  .cmeta details { margin: 0; }
+  .cmeta summary { font-family: inherit; font-size: var(--meta-fs); color: var(--quiet);
+                   list-style: none; }
+  .cmeta summary::-webkit-details-marker { display: none; }
+  .cmeta .usage { font-size: 10.5px; }
+  /* a run of tool calls: one line, unfolding with its height animated */
+  .ctools { display: grid; grid-template-rows: auto 0fr;
+            transition: grid-template-rows var(--t-fold) var(--ease); }
+  .ctools.open { grid-template-rows: auto 1fr; }
+  .ctools .cbody { min-height: 0; overflow: hidden; }
+  .ctl { justify-self: start; background: none; border: 0; border-radius: 8px;
+         color: var(--quiet); font: inherit; font-size: 12.5px; min-height: 28px;
+         padding: 2px 8px; margin-left: 2px; max-width: 100%; overflow: hidden;
+         text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+         transition: color var(--t-fast), background-color var(--t-fast); }
+  .ctl:hover { color: var(--ink); background: #FFFFFF0D; }
+  .ctl .caret { display: inline-block; margin-left: 2px;
+                transition: transform var(--t) var(--ease); }
+  .ctools.open .ctl { color: var(--gold); }
+  .ctools.open .ctl .caret { transform: rotate(90deg); }
+  .cdetail { border-left: 2px solid var(--line); padding: 6px 0 2px 12px; margin: 4px 0 0 10px;
+             opacity: 0; transform: translateY(-4px);
+             transition: opacity var(--t) var(--ease), transform var(--t) var(--ease); }
+  .ctools.open .cdetail { opacity: 1; transform: none; }
+  .cdetail .msg { margin-bottom: 10px; max-width: 100%; }
+  .cdetail .msg .who { font-size: 10px; }
+  .cdetail pre { max-height: 360px; overflow: auto; }
+  /* new items rise in; the working bubble likewise */
+  @keyframes rise { from { opacity: 0; transform: translateY(var(--rise)); }
+                    to { opacity: 1; transform: none; } }
+  .citem.enter { animation: rise var(--t) var(--ease) both; }
+  .typing { flex-direction: row; align-items: center; gap: 8px; margin: 0 0 var(--chat-gap);
+            animation: rise var(--t) var(--ease) both; }
+  .typing .bubble { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px;
+                    background: var(--panel); border: 1px solid var(--line); }
+  .tdots { display: inline-flex; gap: 4px; }
+  .tdots i { width: 6px; height: 6px; border-radius: 50%; background: var(--gold);
+             animation: breathe 1.2s ease-in-out infinite; }
+  .tdots i:nth-child(2) { animation-delay: .16s; }
+  .tdots i:nth-child(3) { animation-delay: .32s; }
+  @keyframes breathe { 0%, 80%, 100% { opacity: .3; transform: translateY(0); }
+                       40% { opacity: 1; transform: translateY(-3px); } }
+  .typing .tword { font-size: 12.5px; color: var(--quiet); }
+  .typing .tstop { font-size: 12px; padding: 3px 10px; }
+  /* what was sent from here and is on its way: drawn as the bubble it will be */
+  #tlive .msg.user { margin: 0 0 var(--chat-gap) auto; max-width: 82%; display: flex;
+                     flex-direction: column; align-items: flex-end; }
+  #tlive .msg .who { font-size: 10px; letter-spacing: .5px; color: var(--quiet); margin: 0 10px 3px; }
+  #tlive .msg .bubble { font-size: var(--chat-fs); line-height: var(--chat-lh);
+                        border-radius: var(--bubble-r); padding: var(--bubble-pad); }
+  #tlive .msg.user .bubble { border-bottom-right-radius: var(--bubble-tail); }
+  #tlive .msg.bot { max-width: 88%; }
+  /* files: compact chips, the thread's behind one line */
+  .fchips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+  .fchip { display: inline-flex; align-items: center; gap: 6px; max-width: 240px; min-width: 0;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+           padding: 3px 10px; font-size: 12px; color: var(--ink); text-decoration: none;
+           transition: border-color var(--t-fast); }
+  a.fchip:hover { border-color: var(--gold); }
+  .fchip .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .fchip .fdir, .fchip .fsize { flex: none; color: var(--quiet); font-size: 10.5px;
+                                font-family: var(--mono); }
+  .fchip.gone { opacity: .5; }
+  .cfiles { margin: 4px 0 8px; }
+  .cfiles summary { font-family: inherit; font-size: 12.5px; color: var(--quiet);
+                    min-height: 28px; display: flex; align-items: center; }
+  /* the way down, when new messages arrive while reading further up */
+  #jumppill { position: absolute; bottom: calc(100% + 10px); left: 50%; z-index: 7;
+              transform: translate(-50%, 8px) scale(.96); opacity: 0; pointer-events: none;
+              background: var(--panel); color: var(--ink); border: 1px solid var(--gold);
+              border-radius: 18px; min-height: 34px; padding: 0 14px; font: inherit;
+              font-size: 13px; box-shadow: 0 4px 14px #0008; white-space: nowrap; cursor: pointer;
+              transition: opacity var(--t) var(--ease), transform var(--t) var(--ease); }
+  #jumppill.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+
+  /* composer: pinned to the bottom of the thread, clear of the home indicator */
+  #composer { flex: none; display: none; flex-direction: column; gap: 6px; padding-top: 10px;
+              border-top: 1px solid var(--line); margin-top: 8px;
+              position: sticky; bottom: 0; z-index: 5; background: var(--bg);
+              padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  #composer .crow button.act { transition: transform var(--t-fast) var(--ease),
+                                           filter var(--t-fast) var(--ease); }
+  #composer .crow button.act:active { transform: scale(.92); filter: brightness(.9); }
   #composer .crow { display: flex; gap: 8px; align-items: flex-end; }
   label.attach { display: inline-flex; align-items: center; justify-content: center;
                  cursor: pointer; font-size: 18px; padding: 6px 10px; min-width: 44px;
@@ -1320,14 +1430,11 @@ PAGE = r"""<!doctype html>
                  font-size: 15px; padding: 0 6px; }
   /* the live end of the open thread: what was just sent, and what it is doing */
   #tlive .msg.out .bubble { opacity: .82; }
+  #tlive .msg.out .fchips { justify-content: flex-end; }
   #tlive .state { font-size: 12px; color: var(--muted); margin-top: 4px; }
   #tlive .state.bad { color: #D8517F; }
   #tlive .note .bubble { background: transparent; border: 1px dashed var(--line);
                          font-size: 13.5px; }
-  .working { display: flex; gap: 10px; align-items: center; color: var(--gold);
-             font-size: 13px; margin: 0 0 14px; }
-  .working .dots::after { content: "…"; animation: blink 1.2s steps(3) infinite; }
-  @keyframes blink { 50% { opacity: .2; } }
   .listtop { display: flex; gap: 8px; padding: 10px 10px 0; }
   .listtop button { flex: 1; }
   #dashm { display: none; margin: 8px 10px 0; }
@@ -1553,7 +1660,6 @@ PAGE = r"""<!doctype html>
   header { padding-top: max(10px, env(safe-area-inset-top));
            padding-left: max(20px, env(safe-area-inset-left));
            padding-right: max(20px, env(safe-area-inset-right)); }
-  #composer { padding-bottom: env(safe-area-inset-bottom); }
   #toast { bottom: calc(18px + env(safe-area-inset-bottom)); }
   .task.flash { outline: 2px solid var(--gold); outline-offset: 2px; }
   #notifybtn.on { color: var(--gold); }
@@ -1562,7 +1668,7 @@ PAGE = r"""<!doctype html>
   .phoneonly, .bpick { display: none; }
   .hmore { display: contents; }
   /* The phone's chat: its thread header, alert count and sheet, jump pill. */
-  #alertslot, #chathead, #jumppill, #alertsheet { display: none; }
+  #alertslot, #chathead, #alertsheet { display: none; }
 
   /* --- phone (max-width: 700px) ----------------------------------------
      One breakpoint, one set of measures. On a phone:
@@ -1696,8 +1802,7 @@ PAGE = r"""<!doctype html>
     .ev .d { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; padding-left: 2px; }
     .artifacts .f { flex-wrap: wrap; overflow-wrap: anywhere; }
     #transcript { scroll-margin-bottom: 130px; }   /* clear of the composer */
-    #composer { position: sticky; bottom: 0; background: var(--bg);
-                padding-bottom: max(10px, var(--safe-b)); }
+    #composer { padding-bottom: max(10px, var(--safe-b)); }
     body.kb #composer { padding-bottom: 8px; }      /* the keyboard covers the indicator */
     #composer textarea { min-height: var(--tap); }
     #composer .crow button.act { min-width: 64px; }
@@ -1734,42 +1839,16 @@ PAGE = r"""<!doctype html>
                        min-height: 36px; padding: 0 10px; }
     #chathead .cinfo { font-size: 18px; color: var(--muted); padding: 0 6px; min-width: 38px; }
     body.reading #transcript { padding-top: 10px; }
-    .cmsg { display: flex; flex-direction: column; align-items: flex-start; max-width: 92%;
-            margin: 0 0 12px; }
-    .cmsg.user { margin-left: auto; align-items: flex-end; max-width: 85%; }
-    .cmsg .bubble { font-size: 15.5px; line-height: 1.45; border-radius: 18px; padding: 9px 13px;
-                    max-width: 100%; }
-    .cmsg.user .bubble { border-bottom-right-radius: 6px; }
-    .cmsg.assistant .bubble { border-bottom-left-radius: 6px; }
-    .cmsg .bubble pre { font-size: 12.5px; }
-    .cmeta { font-size: 11.5px; color: var(--muted); margin: 3px 8px 0; }
-    .cmeta details { margin: 0; }
-    .cmeta summary { font-family: var(--sans); font-size: 11.5px; color: var(--muted);
-                     list-style: none; }
-    .cmeta summary::-webkit-details-marker { display: none; }
-    .ctools { margin: 0 0 12px; }
-    .ctl { background: none; border: 1px solid var(--line2); border-radius: 16px;
-           color: var(--muted); font-size: 13px; min-height: 34px; padding: 0 12px;
-           max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-           cursor: pointer; }
-    .ctools.open .ctl { color: var(--gold); border-color: #C08A1C99; }
-    .cdetail { border-left: 2px solid var(--line); padding: 8px 0 0 10px; margin: 6px 0 0 6px; }
-    .cdetail .msg { margin-bottom: 10px; }
-    body.reading #tlive .msg.user { margin-left: auto; max-width: 85%; display: flex;
-                                    flex-direction: column; align-items: flex-end; }
-    body.reading #tlive .msg .who { font-size: 10.5px; }
-    body.reading #tlive .msg.user .bubble { border-radius: 18px; border-bottom-right-radius: 6px; }
-    body.reading .working button { display: none; }   /* Stop is in the header */
-    .cfiles { margin: 6px 0 4px; }
-    .cfiles summary { font-family: var(--sans); font-size: 13px; color: var(--muted);
-                      min-height: 32px; display: flex; align-items: center; }
-    .cfiles .artifacts { border-top: 0; margin-top: 0; padding-top: 2px; }
-    #jumppill { position: absolute; bottom: calc(100% + 8px); left: 50%;
-                transform: translateX(-50%); z-index: 7; background: var(--panel);
-                color: var(--ink); border: 1px solid var(--gold); border-radius: 18px;
-                min-height: 36px; padding: 0 14px; font-size: 13.5px; box-shadow: 0 4px 14px #0008;
-                white-space: nowrap; }
-    #jumppill.show { display: block; }
+    /* the chat: the shared measures, a size up for a thumb and a phone's eye */
+    :root { --chat-fs: 15.5px; --chat-lh: 1.45; --bubble-r: 18px; --bubble-pad: 9px 13px;
+            --chat-gap: 10px; --meta-fs: 11.5px; }
+    .cmsg { max-width: 92%; }
+    .cmsg.user, #tlive .msg.user { max-width: 85%; }
+    .ctl { min-height: 36px; font-size: 13px; }
+    .cfiles summary { min-height: 36px; font-size: 13px; }
+    .fchip { max-width: 70vw; padding: 5px 11px; }
+    #jumppill { min-height: 38px; font-size: 13.5px; }
+    body.reading .typing .tstop { display: none; }   /* Stop is in the header */
     #composer .crow { align-items: flex-end; gap: 6px; }
     #composer textarea { height: auto; min-height: var(--tap); line-height: 22px;
                          padding: 10px 12px; border-radius: 20px; resize: none;
@@ -1873,6 +1952,14 @@ PAGE = r"""<!doctype html>
   @media (max-width: 380px) {
     header button.hbtn { min-width: 40px; padding: 0 6px; }
   }
+  /* Reduced motion: nothing rises, breathes, slides or unfolds -- every
+     state is reached at once. Last, so it outranks every rule above. */
+  @media (prefers-reduced-motion: reduce) {
+    :root { --t-fast: 0ms; --t: 0ms; --t-fold: 0ms; --rise: 0px; }
+    *, *::before, *::after { animation: none !important; transition: none !important;
+                             scroll-behavior: auto !important; }
+    .tdots i { opacity: .7; }
+  }
 </style>
 </head>
 <body>
@@ -1918,12 +2005,12 @@ PAGE = r"""<!doctype html>
       <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div><div id="tfiles"></div></div>
     </div>
     <div id="composer">
-      <button id="jumppill" onclick="toEnd()">↓ Jump to latest</button>
+      <button id="jumppill" onclick="toEnd(true)" aria-label="scroll to the newest messages">↓ New messages</button>
       <div id="chips"></div>
       <div class="crow">
         <label class="ghost attach" title="attach files or photos">📎<input type="file" id="attach" multiple onchange="addFiles(this.files, 'reply'); this.value = ''"></label>
         <textarea id="reply" placeholder="Message this thread (also posts to Slack) — !project, !stop, !reset, !brief… work too"></textarea>
-        <button class="act" onclick="sendReply()">Send</button>
+        <button class="act" id="sendbtn" onclick="sendReply()">Send</button>
       </div>
     </div>
   </main>
@@ -2128,6 +2215,8 @@ function renderDash() {
   // where it can be reached -- on a phone the thread column is a screen of its
   // own and the panel scrolled away above it (#dashm).
   const wrote = setHTML(document.getElementById("dash"), html);
+  // Above the open thread on a laptop: a reader following the end stays there.
+  if (wrote && active && pinned) toEnd();
   const sum = document.getElementById("dashsum");
   if (sum) sum.textContent = `📊 $${s.total_cost.toFixed(2)} · ${s.threads} threads · cache ${
     s.cache_rate == null ? "—" : s.cache_rate + "%"}`;
@@ -2342,13 +2431,13 @@ function usageLine(m) {
     (m.model ? ` · ${esc(m.model)}` : "") + `</div>`;
 }
 
-// --- the phone's chat ---
-// On a phone the open thread reads as a chat: what the owner said and what
-// Claude answered, as bubbles; every run of tool calls, their results
-// and thinking between two of those folded into one line ("⚙ ran 6 tools")
-// that opens onto the same detail a laptop shows. Token, cache and model
-// figures sit behind a bubble's time, or inside the opened line. A laptop
-// keeps the full log (messageHtml above).
+// --- the chat ---
+// The open thread reads as a chat, on a phone and a laptop alike: what the
+// owner said and what Claude answered, as bubbles; every run of tool calls,
+// their results and thinking between two of those folded into one quiet line
+// ("⚙ ran 6 tools") that unfolds onto the full log of those calls
+// (messageHtml above). Token, cache and model figures sit behind a bubble's
+// time, or inside the opened line.
 //
 // chatItems turns messages into
 //   {kind: "bubble", id, role, text, ts, usage, model}
@@ -2403,7 +2492,28 @@ function chatTime(ts) {
   return d.toDateString() === new Date().toDateString() ? t
     : d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + t;
 }
-const chatOpen = new Set();
+// Motion. Everything that moves is CSS transform and opacity (the one
+// exception: a tools line unfolding, a CSS grid-row transition the brief
+// asked for, with nothing measured from script). Under
+// prefers-reduced-motion the CSS turns it all off, and the script skips the
+// entrance class and the frame's wait before unfolding.
+function reducedMotion() {
+  return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+function nextFrame(fn) {
+  if (reducedMotion() || typeof requestAnimationFrame !== "function") { fn(); return; }
+  requestAnimationFrame(() => requestAnimationFrame(fn));
+}
+const FOLD_MS = 240;           // --t-fold in the CSS
+function afterFold(fn) {
+  if (reducedMotion()) { fn(); return; }
+  setTimeout(fn, FOLD_MS);
+}
+// chatOpen: tools lines whose detail is drawn. chatShown: those unfolded --
+// the line's element wears .open. Opening draws the detail folded, then
+// unfolds it a frame later so the height animates; closing folds it, then
+// drops the detail once folded.
+const chatOpen = new Set(), chatShown = new Set();
 function chatHtml(it) {
   if (it.kind === "bubble") {
     const when = esc(chatTime(it.ts));
@@ -2414,13 +2524,16 @@ function chatHtml(it) {
            `<div class="cmeta">${meta}</div></div>`;
   }
   const open = chatOpen.has(it.id);
-  return `<div class="ctools${open ? " open" : ""}"><button class="ctl" onclick="toggleTools('${it.id}')"
-    >${esc(toolsLabel(it))} <span class="caret">${open ? "▾" : "▸"}</span></button>${
-    open ? `<div class="cdetail">${it.parts.map(messageHtml).join("")}</div>` : ""}</div>`;
+  return `<button class="ctl" aria-expanded="${open}" onclick="toggleTools('${it.id}')"
+    >${esc(toolsLabel(it))} <span class="caret" aria-hidden="true">›</span></button><div class="cbody"><div class="cdetail">${
+    open ? it.parts.map(messageHtml).join("") : ""}</div></div>`;
 }
 // One element per item, as the session list does: an item is rewritten only
 // when its own markup changed, so an open detail stays open as the thread
-// grows and a long thread is not redrawn every few seconds.
+// grows and a long thread is not redrawn every few seconds. The element is
+// the item's for good, so the classes on it (open, enter) survive rewrites
+// of what is inside -- nothing replays as a reply streams in. An item that
+// arrives after the thread was first drawn rises in (.enter).
 const chatEls = new Map();
 function drawChat(msgs, messages, sessionId) {
   const items = chatItems(messages);
@@ -2432,9 +2545,22 @@ function drawChat(msgs, messages, sessionId) {
   const want = new Set(items.map(x => x.id));
   for (const [k, div] of chatEls) if (!want.has(k)) { div.remove(); chatEls.delete(k); }
   if (msgs.querySelector && msgs.querySelector(".empty")) msgs.innerHTML = "";
+  const animate = chatEls.size > 0 && !reducedMotion();
   const divs = items.map(it => {
     let div = chatEls.get(it.id);
-    if (!div) { div = document.createElement("div"); chatEls.set(it.id, div); }
+    if (!div) {
+      div = document.createElement("div");
+      div.classList.add("citem");
+      div.classList.add(it.kind === "tools" ? "ctools" : "cbubble");
+      if (animate) {
+        div.classList.add("enter");
+        div.addEventListener("animationend", e => {
+          if (e.target === div) div.classList.remove("enter");
+        });
+      }
+      chatEls.set(it.id, div);
+    }
+    if (it.kind === "tools") div.classList.toggle("open", chatShown.has(it.id));
     setHTML(div, chatHtml(it));
     return div;
   });
@@ -2442,10 +2568,27 @@ function drawChat(msgs, messages, sessionId) {
   if (now.length !== divs.length || divs.some((d, i) => now[i] !== d))
     for (const d of divs) msgs.appendChild(d);
 }
-function toggleTools(id) {
-  if (chatOpen.has(id)) chatOpen.delete(id); else chatOpen.add(id);
+function redrawChat() {
   if (active && tview.key === active.key)
     drawChat(document.getElementById("tmsgs"), tview.msgs || [], tview.sid);
+}
+function toggleTools(id) {
+  const div = () => chatEls.get(id);
+  if (chatOpen.has(id)) {
+    // Folded first; the detail itself is dropped once the fold has run.
+    chatShown.delete(id);
+    chatOpen.delete(id);
+    if (div()) div().classList.remove("open");
+    afterFold(() => { if (!chatOpen.has(id)) redrawChat(); });
+    return;
+  }
+  chatOpen.add(id);
+  redrawChat();                                     // drawn, still folded
+  nextFrame(() => {
+    if (!chatOpen.has(id)) return;
+    chatShown.add(id);
+    if (div()) div().classList.add("open");
+  });
 }
 // The chat follows the newest message while it is read at the bottom; read
 // further up, it stays put and a pill offers the way down.
@@ -2456,25 +2599,38 @@ function atEnd() {
   const m = scroller();
   return !m || m.scrollHeight - m.scrollTop - m.clientHeight < 80;
 }
-function toEnd() {
+// `smooth`: the pill was tapped, so the way down is shown; following new
+// text as it arrives is instant, so nothing lags behind the reply.
+function toEnd(smooth) {
   const m = scroller();
-  if (m) m.scrollTop = m.scrollHeight;
+  pinned = true;
+  if (m && smooth && !reducedMotion() && typeof m.scrollTo === "function")
+    m.scrollTo({top: m.scrollHeight, behavior: "smooth"});
+  else if (m) m.scrollTop = m.scrollHeight;
   showJump(false);
 }
 function showJump(on) {
   const p = document.getElementById("jumppill");
   if (p && p.classList && p.classList.toggle) p.classList.toggle("show", !!on);
 }
+// Whether the reader is following the end: set by their own scrolling (and
+// by toEnd), not measured at draw time -- the page can grow between draws
+// (the stats above the thread, a redraw from the top), which would read a
+// reader still at the end as one who had scrolled up.
+let pinned = true;
+function onScroll() {
+  pinned = atEnd();
+  if (pinned) showJump(false);
+}
 // Draws with `fn`, then keeps the reader where they were: at the end if they
-// were there, else where they are, with the pill if something new arrived.
+// were following it, else where they are, with the pill if something new
+// arrived.
 function keepEnd(fn, force) {
-  if (!chatMode()) { fn(); return; }
-  const was = atEnd(), m = scroller(), before = m ? m.scrollHeight : 0;
+  const was = pinned || atEnd(), m = scroller(), before = m ? m.scrollHeight : 0;
   fn();
   if (force || was) toEnd();
   else if (m && m.scrollHeight > before) showJump(true);
 }
-function chatMode() { return phone(); }
 // The open thread's own header on a phone, stuck to the top: back to the
 // list, its name and project, what it is doing (with Stop while a turn runs),
 // the alerts' count, and ⓘ for what a laptop shows above the transcript.
@@ -2535,15 +2691,22 @@ function transcriptHead(s) {
   }
   return h;
 }
-function filesHtml(files, compact) {
+// The thread's files: one line that opens onto a row of compact chips --
+// which way it went, its name (ellipsized), its size. One no longer on disk
+// is a muted chip that says why on hover.
+function filesHtml(files) {
   if (!files.length) return "";
-  // In the phone's chat, one line that opens onto the list.
-  if (compact) return `<details class="cfiles"><summary>📎 ${files.length} file${
-    files.length === 1 ? "" : "s"}</summary>${filesHtml(files).replace("<b>Files</b>", "")}</details>`;
-  return `<div class="artifacts"><b>Files</b>` + files.map(f =>
-    `<div class="f"><span>${f.direction === "in" ? "⬇" : "⬆"}</span>
-     ${f.exists ? `<a href="/download?path=${encodeURIComponent(f.path)}">${esc(f.name)}</a>` : esc(f.name) + (f.pruned ? " (pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack)" : " (gone)")}
-     <span>${fmtTok(f.size)}B</span></div>`).join("") + "</div>";
+  return `<details class="cfiles"><summary>📎 ${files.length} file${
+    files.length === 1 ? "" : "s"}</summary><div class="fchips">` + files.map(f => {
+    const dir = f.direction === "in" ? "⬇" : "⬆";
+    const inner = `<span class="fdir">${dir}</span><span class="fname">${esc(f.name)}</span>` +
+                  `<span class="fsize">${fmtTok(f.size)}B</span>`;
+    if (f.exists)
+      return `<a class="fchip" href="/download?path=${encodeURIComponent(f.path)}" title="${esc(f.name)}">${inner}</a>`;
+    const why = f.pruned ? "pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack"
+                         : "gone";
+    return `<span class="fchip gone" title="${esc(f.name)} (${esc(why)})">${inner}</span>`;
+  }).join("") + "</div></details>";
 }
 async function loadTranscript(scroll) {
   if (!active) return;
@@ -2554,10 +2717,9 @@ async function loadTranscript(scroll) {
   // (a reset, or a new thread's first session, included) and says `reset`
   // when that is not the one drawn so far.
   if (scroll) showReading();
-  // Crossing the phone width redraws from the top in the other form.
-  if (scroll || tview.key !== s.key || tview.chat !== chatMode()) {
-    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false, msgs: [], chat: chatMode()};
-    chatOpen.clear(); chatEls.clear();
+  if (scroll || tview.key !== s.key) {
+    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false, msgs: []};
+    chatOpen.clear(); chatShown.clear(); chatEls.clear();
   }
   const want = tview, from = want.cursor;
   // One read at a time; a call made meanwhile (a rename, a resummarize) is
@@ -2586,16 +2748,11 @@ async function loadTranscript(scroll) {
       // The first read, another session (reset), or recovering from an error
       // starts the messages over; anything else is only what is new.
       if (from === 0 || data.reset || want.error) {
-        msgs.innerHTML = ""; want.msgs = []; chatEls.clear(); chatOpen.clear();
+        msgs.innerHTML = ""; want.msgs = []; chatEls.clear(); chatOpen.clear(); chatShown.clear();
       }
       want.error = false;
-      if (want.chat) {
-        want.msgs = want.msgs.concat(data.messages);
-        if (data.messages.length || !msgs.innerHTML) drawChat(msgs, want.msgs, data.session_id);
-      } else if (data.messages.length)
-        msgs.insertAdjacentHTML("beforeend", data.messages.map(messageHtml).join(""));
-      else if (!msgs.innerHTML && !data.session_id)
-        msgs.innerHTML = `<div class="empty">No messages yet.</div>`;
+      want.msgs = want.msgs.concat(data.messages);
+      if (data.messages.length || !msgs.innerHTML) drawChat(msgs, want.msgs, data.session_id);
       want.cursor = data.cursor || 0;
       want.live = data.live || null;
       arrived(s.key, data.messages, (want.live && want.live.turns) || []);
@@ -2603,10 +2760,9 @@ async function loadTranscript(scroll) {
     if (data.session_id !== undefined) want.sid = data.session_id || "";
     want.live = data.live || null;
     drawLive();
-    setHTML(document.getElementById("tfiles"), filesHtml(files, want.chat));
+    setHTML(document.getElementById("tfiles"), filesHtml(files));
     document.getElementById("composer").style.display = "flex";
   }, scroll);
-  if (scroll && !want.chat) document.getElementById("transcript").scrollIntoView(false);
   if (want.again && tview === want) { want.again = false; loadTranscript(false); }
 }
 
@@ -2666,7 +2822,8 @@ function prune(items, turns) {
 const QUEUED_NOTE = "queued — runs when the turn in progress finishes";
 function outBubble(it, note, bad, who) {
   const files = it.files && it.files.length
-    ? `<div class="state">📎 ${it.files.map(esc).join(", ")}</div>` : "";
+    ? `<div class="fchips">${it.files.map(n =>
+        `<span class="fchip"><span class="fname">📎 ${esc(n)}</span></span>`).join("")}</div>` : "";
   return `<div class="msg user out"><div class="who">${esc(who || (it.kind === "command" ? "you · command" : "you · dashboard"))}</div>
     ${it.text ? `<div class="bubble">${md(it.text)}</div>` : ""}${files}
     ${note ? `<div class="state${bad ? " bad" : ""}">${esc(note)}</div>` : ""}</div>`;
@@ -2707,10 +2864,13 @@ function liveHtml(s, live, items) {
     if (t.state === "queued" && !items.some(i => i.ref === t.ref))
       h += outBubble({kind: "prompt", text: t.title, files: []}, QUEUED_NOTE, false,
                      t.source === "slack" ? "you · slack" : "you · queued");
+  // Working: a reply-shaped bubble of three breathing dots where the reply
+  // will be, which the reply's own bubble takes the place of. Its markup
+  // never changes while the turn runs (how long it has run is in the
+  // header and the turn bar), so a poll does not redraw it.
   if (live.running)
-    h += `<div class="working">⏳ <b>Working<span class="dots"></span></b>
-      <span>${s.turn ? dur(s.turn.age_s) : ""}</span>
-      <button class="ghost" onclick="cmdSend('!stop')">■ Stop</button></div>`;
+    h += `<div class="cmsg assistant typing" role="status"><div class="bubble"><span class="tdots" aria-hidden="true"><i></i><i></i><i></i></span><span class="tword">Working</span></div>
+      <button class="ghost tstop" onclick="cmdSend('!stop')">■ Stop</button></div>`;
   const ended = turns.filter(t => t.state !== "queued" && t.state !== "running");
   const last = ended[ended.length - 1];
   if (last && !live.running && ["failed", "cancelled"].includes(last.state)
@@ -2922,9 +3082,11 @@ if (typeof window !== "undefined" && window.visualViewport && window.visualViewp
 }
 (function () {
   const m = scroller();
-  if (m && m.addEventListener) m.addEventListener("scroll", () => { if (atEnd()) showJump(false); },
-                                                  {passive: true});
+  if (m && m.addEventListener) m.addEventListener("scroll", onScroll, {passive: true});
 })();
+// iOS Safari gives a tap :active (the Send button's press) only when the
+// page listens for touches.
+if (document.addEventListener) document.addEventListener("touchstart", () => {}, {passive: true});
 document.addEventListener("keydown", e => {
   // On a phone Return is a new line; the Send button sends.
   if (e.target.id === "reply" && e.key === "Enter" && !e.shiftKey && !phone()) {
