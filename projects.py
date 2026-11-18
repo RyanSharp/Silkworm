@@ -108,6 +108,12 @@ FIELDS: dict[str, tuple] = {
     # What the suite said about recent base commits, so each is run at most
     # once: {sha: {ok, failed, at}}. A handful, newest kept.
     "base_checks": (dict, "suite results on recent base commits, by sha"),
+    # Whether the project's own checkout fails tests a clean worktree of the
+    # same commit passes (basered.py, checkout section). Set when a landing's
+    # post-merge suite fails there and fails the same at the base without the
+    # branch; cleared when the checkout passes again. {sha, base, tests,
+    # since, attention} or None.
+    "checkout_failing": (None, "the checkout fails tests its base passes: {sha, base, tests, since, attention}"),
     "archived": (False, "hidden from pickers; existing tasks keep their label"),
     "created":  (0.0,   "unix time"),
     "updated":  (0.0,   "unix time"),

@@ -6702,8 +6702,12 @@ def test_a_refused_landing_names_the_failing_test():
 
     before = g(repo, "rev-parse", "HEAD").stdout.strip()
     wt, name = branch()
+    # Failing in the checkout only with the branch on it: a checkout that
+    # fails without it too is the checkout's, not the branch's (merge.land 5b).
+    def with_branch(cwd, name):
+        return str(cwd) != str(repo) or not (repo / f"{name}.txt").exists()
     r = M.land(wt, repo, name, "main",
-               lambda cwd: {"ran": True, "ok": str(cwd) != str(repo),
+               lambda cwd: {"ran": True, "ok": with_branch(cwd, name),
                             "code": 1, "output": said})
     d = r.get("detail", "")
     check("refused after the merge, and put back",
@@ -6748,7 +6752,7 @@ def test_a_refused_landing_names_the_failing_test():
           and "1 passed, 1 failed" in run.get("failures", ""), run.get("failures"))
     wt, name = branch()
     r = M.land(wt, repo, name, "main",
-               lambda cwd: run if str(cwd) == str(repo) else {"ran": True, "ok": True})
+               lambda cwd: {"ran": True, "ok": True} if with_branch(cwd, name) else run)
     check("and a landing refused on that run names it",
           "✘ the one that broke" in r.get("detail", ""), r.get("detail", "")[:300])
     check("so does the note sent back to the implementor",
@@ -22241,11 +22245,311 @@ def test_landing_refusals_carry_failures_and_base():
     check("after the rebase: the failing tests and the commit",
           r["stage"] == "tests-after-rebase" and r.get("failed") == ["t1"]
           and r.get("onto") == base, str(r))
+    # Bad in the checkout only with the branch's file there: failing without
+    # it too would be the checkout's own failure (merge.CHECKOUT_FAILING).
     r = M.land(wt, repo, "silkworm/tsk_x", "main",
-               lambda cwd: {"ok": True} if Path(cwd) == wt else bad, generated=[])
+               lambda cwd: ({"ok": True} if Path(cwd) == wt or not (repo / "a").exists()
+                            else bad), generated=[])
     check("after the merge too, with the base it was put back to",
           r["stage"] == "tests-after-merge" and r.get("failed") == ["t1"]
           and r.get("onto") == base and g("rev-parse", "HEAD").stdout.strip() == base, str(r))
+
+
+def _checkout_rig():
+    """A base repo, a git helper, and a way to cut a branch adding one file."""
+    root = Path(tempfile.mkdtemp())
+    repo = root / "repo"; repo.mkdir()
+    def g(cwd, *a): return subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd=str(cwd),
+        capture_output=True, text=True)
+    g(repo, "init", "-q", "-b", "main")
+    (repo / "v.txt").write_text("1\n")
+    g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+    names = iter(range(100))
+
+    def branch(add="doc.txt"):
+        name = f"silkworm/tsk_c{next(names)}"
+        wt = root / name.replace("/", "_")
+        g(repo, "worktree", "add", "-q", "-b", name, str(wt), "main")
+        (wt / add).write_text("a docstring, nothing else\n")
+        g(wt, "add", "-A"); g(wt, "commit", "-qm", name)
+        return wt, name
+    return root, repo, g, branch
+
+
+def test_a_failure_only_in_the_checkout_is_the_checkouts():
+    import merge as M, verify as V
+    print("\na test failing only in the project's checkout is not the branch's fault")
+    root, repo, g, branch = _checkout_rig()
+    # The trader case: a test reading something only the live checkout has.
+    (repo / "live.txt").write_text("a stale paper report\n")
+    CMD = ("sh -c 'if [ -f live.txt ]; then echo \"  ✘ test_entry_point_runs_end_to_end\";"
+           " exit 1; fi; echo \"  ✔ fine\"'")
+    seen = []
+
+    def tests(cwd):
+        seen.append((str(cwd), g(cwd, "rev-parse", "HEAD").stdout.strip()))
+        return V.run(CMD, cwd)
+
+    before = g(repo, "rev-parse", "HEAD").stdout.strip()
+    wt, name = branch()
+    r = M.land(wt, repo, name, "main", tests, generated=[])
+    check("held at checkout-failing, not refused as breaking the base",
+          r.get("stage") == M.CHECKOUT_FAILING and not r.get("landed"), str(r)[:300])
+    check("the base is put back exactly where it was",
+          g(repo, "rev-parse", "HEAD").stdout.strip() == before)
+    check("it names the test, says the worktree's run passed, and blames the checkout",
+          "test_entry_point_runs_end_to_end" in r.get("detail", "")
+          and "worktree" in r["detail"] and "not to this branch" in r["detail"]
+          and r.get("failed") == ["test_entry_point_runs_end_to_end"], r.get("detail"))
+    check("with the base commit, for the one item to name",
+          r.get("onto") == before and r.get("base") == "main")
+    check("the third run was the checkout itself, back at the base",
+          len(seen) == 3 and seen[2] == (str(repo), before), str(seen))
+    check("it needs no person per task: the project's item speaks for it",
+          not M.needs_a_person({**r, "eligible": True}))
+    check("and its line says held, not 'waiting for you'",
+          "held" in M.summary(r, name).lower()
+          and "waiting for you" not in M.summary(r, name))
+    import digest as D
+    check("not a refusal in the digest", M.CHECKOUT_FAILING in D.NOT_REFUSALS)
+
+    # A branch that really breaks the checkout: passes in its worktree, fails
+    # with the checkout's files, and the checkout passes without it.
+    (repo / "live.txt").unlink()
+    (repo / "local.cfg").write_text("checkout only\n")
+    CMD2 = ("sh -c 'if [ -f local.cfg ] && [ -f flag.txt ]; then "
+            "echo \"  ✘ test_flag_with_config\"; exit 1; fi'")
+    wt, name = branch(add="flag.txt")
+    seen.clear()
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: seen.append(str(cwd)) or V.run(CMD2, cwd), generated=[])
+    check("a branch that really breaks the checkout is still refused at tests-after-merge",
+          r.get("stage") == "tests-after-merge" and "merging broke the base" in r["detail"]
+          and M.needs_a_person({**r, "eligible": True}), str(r)[:300])
+    check("after asking the checkout without it", seen == [str(wt), str(repo), str(repo)],
+          str(seen))
+
+    # The checkout already fails one test; the branch adds a second there.
+    CMD3 = ("sh -c 'echo \"  ✘ t_live\"; if [ -f flag2.txt ] && [ -f local.cfg ]; then "
+            "echo \"  ✘ t_branch\"; fi; [ -f local.cfg ] && exit 1; exit 0'")
+    wt, name = branch(add="flag2.txt")
+    r = M.land(wt, repo, name, "main", lambda cwd: V.run(CMD3, cwd), generated=[])
+    check("one more failure than the checkout's own is the branch's",
+          r.get("stage") == "tests-after-merge"
+          and set(r.get("failed") or []) == {"t_live", "t_branch"}, str(r)[:300])
+
+    # Neither side naming a test: nothing to compare, so it stays the branch's.
+    wt, name = branch()
+    calls = []
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: calls.append(1) or {"ran": True, "ok": len(calls) == 1,
+                                                "code": 1, "output": "Traceback ..."},
+               generated=[])
+    check("an unnamed failure stays at tests-after-merge",
+          r.get("stage") == "tests-after-merge" and len(calls) == 3, str(r)[:200])
+
+    # The checkout could not be run at the base: unknown, so not moved off the branch.
+    wt, name = branch()
+    calls = []
+    bad = {"ran": True, "ok": False, "code": 1, "output": "  ✘ t1\n", "failed": ["t1"]}
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: (calls.append(1) or
+                            [{"ran": True, "ok": True}, bad,
+                             {"ran": True, "ok": False, "launch_failure": True,
+                              "output": "  ✘ t1\n", "failed": ["t1"]}][min(len(calls), 3) - 1]),
+               generated=[])
+    check("a launch failure at the base does not clear the branch",
+          r.get("stage") == "tests-after-merge", str(r)[:200])
+
+    # A landing that passes pays nothing: two runs, as before.
+    wt, name = branch()
+    calls = []
+    r = M.land(wt, repo, name, "main",
+               lambda cwd: calls.append(1) or {"ran": True, "ok": True}, generated=[])
+    check("a clean landing runs the suite exactly twice", r.get("landed") and len(calls) == 2,
+          str(calls))
+
+
+def test_the_checkout_rerun_happens_only_after_a_post_merge_failure():
+    print("\nthe extra suite run in the checkout sits inside the post-merge failure")
+    src = (BASE / "merge.py").read_text()
+    tree = ast.parse(src)
+    land = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "land")
+    calls = [n for n in ast.walk(land) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "run_tests"]
+    check("land runs the suite three times in its source, no more",
+          len(calls) == 3, str(len(calls)))
+    fail_ifs = [n for n in ast.walk(land) if isinstance(n, ast.If)
+                and "after_merge.get('ok')" in ast.unparse(n.test)
+                and ast.unparse(n.test).startswith("not ")]
+    check("there is one post-merge failure branch", len(fail_ifs) == 1)
+    inside = {id(c) for c in ast.walk(fail_ifs[0]) if isinstance(c, ast.Call)
+              and isinstance(c.func, ast.Name) and c.func.id == "run_tests"}
+    rerun = [c for c in calls if id(c) in inside]
+    check("exactly one run is inside it, on the checkout",
+          len(rerun) == 1 and ast.unparse(rerun[0].args[0]) == "repo",
+          str([ast.unparse(c) for c in rerun]))
+    resets = [n for n in ast.walk(fail_ifs[0]) if isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Name) and n.func.id == "_git"
+              and any(isinstance(a, ast.Constant) and a.value == "reset" for a in n.args)]
+    check("and after the reset back to the base",
+          resets and all(r.lineno < rerun[0].lineno for r in resets))
+    src_bot = (BASE / "bot.py").read_text()
+    body = src_bot[src_bot.index("def land_if_ready("):src_bot.index("def record_landing(")]
+    check("land_if_ready holds a checkout-failing landing for the checkout",
+          "merge.CHECKOUT_FAILING" in body
+          and "hold_landing_for_checkout(task, result, approved)" in body)
+    fn = next(n for n in ast.parse(src_bot).body
+              if isinstance(n, ast.FunctionDef) and n.name == "land_if_ready")
+    landed = [n for n in ast.walk(fn) if isinstance(n, ast.If)
+              and "result.get('landed')" in ast.unparse(n.test)
+              and "checkout_failing" in ast.unparse(n.test)]
+    check("and a landing that passes in a failing checkout unmarks it for the beat",
+          len(landed) == 1 and any(
+              isinstance(c, ast.Call) and ast.unparse(c.func) == "basered.clear_checkout"
+              for c in ast.walk(landed[0].body[0]) if True), str(len(landed)))
+
+
+def _checkout_glue(ps, ts, suite_ok=False):
+    import threading
+    import basered as _br
+    import merge as _merge
+    import tasks as _T
+    calls = {"posts": [], "landings": [], "suite": [], "recorded": []}
+
+    class Client:
+        def chat_postMessage(self, **kw):
+            calls["posts"].append(kw)
+            return {"ts": f"{len(calls['posts'])}.0"}
+
+    class SyncThread:
+        def __init__(self, target, args=(), **kw):
+            self.target, self.args = target, args
+
+        def start(self):
+            self.target(*self.args)
+
+    def run(cmd, cwd, **kw):
+        calls["suite"].append(cwd)
+        return {"ran": True, "ok": state["ok"], "output": "" if state["ok"] else "  ✘ t1\n"}
+    state = {"ok": suite_ok}
+    ns = bot_functions(
+        "hold_landing_for_checkout", "announce_checkout", "release_checkout_hold",
+        "release_held_checkout", "_probe_checkout", "probe_failing_checkouts",
+        project_store=ps, task_store=ts, basered=_br, merge=_merge, tasks=_T,
+        threading=types.SimpleNamespace(Thread=SyncThread, Lock=threading.Lock),
+        app=types.SimpleNamespace(client=Client()), home_channel=lambda: "DHOME",
+        verify=types.SimpleNamespace(run=run), _repo_lock=lambda cwd: None,
+        branches=types.SimpleNamespace(name_for=lambda t: "silkworm/" + t["id"]),
+        start_landing=lambda tid, approved=False: calls["landings"].append((tid, approved)) or True,
+        record_landing=lambda task, outcome: calls["recorded"].append((task["id"], outcome)),
+        CHECKOUT_PROBE_S=3600, _checkout_probed_at={}, _base_probes=set(),
+        _base_probes_guard=threading.Lock())
+    return ns, calls, state
+
+
+def test_a_failing_checkout_holds_landings_under_one_item():
+    import merge as M
+    import tasks as T
+    import basered as B
+    print("\na failing checkout holds its landings under one needs-you item")
+    ps, ts = _red_stores()
+    ns, calls, suite = _checkout_glue(ps, ts)
+    held = {"eligible": True, "landed": False, "stage": M.CHECKOUT_FAILING,
+            "branch": "b", "base": "main", "onto": "c" * 40,
+            "failed": ["tests/test_paper_report.py::test_entry_point_runs_end_to_end"],
+            "detail": "x"}
+    ids = []
+    for approved in (True, False, True):
+        t = ts.create("change", project="trader", role="implementor", driver="queue",
+                      state=T.AWAITING_APPROVAL)
+        ids.append(t["id"])
+        out = ns["hold_landing_for_checkout"](t, {**held, "branch": t["id"]}, approved)
+        check("the outcome stays checkout-failing, needing no person",
+              out["stage"] == M.CHECKOUT_FAILING and not M.needs_a_person(out))
+        ts.update(t["id"], result={"landing": {"stage": M.CHECKOUT_FAILING}})
+    items = [t for t in ts.all().values() if t.get("source") == B.CHECKOUT_SOURCE]
+    check("three landings, one needs-you item for the project",
+          len(items) == 1 and items[0]["state"] == T.NEEDS_INPUT
+          and items[0]["project"] == "trader", str(len(items)))
+    check("naming the test", "test_entry_point_runs_end_to_end" in items[0]["goal"])
+    check("announced once", len(calls["posts"]) == 1, str(len(calls["posts"])))
+    check("the project is marked", ps.get("trader")["checkout_failing"]["sha"] == "c" * 40)
+    check("each task remembers it, and whether it was approved",
+          [ts.get(i)["held_checkout"]["approved"] for i in ids] == [True, False, True])
+    check("not mistaken for a failing base: implementor work is not paused",
+          "trader" not in B.failing(ps) and not B.stranded(ps, ts))
+
+    # The hourly look: still failing holds everything; and not again within the hour.
+    ns["_checkout_probed_at"]["trader"] = 0
+    ns["probe_failing_checkouts"](now=10_000)
+    check("a still-failing checkout releases nothing",
+          not calls["landings"] and len(calls["suite"]) == 1
+          and "trader" in B.checkout_failing(ps))
+    ns["probe_failing_checkouts"](now=10_100)
+    check("and is not run again within the hour", len(calls["suite"]) == 1)
+
+    # It passes: every held landing goes again, approved as it was; the item closes.
+    t_gone = ts.get(ids[1])
+    ts.transition(t_gone["id"], T.CANCELLED, "dropped")
+    # Retried meanwhile: queued again with its old landing record and mark.
+    retried = ts.create("change", project="trader", role="implementor", driver="queue",
+                        state=T.QUEUED)
+    B.hold_checkout(ts, retried["id"], "c" * 40, True)
+    ts.update(retried["id"], result={"landing": {"stage": M.CHECKOUT_FAILING}})
+    suite["ok"] = True
+    ns["probe_failing_checkouts"](now=20_000)
+    check("a passing checkout lands the held tasks again, approved as before",
+          calls["landings"] == [(ids[0], True), (ids[2], True)], str(calls["landings"]))
+    check("a task cancelled meanwhile only loses its mark",
+          not ts.get(ids[1]).get("held_checkout"))
+    check("and one retried meanwhile is not landed half-done",
+          retried["id"] not in [x for x, _ in calls["landings"]]
+          and not ts.get(retried["id"]).get("held_checkout"))
+    check("every mark is gone and the project unmarked",
+          not any(ts.get(i).get("held_checkout") for i in ids)
+          and not ps.get("trader").get("checkout_failing"))
+    check("and the item is closed", ts.get(items[0]["id"])["state"] in T.ENDED)
+
+    # Closing the item is a person's word that it is fixed: no suite needed.
+    t = ts.create("change", project="trader", role="implementor", driver="queue",
+                  state=T.DONE)
+    ns["hold_landing_for_checkout"](t, held, False)
+    ts.update(t["id"], result={"landing": {"stage": M.CHECKOUT_FAILING}})
+    item = ps.get("trader")["checkout_failing"]["attention"]
+    check("a new failure opens a new item", item != items[0]["id"]
+          and ts.get(item)["state"] == T.NEEDS_INPUT)
+    ts.transition(item, T.DONE, "fixed it")
+    before_suite = len(calls["suite"])
+    ns["probe_failing_checkouts"](now=20_100)
+    check("a closed item releases its landings without running the suite",
+          calls["landings"][-1] == (t["id"], False) and len(calls["suite"]) == before_suite,
+          str(calls["landings"]))
+
+    # Stranded: held, but the project no longer marked (a crash part-way).
+    t = ts.create("change", project="trader", role="implementor", driver="queue",
+                  state=T.DONE)
+    B.hold_checkout(ts, t["id"], "d" * 40, True)
+    ts.update(t["id"], result={"landing": {"stage": M.CHECKOUT_FAILING}})
+    ns["probe_failing_checkouts"](now=30_000)
+    check("a held landing left over a released checkout is sent on",
+          calls["landings"][-1] == (t["id"], True) and not ts.get(t["id"]).get("held_checkout"))
+
+    # A hold that cannot be written must not leave the landing looking held.
+    ns2, _, _ = _checkout_glue(ps, ts)
+    ns2["basered"] = types.SimpleNamespace(
+        mark_checkout=lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    t = ts.create("change", project="trader", role="implementor", driver="queue")
+    out = ns2["hold_landing_for_checkout"](t, held, True)
+    check("a hold that fails falls back to a refusal someone sees",
+          out["stage"] == "tests-after-merge" and M.needs_a_person(out)
+          and "could not be held" in out["detail"], str(out)[:200])
+    src = (BASE / "bot.py").read_text()
+    body = src[src.index("def execute_task("):]
+    body = body[:body.index("progress = ProgressMessage(")]
+    check("a task run again drops its checkout hold, as it drops its base hold",
+          "held_checkout=None" in body)
 
 
 def test_base_recovery_releases_held_work():

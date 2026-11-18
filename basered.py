@@ -274,3 +274,138 @@ def stranded(project_store, task_store) -> dict[str, list[dict]]:
     for rows in out.values():
         rows.sort(key=lambda t: t.get("created") or 0)
     return out
+
+
+# --- a checkout that fails the suite its own base passes ----------------------
+#
+# The other half of the same question, asked from the other side. A landing
+# runs the suite twice on one commit: in the task's worktree after the rebase,
+# and in the project's own checkout after the fast-forward. When the second
+# fails and the first passed, the tree is identical, so what differs is the
+# checkout -- its untracked or live files, .env, data/. merge.land asks the
+# checkout once more at the base without the branch, and if the same tests
+# fail there the landing comes back at stage merge.CHECKOUT_FAILING.
+#
+# That is not the branch's to fix, and not the base's either: a clean checkout
+# of the base passes. So it gets what a failing base gets, kept apart from it:
+# the project is marked `checkout_failing`, gets one needs-you item, and the
+# landing is held (`held_checkout`) rather than refused. Implementor work is not
+# paused -- the work is fine; only landing in that checkout is not. It is landed
+# again when the checkout passes (a later landing there succeeds, or the
+# periodic look finds the suite green) or when a person closes the item.
+
+#: The `source` of a failing checkout's one needs-you item.
+CHECKOUT_SOURCE = "checkout-red"
+
+
+def checkout_line(slug: str, state: dict) -> str:
+    """The one line a failing checkout gets, wherever it is shown."""
+    return f"{slug} checkout fails tests its base passes: {named(state.get('tests'))}"
+
+
+def _checkout_goal(slug: str, state: dict, cwd: str = "") -> str:
+    tests = state.get("tests") or []
+    listing = "\n".join(f"  {t}" for t in tests) or "  (the run named no test)"
+    return (f"{slug}'s checkout{f' at {cwd}' if cwd else ''} fails its own test "
+            f"suite on {state.get('base') or 'its base branch'} at "
+            f"{(state.get('sha') or '')[:12]}, with or without a landing's branch on "
+            f"it, while the same tree passes in a clean worktree. Failing there:\n\n"
+            f"{listing}\n\nSo the failure comes from something the checkout has "
+            "that a fresh checkout does not -- untracked or live files, .env, "
+            "data/ -- not from any branch. Landings are held rather than refused "
+            "until the checkout passes; they are landed again on their own then, "
+            "or when this item is closed.")
+
+
+def mark_checkout(project_store, task_store, slug: str, result: dict,
+                  base: str = "", scope: dict | None = None) -> tuple[dict, bool]:
+    """Record that `slug`'s checkout fails, and see it has one needs-you item.
+
+    `result` is a merge.CHECKOUT_FAILING landing outcome ({failed, onto}).
+    Returns (state, news); `news` only the first time. Every later landing held
+    the same way updates the wording of the one item rather than opening more.
+    """
+    with _state_lock:
+        rec = project_store.get(slug) or {}
+        prior = rec.get("checkout_failing") or {}
+        state = {"sha": result.get("onto") or result.get("sha") or "",
+                 "base": base or result.get("base") or prior.get("base") or "",
+                 "tests": list(result.get("checkout_failed") or result.get("failed") or []),
+                 "since": prior.get("since") or time.time(),
+                 "attention": prior.get("attention") or ""}
+        item = task_store.get(state["attention"]) if state["attention"] else None
+        scope = dict(scope or rec.get("scope") or {})
+        title = checkout_line(slug, state)[:80]
+        goal = _checkout_goal(slug, state, scope.get("cwd") or "")
+        if item and item.get("state") not in tasks.ENDED:
+            task_store.update(item["id"], title=title, goal=goal)
+        else:
+            item = task_store.create(
+                goal, title=title, state=tasks.NEEDS_INPUT, role="assistant",
+                driver="queue", isolate=False, source=CHECKOUT_SOURCE,
+                source_ref=f"{slug}@{state['sha'][:12]}", project=slug, scope=scope)
+            state["attention"] = item["id"]
+        project_store.update(slug, checkout_failing=state)
+        return state, not prior
+
+
+def hold_checkout(task_store, tid: str, sha: str, approved: bool = False) -> None:
+    """Note on a task that its landing waits on its project's checkout."""
+    task_store.update(tid, held_checkout={"sha": sha, "approved": bool(approved),
+                                          "at": time.time()})
+
+
+def checkout_failing(project_store) -> set:
+    """Projects whose checkout is known to fail tests its base passes."""
+    return {p["slug"] for p in project_store.all() if p.get("checkout_failing")}
+
+
+def held_for_checkout(task_store, slug: str) -> list[dict]:
+    """The project's tasks whose landing waits on its checkout, oldest first."""
+    return sorted((t for t in task_store.all().values()
+                   if t.get("held_checkout") and (t.get("project") or "") == slug),
+                  key=lambda t: t.get("created") or 0)
+
+
+def checkout_item_closed(project_store, task_store, slug: str) -> bool:
+    """Whether a person has closed the failing checkout's item: their word
+    that it is fixed, worth a landing again (which runs the suite anyway)."""
+    state = (project_store.get(slug) or {}).get("checkout_failing") or {}
+    item = task_store.get(state.get("attention") or "") if state else None
+    return bool(state) and bool(item) and item.get("state") in tasks.ENDED
+
+
+def clear_checkout(project_store, task_store, slug: str, why: str) -> tuple[dict, list]:
+    """The checkout passes (or a person says it does): clear the mark and close
+    the item. Returns (the state cleared, the tasks held), or ({}, []) if the
+    project was not marked. Releasing them is the caller's; each keeps its
+    `held_checkout` until then, so a crash part-way leaves them findable
+    (`stranded_checkout`)."""
+    with _state_lock:
+        rec = project_store.get(slug) or {}
+        state = rec.get("checkout_failing") or {}
+        if not state:
+            return {}, []
+        project_store.update(slug, checkout_failing=None)
+        item = task_store.get(state.get("attention") or "")
+        if item and item.get("state") not in tasks.ENDED + (tasks.RUNNING,):
+            to = tasks.CANCELLED if item.get("state") == tasks.QUEUED else tasks.DONE
+            try:
+                task_store.transition(item["id"], to, why[:200])
+            except Exception:
+                log.exception("could not close %s", item["id"])
+        log.warning("%s's checkout: %s", slug, why)
+        return state, held_for_checkout(task_store, slug)
+
+
+def stranded_checkout(project_store, task_store) -> dict[str, list[dict]]:
+    """Tasks held for a checkout whose project is no longer marked failing."""
+    red = checkout_failing(project_store)
+    out: dict[str, list[dict]] = {}
+    for t in task_store.all().values():
+        slug = t.get("project") or ""
+        if t.get("held_checkout") and slug not in red:
+            out.setdefault(slug, []).append(t)
+    for rows in out.values():
+        rows.sort(key=lambda t: t.get("created") or 0)
+    return out

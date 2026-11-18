@@ -342,6 +342,10 @@ FIELDS: dict[str, tuple] = {
     # and verified or landed again once the base passes. {kind: verify |
     # landing, sha, approved, at} or None.
     "held_base":       (None,  "held while the base fails the same tests: {kind, sha, approved, at}"),
+    # Set while this task's landing waits on its project's own checkout,
+    # which fails tests the identical tree passes elsewhere (basered.py,
+    # checkout section). Landed again once the checkout passes.
+    "held_checkout":   (None,  "landing held while the checkout fails tests its base passes: {sha, approved, at}"),
     "verify_attempts": (0,     "times it was sent back for failing tests"),
     "commit_attempts": (0,     "times it was sent back for leaving its work uncommitted"),
     # Each once at most, and only on projects that take unsupervised work:

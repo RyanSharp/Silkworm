@@ -1289,6 +1289,9 @@ def project_line(rec: dict, brief: str = "", excerpt: int = 300) -> str:
             f"{scope.get('cwd') or ''} — {ready}; {json.dumps(settings)}")
     if rec.get("main_failing"):
         head += f"; base failing its own tests: {json.dumps(rec['main_failing'])[:200]}"
+    if rec.get("checkout_failing"):
+        head += (f"; checkout failing tests its base passes (landings held): "
+                 f"{json.dumps(rec['checkout_failing'])[:200]}")
     return head + (f"\n  brief: {_clip(' '.join(brief.split()), excerpt)}" if brief else "")
 
 

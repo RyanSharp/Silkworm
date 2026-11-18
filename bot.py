@@ -2541,7 +2541,8 @@ def take_step(action: str, payload: dict) -> dict:
     # the base while that branch is mid-landing, or after it was refused,
     # would release without the work and then close the task as if it had.
     landing = (task.get("result") or {}).get("landing") or {}
-    if (landing.get("stage") in (LANDING_UNDERWAY, merge.BASE_FAILING)
+    if (landing.get("stage") in (LANDING_UNDERWAY, merge.BASE_FAILING,
+                                 merge.CHECKOUT_FAILING)
             or merge.needs_a_person(landing)):
         return {"ok": False, "error": f"its branch has not landed ({landing.get('stage')}); "
                                       "land it first -- mark this Done, then Land it "
@@ -4655,6 +4656,10 @@ def execute_task(task: dict) -> None:
         # Running again -- retried by a person -- is no longer waiting on the
         # base; left on, release_held would act on it later, mid-review.
         task_store.update(tid, held_base=None)
+    if task.get("held_checkout"):
+        # Likewise for a landing held for its checkout: this run's branch is
+        # not the one that was held, and must not be landed half-done.
+        task_store.update(tid, held_checkout=None)
 
     progress = ProgressMessage(app.client, channel, thread_ts)
 
@@ -5287,6 +5292,167 @@ def hold_landing_for_base(task: dict, result: dict, approved: bool) -> dict | No
                        f"{(state.get('sha') or '')[:8]} with no change on it "
                        f"({basered.named(result.get('failed'))}); landed again "
                        "once the base passes")}
+
+
+def hold_landing_for_checkout(task: dict, result: dict, approved: bool) -> dict:
+    """A landing that failed only in the project's own checkout, held.
+
+    merge.land has already shown it: the identical tree passed in the
+    worktree, and the checkout fails the same tests at the base with the
+    branch taken back out. So the project gets its one needs-you item (once,
+    however many landings hit it) and the task a mark, instead of a refusal
+    accusing the branch of breaking main. Landed again, asked for the same
+    way, once the checkout passes (release_checkout_hold).
+    """
+    slug = task.get("project") or ""
+    try:
+        state, news = basered.mark_checkout(
+            project_store, task_store, slug, result, result.get("base") or "",
+            scope=project_store.scope_for(slug))
+        basered.hold_checkout(task_store, task["id"], state.get("sha", ""), approved)
+        # It just failed there; the hourly look starts an hour from now.
+        _checkout_probed_at[slug] = time.time()
+    except Exception:
+        log.exception("holding %s's landing for %s's checkout failed",
+                      task.get("id"), slug)
+        # Unheld, it must not read as held: nothing would ever look at it
+        # again. A refusal is wrong about whose fault it is, but is seen.
+        return {**result, "stage": "tests-after-merge",
+                "detail": ("could not be held for the checkout, so refused instead: "
+                           + str(result.get("detail") or ""))[:600]}
+    if news:
+        announce_checkout(slug, state)
+    return result
+
+
+def announce_checkout(slug: str, state: dict) -> None:
+    """Say once that a project's checkout fails what its base passes, and make
+    that message the thread of its one needs-you item."""
+    channel = home_channel()
+    if not channel:
+        return
+    cwd = project_store.scope_for(slug).get("cwd") or "its checkout"
+    try:
+        resp = app.client.chat_postMessage(
+            channel=channel,
+            text=(f":warning: *{basered.checkout_line(slug, state)}*\n"
+                  f"_{cwd} fails these on {state.get('base') or 'the base'} at "
+                  f"`{(state.get('sha') or '')[:8]}` with or without a landing's "
+                  "branch, while the same tree passes in a clean worktree -- so it "
+                  "is something in the checkout (untracked or live files, .env, "
+                  "data/), not a branch. Landings there are held, not refused, "
+                  "and go again once it passes or this is closed._"))
+        if state.get("attention"):
+            task_store.update(state["attention"], thread=f"{channel}:{resp['ts']}")
+    except Exception:
+        log.exception("announcing %s's failing checkout failed", slug)
+
+
+def release_checkout_hold(slug: str, why: str) -> list[str]:
+    """The checkout passes again (or a person says so): send held landings on."""
+    state, _held = basered.clear_checkout(project_store, task_store, slug, why)
+    if not state:
+        return []
+    return release_held_checkout(slug)
+
+
+def release_held_checkout(slug: str) -> list[str]:
+    """Land again every task held for `slug`'s checkout, approved as before.
+
+    Only if it is still where the hold left it: a task cancelled since, or one
+    whose landing has moved on, just loses the mark. A landing that fails in
+    the checkout again simply holds again, under a fresh item.
+    """
+    released = []
+    for t in basered.held_for_checkout(task_store, slug):
+        if slug in basered.checkout_failing(project_store):
+            break                                   # failing again meanwhile
+        tid, hc = t["id"], t.get("held_checkout") or {}
+        landing = (t.get("result") or {}).get("landing") or {}
+        try:
+            task_store.update(tid, held_checkout=None)
+            # Only from where a landing is asked for: finished, or waiting
+            # on approval. Anything else has since been retried or dropped.
+            if (landing.get("stage") == merge.CHECKOUT_FAILING
+                    and t.get("state") in (tasks.DONE, tasks.AWAITING_APPROVAL)):
+                if not start_landing(tid, approved=bool(hc.get("approved"))):
+                    record_landing(t, {
+                        "eligible": True, "landed": False, "stage": "held-released",
+                        "branch": branches.name_for(t),
+                        "detail": "the checkout passes again, but its landing could "
+                                  "not be restarted; Land it from its card"})
+                released.append(tid)
+        except Exception:
+            log.exception("could not release %s after %s's checkout passed", tid, slug)
+    return released
+
+
+#: How often a failing checkout's suite is run again to see whether it passes.
+#: A whole suite in the person's own checkout, so far apart, and skipped while
+#: anything else holds that checkout.
+CHECKOUT_PROBE_S = 3600
+_checkout_probed_at: dict[str, float] = {}
+
+
+def _probe_checkout(slug: str) -> None:
+    """Run the suite in a failing checkout, as it stands, and release on a pass."""
+    proj = project_store.get(slug) or {}
+    if not proj.get("checkout_failing"):
+        return
+    cmd = (proj.get("test_cmd") or "").strip()
+    cwd = project_store.scope_for(slug).get("cwd") or ""
+    if not cmd or not cwd:
+        # Nothing can prove it failing any more: let held work try again.
+        release_checkout_hold(slug, "no test command or checkout to ask any more")
+        return
+    lock = _repo_lock(cwd)
+    if lock is not None and not lock.acquire(blocking=False):
+        return                         # a turn or landing has it; next time
+    try:
+        r = verify.run(cmd, cwd, project=slug, retry_launch=True)
+    finally:
+        if lock is not None:
+            lock.release()
+    if r.get("ran") and r.get("ok"):
+        release_checkout_hold(slug, "its suite passes there again")
+
+
+def probe_failing_checkouts(now: float | None = None) -> list[str]:
+    """Release held landings of a checkout a person has closed the item for,
+    or that is no longer marked; and, hourly, run the suite in each failing
+    checkout to see if it passes now. Never runs a suite on the caller's
+    thread. Returns the slugs started."""
+    now = time.time() if now is None else now
+    jobs = []
+    for slug in sorted(basered.checkout_failing(project_store)):
+        if basered.checkout_item_closed(project_store, task_store, slug):
+            jobs.append((slug, lambda s: release_checkout_hold(s, "its item was closed")))
+        elif now - _checkout_probed_at.get(slug, 0) >= CHECKOUT_PROBE_S:
+            jobs.append((slug, _probe_checkout))
+    jobs += [(slug, release_held_checkout) for slug in sorted(
+        basered.stranded_checkout(project_store, task_store))]
+    started = []
+    for slug, job in jobs:
+        key = f"checkout:{slug}"
+        with _base_probes_guard:
+            if key in _base_probes:
+                continue
+            _base_probes.add(key)
+            _checkout_probed_at[slug] = now
+
+        def run(slug=slug, job=job, key=key):
+            try:
+                job(slug)
+            except Exception:
+                log.exception("looking at %s's checkout failed", slug)
+            finally:
+                with _base_probes_guard:
+                    _base_probes.discard(key)
+
+        threading.Thread(target=run, daemon=True,
+                         name=f"checkoutprobe-{slug[:12]}").start()
+        started.append(slug)
+    return started
 
 
 #: Projects being asked about right now, so the beat does not start a second
@@ -6183,6 +6349,17 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     # again, on a checkout of its own.
     if result.get("stage") in ("tests-after-rebase", "tests-after-merge"):
         result = hold_landing_for_base(task, result, approved) or result
+    elif result.get("stage") == merge.CHECKOUT_FAILING:
+        result = hold_landing_for_checkout(task, result, approved)
+    elif result.get("landed") and (project_store.get(task.get("project") or "")
+                                   or {}).get("checkout_failing"):
+        # The suite just passed in that very checkout, so whatever made it
+        # fail there is gone. Only unmarked here: the beat sends on what was
+        # held (probe_failing_checkouts, as stranded), under the one key that
+        # keeps two releases of the same tasks from running at once.
+        basered.clear_checkout(project_store, task_store, task["project"],
+                               f"a landing passed its suite there at "
+                               f"{str(result.get('head') or '')[:8]}")
     return result
 
 
@@ -7311,6 +7488,8 @@ def _task_scheduler() -> None:
             # A failing base is watched for the commit that fixes it: nothing
             # else would ask, since its implementor work is not being started.
             probe_failing_bases()
+            # And a failing checkout for the moment it passes, or is closed.
+            probe_failing_checkouts()
             # Anything waiting on a task that ended is waiting for nothing.
             # Released here as well as when the blocker ends, so a task
             # stranded by a crash in between still reaches the board.

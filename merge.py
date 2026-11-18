@@ -49,6 +49,13 @@ def _git(cwd, *args, timeout: int = 300):
 #: change on it: held until the base passes, not refused. See basered.py.
 BASE_FAILING = "base-failing"
 
+#: A landing whose suite passed in its worktree and then failed in the
+#: project's own checkout on the identical commit -- and fails the same tests
+#: there with the branch taken back out. The failure is the checkout's
+#: (untracked or live files, .env, data/), not the change's: held until the
+#: checkout passes, not refused. See basered.py's checkout section.
+CHECKOUT_FAILING = "checkout-failing"
+
 
 def _fail(stage: str, detail: str) -> dict:
     return {"landed": False, "stage": stage, "detail": detail.strip()[-600:]}
@@ -76,6 +83,41 @@ def _tests_failed(stage: str, why: str, result: dict) -> dict:
     return {"landed": False, "stage": stage, "failed": failed,
             "detail": f"{why}:\n{named[:450]}\n--- output tail ---\n"
                       + output.strip()[-250:]}
+
+
+def _named_failures(result: dict) -> list[str]:
+    """The tests a run failed, by name; empty for a pass or an unnamed failure."""
+    if not result or result.get("ok"):
+        return []
+    return list(result.get("failed")
+                or verify.failed_tests(str(result.get("output", ""))))
+
+
+def _checkout_owns(after_merge: dict, at_base: dict) -> bool:
+    """Whether a post-merge failure is the checkout's rather than the branch's.
+
+    True only when the checkout, put back to the base with no branch on it,
+    still fails every test the merge failed, by name. A base that passes there
+    -- or fails other tests, or fails without naming any, or could not be run
+    at all -- leaves the failure where it was: on the branch.
+    """
+    if not at_base or not at_base.get("ran", True) or at_base.get("ok"):
+        return False
+    if verify.launch_failure(at_base):
+        return False
+    mine = set(_named_failures(after_merge))
+    return bool(mine) and mine <= set(_named_failures(at_base))
+
+
+def _checkout_detail(base_name: str, before: str, failed) -> str:
+    shown = ", ".join(failed[:6]) + (f" and {len(failed) - 6} more"
+                                     if len(failed) > 6 else "")
+    return (f"{shown[:280]} failed in the {base_name!r} checkout after the fast-forward, "
+            f"and fail there just the same at {before[:8]} with the branch taken "
+            f"back out. The worktree's run of the identical tree passed, so the "
+            f"failure belongs to the checkout -- its untracked or live files, "
+            f".env, data/ -- not to this branch. Nothing was merged; it lands "
+            f"again once the checkout passes.")
 
 
 def _on_origin(repo, base_name: str) -> str:
@@ -344,6 +386,30 @@ def land(worktree, repo, branch: str, base: str, run_tests,
                     (Path(repo) / rel).write_bytes(data)
                 except OSError:
                     log.exception("could not put back %s after the reset", rel)
+        # 5b. Who broke it? The tree that just failed here is the tree that
+        # passed in the worktree at step 2, file for file, so a failure only
+        # here can come from what this checkout has and the worktree does not
+        # -- untracked files, live data, a .env -- rather than from the change.
+        # On 2026-11-17 three unrelated trader branches, one changing only a
+        # docstring, were each refused here as having broken main over one
+        # test that read the checkout's live paper report.
+        #
+        # So ask the checkout once more, back at `before`, without the branch.
+        # Only on this path: a landing that passed step 5 pays nothing for it.
+        # And only when it fails *every* test the merge failed (by name) does
+        # the blame move: a test the base passes here is one the branch broke,
+        # and a run that names nothing cannot be compared, so both stay the
+        # branch's -- the same rule basered.only_failing_on_base keeps.
+        at_base = run_tests(repo)
+        if _checkout_owns(after_merge, at_base):
+            failed = _named_failures(after_merge)
+            log.error("landing %s: %s fails %s in its checkout with or without "
+                      "the branch; the checkout's, not the branch's", branch,
+                      base_name, ", ".join(failed[:4]))
+            return {"landed": False, "stage": CHECKOUT_FAILING, "failed": failed,
+                    "checkout_failed": _named_failures(at_base),
+                    "base": base_name, "onto": before,
+                    "detail": _checkout_detail(base_name, before, failed)}
         log.error("landing %s broke %s; reset back to %s", branch, base_name, before[:8])
         return {**_tests_failed("tests-after-merge",
                                 "merging broke the base, so it was put back",
@@ -448,8 +514,9 @@ def needs_a_person(outcome: dict) -> bool:
     had. Only the second needs someone.
     """
     return (bool(outcome.get("eligible")) and not outcome.get("landed")
-            # Held for the base, which has its own one item: see basered.py.
-            and outcome.get("stage") != BASE_FAILING)
+            # Held for the base, or for the checkout, each with its own one
+            # item for the project: see basered.py.
+            and outcome.get("stage") not in (BASE_FAILING, CHECKOUT_FAILING))
 
 
 def summary(result: dict, branch: str) -> str:
@@ -468,7 +535,7 @@ def summary(result: dict, branch: str) -> str:
         if result.get("detail"):
             line += f"\n```\n{result['detail'][-800:]}\n```"
         return line
-    if result.get("stage") == BASE_FAILING:
+    if result.get("stage") in (BASE_FAILING, CHECKOUT_FAILING):
         return f":pause_button: _Landing held: {result.get('detail', '')[-600:]}_"
     if not result.get("eligible", True):
         # Never reached git, so there is no branch waiting and no output to

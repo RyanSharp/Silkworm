@@ -474,6 +474,12 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
         row["main_failing"] = ({"line": basered.line(slug, red), "sha": red.get("sha"),
                                 "tests": list(red.get("tests") or []),
                                 "since": red.get("since")} if red else None)
+        # And while its own checkout fails tests the base passes elsewhere.
+        bad = p.get("checkout_failing") or None
+        row["checkout_failing"] = ({"line": basered.checkout_line(slug, bad),
+                                    "sha": bad.get("sha"),
+                                    "tests": list(bad.get("tests") or []),
+                                    "since": bad.get("since")} if bad else None)
         row["release"] = releases_by_slug.get(slug)
         row["health"] = health.board_line(health_by.get(slug, ()))
         out.append(row)

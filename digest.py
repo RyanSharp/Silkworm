@@ -39,7 +39,7 @@ LIST_LIMIT = 5
 
 #: Landing stages that are not refusals even when merge.needs_a_person would
 #: say so: still going (bot.LANDING_UNDERWAY), or dropped on purpose.
-NOT_REFUSALS = ("in-progress", "dropped", merge.BASE_FAILING)
+NOT_REFUSALS = ("in-progress", "dropped", merge.BASE_FAILING, merge.CHECKOUT_FAILING)
 
 #: "Stuck" is measured against how long tasks usually sit in a state -- three
 #: times the median -- but never less than these, so a history of instant
