@@ -21396,10 +21396,10 @@ def test_dashboard_polls_without_redrawing():
     js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
     for name in ("readJSON", "setHTML", "renderList", "cardHtml", "freshAges", "poller",
                  "taskRead", "openMore", "moreToggled", "rowMore", "rowWhy", "taskBody",
-                 "transcriptHead", "messageHtml", "filesHtml", "openSession"):
+                 "transcriptHead", "messageHtml", "drawerHtml", "openSession"):
         check(f"{name}() is defined", re.search(rf"function\s+{name}\b", js) is not None)
     check("the transcript's parts are in the page",
-          all(f'id="{i}"' in V.PAGE for i in ("thead", "tmsgs", "tfiles")))
+          all(f'id="{i}"' in V.PAGE for i in ("thead", "tmsgs", "tlive", "attdrawer", "imgview")))
     node = shutil.which("node")
     if not node:
         print("  … node not installed — cannot run the page's own javascript")
@@ -24321,11 +24321,13 @@ function mk(id) {
     appendChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1);
                      this.children.push(c); c.parent = this; },
     remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); },
-    scrollIntoView(){}, focus(){}};
+    scrollIntoView(){}, focus(){}, attrs: {}, setAttribute(k, v) { this.attrs[k] = String(v); }};
   Object.defineProperty(e, "innerHTML", {get() { return this._inner; },
-    set(v) { this._inner = v; this.children.length = 0; }});
+    set(v) { this._inner = v; this.children.length = 0; this._sets = (this._sets || 0) + 1; }});
   return e;
 }
+// An element's markup with its children's: a turn's line is made of elements.
+const D = e => (e._inner || "") + (e.children || []).map(D).join("");
 const els = {};
 const byId = id => els[id] || (els[id] = mk(id));
 const bodyCls = new Set();
@@ -24352,8 +24354,10 @@ globalThis.getComputedStyle = () => ({lineHeight: "22px", paddingTop: "10px", pa
                                       borderTopWidth: "1px", borderBottomWidth: "1px"});
 (0, eval)(__JS__ + `
 ;globalThis.__p = {chatItems, toolsLabel, chatHtml, drawChat, toggleTools, chatOpen, chatEls,
+  toggleCall, callOpen, fmtMs, placeFiles, drawerHtml, openDrawer, closeDrawer, drawerIsOpen,
+  threadFiles, renderChips, addFiles, dropFile, staged, viewImage, closeViewer, viewerIsOpen,
   alertParts, renderAlerts, alertCount: () => alertList.length, defaultKind, setKind,
-  kind: () => threadKind, chatHead, growReply, jumpTo, filesHtml, keepEnd, cardHtml, freshAges, transcriptHead,
+  kind: () => threadKind, chatHead, growReply, jumpTo, keepEnd, cardHtml, freshAges, transcriptHead,
   answeredAgo: s => readCache.set("/api/sessions", {etag: "x", data: {}, at: Date.now() - s * 1000}),
   forgetAnswer: () => readCache.delete("/api/sessions"),
   setLast: s => { lastSessions = s; }, getActive: () => active, setActive: a => { active = a; },
@@ -24383,15 +24387,22 @@ out.labels = items.filter(i => i.kind === "tools").map(P.toolsLabel);
 out.thinkingOnly = P.toolsLabel(P.chatItems([T("assistant", {type: "thinking", text: "x"})])[0]);
 const fixed = items[2];
 out.bubbleUsage = !!fixed.usage && fixed.model === "claude-opus-5-5";
-out.groupUsage = items[1].parts.some(p => p.usage && p.model);
+out.groupUsage = items[1].usage.some(u => u.usage && u.model);
 const firstTools = items[1];
-const closed = P.chatHtml(firstTools);
-out.closed = {pre: closed.includes("<pre>"), usage: closed.includes('class="usage"'), label: closed.includes("ran 3 tools")};
+P.chatEls.clear();
+const pre = byId("tmsgsPre");
+P.drawChat(pre, msgs, "s");
+const toolDiv = P.chatEls.get(firstTools.id);
+const closed = D(toolDiv);
+out.closed = {pre: closed.includes("<pre>"), usage: closed.includes('class="usage"'),
+              label: closed.includes("Bash ×2 · Read ×1 · Edit ×1")};
 P.chatOpen.add(firstTools.id);
-const opened = P.chatHtml(firstTools);
+P.callOpen.add(firstTools.id + "/0");
+P.drawChat(pre, msgs, "s");
+const opened = D(toolDiv);
 out.opened = {pre: opened.includes("<pre>ls</pre>"), usage: opened.includes('class="usage"'),
-              bash: opened.includes("⚙ Bash"), result: opened.includes("↳ result")};
-P.chatOpen.clear();
+              bash: opened.includes('class="cname">Bash<'), result: opened.includes("<pre>a b</pre>")};
+P.chatOpen.clear(); P.callOpen.clear(); P.chatEls.clear();
 out.bubbleHtml = P.chatHtml(fixed);
 out.plainBubble = P.chatHtml(items[0]);
 // Keyed drawing: earlier items keep their elements as the thread grows, and
@@ -24403,11 +24414,11 @@ P.drawChat(box, msgs.slice(0, 6), "s");
 const firstEls = box.children.slice();
 out.drawn1 = firstEls.length;
 P.toggleTools(firstTools.id);
-out.openAfterToggle = box.children[1]._inner.includes("<pre>ls</pre>");
+out.openAfterToggle = D(box.children[1]).includes('class="chain"');
 P.drawChat(box, msgs, "s");
 out.drawn2 = box.children.length;
 out.kept = firstEls.every((e, i) => box.children[i] === e);
-out.stillOpen = box.children[1]._inner.includes("<pre>ls</pre>") && box.children[1]._inner.includes("make");
+out.stillOpen = D(box.children[1]).includes('class="chain"') && D(box.children[1]).includes("Edit");
 P.drawChat(box, [], "");
 out.empty = box.innerHTML.includes("No messages yet");
 // Alerts: one count for the laptop's bar and the phone's ⚠.
@@ -24501,8 +24512,6 @@ main.scrollTop = 1500; P.onScroll();                     // mid-glide
 P.keepEnd(() => { main.scrollHeight = 3200; });
 out.glide = [main.scrollTop, byId("jumppill").classList.contains("show")];
 delete main.scrollTo;
-out.filesCompact = P.filesHtml([{direction: "in", exists: true, path: "/p/a.png", name: "a.png", size: 2048}], true);
-out.filesGone = P.filesHtml([{direction: "out", exists: false, pruned: 1700000000, name: "old.log", size: 10}]);
 // On a laptop too: the same chat, and the same pill when read further up.
 wide = true;
 byId("jumppill").classList.toggle("show", false);
@@ -24568,15 +24577,15 @@ P.keepEnd(() => { main.scrollHeight = 2400; });
 out.openedNotYanked = [main.scrollTop, byId("jumppill").classList.contains("show")];
 P.toggleTools(toolsId); for (const [f] of later.splice(0)) f(); runFrames();
 P.toggleTools(toolsId);
-out.openBeforeFrame = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>")];
+out.openBeforeFrame = [toolsEl().classList.contains("open"), D(toolsEl()).includes('class="chain"')];
 runFrames();
 out.openAfterFrame = toolsEl().classList.contains("open");
 later.length = 0;
 P.toggleTools(toolsId);
-out.closing = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>"),
+out.closing = [toolsEl().classList.contains("open"), D(toolsEl()).includes('class="chain"'),
                later.map(l => l[1])];
 for (const [f] of later.splice(0)) f();
-out.closed2 = toolsEl()._inner.includes("<pre>ls</pre>");
+out.closed2 = D(toolsEl()).includes('class="chain"');
 // Reduced motion: nothing rises; open and closed at once, no frame or timer waited on.
 reduce = true;
 const box3 = byId("tmsgs3");
@@ -24589,8 +24598,177 @@ frames.length = 0; later.length = 0;
 P.toggleTools(toolsId);
 out.reducedOpen = [toolsEl().classList.contains("open"), frames.length];
 P.toggleTools(toolsId);
-out.reducedClose = [toolsEl().classList.contains("open"), toolsEl()._inner.includes("<pre>ls</pre>"), later.length];
+out.reducedClose = [toolsEl().classList.contains("open"), D(toolsEl()).includes('class="chain"'), later.length];
 reduce = false;
+// --- one line per turn, counting calls by tool, live and once done ---
+reduce = false;
+P.chatEls.clear(); P.chatOpen.clear(); P.callOpen.clear();
+const At = (s, role, ...blocks) => ({role, ts: `2026-10-15T10:00:${String(s).padStart(2, "0")}.000Z`, blocks});
+const turn = [
+  At(0, "user", {type: "text", text: "look around"}),
+  At(1, "assistant", {type: "tool", id: "r1", name: "Read", arg: "src/a.py", input: '{"file_path": "/x/src/a.py"}'},
+                     {type: "tool", id: "g1", name: "Grep", arg: "TODO", input: '{"pattern": "TODO"}'}),
+  At(2, "user", {type: "tool_result", for: "g1", text: "3 hits"}, {type: "tool_result", for: "r1", text: "print(1)"}),
+  At(3, "assistant", {type: "text", text: "Now the tests."}),
+  At(3, "assistant", {type: "tool", id: "b1", name: "Bash", arg: "make test", input: '{"command": "make test"}'}),
+];
+const tbox = byId("tmsgsTurn");
+P.setActive({key: "k"});
+P.setTview({key: "k", sid: "s", msgs: turn, live: {running: true, turns: []}});
+P.drawChat(tbox, turn, "s");
+const lineId = P.chatItems(turn)[1].id;
+const lineEl = P.chatEls.get(lineId);
+const userEl = tbox.children[0], saidEl = tbox.children[2];
+const setsBefore = [userEl._sets, saidEl._sets];
+out.liveLine = {text: lineEl._ctl._inner, live: lineEl.classList.contains("live"),
+                items: tbox.children.length};
+// More calls stream in while it runs: the same line counts them.
+const turn2 = turn.concat([
+  At(9, "user", {type: "tool_result", for: "b1", text: "FAILED", error: true}),
+  At(10, "assistant", {type: "tool", id: "r2", name: "Read", arg: "tests/t.py", input: "{}"}),
+  At(11, "user", {type: "tool_result", for: "r2", text: "def test(): ..."}),
+  At(12, "assistant", {type: "tool", id: "b2", name: "Bash", arg: "make test", input: "{}"}),
+]);
+P.setTview({key: "k", sid: "s", msgs: turn2, live: {running: true, turns: []}});
+P.drawChat(tbox, turn2, "s");
+out.liveGrown = {text: lineEl._ctl._inner, same: P.chatEls.get(lineId) === lineEl,
+                 items: tbox.children.length,
+                 untouched: userEl._sets === setsBefore[0] && saidEl._sets === setsBefore[1]};
+// Opened while it runs: the chain in order, the last call still spinning.
+P.toggleTools(lineId); runFrames();
+const chain = lineEl._detail._inner;
+out.chainLive = {open: lineEl.classList.contains("open"),
+                 aria: lineEl._ctl.attrs["aria-expanded"],
+                 order: (chain.match(/class="cname">[^<]*</g) || []).map(x => x.slice(14, -1)),
+                 args: (chain.match(/class="carg">[^<]*</g) || []).map(x => x.slice(13, -1)),
+                 states: (chain.match(/class="step call (\w+)/g) || []).map(x => x.split(" ").pop()),
+                 durs: (chain.match(/class="cdur">[^<]*</g) || []).map(x => x.slice(13, -1)),
+                 noIO: !chain.includes('class="cio"')};
+// A call opens onto its input and output, and closes again.
+P.toggleCall(lineId, 2);
+const io = lineEl._detail._inner;
+out.callOpen = {input: io.includes("<pre>{&quot;command&quot;: &quot;make test&quot;}</pre>"),
+                output: io.includes("<pre>FAILED</pre>"), err: io.includes('class="clbl">error<'),
+                aria: io.includes('aria-expanded="true" data-k="' + lineId + '/2"')};
+P.toggleCall(lineId, 2);
+out.callClosed = !lineEl._detail._inner.includes('class="cio"');
+// The turn ends: the last result and the reply arrive; the line stops
+// spinning and says how long the turn took.
+const turn3 = turn2.concat([
+  At(20, "user", {type: "tool_result", for: "b2", text: "ok"}),
+  At(21, "assistant", {type: "text", text: "Fixed."}),
+]);
+P.setTview({key: "k", sid: "s", msgs: turn3, live: {running: false, turns: []}});
+P.drawChat(tbox, turn3, "s");
+out.doneLine = {text: lineEl._ctl._inner, live: lineEl.classList.contains("live"),
+                states: (lineEl._detail._inner.match(/class="step call (\w+)/g) || []).map(x => x.split(" ").pop())};
+// Collapsed again, the chain is dropped once folded.
+P.toggleTools(lineId); for (const [f] of later.splice(0)) f(); runFrames();
+out.collapsed = {open: lineEl.classList.contains("open"), detail: lineEl._detail._inner,
+                 aria: lineEl._ctl.attrs["aria-expanded"]};
+// A turn that ended with a call never answered says so, rather than spin.
+const lost = [At(0, "user", {type: "text", text: "go"}),
+              At(1, "assistant", {type: "tool", id: "z", name: "Bash", arg: "sleep", input: "{}"})];
+P.chatEls.clear(); P.chatOpen.clear();
+P.setTview({key: "k", sid: "s", msgs: lost, live: {running: false, turns: []}});
+const lbox = byId("tmsgsLost");
+P.drawChat(lbox, lost, "s");
+P.chatOpen.add(P.chatItems(lost)[1].id); P.drawChat(lbox, lost, "s");
+out.lost = {line: lbox.children[1]._ctl._inner, state: /class="step call lost/.test(lbox.children[1]._detail._inner)};
+// A new turn is a new line: the owner speaking again starts it.
+const two = turn3.concat([At(30, "user", {type: "text", text: "and again"}),
+                          At(31, "assistant", {type: "tool", id: "q", name: "Glob", input: "{}"})]);
+// A result that comes with a note in the same message (an interruption)
+// still finds its call; it does not start a turn.
+const intr = [At(0, "user", {type: "text", text: "go"}),
+              At(1, "assistant", {type: "tool", id: "i1", name: "Bash", input: "{}"}),
+              At(2, "user", {type: "tool_result", for: "i1", text: "stopped"},
+                            {type: "text", text: "[Request interrupted by user for tool use]"}),
+              At(3, "assistant", {type: "tool", id: "i2", name: "Read", input: "{}"})];
+const iItems = P.chatItems(intr).filter(i => i.kind === "tools");
+out.interrupted = iItems.map(g => [P.toolsLabel(g, true), g.calls.map(c => c.done)]);
+// The bot says a new turn runs before its message reaches the transcript:
+// the last turn's line does not start spinning again.
+P.chatEls.clear(); P.chatOpen.clear();
+const nbox = byId("tmsgsNext");
+const startedAfter = String(Date.parse("2026-10-15T10:01:00.000Z") / 1000);
+P.setTview({key: "k", sid: "s", msgs: turn3, live: {running: true, turns: [{ref: startedAfter, state: "running"}]}});
+P.drawChat(nbox, turn3, "s");
+out.nextTurnOld = nbox.children[1].classList.contains("live");
+const startedBefore = String(Date.parse("2026-10-15T10:00:00.500Z") / 1000);
+P.setTview({key: "k", sid: "s", msgs: turn3, live: {running: true, turns: [{ref: startedBefore, state: "running"}]}});
+P.drawChat(nbox, turn3, "s");
+out.thisTurnLive = nbox.children[1].classList.contains("live");
+out.perTurn = P.chatItems(two).filter(i => i.kind === "tools").map(i => P.toolsLabel(i, false));
+out.fmt = [P.fmtMs(30), P.fmtMs(400), P.fmtMs(4200), P.fmtMs(42000), P.fmtMs(192000), P.fmtMs(3900000)];
+
+// --- attachments: on their message, and in the drawer ---
+P.chatEls.clear(); P.chatOpen.clear(); P.callOpen.clear();
+const sec = s => Date.parse(`2026-10-15T10:00:${String(s).padStart(2, "0")}.000Z`) / 1000;
+const note = "\n\n[The user attached 2 file(s), saved locally:\n- /up/1-shot.png (image/png, 12 KB) — an image; use Read to look at it\n- /up/1-notes.txt (text/plain)\nRead them if they are relevant to the request.]";
+const fmsgs = [At(0, "user", {type: "text", text: "what is wrong here?" + note}),
+               At(5, "assistant", {type: "text", text: "Here is the fixed one."}),
+               At(9, "user", {type: "text", text: "thanks"})];
+const files = [
+  {name: "shot.png", path: "/up/1-shot.png", direction: "in", ts: sec(0) - 2, exists: true, image: true, size: 12000},
+  {name: "notes.txt", path: "/up/1-notes.txt", direction: "in", ts: sec(0) - 2, exists: true, image: false, size: 900},
+  {name: "fixed.png", path: "/art/2-fixed.png", direction: "out", ts: sec(7), exists: true, image: true, size: 50000},
+  {name: "report.pdf", path: "/art/2-report.pdf", direction: "out", ts: sec(7), exists: true, image: false, size: 2400000},
+  {name: "old.log", path: "/art/old.log", direction: "out", ts: sec(7) - 86400 * 30, exists: false, pruned: 1700000000, size: 10},
+];
+const fbox = byId("tmsgsFiles");
+P.setTview({key: "k", sid: "s", msgs: fmsgs, live: null, files});
+P.drawChat(fbox, fmsgs, "s", files);
+const ub = fbox.children[0]._inner, ab = fbox.children[1]._inner, tb = fbox.children[2]._inner;
+out.inline = {
+  noteGone: !ub.includes("The user attached") && ub.includes("what is wrong here?"),
+  thumb: /<button type="button" class="athumb" data-path="\/up\/1-shot.png"[^>]*onclick="viewImage\(this.dataset.path\)"/.test(ub)
+         && ub.includes('src="/thumb?path=%2Fup%2F1-shot.png"') && ub.includes('loading="lazy"')
+         && ub.includes('width="96" height="96"'),
+  chip: ub.includes('<a class="fchip" href="/download?path=%2Fup%2F1-notes.txt" download="notes.txt"')
+        && ub.includes('class="fsize">900 B<'),
+  outThumb: ab.includes("/thumb?path=%2Fart%2F2-fixed.png"),
+  outChip: ab.includes("report.pdf") && ab.includes("2.3 MB"),
+  oldNowhere: !(ub + ab + tb).includes("old.log"),
+  thanksBare: !tb.includes('class="atts"'),
+};
+// The viewer opens on the image, at full size, inline.
+P.setActive({key: "k"});
+P.viewImage("/art/2-fixed.png");
+out.viewer = {open: P.viewerIsOpen(), src: byId("imgviewimg").src, name: byId("imgviewname")._inner};
+P.closeViewer();
+out.viewerClosed = P.viewerIsOpen();
+// The header: Attachments (N), on a laptop and a phone.
+out.headFiles = P.chatHead({title: "F"}, {turns: []}, 0, P.threadFiles().length);
+out.toolbarFiles = P.transcriptHead({resume_cmd: "x", slack_link: "y"});
+// The drawer: all of it, newest first, images a grid, the rest a list.
+const many = [];
+for (let i = 0; i < 24; i++)
+  many.push({name: `s${i}.png`, path: `/art/s${i}.png`, direction: "out", ts: 1000 + i, exists: true, image: true, size: 1000});
+many.push({name: "z.zip", path: "/art/z.zip", direction: "out", ts: 2000, exists: true, image: false, size: 5});
+many.push({name: "gone.png", path: "/art/gone.png", direction: "in", ts: 500, exists: false, image: true, size: 5});
+P.setTview({key: "k", sid: "s", msgs: fmsgs, live: null, files: many});
+P.openDrawer();
+const body = byId("drawerbody")._inner;
+out.drawer = {open: P.drawerIsOpen(), title: byId("drawertitle")._inner,
+              thumbs: (body.match(/class="athumb"/g) || []).length,
+              listed: (body.match(/<li>/g) || []).length,
+              firstImg: (body.match(/data-path="([^"]+)"/) || [])[1],
+              lastImg: (body.match(/data-path="([^"]+)"/g) || []).pop(),
+              zipFirst: body.indexOf("z.zip") < body.indexOf("gone.png"),
+              lazy: (body.match(/loading="lazy"/g) || []).length};
+P.closeDrawer();
+out.drawerClosed = P.drawerIsOpen();
+// The composer: only the files staged for the next message, removable.
+P.addFiles([{name: "a.png", size: 2048, type: "image/png"}, {name: "b.txt", size: 10, type: "text/plain"}], "reply");
+const chipsA = byId("chips")._inner;
+P.dropFile("reply", 0);
+out.composer = {before: (chipsA.match(/class="chip"/g) || []).length,
+                names: chipsA.includes("a.png") && chipsA.includes("b.txt") && chipsA.includes("2 KB"),
+                removable: chipsA.includes("onclick=\"dropFile('reply', 1)\"") && chipsA.includes('aria-label="remove b.txt"'),
+                after: (byId("chips")._inner.match(/class="chip"/g) || []).length,
+                thread: !chipsA.includes("shot.png")};
+P.dropFile("reply", 0);
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -24652,20 +24830,20 @@ def test_viz_phone_chat():
     if r.returncode:
         return
     o = json.loads(r.stdout)
-    check("messages become bubbles, each run of tools between them one line",
-          o["shape"] == ["user:please fix it", "tools:3:Bash+Read", "assistant:Fixed **it**.",
-                         "assistant:One more:", "tools:1:Edit", "assistant:All done."], str(o["shape"]))
+    check("messages become bubbles; every tool call of a turn is one line, where the first ran",
+          o["shape"] == ["user:please fix it", "tools:4:Bash+Read+Edit", "assistant:Fixed **it**.",
+                         "assistant:One more:", "assistant:All done."], str(o["shape"]))
     check("an item's id is where it starts, so it is the same as the thread grows",
           o["ids"][:len(o["prefixIds"])] == o["prefixIds"] and o["prefixIds"] == ["0.0", "1.0"],
           f'{o["ids"]} vs {o["prefixIds"]}')
-    check("the tools line says how many ran and which",
-          o["labels"] == ["⚙ ran 3 tools · Bash, Read", "⚙ ran 1 tool · Edit"], str(o["labels"]))
+    check("the tools line counts the calls by tool, most first",
+          o["labels"] == ["Bash ×2 · Read ×1 · Edit ×1"], str(o["labels"]))
     check("a run of only thinking says so", o["thinkingOnly"] == "💭 thinking", o["thinkingOnly"])
     check("a message's figures go with its words, else with its tools",
           o["bubbleUsage"] is True and o["groupUsage"] is True)
     check("folded, a tools line shows no detail and no figures",
           o["closed"] == {"pre": False, "usage": False, "label": True}, str(o["closed"]))
-    check("opened, it shows the laptop's detail: each call, result and the figures",
+    check("opened, it shows each call -- one opened shows its input and result -- and the figures",
           all(o["opened"].values()), str(o["opened"]))
     check("a bubble's figures sit behind its time, the markdown rendered",
           '<details class="cstat"><summary>' in o["bubbleHtml"] and 'class="usage"' in o["bubbleHtml"]
@@ -24673,7 +24851,7 @@ def test_viz_phone_chat():
     check("a bubble with no figures is only its time",
           "<details" not in o["plainBubble"] and 'class="cmsg user"' in o["plainBubble"], o["plainBubble"])
     check("drawing a grown thread keeps the elements already drawn",
-          o["drawn1"] == 2 and o["drawn2"] == 6 and o["kept"] is True, str(o))
+          o["drawn1"] == 2 and o["drawn2"] == 5 and o["kept"] is True, str(o))
     check("a tools line opened stays open, and still open as it collects more",
           o["openAfterToggle"] is True and o["stillOpen"] is True)
     check("a thread with nothing in it says so", o["empty"] is True)
@@ -24722,16 +24900,6 @@ def test_viz_phone_chat():
     check("what the owner just sent is brought into view", o["forced"] == [1600, False], str(o["forced"]))
     check("a reader following the end keeps following when the page grew between draws",
           o["grewBetween"] == [True, False], str(o["grewBetween"]))
-    check("the files are one line that opens onto the list",
-          o["filesCompact"].startswith('<details class="cfiles"><summary>📎 1 file</summary>')
-          and "a.png" in o["filesCompact"], o["filesCompact"][:200])
-    check("each file a compact chip: direction, name, size, linked to its download",
-          '<a class="fchip" href="/download?path=%2Fp%2Fa.png"' in o["filesCompact"]
-          and 'class="fname">a.png<' in o["filesCompact"] and "2.0kB" in o["filesCompact"],
-          o["filesCompact"])
-    check("a file no longer on disk is a muted chip that says why",
-          'class="fchip gone"' in o["filesGone"] and "the copy is in Slack" in o["filesGone"]
-          and "<a " not in o["filesGone"], o["filesGone"])
     check("on a laptop, read further up, the chat stays put and shows the pill",
           o["wideStayed"] == [100, True], str(o["wideStayed"]))
     check("on a laptop, read at the end, it follows and the pill goes",
@@ -24752,7 +24920,7 @@ def test_viz_phone_chat():
     check("mid-glide to the end, a poll still follows (the glide is not the reader scrolling up)",
           o["glide"] == [3200, False], str(o["glide"]))
     check("a grown thread appends only its new items, moving none already there",
-          o["appendedOnly"] == [-1, -1, -1], str(o["appendedOnly"]))
+          o["appendedOnly"] == [-1, -1], str(o["appendedOnly"]))
     check("the hidden pill is out of the tab order and the accessibility tree",
           re.search(r"#jumppill \{[^}]*visibility: hidden;", css) is not None
           and re.search(r"#jumppill\.show \{[^}]*visibility: visible;", css) is not None)
@@ -24774,6 +24942,70 @@ def test_viz_phone_chat():
           o["reducedOpen"] == [True, 0], str(o["reducedOpen"]))
     check("reduced motion: and closes at once, its detail dropped with no timer",
           o["reducedClose"] == [False, False, 0], str(o["reducedClose"]))
+
+    # One line per turn, counting calls by tool, live and once done.
+    ll, lg = o["liveLine"], o["liveGrown"]
+    check("while the turn runs its line spins and counts each tool, with no time yet",
+          ll["live"] and 'class="spin"' in ll["text"] and "Read ×1 · Grep ×1 · Bash ×1" in ll["text"]
+          and " · " not in ll["text"].split("Bash ×1")[1].split("<")[0], str(ll))
+    check("calls streaming in update the same line's counts in place",
+          "Read ×2 · Bash ×2 · Grep ×1" in lg["text"] and lg["same"] and lg["items"] == 3, str(lg))
+    check("...rewriting nothing else in the thread", lg["untouched"] is True, str(lg))
+    cl = o["chainLive"]
+    check("tapped, it unfolds onto the turn's calls in the order they ran",
+          cl["open"] and cl["aria"] == "true" and cl["order"] == ["Read", "Grep", "Bash", "Read", "Bash"]
+          and cl["noIO"], str(cl))
+    check("each call: a short argument, how it ended (the running one spins), its time",
+          cl["args"] == ["src/a.py", "TODO", "make test", "tests/t.py", "make test"]
+          and cl["states"] == ["ok", "ok", "err", "ok", "run"]
+          and cl["durs"] == ["1.0s", "1.0s", "6.0s", "1.0s", ""], str(cl))
+    check("a call opens onto its input and its output (an error says so)",
+          all(o["callOpen"].values()), str(o["callOpen"]))
+    check("and closes again", o["callClosed"] is True)
+    dl = o["doneLine"]
+    check("the turn over, the line stops spinning and says the turn's total time",
+          not dl["live"] and "spin" not in dl["text"] and "Read ×2 · Bash ×2 · Grep ×1 · 19s" in dl["text"]
+          and dl["states"] == ["ok", "ok", "err", "ok", "ok"], str(dl))
+    check("tapped again it folds back, its chain dropped",
+          o["collapsed"] == {"open": False, "detail": "", "aria": "false"}, str(o["collapsed"]))
+    check("a call a finished turn never answered shows no result, not a spinner",
+          o["lost"]["state"] and "spin" not in o["lost"]["line"], str(o["lost"]))
+    check("the owner speaking again starts the next turn's line",
+          o["perTurn"] == ["Read ×2 · Bash ×2 · Grep ×1 · 19s", "Glob ×1"], str(o["perTurn"]))
+    check("a result sharing a message with a note (an interruption) finds its call; one line",
+          o["interrupted"] == [["Bash ×1 · Read ×1", [True, False]]], str(o["interrupted"]))
+    check("a new turn not yet in the transcript does not set the last turn's line spinning",
+          o["nextTurnOld"] is False and o["thisTurnLive"] is True,
+          f'{o["nextTurnOld"]} {o["thisTurnLive"]}')
+    check("times are short: <0.1s, 0.4s, 4.2s, 42s, 3m 12s, 1h 5m",
+          o["fmt"] == ["<0.1s", "0.4s", "4.2s", "42s", "3m 12s", "1h 5m"], str(o["fmt"]))
+    check("the spinner turns by transform, and is still under reduced motion",
+          re.search(r"\.spin \{[^}]*animation: spin", css) is not None and "spin" in frames)
+    # Attachments: on their message, in the drawer, and the composer's own.
+    check("files sit on the message they came with: images lazy, fixed-size thumbnails, others chips",
+          all(o["inline"].values()), str(o["inline"]))
+    check("an image opens the viewer at full size, inline, and closes",
+          o["viewer"]["open"] and o["viewer"]["src"] == "/download?inline=1&path=%2Fart%2F2-fixed.png"
+          and "2 / 2" in o["viewer"]["name"] and o["viewerClosed"] is False, str(o["viewer"]))
+    check("the thread's header offers Attachments (N), on a phone and a laptop",
+          'aria-label="Attachments (5)">📎 5<' in o["headFiles"]
+          and "📎 Attachments (5)" in o["toolbarFiles"], o["headFiles"][-300:])
+    dr = o["drawer"]
+    check("the drawer holds every file, newest first: images a grid, the rest a list",
+          dr["open"] and dr["title"] == "📎 Attachments (26)" and dr["thumbs"] == 24
+          and dr["listed"] == 2 and dr["firstImg"] == "/art/s23.png"
+          and dr["lastImg"] == 'data-path="/art/s0.png"' and dr["zipFirst"] and dr["lazy"] == 24, str(dr))
+    check("and closes", o["drawerClosed"] is False)
+    check("the composer shows only the files staged for the next message, each removable",
+          o["composer"] == {"before": 2, "names": True, "removable": True, "after": 1, "thread": True},
+          str(o["composer"]))
+    check("thumbnails are fixed squares, faded in by opacity (no layout shift)",
+          re.search(r"\.athumb \{ width: 84px; height: 84px;", css) is not None
+          and re.search(r"\.athumb img \{[^}]*object-fit: cover; opacity: 0;", css) is not None)
+    check("the drawer slides by transform, the viewer fades by opacity",
+          re.search(r"#attdrawer \.box \{[^}]*transform: translateX\(100%\)", css) is not None
+          and re.search(r"#imgview \{[^}]*opacity: 0;", css) is not None)
+    check("the thread's file list no longer sits under the chat", 'id="tfiles"' not in V.PAGE)
 
 
 # --- conversation threads from the dashboard --------------------------------------
@@ -33281,6 +33513,130 @@ def test_digest_says_which_message_decided():
           and "iphone182" in text and "dismiss, Slack message 9.2" in text, text)
 
 
+
+# --- the chat's tool calls and files, served --------------------------------------
+# The chat's one line per turn needs each call's id (to pair its result), a
+# short argument and whether it failed; the thread's files are drawn inline
+# -- thumbnails, a viewer -- which only images may be, never an .html or .svg
+# that would run script as the dashboard.
+def test_viz_tool_calls_and_inline_files():
+    import random
+    import struct
+    import threading
+    import urllib.error
+    import urllib.request
+    import zlib
+    from http.server import ThreadingHTTPServer
+    import visualizer as V
+    print("\nthe transcript carries call ids and arguments; only images are served inline")
+    blocks = V._block_list([
+        {"type": "tool_use", "id": "toolu_1", "name": "Read",
+         "input": {"file_path": "/Users/x/workspace/Silkworm/visualizer.py", "limit": 5}},
+        {"type": "tool_use", "id": "toolu_2", "name": "Bash",
+         "input": {"command": "make test\necho done", "description": "run them"}},
+        {"type": "tool_result", "tool_use_id": "toolu_2", "is_error": True,
+         "content": [{"type": "text", "text": "boom"}]},
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+    ])
+    check("a call carries its id and a short argument (a path by its last two parts)",
+          blocks[0]["id"] == "toolu_1" and blocks[0]["arg"] == "Silkworm/visualizer.py", str(blocks[0]))
+    check("a command is its first line", blocks[1]["arg"] == "make test", str(blocks[1]))
+    check("a command is what ran, not the cd before it",
+          V.tool_arg("Bash", {"command": 'cd "/a b" && cd c; make test'}) == "make test"
+          and V.tool_arg("Bash", {"command": "cd /x"}) == "cd /x"
+          and V.tool_arg("Bash", {"command": "cd /x/y\ngit init -q && ls"}) == "git init -q && ls")
+    check("a result names its call and says whether it failed",
+          blocks[2]["for"] == "toolu_2" and blocks[2]["error"] is True and blocks[2]["text"] == "boom"
+          and blocks[3]["for"] == "toolu_1" and blocks[3]["error"] is False, str(blocks[2:]))
+    check("an unknown tool shows its first string field; none, nothing",
+          V.tool_arg("Zap", {"n": 2, "q": "x" * 100}) == "x" * 79 + "…" and V.tool_arg("Zap", {}) == "")
+
+    # What Claude Code writes as the user (isMeta: reminders, a skill's body)
+    # is neither a bubble nor a new turn; its results still count.
+    tdir = Path(tempfile.mkdtemp())
+    tr = tdir / "s.jsonl"
+    tr.write_text("\n".join(json.dumps(e) for e in [
+        {"type": "user", "timestamp": "t0", "message": {"content": "hi"}},
+        {"type": "user", "isMeta": True, "timestamp": "t1",
+         "message": {"content": "<system-reminder>skill body</system-reminder>"}},
+        {"type": "user", "isMeta": True, "timestamp": "t2",
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "a", "content": "r"},
+                                 {"type": "text", "text": "noise"}]}},
+    ]) + "\n")
+    saved_find = V.find_transcript
+    V.find_transcript = lambda sid: tr
+    try:
+        got = V.load_transcript("s")["messages"]
+    finally:
+        V.find_transcript = saved_find
+    check("Claude Code's own user-side text is dropped; its tool results kept",
+          [[b["type"] for b in m["blocks"]] for m in got] == [["text"], ["tool_result"]], str(got))
+
+    def png(w, h, noise):
+        rows = b"".join(b"\0" + (bytes(random.getrandbits(8) for _ in range(w * 3)) if noise
+                                 else b"\x80" * (w * 3)) for _ in range(h))
+        chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+    tmp = Path(tempfile.mkdtemp())
+    small, big = tmp / "small.png", tmp / "big.png"
+    small.write_bytes(png(8, 8, False))
+    big.write_bytes(png(400, 300, True))
+    page, svg = tmp / "page.html", tmp / "pic.svg"
+    page.write_text("<script>alert(1)</script>")
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+    sessions = tmp / "sessions.json"
+    files = [{"name": f.name, "path": str(f), "direction": "out", "ts": 1.0} for f in (small, big, page, svg)]
+    sessions.write_text(json.dumps({"D1:1.0": {"files": files}}))
+    saved = (V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR)
+    V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR = sessions, True, tmp / "thumbs"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), V.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    from urllib.parse import quote
+
+    def get(path):
+        try:
+            with urllib.request.urlopen(base + path, timeout=30) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, b""
+    try:
+        listed = {f["name"]: f for f in V.artifacts("D1:1.0")}
+        check("the thread's files say which are images",
+              listed["big.png"]["image"] is True and listed["page.html"]["image"] is False
+              and listed["pic.svg"]["image"] is False, str(listed))
+        st, h, body = get("/download?inline=1&path=" + quote(str(big)))
+        check("an image asked for inline is served as an image, inline",
+              st == 200 and h["Content-Type"] == "image/png" and h["Content-Disposition"] == "inline"
+              and h["X-Content-Type-Options"] == "nosniff" and body == big.read_bytes(), f"{st} {dict(h)}")
+        for f in (page, svg):
+            st, h, _ = get("/download?inline=1&path=" + quote(str(f)))
+            check(f"{f.suffix} is never inline: always a download, never sniffed",
+                  st == 200 and h["Content-Type"] == "application/octet-stream"
+                  and h["Content-Disposition"].startswith("attachment")
+                  and h["X-Content-Type-Options"] == "nosniff", dict(h))
+            st, _, _ = get("/thumb?path=" + quote(str(f)))
+            check(f"{f.suffix} has no thumbnail", st == 404, str(st))
+        st, _, _ = get("/thumb?path=" + quote(str(tmp / "elsewhere.png")))
+        check("a path the bot never recorded has no thumbnail either", st == 404, str(st))
+        st, h, body = get("/thumb?path=" + quote(str(small)))
+        check("a small image is its own thumbnail", st == 200 and body == small.read_bytes()
+              and h["Content-Type"] == "image/png", str(st))
+        st, h, body = get("/thumb?path=" + quote(str(big)))
+        if Path("/usr/bin/sips").exists():
+            check("a large image's thumbnail is a small JPEG, made once and kept",
+                  st == 200 and h["Content-Type"] == "image/jpeg" and body[:2] == b"\xff\xd8"
+                  and len(body) < big.stat().st_size // 4
+                  and len(list((tmp / "thumbs").glob("*.jpg"))) == 1, f"{st} {len(body)}")
+        else:
+            check("without sips a large image is served as itself", st == 200 and body == big.read_bytes())
+    finally:
+        srv.shutdown()
+        V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR = saved
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:
@@ -33298,5 +33654,3 @@ if __name__ == "__main__":
     for f in FAILED:
         print(f"  FAILED: {f}")
     sys.exit(1 if FAILED else 0)
-
-

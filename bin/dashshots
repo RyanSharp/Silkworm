@@ -224,6 +224,10 @@ def pick_examples(base: str, project: str) -> dict:
              and not s.get("hidden") and s.get("turns", 0) > 2]
     if convs:
         out["thread"] = max(convs, key=lambda s: s.get("updated", 0))["key"]
+    # The thread with the most files, for its inline attachments and drawer.
+    filed = [s for s in sessions if not s.get("hidden") and s.get("files", 0) > 0]
+    if filed:
+        out["files"] = max(filed, key=lambda s: (s.get("files", 0), s.get("updated", 0)))["key"]
     # A turn in progress: the harness's own thread when a Silkworm turn runs
     # it (that turn is running while it shoots), else any live one.
     running = [s for s in sessions if s.get("turn") and not s["turn"].get("stalled")]
@@ -248,6 +252,10 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("stats", "/?view=stats"),
         ("thread", f"/?thread={quote(ex['thread'])}"),
         *([("thread-running", f"/?thread={quote(ex['running'])}")] if ex.get("running") else []),
+        # The thread's longest turn, its one tools line opened onto the chain.
+        ("thread-tools", f"/?thread={quote(ex['thread'])}&tools=open"),
+        *([("thread-files", f"/?thread={quote(ex['files'])}&files=1"),
+           ("thread-drawer", f"/?thread={quote(ex['files'])}&drawer=1")] if ex.get("files") else []),
         # A thread with no session yet is what a new thread is until its first
         # turn writes: the page draws it from the key alone.
         ("thread-new", f"/?thread={quote(NEW_THREAD)}"),

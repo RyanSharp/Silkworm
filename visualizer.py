@@ -13,8 +13,10 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -569,14 +571,45 @@ def _block_list(content) -> list[dict]:
         elif btype == "thinking" and b.get("thinking", "").strip():
             blocks.append({"type": "thinking", "text": b["thinking"]})
         elif btype == "tool_use":
+            args = b.get("input") or {}
             blocks.append({"type": "tool", "name": b.get("name", "tool"),
-                           "input": json.dumps(b.get("input") or {}, indent=2)[:2000]})
+                           "id": b.get("id", ""), "arg": tool_arg(b.get("name", ""), args),
+                           "input": json.dumps(args, indent=2)[:2000]})
         elif btype == "tool_result":
             inner = b.get("content")
             if isinstance(inner, list):
                 inner = "\n".join(x.get("text", "") for x in inner if isinstance(x, dict))
-            blocks.append({"type": "tool_result", "text": str(inner or "")[:2000]})
+            blocks.append({"type": "tool_result", "for": b.get("tool_use_id", ""),
+                           "error": bool(b.get("is_error")), "text": str(inner or "")[:2000]})
     return blocks
+
+
+#: The input field that best says what a call was about, by tool; any other
+#: tool shows its first short string field.
+TOOL_ARG_KEYS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path",
+                 "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
+                 "Bash": "command", "Grep": "pattern", "Glob": "pattern",
+                 "WebFetch": "url", "WebSearch": "query", "Agent": "description",
+                 "Task": "description", "Skill": "skill", "ToolSearch": "query"}
+
+
+def tool_arg(name: str, args) -> str:
+    """A tool call's argument in a few words, for the chat's chain of calls:
+    a file's path by its last two parts, a command's first line."""
+    if not isinstance(args, dict):
+        return ""
+    key = TOOL_ARG_KEYS.get(name)
+    if not (isinstance(args.get(key), str) and args[key].strip()):
+        key = next((k for k, v in args.items() if isinstance(v, str) and v.strip()), None)
+    if key is None:
+        return ""
+    v = args[key].strip()
+    if key == "command":                  # what ran, not where: "cd ~/x && make" is "make"
+        v = re.sub(r"^(cd[ \t]+(\"[^\"]*\"|'[^']*'|\S+)[ \t]*(&&|;|\n)\s*)+", "", v) or v
+    if key.endswith("_path") and "/" in v:
+        v = "/".join(v.rstrip("/").split("/")[-2:])
+    v = v.splitlines()[0]
+    return v if len(v) <= 80 else v[:79] + "…"
 
 
 def iter_entries(path: Path):
@@ -634,6 +667,10 @@ def load_transcript(session_id: str, cursor: int | None = None) -> dict:
     for d in entries:
         msg = d.get("message") or {}
         blocks = _block_list(msg.get("content"))
+        # What Claude Code adds as the user -- reminders, a skill's body -- is
+        # not the owner speaking: no bubble, and no new turn.
+        if d.get("isMeta"):
+            blocks = [b for b in blocks if b["type"] != "text"]
         if not blocks:
             continue
         item = {"role": d["type"], "ts": d.get("timestamp", ""), "blocks": blocks}
@@ -827,7 +864,8 @@ def artifacts(key: str) -> list[dict]:
     for rec in entry.get("files", []):
         p = Path(rec.get("path", ""))
         out.append({**rec, "exists": p.is_file(),
-                    "size": p.stat().st_size if p.is_file() else 0})
+                    "size": p.stat().st_size if p.is_file() else 0,
+                    "image": p.suffix.lower() in INLINE_IMAGES})
     return out
 
 
@@ -839,6 +877,46 @@ def allowed_download(path_str: str) -> Path | None:
                 p = Path(path_str)
                 return p if p.is_file() else None
     return None
+
+
+#: Images the page draws itself -- a thumbnail on the message, the viewer.
+#: Only these are ever served inline: anything else (an .html, an .svg, which
+#: could run script as this page) is only ever a download.
+INLINE_IMAGES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic"}
+
+#: Thumbnails, made once per file (and again if it changes) with macOS's sips.
+THUMB_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "silkworm-thumbs"
+THUMB_PX = 320
+THUMB_MIN_BYTES = 96 * 1024
+
+
+def thumbnail(p: Path) -> tuple[bytes, str]:
+    """A small JPEG of image `p` -- a screenshot is megabytes, and a thread's
+    drawer shows dozens. When sips cannot make one, the image itself."""
+    st = p.stat()
+    if st.st_size < THUMB_MIN_BYTES:          # small already: no smaller (or upscaled) copy
+        return p.read_bytes(), INLINE_IMAGES.get(p.suffix.lower(), "application/octet-stream")
+    tag = hashlib.sha1(f"{p}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:20]
+    out = THUMB_DIR / f"{tag}.jpg"
+    if not out.is_file():
+        tmp = out.with_suffix(f".{os.getpid()}.{threading.get_ident()}.jpg")
+        try:
+            THUMB_DIR.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["/usr/bin/sips", "-Z", str(THUMB_PX), "-s", "format", "jpeg",
+                                "-s", "formatOptions", "70", str(p), "--out", str(tmp)],
+                               capture_output=True, timeout=20)
+            if r.returncode == 0 and tmp.is_file():
+                os.replace(tmp, out)
+            else:
+                tmp.unlink(missing_ok=True)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+    if out.is_file():
+        return out.read_bytes(), "image/jpeg"
+    return p.read_bytes(), INLINE_IMAGES.get(p.suffix.lower(), "application/octet-stream")
 
 
 # --- HTTP -----------------------------------------------------------------------
@@ -1036,8 +1114,24 @@ class Handler(BaseHTTPRequestHandler):
             if not p:
                 self._send(404, b"not an artifact", "text/plain")
                 return
+            image = INLINE_IMAGES.get(p.suffix.lower())
+            if qs.get("inline") and image:
+                self._send(200, p.read_bytes(), image, {
+                    "Content-Disposition": "inline", "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "private, max-age=86400"})
+                return
             self._send(200, p.read_bytes(), "application/octet-stream",
-                       {"Content-Disposition": f'attachment; filename="{p.name}"'})
+                       {"Content-Disposition": f'attachment; filename="{p.name}"',
+                        "X-Content-Type-Options": "nosniff"})
+        elif url.path == "/thumb":
+            p = allowed_download(qs.get("path", [""])[0])
+            if not p or p.suffix.lower() not in INLINE_IMAGES:
+                self._send(404, b"not an image artifact", "text/plain")
+                return
+            body, ctype = thumbnail(p)
+            self._send(200, body, ctype, {"Content-Disposition": "inline",
+                                          "X-Content-Type-Options": "nosniff",
+                                          "Cache-Control": "private, max-age=86400"})
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -1361,7 +1455,7 @@ PAGE = r"""<!doctype html>
   /* --- the chat (both widths) -----------------------------------------
      Bubbles on one column; each run of tool calls is a quiet line that
      unfolds; times and figures small and dim. */
-  #tmsgs, #tlive, #tfiles { max-width: var(--chat-max); }
+  #tmsgs, #tlive { max-width: var(--chat-max); }
   .citem { margin: 0 0 var(--chat-gap); }
   .cmsg { display: flex; flex-direction: column; align-items: flex-start; max-width: 88%;
           min-width: 0; }
@@ -1396,9 +1490,42 @@ PAGE = r"""<!doctype html>
              opacity: 0; transform: translateY(-4px);
              transition: opacity var(--t) var(--ease), transform var(--t) var(--ease); }
   .ctools.open .cdetail { opacity: 1; transform: none; }
-  .cdetail .msg { margin-bottom: 10px; max-width: 100%; }
-  .cdetail .msg .who { font-size: 10px; }
-  .cdetail pre { max-height: 360px; overflow: auto; }
+  .ctl .gear { margin-right: 5px; opacity: .8; }
+  .ctl .ctlabel { font-variant-numeric: tabular-nums; }
+  .ctools.live .ctl { color: var(--muted); }
+  /* a spinner: a quarter ring turning (transform only) */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { display: inline-block; width: 11px; height: 11px; margin-right: 6px;
+          vertical-align: -1px; border-radius: 50%; border: 1.5px solid var(--line);
+          border-top-color: var(--gold); animation: spin .9s linear infinite; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
+        white-space: nowrap; }
+  /* the turn's chain of calls, each opening onto its input and output */
+  .chain { list-style: none; margin: 0; padding: 0; counter-reset: call; }
+  .chain .step { margin: 0 0 2px; min-width: 0; }
+  .chain .crow { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
+                 align-items: center; gap: 8px; width: 100%; min-height: 28px;
+                 background: none; border: 0; border-radius: 6px; padding: 2px 6px;
+                 color: var(--ink); font: inherit; font-size: 12.5px; text-align: left;
+                 cursor: pointer; transition: background-color var(--t-fast); }
+  .chain .crow:hover { background: #FFFFFF0D; }
+  .chain .open > .crow { background: #FFFFFF0A; }
+  .chain .cname { font-weight: 600; white-space: nowrap; }
+  .chain .think .cname { font-weight: 400; color: var(--quiet); }
+  .chain .carg { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chain .cstate { font-size: 12px; min-width: 14px; text-align: center; }
+  .chain .ok .cstate { color: #6FBF73; }
+  .chain .err .cstate { color: #D8517F; }
+  .chain .lost .cstate { color: var(--quiet); }
+  .chain .cstate .spin { margin: 0; }
+  .chain .cdur { font-size: var(--meta-fs); color: var(--quiet); min-width: 34px;
+                 text-align: right; font-variant-numeric: tabular-nums; }
+  .chain .cio { margin: 2px 0 8px 6px; padding-left: 10px; border-left: 1px solid var(--line2); }
+  .chain .clbl { font-size: 10px; letter-spacing: .5px; text-transform: uppercase;
+                 color: var(--quiet); margin: 6px 0 2px; }
+  .chain .cio pre { max-height: 300px; overflow: auto; margin: 0; font-size: 11.5px; }
+  .cfig { margin: 6px 0 0 6px; }
   /* new items rise in; the working bubble breathes */
   @keyframes rise { from { opacity: 0; transform: translateY(var(--rise)); }
                     to { opacity: 1; transform: none; } }
@@ -1424,7 +1551,18 @@ PAGE = r"""<!doctype html>
                         border-radius: var(--bubble-r); padding: var(--bubble-pad); }
   #tlive .msg.user .bubble { border-bottom-right-radius: var(--bubble-tail); }
   #tlive .msg.bot { max-width: 88%; }
-  /* files: compact chips, the thread's behind one line */
+  /* files: on the message they came with -- an image a fixed square that
+     opens the viewer (so its loading moves nothing), any other file a chip */
+  .atts { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+  .cmsg.user .atts { justify-content: flex-end; }
+  .athumb { width: 84px; height: 84px; flex: none; padding: 0; border: 1px solid var(--line);
+            border-radius: 12px; overflow: hidden; background: var(--panel); cursor: zoom-in;
+            transition: transform var(--t-fast) var(--ease), border-color var(--t-fast); }
+  .athumb:hover { border-color: var(--gold); }
+  .athumb:active { transform: scale(.96); }
+  .athumb img { display: block; width: 100%; height: 100%; object-fit: cover; opacity: 0;
+                transition: opacity var(--t) var(--ease); }
+  .athumb img.ld { opacity: 1; }
   .fchips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
   .fchip { display: inline-flex; align-items: center; gap: 6px; max-width: 240px; min-width: 0;
            background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
@@ -1432,12 +1570,54 @@ PAGE = r"""<!doctype html>
            transition: border-color var(--t-fast); }
   a.fchip:hover { border-color: var(--gold); }
   .fchip .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .fchip .ficon { flex: none; }
   .fchip .fdir, .fchip .fsize { flex: none; color: var(--quiet); font-size: 10.5px;
                                 font-family: var(--mono); }
   .fchip.gone { opacity: .5; }
-  .cfiles { margin: 4px 0 8px; }
-  .cfiles summary { font-family: inherit; font-size: 12.5px; color: var(--quiet);
-                    min-height: 28px; display: flex; align-items: center; }
+  /* the thread's files, newest first: a drawer from the right (a sheet from
+     the bottom on a phone), sliding by transform */
+  #attdrawer { position: fixed; inset: 0; z-index: 46; background: #0000; visibility: hidden;
+               transition: background-color var(--t) var(--ease), visibility 0s linear var(--t); }
+  #attdrawer.open { background: #0008; visibility: visible; transition-delay: 0s; }
+  #attdrawer .box { position: absolute; top: 0; right: 0; bottom: 0; width: min(440px, 100%);
+                    background: var(--bg); border-left: 1px solid var(--line);
+                    display: flex; flex-direction: column; transform: translateX(100%);
+                    transition: transform var(--t) var(--ease); }
+  #attdrawer.open .box { transform: none; }
+  #attdrawer .dhead { display: flex; align-items: center; gap: 8px; padding: 12px 14px;
+                      border-bottom: 1px solid var(--line); }
+  #attdrawer .dhead h2 { flex: 1; margin: 0; font-size: 16px; }
+  #drawerbody { overflow-y: auto; overscroll-behavior: contain; padding: 4px 14px
+                calc(16px + env(safe-area-inset-bottom)); }
+  #drawerbody h3 { font-size: 12px; letter-spacing: .5px; text-transform: uppercase;
+                   color: var(--quiet); margin: 14px 0 8px; font-weight: 600; }
+  .dn { color: var(--quiet); font-weight: 400; }
+  .dgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px; }
+  .dgrid .athumb { width: auto; height: auto; aspect-ratio: 1; }
+  .dlist { list-style: none; margin: 0; padding: 0; }
+  .dlist li { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+              padding: 4px 0; border-bottom: 1px solid var(--line2); min-width: 0; }
+  .dlist .fchip { max-width: 70%; }
+  .dlist .dwhen { font-size: var(--meta-fs); color: var(--quiet); white-space: nowrap; }
+  /* the viewer: one image at the screen's size */
+  #imgview { position: fixed; inset: 0; z-index: 60; background: #000E; display: flex;
+             flex-direction: column; align-items: center; justify-content: center;
+             opacity: 0; visibility: hidden;
+             transition: opacity var(--t) var(--ease), visibility 0s linear var(--t); }
+  #imgview.open { opacity: 1; visibility: visible; transition-delay: 0s; }
+  #imgview img { max-width: 100%; max-height: calc(100% - 64px); object-fit: contain;
+                 transform: scale(.97); transition: transform var(--t) var(--ease); }
+  #imgview.open img { transform: none; }
+  #imgview .vbar { position: absolute; top: 0; left: 0; right: 0; display: flex; gap: 8px;
+                   align-items: center; padding: max(10px, env(safe-area-inset-top)) 12px 10px;
+                   background: linear-gradient(#000C, #0000); }
+  #imgview .vbar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                        white-space: nowrap; font-size: 13.5px; }
+  #imgview .vbar a, #imgview .vbar button { color: var(--ink); min-height: 40px; min-width: 40px; }
+  #imgview .vnav { position: absolute; top: 50%; transform: translateY(-50%); font-size: 28px;
+                   background: #0006; border: 0; color: var(--ink); width: 44px; height: 64px;
+                   border-radius: 10px; cursor: pointer; }
+  #imgview .vprev { left: 8px; } #imgview .vnext { right: 8px; }
   /* the way down, when new messages arrive while reading further up */
   #jumppill { position: absolute; bottom: calc(100% + 10px); left: 50%; z-index: 7;
               transform: translate(-50%, 8px) scale(.96); opacity: 0; pointer-events: none;
@@ -1467,7 +1647,10 @@ PAGE = r"""<!doctype html>
   .chip { display: inline-flex; gap: 6px; align-items: center; background: var(--panel);
           border: 1px solid var(--line); border-radius: 14px; padding: 2px 4px 2px 10px;
           font-size: 12px; font-family: var(--mono); max-width: 100%; }
-  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+  .chip .cname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+  .chip .fsize { color: var(--quiet); font-size: 10.5px; white-space: nowrap; }
+  .chip .cpv { width: 24px; height: 24px; border-radius: 5px; object-fit: cover; flex: none;
+               margin-left: -6px; }
   .chip button { background: none; border: 0; color: var(--muted); cursor: pointer;
                  font-size: 15px; padding: 0 6px; }
   /* the live end of the open thread: what was just sent, and what it is doing */
@@ -1887,8 +2070,16 @@ PAGE = r"""<!doctype html>
     .cmsg { max-width: 92%; }
     .cmsg.user, #tlive .msg.user { max-width: 85%; }
     .ctl { min-height: 36px; font-size: 13px; }
-    .cfiles summary { min-height: 36px; font-size: 13px; }
     .fchip { max-width: 70vw; padding: 5px 11px; }
+    .athumb { width: 72px; height: 72px; }
+    .dgrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .chain .crow { min-height: 36px; font-size: 13px; }
+    #attdrawer .box { top: auto; left: 0; width: 100%; height: 82dvh; border-left: 0;
+                      border-top: 1px solid var(--line); border-radius: 16px 16px 0 0;
+                      transform: translateY(100%); }
+    #attdrawer.open .box { transform: none; }
+    #imgview .vnav { display: none; }
+    #chathead .cattach { font-size: 14px; color: var(--muted); padding: 0 4px; min-width: 40px; }
     #jumppill { min-height: 38px; font-size: 13.5px; }
     body.reading .typing .tstop { display: none; }   /* Stop is in the header */
     #composer .crow { align-items: flex-end; gap: 6px; }
@@ -1994,6 +2185,8 @@ PAGE = r"""<!doctype html>
   @media (max-width: 380px) {
     header button.hbtn { min-width: 40px; padding: 0 6px; }
   }
+  /* a deep link lands on its state at once (instantly() in the script) */
+  body.instant *, body.instant *::before, body.instant *::after { transition: none !important; }
   /* Reduced motion: nothing rises, breathes, slides or unfolds -- every
      state is reached at once. Last, so it outranks every rule above. */
   @media (prefers-reduced-motion: reduce) {
@@ -2044,7 +2237,7 @@ PAGE = r"""<!doctype html>
     <div id="chathead"></div>
     <div id="content">
       <div id="dash"></div>
-      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div><div id="tfiles"></div></div>
+      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div></div>
     </div>
     <div id="composer">
       <button id="jumppill" onclick="toEnd(true)">↓ New messages</button>
@@ -2065,6 +2258,21 @@ PAGE = r"""<!doctype html>
     <h2>⚠ Alerts</h2>
     <div id="alertlist"></div>
   </div>
+</div>
+<div id="attdrawer" aria-hidden="true" onclick="if(event.target.id==='attdrawer')closeDrawer()">
+  <div class="box" role="dialog" aria-labelledby="drawertitle">
+    <div class="dhead"><h2 id="drawertitle">📎 Attachments</h2>
+      <button class="ghost" onclick="closeDrawer()" title="close" aria-label="close">✕</button></div>
+    <div id="drawerbody"></div>
+  </div>
+</div>
+<div id="imgview" aria-hidden="true" role="dialog" aria-label="image" onclick="if(event.target.id==='imgview')closeViewer()">
+  <div class="vbar"><span id="imgviewname"></span>
+    <a id="imgviewdl" class="ghost" href="#" download title="download" aria-label="download">⬇</a>
+    <button class="ghost" onclick="closeViewer()" title="close" aria-label="close">✕</button></div>
+  <button class="vnav vprev" onclick="stepImage(-1)" aria-label="previous image">‹</button>
+  <img id="imgviewimg" alt="">
+  <button class="vnav vnext" onclick="stepImage(1)" aria-label="next image">›</button>
 </div>
 <div id="taskmodal" onclick="if(event.target.id==='taskmodal')toggleTasks()">
   <div class="box">
@@ -2475,56 +2683,132 @@ function usageLine(m) {
 
 // --- the chat ---
 // The open thread reads as a chat, on a phone and a laptop alike: what the
-// owner said and what Claude answered, as bubbles; every run of tool calls,
-// their results and thinking between two of those folded into one quiet line
-// ("⚙ ran 6 tools") that unfolds onto the full log of those calls
-// (messageHtml above). Token, cache and model figures sit behind a bubble's
-// time, or inside the opened line.
+// owner said and what Claude answered, as bubbles; every tool call of a turn
+// (and the thinking between them) folded into ONE quiet line that counts the
+// calls by tool -- "Read ×4 · Bash ×3 · Grep ×2" -- with a spinner while the
+// turn runs and its total time once done. The line unfolds onto the turn's
+// chain of calls, in order: each its tool, what it was about, how it ended
+// and how long it took, and each opens again onto its input and output.
+// Files sent with a message sit on it as thumbnails or chips; all of a
+// thread's files are behind "Attachments (N)" in its header.
 //
 // chatItems turns messages into
-//   {kind: "bubble", id, role, text, ts, usage, model}
-//   {kind: "tools", id, parts: [message-shaped pieces], tools, names}
-// An id is where the item starts ("<message>.<block>"); messages are only
-// ever appended, so an item keeps its id as the thread grows, and a tools
-// line still collecting keeps its id (and whether it is open) as it grows.
+//   {kind: "bubble", id, role, text, raw, ts, usage, model}
+//   {kind: "tools", id, steps, calls, counts, tools, names, usage, start, end}
+// where a step is {kind: "call", name, arg, input, output, error, done,
+// start, end} or {kind: "thinking", text}. A turn starts at a message the
+// owner wrote (text, not a tool's result). An id is where the item starts
+// ("<message>.<block>"); messages are only ever appended, so an item keeps
+// its id as the thread grows, and a turn's line keeps its id (and whether it
+// is open) as calls stream into it.
+const ATTACH_NOTE = /\s*\[The user attached \d+ file\(s\), saved locally:\n[\s\S]*\]\s*$/;
 function chatItems(messages) {
   const items = [];
   let group = null;
+  const byId = new Map();      // tool ids are unique in a thread: a result finds its call
   messages.forEach((m, i) => {
     const blocks = m.blocks || [];
-    let bubble = null, part = null, said = null;
+    const at = m.ts ? Date.parse(m.ts) : NaN;
+    // The owner speaking starts a new turn, and so a new tools line -- not
+    // a message that also carries a result (an interruption's note).
+    if (m.role === "user" && blocks.some(b => b.type === "text")
+        && !blocks.some(b => b.type === "tool_result")) group = null;
+    let bubble = null, said = null;
     blocks.forEach((b, j) => {
       if (b.type === "text") {
-        part = null; group = null;
+        const text = m.role === "user" ? b.text.replace(ATTACH_NOTE, "") : b.text;
         if (!bubble) {
-          bubble = said = {kind: "bubble", id: `${i}.${j}`, role: m.role, text: b.text, ts: m.ts};
+          bubble = said = {kind: "bubble", id: `${i}.${j}`, role: m.role, text, raw: b.text, ts: m.ts};
           items.push(bubble);
-        } else bubble.text += "\n\n" + b.text;
+        } else { bubble.text += "\n\n" + text; bubble.raw += "\n\n" + b.text; }
         return;
       }
       bubble = null;
+      if (b.type === "tool_result") {
+        // Its call: by id, else the oldest still waiting (older transcripts).
+        const c = (b.for && byId.get(b.for)) || (group && group.calls.find(x => !x.done));
+        if (c) {
+          Object.assign(c, {done: true, output: b.text || "", error: !!b.error, end: at});
+          if (c.group && !(c.group.end >= at)) c.group.end = at;
+        }
+        return;
+      }
       if (!group) {
-        group = {kind: "tools", id: `${i}.${j}`, parts: [], tools: 0, names: []};
+        group = {kind: "tools", id: `${i}.${j}`, steps: [], calls: [], counts: {}, tools: 0,
+                 names: [], usage: [], start: NaN, end: NaN, t0: at};
         items.push(group);
       }
-      if (!part) { part = {role: m.role, ts: m.ts, blocks: []}; group.parts.push(part); }
-      part.blocks.push(b);
-      if (b.type === "tool") {
-        group.tools++;
-        if (!group.names.includes(b.name)) group.names.push(b.name);
-      }
+      if (b.type === "thinking") { group.steps.push({kind: "thinking", text: b.text}); return; }
+      if (b.type !== "tool") return;
+      const c = {kind: "call", name: b.name || "tool", arg: b.arg || "", input: b.input || "",
+                 output: "", error: false, done: false, start: at, end: NaN, group};
+      group.steps.push(c); group.calls.push(c);
+      if (b.id) byId.set(b.id, c);
+      group.tools++;
+      if (!(c.name in group.counts)) { group.counts[c.name] = 0; group.names.push(c.name); }
+      group.counts[c.name]++;
+      if (!(group.start <= at)) group.start = at;
     });
-    // A message's figures go with its words when it has any, else its tools.
-    const owner = said || part;
-    if (owner && m.usage) { owner.usage = m.usage; owner.model = m.model; }
+    // A message's figures go with its words when it has any, else its turn's line.
+    if (m.usage) {
+      if (said) { said.usage = m.usage; said.model = m.model; }
+      else if (group) group.usage.push({usage: m.usage, model: m.model});
+    }
   });
   return items;
 }
-function toolsLabel(g) {
-  const n = g.tools;
-  const what = n ? `⚙ ran ${n} tool${n === 1 ? "" : "s"}` : "💭 thinking";
-  const names = g.names.slice(0, 3).join(", ") + (g.names.length > 3 ? ", …" : "");
-  return what + (names ? " · " + names : "");
+// A length of time in milliseconds, as short as it can say it.
+function fmtMs(ms) {
+  if (!(ms >= 0)) return "";
+  if (ms < 1000) return ms < 50 ? "<0.1s" : (ms / 1000).toFixed(1) + "s";
+  const s = ms / 1000;
+  if (s < 10) return s.toFixed(1) + "s";
+  if (s < 60) return Math.round(s) + "s";
+  const m = Math.floor(s / 60), r = Math.round(s % 60);
+  if (m < 60) return m + "m" + (r ? " " + r + "s" : "");
+  return Math.floor(m / 60) + "h" + (m % 60 ? " " + (m % 60) + "m" : "");
+}
+// The line's words: each tool and how many times it ran, most first (ties
+// in the order they first ran), then the turn's time once it is over.
+function toolsLabel(g, live) {
+  if (!g.tools) return "💭 thinking";
+  const names = g.names.slice().sort((a, b) => g.counts[b] - g.counts[a]);
+  let s = names.map(n => `${n} ×${g.counts[n]}`).join(" · ");
+  const took = g.end - g.start;
+  if (!live && took > 0) s += " · " + fmtMs(took);
+  return s;
+}
+function toolsLineHtml(g, live, open) {
+  return (live ? `<span class="spin" aria-hidden="true"></span>` : `<span class="gear" aria-hidden="true">⚙</span>`) +
+    `<span class="ctlabel">${esc(toolsLabel(g, live))}</span>` +
+    (live ? `<span class="sr">running</span>` : "") +
+    `<span class="caret" aria-hidden="true">›</span>`;
+}
+// The opened line: the chain of calls, in order. A call still waiting on its
+// result spins while the turn runs; one whose turn ended without it says so.
+// callOpen: the calls (as "<line id>/<index>") opened onto input and output.
+const callOpen = new Set();
+function chainHtml(g, live) {
+  const rows = g.steps.map((st, i) => {
+    const k = `${g.id}/${i}`, open = callOpen.has(k);
+    if (st.kind === "thinking")
+      return `<li class="step think${open ? " open" : ""}"><button type="button" class="crow" aria-expanded="${open}" data-k="${k}"
+        onclick="toggleCall('${g.id}', ${i})"><span class="cname">💭 thinking</span><span class="carg">${
+        esc(st.text.split("\n")[0].slice(0, 80))}</span></button>${
+        open ? `<div class="cio"><pre>${esc(st.text)}</pre></div>` : ""}</li>`;
+    const state = st.done ? (st.error ? "err" : "ok") : live ? "run" : "lost";
+    const mark = {ok: "✓", err: "✗", run: `<span class="spin" aria-hidden="true"></span>`, lost: "–"}[state];
+    const said = {ok: "done", err: "failed", run: "running", lost: "no result"}[state];
+    const took = st.done ? fmtMs(st.end - st.start) : "";
+    return `<li class="step call ${state}${open ? " open" : ""}"><button type="button" class="crow" aria-expanded="${open}" data-k="${k}"
+      onclick="toggleCall('${g.id}', ${i})"><span class="cname">${esc(st.name)}</span><span class="carg">${
+      esc(st.arg)}</span><span class="cstate" title="${said}">${mark}<span class="sr">${said}</span></span><span class="cdur">${
+      took}</span></button>${open ? `<div class="cio"><div class="clbl">input</div><pre>${esc(st.input)}</pre>` +
+      (st.done ? `<div class="clbl">${st.error ? "error" : "output"}</div><pre>${esc(st.output) || "<i>(empty)</i>"}</pre>` : "") +
+      `</div>` : ""}</li>`;
+  }).join("");
+  const figures = g.usage.map(u => usageLine(u)).join("");
+  return `<ol class="chain">${rows}</ol>${figures ? `<div class="cfig">${figures}</div>` : ""}`;
 }
 function chatTime(ts) {
   if (!ts) return "";
@@ -2551,25 +2835,119 @@ function afterFold(fn) {
   if (reducedMotion()) { fn(); return; }
   setTimeout(fn, FOLD_MS);
 }
-// chatOpen: tools lines whose detail is drawn. chatShown: those unfolded --
-// the line's element wears .open. Opening draws the detail folded, then
-// unfolds it a frame later so the height animates; closing folds it, then
-// drops the detail once folded.
-const chatOpen = new Set(), chatShown = new Set();
+
+// --- files on the messages they came with ---
+const IMG_EXT = /\.(png|jpe?g|gif|webp|heic)$/i;
+function isImage(f) { return f.image !== undefined ? !!f.image : IMG_EXT.test(f.name || ""); }
+function fmtSize(n) {
+  if (!(n > 0)) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return Math.round(n / 1024) + " KB";
+  return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + " MB";
+}
+function fileIcon(name) {
+  const ext = (String(name).match(/\.([a-z0-9]+)$/i) || ["", ""])[1].toLowerCase();
+  if (IMG_EXT.test(name)) return "🖼";
+  if (["mp4", "mov", "m4v", "webm"].includes(ext)) return "🎞";
+  if (["mp3", "m4a", "wav", "aac", "caf"].includes(ext)) return "🎵";
+  if (["zip", "gz", "tgz", "tar", "dmg", "ipa"].includes(ext)) return "📦";
+  if (["csv", "tsv", "xlsx", "numbers"].includes(ext)) return "📊";
+  if (["pdf"].includes(ext)) return "📕";
+  if (["md", "txt", "log", "json", "py", "js", "swift", "html", "diff", "patch"].includes(ext)) return "📝";
+  return "📄";
+}
+// Which message each of the thread's files came with. One the owner sent is
+// on the message whose attachment note names its path (else the one of
+// theirs nearest in time); one Claude sent is on Claude's last words before
+// it was uploaded (files go up once the turn is over). Within the half hour,
+// so a file from a session since reset is not pinned to a stranger: those
+// are only in the drawer.
+function placeFiles(items, files) {
+  const bubbles = items.filter(x => x.kind === "bubble");
+  for (const b of bubbles) b.files = [];
+  for (const f of files || []) {
+    const t = (f.ts || 0) * 1000;
+    let home = null;
+    if (f.direction === "in") {
+      home = bubbles.find(b => b.role === "user" && f.path && (b.raw || "").includes(f.path));
+      if (!home) {
+        let best = Infinity;
+        for (const b of bubbles) {
+          const d = Math.abs(Date.parse(b.ts) - t);
+          if (b.role === "user" && d < best && d < 600000) { best = d; home = b; }
+        }
+      }
+    } else {
+      for (const b of bubbles) {
+        const bt = Date.parse(b.ts);
+        if (b.role !== "user" && bt <= t + 5000 && t - bt < 1800000) home = b;   // Claude's words
+      }
+    }
+    if (home) home.files.push(f);
+  }
+}
+function fileLink(f, inline) {
+  return (inline ? "/thumb" : "/download") + "?path=" + encodeURIComponent(f.path);
+}
+// An image is a thumbnail (a fixed square, so it loading moves nothing) that
+// opens the viewer; any other file a chip -- icon, name, size -- that
+// downloads it. One no longer on disk is muted and says why.
+function attachHtml(f) {
+  const gone = !f.exists;
+  const why = gone ? (f.pruned ? "pruned " + new Date(f.pruned * 1000).toLocaleDateString() +
+                                 "; the copy is in Slack" : "gone") : "";
+  if (isImage(f) && !gone)
+    return `<button type="button" class="athumb" data-path="${esc(f.path)}" onclick="viewImage(this.dataset.path)"
+      title="${esc(f.name)}" aria-label="view ${esc(f.name)}"><img src="${fileLink(f, true)}" alt="${esc(f.name)}"
+      loading="lazy" decoding="async" width="96" height="96" onload="this.classList.add('ld')"></button>`;
+  const inner = `<span class="ficon" aria-hidden="true">${fileIcon(f.name)}</span><span class="fname">${
+    esc(f.name)}</span><span class="fsize">${fmtSize(f.size)}</span>`;
+  if (gone) return `<span class="fchip gone" title="${esc(f.name)} (${esc(why)})">${inner}</span>`;
+  return `<a class="fchip" href="${fileLink(f)}" download="${esc(f.name)}" title="${esc(f.name)}">${inner}</a>`;
+}
+function attachRow(files) {
+  if (!files || !files.length) return "";
+  return `<div class="atts">${files.map(attachHtml).join("")}</div>`;
+}
 function chatHtml(it) {
   if (it.kind === "bubble") {
     const when = esc(chatTime(it.ts));
     const meta = it.usage
       ? `<details class="cstat"><summary>${when} · ⓘ</summary>${usageLine(it)}</details>`
       : `<span>${when}</span>`;
-    return `<div class="cmsg ${it.role}"><div class="bubble">${md(it.text)}</div>` +
-           `<div class="cmeta">${meta}</div></div>`;
+    return `<div class="cmsg ${it.role}">${it.text.trim() ? `<div class="bubble">${md(it.text)}</div>` : ""}` +
+           attachRow(it.files) + `<div class="cmeta">${meta}</div></div>`;
   }
-  const open = chatOpen.has(it.id);
-  return `<button class="ctl" aria-expanded="${open}" onclick="toggleTools('${it.id}')"
-    >${esc(toolsLabel(it))} <span class="caret" aria-hidden="true">›</span></button><div class="cbody"><div class="cdetail">${
-    open ? it.parts.map(messageHtml).join("") : ""}</div></div>`;
+  return `<button class="ctl">${toolsLineHtml(it, false)}</button>`;
 }
+// A turn's line is three elements made once -- the line, and the detail it
+// unfolds onto -- so a call streaming in rewrites only the line's words (and
+// the chain, if open): nothing else in the thread is touched, and the line
+// keeps its focus.
+function toolsEl() {
+  const div = document.createElement("div");
+  const btn = document.createElement("button"), body = document.createElement("div"),
+        detail = document.createElement("div");
+  btn.className = "ctl"; btn.type = "button";
+  body.className = "cbody"; detail.className = "cdetail";
+  body.appendChild(detail); div.appendChild(btn); div.appendChild(body);
+  div._ctl = btn; div._detail = detail;
+  return div;
+}
+function drawTools(div, it, live) {
+  const open = chatOpen.has(it.id);
+  div._ctl.onclick = () => toggleTools(it.id);
+  setHTML(div._ctl, toolsLineHtml(it, live, open));
+  if (div._ctl.setAttribute) div._ctl.setAttribute("aria-expanded", String(open));
+  setHTML(div._detail, open ? chainHtml(it, live) : "");
+  div.classList.toggle("open", chatShown.has(it.id));
+  div.classList.toggle("live", !!live);
+}
+// chatOpen: tools lines whose detail is drawn. chatShown: those unfolded --
+// the line's element wears .open. Opening draws the detail folded, then
+// unfolds it a frame later so the height animates; closing folds it, then
+// drops the detail once folded.
+const chatOpen = new Set(), chatShown = new Set();
 // One element per item, as the session list does: an item is rewritten only
 // when its own markup changed, so an open detail stays open as the thread
 // grows and a long thread is not redrawn every few seconds. The element is
@@ -2577,13 +2955,31 @@ function chatHtml(it) {
 // of what is inside -- nothing replays as a reply streams in. An item that
 // arrives after the thread was first drawn rises in (.enter).
 const chatEls = new Map();
-function drawChat(msgs, messages, sessionId) {
+// The turn's line is live while the thread's turn runs and nothing the
+// owner said has come after it -- and only a line of that turn: the running
+// turn's message (its ref, a Slack ts) was posted before any of its calls,
+// so a line begun before it is the last turn's, its prompt not read yet.
+function liveLine(items, live) {
+  if (!live || !live.running) return null;
+  const now = (live.turns || []).find(t => t.state === "running");
+  const since = now && parseFloat(now.ref) > 0 ? parseFloat(now.ref) * 1000 - 2000 : -Infinity;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i].kind === "tools") return items[i].t0 >= since || isNaN(items[i].t0) ? items[i].id : null;
+    if (items[i].role === "user") return null;
+  }
+  return null;
+}
+let chatItemsNow = [];
+function drawChat(msgs, messages, sessionId, files) {
   const items = chatItems(messages);
+  chatItemsNow = items;
+  placeFiles(items, files);
   if (!items.length) {
     chatEls.clear();
     msgs.innerHTML = sessionId ? "" : `<div class="empty">No messages yet — say something below.</div>`;
     return;
   }
+  const liveId = liveLine(items, typeof tview !== "undefined" && tview ? tview.live : null);
   const want = new Set(items.map(x => x.id));
   for (const [k, div] of chatEls) if (!want.has(k)) { div.remove(); chatEls.delete(k); }
   if (msgs.querySelector && msgs.querySelector(".empty")) msgs.innerHTML = "";
@@ -2591,7 +2987,7 @@ function drawChat(msgs, messages, sessionId) {
   const divs = items.map(it => {
     let div = chatEls.get(it.id);
     if (!div) {
-      div = document.createElement("div");
+      div = it.kind === "tools" ? toolsEl() : document.createElement("div");
       div.classList.add("citem");
       div.classList.add(it.kind === "tools" ? "ctools" : "cbubble");
       if (animate) {
@@ -2602,8 +2998,8 @@ function drawChat(msgs, messages, sessionId) {
       }
       chatEls.set(it.id, div);
     }
-    if (it.kind === "tools") div.classList.toggle("open", chatShown.has(it.id));
-    setHTML(div, chatHtml(it));
+    if (it.kind === "tools") drawTools(div, it, it.id === liveId);
+    else setHTML(div, chatHtml(it));
     return div;
   });
   // Only what is new is appended: moving an element takes it out of the
@@ -2616,16 +3012,7 @@ function drawChat(msgs, messages, sessionId) {
 }
 function redrawChat() {
   if (active && tview.key === active.key)
-    drawChat(document.getElementById("tmsgs"), tview.msgs || [], tview.sid);
-}
-// Redraws, putting focus back on the line's button if it had it: the button
-// is part of the markup a redraw replaces.
-function redrawKeepFocus(id) {
-  const div = chatEls.get(id), a = typeof document !== "undefined" && document.activeElement;
-  const had = !!(div && a && div.contains && div.contains(a));
-  redrawChat();
-  const b = had && div.querySelector && div.querySelector(".ctl");
-  if (b && b.focus) b.focus();
+    drawChat(document.getElementById("tmsgs"), tview.msgs || [], tview.sid, tview.files);
 }
 function toggleTools(id) {
   const div = () => chatEls.get(id);
@@ -2633,20 +3020,107 @@ function toggleTools(id) {
     // Folded first; the detail itself is dropped once the fold has run.
     chatShown.delete(id);
     chatOpen.delete(id);
-    if (div()) div().classList.remove("open");
-    afterFold(() => { if (!chatOpen.has(id)) redrawKeepFocus(id); });
+    if (div()) { div().classList.remove("open"); if (div()._ctl.setAttribute) div()._ctl.setAttribute("aria-expanded", "false"); }
+    afterFold(() => { if (!chatOpen.has(id)) redrawChat(); });
     return;
   }
   // Opened, it is being read: the next poll must not scroll it away.
   pinned = false;
   chatOpen.add(id);
-  redrawKeepFocus(id);                              // drawn, still folded
+  redrawChat();                                     // drawn, still folded
   nextFrame(() => {
     if (!chatOpen.has(id)) return;
     chatShown.add(id);
     if (div()) div().classList.add("open");
   });
 }
+// A call in the chain opens onto its input and output, and closes again.
+function toggleCall(id, i) {
+  const k = `${id}/${i}`;
+  if (callOpen.has(k)) callOpen.delete(k); else callOpen.add(k);
+  pinned = false;
+  redrawChat();
+  const row = typeof document.querySelector === "function" &&
+              document.querySelector(`.crow[data-k="${k}"]`);
+  if (row && row.focus) row.focus();
+}
+
+// --- the thread's files: the drawer, and the viewer ---
+// Newest first: its images as a grid, its other files as a list.
+function drawerHtml(files) {
+  const all = (files || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  if (!all.length) return `<div class="empty">No files in this thread.</div>`;
+  const imgs = all.filter(f => isImage(f) && f.exists), rest = all.filter(f => !(isImage(f) && f.exists));
+  let h = "";
+  if (imgs.length) h += `<h3>Images <span class="dn">${imgs.length}</span></h3><div class="dgrid">${
+    imgs.map(attachHtml).join("")}</div>`;
+  if (rest.length) h += `<h3>Files <span class="dn">${rest.length}</span></h3><ul class="dlist">${
+    rest.map(f => `<li>${attachHtml(f)}<span class="dwhen">${f.direction === "in" ? "you" : "Claude"}${
+      f.ts ? " · " + esc(chatTime(new Date(f.ts * 1000).toISOString())) : ""}</span></li>`).join("")}</ul>`;
+  return h;
+}
+function threadFiles() { return (active && tview.key === active.key && tview.files) || []; }
+function drawerIsOpen() {
+  const d = document.getElementById("attdrawer");
+  return !!(d && d.classList.contains("open"));
+}
+function drawDrawer() {
+  const files = threadFiles();
+  setHTML(document.getElementById("drawertitle"), `📎 Attachments (${files.length})`);
+  setHTML(document.getElementById("drawerbody"), drawerHtml(files));
+}
+function openDrawer() {
+  drawDrawer();
+  const d = document.getElementById("attdrawer");
+  d.classList.add("open");
+  if (d.setAttribute) d.setAttribute("aria-hidden", "false");
+}
+function closeDrawer() {
+  const d = document.getElementById("attdrawer");
+  if (!d) return;
+  d.classList.remove("open");
+  if (d.setAttribute) d.setAttribute("aria-hidden", "true");
+}
+// The viewer: one image at the screen's size, the thread's others a swipe or
+// an arrow key away.
+let viewing = "";
+function viewImage(path) {
+  const imgs = threadFiles().filter(f => isImage(f) && f.exists);
+  const f = imgs.find(x => x.path === path) || {path, name: path.split("/").pop()};
+  viewing = f.path;
+  const v = document.getElementById("imgview");
+  document.getElementById("imgviewimg").src = "/download?inline=1&path=" + encodeURIComponent(f.path);
+  document.getElementById("imgviewimg").alt = f.name;
+  setHTML(document.getElementById("imgviewname"), esc(f.name) + (imgs.length > 1
+    ? ` <span class="dn">${imgs.indexOf(f) + 1} / ${imgs.length}</span>` : ""));
+  document.getElementById("imgviewdl").href = fileLink(f);
+  v.classList.add("open");
+  if (v.setAttribute) v.setAttribute("aria-hidden", "false");
+}
+function stepImage(by) {
+  const imgs = threadFiles().filter(f => isImage(f) && f.exists);
+  const i = imgs.findIndex(f => f.path === viewing);
+  if (i < 0 || imgs.length < 2) return;
+  viewImage(imgs[(i + by + imgs.length) % imgs.length].path);
+}
+function viewerIsOpen() {
+  const v = document.getElementById("imgview");
+  return !!(v && v.classList.contains("open"));
+}
+function closeViewer() {
+  const v = document.getElementById("imgview");
+  if (!v) return;
+  v.classList.remove("open");
+  if (v.setAttribute) v.setAttribute("aria-hidden", "true");
+  viewing = "";
+}
+document.addEventListener("keydown", e => {
+  if (viewerIsOpen()) {
+    if (e.key === "Escape") closeViewer();
+    else if (e.key === "ArrowRight") stepImage(1);
+    else if (e.key === "ArrowLeft") stepImage(-1);
+  } else if (e.key === "Escape" && drawerIsOpen()) closeDrawer();
+});
 // The chat follows the newest message while it is read at the bottom; read
 // further up, it stays put and a pill offers the way down.
 function scroller() {
@@ -2699,7 +3173,7 @@ function keepEnd(fn, force) {
 // The open thread's own header on a phone, stuck to the top: back to the
 // list, its name and project, what it is doing (with Stop while a turn runs),
 // the alerts' count, and ⓘ for what a laptop shows above the transcript.
-function chatHead(s, live, nAlerts) {
+function chatHead(s, live, nAlerts, nFiles) {
   const turns = (live && live.turns) || [];
   const queued = turns.filter(t => t.state === "queued").length;
   const t = s.turn;
@@ -2712,19 +3186,22 @@ function chatHead(s, live, nAlerts) {
       <span class="csub">${s.project ? `<span class="cproj">${esc(s.project)}</span>` : ""}${state}${
         queued ? `<span class="cst">· ${queued} queued</span>` : ""}</span></div>
     ${nAlerts ? `<button class="calert" onclick="openAlerts(event)" title="alerts">⚠ ${nAlerts}</button>` : ""}
+    ${nFiles ? `<button class="cattach" onclick="openDrawer()" title="attachments" aria-label="Attachments (${nFiles})">📎 ${nFiles}</button>` : ""}
     ${running ? `<button class="cstop" onclick="cmdSend('!stop')">■ Stop</button>` : ""}
     <button class="cinfo" onclick="document.body.classList.toggle('threadinfo')" title="thread details">ⓘ</button>`;
 }
 function drawChatHead() {
   const el = document.getElementById("chathead");
   if (!el || !active) return;
-  setHTML(el, chatHead(active, tview.key === active.key ? tview.live : null, alertList.length));
+  setHTML(el, chatHead(active, tview.key === active.key ? tview.live : null, alertList.length,
+                       threadFiles().length));
 }
 function transcriptHead(s) {
   let h = `<div class="toolbar">
     <code id="cmd">${esc(s.resume_cmd)}</code>
     <button class="act" onclick="navigator.clipboard.writeText(document.getElementById('cmd').textContent);toast('Copied')">Copy resume cmd</button>
     <button class="ghost" onclick="window.open('${esc(s.slack_link)}')">Open in Slack</button>
+    ${threadFiles().length ? `<button class="ghost tattach" onclick="openDrawer()">📎 Attachments (${threadFiles().length})</button>` : ""}
     ${s.running ? `<button class="ghost" onclick="cmdSend('!stop')">■ Stop</button>` : ""}
     ${s.checked_out ? `<button class="ghost" onclick="cmdSend('!takeover')">Take over</button>
                        <button class="ghost" onclick="cmdSend('!back')">Reclaim</button>` : ""}
@@ -2756,23 +3233,6 @@ function transcriptHead(s) {
   }
   return h;
 }
-// The thread's files: one line that opens onto a row of compact chips --
-// which way it went, its name (ellipsized), its size. One no longer on disk
-// is a muted chip that says why on hover.
-function filesHtml(files) {
-  if (!files.length) return "";
-  return `<details class="cfiles"><summary>📎 ${files.length} file${
-    files.length === 1 ? "" : "s"}</summary><div class="fchips">` + files.map(f => {
-    const dir = f.direction === "in" ? "⬇" : "⬆";
-    const inner = `<span class="fdir">${dir}</span><span class="fname">${esc(f.name)}</span>` +
-                  `<span class="fsize">${fmtTok(f.size)}B</span>`;
-    if (f.exists)
-      return `<a class="fchip" href="/download?path=${encodeURIComponent(f.path)}" title="${esc(f.name)}">${inner}</a>`;
-    const why = f.pruned ? "pruned " + new Date(f.pruned * 1000).toLocaleDateString() + "; the copy is in Slack"
-                         : "gone";
-    return `<span class="fchip gone" title="${esc(f.name)} (${esc(why)})">${inner}</span>`;
-  }).join("") + "</div></details>";
-}
 async function loadTranscript(scroll) {
   if (!active) return;
   const s = active;
@@ -2783,8 +3243,9 @@ async function loadTranscript(scroll) {
   // when that is not the one drawn so far.
   if (scroll) showReading();
   if (scroll || tview.key !== s.key) {
-    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false, msgs: []};
-    chatOpen.clear(); chatShown.clear(); chatEls.clear();
+    tview = {key: s.key, sid: "", cursor: 0, busy: false, error: false, msgs: [], files: []};
+    chatOpen.clear(); chatShown.clear(); chatEls.clear(); callOpen.clear();
+    closeDrawer(); closeViewer();
   }
   const want = tview, from = want.cursor;
   // One read at a time; a call made meanwhile (a rename, a resummarize) is
@@ -2801,6 +3262,9 @@ async function loadTranscript(scroll) {
   } finally { want.busy = false; }
   if (tview !== want || want.cursor !== from) return;   // superseded meanwhile
   const msgs = document.getElementById("tmsgs");
+  // Files first: the header counts them, and the messages carry them.
+  const filesChanged = JSON.stringify(files || []) !== JSON.stringify(want.files || []);
+  want.files = files || [];
   keepEnd(() => {
     setHTML(document.getElementById("thead"), transcriptHead(s));
     if (data.error) {
@@ -2814,10 +3278,18 @@ async function loadTranscript(scroll) {
       // starts the messages over; anything else is only what is new.
       if (from === 0 || data.reset || want.error) {
         msgs.innerHTML = ""; want.msgs = []; chatEls.clear(); chatOpen.clear(); chatShown.clear();
+        callOpen.clear();
       }
       want.error = false;
       want.msgs = want.msgs.concat(data.messages);
-      if (data.messages.length || !msgs.innerHTML) drawChat(msgs, want.msgs, data.session_id);
+      // Drawn again when what it shows moved: new messages, the files, or
+      // the turn starting or ending (a line's spinner, its time).
+      const running = !!(data.live && data.live.running);
+      if (data.messages.length || !msgs.innerHTML || filesChanged || running !== !!want.wasRunning) {
+        want.live = data.live || null;
+        drawChat(msgs, want.msgs, data.session_id, want.files);
+      }
+      want.wasRunning = running;
       want.cursor = data.cursor || 0;
       want.live = data.live || null;
       arrived(s.key, data.messages, (want.live && want.live.turns) || []);
@@ -2825,7 +3297,7 @@ async function loadTranscript(scroll) {
     if (data.session_id !== undefined) want.sid = data.session_id || "";
     want.live = data.live || null;
     drawLive();
-    setHTML(document.getElementById("tfiles"), filesHtml(files));
+    if (drawerIsOpen()) drawDrawer();
     document.getElementById("composer").style.display = "flex";
   }, scroll);
   if (want.again && tview === want) { want.again = false; loadTranscript(false); }
@@ -2988,11 +3460,28 @@ function addFiles(list, where) {
   renderChips(where);
 }
 function dropFile(where, i) { staged[where].splice(i, 1); renderChips(where); }
+// Files staged for the next message, and only those: removable chips, an
+// image with a small preview of itself (an object URL, let go once the file
+// is no longer staged).
+const previews = new Map();
+function previewOf(f) {
+  if (!(f.type || "").startsWith("image/") || typeof Blob === "undefined" || !(f instanceof Blob)
+      || typeof URL === "undefined" || !URL.createObjectURL) return "";
+  if (!previews.has(f)) previews.set(f, URL.createObjectURL(f));
+  return previews.get(f);
+}
 function renderChips(where) {
   const box = document.getElementById(where === "nt" ? "ntchips" : "chips");
+  const still = new Set([...staged.reply, ...staged.nt]);
+  for (const [f, u] of previews) if (!still.has(f)) { URL.revokeObjectURL(u); previews.delete(f); }
   if (!box) return;
-  setHTML(box, staged[where].map((f, i) =>
-    `<span class="chip"><span>${esc(f.name)}</span><button title="remove" onclick="dropFile('${where}', ${i})">✕</button></span>`).join(""));
+  setHTML(box, staged[where].map((f, i) => {
+    const pv = previewOf(f);
+    return `<span class="chip">${pv ? `<img class="cpv" src="${pv}" alt="" width="24" height="24">`
+      : `<span class="ficon" aria-hidden="true">${fileIcon(f.name)}</span>`}<span class="cname">${
+      esc(f.name)}</span><span class="fsize">${fmtSize(f.size)}</span><button type="button" title="remove"
+      aria-label="remove ${esc(f.name)}" onclick="dropFile('${where}', ${i})">✕</button></span>`;
+  }).join(""));
 }
 function readB64(file) {
   return new Promise((ok, fail) => {
@@ -3169,7 +3658,7 @@ document.addEventListener("keydown", e => {
 let ntClientId = "";
 async function newThreadForm() {
   try { await loadFormChoices(); } catch (e) { formProjects = formProjects || []; }
-  staged.nt = [];
+  staged.nt = []; renderChips("nt");
   // One id for whatever this form sends: a second tap after an unconfirmed
   // start asks after the first rather than starting another thread.
   ntClientId = newClientId();
@@ -3201,7 +3690,7 @@ async function submitNewThread() {
   }
   if (!r.ok) { formError(r.error || "refused"); return; }
   closeModal();
-  staged.nt = [];
+  staged.nt = []; renderChips("nt");
   sentFor(r.key).push({ref: r.ref, text, files: files.map(f => f.name), kind: "prompt",
                        at: Date.now(), replies: r.replies || []});
   // Until the list has it: enough of a session for the header to draw.
@@ -4803,7 +5292,7 @@ function showReading() {
 }
 function leaveReading() {
   if (document.body) { document.body.classList.remove("reading"); document.body.classList.remove("threadinfo"); }
-  showJump(false); closeAlerts();
+  showJump(false); closeAlerts(); closeDrawer(); closeViewer();
   active = null;                 // stops the transcript poll; the list unhighlights
   loadList();
 }
@@ -4825,15 +5314,59 @@ if (window.addEventListener)
 // tap) all land on it the same way. Read once, then taken off the address
 // bar, so a reload opens the list rather than this again.
 //   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
+//     [&drawer=1] [&tools=open] [&files=1]  ...its attachments drawer, its longest turn's calls
+//                                         open, or its newest message with files in view
 //   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
 //   ?q=<words>                            transcript search
+// Runs `fn` with transitions held: a link lands on the state it names, not
+// on the way there (and a view never painted, as a screenshot's, would not
+// run the transition at all).
+function instantly(fn) {
+  const b = document.body;
+  if (b && b.classList) b.classList.add("instant");
+  try { fn(); } finally {
+    setTimeout(() => { if (b && b.classList) b.classList.remove("instant"); }, 1500);
+  }
+}
+// Runs `fn` once the thread `key` is open and its first read drawn (gives
+// up after twenty seconds).
+function whenRead(key, fn, tries) {
+  if (active && active.key === key && tview.key === key && tview.cursor > 0 && !tview.busy) return fn();
+  if ((tries || 0) < 80) setTimeout(() => whenRead(key, fn, (tries || 0) + 1), 250);
+}
 async function openLink(q) {
   const view = q.get("view") || "", slug = q.get("slug") || "", modal = q.get("modal") || "";
   const thread = q.get("thread"), card = q.get("card"), words = q.get("q");
   // A thread or a task: the notification's own way in (openTarget, below).
   if (thread || q.get("task")) await openTarget("/?" + q.toString());
+  // &drawer=1: the thread's attachments drawer; &tools=open: its longest turn's
+  // line opened onto its chain -- once the thread has been read.
+  if (thread && (q.get("drawer") || q.get("tools") || q.get("files"))) whenRead(thread, () => instantly(() => {
+    if (q.get("drawer")) openDrawer();
+    if (q.get("files")) {
+      // The newest message that came with files, at the top of the chat.
+      const b = chatItemsNow.filter(x => x.kind === "bubble" && x.files && x.files.length).pop();
+      const el = b && chatEls.get(b.id), m = scroller();
+      if (el && m && el.getBoundingClientRect) {
+        pinned = false;
+        m.scrollTop += el.getBoundingClientRect().top - m.getBoundingClientRect().top - 12;
+      }
+    }
+    if (q.get("tools")) {
+      const lines = chatItemsNow.filter(x => x.kind === "tools");
+      const g = lines.sort((a, b) => b.steps.length - a.steps.length)[0];
+      if (g) {
+        // Opened as it would be once unfolded: no frame waited on.
+        chatOpen.add(g.id); chatShown.add(g.id); pinned = false;
+        redrawChat();
+        const el = chatEls.get(g.id), m = scroller();
+        if (el && m && el.getBoundingClientRect)
+          m.scrollTop += el.getBoundingClientRect().top - m.getBoundingClientRect().top - 12;
+      }
+    }
+  }));
   if (view === "stats") {
     const d = document.getElementById("dashm");
     if (d) d.open = true;
