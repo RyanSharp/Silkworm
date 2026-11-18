@@ -391,7 +391,8 @@ _GOAL_FILLER = frozenset("""
     ahead sounds sound good great perfect sure fine nice cool awesome thanks thank
     yeah yep yup alright right lgtm agreed agree approve approved
     first second third fourth fifth last next previous above below earlier latter former
-    proposed suggested suggestion suggestions recommended recommendation recommendations
+    proposed suggest suggested suggestion suggestions
+    recommend recommended recommendation recommendations
     idea ideas option options
 """.split())
 
@@ -408,12 +409,25 @@ def _stem(w: str) -> str:
     return w[:4]
 
 
+def _filler(w: str) -> bool:
+    """Filler, or another form of a filler word ("proposals", "approves",
+    "recommends") -- its inflection cut, at full length, then with an "e"
+    back on. Not `_stem`: cut to four letters the filler would swallow real
+    words that merely start alike ("perfect" -> "performance", "recommended"
+    -> "recovery"); and only filler of five letters or more has other forms
+    here, or "noted" would be "not", "cooling" "cool" and "mining" "mine"."""
+    if w in _GOAL_FILLER:
+        return True
+    root = _SUFFIX.sub("", w)
+    return root != w and any(len(r) >= 5 and r in _GOAL_FILLER for r in (root, root + "e"))
+
+
 def _content(words: list) -> set:
     """Your words that name something (two-letter ones too: CI, UI, DB),
-    stemmed; filler, the asking and filing words, numbers and the pieces of
-    a contraction ("isn't" -> isn, t) are not."""
+    stemmed; filler in any of its forms, the asking and filing words,
+    numbers and the pieces of a contraction ("isn't" -> isn, t) are not."""
     return {_stem(w) for w in words
-            if len(w) >= 2 and w not in _GOAL_FILLER and not w.isdigit()}
+            if len(w) >= 2 and not _filler(w) and not w.isdigit()}
 
 
 def request_goal_refusal(goal: str, text: str) -> str:

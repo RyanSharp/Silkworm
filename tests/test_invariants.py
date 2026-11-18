@@ -32888,6 +32888,15 @@ def test_request_goal_refusal_ties_the_goal_to_your_message():
     for m in ("go ahead and file it", "sounds good, file the first one",
               "perfect, the recommended one please", "yep, the second suggested option"):
         check(f"saying yes or pointing is not words the goal must repeat: {m!r}", g(goal, m) == "")
+    for m in ("yes, he approves the proposals", "the one he recommends", "she suggests it",
+              "approving both proposals", "agrees with the recommendations"):
+        check(f"nor are other forms of those words: {m!r}", g(goal, m) == "")
+    check("filler's forms do not swallow real words that merely start alike",
+          O._content(O._words("performance record recovery format approach preview"))
+          == {"perf", "reco", "form", "appr", "prev"})
+    check("nor do short filler words' look-alikes",
+          {"not", "cool", "min", "good", "will", "last"}
+          <= O._content(O._words("noted cooling mining goods willing lasting")))
     check("but the fix named beside them still is",
           g(goal, "sure, file the suggested fix") != ""
           and g("Fix the universe rebuild", "sure, file the suggested fix") == "")
