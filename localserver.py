@@ -16,9 +16,12 @@ class LocalServer:
         self.port = port
         self._routes = {}
 
-    def route(self, path: str, fn) -> None:
-        """fn(payload: dict) -> dict; runs on the request thread and may block."""
-        self._routes[path] = fn
+    def route(self, path: str, fn, peer: bool = False) -> None:
+        """fn(payload: dict) -> dict; runs on the request thread and may block.
+        With `peer`, fn(payload, client, server): the connection's two ends as
+        (host, port), from the socket -- never from anything the caller sent
+        -- for a route that must ask who is on the other end."""
+        self._routes[path] = (fn, peer)
 
     def start(self) -> None:
         routes = self._routes
@@ -28,7 +31,7 @@ class LocalServer:
                 pass
 
             def do_POST(self):
-                fn = routes.get(self.path)
+                fn, peer = routes.get(self.path) or (None, False)
                 if fn is None:
                     self.send_response(404)
                     self.end_headers()
@@ -39,7 +42,11 @@ class LocalServer:
                 except Exception:
                     payload = {}
                 try:
-                    answer = fn(payload) or {}
+                    if peer:
+                        answer = fn(payload, tuple(self.client_address[:2]),
+                                    tuple(self.connection.getsockname()[:2])) or {}
+                    else:
+                        answer = fn(payload) or {}
                 except Exception:
                     log.exception("handler for %s failed", self.path)
                     answer = {}

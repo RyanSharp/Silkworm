@@ -23,8 +23,16 @@ any it cannot establish:
     by any process on the mini; the process on the other end of the socket
     cannot be: an agent runs as the user, never as root.
 
-The probes (this machine's tailnet addresses, whois, the socket's owner)
-are a `Probe`, so tests stand in for the machine.
+The bot takes the dashboard's word for this only from the dashboard itself
+(from_visualizer): its /web-message route is loopback too, and any process
+on the mini could post a `dashboard_owner` there. So the bot asks, the same
+way, who opened the connection carrying one -- and it must be the process
+launchd runs as the visualizer's job (VIZ_LABEL), not one an agent started.
+A key the two shared would not do: agents run as the same user, and read
+whatever file the visualizer could.
+
+The probes (this machine's tailnet addresses, whois, the socket's owner,
+the visualizer's job) are a `Probe`, so tests stand in for the machine.
 """
 
 from __future__ import annotations
@@ -50,6 +58,10 @@ SELF_IPS_TTL_S = 60
 
 NETSTAT = "/usr/sbin/netstat"
 PS = "/bin/ps"
+#: By full path: PATH starts in directories any agent can write.
+LAUNCHCTL = "/bin/launchctl"
+#: The visualizer's launchd job (bin/silkworm LaunchdManager.SERVICES).
+VIZ_LABEL = "com.silkworm.viz"
 
 
 def peer_of(headers) -> str:
@@ -177,6 +189,19 @@ class Probe:
         except Exception:
             return {}
 
+    def job_pid(self, label: str) -> int:
+        """The pid launchd says its job `label` runs as in this user's GUI
+        domain, or 0 (not loaded, not running, launchctl failing, or loaded
+        from anywhere but its plist in ~/Library/LaunchAgents)."""
+        try:
+            rc, out, _ = self._run([LAUNCHCTL, "print", f"gui/{os.getuid()}/{label}"],
+                                   PROBE_TIMEOUT_S)
+        except Exception:
+            return 0
+        if rc != 0:
+            return 0
+        return job_pid_of(out or "", launch_agent(label))
+
     @staticmethod
     def cli_beside(daemon_path: str) -> str:
         """The tailscale CLI installed beside the running tailscaled, or "".
@@ -186,6 +211,52 @@ class Probe:
             return ""
         cli = os.path.join(os.path.dirname(daemon_path), "tailscale")
         return cli if os.path.isfile(cli) and os.access(cli, os.X_OK) else ""
+
+
+def launch_agent(label: str) -> str:
+    """Where `silkworm install` writes the job's plist."""
+    return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"{label}.plist")
+
+
+def job_pid_of(launchctl_print: str, plist: str) -> int:
+    """The job's own `pid = N` in `launchctl print` output -- the line one
+    tab in, not one nested deeper -- or 0, unless the job was loaded from
+    `plist`. Any process of the user's can take a free label (`launchctl
+    submit -l`, or bootstrap a plist of its own after a bootout); launchd
+    says where each job came from, and only the installed plist is the
+    visualizer -- writing that is editing the install, not posting to it."""
+    lines = launchctl_print.splitlines()
+    if f"\tpath = {plist}" not in lines:
+        return 0
+    for line in lines:
+        if line.startswith("\tpid = "):
+            raw = line[len("\tpid = "):].strip()
+            return int(raw) if raw.isdigit() and int(raw) > 0 else 0
+    return 0
+
+
+def from_visualizer(client, server, probe) -> tuple[bool, str]:
+    """(True, "") when the loopback connection from `client` to `server`
+    (both (host, port)) was opened by the visualizer's launchd job, else
+    (False, why not) -- failing closed on anything it cannot establish. The
+    bot asks this before it takes a /web-message's `dashboard_owner` as the
+    dashboard's word rather than a claim anyone on the mini could post."""
+    try:
+        client, server = tuple(client)[:2], tuple(server)[:2]
+    except TypeError:
+        return False, "no connection to check"
+    if len(client) != 2 or len(server) != 2:
+        return False, "no connection to check"
+    job = probe.job_pid(VIZ_LABEL)
+    if not job:
+        return False, f"the visualizer's launchd job ({VIZ_LABEL}) is not running"
+    pid = (probe.connector(client, server) or {}).get("pid") or 0
+    if not pid:
+        return False, "could not tell which process opened the connection"
+    if pid != job:
+        return False, (f"sent by pid {pid}, not the visualizer ({VIZ_LABEL}, pid {job}): "
+                       f"only the dashboard vouches for who sent a message")
+    return True, ""
 
 
 def _is_ip(raw) -> bool:

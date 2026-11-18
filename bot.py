@@ -2039,10 +2039,20 @@ THREAD_KEY_RE = re.compile(r"[A-Z0-9]+:[0-9.]+")
 WEB_REPEAT_WAIT_S = 15.0
 #: Dashboard sends by their client id (webthread.Sends).
 WEB_SENDS = webthread.Sends()
+#: Asks who opened a /web-message connection (dashowner.from_visualizer).
+WEB_PEER_PROBE = dashowner.Probe()
 
 
-def handle_web_message(payload: dict) -> dict:
+def handle_web_message(payload: dict, client=None, server=None) -> dict:
     """Route for /web-message — a message sent from the dashboard's composer.
+
+    `dashboard_owner` -- the dashboard's word that you sent it, which opens
+    your grant -- is kept only on a connection the visualizer's launchd job
+    opened (dashowner.from_visualizer; `client`/`server` are the socket's two
+    ends, which LocalServer reads off the connection). This port is loopback
+    with no other gate, so anything else on the mini -- an agent's curl --
+    could otherwise post one and act on your word. Dropped, the message still
+    goes, as no one's in particular.
 
     Idempotent by `client_id`, an id the page gives each message: when the
     page cannot tell whether a send went through (the dashboard stopped
@@ -2053,6 +2063,12 @@ def handle_web_message(payload: dict) -> dict:
     forgotten, so a retry after a real refusal really retries. Without an id
     every send is new, as before. See deliver_web_message for the rest.
     """
+    payload = dict(payload or {})
+    if "dashboard_owner" in payload:
+        ok, why = dashowner.from_visualizer(client, server, WEB_PEER_PROBE)
+        if not ok:
+            log.warning("web message: dashboard_owner dropped -- %s", why)
+            payload.pop("dashboard_owner")
     cid = str(payload.get("client_id") or "")
     if not cid:
         return deliver_web_message(payload)
@@ -2085,7 +2101,9 @@ def deliver_web_message(payload: dict) -> dict:
     it is a new one).
 
     Localhost-only by construction (the LocalServer binds 127.0.0.1), so it is
-    trusted like the machine owner: it bypasses the Slack allowlist.
+    trusted like the machine owner: it bypasses the Slack allowlist. Not with
+    your grant, though: that only on a `dashboard_owner` handle_web_message
+    kept, having checked the visualizer sent it.
 
     Every message, prompt or !command, goes through handle_prompt -- the very
     path a Slack message takes -- so a command is handle_command's, never a
@@ -3985,7 +4003,7 @@ server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
 server.route("/drain", handle_drain)
 server.route("/tell", handle_tell)
-server.route("/web-message", handle_web_message)
+server.route("/web-message", handle_web_message, peer=True)
 server.route("/thread-state", handle_thread_state)
 server.route("/push", handle_push)
 server.route("/register-terminal", handle_register_terminal)
@@ -7097,8 +7115,9 @@ def dashboard_owner(event: dict) -> dict | None:
     """{login, peer, node} of a dashboard message the dashboard vouched is
     yours (visualizer: dashowner.verify -- through tailscale serve as
     VIZ_TAILSCALE_LOGIN, past its cross-site checks, from another tailnet
-    device, on a connection tailscaled opened), read again against
-    VIZ_TAILSCALE_LOGIN here; None for any other message."""
+    device, on a connection tailscaled opened -- and handle_web_message:
+    sent by the visualizer itself), read again against VIZ_TAILSCALE_LOGIN
+    here; None for any other message."""
     if not event.get("_web"):
         return None
     allowed = (os.environ.get("VIZ_TAILSCALE_LOGIN")

@@ -33694,6 +33694,151 @@ def test_bot_opens_your_grant_for_a_vouched_dashboard_message():
           == {"via", "login", "node", "peer"})
 
 
+# 2026-11-18: /web-message is loopback with no other gate, and the bot took
+# `dashboard_owner` from its body -- so any process on the mini (an agent's
+# curl) could post one and start a turn on the owner's word. It now keeps one
+# only on a connection the visualizer's launchd job opened.
+
+class _VizProbe:
+    def __init__(self, job=4242, opener=4242):
+        self.job, self.opener, self.asked = job, opener, []
+
+    def job_pid(self, label):
+        self.asked.append(("job", label))
+        return self.job
+
+    def connector(self, client, server):
+        self.asked.append(("conn", client, server))
+        return {"pid": self.opener, "uid": 501, "name": "python3.12"} if self.opener else {}
+
+
+def test_bot_takes_dashboard_owner_only_from_the_visualizer():
+    import socket
+    import urllib.error
+    import urllib.request
+    import dashowner as D
+    from localserver import LocalServer
+    print("\n/web-message: dashboard_owner counts only when the visualizer sent it")
+    c, s = ("127.0.0.1", 55072), ("127.0.0.1", 8787)
+    ok, _ = D.from_visualizer(c, s, _VizProbe())
+    check("the visualizer's own connection is taken", ok)
+    pr = _VizProbe(opener=9999)
+    ok, why = D.from_visualizer(c, s, pr)
+    check("any other process's is not, and says whose it was",
+          not ok and "9999" in why and "4242" in why, why)
+    check("it asks launchd for the visualizer's job by its label",
+          ("job", D.VIZ_LABEL) in pr.asked and D.VIZ_LABEL == "com.silkworm.viz")
+    pr = _VizProbe(job=0)
+    ok, why = D.from_visualizer(c, s, pr)
+    check("no visualizer job running: not taken, said so, and no netstat run for it",
+          not ok and "not running" in why and pr.asked == [("job", D.VIZ_LABEL)], (why, pr.asked))
+    check("opener unknown: not taken",
+          not D.from_visualizer(c, s, _VizProbe(opener=0))[0])
+    check("no connection to ask about: not taken",
+          not D.from_visualizer(None, None, _VizProbe())[0]
+          and not D.from_visualizer(("x",), s, _VizProbe())[0])
+
+    plist = D.launch_agent(D.VIZ_LABEL)
+    print_out = ("gui/501/com.silkworm.viz = {\n\tactive count = 1\n"
+                 f"\tpath = {plist}\n\tstate = running\n"
+                 "\tprogram = /x/python\n\tpid = 96925\n\tendpoints = {\n"
+                 "\t\tpid = 1\n\t}\n}\n")
+    check("the installed plist is ~/Library/LaunchAgents/com.silkworm.viz.plist",
+          plist == str(Path.home() / "Library" / "LaunchAgents" / "com.silkworm.viz.plist"))
+    check("launchctl print: the job's own pid line", D.job_pid_of(print_out, plist) == 96925)
+    check("not a nested one",
+          D.job_pid_of(print_out.replace("\tpid = 96925\n", ""), plist) == 0)
+    check("no pid (not running): 0", D.job_pid_of(f"\tpath = {plist}\n\tstate = waiting\n",
+                                                  plist) == 0)
+    check("a job under the label loaded from another plist (bootstrap of the agent's own) is not it",
+          D.job_pid_of(print_out.replace(plist, "/tmp/x.plist"), plist) == 0)
+    check("nor one with no plist at all (launchctl submit -l)",
+          D.job_pid_of(print_out.replace(f"\tpath = {plist}\n", ""), plist) == 0)
+    seen = []
+    got = D.Probe(run=lambda a, t: (seen.append(a), (0, print_out, ""))[1]).job_pid(D.VIZ_LABEL)
+    check("Probe.job_pid runs launchctl by full path in this user's GUI domain",
+          got == 96925 and seen == [["/bin/launchctl", "print",
+                                     f"gui/{os.getuid()}/com.silkworm.viz"]], (got, seen))
+    check("and answers 0 when launchctl fails",
+          D.Probe(run=lambda a, t: (113, "", "no such")).job_pid(D.VIZ_LABEL) == 0)
+
+    # The bot's route: the field dropped unless from_visualizer says so.
+    delivered = []
+    ns = bot_functions("handle_web_message", dashowner=D,
+                       deliver_web_message=lambda p: delivered.append(p) or {"ok": True},
+                       WEB_SENDS=None, webthread=None, WEB_PEER_PROBE=_VizProbe(opener=777))
+    vouched = {"login": "owner@example.com", "peer": PHONE, "node": "iphone182"}
+    ns["handle_web_message"]({"key": "D1:1.0", "text": "accept tsk_1",
+                              "dashboard_owner": vouched}, c, s)
+    check("a dashboard_owner posted by another process is dropped; the message still goes",
+          delivered and "dashboard_owner" not in delivered[-1]
+          and delivered[-1]["text"] == "accept tsk_1", delivered)
+    ns["handle_web_message"]({"key": "D1:1.0", "text": "x", "dashboard_owner": vouched})
+    check("as is one with no connection to check", "dashboard_owner" not in delivered[-1])
+    ns["WEB_PEER_PROBE"] = _VizProbe()
+    ns["handle_web_message"]({"key": "D1:1.0", "text": "x", "dashboard_owner": vouched}, c, s)
+    check("one the visualizer sent is kept", delivered[-1].get("dashboard_owner") == vouched)
+    asked = ns["WEB_PEER_PROBE"].asked = []
+    ns["handle_web_message"]({"key": "D1:1.0", "text": "x"}, c, s)
+    check("a message with no such field costs no probe", asked == [] and
+          "dashboard_owner" not in delivered[-1])
+    src = (BASE / "bot.py").read_text()
+    check("the bot's server hands /web-message its connection",
+          'server.route("/web-message", handle_web_message, peer=True)' in src)
+
+    # LocalServer: a peer route gets the socket's two ends; others as before.
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    got = {}
+    srv = LocalServer(port)
+    srv.route("/p", lambda p, cl, sv: got.update(p=p, cl=cl, sv=sv) or {"ok": True}, peer=True)
+    srv.route("/q", lambda p: {"q": p.get("n")})
+    srv.start()
+
+    def post(path, body, port=port):
+        for _ in range(50):
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                             data=json.dumps(body).encode(), method="POST",
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return json.loads(r.read())
+            except (ConnectionRefusedError, urllib.error.URLError):
+                time.sleep(0.05)
+        return None
+    check("a peer route gets (payload, client, server) from the socket",
+          post("/p", {"n": 1}) == {"ok": True} and got["p"] == {"n": 1}
+          and got["sv"] == ("127.0.0.1", port) and got["cl"][0] == "127.0.0.1"
+          and isinstance(got["cl"][1], int), got)
+    check("a plain route still gets the payload alone", post("/q", {"n": 2}) == {"q": 2})
+
+    # Live: the real netstat names this very process as a loopback client,
+    # so the bot's check reads the connection it is answering.
+    real = D.Probe()
+    seen_live = {}
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        lport = sk.getsockname()[1]
+    lsrv = LocalServer(lport)
+
+    def live(p, cl, sv):
+        mine = types.SimpleNamespace(job_pid=lambda label: os.getpid(),
+                                     connector=real.connector)
+        other = types.SimpleNamespace(job_pid=lambda label: os.getpid() + 1,
+                                      connector=real.connector)
+        seen_live["mine"] = D.from_visualizer(cl, sv, mine)
+        seen_live["other"] = D.from_visualizer(cl, sv, other)
+        return {"ok": True}
+    lsrv.route("/live", live, peer=True)
+    lsrv.start()
+    post("/live", {}, port=lport)
+    check("live: netstat names this process as the opener of its own loopback request",
+          seen_live.get("mine") == (True, ""), seen_live)
+    check("live: and refuses when the job is someone else",
+          seen_live.get("other", (True,))[0] is False, seen_live)
+
+
 def _dash_say(bot, text, turn=None, ts="1763400000.000100"):
     """Open a grant as handle_prompt does for a dashboard message it vouched for."""
     return bot.ns["OPERATOR_GRANTS"].open(
