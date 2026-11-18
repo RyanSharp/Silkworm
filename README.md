@@ -1066,7 +1066,10 @@ Work you ask it for in so many words it files with `silkworm task
 --requested-by-user --notes "<your request>" "<goal>"`: straight to the queue
 (or as a proposal, with `--propose`), past the project's `MAX_OPEN_PROPOSALS`
 cap, which rations ideas nobody asked for. Only in a turn you started in its
-thread (the grant); the task records `requested_by_user` — who, which message,
+thread (the grant), with `--notes` quoting your message word for word and a
+goal that shares at least two of its own words (the asking and filing words
+aside), so a real quote cannot carry an unrelated goal past the cap; the task
+records `requested_by_user` — who, which message,
 your words and how full the board was. Its own ideas, the sweep's, ideation's
 and a review's follow-ups keep the cap.
 

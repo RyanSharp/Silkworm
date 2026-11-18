@@ -3813,6 +3813,11 @@ def requested_filing(payload: dict, key: str, caller_role: str, parent, from_res
     why = operator_role.request_quote_refusal(notes, grant.get("text") or "")
     if why:
         return None, why
+    # And the goal is what you asked for: a real quote beside an unrelated
+    # goal would file that goal past the cap on your word.
+    why = operator_role.request_goal_refusal(payload.get("goal") or "", grant.get("text") or "")
+    if why:
+        return None, why
     return {"by": grant["user"], "ts": grant["ts"], "notes": notes[:500],
             "source": operator_role.grant_source(grant), "via": grant.get("via") or "",
             "at": time.time()}, ""

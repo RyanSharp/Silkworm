@@ -366,6 +366,79 @@ def request_quote_refusal(notes: str, text: str) -> str:
             f"word (at least {need} words of it); it does not contain what the notes say")
 
 
+#: How many of your message's own words the goal of a filing made on your
+#: request must share (`request_goal_refusal`), unless it has fewer.
+GOAL_MIN_SHARED = 2
+
+#: Words that say nothing about *what* was asked: filler, the asking and
+#: filing itself ("please file a task to ..."), and saying yes or pointing at
+#: something already on the table ("sounds good, go ahead with the first
+#: suggested one"), so they cannot be what ties a goal to your message -- nor
+#: what a goal must repeat to be filed on it.
+_GOAL_FILLER = frozenset("""
+    a an the and or but nor so if then than that this these those there here it its
+    to of in on at by for from with without into onto about over under up down out off
+    as is are was were be been being am do does did done doing have has had having
+    will would shall should can could may might must not no yes ok okay please pls
+    i me my mine we us our you your yours he she they them their his her
+    what which who whom whose when where why how all any some each every both
+    just also too very really now today tonight tomorrow later soon again still
+    file filed filing task tasks ticket proposal propose queue queued ask asked asking
+    want wants wanted need needs needed get got let make made go going thing things
+    user operator one two new
+    isn aren wasn weren doesn don didn won wouldn couldn shouldn hasn haven hadn
+    re ve ll im id
+    ahead sounds sound good great perfect sure fine nice cool awesome thanks thank
+    yeah yep yup alright right lgtm agreed agree approve approved
+    first second third fourth fifth last next previous above below earlier latter former
+    proposed suggested suggestion suggestions recommended recommendation recommendations
+    idea ideas option options
+""".split())
+
+_SUFFIX = re.compile(r"(?:ies|es|ed|ing|s)$")
+
+
+def _stem(w: str) -> str:
+    """A short stem, so "flaky" and "flakiness", "fix" and "fixes", or "bug"
+    and "bugs" count as the same word."""
+    if len(w) > 4:
+        w = _SUFFIX.sub("", w) or w
+    elif len(w) == 4 and w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    return w[:4]
+
+
+def _content(words: list) -> set:
+    """Your words that name something (two-letter ones too: CI, UI, DB),
+    stemmed; filler, the asking and filing words, numbers and the pieces of
+    a contraction ("isn't" -> isn, t) are not."""
+    return {_stem(w) for w in words
+            if len(w) >= 2 and w not in _GOAL_FILLER and not w.isdigit()}
+
+
+def request_goal_refusal(goal: str, text: str) -> str:
+    """"" when the goal of a `task --requested-by-user` filing is about what
+    your message (the grant's text) asked for, or why not.
+
+    The quote rule (request_quote_refusal) proves the notes are your words;
+    it says nothing of the goal beside them, so a real quote could carry an
+    unrelated goal past the proposal cap. The goal must share at least
+    GOAL_MIN_SHARED of your message's own words (or all of them, if it has
+    fewer) -- a floor, read by a rule a test pins down, not proof: the
+    operator still writes the goal, and the task records your quote for you
+    to hold it to."""
+    said = _content(_words(text))
+    if not said:
+        return ""  # nothing of yours to hold the goal to: the quote rule decides
+    need = min(GOAL_MIN_SHARED, len(said))
+    shared = said & _content(_words(goal))
+    if len(shared) >= need:
+        return ""
+    return (f"--requested-by-user files what the user asked for: the goal must be about "
+            f"their message, sharing at least {need} of its own words, and it shares "
+            f"{len(shared)}; file it as a proposal (the cap applies) or ask them")
+
+
 def decision_note(grant: dict, action: str, payload: dict) -> str:
     """The event a task gets when the operator acted on your word."""
     by = grant.get("user") or "the user"

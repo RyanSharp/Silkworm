@@ -32290,10 +32290,15 @@ def test_requested_filing_passes_a_full_cap_and_a_sweep_does_not():
           and any("filed on the request of U_ME" in e.get("detail", "")
                   for e in rec.get("events") or []), rec)
     out = file(requested_by_user=True, caller_grant=g, propose=True,
-               goal="A proposal the user asked for, to look at before it runs",
+               goal="A proposal: review a universe rebuild plan first, before anything runs",
                notes="as a proposal -- user: 'file the universe rebuild'")
     check("asked for as a proposal, it is one, past the cap",
           out.get("ok") and out.get("state") == T.PROPOSED, out)
+    out = file(requested_by_user=True, caller_grant=g,
+               goal="Raise the leverage cap on the live momentum sleeve to 1.5x",
+               notes="user: 'file the universe rebuild'")
+    check("your real words beside a goal you never asked for are refused",
+          not out["ok"] and "the goal must be about" in out["error"], out)
     out = file(propose=True, goal="Another idea of its own, while the board is full")
     check("in the same turn, its own idea is still capped",
           not out["ok"] and "standing limit" in out["error"], out)
@@ -32320,6 +32325,59 @@ def test_request_quote_refusal_needs_the_users_own_words():
     check("but not by a fragment of it",
           O.request_quote_refusal("user: 'do'", "do it now") != "")
     check("an empty message quotes nothing", O.request_quote_refusal("user: x", "") != "")
+
+
+def test_request_goal_refusal_ties_the_goal_to_your_message():
+    import operator_role as O
+    print("\nfiling on your request: the goal must be about what you asked, not just beside your quote")
+    said = "Please file a task to fix the flaky pull tests in cadence"
+    ok = lambda g: O.request_goal_refusal(g, said) == ""
+    check("a goal naming what you asked passes",
+          ok("Fix SupabaseSyncServicePullTests flakiness in Cadence's pull tests"))
+    check("inflections count as the same word", ok("Make the flakiness in Cadence go away"))
+    check("an unrelated goal is refused", not ok("Raise trader's leverage cap to 1.5x"))
+    check("one shared word is not enough", not ok("Rewrite the cadence onboarding screens"))
+    check("the asking and filing words tie nothing",
+          not ok("Please file a task to do the thing you want"))
+    check("a message of one content word needs only that word",
+          O.request_goal_refusal("Ship the release notes for mondays", "do mondays") == "")
+    check("a message with no content words leaves it to the quote rule",
+          O.request_goal_refusal("anything at all", "yes please do it") == "")
+    check("the refusal says why", "shares 0" in O.request_goal_refusal("Raise leverage", said))
+    g = O.request_goal_refusal
+    check("short words match their plurals", g("Fixes bugs in the login", "fix the bug in login") == "")
+    check("two-letter acronyms count", g("Make CI less slow", "CI is slow") == ""
+          and g("Make the build less slow", "CI is slow") != "")
+    goal = "Rebuild the momentum universe point-in-time"
+    for m in ("go ahead and file it", "sounds good, file the first one",
+              "perfect, the recommended one please", "yep, the second suggested option"):
+        check(f"saying yes or pointing is not words the goal must repeat: {m!r}", g(goal, m) == "")
+    check("but the fix named beside them still is",
+          g(goal, "sure, file the suggested fix") != ""
+          and g("Fix the universe rebuild", "sure, file the suggested fix") == "")
+    check("a contraction's pieces are not words of the request",
+          "isn" not in O._content(O._words("it isn't working, the importer"))
+          and g("Get the importer working again", "it isn't working, the importer") == "")
+
+
+def test_operator_role_binds_each_module_name_once():
+    import ast
+    print("\noperator_role: no module-level name is bound twice (a second _FILLER silently replaced the first)")
+    tree = ast.parse((BASE / "operator_role.py").read_text())
+    seen, twice = set(), []
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            targets = [ast.Name(id=node.name)]
+        for t in targets:
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name):
+                    (twice.append(n.id) if n.id in seen else seen.add(n.id))
+    check("each name once", not twice, twice)
 
 
 def test_cli_task_requested_by_user_sends_notes():
