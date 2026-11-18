@@ -13178,7 +13178,8 @@ def test_task_costs():
                        log=logging.getLogger("t"),
                        _with_costs=None, _spend=None)
     ns = {"task_store": ts, "costs": costs, "board": __import__("board"),
-          "research": __import__("research"), "slacklinks": __import__("slacklinks")}
+          "research": __import__("research"), "slacklinks": __import__("slacklinks"),
+          "tasks": T}
     _bot_fns({"_with_costs", "_spend"}, ns)
     handle.__globals__.update(_with_costs=ns["_with_costs"], _spend=ns["_spend"])
     r = handle({"action": "attention"})
@@ -13379,7 +13380,10 @@ def test_a_task_is_not_claimed_beside_its_relatives():
           st.claim(**lane("review")) is None)
     other = st.create("review another", role="reviewer", driver="queue", thread="C:2")
     check("an unrelated review still is", (st.claim(**lane("review")) or {}).get("id") == other["id"])
-    st.transition(parent["id"], T.DONE, "finished")
+    # Stopping parks it on its review, as resolve_review does. Not `done`: a
+    # task that has ended closes its unrun reviews (TaskStore._close_reviews),
+    # so a queued review of a finished task is cancelled, not claimed.
+    st.transition(parent["id"], T.BLOCKED, "awaiting review")
     check("and the waiting one once the implementor stops",
           (st.claim(**lane("review")) or {}).get("id") == rev["id"])
 
@@ -20115,7 +20119,8 @@ def test_findings_clicks_tell_rounds_apart():
           B.card(st.get(c)).get("round") == research.round_of(st.get(c))
           == B.detail(st.get(c), list(st.all().values())).get("round"))
     w = bot_functions("_with_costs", task_store=st, costs=__import__("costs"),
-                      research=research, board=B, slacklinks=__import__("slacklinks"))
+                      research=research, board=B, slacklinks=__import__("slacklinks"),
+                      tasks=__import__("tasks"))
     check("as do the task panel's rows",
           w["_with_costs"]([st.get(c)])[0].get("round") == research.round_of(st.get(c)))
 
@@ -20945,7 +20950,8 @@ def test_task_panel_slim_rows():
     recs = list(ts.all().values())
 
     ns = {"task_store": ts, "costs": costs, "board": B,
-          "research": __import__("research"), "slacklinks": __import__("slacklinks")}
+          "research": __import__("research"), "slacklinks": __import__("slacklinks"),
+          "tasks": __import__("tasks")}
     _bot_fns({"_with_costs"}, ns)
     full = ns["_with_costs"](sorted(recs, key=lambda t: -(t.get("created") or 0)))
     slim = [B.panel_row(t) for t in full]
@@ -31567,6 +31573,256 @@ def test_no_secret_shaped_literal_in_tracked_source():
     check("binaries are skipped, and a fake assembled at runtime is not a hit",
           not [f for f, _, _ in found if f in ("blob.bin", "split.py")], found)
     shutil.rmtree(scratch, ignore_errors=True)
+
+
+
+def _review_pair(st, T, parent_state, review_state=None):
+    """An implementor blocked on its review, the review then failing the way
+    refuse_review fails it -- which releases the parent to awaiting_approval
+    (it has a result). Then the parent is moved to `parent_state`."""
+    p = st.create("implement the thing", role="implementor", driver="queue")
+    st.transition(p["id"], T.RUNNING)
+    st.update(p["id"], result={"text": "did it"})
+    r = st.create("review it", role="reviewer", driver="queue", parent=p["id"],
+                  title="Review: thing")
+    st.update(p["id"], blocked_on=[r["id"]])
+    st.transition(p["id"], T.BLOCKED, f"awaiting review {r['id']}")
+    st.transition(r["id"], T.RUNNING)
+    if review_state:
+        st.transition(r["id"], review_state, "could not check out the branch",
+                      _release=False)
+    else:
+        st.transition(r["id"], T.FAILED,
+                      "could not check out silkworm/x, so nothing was reviewed")
+    if parent_state and st.get(p["id"])["state"] != parent_state:
+        st.transition(p["id"], parent_state, "moved on")
+    return p["id"], r["id"]
+
+
+def test_a_review_closes_with_its_task():
+    """tsk_0051063496: a failed review of a task later cancelled sat in Needs
+    you, offering Retry, for three weeks -- and was retried twice into the
+    same failure. Ending a task closes its reviews; Retry is refused, and not
+    drawn, on a review its task no longer waits on; startup sweeps the rest."""
+    import tasks as T
+    import board as B
+    import home as H
+    from tasks import TaskStore
+    print("\na review closes with the task it reviews")
+    st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    handle = _bot_func("handle_tasks", task_store=st, tasks=T,
+                       log=logging.getLogger("test"))
+
+    # (1) parent cancelled after its review failed: the review is closed.
+    pid, rid = _review_pair(st, T, T.AWAITING_APPROVAL)
+    check("a failed review releases its parent to awaiting_approval",
+          st.get(pid)["state"] == T.AWAITING_APPROVAL, st.get(pid)["state"])
+    st.transition(pid, T.CANCELLED, "dismiss via ui")
+    rec = TaskStore(st._path).get(rid)
+    check("cancelling the parent cancels its failed review, on disk",
+          rec["state"] == T.CANCELLED, rec["state"])
+    check("with a reason that names the parent and its state",
+          pid in rec["events"][-1]["detail"]
+          and "cancelled" in rec["events"][-1]["detail"], rec["events"][-1])
+    r = handle({"action": "retry", "id": rid})
+    check("and it can no longer be retried", not r["ok"]
+          and st.get(rid)["state"] == T.CANCELLED, r)
+
+    # A review the runner claims between being listed and being closed is
+    # running: it must not be labelled cancelled while its agent carries on.
+    p = st.create("work", role="implementor", driver="queue")
+    q = st.create("review", role="reviewer", driver="queue", parent=p["id"])
+    real_transition = st.transition
+    raced = {"done": False}
+
+    def claims_first(tid, to_state, *a, **kw):
+        if tid == q["id"] and to_state == T.CANCELLED and not raced["done"]:
+            raced["done"] = True
+            st.claim(only_roles={"reviewer"})
+        return real_transition(tid, to_state, *a, **kw)
+    st.transition = claims_first
+    try:
+        real_transition(p["id"], T.CANCELLED, "cancel via ui")
+    finally:
+        st.transition = real_transition
+    check("a review claimed while its task was being closed is left running",
+          raced["done"] and st.get(q["id"])["state"] == T.RUNNING,
+          (raced, st.get(q["id"])["state"]))
+
+    # Queued and blocked reviews close too; a running one is left to finish.
+    for rstate in (T.QUEUED, T.BLOCKED):
+        p = st.create("work", role="implementor", driver="queue")
+        q = st.create("review", role="reviewer", driver="queue", parent=p["id"])
+        if rstate == T.BLOCKED:
+            st.transition(q["id"], T.BLOCKED, "quota")
+        st.transition(p["id"], T.CANCELLED, "cancel via ui")
+        check(f"a {rstate} review of a cancelled task is cancelled",
+              st.get(q["id"])["state"] == T.CANCELLED, st.get(q["id"])["state"])
+    p = st.create("work", role="implementor", driver="queue")
+    q = st.create("review", role="reviewer", driver="queue", parent=p["id"])
+    st.transition(q["id"], T.RUNNING)
+    st.transition(p["id"], T.CANCELLED, "cancel via ui")
+    check("a running review is left to finish",
+          st.get(q["id"])["state"] == T.RUNNING, st.get(q["id"])["state"])
+    # Somebody else's review is not touched.
+    p1 = st.create("one", role="implementor", driver="queue")
+    p2 = st.create("two", role="implementor", driver="queue")
+    q2 = st.create("review two", role="reviewer", driver="queue", parent=p2["id"])
+    st.transition(p1["id"], T.CANCELLED, "cancel")
+    check("only the ended task's own reviews close",
+          st.get(q2["id"])["state"] == T.QUEUED, st.get(q2["id"])["state"])
+    # A save that fails while closing a review does not undo the parent's move.
+    p = st.create("work", role="implementor", driver="queue")
+    q = st.create("review", role="reviewer", driver="queue", parent=p["id"])
+    real = st._save
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("disk full")
+        real()
+    st._save = flaky
+    try:
+        moved = st.transition(p["id"], T.CANCELLED, "cancel")
+        raised = False
+    except OSError:
+        raised = True
+    st._save = real
+    check("a review that cannot be closed does not fail its parent's move",
+          not raised and moved["state"] == T.CANCELLED
+          and st.get(q["id"])["state"] == T.QUEUED,
+          (raised, st.get(q["id"])["state"]))
+
+    # (3) the startup sweep closes what ended before the rule, or across a crash.
+    sweep_review = q["id"]
+    closed = st.close_orphaned_reviews()
+    check("the startup sweep closes a review left open by an ended task",
+          sweep_review in closed
+          and TaskStore(st._path).get(sweep_review)["state"] == T.CANCELLED, closed)
+    pid_s, rid_s = _review_pair(st, T, T.AWAITING_APPROVAL)
+    # As tasks.json held it on 2026-11-15: parent cancelled, review failed.
+    st._data[pid_s]["state"] = T.CANCELLED
+    st._save()
+    check("(fixture: before the sweep it is still failed, in Needs you)",
+          st.get(rid_s)["state"] == T.FAILED
+          and "cancelled" in T.no_retry(st.get(rid_s), st.all()))
+    closed = st.close_orphaned_reviews()
+    check("and the sweep closes it", rid_s in closed
+          and st.get(rid_s)["state"] == T.CANCELLED, closed)
+    check("a second sweep finds nothing", st.close_orphaned_reviews() == [])
+    sched = next(n for n in ast.parse((BASE / "bot.py").read_text()).body
+                 if isinstance(n, ast.FunctionDef) and n.name == "_task_scheduler")
+    loop = next(n for n in ast.walk(sched) if isinstance(n, ast.While))
+    called = {c.func.attr for c in ast.walk(loop) if isinstance(c, ast.Call)
+              and isinstance(c.func, ast.Attribute)}
+    check("the scheduler runs the sweep on its beat, from startup",
+          "close_orphaned_reviews" in called, called)
+    pid_live, rid_live = _review_pair(st, T, T.AWAITING_APPROVAL)
+    st.close_orphaned_reviews()
+    check("the sweep leaves a failed review its task still waits on",
+          st.get(rid_live)["state"] == T.FAILED)
+
+    # (2) Retry: allowed while the parent waits, refused once it has moved on.
+    r = handle({"action": "retry", "id": rid_live})
+    check("a failed review whose task awaits approval can be retried",
+          r["ok"] and st.get(rid_live)["state"] == T.QUEUED, r)
+    pid_b, rid_b = _review_pair(st, T, None, review_state=T.FAILED)
+    check("(fixture: the parent is still blocked on its review)",
+          st.get(pid_b)["state"] == T.BLOCKED
+          and rid_b in st.get(pid_b)["blocked_on"], st.get(pid_b))
+    check("Retry is drawn on it", not T.no_retry(st.get(rid_b), st.all()))
+    r = handle({"action": "retry", "id": rid_b})
+    check("a failed review whose task is still blocked on it can be retried",
+          r["ok"] and st.get(rid_b)["state"] == T.QUEUED, r)
+
+    pid_f, rid_f = _review_pair(st, T, T.QUEUED)       # sent back for rework
+    why = T.no_retry(st.get(rid_f), st.all())
+    check("a review whose task has moved on is not offered Retry",
+          pid_f in why and "queued" in why, why)
+    r = handle({"action": "retry", "id": rid_f})
+    check("and Retry on it is refused, saying why",
+          not r["ok"] and why in r.get("error", "")
+          and st.get(rid_f)["state"] == T.FAILED, r)
+    pid_n, rid_n = _review_pair(st, T, T.AWAITING_APPROVAL)
+    newer = st.create("review again", role="reviewer", driver="queue",
+                      parent=pid_n)
+    st._data[newer["id"]]["created"] = st.get(rid_n)["created"] + 1
+    check("nor one superseded by a newer review of the same task",
+          newer["id"] in T.no_retry(st.get(rid_n), st.all())
+          and not handle({"action": "retry", "id": rid_n})["ok"])
+    # Blocked, but on a later review than this one: the old one is history.
+    pid_o, rid_o = _review_pair(st, T, None, review_state=T.FAILED)
+    later = st.create("review again", role="reviewer", driver="queue", parent=pid_o)
+    st.update(pid_o, blocked_on=[later["id"]])
+    why_o = T.no_retry(st.get(rid_o), st.all())
+    r = handle({"action": "retry", "id": rid_o})
+    check("nor one whose task is blocked on a different review",
+          "different review" in why_o and not r["ok"]
+          and st.get(rid_o)["state"] == T.FAILED, (why_o, r))
+    plain = st.create("not a review", role="implementor", driver="queue")
+    st.transition(plain["id"], T.RUNNING)
+    st.transition(plain["id"], T.FAILED, "boom")
+    check("an ordinary failed task is retried as before",
+          handle({"action": "retry", "id": plain["id"]})["ok"])
+
+    # The boards draw by the same rule.
+    items = T.mark_no_retry([dict(r, id=i) for i, r in st.all().items()])
+    marked = {t["id"]: t for t in items}
+    acts = lambda t: [b[1] for b in H.buttons_for(t)]
+    check("Slack board: no Retry on the moved-on review, Dismiss still there",
+          "retry" not in acts(marked[rid_f]) and "dismiss" in acts(marked[rid_f]),
+          acts(marked[rid_f]))
+    pid_w, rid_w = _review_pair(st, T, T.AWAITING_APPROVAL)
+    items = T.mark_no_retry([dict(r, id=i) for i, r in st.all().items()])
+    marked = {t["id"]: t for t in items}
+    check("Slack board: Retry on a review still waited on",
+          "retry" in acts(marked[rid_w]), acts(marked[rid_w]))
+    def offers(view, tid):
+        flat = json.dumps(view)
+        return (f'"home_retry", "value": "{tid}|' in flat
+                or f'"retry|{tid}|' in flat)
+    for compact in (False, True):
+        view = H.render(items, now=time.time(), compact=compact, max_attention=500)
+        check(f"the rendered {'board' if compact else 'Home tab'} offers Retry "
+              "on one and not the other, and shows both",
+              offers(view, rid_w) and not offers(view, rid_f)
+              and rid_f in json.dumps(view))
+    check("dashboard rows and cards carry the same verdict",
+          why and B.panel_row(dict(st.get(rid_f), no_retry=why))["no_retry"] == why
+          and B.card(st.get(rid_f), by_id=st.all())["no_retry"] == why
+          and B.detail(st.get(rid_f), st.all().values())["no_retry"] == why
+          and B.card(st.get(rid_w), by_id=st.all())["no_retry"] == "")
+    # bot._with_costs is what the dashboard's task list is built from.
+    wc = _bot_func("_with_costs", task_store=st, tasks=T, board=B,
+                   research=__import__("research"),
+                   slacklinks=__import__("slacklinks"))
+    rows = {t["id"]: t for t in wc([st.get(rid_f), st.get(rid_w)])}
+    check("the dashboard list marks them the same way",
+          why and rows[rid_f]["no_retry"] == why and rows[rid_w]["no_retry"] == "", rows)
+
+    import visualizer as V
+    import re as _re
+    js = _re.search(r"<script>(.*?)</script>", V.PAGE, _re.S).group(1)
+    fn = js[js.index("function taskButtons(t)"):js.index("async function renderTasks()")]
+    esc = _re.search(r"const esc = .*", js).group(0)
+    harness = (esc + "\n" + fn + "\nprocess.stdout.write(JSON.stringify(["
+               'taskButtons({id: "tsk_1", state: "failed", role: "reviewer", no_retry: "x is cancelled"}),'
+               'taskButtons({id: "tsk_2", state: "failed", role: "reviewer", no_retry: ""})]));\n')
+    try:
+        run = subprocess.run(["node", "-e", harness], capture_output=True, text=True,
+                             timeout=30)
+        out = json.loads(run.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        out = None
+    if out is None:
+        print("    (node unavailable — dashboard checked by contract only)")
+        check("dashboard taskButtons reads no_retry", "t.no_retry" in fn)
+    else:
+        check("dashboard: no Retry when the review is not waited on, and why",
+              "'retry'" not in out[0] and "x is cancelled" in out[0]
+              and "'dismiss'" in out[0], out[0])
+        check("dashboard: Retry when it is", "'retry')\">Retry" in out[1], out[1])
 
 
 if __name__ == "__main__":

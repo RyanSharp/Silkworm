@@ -116,6 +116,67 @@ TRANSITIONS: dict[str, tuple] = {
 }
 
 
+#: States a review is closed from when the task it reviews has ended: it has
+#: not run, or ran and failed, and either way it is still on offer -- a failed
+#: one as a Retry on the board, a queued or blocked one as a run the lane will
+#: claim. Neither can review anything once its parent is closed. A running
+#: review is left to finish; resolve_review copes with a closed parent.
+CLOSABLE_REVIEW = (FAILED, QUEUED, BLOCKED)
+
+
+def review_wait(review: dict, parent: dict | None, by_id: dict | None = None) -> str:
+    """Why `review` has nobody waiting on it, or "" if its parent still is.
+
+    The one rule for whether a review may be retried: bot.handle_tasks refuses
+    on it, and home.py and the dashboard leave Retry off on it, so the button
+    and the refusal cannot disagree. Not a review, or not one of anything:
+    "" -- the rule is about reviews only.
+
+    Waiting means blocked on this review, or parked for approval with this as
+    its latest review -- a review that cannot reach the branch releases its
+    parent to awaiting_approval (refuse_review), and a retry that passes is
+    what lands it from there. Anything else is a parent that has moved on: a
+    retry would check out a branch nobody is waiting to hear about, and fail
+    or report into a closed task. `by_id` (every task by id) finds a newer
+    review of the same parent; without it that check is skipped.
+    """
+    if review.get("role") != "reviewer" or not review.get("parent"):
+        return ""
+    pid = review["parent"]
+    if parent is None:
+        return f"the task it reviews, {pid}, no longer exists"
+    state = parent.get("state")
+    if state == BLOCKED:
+        if review.get("id") in (parent.get("blocked_on") or ()):
+            return ""
+        return f"{pid} is waiting on a different review, not this one"
+    if state == AWAITING_APPROVAL:
+        newer = [r.get("id") for r in (by_id or {}).values()
+                 if r.get("role") == "reviewer" and r.get("parent") == pid
+                 and r.get("id") != review.get("id")
+                 and (r.get("created") or 0) > (review.get("created") or 0)]
+        if newer:
+            return f"{pid} has been reviewed again since ({newer[0]})"
+        return ""
+    return f"{pid} is {state}, not waiting on this review"
+
+
+def no_retry(task: dict, by_id: dict) -> str:
+    """Why a board should not offer Retry on `task`, or "". Only a failed
+    review is asked: Retry is offered on failed tasks, and review_wait is the
+    rule the route refuses on."""
+    if task.get("state") != FAILED or task.get("role") != "reviewer":
+        return ""
+    return review_wait(task, by_id.get(task.get("parent") or ""), by_id)
+
+
+def mark_no_retry(items: list) -> list:
+    """`items` (whole task dicts, each with its id) with `no_retry` set on
+    each, judged against the rest of them."""
+    by_id = {t.get("id"): t for t in items}
+    return [dict(t, no_retry=no_retry(t, by_id)) for t in items]
+
+
 class InvalidTransition(Exception):
     pass
 
@@ -472,6 +533,69 @@ class TaskStore:
             self._data[tid] = prior
             raise
 
+    def _retry_refusal(self, rec: dict) -> str:
+        """Caller holds the lock."""
+        if rec.get("role") != "reviewer":
+            return ""
+        return review_wait(rec, self._data.get(rec.get("parent") or ""), self._data)
+
+    def _close_reviews(self, parent_id: str, parent_state: str) -> list[str]:
+        """Cancel the reviews of a task that has ended and that will never run
+        or be retried to any purpose. Returns their ids.
+
+        Each is its own transition -- the lock and the save-or-restore that
+        every move takes, and the on_move hook the board redraws on. Nothing
+        raised reaches the caller, whose move has already happened: a review
+        left open here is found by close_orphaned_reviews on the next start.
+        """
+        with self._lock:
+            ids = [(tid, r.get("state")) for tid, r in self._data.items()
+                   if r.get("role") == "reviewer" and r.get("parent") == parent_id
+                   and r.get("state") in CLOSABLE_REVIEW]
+        closed = []
+        for tid, seen in ids:
+            try:
+                # Held to the state it was listed in: a review the runner claims
+                # in between is running, and cancelling that would label it
+                # cancelled while its agent carried on (bot.handle_tasks stops
+                # a running task before cancelling it; this cannot).
+                self.transition(tid, CANCELLED,
+                                f"the task it reviews, {parent_id}, is {parent_state}",
+                                expect=seen)
+                closed.append(tid)
+            except InvalidTransition:
+                pass                          # moved on since; not ours to close
+            except Exception:
+                log.exception("could not close review %s of %s", tid, parent_id)
+        if closed:
+            log.info("closed review(s) %s: %s is %s", ", ".join(closed),
+                     parent_id, parent_state)
+        return closed
+
+    def close_orphaned_reviews(self) -> list[str]:
+        """Close reviews already left open by a parent that ended.
+
+        _close_reviews fires as a parent ends, which does nothing for one that
+        ended before the rule existed, or across a crash in between: such a
+        review sat failed -- in Needs you, offering Retry -- for three weeks
+        after its parent was cancelled. Nor for a review filed in the moment
+        after its parent ended (resolve_review creates it, then blocks the
+        parent on it). Run at startup and on the scheduler's beat.
+        """
+        with self._lock:
+            ended = {r.get("parent"): (self._data.get(r.get("parent")) or {}).get("state")
+                     for r in self._data.values()
+                     if r.get("role") == "reviewer" and r.get("parent")
+                     and r.get("state") in CLOSABLE_REVIEW
+                     and (self._data.get(r.get("parent")) or {}).get("state") in TERMINAL}
+        closed = []
+        for pid, state in ended.items():
+            closed += self._close_reviews(pid, state)
+        if closed:
+            log.warning("closed %d review(s) whose task had already ended: %s",
+                        len(closed), ", ".join(closed))
+        return closed
+
     def create(self, goal: str, **fields) -> dict:
         task = make(goal, **fields)
         with self._lock:
@@ -518,7 +642,7 @@ class TaskStore:
                    _release: bool = True, _seen: set | None = None,
                    _unblock: tuple = (), refuse_running: str = "",
                    fields: dict | None = None, expect: str = "",
-                   expect_round: str = "") -> dict:
+                   expect_round: str = "", refuse_unwaited: bool = False) -> dict:
         """Move a task's state, refusing anything the lifecycle disallows.
 
         Ending a task also releases whatever was waiting on it. That happens
@@ -540,6 +664,12 @@ class TaskStore:
         `expect_round` goes further for a task back where it was seen: refused
         unless it is still the same wait (parked_round) -- a click on findings
         drawn before a Dig deeper must not close the next round's.
+        `refuse_unwaited` is for Retry: a review nobody waits on any more
+        (review_wait) raises NotEditable, under the lock, rather than going
+        back in the queue.
+
+        Ending a task closes its reviews that have not run or have failed
+        (_close_reviews): with nothing to review, they are not work left.
         """
         if to_state not in STATES:
             raise ValueError(f"unknown state {to_state!r}")
@@ -556,6 +686,10 @@ class TaskStore:
             if expect_round and parked_round(rec) != expect_round:
                 raise InvalidTransition(f"{tid}: {current} -> {to_state} "
                                         f"(it has parked again since)")
+            if refuse_unwaited:
+                why = self._retry_refusal(rec)
+                if why:
+                    raise NotEditable(f"not retried: {why}")
             if current == to_state and not fields:
                 return dict(rec)                     # idempotent
             if not can(current, to_state):
@@ -604,6 +738,8 @@ class TaskStore:
                 log.exception("task %s: on_move failed (the move stands)", tid)
         if _release and to_state in ENDED:
             self._release_waiters(tid, to_state, detail, _seen or {tid})
+        if to_state in TERMINAL:
+            self._close_reviews(tid, to_state)
         return moved
 
     # --- nothing waits on a task that has stopped ----------------------------

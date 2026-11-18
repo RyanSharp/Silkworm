@@ -3491,7 +3491,10 @@ function taskButtons(t) {
     b.push(`<button class="ghost" onclick="sendBack('${t.id}',true)">Answer…</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "failed") {
-    b.push(`<button class="ghost" onclick="taskAction('${t.id}','retry')">Retry</button>`);
+    // Not on a review its task no longer waits on (tasks.no_retry); the route
+    // refuses on the same rule. Said instead, so the row is not a dead end.
+    if (t.no_retry) b.push(`<span class="hint" title="${esc(t.no_retry)}">no retry: ${esc(t.no_retry)}</span>`);
+    else b.push(`<button class="ghost" onclick="taskAction('${t.id}','retry')">Retry</button>`);
     b.push(`<button class="ghost" onclick="taskAction('${t.id}','dismiss')">Dismiss</button>`);
   } else if (t.state === "running") {
     // A running row used to offer nothing but Thread, which left the one

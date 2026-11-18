@@ -2635,7 +2635,8 @@ def tidy_checkout(payload: dict) -> dict:
 def _with_costs(items: list) -> list:
     """Each task with `cost_total`: its own cost plus its reviews', and
     whether that is complete. Copies -- the store's records are not touched."""
-    records = list(task_store.all().values())
+    by_id = task_store.all()
+    records = list(by_id.values())
     reviews = costs.reviews_by_parent(records)
     kids = research.children_by_parent(records)
     # And, for research, the next steps it filed; and the thread as a link
@@ -2645,7 +2646,9 @@ def _with_costs(items: list) -> list:
                  research=board.findings(t, kids.get(t.get("id"), ())),
                  findings=research.has_findings(t),
                  # Which findings: Close and Dig deeper send it back (decide_findings).
-                 round=research.round_of(t))
+                 round=research.round_of(t),
+                 # Why Retry is not offered on it, or "" (tasks.no_retry).
+                 no_retry=tasks.no_retry(t, by_id))
             for t in items]
 
 
@@ -3106,6 +3109,10 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                 # Cancelling a running task is what stops it; requeueing one
                 # would put a second run beside the first.
                 refuse_running=tasks.RUNNING_BUSY if target == tasks.QUEUED else "",
+                # A review is retried only while its task still waits on it
+                # (tasks.review_wait) -- the rule the Retry buttons are drawn
+                # by, checked again here under the store's lock.
+                refuse_unwaited=action == "retry",
                 # A Dismiss on research's findings carries the round it saw,
                 # like Close: one drawn before a Dig deeper must not cancel
                 # the findings that dig produced (decide_findings).
@@ -7198,6 +7205,12 @@ def _task_scheduler() -> None:
             # Released here as well as when the blocker ends, so a task
             # stranded by a crash in between still reaches the board.
             task_store.release_stranded()
+            # A review whose task has ended reviews nothing, and a failed one
+            # sat in Needs you offering Retry for three weeks after its parent
+            # was cancelled. Closed as a parent ends (TaskStore._close_reviews);
+            # this pass, first run at startup, is for the ones that ended
+            # before that rule, across a crash, or were filed just after.
+            task_store.close_orphaned_reviews()
         except Exception:
             log.exception("task scheduler iteration failed")
         time.sleep(TASK_POLL_S)

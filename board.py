@@ -171,7 +171,8 @@ def findings(rec: dict, kids=()) -> dict | None:
     return {"children": kids, "held": held, "line": research.line(kids, held)}
 
 
-def card(rec: dict, reviews=(), unmerged: dict | None = None, kids=()) -> dict:
+def card(rec: dict, reviews=(), unmerged: dict | None = None, kids=(),
+         by_id: dict | None = None) -> dict:
     """What a board card needs: small, because the page polls the board."""
     goal = (rec.get("goal") or "").strip()
     return {
@@ -208,6 +209,8 @@ def card(rec: dict, reviews=(), unmerged: dict | None = None, kids=()) -> dict:
         # Which round of them: Close and Dig deeper send it back, so a click
         # drawn before a dig cannot act on the findings that dig produced.
         "round": research.round_of(rec),
+        # Why Retry is left off this card, or "" (tasks.no_retry).
+        "no_retry": tasks.no_retry(rec, by_id or {}),
     }
 
 
@@ -225,7 +228,7 @@ ROW_RESULT = ("review", "landing", "landed")
 #: The rest of what a task panel row reads, copied as they are.
 ROW_FIELDS = ("id", "title", "state", "role", "project", "source", "attempts",
               "created", "thread", "thread_link", "cost_total", "needs_user",
-              "findings", "round", "research")
+              "findings", "round", "research", "no_retry")
 
 
 def panel_row(t: dict) -> dict:
@@ -293,6 +296,7 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
     reviews = costs.reviews_by_parent(records)
     kids = research.children_by_parent(records)
     by_id = {r.get("id"): r for r in unmerged_rows}
+    tasks_by_id = {r.get("id"): r for r in records}
     cols: dict = {c: [] for c in COLUMNS}
     roles_seen = set()
     for rec in records:
@@ -306,7 +310,7 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
             continue
         tid = rec.get("id")
         cols[col].append(card(rec, reviews.get(tid, ()), unmerged_of(by_id.get(tid)),
-                              kids.get(tid, ())))
+                              kids.get(tid, ()), tasks_by_id))
     for name, items in cols.items():
         if name == "done":
             items.sort(key=lambda c: -(c["finished"] or 0))
@@ -354,6 +358,7 @@ def detail(rec: dict, records=(), unmerged_rows=(), full: bool = False) -> dict:
     out["research"] = findings(rec, research.children(rec.get("id"), records))
     out["findings"] = research.has_findings(rec)
     out["round"] = research.round_of(rec)
+    out["no_retry"] = tasks.no_retry(rec, {r.get("id"): r for r in records})
     out["unmerged"] = unmerged_of(next(
         (r for r in unmerged_rows if r.get("id") == rec.get("id")), None))
     out["reviews"] = [{"id": r.get("id"), "state": r.get("state"),

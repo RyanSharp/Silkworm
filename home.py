@@ -111,6 +111,10 @@ def buttons_for(task: dict) -> list:
     findings = research.has_findings(task)
     if findings:
         base = RESEARCH_BUTTONS
+    if task.get("no_retry"):
+        # A review whose task no longer waits on it (tasks.no_retry): the
+        # route refuses Retry on the same rule, so the menu does not offer it.
+        base = [b for b in base if b[1] != "retry"]
     if state != tasks.NEEDS_INPUT or not asks.get("action"):
         return base
     step = []
@@ -782,7 +786,7 @@ class Home:
         except Exception:
             log.exception("watching list failed")
             watching = []
-        items = [dict(r, id=tid) for tid, r in self.store.all().items()]
+        items = tasks.mark_no_retry([dict(r, id=tid) for tid, r in self.store.all().items()])
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, notice=text, releasable=self.releasable())
 
@@ -1155,7 +1159,7 @@ class Board(Home):
         except Exception:
             log.exception("watching list failed")
             watching = []
-        items = [dict(r, id=tid) for tid, r in self.store.all().items()]
+        items = tasks.mark_no_retry([dict(r, id=tid) for tid, r in self.store.all().items()])
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
                       max_attention=self.MAX_ATTENTION, compact=True,
