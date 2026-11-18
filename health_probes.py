@@ -12,7 +12,10 @@ outside it, each a lesson already paid for:
            healthcheck  -- the latest result of trader's own
                            scripts/paper_healthcheck.py, read from its log.
   backends backend-drift -- deployed edge functions and applied migrations
-                           against what is on the base branch (Supabase).
+                           against what is on the base branch (Supabase);
+                           plus public-schema functions, tables and columns
+                           no base-branch migration creates, and gaps in the
+                           base branch's migration numbering.
   apps     app-store    -- the App Store version and any open review.
            testflight   -- the latest build's processing state.
   mini     credentials  -- claude's credential, Apple certificates/profiles,
@@ -658,8 +661,10 @@ def _drift(sys: System, rec, ref, sub, known) -> dict:
     mig_listing = _git(sys, repo, "ls-tree", "--name-only", f"{branch}:{sub}/migrations",
                        budget=budget) if _has_path(sys, repo, branch, f"{sub}/migrations",
                                                    budget) else ""
-    migrations = {}
+    migrations, mig_files = {}, []
     for name in mig_listing.split():
+        if name.endswith(".sql"):
+            mig_files.append(name)
         if name.endswith(".sql") and "_" in name:
             migrations[name.split("_", 1)[0]] = name
 
@@ -761,6 +766,16 @@ def _drift(sys: System, rec, ref, sub, known) -> dict:
                              f"{_iso(since)}, not applied in production", f"mig:{version}"))
     for version in sorted(applied_v - set(migrations)):
         notes.append(f"migration {version}: applied in production, not on {short}")
+    for first, last in numbering_gaps(migrations):
+        span = first if first == last else f"{first}–{last}"
+        hist = ("production's history skips them too" if not any(
+            v.isdigit() and first <= v.zfill(len(first)) <= last for v in applied_v)
+            else "production's history has some of them")
+        notes.append(f"migration {span}: {short} skips "
+                     f"{'this number' if first == last else 'these numbers'}; {hist} -- "
+                     "a migration applied by hand may be unrecorded")
+    notes.extend(_unrecorded(sys, repo, branch, short, label, token, ref, sub,
+                             mig_files, evidence, budget))
 
     link = f"https://supabase.com/dashboard/project/{ref}"
     lines = [d[1] for d in sorted(drift)] + notes + evidence
@@ -780,6 +795,207 @@ def _drift(sys: System, rec, ref, sub, known) -> dict:
                       lines, link)
     return result(OK, f"{len(functions)} function(s) and {len(migrations)} migration(s) "
                       f"match {short}", lines, link)
+
+
+# --- Production schema that no migration creates ----------------------------
+#
+# A migration applied by hand (from an unmerged branch) and then baselined
+# with `migration repair` leaves no trace in the history the drift check
+# compares: its version was never recorded, and main has no file for it. The
+# schema itself still shows it. Two cheap signals: the objects production has
+# that no migration on the base branch creates, and the version numbers the
+# base branch skips.
+
+#: Sequential migration numbers are short (0001_…); timestamps (2026…) are
+#: not numbered and have no gaps to read.
+SEQUENTIAL_DIGITS = 6
+#: A table section or the Functions section of `supabase gen types`' output.
+_TS_SECTION = re.compile(r"^    (Tables|Views|Functions|Enums|CompositeTypes): \{\s*$")
+_TS_ENTRY = re.compile(r'^      "?([A-Za-z_][A-Za-z0-9_]*)"?:(?: |\s*$)')
+_TS_COLUMN = re.compile(r'^          "?([A-Za-z_][A-Za-z0-9_]*)"?\??: ')
+
+
+def schema_objects(types: str) -> dict:
+    """{'tables': {name: [columns]}, 'views': {name: [columns]}, 'functions':
+    [names]} for the public schema, read from the Management API's generated
+    TypeScript (`/types/typescript`): entries at the section's indent, a
+    table's columns under its `Row`. Raises Unavailable when the text has no
+    public schema -- an answer it cannot read is not an empty schema."""
+    lines = types.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == "  public: {")
+    except StopIteration:
+        raise Unavailable("production's schema types have no public schema")
+    out = {"tables": {}, "views": {}, "functions": []}
+    section = entry = None
+    in_row = False
+    for ln in lines[start + 1:]:
+        if ln.startswith("  }") or (ln.startswith("  ") and not ln.startswith("   ")
+                                    and ln.strip()):
+            break                               # the next schema, or the end of public
+        m = _TS_SECTION.match(ln)
+        if m:
+            section, entry, in_row = m.group(1), None, False
+            continue
+        if section not in ("Tables", "Views", "Functions"):
+            continue
+        m = _TS_ENTRY.match(ln)
+        if not m and ln.startswith("      ") and not ln.startswith("       "):
+            entry, in_row = None, False         # a name this cannot read: skip its body
+            continue
+        if m:
+            entry, in_row = m.group(1), False
+            if section == "Functions":
+                if entry not in out["functions"]:
+                    out["functions"].append(entry)
+            else:
+                out["tables" if section == "Tables" else "views"].setdefault(entry, [])
+            continue
+        if section == "Functions" or entry is None:
+            continue
+        if ln.startswith("        ") and not ln.startswith("         "):
+            in_row = ln.strip() == "Row: {"
+            continue
+        m = _TS_COLUMN.match(ln) if in_row else None
+        if m:
+            out["tables" if section == "Tables" else "views"][entry].append(m.group(1))
+    if not (out["tables"] or out["views"] or out["functions"]):
+        raise Unavailable("production's schema types list no public tables or functions")
+    return out
+
+
+def _sql_code(text: str) -> str:
+    """Migration SQL without its comments, lower-cased: a comment that says
+    `add column x` did not add it."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            out.append(" ")
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        elif c == "'":
+            j = i + 1
+            while j < n and not (text[j] == "'" and text[j + 1:j + 2] != "'"):
+                j += 2 if text[j] == "'" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif c == "$" and (m := re.match(r"\$[A-Za-z_]*\$", text[i:])):
+            j = text.find(m.group(0), i + len(m.group(0)))
+            j = n if j < 0 else j + len(m.group(0))
+            out.append(text[i:j])               # a body: kept, its comments with it
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out).lower()
+
+
+def _ident(name: str) -> str:
+    return rf'(?:"?public"?\s*\.\s*)?"?{re.escape(name.lower())}"?'
+
+
+def _create_bodies(sql: str, table: str) -> list[str]:
+    """The parenthesised column lists of every `create table <table> (…)`."""
+    out = []
+    pat = re.compile(rf"create\s+(?:unlogged\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+                     rf"{_ident(table)}\s*\(")
+    for m in pat.finditer(sql):
+        depth, i = 1, m.end()
+        while i < len(sql) and depth:
+            depth += {"(": 1, ")": -1}.get(sql[i], 0)
+            i += 1
+        out.append(sql[m.end():i])
+    return out
+
+
+def unrecorded_objects(objects: dict, sql: str) -> list[str]:
+    """What production has that no migration creates, as `function f`,
+    `table t`, `view v`, `column t.c`. `sql` is every base-branch migration,
+    through _sql_code. Cheap and lenient: a function counts as created by any
+    `create [or replace] function f(`, a table or view by `create … t`, a
+    column by `add column c` anywhere or by its name in a `create table t (…)`
+    or a rename to it -- so this misses a column some migration adds to a
+    different table. Objects an extension installs into public (pg_trgm's
+    functions, PostGIS's tables) have no create of their own and are
+    reported; no project here installs one there."""
+    out = []
+    for fn in objects.get("functions", []):
+        if not re.search(rf"create\s+(?:or\s+replace\s+)?function\s+{_ident(fn)}\s*\(", sql):
+            out.append(f"function {fn}")
+    for kind, key, creates in (("table", "tables", r"(?:unlogged\s+)?table"),
+                               ("view", "views", r"(?:materialized\s+)?view")):
+        for name, cols in objects.get(key, {}).items():
+            made = re.search(rf"create\s+(?:or\s+replace\s+)?{creates}\s+"
+                             rf"(?:if\s+not\s+exists\s+)?{_ident(name)}(?![a-z0-9_])", sql) \
+                or re.search(rf"rename\s+to\s+{_ident(name)}(?![a-z0-9_])", sql)
+            if not made:
+                out.append(f"{kind} {name}")
+                continue
+            if kind == "view":
+                continue                        # a view's columns come with its query
+            bodies = _create_bodies(sql, name)
+            for col in cols:
+                word = rf'(?<![a-z0-9_])"?{re.escape(col.lower())}"?(?![a-z0-9_])'
+                if re.search(rf"add\s+(?:column\s+)?(?:if\s+not\s+exists\s+)?{word}", sql) \
+                        or re.search(rf"rename\s+column\s+\S+\s+to\s+{word}", sql) \
+                        or any(re.search(word, b) for b in bodies):
+                    continue
+                out.append(f"column {name}.{col}")
+    return out
+
+
+def numbering_gaps(versions) -> list[tuple[str, str]]:
+    """(first, last) of each run of version numbers a sequentially numbered
+    set skips, zero-padded as the files are. Timestamped versions: none."""
+    nums = sorted(int(v) for v in versions if v.isdigit() and len(v) <= SEQUENTIAL_DIGITS)
+    if len(nums) < 2:
+        return []
+    width = max(len(v) for v in versions if v.isdigit() and len(v) <= SEQUENTIAL_DIGITS)
+    return [(f"{a + 1:0{width}d}", f"{b - 1:0{width}d}")
+            for a, b in zip(nums, nums[1:]) if b - a > 1]
+
+
+def _unrecorded(sys, repo, branch, short, label, token, ref, sub, mig_files, evidence,
+                budget) -> list[str]:
+    """Notes for production schema no migration on the base branch creates.
+    A failure to read the schema is evidence, not unknown: the rest of the
+    drift check stands without it."""
+    try:
+        got = supabase_get(sys, label, token, f"/v1/projects/{ref}/types/typescript"
+                                              "?included_schemas=public", budget)
+        types = got.get("types") if isinstance(got, dict) else None
+        if not isinstance(types, str):
+            raise Unavailable("Supabase's types answer has no types")
+        objects = schema_objects(types)
+        names = [f"{branch}:{sub}/migrations/{n}" for n in sorted(mig_files)]
+        sql = _sql_code(_git(sys, repo, "show", *names, budget=budget)) if names else ""
+    except Unavailable as e:
+        evidence.append(f"production schema not compared with {short}'s migrations: {e}")
+        return []
+    missing = unrecorded_objects(objects, sql)
+    counted = (f"{len(objects['tables'])} table(s), {len(objects['views'])} view(s), "
+               f"{len(objects['functions'])} function(s)")
+    if not missing:
+        evidence.append(f"production's public schema ({counted}) is all created by "
+                        f"{short}'s migrations")
+        return []
+    # One note per table's columns: six subscription_* columns are one gap.
+    cols: dict[str, list[str]] = {}
+    for what in missing:
+        if what.startswith("column "):
+            table, _, col = what[len("column "):].partition(".")
+            cols.setdefault(table, []).append(col)
+    out = [f"{what}: in production, no migration on {short} creates it"
+           for what in missing if not what.startswith("column ")]
+    out += [f"column{'s' if len(c) > 1 else ''} {t}.{', '.join(c)}: in production, no "
+            f"migration on {short} creates {'them' if len(c) > 1 else 'it'}"
+            for t, c in cols.items()]
+    return out
 
 
 def _release_tags(sys: System, repo, branch, budget) -> list:

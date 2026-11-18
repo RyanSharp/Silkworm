@@ -28249,6 +28249,208 @@ def test_probe_backend_drift_measures_a_release_by_ancestry():
     check("nor does one whose targets are not tables", r["status"] == H.OK, r["summary"])
 
 
+def _types(tables=None, functions=(), views=None):
+    """The Management API's /types/typescript answer, shaped as `supabase gen
+    types` writes it: entries at six spaces, a table's Row columns at ten."""
+    def table(name, cols):
+        rows = "".join(f"          {c}: string\n" for c in cols)
+        ins = "".join(f"          {c}?: string\n" for c in cols)
+        return (f"      {name}: {{\n        Row: {{\n{rows}        }}\n"
+                f"        Insert: {{\n{ins}        }}\n        Relationships: []\n      }}\n")
+    tabs = "".join(table(n, c) for n, c in (tables or {}).items()) \
+        or "      [_ in never]: never\n"
+    vws = "".join(table(n, c) for n, c in (views or {}).items()) \
+        or "      [_ in never]: never\n"
+    fns = "".join(f"      {f}: {{ Args: never; Returns: undefined }}\n" for f in functions) \
+        or "      [_ in never]: never\n"
+    return json.dumps({"types": (
+        "export type Database = {\n  __InternalSupabase: {\n    PostgrestVersion: \"14\"\n  }\n"
+        f"  public: {{\n    Tables: {{\n{tabs}    }}\n    Views: {{\n{vws}    }}\n"
+        f"    Functions: {{\n{fns}    }}\n    Enums: {{\n      issue_state: \"open\" | \"closed\"\n"
+        "    }\n  }\n}\n")})
+
+
+def test_probe_backend_drift_finds_production_schema_no_migration_creates():
+    P = _probes()
+    import health as H
+    print("\nbackend-drift: production schema no base-branch migration creates (the Mondays case)")
+    R = _recorded()
+    day = 86400
+    now = _PROBE_NOW
+    cfg = {"supabase": {"mondays": {"ref": "refabc", "dir": "backend/supabase"}}}
+    mig = "backend/supabase/migrations/"
+    # Mondays on 2026-11-17: main's numbering jumps 0023 -> 0027; feat/premium's
+    # 0024-0026 were applied by hand and the history baselined from main.
+    files = {f"{mig}{n:04d}_m{n}.sql": "select 1;" for n in range(1, 23)}
+    files.update({
+        f"{mig}0001_m1.sql": "create table profiles (\n  id uuid primary key,\n"
+                             "  display_name text not null -- , subscription_status text\n);\n"
+                             "create table if not exists public.groups (id uuid, title text);\n"
+                             "create or replace view public.member_view as select 1;\n",
+        f"{mig}0002_m2.sql": "alter table profiles add column if not exists pro_until "
+                             "timestamptz;\ncreate or replace function public.add_entry("
+                             "p uuid) returns uuid language sql as $$ select p $$;\n"
+                             "/* create function my_entitlement() later */\n",
+        f"{mig}0023_add_entry.sql": "alter table groups rename column title to name;\n",
+        f"{mig}0027_account_deletion.sql": "create function delete_account() returns void "
+                                           "language sql as $$ select $$;\n",
+        "backend/supabase/functions/alpha/index.ts": "a1",
+    })
+    applied = [{"version": f"{n:04d}"} for n in list(range(1, 24)) + [27]]
+    premium = _types(
+        tables={"profiles": ["id", "display_name", "pro_until", "subscription_status",
+                             "subscription_expires_at"],
+                "groups": ["id", "name"]},
+        views={"member_view": ["x"]},
+        functions=["add_entry", "apply_subscription", "delete_account", "my_entitlement",
+                   "premium_members"])
+
+    def run(repo, types, migs=applied):
+        rec = {"slug": "mondays", "scope": {"cwd": str(repo)}}
+        http = {"/functions": (200, json.dumps([_deployed("alpha", 3, now - 19 * day)])),
+                "/database/migrations": (200, json.dumps(migs))}
+        if types is not None:
+            http["/types/typescript?included_schemas=public"] = types
+        s = _probe_sys(home=_supabase_home() / "home", now=now, http=http)
+        return _run_probe(P.make_backend_drift(s, cfg), rec), s
+
+    repo = _drift_repo([(now - 20 * day, files)])
+    r, s = run(repo, (200, premium))
+    ev = r["evidence"]
+    check("every migration applied, yet production has objects main never creates: warn",
+          r["status"] == H.WARN and "not on main" in r["summary"], r["summary"])
+    for fn in ("apply_subscription", "my_entitlement", "premium_members"):
+        check(f"names function {fn}", any(e.startswith(f"function {fn}: in production, no "
+                                                       "migration on main creates it")
+                                          for e in ev), ev)
+    check("names the unrecorded columns of profiles, in one line",
+          [e for e in ev if e.startswith("columns profiles.subscription_status, "
+                                         "subscription_expires_at:")] != [], ev)
+    check("names the numbering gap 0024–0026, which production's history also skips",
+          any(e.startswith("migration 0024–0026: main skips these numbers; production's "
+                           "history skips them too") for e in ev), ev)
+    check("what a migration creates is not reported: create [or replace] [public.] "
+          "function, if not exists, add column, rename column, views",
+          not any(w in e for e in ev if "creates" in e
+                  for w in ("add_entry", "delete_account", "groups", "pro_until",
+                            "display_name", "member_view", "alpha"))
+          and len([e for e in ev if "creates" in e]) == 4, ev)
+    check("a comment is not a migration (subscription_status, my_entitlement)",
+          any("subscription_status" in e for e in ev)
+          and any(e.startswith("function my_entitlement") for e in ev))
+    check("still read-only: GETs only, the schema through the types endpoint",
+          [a[0] for a, _ in s.calls if a[0].startswith("http")][-1].endswith(
+              "/v1/projects/refabc/types/typescript?included_schemas=public")
+          and all(a[0].startswith("https://api.supabase.com/v1/projects/refabc/")
+                  for a, _ in s.calls if a[0].startswith("http")))
+    check("each call bounded", all(t <= 30 for _, t in s.calls))
+    check("and no token value appears", "sbp_" not in json.dumps(r))
+
+    # The premium backend lands on main: nothing unrecorded, gap filled.
+    landed = dict(files, **{
+        f"{mig}0024_subscriptions.sql": "alter table profiles\n  add column subscription_status "
+                                        "text,\n  add column subscription_expires_at timestamptz;\n",
+        f"{mig}0025_subscription_apply.sql": "create or replace function apply_subscription("
+                                             ") returns void as $$ $$ language sql;\n"
+                                             "create or replace function my_entitlement() "
+                                             "returns void as $$ $$ language sql;\n",
+        f"{mig}0026_subscription_order.sql": "create function premium_members(p uuid[]) "
+                                             "returns void as $$ $$ language sql;\n"})
+    repo = _drift_repo([(now - 20 * day, landed)])
+    full = [{"version": f"{n:04d}"} for n in range(1, 28)]
+    r, _ = run(repo, (200, premium), full)
+    check("once the premium backend is on main and recorded: ok, saying the schema matched",
+          r["status"] == H.OK and any("public schema (2 table(s), 1 view(s), 5 function(s)) is "
+                                      "all created by main's migrations" in e
+                                      for e in r["evidence"]), (r["summary"], r["evidence"]))
+
+    # A gap production's history fills (recorded but not on main) says so.
+    repo = _drift_repo([(now - 20 * day, files)])
+    r, _ = run(repo, (200, premium), applied + [{"version": "0025"}])
+    check("a gap production's history partly fills says so",
+          any(e.startswith("migration 0024–0026: main skips these numbers; production's "
+                           "history has some of them") for e in r["evidence"])
+          and any(e.startswith("migration 0025: applied in production") for e in r["evidence"]),
+          r["evidence"])
+
+    # The schema cannot be read: the rest of the check stands, saying why.
+    for label, ans in (("refused", (403, '{"message":"no"}')), ("missing", None),
+                       ("not types", (200, '{"x": 1}')),
+                       ("no public schema", (200, json.dumps({"types": "export {}\n"}))),
+                       ("unreachable", P.Unavailable("api.supabase.com unreachable: timed out"))):
+        r, _ = run(repo, ans)
+        check(f"schema {label}: still warns on the gap, evidence says the schema was not read",
+              r["status"] == H.WARN and any("0024–0026" in e for e in r["evidence"])
+              and any(e.startswith("production schema not compared with main's migrations")
+                      for e in r["evidence"])
+              and not any("no migration on main creates" in e for e in r["evidence"]),
+              (r["summary"], r["evidence"]))
+
+    # Timestamped versions have no numbering to skip.
+    check("timestamped versions have no gaps",
+          P.numbering_gaps(["20261001000001", "20261019000001"]) == [])
+    check("sequential gaps, zero-padded, each run once",
+          P.numbering_gaps(["0001", "0002", "0005", "0007"]) == [("0003", "0004"),
+                                                                 ("0006", "0006")])
+    check("a single gap reads as one number",
+          any(e.startswith("migration 0024: main skips this number")
+              for e in run(_drift_repo([(now - 20 * day, {
+                  k: v for k, v in landed.items() if "0024_" not in k})]),
+                  (200, _types(functions=["add_entry"])), full)[0]["evidence"]))
+
+    # Forms a migration creates things in, which must not read as unrecorded.
+    U, C = P.unrecorded_objects, P._sql_code
+    some = {"tables": {"profiles": ["id", "tier"]}, "views": {},
+            "functions": ["apply_subscription"]}
+    check("supabase db diff's quoted \"public\".\"x\" counts as created",
+          U(some, C('create table "public"."profiles" ("id" uuid, "tier" text);\n'
+                    'create or replace function "public"."apply_subscription"() returns void '
+                    "as $$ $$ language sql;")) == [])
+    check("alter table … add <col> without COLUMN counts",
+          U(some, C("create table profiles (id uuid);\nalter table profiles add tier text;\n"
+                    "create function apply_subscription() returns void as $$ $$;")) == [])
+    check("a /* or -- inside a string or a $$ body is not a comment",
+          U(some, C("select '/*';\ncreate table profiles (id uuid, tier text);\n"
+                    "create function apply_subscription() returns void as $$ select 1 -- x\n"
+                    "$$;\nselect '*/';")) == [])
+    check("and a real comment still is",
+          U(some, C("create table profiles (id uuid);\n-- alter table profiles add tier\n"
+                    "/* create function apply_subscription() */")) ==
+          ["function apply_subscription", "column profiles.tier"])
+    check("an apostrophe in a $$ body does not hide the comment after it",
+          U(some, C("create table profiles (id uuid, tier text);\n"
+                    "create function g() returns text as $body$ select 'it''s' || $$don't$$ "
+                    "$body$;\n-- create function apply_subscription()\nselect 'x';")) ==
+          ["function apply_subscription"])
+    odd = ("  public: {\n    Tables: {\n      profiles: {\n        Row: {\n          id: string\n"
+           "        }\n      }\n      \"2fa-codes\": {\n        Row: {\n          code: string\n"
+           "        }\n      }\n    }\n    Functions: {\n      grant_pro:\n"
+           "        | { Args: never; Returns: undefined }\n"
+           "        | { Args: { p: string }; Returns: undefined }\n    }\n  }\n")
+    got = P.schema_objects(odd)
+    check("an overloaded function (a union on the next lines) is read",
+          got["functions"] == ["grant_pro"], got)
+    check("a table name this cannot read does not lend its columns to the one before",
+          got["tables"] == {"profiles": ["id"]}, got)
+    two = dict(files, **{f"{mig}0027_b.sql": "create function premium_members() returns void "
+                                             "as $$ $$;\n"})
+    r, _ = run(_drift_repo([(now - 20 * day, two)]), (200, premium))
+    check("two files sharing a version number are both read",
+          not any(e.startswith("function premium_members") for e in r["evidence"])
+          and any(e.startswith("function my_entitlement") for e in r["evidence"]),
+          r["evidence"])
+
+    # The real answer, recorded from Mondays on 2026-11-17.
+    real = P.schema_objects(R["mondays_types"]["types"])
+    check("the recorded Mondays schema parses: tables, their Row columns, functions",
+          "profiles" in real["tables"] and "subscription_status" in real["tables"]["profiles"]
+          and {"apply_subscription", "my_entitlement", "premium_members", "add_entry"}
+          <= set(real["functions"]) and "issue_state" not in real["functions"]
+          and not real["views"], real["functions"])
+    check("a column is read from Row only, not Insert or Update",
+          all(len(c) == len(set(c)) for c in real["tables"].values()))
+
+
 def test_probe_mini_credentials_and_disk():
     P = _probes()
     import health as H
