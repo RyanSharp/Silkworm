@@ -1468,7 +1468,11 @@ PAGE = r"""<!doctype html>
   /* No bottom padding: the composer, stuck to main's bottom, brings its own,
      and a padded scroller would hold it up with the thread showing under it. */
   main { flex: 1; overflow-y: auto; padding: 18px 22px 0; min-width: 0;
-         display: flex; flex-direction: column; }
+         display: flex; flex-direction: column;
+         /* The page keeps the reader's place itself (keepEnd, holdAnchor):
+            Safari has no scroll anchoring, and Chrome's would correct the
+            same shift a second time. */
+         overflow-anchor: none; }
   #content { flex: 1; }
 
   /* dashboard */
@@ -3250,8 +3254,10 @@ function toggleTools(id) {
     afterFold(() => { if (!chatOpen.has(id)) redrawChat(); });
     return;
   }
-  // Opened, it is being read: the next poll must not scroll it away.
+  // Opened, it is being read: the next poll must not scroll it away, nor
+  // the line move as it unfolds.
   pinned = false;
+  noteAnchor();
   chatOpen.add(id);
   redrawChat();                                     // drawn, still folded
   nextFrame(() => {
@@ -3265,7 +3271,9 @@ function toggleCall(id, i) {
   const k = `${id}/${i}`;
   if (callOpen.has(k)) callOpen.delete(k); else callOpen.add(k);
   pinned = false;
+  noteAnchor();
   redrawChat();
+  holdAnchor();
   const row = typeof document.querySelector === "function" &&
               document.querySelector(`.crow[data-k="${k}"]`);
   if (row && row.focus) row.focus();
@@ -3378,23 +3386,83 @@ function showJump(on) {
 // (the stats above the thread, a redraw from the top), which would read a
 // reader still at the end as one who had scrolled up.
 let pinned = true, gliding = 0;
+// Read further up, where the reader is: the message at the top of what they
+// see, and how far below the top of the thread's box it sits. Whatever is
+// drawn, opened, loaded or resized, that message is put back there -- the
+// browser does not (Safari has no scroll anchoring at all).
+let anchor = null;
+function noteAnchor() {
+  anchor = null;
+  const m = scroller(), box = document.getElementById("tmsgs");
+  if (!m || !box || typeof m.getBoundingClientRect !== "function") return;
+  const kids = [...(box.children || [])].filter(k => typeof k.getBoundingClientRect === "function");
+  const top = m.getBoundingClientRect().top;
+  // What is shown starts under the phone's sticky header, not at the box's top.
+  const head = document.getElementById("chathead");
+  const hr = head && typeof head.getBoundingClientRect === "function" ? head.getBoundingClientRect() : null;
+  const seen = hr && hr.bottom > top && hr.bottom - hr.top > 0 ? hr.bottom : top;
+  // The first message whose bottom is below that (they are in order).
+  let lo = 0, hi = kids.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (kids[mid].getBoundingClientRect().bottom > seen) hi = mid; else lo = mid + 1;
+  }
+  // None, or the first is still below: the reader is above the messages (the
+  // stats, the thread's details), where nothing needs holding.
+  if (lo >= kids.length || (lo === 0 && kids[0].getBoundingClientRect().top > seen)) return;
+  anchor = {el: kids[lo], at: kids[lo].getBoundingClientRect().top - top};
+}
+function holdAnchor() {
+  const m = scroller(), a = anchor;
+  if (!a || !m || a.el.isConnected === false || typeof m.getBoundingClientRect !== "function") return;
+  const moved = a.el.getBoundingClientRect().top - m.getBoundingClientRect().top - a.at;
+  if (Math.abs(moved) >= 1) m.scrollTop += moved;
+}
+// The thread's box or what is in it changed size outside a draw -- the
+// keyboard opening or closing, the composer growing a line, an image or a
+// font arriving, a line unfolding: a reader following the end is kept at
+// it, and one reading further up keeps their place.
+let boxHeight = -1;
+function reflow() {
+  const m = scroller();
+  if (!m) return;
+  boxHeight = m.clientHeight;
+  if (pinned) { if (!gliding && m.scrollHeight - m.scrollTop - m.clientHeight > 1) m.scrollTop = m.scrollHeight; }
+  else holdAnchor();
+}
 function onScroll() {
+  const m = scroller();
+  // The box itself changed height (the keyboard): the scroll is the
+  // browser's, not the reader's -- which would read a reader at the end,
+  // the keyboard now over the last messages, as one who scrolled up.
+  if (m && boxHeight >= 0 && m.clientHeight !== boxHeight) { reflow(); return; }
   if (gliding && Date.now() - gliding < 1000 && !atEnd()) return;
   gliding = 0;
   pinned = atEnd();
-  if (pinned) showJump(false);
+  if (pinned) { anchor = null; showJump(false); }
+  else noteAnchor();
 }
 // Draws with `fn`, then keeps the reader where they were: at the end if they
-// were following it, else where they are, with the pill if something new
-// arrived.
+// were following it, else where they are (the same message at the same
+// height), with the pill if something new arrived.
+// A draw inside another's (a transcript read draws the live end too) is the
+// outer one's to keep: noting the place again halfway would note where the
+// first half of the draw had already moved the reader to.
+let keeping = 0;
 function keepEnd(fn, force) {
+  if (keeping) { fn(); return; }
   const was = pinned || atEnd(), m = scroller(), before = m ? m.scrollHeight : 0;
-  fn();
+  if (!was) noteAnchor();
+  keeping++;
+  try { fn(); } finally { keeping--; }
   const grew = !m || m.scrollHeight !== before;
   // Following: only when the draw changed something -- a draw that changed
   // nothing leaves a reader who opened something near the end where they are.
   if (force || (was && grew)) toEnd();
-  else if (m && m.scrollHeight > before) showJump(true);
+  else {
+    if (!was) holdAnchor();
+    if (m && m.scrollHeight > before) showJump(true);
+  }
 }
 // The open thread's own header on a phone, stuck to the top: back to the
 // list, its name and project, what it is doing (with Stop while a turn runs),
@@ -3856,6 +3924,10 @@ function fitViewport() {
   root.style.setProperty("--vvh", Math.round(vv.height) + "px");
   if (document.body) document.body.classList.toggle("kb", window.innerHeight - vv.height > 120);
   if (vv.offsetTop && window.scrollTo) window.scrollTo(0, 0);
+  // The thread's box is now shorter (or taller): the last message stays
+  // just above the composer, not under it, when it was being read.
+  const m = scroller();
+  if (m && m.clientHeight !== boxHeight) reflow();
 }
 if (typeof window !== "undefined" && window.visualViewport && window.visualViewport.addEventListener) {
   window.visualViewport.addEventListener("resize", fitViewport);
@@ -3865,6 +3937,15 @@ if (typeof window !== "undefined" && window.visualViewport && window.visualViewp
 (function () {
   const m = scroller();
   if (m && m.addEventListener) m.addEventListener("scroll", onScroll, {passive: true});
+  // Any change of size in the thread's box or what it holds, whatever made it.
+  if (m && typeof ResizeObserver === "function") {
+    const ro = new ResizeObserver(() => reflow());
+    ro.observe(m);
+    for (const id of ["chathead", "content", "tmsgs", "tlive", "composer"]) {
+      const el = document.getElementById(id);
+      if (el) ro.observe(el);
+    }
+  }
 })();
 // iOS Safari gives a tap :active (the Send button's press) only when the
 // page listens for touches.
@@ -6505,6 +6586,7 @@ async function openLink(q) {
       if (el && m && el.getBoundingClientRect) {
         pinned = false;
         m.scrollTop += el.getBoundingClientRect().top - m.getBoundingClientRect().top - 12;
+        noteAnchor();
       }
     }
     if (q.get("tools")) {
@@ -6515,8 +6597,10 @@ async function openLink(q) {
         chatOpen.add(g.id); chatShown.add(g.id); pinned = false;
         redrawChat();
         const el = chatEls.get(g.id), m = scroller();
-        if (el && m && el.getBoundingClientRect)
+        if (el && m && el.getBoundingClientRect) {
           m.scrollTop += el.getBoundingClientRect().top - m.getBoundingClientRect().top - 12;
+          noteAnchor();
+        }
       }
     }
   }));

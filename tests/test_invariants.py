@@ -35594,6 +35594,263 @@ def test_trader_tabs_follow_trader_status_down_its_error_paths():
     check("strings in trader_status.py's own fields are escaped, never markup",
           all("<img" not in h for h in o["escaped"].values()) and n >= 10, n)
 
+
+# A thread's box, laid out: main scrolls a column of the sticky header, the
+# messages (#tmsgs, each an element of a given height), the live end (#tlive)
+# and the sticky composer. Rects are measured from it, scrollTop is clamped
+# as a browser clamps it, a scroll event follows a scroll (delivered when a
+# check says so), and a ResizeObserver fires when layout() is called -- as a
+# browser does after any size change.
+SCROLL_HARNESS = r"""
+const HEAD = 50, COMPOSER = 70;
+let vvh = 800, liveH = 0, pendingScroll = false;
+const listeners = {}, roCallbacks = [];
+function plain(id) {
+  const cls = new Set();
+  const e = {id, style: {setProperty(k, v) { if (k === "--vvh") vvh = parseFloat(v); }},
+    dataset: {}, value: "", children: [], _inner: "", attrs: {},
+    classList: {add: c => cls.add(c), remove: c => cls.delete(c), contains: c => cls.has(c),
+                toggle: (c, on) => { if (on === undefined ? !cls.has(c) : on) cls.add(c); else cls.delete(c); }},
+    addEventListener(){}, querySelectorAll: () => [], querySelector: () => null,
+    insertAdjacentHTML(){}, appendChild(c) { this.children.push(c); c.parent = this; },
+    setAttribute(k, v) { this.attrs[k] = v; }, focus(){}, blur(){}, scrollIntoView(){}};
+  Object.defineProperty(e, "innerHTML", {get() { return this._inner; },
+    set(v) { this._inner = v; if (this.id !== "tmsgs") this.children.length = 0; }});
+  return e;
+}
+const els = {};
+const byId = id => els[id] || (els[id] = plain(id));
+const tmsgs = byId("tmsgs");
+// The phone's thread header: sticky, over the top HEAD px of what is shown.
+byId("chathead").getBoundingClientRect = () => ({top: 0, bottom: HEAD});
+// A message: only its height matters; it is where the column puts it.
+function item(h) {
+  const it = {h, isConnected: true, classList: plain("").classList,
+    getBoundingClientRect() {
+      const i = tmsgs.children.indexOf(this);
+      let y = HEAD;
+      for (let k = 0; k < i; k++) y += tmsgs.children[k].h;
+      return {top: y - main.scrollTop, bottom: y + this.h - main.scrollTop};
+    }};
+  return it;
+}
+const content = () => HEAD + tmsgs.children.reduce((a, c) => a + c.h, 0) + liveH + COMPOSER;
+const main = plain("__main");
+let top_ = 0;
+Object.defineProperty(main, "clientHeight", {get: () => vvh});
+Object.defineProperty(main, "scrollHeight", {get: () => Math.max(content(), vvh)});
+Object.defineProperty(main, "scrollTop", {get: () => top_, set(v) {
+  const t = Math.max(0, Math.min(v, main.scrollHeight - main.clientHeight));
+  if (t !== top_) { top_ = t; pendingScroll = true; }
+}});
+main.getBoundingClientRect = () => ({top: 0, bottom: vvh});
+main.addEventListener = (k, f) => { listeners[k] = f; };
+const flush = () => { if (pendingScroll) { pendingScroll = false; listeners.scroll(); } };
+const layout = () => { for (const f of roCallbacks) f([]); flush(); };
+if (!__NORO__) globalThis.ResizeObserver = class { constructor(f) { roCallbacks.push(f); } observe(){} };
+const bodyCls = new Set();
+globalThis.document = {getElementById: byId, addEventListener(){}, querySelectorAll: () => [],
+  querySelector: s => s === "main" ? main : null, createElement: () => plain(""), hidden: false,
+  documentElement: plain("html"),
+  body: {classList: {add: c => bodyCls.add(c), remove: c => bodyCls.delete(c), contains: c => bodyCls.has(c),
+                     toggle: (c, on) => { if (on === undefined ? !bodyCls.has(c) : on) bodyCls.add(c); else bodyCls.delete(c); }}}};
+const vvListeners = {};
+const vv = {height: 800, scale: 1, offsetTop: 0, addEventListener: (k, f) => { vvListeners[k] = f; }};
+globalThis.history = {state: null, replaceState(){}, pushState(){}, back(){}};
+globalThis.window = {addEventListener(){}, history: globalThis.history, location: {search: ""},
+                     innerHeight: 800, visualViewport: vv, scrollTo(){}};
+globalThis.matchMedia = q => ({matches: q === "(max-width: 700px)"});
+Object.defineProperty(globalThis, "navigator", {value: {}, configurable: true});
+globalThis.localStorage = {getItem: () => null, setItem(){}};
+globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;
+globalThis.requestAnimationFrame = () => 0;
+globalThis.fetch = () => new Promise(() => {});
+globalThis.getComputedStyle = () => ({});
+(0, eval)(__JS__ + `
+;globalThis.__p = {keepEnd, toEnd, atEnd, onScroll, isPinned: () => pinned};`);
+const P = globalThis.__p, out = {};
+// The keyboard, as iOS opens it: the visual viewport shrinks and says so.
+function keyboard(open) { vv.height = open ? 460 : 800; vvListeners.resize(); layout(); }
+// Thirty messages; read at the end, or scrolled up to the middle.
+function fresh(mode) {
+  if (vv.height !== 800) keyboard(false);
+  tmsgs.children.length = 0; liveH = 0;
+  for (let i = 0; i < 30; i++) tmsgs.children.push(item(80 + (i % 4) * 30));
+  P.keepEnd(() => {}, true); layout();                  // opened: at the end
+  if (mode === "up") { main.scrollTop = 900; flush(); }
+}
+const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+const last = () => tmsgs.children[tmsgs.children.length - 1];
+// The last message ends above the composer, inside what is shown.
+const latestShown = () => last().getBoundingClientRect().bottom <= vvh - COMPOSER + 1;
+// Where the message at the top of what is shown is, to see it did not move:
+// by its place in the thread, so a redraw's new element for it is measured.
+function topOf() {
+  const i = tmsgs.children.findIndex(c => c.getBoundingClientRect().bottom > 0);
+  return {i, at: tmsgs.children[i].getBoundingClientRect().top};
+}
+const moved = t => Math.round(tmsgs.children[t.i].getBoundingClientRect().top - t.at);
+// The message just above the one on screen: what changes there moves the reader.
+const above = () => tmsgs.children[Math.max(0, topOf().i - 1)];
+const pill = () => byId("jumppill").classList.contains("show");
+function trial(name, mode, act) {
+  fresh(mode);
+  const t = topOf(), top0 = main.scrollTop;
+  act();
+  out[name + ":" + mode] = mode === "bottom"
+    ? {gap: gap(), latestShown: latestShown(), pinned: P.isPinned()}
+    : {moved: moved(t), top0, top: main.scrollTop, pinned: P.isPinned(), pill: pill()};
+}
+for (const mode of ["bottom", "up"]) {
+  // The composer focused: the keyboard opens.
+  trial("keyboard-open", mode, () => keyboard(true));
+  // ...and a scroll event the browser sends once the box has shrunk, before
+  // the page has heard of the keyboard, is not the reader scrolling up.
+  trial("keyboard-then-scroll-event", mode, () => {
+    vvh = 460; pendingScroll = true; flush();
+    vv.height = 460; vvListeners.resize(); layout();
+  });
+  trial("keyboard-close", mode, () => { keyboard(true); keyboard(false); });
+  // A poll brings new messages.
+  trial("new-messages", mode, () => P.keepEnd(() => { tmsgs.children.push(item(140), item(90)); }));
+  // A turn's tools line rewritten in place (more calls counted, a line
+  // wrapping): one above what is read, and the last.
+  trial("tool-line-updates", mode, () => P.keepEnd(() => { above().h += 40; last().h += 40; }));
+  // A tools line unfolding (one opened before, the live line's chain growing):
+  // a CSS transition after the draw, seen by the observer.
+  trial("tool-line-expands", mode, () => { above().h += 220; layout(); });
+  // A thumbnail (or a font) arriving after the draw, above the reader.
+  trial("media-loads-late", mode, () => { tmsgs.children[2].h += 120; tmsgs.children[16].h += 120; layout(); });
+  // A transcript read draws the live end inside its own draw: what grows
+  // above the reader in the first part is still put right.
+  trial("poll-grows-above", mode, () => P.keepEnd(() => { above().h += 100; P.keepEnd(() => { liveH = 30; }); }));
+  // The working indicator under the last message, appearing and going.
+  trial("working-appears", mode, () => P.keepEnd(() => { liveH = 60; }));
+  trial("working-disappears", mode, () => { P.keepEnd(() => { liveH = 60; }); P.keepEnd(() => { liveH = 0; }); layout(); });
+  // The transcript drawn again from the top (another session, an error read
+  // recovered): new elements, the same heights. A guard, not a fix -- it held
+  // before too: never thrown to the top.
+  trial("redrawn-from-top", mode, () => P.keepEnd(() => {
+    const hs = tmsgs.children.map(c => c.h);
+    for (const c of tmsgs.children) c.isConnected = false;
+    tmsgs.children.length = 0;
+    for (const h of hs) tmsgs.children.push(item(h));
+  }));
+}
+// A message wholly under the sticky header grows (a tools line redrawn): what
+// is read below the header -- the first message showing past it -- stays put.
+fresh("up");
+{
+  const k = 10, it = tmsgs.children[k];
+  main.scrollTop += it.getBoundingClientRect().bottom - (HEAD - 10); flush();
+  const shown = () => tmsgs.children.find(c => c.getBoundingClientRect().bottom > HEAD);
+  const was = shown(), at = was.getBoundingClientRect().top;
+  P.keepEnd(() => { it.h += 100; }); layout();
+  out.underHeader = {sameMessage: shown() === was, moved: Math.round(was.getBoundingClientRect().top - at)};
+}
+// Read above the messages (a laptop's stats, the thread's details): what is
+// above them growing leaves the reader at what they were reading.
+fresh("up");
+let stats = 200;                                         // the stats, above the first message
+tmsgs.children[0].getBoundingClientRect = function () {
+  return {top: HEAD + stats - main.scrollTop, bottom: HEAD + stats + this.h - main.scrollTop}; };
+main.scrollTop = 0; flush();
+P.keepEnd(() => { stats = 500; }); layout();             // a draw grows them
+out.aboveMessages = {top: main.scrollTop};
+// Another thread opened: at its end, whatever was read where in the last one.
+fresh("up");
+P.keepEnd(() => { tmsgs.children.length = 0; for (let i = 0; i < 12; i++) tmsgs.children.push(item(100)); }, true);
+layout();
+out.switched = {gap: gap(), latestShown: latestShown(), pinned: P.isPinned(), pill: pill()};
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def scroll_harness(js: str, resize_observer: bool = True) -> dict:
+    import shutil
+    import subprocess as _sp
+    node = shutil.which("node")
+    if not node:
+        return None
+    src = SCROLL_HARNESS.replace("__NORO__", "false" if resize_observer else "true")
+    r = _sp.run([node, "-e", src.replace("__JS__", json.dumps(js))],
+                capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        raise AssertionError("scroll harness: " + r.stderr[-800:])
+    return json.loads(r.stdout)
+
+
+def test_dashshots_scroll_probe_injects():
+    import importlib.machinery
+    import importlib.util
+    import re
+    import shutil
+    import subprocess as _sp
+    import tempfile
+    print("\nbin/dashshots --scroll-probe: the probe goes into a copy's page, ahead of its script")
+    root = Path(__file__).resolve().parent.parent
+    loader = importlib.machinery.SourceFileLoader("dashshots_t", str(root / "bin" / "dashshots"))
+    spec = importlib.util.spec_from_loader("dashshots_t", loader)
+    D = importlib.util.module_from_spec(spec)
+    loader.exec_module(D)
+    with tempfile.TemporaryDirectory() as td:
+        viz = Path(td) / "visualizer.py"
+        shutil.copy2(root / "visualizer.py", viz)
+        D.inject_probe(viz, 4321)
+        page = viz.read_text()
+    probe, own = page.find("const BOT = \"http://127.0.0.1:4321\""), page.find("function setHTML(")
+    check("the probe is in the copy's page, before the page's own script, its bot filled in",
+          0 < probe < own and "__BOT__" not in page[probe - 200:own])
+    check("the real visualizer.py is untouched", "scrollprobe" not in (root / "visualizer.py").read_text())
+    node = shutil.which("node")
+    if node:
+        r = _sp.run([node, "--check", str(root / "bin" / "scrollprobe.js")], capture_output=True, text=True)
+        check("bin/scrollprobe.js parses", r.returncode == 0, r.stderr[-400:])
+    check("the probe answers only to ?probe=, so a copy without it behaves as the dashboard",
+          re.search(r"if \(!/\[\?&\]probe=/\.test\(location\.search\)\) return;",
+                    (root / "bin" / "scrollprobe.js").read_text()) is not None)
+
+
+def test_viz_chat_keeps_its_place():
+    import re
+    import visualizer as V
+    print("\nthe chat keeps the reader's place: at the end it stays at the end; read further up it stays put")
+    css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
+    check("main does its own anchoring, so Chrome's cannot correct a shift twice",
+          re.search(r"\n  main \{[^}]*overflow-anchor: none;", css) is not None)
+    check("thumbnails reserve their square before they load",
+          re.search(r"\.athumb \{ width: 84px; height: 84px;", css) is not None
+          and 'width="96" height="96"' in V.PAGE)
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    o = scroll_harness(js)
+    if o is None:
+        print("  … node not installed — the chat's scrolling not exercised")
+        return
+    triggers = ("keyboard-open", "keyboard-then-scroll-event", "keyboard-close", "new-messages",
+                "poll-grows-above", "tool-line-updates", "tool-line-expands", "media-loads-late", "working-appears",
+                "working-disappears", "redrawn-from-top")
+    for t in triggers:
+        b, u = o[t + ":bottom"], o[t + ":up"]
+        check(f"{t}, read at the end: the latest message stays shown above the composer",
+              b["gap"] <= 1 and b["latestShown"] and b["pinned"], b)
+        check(f"{t}, read further up: the message on screen does not move",
+              abs(u["moved"]) <= 1 and not u["pinned"] and u["top"] > 0, u)
+    check("new messages while read further up: the pill says so",
+          o["new-messages:up"]["pill"], o["new-messages:up"])
+    check("another thread opens at its end, the pill gone",
+          o["switched"]["gap"] <= 1 and o["switched"]["latestShown"] and not o["switched"]["pill"],
+          o["switched"])
+    check("a message hidden under the phone's sticky header growing moves nothing shown",
+          o["underHeader"]["sameMessage"] and abs(o["underHeader"]["moved"]) <= 1, o["underHeader"])
+    check("read above the messages (the stats), what grows there does not scroll the reader",
+          o["aboveMessages"]["top"] == 0, o["aboveMessages"])
+    # A WebKit without ResizeObserver (before iOS 13.4): the keyboard is still
+    # followed, from the visual viewport's own resize.
+    n = scroll_harness(js, resize_observer=False)
+    check("with no ResizeObserver, the keyboard opening still keeps the latest message shown",
+          n["keyboard-open:bottom"]["gap"] <= 1 and n["keyboard-open:bottom"]["latestShown"]
+          and abs(n["keyboard-open:up"]["moved"]) <= 1, (n["keyboard-open:bottom"], n["keyboard-open:up"]))
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

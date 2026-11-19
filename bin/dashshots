@@ -126,13 +126,55 @@ def free_port() -> int:
 
 # --- the stand-in bot ----------------------------------------------------------
 
+class Probe:
+    """What the page's scroll probe (bin/scrollprobe.js) has said, and how far
+    the harness has let it go: it waits at each phase for a photograph."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.log: list[dict] = []
+        self.go = 0
+
+    def reset(self):
+        with self.lock:
+            self.log, self.go = [], 0
+
+
+PROBE = Probe()
+
+
 def stand_in(real_port: str):
     class Bot(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
+        def _probe(self, body: bytes = b"") -> bool:
+            # The page is another origin (the dashboard copy's port): a plain
+            # GET it may read, and a no-cors POST it may send.
+            if not self.path.startswith("/probe/"):
+                return False
+            if self.path == "/probe/log":
+                try:
+                    entry = json.loads(body or b"{}")
+                except ValueError:
+                    entry = {"phase": "garbled", "raw": body[:200].decode("utf-8", "replace")}
+                with PROBE.lock:
+                    PROBE.log.append(entry)
+            with PROBE.lock:
+                out = json.dumps({"go": PROBE.go}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return True
+
         def do_POST(self):
             n = int(self.headers.get("Content-Length") or 0)
+            if self.path.startswith("/probe/"):
+                self._probe(self.rfile.read(n))
+                return
             try:
                 payload = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
@@ -158,6 +200,8 @@ def stand_in(real_port: str):
             self.wfile.write(body)
 
         def do_GET(self):
+            if self._probe():
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -205,11 +249,28 @@ def trader_projects(home: Path, tmp: Path, live: bool) -> None:
         {"trader": {"slug": "trader", "title": "Trader", "scope": {"cwd": cwd}}}))
 
 
+PROBE_JS = REPO / "bin" / "scrollprobe.js"
+
+
+def inject_probe(viz: Path, bot_port: int) -> None:
+    """The copy's page runs bin/scrollprobe.js ahead of its own script (it
+    does nothing unless the address carries ?probe=)."""
+    src = viz.read_text()
+    marker = "\n<script>\n"
+    at = src.index("PAGE = r\"\"\"")
+    i = src.index(marker, at)
+    js = PROBE_JS.read_text().replace("__BOT__", f"http://127.0.0.1:{bot_port}")
+    assert '"""' not in js
+    viz.write_text(src[:i] + "\n<script>" + js + "</script>" + src[i:])
+
+
 def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: int,
-                    trader_live: bool = False):
+                    trader_live: bool = False, probe: bool = False):
     trader_projects(home, tmp, trader_live)
     for f in source.glob("*.py"):
         shutil.copy2(f, tmp / f.name)
+    if probe:
+        inject_probe(tmp / "visualizer.py", bot_port)
     if (source / "assets").is_dir():
         shutil.copytree(source / "assets", tmp / "assets")
     for name in ("sessions.json",):
@@ -379,6 +440,69 @@ def shoot_phone(width: int, targets, shots, out: Path, wait: float):
         simctl("shutdown", udid, check=False)
 
 
+def probe_phone(width: int, targets, out: Path, runs: str, timeout: float = 600):
+    """Each target's page runs the scroll probe in Mobile Safari; every phase
+    it reports is photographed (a burst of frames right after a trigger), and
+    what it measured is written to out/probe-<width><suffix>.json."""
+    udid = device_for(width)
+    print(f"  {DEVICES[width][0]} ({udid})")
+    state = json.loads(simctl("list", "devices", "-j"))
+    booted_before = any(d["udid"] == udid and d["state"] == "Booted"
+                        for devs in state["devices"].values() for d in devs)
+    results = {}
+    try:
+        if not booted_before:
+            simctl("boot", udid)
+        simctl("bootstatus", udid, "-b")
+        simctl("ui", udid, "appearance", "dark", check=False)
+        for suffix, base in targets:
+            simctl("openurl", udid, base + "/")
+            time.sleep(8)
+        for suffix, base in targets:
+            PROBE.reset()
+            frames = out / f"frames-{width}{suffix}"
+            frames.mkdir(parents=True, exist_ok=True)
+            url = base + "/?probe=1" + (f"&runs={quote(runs)}" if runs else "")
+            simctl("openurl", udid, url)
+            seen, done, t0, rows = 0, False, time.time(), []
+            while not done and time.time() - t0 < timeout:
+                with PROBE.lock:
+                    new = PROBE.log[seen:]
+                    seen = len(PROBE.log)
+                for e in new:
+                    ph = e.get("phase")
+                    if ph in ("done", "error"):
+                        done = True
+                        if ph == "error":
+                            print("    probe error:", e.get("error"))
+                    if ph == "start":
+                        print(f"    {suffix or 'page'}: visualViewport stubbed={e.get('stubbed')} "
+                              f"keyboard={e.get('kb')}px innerHeight={e.get('inner')}")
+                    if "step" not in e:
+                        continue
+                    tag = f"{e.get('run', 'x')}-{e.get('mode', '')}"
+                    if ph == "burst":
+                        for k in range(4):
+                            simctl("io", udid, "screenshot", str(frames / f"{tag}-{k + 1}.png"))
+                    else:
+                        simctl("io", udid, "screenshot", str(frames / f"{tag}-{ph}.png"))
+                    if ph == "after":
+                        rows.append(e)
+                        print(f"    {'ok  ' if e.get('ok') else 'JUMP'} {e['run']:20} {e['mode']:6} "
+                              f"shift={e.get('shift')} gap {e['before']['gap']}->{e['after']['gap']} "
+                              f"latest visible {e['before']['lastVisible']}->{e['after']['lastVisible']}")
+                    with PROBE.lock:
+                        PROBE.go = e["step"]
+                time.sleep(0.1)
+            if not done:
+                print("    probe timed out")
+            results[suffix or "page"] = rows
+            (out / f"probe-{width}{suffix}.json").write_text(json.dumps(rows, indent=1))
+    finally:
+        simctl("shutdown", udid, check=False)
+    return results
+
+
 def snapper(tmp: Path) -> Path:
     cache = Path.home() / ".cache" / "silkworm-dashshots"
     cache.mkdir(parents=True, exist_ok=True)
@@ -414,6 +538,10 @@ def main():
     ap.add_argument("--list", action="store_true", help="print the views and exit")
     ap.add_argument("--trader-fixture", default="",
                     help="the status document the trader views draw (default: the real-shape capture)")
+    ap.add_argument("--scroll-probe", action="store_true",
+                    help="run the chat's scroll probe (bin/scrollprobe.js) on the phone widths "
+                         "instead of shooting views")
+    ap.add_argument("--runs", default="", help="with --scroll-probe: only these triggers")
     ap.add_argument("--trader-live", action="store_true",
                     help="draw the trader view from the real trader checkout, not the fixture")
     a = ap.parse_args()
@@ -431,7 +559,8 @@ def main():
         bot = ThreadingHTTPServer(("127.0.0.1", bot_port), stand_in(real_port))
         threading.Thread(target=bot.serve_forever, daemon=True).start()
         port = free_port()
-        proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port, a.trader_live)
+        proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port, a.trader_live,
+                               a.scroll_probe)
         base = f"http://127.0.0.1:{port}"
         procs, targets = [proc], [("", base)]
         try:
@@ -440,8 +569,13 @@ def main():
                 btmp.mkdir()
                 bport = free_port()
                 procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport,
-                                             a.trader_live))
+                                             a.trader_live, a.scroll_probe))
                 targets = [("-before", f"http://127.0.0.1:{bport}"), ("-after", base)]
+            if a.scroll_probe:
+                print(f"scroll probe: dashboard copy at {base} (stand-in bot :{bot_port}) -> {out}")
+                for w in [int(x) for x in a.widths.split(",") if x and int(x) in DEVICES]:
+                    probe_phone(w, targets, out, a.runs)
+                return
             ex = pick_examples(base, a.project)
             shots = views(ex, a.project)
             if a.views:

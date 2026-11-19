@@ -1440,8 +1440,11 @@ A local web dashboard for every thread session (localhost-only):
   replies as bubbles, and each run of tool calls folded into one line
   (`⚙ ran 6 tools · Bash, Read`) that opens onto the full log. A reply's
   tokens, cache and model are behind its time. It follows the newest message
-  while you are at the bottom; scrolled up, *↓ Jump to latest* appears. The
-  box grows to six lines and sits on the keyboard. Alerts (stale revision,
+  while you are at the bottom -- the keyboard opening, the box growing a line,
+  a thumbnail or a tools line unfolding included; scrolled up, the message you
+  are reading stays where it is whatever is drawn or loaded above it, and
+  *↓ New messages* appears. The box grows to six lines and sits on the
+  keyboard. Alerts (stale revision,
   Slack down, stalled threads, cost spikes) are never a bar on a phone: the
   header shows `⚠ <count>`, which opens them as a sheet.
 - **Deep links** — every view opens from its address, which is how a
@@ -1459,6 +1462,7 @@ A local web dashboard for every thread session (localhost-only):
 bin/dashshots                          # artifacts/dashshots/<view>-<width>.png
 bin/dashshots --widths 375 --views board,card
 bin/dashshots --source /path/to/other/checkout --out /tmp/before
+bin/dashshots --scroll-probe --widths 430,375 --before /tmp/main-export --out /tmp/probe
 ```
 
 Mobile Safari in an iOS Simulator at 375px (iPhone SE (3rd generation)) and
@@ -1471,10 +1475,21 @@ simulators are its own (`Silkworm Shots 375` / `430`, made on first use) and are
 shut down afterwards; it never touches any other device. Needs Xcode (for
 `simctl` and `swiftc`). What the simulator cannot show: the home-screen app's
 standalone mode (Add to Home Screen needs a tap), so the safe-area insets there
-are checked by the CSS alone; nor the keyboard. The thread views are a long
+are checked by the CSS alone. The thread views are a long
 conversation (`thread`), a turn running now (`thread-running` -- run from a
 Silkworm turn, its own), and a new thread with nothing in it yet
 (`thread-new`).
+
+`--scroll-probe` checks the chat keeps the reader's place. The copy's page
+gets `bin/scrollprobe.js`, which opens threads it makes up itself and puts
+each thing that can move the reader through the page's own code -- the
+keyboard opening and closing (the simulator's real one: focusing the composer
+opens it), new messages by a poll, a tools line updating and unfolding, a
+thumbnail arriving, the working indicator coming and going, switching thread,
+something above growing late -- once read at the bottom and once scrolled up.
+It prints `ok`/`JUMP` per case, writes what it measured to
+`probe-<width>[-before|-after].json`, and photographs every phase (a burst of
+frames right after each trigger) into `frames-<width>…/`. `--runs` picks triggers.
 
 ## Notes & limits
 
