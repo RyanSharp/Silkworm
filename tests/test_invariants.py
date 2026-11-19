@@ -21447,8 +21447,9 @@ def test_dashboard_polls_without_redrawing():
     check("showing it again refreshes at once",
           "/api/sessions" in o["backFetches"] and "/api/stats" in o["backFetches"]
           and "/api/session" in o["backFetches"], o["backFetches"])
-    # 1500: the open thread while something is under way in it (threadBusy).
-    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 4000, 5000, 5000, 30000],
+    # 1500: the open thread while something is under way in it (threadBusy);
+    # 60000: the Trader view, which only reads while it is open.
+    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 4000, 5000, 5000, 30000, 60000],
           o["intervals"])
 
 
@@ -34290,6 +34291,356 @@ def test_tasks_show_prints_one_task_and_changes_nothing():
               tools)
     check("the ideator is told it is the way to read a task",
           "/x/bin/silkworm tasks show <id>" in R.system_prompt("ideator", "/x/bin/silkworm"))
+
+
+# --- the Trader view: read-only, drawn from trader's own status document ------
+# trader's scripts/trader_status.py prints one JSON document; /api/trader runs
+# it (20s limit, cached 60s, ETag/304) and the page only draws it. A failed run
+# says why beside the last good document -- never a blank page -- and nothing
+# on the view posts anything.
+
+TRADER_FIXTURE = BASE / "tests" / "fixtures" / "trader_status.json"
+
+
+def _trader_reset(V):
+    V._trader_cache.update(at=None, answer=None, good=None, good_at=None)
+
+
+def _fake_trader(script: str) -> str:
+    """A trader checkout whose .venv/bin/python3 is the shell `script`."""
+    root = Path(tempfile.mkdtemp())
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    (root / "scripts" / "trader_status.py").write_text("# stand-in\n")
+    py = root / ".venv" / "bin" / "python3"
+    py.write_text("#!/bin/sh\n" + script + "\n")
+    py.chmod(0o755)
+    return str(root)
+
+
+def test_trader_route_runs_caches_and_times_out():
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\n/api/trader runs trader's status script, caches it a minute, and times out")
+    check("the limits: 20s to run, cached just under the page's 60s poll",
+          V.TRADER_TIMEOUT_S == 20 and V.TRADER_TTL_S == 55)
+    good = json.loads(TRADER_FIXTURE.read_text())
+    # The real runner, against stand-in checkouts.
+    doc, why = V.run_trader_status(_fake_trader(f"exec cat '{TRADER_FIXTURE}'"))
+    check("a good run hands back the document", doc == good and why == "", why)
+    argv_log = Path(tempfile.mkdtemp()) / "argv"
+    cwd = _fake_trader(f"echo \"$PWD $*\" > '{argv_log}'; exec cat '{TRADER_FIXTURE}'")
+    V.run_trader_status(cwd)
+    check("it runs <cwd>/.venv/bin/python3 scripts/trader_status.py --json in the checkout",
+          argv_log.read_text().split() == [str(Path(cwd).resolve()), "scripts/trader_status.py", "--json"]
+          or argv_log.read_text().split() == [cwd, "scripts/trader_status.py", "--json"],
+          argv_log.read_text())
+    # A hang in a child of the script: the whole group goes, not just the script.
+    t0 = time.monotonic()
+    doc, why = V.run_trader_status(_fake_trader("sleep 30 & sleep 30; wait"), timeout=0.5)
+    took = time.monotonic() - t0
+    check("a run past the limit is a failure that says so",
+          doc is None and why == "scripts/trader_status.py timed out after 0.5s", why)
+    check("and returns at the limit, even with a child holding the pipe", took < 4, took)
+    for script, want in [("echo boom >&2; exit 3", "exited 3: boom"),
+                         ("echo not json", "did not print JSON"),
+                         ("echo '{\"v\": 2, \"sections\": {}}'", "cannot read (v=2)")]:
+        doc, why = V.run_trader_status(_fake_trader(script))
+        check(f"a bad run is named: {want}", doc is None and want in why, why)
+    doc, why = V.run_trader_status(str(Path(tempfile.mkdtemp())))
+    check("a checkout without the script says it is not there yet",
+          doc is None and "scripts/trader_status.py is not in" in why, why)
+    doc, why = V.run_trader_status("")
+    check("no trader project says so", doc is None and "projects.json" in why, why)
+    doc, why = V.run_trader_status(_fake_trader("printf '\\377\\376' >&2; exit 1"))
+    check("output that is not UTF-8 is a named failure, not a crash",
+          doc is None and "exited 1" in why, why)
+    saved_base = V.BASE_DIR
+    try:
+        for shape in ({"trader": {"scope": "x"}}, {"trader": "x"}, ["trader"],
+                      {"trader": {"scope": {"cwd": 3}}}, {}):
+            V.BASE_DIR = Path(tempfile.mkdtemp())
+            (V.BASE_DIR / "projects.json").write_text(json.dumps(shape))
+            check(f"an oddly shaped projects.json ({json.dumps(shape)}) is no folder, not a crash",
+                  V.trader_cwd() == "")
+        (V.BASE_DIR / "projects.json").write_text(json.dumps({"trader": {"scope": {"cwd": "/t"}}}))
+        check("and the trader project's cwd is read from it", V.trader_cwd() == "/t")
+    finally:
+        V.BASE_DIR = saved_base
+
+    # The cache: one run per minute, failures included, last good kept.
+    runs, results, now = [], [], [1000.0]
+
+    def fake_run(cwd):
+        runs.append(cwd)
+        return results.pop(0)
+    _trader_reset(V)
+    try:
+        results[:] = [(good, ""), (None, "timed out after 20s"), (good, "")]
+        a1 = V.trader_status(run=fake_run, clock=lambda: now[0])
+        now[0] += 30
+        a2 = V.trader_status(run=fake_run, clock=lambda: now[0])
+        check("a second ask within the minute is the cached answer, not a second run",
+              len(runs) == 1 and a2 is a1 and a1["ok"] and a1["doc"] == good, runs)
+        now[0] += 26
+        a3 = V.trader_status(run=fake_run, clock=lambda: now[0])
+        check("after a minute it runs again", len(runs) == 2)
+        check("a failed run carries its reason, the last good document and when it was fetched",
+              not a3["ok"] and a3["error"] == "timed out after 20s"
+              and a3["last_good"] == good and a3["last_good_at"] == 1000.0, a3)
+        now[0] += 10
+        V.trader_status(run=fake_run, clock=lambda: now[0])
+        check("a failure is cached too: a broken script is not re-run on every poll", len(runs) == 2)
+        now[0] += 60
+        a5 = V.trader_status(run=fake_run, clock=lambda: now[0])
+        check("and a later good run replaces it", len(runs) == 3 and a5["ok"])
+
+        # Over HTTP: ETag and 304, like /api/sessions; GET only.
+        import threading as _th
+        import urllib.request as _u
+        import urllib.error as _ue
+        saved = V.run_trader_status
+        V.run_trader_status = lambda cwd: (good, "")
+        _trader_reset(V)
+        srv = V.make_server("127.0.0.1", 0)
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            with _u.urlopen(base + "/api/trader", timeout=10) as r:
+                tag, body = r.headers.get("ETag"), json.loads(r.read())
+            check("GET /api/trader answers the document with an ETag",
+                  body["ok"] and body["doc"] == good and tag, tag)
+            req = _u.Request(base + "/api/trader", headers={"If-None-Match": tag})
+            try:
+                _u.urlopen(req, timeout=10)
+                status = 200
+            except _ue.HTTPError as e:
+                status = e.code
+            check("asked again with that ETag it is a 304", status == 304, status)
+            req = _u.Request(base + "/api/trader", data=b"{}", method="POST",
+                             headers={"Content-Type": "application/json"})
+            try:
+                _u.urlopen(req, timeout=10)
+                status = 200
+            except _ue.HTTPError as e:
+                status = e.code
+            check("there is no POST /api/trader", status == 404, status)
+        finally:
+            srv.shutdown()
+            V.run_trader_status = saved
+    finally:
+        _trader_reset(V)
+    tree = ast.parse((BASE / "visualizer.py").read_text())
+    post = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "do_POST")
+    check("do_POST names no trader route", "trader" not in ast.unparse(post))
+
+
+TRADER_DRIVER = r"""
+// Draws /api/trader answers with the page's own functions against a stub DOM,
+// and records every request the view makes.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const fixture = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+function el(id) {
+  return {id, textContent: "", value: "", innerHTML: "", style: {}, dataset: {}, children: [],
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) { return c; }, addEventListener() {}, querySelector() { return null; },
+    querySelectorAll() { return []; }, focus() {}};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+globalThis.document = {getElementById: byId, createElement: () => el("new"), hidden: false,
+  querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, body: el("body")};
+const winListeners = {};
+globalThis.window = {addEventListener(k, f) { winListeners[k] = f; }, location: {search: ""}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+const asked = [];
+let answer = null;
+globalThis.fetch = async (url, opts) => {
+  asked.push({url, method: (opts && opts.method) || "GET", body: !!(opts && opts.body)});
+  if (url === "/api/trader") return {status: 200, headers: {get: () => null}, json: async () => answer};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {sessions: [], slack: {}};
+  if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  return {status: 200, headers: {get: () => null}, json: async () => out};
+};
+(0, eval)(src + `;globalThis.__t = {traderHtml, toggleTrader, refreshTrader, traderIsOpen, TRADER_WATCH, openLink};`);
+const T = globalThis.__t, tick = () => new Promise(r => setImmediate(r));
+const now = Date.parse("2026-11-18T15:10:00-08:00") / 1000;
+const unknownDoc = {v: 1, generated_at: null, verdict: "unknown", sections: Object.fromEntries(
+  ["summary", "sleeves", "gate", "universe", "dispatches", "fills", "jobs", "freshness", "health",
+   "host", "shadow", "env"].map(k => [k, {status: "unknown", reason: k + " source unreadable", source: null, as_of: null}]))};
+(async () => {
+  const out = {};
+  out.good = T.traderHtml({ok: true, doc: fixture, fetched_at: now}, now);
+  out.unknown = T.traderHtml({ok: true, doc: unknownDoc, fetched_at: now}, now);
+  out.empty = T.traderHtml({ok: true, doc: {v: 1, sections: {}}, fetched_at: now}, now);
+  // Its age is the document's own (generated_at), three hours before.
+  out.failedWithGood = T.traderHtml({ok: false, error: "scripts/trader_status.py timed out after 20s",
+    last_good: fixture, last_good_at: now - 60}, Date.parse(fixture.generated_at) / 1000 + 3 * 3600);
+  out.failedNoGood = T.traderHtml({ok: false, error: "scripts/trader_status.py is not in /x yet",
+    last_good: null, last_good_at: null}, now);
+  out.nothing = T.traderHtml(null, now);
+  // A tile may also come from its section's own watch map.
+  const sec = JSON.parse(JSON.stringify(fixture));
+  sec.watch = sec.watch.filter(w => w.id !== "guards");
+  sec.sections.sleeves.watch = {guards: {status: "bad", label: "halted", reason: "halt marker present"}};
+  out.sectionWatch = T.traderHtml({ok: true, doc: sec}, now);
+  // Document strings are text, never markup.
+  const evil = '<img src=x onerror=alert(1)>"\'';
+  const bad = JSON.parse(JSON.stringify(fixture));
+  bad.verdict.headline = evil; bad.verdict.lines = [evil]; bad.watch[0].label = evil;
+  bad.watch[0].reason = evil; bad.sections.sleeves.sleeves[0].label = evil;
+  bad.sections.summary.doing = [evil];
+  out.escaped = T.traderHtml({ok: true, doc: bad}, now) + T.traderHtml({ok: false, error: evil}, now);
+  out.watchIds = T.TRADER_WATCH.map(w => w[0]);
+  // Opened by its deep link, then polled and refocused: every request a read.
+  answer = {ok: true, doc: fixture, fetched_at: now};
+  for (let i = 0; i < 20; i++) await tick();          // the page's own first reads settle
+  asked.length = 0;
+  await T.openLink(new URLSearchParams("view=trader"));
+  await tick(); await tick();
+  out.openedByLink = T.traderIsOpen();
+  out.drawn = byId("trbody").innerHTML.includes("What to watch");
+  answer = {ok: false, error: "scripts/trader_status.py exited 1: boom", last_good: null};
+  if (winListeners.focus) winListeners.focus();
+  await tick(); await tick();
+  out.afterFocus = byId("trbody").innerHTML;
+  out.asked = asked.filter(a => a.url === "/api/trader" || a.method !== "GET" || a.body);
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+def test_trader_view_draws_the_document():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe Trader view draws trader's status document, and posts nothing")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    for name in ("traderHtml", "toggleTrader", "refreshTrader", "traderIsOpen", "trBadge"):
+        check(f"{name}() is defined", re.search(rf"function\s+{name}\b", js) is not None)
+    check("the header has a Trader entry", 'onclick="toggleTrader()"' in V.PAGE
+          and "Trader</span></button>" in V.PAGE)
+    check("?view=trader opens it", 'view === "trader"' in js)
+    check("it is polled every minute while open, and on focus and on showing the tab",
+          "const TRADER_POLL_MS = 60000;" in js and "setInterval(pollTrader, TRADER_POLL_MS)" in js
+          and "traderIsOpen() ? refreshTrader()" in js and 'addEventListener("focus"' in js
+          and "pollBoard(); pollTrader(); }" in js)
+    # Nothing on the view posts: its markup has one button (close) and no form.
+    modal = re.search(r'<div id="tradermodal".*?\n</div>\n', V.PAGE, re.S).group(0)
+    check("the view's markup has no form, no input and only its close button",
+          "<form" not in modal and "<input" not in modal and "<select" not in modal
+          and modal.count("<button") == 1 and 'onclick="toggleTrader()"' in modal, modal)
+    block = js[js.index("// --- trader ---"):js.index("// --- projects overview")]
+    check("the view's script posts nothing and calls no action",
+          "POST" not in block and "taskCall" not in block and "taskAction" not in block
+          and "bot_call" not in block and block.count("fetch(") == 0
+          and block.count('readJSON("/api/trader")') == 1, "")
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(TRADER_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(TRADER_FIXTURE)],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        check("the trader view's javascript runs", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    g = o["good"]
+    ICON = '<span aria-hidden="true">'
+    check("the verdict banner is drawn with its icon and words",
+          'class="tr-verdict warn"' in g and ICON + '!</span> look at</span> Trading normally, with 3 things to look at</h3>' in g
+          and "<b>Look at:</b>" in g, g[:400])
+    check("the book card shows the total and each sleeve's allocation, net liq, cash and holdings",
+          "$196,999" in g and "Momentum" in g and "75% · 1.0x" in g and "$146,848" in g
+          and "100%" in g and "all cash since Nov 2" in g and "91%" in g and "VNQ" in g)
+    check("drawdown meters against the 40% halt, with the 34% target tick",
+          "Drawdown vs the 40% halt" in g and "22.9% from peak $190,510" in g
+          and "17.1pp to the halt" in g and "36.5pp to the halt" in g
+          and g.count("<u style=\"left:68.0%\">") == 2 and g.count("<b style=\"left:80.0%\">") == 2, "")
+    check("the plain-words card says what it is doing",
+          "What it's doing" in g and "credit gate" in g and "Dec 1 rebalance" in g)
+    tiles = re.findall(r'<div class="tr-w" data-watch="(\w+)">(.*?)</span></div>', g)
+    check("all ten watch tiles, in the audit's order",
+          [t[0] for t in tiles] == o["watchIds"] and len(tiles) == 10, [t[0] for t in tiles])
+    icons = {"ok": "✓", "warn": "!", "bad": "✕", "unknown": "?"}
+    labelled = all(re.search(r'class="tr-st (ok|warn|bad|unknown)"[^>]*><span aria-hidden="true">([✓!✕?])</span> \S', h)
+                   and icons[re.search(r'class="tr-st (\w+)"', h).group(1)] in h for _, h in tiles)
+    check("every tile has an icon and a label, never colour alone", labelled)
+    check("tiles take their own entries", ICON + "!</span> restart pending" in g and ICON + "✕</span> trades.db 93d old" in g
+          and ICON + "✓</span> none tripped" in g)
+    check("each fixture tile has its own entry (none 'not reported')", "not reported" not in g)
+    check("a tile can also come from its section's watch map",
+          ICON + "✕</span> halted" in o["sectionWatch"] and "not reported" not in o["sectionWatch"])
+    u = o["unknown"]
+    check("an all-unknown document still draws every card and all ten tiles",
+          "Status unknown" in u and u.count('data-watch="') == 10 and "Book" in u
+          and "Drawdown vs the 40% halt" in u and "What it's doing" in u)
+    check("its tiles say unknown with a ?, and what their section says",
+          u.count('<span class="tr-st unknown"') >= 12 and u.count(ICON + "?</span> not reported") == 10
+          and "host: host source unreadable" in u, "")
+    check("unknown numbers are shown as unknown, never a default figure",
+          "$0" not in u and "NaN" not in u and "undefined" not in u and "null" not in u
+          and "—" in u and "no sleeve data" in u)
+    check("an empty document draws too, with no NaN, undefined or null",
+          all(x not in o["empty"] for x in ("NaN", "undefined", "null")) and o["empty"].count('data-watch="') == 10)
+    f = o["failedWithGood"]
+    check("a failed run says 'status unavailable: <reason>' and how old the last good document is",
+          ICON + "?</span> status unavailable:</span> scripts/trader_status.py timed out after 20s" in f
+          and "last good document, 3h old" in f and 'class="tr-old"' in f and "$196,999" in f, f[:600])
+    n = o["failedNoGood"]
+    check("with no good document yet it still says why, not a blank page",
+          '<span aria-hidden="true">?</span> status unavailable:</span> scripts/trader_status.py is not in /x yet' in n
+          and "No good document since the dashboard started" in n)
+    check("even no answer at all is drawn", "status unavailable" in o["nothing"])
+    check("document strings are escaped, never markup",
+          "<img" not in o["escaped"] and o["escaped"].count("&lt;img src=x onerror=alert(1)&gt;&quot;") == 7,
+          o["escaped"].count("&lt;img"))
+    check("?view=trader opens the view and draws it", o["openedByLink"] and o["drawn"])
+    check("focus refreshes it, keeping the last good document beside the failure",
+          "exited 1: boom" in o["afterFocus"] and "$196,999" in o["afterFocus"], o["afterFocus"][:300])
+    check("every request the view made was a GET of /api/trader, with no body",
+          o["asked"] and all(a == {"url": "/api/trader", "method": "GET", "body": False} for a in o["asked"]),
+          o["asked"])
+    for html in (g, u, f, n):
+        if "onclick" in html or "<button" in html or "<form" in html:
+            check("a drawn document has no buttons, forms or handlers", False, html[:300])
+            break
+    else:
+        check("a drawn document has no buttons, forms or handlers", True)
+
+
+def test_dashshots_has_a_trader_view_fed_by_the_fixture():
+    print("\nbin/dashshots photographs the trader view from the fixture")
+    src = (BASE / "bin" / "dashshots").read_text()
+    check("a trader view at ?view=trader", '("trader", "/?view=trader")' in src)
+    check("fed by tests/fixtures/trader_status.json through a stand-in checkout",
+          'TRADER_FIXTURE = REPO / "tests" / "fixtures" / "trader_status.json"' in src
+          and "def stand_in_trader" in src and "trader_projects(home, tmp, trader_live)" in src)
+    doc = json.loads(TRADER_FIXTURE.read_text())
+    sections = {"summary", "sleeves", "gate", "universe", "dispatches", "fills", "jobs",
+                "freshness", "health", "host", "shadow", "env"}
+    check("the fixture is a v1 document with every section the emitter promises",
+          doc["v"] == 1 and set(doc["sections"]) == sections
+          and all({"status", "reason", "source", "as_of"} <= set(s) for s in doc["sections"].values()))
+    # It is the example the emitter's goal points at, so it carries every
+    # field the view reads, in the shape the amendment to tsk_8b1c77e711 states.
+    check("the fixture has every field the view reads",
+          {"status", "headline", "lines", "look_at"} <= set(doc["verdict"])
+          and isinstance(doc["sections"]["summary"]["book_total"], (int, float))
+          and doc["sections"]["summary"]["doing"]
+          and all({"name", "label", "alloc", "leverage", "net_liq", "cash", "holds", "drawdown", "peak"} <= set(x)
+                  for x in doc["sections"]["sleeves"]["sleeves"])
+          and doc["sections"]["sleeves"]["halt"] == 0.40 and doc["sections"]["sleeves"]["target"] == 0.34
+          and [w["id"] for w in doc["watch"]] == ["daemon", "dispatch", "guards", "equity", "bars", "jobs",
+                                                 "gateway", "alerts", "backups", "uptime"]
+          and all({"id", "status", "label", "reason"} <= set(w) for w in doc["watch"]))
 
 
 if __name__ == "__main__":

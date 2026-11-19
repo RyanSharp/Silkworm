@@ -1,0 +1,186 @@
+{
+  "v": 1,
+  "generated_at": "2026-11-18T15:09:00-08:00",
+  "verdict": {
+    "status": "warn",
+    "headline": "Trading normally, with 3 things to look at",
+    "lines": [
+      "The daemon dispatched both slots today with every quote live. No sleeve is halted or tripped."
+    ],
+    "look_at": [
+      "equity snapshots run two sessions behind (newest is 2026-11-16, with NaN gaps)",
+      "the 12 ETFs are a session late every evening",
+      "the running daemon still uses the static universe although .env now says pit (applies at the Sunday restart)"
+    ]
+  },
+  "sections": {
+    "summary": {
+      "status": "warn",
+      "reason": "Trading normally, with 3 things to look at",
+      "source": "data/paper_state/",
+      "as_of": "2026-11-18T13:00:00-08:00",
+      "book_total": 196999,
+      "doing": [
+        "Momentum sold all 15 names at the Nov 2 monthly rebalance because the credit gate (HYG/LQD vs its 100-day average) was off that day. The gate turned back on Nov 12, by a hair. The next decision is the Dec 1 rebalance.",
+        "Trend trades most closes (8 orders in the last 10 sessions): now holds 45 VNQ; sold DBC today."
+      ]
+    },
+    "sleeves": {
+      "status": "ok",
+      "reason": "No halt marker, no daily-loss trip today, nothing paused on a pending order.",
+      "source": "data/paper_state/",
+      "as_of": "2026-11-18T13:00:00-08:00",
+      "halt": 0.4,
+      "target": 0.34,
+      "sleeves": [
+        {
+          "name": "CreditGatedMomentum",
+          "label": "Momentum",
+          "alloc": 0.75,
+          "leverage": 1.0,
+          "net_liq": 146848,
+          "cash": 146848,
+          "holds": [],
+          "doing": "all cash since Nov 2",
+          "drawdown": 0.229,
+          "peak": 190510
+        },
+        {
+          "name": "CrossAssetTrend",
+          "label": "Trend",
+          "alloc": 0.25,
+          "leverage": 1.0,
+          "net_liq": 50152,
+          "cash": 45640,
+          "holds": [
+            "VNQ"
+          ],
+          "drawdown": 0.035,
+          "peak": 51970
+        }
+      ]
+    },
+    "gate": {
+      "status": "ok",
+      "reason": "credit gate on since 2026-11-12 (HYG/LQD +0.03% over its 100-day average)",
+      "source": "data/bars/daily/",
+      "as_of": "2026-11-17"
+    },
+    "universe": {
+      "status": "warn",
+      "reason": "running static, .env says pit: 16 in, 16 out at the next restart",
+      "source": "data/paper_trade.log",
+      "as_of": "2026-11-15T08:00:00-08:00"
+    },
+    "dispatches": {
+      "status": "ok",
+      "reason": "close slot ran 13:00, 62/62 live quotes",
+      "source": "data/paper_trade.log",
+      "as_of": "2026-11-18T13:00:00-08:00"
+    },
+    "fills": {
+      "status": "ok",
+      "reason": "1 fill today",
+      "source": "data/journal/trades.db",
+      "as_of": "2026-11-18T13:00:04-08:00"
+    },
+    "jobs": {
+      "status": "warn",
+      "reason": "3 jobs exited 1, none missed",
+      "source": "launchctl",
+      "as_of": "2026-11-18T15:09:00-08:00"
+    },
+    "freshness": {
+      "status": "warn",
+      "reason": "12 ETFs one session late; equity snapshot 2 sessions behind",
+      "source": "data/bars/daily/",
+      "as_of": "2026-11-18T15:09:00-08:00"
+    },
+    "health": {
+      "status": "ok",
+      "reason": "last page Wed 13:15 via ntfy",
+      "source": "data/alert_state.json",
+      "as_of": "2026-11-18T13:15:00-08:00"
+    },
+    "host": {
+      "status": "bad",
+      "reason": "trades.db backup 93 days old",
+      "source": "ps, netstat, sysctl, df",
+      "as_of": "2026-11-18T15:09:00-08:00"
+    },
+    "shadow": {
+      "status": "warn",
+      "reason": "blend shadow stuck at 2026-11-13",
+      "source": "data/shadow_blend/curve.csv",
+      "as_of": "2026-11-13"
+    },
+    "env": {
+      "status": "ok",
+      "reason": "BROKER=ibkr, MOMENTUM_UNIVERSE=pit; 9 other keys (set)",
+      "source": ".env",
+      "as_of": "2026-11-15T07:58:00-08:00"
+    }
+  },
+  "watch": [
+    {
+      "id": "daemon",
+      "status": "warn",
+      "label": "restart pending",
+      "reason": "PID up since Sun Nov 15 08:00 · loaded static universe; disk says pit. Applies at Sun Nov 22 08:00."
+    },
+    {
+      "id": "dispatch",
+      "status": "ok",
+      "label": "close Wed 13:00",
+      "reason": "62/62 live quotes, 0 fallback, 0 dropped, 1 order(s). No skipped slot in 10 sessions."
+    },
+    {
+      "id": "guards",
+      "status": "ok",
+      "label": "none tripped",
+      "reason": "No halt marker, no daily-loss trip today, nothing paused on a pending order."
+    },
+    {
+      "id": "equity",
+      "status": "warn",
+      "label": "newest 2026-11-16 (2d)",
+      "reason": "11 NaN rows in history; tracking check unavailable since Oct 26."
+    },
+    {
+      "id": "bars",
+      "status": "warn",
+      "label": "12 ETFs 1 session late",
+      "reason": "ETFs (dataupdate 18:30) newest 2026-11-16; pool names (pooldata 21:00) newest 2026-11-17."
+    },
+    {
+      "id": "jobs",
+      "status": "warn",
+      "label": "3 exited 1",
+      "reason": "paperhealth (failing checks), pooldata (pool-only defects), shadowblend (crashing nightly since Oct 26). None missed."
+    },
+    {
+      "id": "gateway",
+      "status": "ok",
+      "label": "port 4002 up",
+      "reason": "Link-loss (1100) events aren't timestamped yet; last relaunch is the nightly 23:45 IBKR restart."
+    },
+    {
+      "id": "alerts",
+      "status": "ok",
+      "label": "last page Wed 13:15",
+      "reason": "ntfy. Daemon alerts (DAILY-LOSS etc.) still go only to its log. Heartbeat silence isn't alerted off-box."
+    },
+    {
+      "id": "backups",
+      "status": "bad",
+      "label": "trades.db 93d old",
+      "reason": "Last by hand, Aug 17. Nothing off-box. 140 GB free."
+    },
+    {
+      "id": "uptime",
+      "status": "ok",
+      "label": "up 16d",
+      "reason": "Last boot Mon Nov 02 14:45 (unattended macOS update)."
+    }
+  ]
+}

@@ -22,6 +22,13 @@ real bot (the task board, projects, roles, learnings) and refuses every
 action; a release plan is a fixed sample, since a real one fetches origin.
 Transcripts are read where they are, as the dashboard always does.
 
+The trader view is fed tests/fixtures/trader_status.json: the copy's
+projects.json points the trader project at a stand-in checkout whose
+scripts/trader_status.py "runs" by printing that fixture, so the dashboard's
+own subprocess, cache and render path are what is photographed. With
+--trader-live the copy points at the real trader checkout instead (its status
+script only reads).
+
 The simulators are this script's own ("Silkworm Shots 375" / "... 430",
 made on first use) and are shut down at the end. It refuses to touch any
 other device -- in particular "Cadence Test iPhone 17", which another
@@ -59,6 +66,9 @@ READ_PROJECTS = {"list", "get", "unregistered"}
 READ_LEARNINGS = {"list"}
 #: Routes that only ever read: whether the bot is up, and a thread's live turn.
 READ_ROUTES = {"/status", "/thread-state"}
+
+#: The trader status document the trader view draws (visualizer /api/trader).
+TRADER_FIXTURE = REPO / "tests" / "fixtures" / "trader_status.json"
 
 #: A release plan to draw, shaped as releases.plan answers.
 SAMPLE_PLAN = {
@@ -163,7 +173,37 @@ def forward(port: str, path: str, payload: dict) -> dict:
 
 # --- the dashboard copy --------------------------------------------------------
 
-def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: int):
+def stand_in_trader(tmp: Path) -> Path:
+    """A trader checkout that only prints the fixture: .venv/bin/python3 is a
+    shell script that cats it, whatever it is asked to run."""
+    root = tmp / "trader-standin"
+    (root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (root / "scripts").mkdir(exist_ok=True)
+    (root / "scripts" / "trader_status.py").write_text("# stand-in: see .venv/bin/python3\n")
+    py = root / ".venv" / "bin" / "python3"
+    py.write_text(f"#!/bin/sh\nexec cat '{TRADER_FIXTURE}'\n")
+    py.chmod(0o755)
+    return root
+
+
+def trader_projects(home: Path, tmp: Path, live: bool) -> None:
+    """The copy's projects.json: only the trader project, at the stand-in
+    (or, live, at the real checkout the live projects.json names)."""
+    cwd = ""
+    if live:
+        try:
+            cwd = json.loads((home / "projects.json").read_text())["trader"]["scope"]["cwd"]
+        except (OSError, ValueError, KeyError, TypeError):
+            raise SystemExit("--trader-live: no trader project with a cwd in projects.json")
+    else:
+        cwd = str(stand_in_trader(tmp))
+    (tmp / "projects.json").write_text(json.dumps(
+        {"trader": {"slug": "trader", "title": "Trader", "scope": {"cwd": cwd}}}))
+
+
+def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: int,
+                    trader_live: bool = False):
+    trader_projects(home, tmp, trader_live)
     for f in source.glob("*.py"):
         shutil.copy2(f, tmp / f.name)
     if (source / "assets").is_dir():
@@ -273,6 +313,7 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("new-project", "/?modal=new-project"),
         ("release", f"/?view=projects&modal=release&slug={p}"),
         ("learnings", "/?view=learnings"),
+        ("trader", "/?view=trader"),
     ]
 
 
@@ -363,6 +404,8 @@ def main():
     ap.add_argument("--project", default="silkworm")
     ap.add_argument("--wait", type=float, default=5.0, help="seconds per view to settle")
     ap.add_argument("--list", action="store_true", help="print the views and exit")
+    ap.add_argument("--trader-live", action="store_true",
+                    help="draw the trader view from the real trader checkout, not the fixture")
     a = ap.parse_args()
 
     home = live_home()
@@ -375,7 +418,7 @@ def main():
         bot = ThreadingHTTPServer(("127.0.0.1", bot_port), stand_in(real_port))
         threading.Thread(target=bot.serve_forever, daemon=True).start()
         port = free_port()
-        proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port)
+        proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port, a.trader_live)
         base = f"http://127.0.0.1:{port}"
         procs, targets = [proc], [("", base)]
         try:
@@ -383,7 +426,8 @@ def main():
                 btmp = tmp / "before"
                 btmp.mkdir()
                 bport = free_port()
-                procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport))
+                procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport,
+                                             a.trader_live))
                 targets = [("-before", f"http://127.0.0.1:{bport}"), ("-after", base)]
             ex = pick_examples(base, a.project)
             shots = views(ex, a.project)

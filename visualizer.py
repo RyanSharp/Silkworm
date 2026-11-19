@@ -919,6 +919,105 @@ def thumbnail(p: Path) -> tuple[bytes, str]:
     return p.read_bytes(), INLINE_IMAGES.get(p.suffix.lower(), "application/octet-stream")
 
 
+# --- trader -------------------------------------------------------------------
+# The Trader view's one read. Trader owns the facts, the dashboard owns the
+# pixels: trader's scripts/trader_status.py prints one JSON document
+# ({"v": 1, "generated_at", "verdict", "sections", ...}) and this only runs it
+# and hands the result on -- it never parses a trader file itself, and there
+# is no route here that asks trader to do anything.
+
+#: The project whose scope cwd holds the trader checkout.
+TRADER_SLUG = "trader"
+TRADER_SCRIPT = "scripts/trader_status.py"
+#: How long one run may take before it is called failed.
+TRADER_TIMEOUT_S = 20
+#: How long an answer (good or failed) is served before the script runs again.
+#: A little under the page's 60s poll, so each poll gets a fresh run rather than
+#: one cached a second ago and the data on screen is never two minutes old.
+TRADER_TTL_S = 55
+
+_trader_lock = threading.Lock()
+_trader_cache = {"at": None, "answer": None, "good": None, "good_at": None}
+
+
+def trader_cwd() -> str:
+    """The trader project's folder, from projects.json (read-only: this is
+    the bot's file, so nothing here repairs or rewrites it)."""
+    try:
+        data = jsonstore.load(BASE_DIR / "projects.json", default={}, repair=False) or {}
+        scope = data[TRADER_SLUG]["scope"]
+        cwd = scope.get("cwd") if isinstance(scope, dict) else ""
+        return cwd if isinstance(cwd, str) else ""
+    except Exception:                     # missing, unreadable or oddly shaped
+        return ""
+
+
+def run_trader_status(cwd: str, timeout: float = TRADER_TIMEOUT_S) -> tuple:
+    """Run trader's status script once: (document, "") or (None, why not)."""
+    if not cwd:
+        return None, f"no {TRADER_SLUG!r} project with a folder in projects.json"
+    root = Path(cwd)
+    if not (root / TRADER_SCRIPT).is_file():
+        return None, f"{TRADER_SCRIPT} is not in {cwd} yet"
+    py = root / ".venv" / "bin" / "python3"
+    if not py.exists():
+        return None, f"no .venv/bin/python3 in {cwd}"
+    try:
+        # Its own process group: on a timeout the whole group is killed, so a
+        # child it started (plutil, netstat) cannot keep the pipe -- and this
+        # request -- open past the limit.
+        p = subprocess.Popen([str(py), TRADER_SCRIPT, "--json"], cwd=str(root),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, errors="replace",
+                             start_new_session=True)
+    except OSError as e:
+        return None, f"could not run {TRADER_SCRIPT}: {e}"
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, 9)
+        except OSError:
+            p.kill()
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+        return None, f"{TRADER_SCRIPT} timed out after {timeout:g}s"
+    if p.returncode != 0:
+        tail = (err or "").strip().splitlines()
+        return None, (f"{TRADER_SCRIPT} exited {p.returncode}"
+                      + (f": {tail[-1][:200]}" if tail else ""))
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return None, f"{TRADER_SCRIPT} did not print JSON"
+    if not isinstance(doc, dict) or doc.get("v") != 1 or not isinstance(doc.get("sections"), dict):
+        return None, f"{TRADER_SCRIPT} printed a document this page cannot read (v={doc.get('v') if isinstance(doc, dict) else None!r})"
+    return doc, ""
+
+
+def trader_status(run=None, clock=time.time) -> dict:
+    """/api/trader's answer, run at most once per TRADER_TTL_S. A failure is
+    cached the same as a success (a broken script is not re-run on every
+    poll) and carries the last good document and when it was fetched, so the
+    page always has something to show beside why."""
+    with _trader_lock:                    # concurrent polls wait for one run
+        now = clock()
+        at = _trader_cache["at"]
+        if at is not None and 0 <= now - at < TRADER_TTL_S:
+            return _trader_cache["answer"]
+        doc, why = (run or run_trader_status)(trader_cwd())
+        if doc is not None:
+            _trader_cache.update(good=doc, good_at=now)
+            answer = {"ok": True, "doc": doc, "fetched_at": now}
+        else:
+            answer = {"ok": False, "error": why, "fetched_at": now,
+                      "last_good": _trader_cache["good"], "last_good_at": _trader_cache["good_at"]}
+        _trader_cache.update(at=now, answer=answer)
+        return answer
+
+
 # --- HTTP -----------------------------------------------------------------------
 
 #: /api/tasks actions that only read. Only these answer 304: an action that
@@ -1105,6 +1204,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._cached(load_transcript(qs.get("id", [""])[0], cursor))
         elif url.path == "/api/stats":
             self._cached(cached_stats())
+        elif url.path == "/api/trader":
+            # Read-only, and GET only: there is deliberately no POST /api/trader.
+            self._cached(trader_status())
         elif url.path == "/api/search":
             self._json(search(qs.get("q", [""])[0]))
         elif url.path == "/api/artifacts":
@@ -1741,6 +1843,64 @@ PAGE = r"""<!doctype html>
                    white-space: pre-wrap; margin-top: 3px; }
   #tproj { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
            border-radius: 8px; font: inherit; font-size: 12px; padding: 3px 8px; }
+  /* the Trader view: read-only, drawn from trader's own status document */
+  #tradermodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
+                 display: none; align-items: flex-start; justify-content: center; padding: 30px 16px; }
+  #tradermodal .box { background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+                      width: min(1180px, 100%); max-height: 90vh; overflow: auto; padding: 18px 20px; }
+  #tradermodal h2 { margin: 0 0 4px; font-size: 18px; display: flex; align-items: center;
+                    gap: 10px; flex-wrap: wrap; }
+  #tradermodal .asof { font: 11px var(--mono); color: var(--muted); font-weight: 400; }
+  #tradermodal .ro { font: 10.5px var(--mono); color: var(--gold); border: 1px dashed #ECB22E80;
+                     border-radius: 6px; padding: 1px 6px; }
+  .tr-verdict { border-radius: 10px; padding: 11px 14px; margin: 10px 0 14px; border: 1px solid var(--line);
+                background: var(--panel); font-size: 13.5px; }
+  .tr-verdict.ok { background: #2EB67D14; border-color: #2EB67D80; }
+  .tr-verdict.warn { background: #E3A23B1c; border-color: #E3A23B80; }
+  .tr-verdict.bad { background: #D8517F1c; border-color: #D8517F99; }
+  .tr-verdict h3 { margin: 0 0 4px; font-size: 16px; }
+  .tr-verdict p { margin: 2px 0; }
+  .tr-stale { border: 1px dashed #D8517F99; border-radius: 10px; padding: 10px 14px; margin: 10px 0;
+              background: #D8517F14; font-size: 13.5px; }
+  .tr-stale .sub { color: var(--muted); font-size: 12.5px; }
+  .tr-old { opacity: .62; }
+  .tr-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(330px, 100%), 1fr)); }
+  .tr-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+             font-size: 13.5px; min-width: 0; }
+  .tr-card h4, .tr-h { font-size: 12px; letter-spacing: .06em; text-transform: uppercase;
+                       color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+  .tr-h { margin: 18px 0 8px; }
+  .tr-big { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .tr-card .sub, .tr-w .sub { color: var(--muted); font-size: 12.5px; }
+  .tr-card table { border-collapse: collapse; width: 100%; font-size: 12.5px;
+                   font-variant-numeric: tabular-nums; margin-top: 8px; }
+  .tr-card td, .tr-card th { padding: 4px 6px; border-bottom: 1px solid #57265B80; text-align: left;
+                             vertical-align: top; }
+  .tr-card th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
+  .tr-card .r { text-align: right; }
+  .tr-card p { margin: 0 0 6px; }
+  .tr-st { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600;
+           padding: 1px 7px; border-radius: 9px; white-space: nowrap; max-width: 100%;
+           overflow: hidden; text-overflow: ellipsis; }
+  .tr-st.ok { color: #2EB67D; background: #2EB67D1f; }
+  .tr-st.warn { color: #E3A23B; background: #E3A23B22; }
+  .tr-st.bad { color: #E5546B; background: #E5546B22; }
+  .tr-st.unknown { color: var(--muted); background: #ffffff10; }
+  .tr-dd { margin-bottom: 10px; }
+  .tr-dd .top { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .tr-dd .top b { overflow-wrap: anywhere; }
+  .tr-dd .mono { font: 12px var(--mono); }
+  .tr-meter { position: relative; height: 10px; background: #ffffff12; border-radius: 5px; margin: 6px 0 2px; }
+  .tr-meter i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; background: #6FB4E8; }
+  .tr-meter u { position: absolute; top: -4px; bottom: -4px; width: 2px; background: #E3A23B; }
+  .tr-meter b { position: absolute; top: -4px; bottom: -4px; width: 2px; background: #E5546B; }
+  .tr-note { font-size: 12px; color: var(--muted); border-left: 2px solid var(--gold); padding-left: 8px;
+             margin: 8px 0 0; }
+  .tr-watch { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(250px, 100%), 1fr)); gap: 8px; }
+  .tr-w { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px;
+          font-size: 13.5px; min-width: 0; }
+  .tr-w .k { font-size: 11.5px; color: var(--muted); }
+  .tr-w .sub { display: block; margin-top: 2px; overflow-wrap: anywhere; }
   /* projects overview and per-project boards */
   #boardmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
                 display: none; align-items: flex-start; justify-content: center; padding: 30px 16px; }
@@ -2090,12 +2250,13 @@ PAGE = r"""<!doctype html>
     #composer label.attach { padding: 0; }
 
     /* panels: whole-screen sheets, scrolling inside, closed by their ✕ */
-    #taskmodal, #boardmodal, #learnmodal, #fmodal { padding: 0; }
-    #taskmodal .box, #boardmodal .box, #learnmodal .box, #fmodal .fbox {
+    #taskmodal, #boardmodal, #learnmodal, #tradermodal, #fmodal { padding: 0; }
+    #taskmodal .box, #boardmodal .box, #learnmodal .box, #tradermodal .box, #fmodal .fbox {
       width: 100%; max-width: 100%; height: 100%; max-height: none; border-radius: 0;
       border: 0; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
       padding: var(--safe-t) var(--safe-r) calc(18px + var(--safe-b)) var(--safe-l); }
-    #taskmodal h2, #boardmodal h2, #learnmodal h2 { font-size: 20px; gap: 8px; }
+    #taskmodal h2, #boardmodal h2, #learnmodal h2, #tradermodal h2 { font-size: 20px; gap: 8px; }
+    #tradermodal .box { padding-left: max(12px, var(--safe-l)); padding-right: max(12px, var(--safe-r)); }
     .xclose { position: sticky; top: 0; z-index: 2; background: var(--bg); }
     .box .hint { font-size: 13px; }
     #bdetail { width: 100vw; border-left: 0;
@@ -2218,6 +2379,7 @@ PAGE = r"""<!doctype html>
   <button class="ghost hbtn phoneonly" id="menubtn" onclick="toggleMenu(event)" title="more" aria-haspopup="true">⋯</button>
   <div class="hmore" onclick="closeMenu()">
   <button class="ghost hbtn" onclick="toggleLearn()" title="learnings">🧠<span class="lbl"> Learnings</span></button>
+  <button class="ghost hbtn" onclick="toggleTrader()" title="trader: is it OK, and what is it doing (read-only)">📈<span class="lbl"> Trader</span></button>
   <button class="ghost hbtn wide" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <button class="ghost hbtn" id="notifybtn" onclick="enableNotifications()" title="Enable notifications">🔔<span class="lbl" id="notifylbl"> Notify</span></button>
   </div>
@@ -2320,6 +2482,13 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="bdetail"></div>
 <div id="fmodal" onclick="if(event.target.id==='fmodal')closeModal()"><div class="fbox" id="fbox"></div></div>
+<div id="tradermodal" onclick="if(event.target.id==='tradermodal')toggleTrader()">
+  <div class="box">
+    <button class="ghost xclose" onclick="toggleTrader()" title="close">✕</button>
+    <h2>📈 Trader <span class="ro">read-only</span> <span class="asof" id="trasof"></span></h2>
+    <div id="trbody"><div class="hint">Reading trader's status…</div></div>
+  </div>
+</div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
   <div class="box">
     <button class="ghost xclose" onclick="toggleLearn()" title="close">✕</button>
@@ -4417,6 +4586,209 @@ async function delLearning(id) {
   if (r.ok) renderLearnings();
 }
 
+// --- trader ---
+// Read-only: trader's scripts/trader_status.py prints one status document, the
+// server runs it (cached a minute) and this only draws it. Nothing here posts,
+// and nothing on the view is a button that does anything but close it.
+// The document: {v:1, generated_at, verdict, sections:{summary, sleeves, gate,
+// universe, dispatches, fills, jobs, freshness, health, host, shadow, env},
+// watch?}. Each section has status (ok/warn/bad/unknown), reason, source,
+// as_of. The view reads these optional fields when present, and says
+// "unknown" -- never a default number -- when one is missing:
+//   verdict: "ok"|... or {status, headline, lines:[...], look_at:[...]}
+//   sections.summary: book_total, doing:[...]
+//   sections.sleeves: sleeves:[{name, label, alloc, leverage, net_liq, cash,
+//     cash_pct, holds, doing, drawdown, peak}], halt, target, peak_note
+//   watch: [{id, status, label, reason}] (or {id: {...}}), or per section
+//     sections.<s>.watch: {id: {...}}, for the ten tiles in TRADER_WATCH.
+const TRADER_STATES = {ok: ["✓", "OK"], warn: ["!", "look at"], bad: ["✕", "not OK"], unknown: ["?", "unknown"]};
+// The resilience audit's ten "what to watch" items (tsk_6949469ad6 §4), each
+// with the section that would carry it.
+const TRADER_WATCH = [
+  ["daemon", "Daemon running = what's on disk?", "host"],
+  ["dispatch", "Last dispatch", "dispatches"],
+  ["guards", "Sleeve guards", "sleeves"],
+  ["equity", "Equity snapshot", "freshness"],
+  ["bars", "Bar freshness", "freshness"],
+  ["jobs", "Scheduled jobs", "jobs"],
+  ["gateway", "IB Gateway", "host"],
+  ["alerts", "Alert delivery", "health"],
+  ["backups", "Backups", "host"],
+  ["uptime", "Mini uptime", "host"],
+];
+const TRADER_POLL_MS = 60000;
+let traderAsk = 0;
+function trStatus(s) { return Object.prototype.hasOwnProperty.call(TRADER_STATES, s) ? s : "unknown"; }
+// A status is always its icon and words, never colour alone.
+function trBadge(status, label) {
+  const s = trStatus(status), [icon, word] = TRADER_STATES[s];
+  const text = String(label == null || label === "" ? word : label);
+  return `<span class="tr-st ${s}" title="${esc(word)}"><span aria-hidden="true">${icon}</span> ${esc(text)}</span>`;
+}
+const trNum = v => typeof v === "number" && isFinite(v);
+const trMoney = v => trNum(v) ? "$" + Math.round(v).toLocaleString("en-US") : "—";
+const trPct = (v, d) => trNum(v) ? (v * 100).toFixed(d == null ? 1 : d) + "%" : "—";
+const trStr = v => v == null ? "" : typeof v === "string" ? v : Array.isArray(v) ? v.join(", ") : String(v);
+function trWhen(iso) {
+  const t = Date.parse(iso || "");
+  return isNaN(t) ? null : t / 1000;
+}
+// An ISO time as "Wed Nov 18 15:09" in this device's zone; anything else as given.
+function trFmt(v) {
+  const t = trWhen(typeof v === "string" ? v : "");
+  if (t == null) return trStr(v);
+  const d = new Date(t * 1000), p = n => String(n).padStart(2, "0");
+  return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()] + " "
+    + ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()]
+    + " " + d.getDate() + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function trAgeWords(sec) {
+  if (sec == null) return "unknown";
+  return dur(Math.max(0, Math.round(sec))) + " old";
+}
+function trVerdict(doc) {
+  const v = doc.verdict, o = v && typeof v === "object" ? v : {status: v};
+  const s = trStatus(o.status);
+  const head = o.headline || {ok: "Trading normally", warn: "Trading, with things to look at",
+    bad: "Not OK", unknown: "Status unknown"}[s];
+  const lines = (Array.isArray(o.lines) ? o.lines : o.lines ? [o.lines] : []).map(l => `<p>${esc(trStr(l))}</p>`);
+  const look = Array.isArray(o.look_at) ? o.look_at : o.look_at ? [o.look_at] : [];
+  if (look.length) lines.push(`<p><b>Look at:</b> ${look.map(x => esc(trStr(x))).join("; ")}</p>`);
+  if (!lines.length) {
+    const sm = (doc.sections || {}).summary;
+    if (sm && sm.reason) lines.push(`<p>${esc(trStr(sm.reason))}</p>`);
+  }
+  // The headline at full size and wrapping, its icon and status word before it.
+  const [icon, word] = TRADER_STATES[s];
+  return `<div class="tr-verdict ${s}"><h3><span class="tr-st ${s}" title="${esc(word)}"><span aria-hidden="true">${icon}</span> ${esc(word)}</span> ${esc(trStr(head))}</h3>${lines.join("")}</div>`;
+}
+function trSleeves(doc) {
+  const sl = (doc.sections || {}).sleeves || {};
+  return Array.isArray(sl.sleeves) ? sl.sleeves.filter(x => x && typeof x === "object") : [];
+}
+function trBook(doc) {
+  const sec = doc.sections || {}, sm = sec.summary || {}, rows = trSleeves(doc);
+  let total = trNum(sm.book_total) ? sm.book_total : trNum((sec.sleeves || {}).book_total) ? sec.sleeves.book_total : null;
+  if (total == null && rows.length && rows.every(r => trNum(r.net_liq)))
+    total = rows.reduce((a, r) => a + r.net_liq, 0);
+  const body = rows.map(r => {
+    const alloc = (trNum(r.alloc) ? trPct(r.alloc, 0) : "—") + (trNum(r.leverage) ? ` · ${r.leverage.toFixed(1)}x` : "");
+    const cp = trNum(r.cash_pct) ? r.cash_pct : trNum(r.cash) && trNum(r.net_liq) && r.net_liq ? r.cash / r.net_liq : null;
+    const cash = trNum(cp) ? trPct(cp, 0) + (trNum(r.cash) ? `<div class="sub">${trMoney(r.cash)}</div>` : "") : "—";
+    const doing = trStr(r.doing) || trStr(r.holds) || "—";
+    return `<tr><td>${esc(trStr(r.label || r.name) || "?")}</td><td class="r">${alloc}</td>`
+      + `<td class="r">${trMoney(r.net_liq)}</td><td class="r">${cash}</td><td>${esc(doing)}</td></tr>`;
+  }).join("");
+  const asOf = sm.as_of || (sec.sleeves || {}).as_of;
+  const sub = [rows.length ? `${rows.length} sleeve${rows.length === 1 ? "" : "s"}` : "no sleeves reported",
+    asOf ? "as of " + trFmt(asOf) : ""].filter(Boolean).join(" · ");
+  return `<div class="tr-card"><h4>Book</h4><div class="tr-big">${trMoney(total)}</div>`
+    + `<div class="sub">${esc(sub)}</div>`
+    + (rows.length ? `<table><tr><th>sleeve</th><th class="r">alloc</th><th class="r">net liq</th><th class="r">cash</th><th>holds / doing</th></tr>${body}</table>`
+                   : `<p class="sub">${trBadge("unknown", "no sleeve data")} ${esc(trStr((sec.sleeves || {}).reason))}</p>`)
+    + `</div>`;
+}
+function trDrawdown(doc) {
+  const sl = (doc.sections || {}).sleeves || {}, rows = trSleeves(doc);
+  const halt = trNum(sl.halt) ? sl.halt : 0.40, target = trNum(sl.target) ? sl.target : 0.34;
+  const scale = Math.max(0.5, halt * 1.25);
+  const pos = v => Math.min(100, Math.max(0, v / scale * 100)).toFixed(1) + "%";
+  const meters = rows.map(r => {
+    const name = esc(trStr(r.name || r.label) || "?");
+    if (!trNum(r.drawdown))
+      return `<div class="tr-dd"><div class="top"><b>${name}</b>${trBadge("unknown", "drawdown unknown")}</div>`
+        + `<div class="tr-meter" role="img" aria-label="drawdown unknown"><u style="left:${pos(target)}"></u><b style="left:${pos(halt)}"></b></div></div>`;
+    const left = halt - r.drawdown;
+    const st = left <= 0 ? "bad" : r.drawdown >= target ? "warn" : "ok";
+    const words = left <= 0 ? "at or past the halt" : `${(left * 100).toFixed(1)}pp to the halt`;
+    return `<div class="tr-dd"><div class="top"><b>${name}</b><span class="mono">${trPct(r.drawdown)} from peak ${trMoney(r.peak)}</span></div>`
+      + `<div class="tr-meter" role="img" aria-label="${esc(trPct(r.drawdown))} drawdown, halt at ${esc(trPct(halt, 0))}">`
+      + `<i style="width:${pos(r.drawdown)}"></i><u style="left:${pos(target)}"></u><b style="left:${pos(halt)}"></b></div>`
+      + `<div class="sub">${trBadge(st, words)} · amber tick = ${trPct(target, 0)} target, red = ${trPct(halt, 0)} halt</div></div>`;
+  }).join("");
+  const note = sl.peak_note || "Peak is the in-memory one, re-seeded each restart (DURABLE_PEAK is off), so this can understate the true drawdown.";
+  return `<div class="tr-card"><h4>Drawdown vs the ${trPct(halt, 0)} halt</h4>`
+    + (meters || `<p class="sub">${trBadge("unknown", "no sleeve data")}</p>`)
+    + `<div class="tr-note">${esc(trStr(note))}</div></div>`;
+}
+function trDoing(doc) {
+  const sec = doc.sections || {}, sm = sec.summary || {};
+  let lines = Array.isArray(sm.doing) ? sm.doing : sm.doing ? [sm.doing] : [];
+  if (!lines.length) lines = ["gate", "universe", "dispatches"].map(k => sec[k] && sec[k].reason ? `${k}: ${trStr(sec[k].reason)}` : "").filter(Boolean);
+  const body = lines.length ? lines.map(l => `<p>${esc(trStr(l))}</p>`).join("")
+    : `<p class="sub">${trBadge("unknown", "not reported")}</p>`;
+  return `<div class="tr-card"><h4>What it's doing</h4>${body}</div>`;
+}
+// A tile's own entry: top-level watch (a list or a map), else the section's.
+function trWatchItem(doc, id, sec) {
+  const w = doc.watch;
+  if (Array.isArray(w)) { const x = w.find(t => t && t.id === id); if (x) return x; }
+  else if (w && typeof w === "object" && w[id]) return w[id];
+  const s = (doc.sections || {})[sec];
+  return s && s.watch && typeof s.watch === "object" && s.watch[id] ? s.watch[id] : null;
+}
+function trWatch(doc) {
+  return TRADER_WATCH.map(([id, title, sec], i) => {
+    const it = trWatchItem(doc, id, sec);
+    let badge, reason;
+    if (it) { badge = trBadge(it.status, it.label); reason = trStr(it.reason); }
+    else {
+      // Not reported on its own: say so, with what its section says, and no
+      // colour borrowed from a section that may be about something else.
+      const s = (doc.sections || {})[sec];
+      badge = trBadge("unknown", "not reported");
+      reason = s && s.reason ? `${sec}: ${trStr(s.reason)}` : `no ${sec} section`;
+    }
+    return `<div class="tr-w" data-watch="${id}"><div class="k">${i + 1}. ${esc(title)}</div>${badge}<span class="sub">${esc(reason)}</span></div>`;
+  }).join("");
+}
+function trDoc(doc) {
+  return trVerdict(doc)
+    + `<div class="tr-grid">${trBook(doc)}${trDrawdown(doc)}${trDoing(doc)}</div>`
+    + `<h4 class="tr-h">What to watch (resilience audit, tsk_6949469ad6)</h4>`
+    + `<div class="tr-watch">${trWatch(doc)}</div>`;
+}
+// The whole view from one /api/trader answer, at `now` (seconds). Pure, so
+// the tests draw fixtures with it.
+function traderHtml(a, now) {
+  if (!a || typeof a !== "object") a = {ok: false, error: "no answer from the dashboard"};
+  if (a.ok && a.doc) return trDoc(a.doc);
+  const doc = a.last_good, gen = doc ? trWhen(doc.generated_at) : null;
+  const ageFrom = gen != null ? gen : a.last_good_at;
+  const head = `<div class="tr-stale">${trBadge("unknown", "status unavailable:")} `
+    + `${esc(trStr(a.error) || "unknown reason")}`
+    + `<div class="sub">${doc ? `Below is the last good document, ${esc(trAgeWords(ageFrom != null ? now - ageFrom : null))}`
+        + (doc.generated_at ? ` (generated ${esc(trFmt(doc.generated_at))})` : "") + "."
+        : "No good document since the dashboard started, so there is nothing older to show."}</div></div>`;
+  return head + (doc && doc.sections ? `<div class="tr-old">${trDoc(doc)}</div>` : "");
+}
+function traderIsOpen() {
+  return document.getElementById("tradermodal").style.display === "flex";
+}
+function toggleTrader() {
+  const m = document.getElementById("tradermodal");
+  const open = !traderIsOpen();
+  m.style.display = open ? "flex" : "none";
+  if (open) refreshTrader();
+}
+async function refreshTrader() {
+  const ask = ++traderAsk;
+  let a;
+  try { a = await readJSON("/api/trader"); }
+  catch (e) { a = {ok: false, error: "the dashboard did not answer (" + (e && e.message || e) + ")", last_good: lastTrader}; }
+  if (ask !== traderAsk) return;
+  if (a && a.ok && a.doc) lastTrader = a.doc;
+  else if (a && !a.last_good && lastTrader) a = Object.assign({}, a, {last_good: lastTrader});
+  const now = Date.now() / 1000;
+  setHTML(document.getElementById("trbody"), traderHtml(a, now));
+  const doc = a && a.ok ? a.doc : null;
+  document.getElementById("trasof").textContent = doc && doc.generated_at
+    ? "data as of " + trFmt(doc.generated_at) : "";
+}
+let lastTrader = null;
+if (typeof window !== "undefined" && window.addEventListener)
+  window.addEventListener("focus", () => { if (traderIsOpen()) refreshTrader(); });
+
 // --- projects overview and per-project boards ---
 // The task panel answers "what needs me"; this answers "where is each project".
 // Read through the bot's /tasks route (overview, board, task), which reuses a
@@ -5317,7 +5689,7 @@ if (window.addEventListener)
 //   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
 //     [&drawer=1] [&tools=open] [&files=1]  ...its attachments drawer, its longest turn's calls
 //                                         open, or its newest message with files in view
-//   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
+//   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings | trader
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
 //   ?q=<words>                            transcript search
@@ -5379,6 +5751,8 @@ async function openLink(q) {
     if (!boardIsOpen()) toggleBoard(); else refreshBoard();
   } else if (view === "learnings") {
     toggleLearn();
+  } else if (view === "trader") {
+    if (!traderIsOpen()) toggleTrader();
   }
   if (card) openCard(card);
   if (modal === "new-thread") newThreadForm();
@@ -5566,15 +5940,17 @@ function poller(fn) {
 const pollList = poller(loadList), pollStats = poller(loadStats),
       pollTranscript = poller(() => active ? loadTranscript(false) : null),
       pollLive = poller(() => threadBusy() ? loadTranscript(false) : null),
-      pollBoard = poller(() => boardIsOpen() ? refreshBoard() : null);
+      pollBoard = poller(() => boardIsOpen() ? refreshBoard() : null),
+      pollTrader = poller(() => traderIsOpen() ? refreshTrader() : null);
 loadList(); loadStats();
 setInterval(pollList, 5000);
 setInterval(pollStats, 30000);
 setInterval(pollTranscript, 4000);
 setInterval(pollLive, 1500);
 setInterval(pollBoard, 5000);
+setInterval(pollTrader, TRADER_POLL_MS);
 document.addEventListener("visibilitychange", () => {
-  if (visible()) { pollList(); pollStats(); pollTranscript(); pollBoard(); }
+  if (visible()) { pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); }
 });
 </script>
 </body>
