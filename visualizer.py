@@ -1962,6 +1962,9 @@ PAGE = r"""<!doctype html>
     border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 12.5px;
     padding: 4px 8px; }
   .bfilters input { width: 240px; }
+  .bfilters .bturns { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px;
+    color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .bfilters .bturns input { width: auto; flex: none; margin: 0; padding: 0; }
   .pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
             gap: 12px; }
   .pcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -2523,6 +2526,7 @@ PAGE = r"""<!doctype html>
       <select id="brole" onchange="renderBoard()" title="role"></select>
       <select id="bstate" onchange="renderBoard()" title="state"></select>
       <input id="bq" placeholder="search title or goal…" autocomplete="off" oninput="boardSearch()">
+      <label class="bturns" title="every message a thread takes is recorded as a task; off, they are left to their threads (one waiting on you is shown either way)"><input type="checkbox" id="bturns" onchange="setShowTurns(this.checked)"> Show conversation turns</label>
     </div>
     <div id="bover"></div>
     <div id="bboard"></div>
@@ -4454,8 +4458,8 @@ async function renderTasks() {
   // Awaited, not fired off: a row has to say whether its checkout is still
   // holding work before it offers a button that makes that work unreachable.
   await renderHolding();
-  const r = await taskRead({action: taskView === "attention" ? "attention" : "list",
-                            project: project || undefined, slim: true});
+  const r = await taskRead(withTurns({action: taskView === "attention" ? "attention" : "list",
+                                      project: project || undefined, slim: true}));
   if (!r.ok) { setHTML(list, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }
   updateTaskBadge(r.counts);
   const spend = document.getElementById("spend");
@@ -4578,9 +4582,9 @@ function updateTaskBadge(counts) {
 }
 async function refreshTaskBadge() {
   // Polled with the session list: the counts alone, not two hundred tasks.
-  let r = await taskRead({action: "counts"});
+  let r = await taskRead(withTurns({action: "counts"}));
   // A bot older than `counts` refuses it; the whole list still has them.
-  if (!r.ok) r = await taskCall({action: "list"});
+  if (!r.ok) r = await taskCall(withTurns({action: "list"}));
   if (r.ok) updateTaskBadge(r.counts);
 }
 function toggleLearn() {
@@ -5252,6 +5256,27 @@ const UNFILED = "__unfiled__";            // board.UNFILED: work under no projec
 const BOARD_COLUMNS = [["backlog", "Backlog"], ["running", "Running"],
   ["review", "In review"], ["needs", "Needs you"], ["done", "Done · 14d"]];
 let boardProject = null;                  // null: overview; "": all; UNFILED; a slug
+// "Show conversation turns": every message a thread takes is a task (recovery,
+// cost, the turn lock), but it is the conversation, not work, so the board,
+// the overview, the task panel and the badge leave them to their threads unless
+// asked. Remembered per device; off by default. The bot decides which tasks
+// are turns (tasks.on_board) -- this only says whether to ask for them.
+const TURNS_KEY = "silkworm.showTurns";
+let showTurns = false;
+try { showTurns = localStorage.getItem(TURNS_KEY) === "1"; } catch (e) { showTurns = false; }
+function withTurns(payload) {
+  return showTurns ? Object.assign({}, payload, {turns: true}) : payload;
+}
+function setShowTurns(on) {
+  showTurns = !!on;
+  try { localStorage.setItem(TURNS_KEY, showTurns ? "1" : "0"); } catch (e) {}
+  const box = document.getElementById("bturns");
+  if (box) box.checked = showTurns;
+  renderBoard();
+  refreshTaskBadge();
+  const panel = document.getElementById("taskmodal");
+  if (panel && panel.style.display === "flex") renderTasks();
+}
 let boardDetailId = null;
 let boardRows = [];                       // the overview's projects, for the picker
 let lastSessions = [];                    // from loadList, for the unfiled threads
@@ -5320,6 +5345,8 @@ function boardFilters() {
     // a slug the overview has not listed yet
     + (listed ? "" : `<option value="${esc(keep)}">${esc(keep)}</option>`));
   if (proj.value !== keep) proj.value = keep;
+  const turnsBox = document.getElementById("bturns");
+  if (turnsBox && turnsBox.checked !== showTurns) turnsBox.checked = showTurns;
   document.getElementById("bvover").className = boardProject === null ? "on" : "";
   document.getElementById("bvall").className = boardProject === "" ? "on" : "";
   document.getElementById("bvunfiled").className = boardProject === UNFILED ? "on" : "";
@@ -5351,7 +5378,7 @@ async function renderBoard() {
   // A poll in flight when a filter changes must not land on top of the
   // filtered answer: only the newest request draws.
   const ask = ++boardAsk;
-  const r = await taskRead({action: "board", project: boardProject, role, state, q});
+  const r = await taskRead(withTurns({action: "board", project: boardProject, role, state, q}));
   if (ask !== boardAsk) return;
   const el = document.getElementById("bboard");
   if (!r.ok) { setHTML(el, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }
@@ -5457,7 +5484,7 @@ function unfiledThreads() {
 }
 async function loadOverview() {
   const ask = ++boardAsk;
-  const r = await taskRead({action: "overview"});
+  const r = await taskRead(withTurns({action: "overview"}));
   if (ask !== boardAsk || boardProject !== null) return;   // superseded meanwhile
   const el = document.getElementById("bover");
   if (!r.ok) { setHTML(el, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }

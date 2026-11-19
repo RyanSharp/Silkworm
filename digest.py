@@ -252,7 +252,7 @@ def sections(records, now: float, *, branch_rows=(), released=None,
                 add(proj, "decided", f"{_title(rec)} — {_esc(what)}, {_esc(via[:120])}")
 
         runs = [e for e in _events(rec) if e.get("kind") == tasks.RUNNING and e["at"] >= since]
-        if runs and (rec.get("attempts") or 0) > 1:
+        if runs and (rec.get("attempts") or 0) > 1 and tasks.on_board(rec):
             add(proj, "reran", f"{_title(rec)} ({rec['attempts']} runs)")
 
         state = rec.get("state")
@@ -308,7 +308,9 @@ def sections(records, now: float, *, branch_rows=(), released=None,
     waiting: dict = {}
     for rec in records:
         # A failing base's item, and a failing check's, have their own lines.
-        if (rec.get("state") in dict(WAITING)
+        # Counted as the board counts (tasks.on_board): a conversation turn
+        # only while it is waiting on you.
+        if (rec.get("state") in dict(WAITING) and tasks.on_board(rec)
                 and rec.get("source") not in (basered.SOURCE, health_mod.SOURCE)):
             row = waiting.setdefault(_project_of(rec, by_id), {})
             row[rec["state"]] = row.get(rec["state"], 0) + 1

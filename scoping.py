@@ -344,23 +344,17 @@ MAX_NAME_CHARS = 100
 #: Neither is an idea, and listing them as ones already had would be nonsense.
 MACHINERY_ROLES = ("reviewer", "ideator")
 
-#: Where a conversation turn comes from. A Slack or web message and a scheduled
-#: wake-up are all filed as tasks, all inherit their thread's project, and all
-#: sit in a non-terminal state while they run -- and one killed by a restart or
-#: a quota error stays there indefinitely. Telling the nightly pass not to file
-#: "check whether the paper book's rejects cleared" again costs a listing slot
-#: and tells it nothing. Work typed into the dashboard's task form is filed as
-#: `dashboard`, not `ui`, so it is on the board whatever its role. Paired with
-#: the role below because older records filed from that form say `ui`.
-CONVERSATION_SOURCES = ("slack", "ui", "defer")
-
-
 def is_work(rec: dict) -> bool:
     """Is this record a piece of work on the board, or the board running?"""
     role = rec.get("role") or ""
     if role in MACHINERY_ROLES:
         return False
-    return not (role == "assistant" and rec.get("source") in CONVERSATION_SOURCES)
+    # A Slack or web message and a scheduled wake-up are all filed as tasks,
+    # inherit their thread's project, and sit in a non-terminal state while
+    # they run -- one killed by a restart stays there. Telling the nightly pass
+    # not to file "check whether the paper book's rejects cleared" again costs
+    # a listing slot and tells it nothing. What a turn is: tasks.is_turn.
+    return not tasks.is_turn(rec)
 
 
 def task_name(rec: dict) -> str:

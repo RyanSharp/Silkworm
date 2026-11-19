@@ -2847,8 +2847,14 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                 return record_user_decision(grant, action, payload,
                                             handle_tasks(payload, _decided=grant))
     project = payload.get("project") or ""
+    # Conversation turns are recorded as tasks but listed with their thread,
+    # not as work (tasks.on_board); `turns` asks for them too -- the board's
+    # "Show conversation turns", `silkworm tasks --all`, and the callers that
+    # must see every running turn (deploy's wait, status --json).
+    turns = bool(payload.get("turns"))
     def _filter(items):
-        return [t for t in items if not project or (t.get("project") or "") == project]
+        return [t for t in items if (not project or (t.get("project") or "") == project)
+                and tasks.on_board(t, turns)]
     # `slim`: rows cut to what the dashboard's task panel draws (board.panel_row);
     # the whole goal and reply come from `task` when a row is opened.
     rows = ((lambda ts: [board.panel_row(t) for t in ts]) if payload.get("slim")
@@ -2859,14 +2865,14 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                  else sorted(task_store.all().values(),
                              key=lambda t: -(t.get("created") or 0)))
         return {"ok": True, "tasks": rows(_with_costs(_filter(items)[:200])),
-                "counts": task_store.counts(), **_spend(project)}
+                "counts": task_store.counts(turns), **_spend(project)}
     if action == "attention":
         return {"ok": True, "tasks": rows(_with_costs(_filter(task_store.needs_attention()))),
-                "counts": task_store.counts(), **_spend(project)}
+                "counts": task_store.counts(turns), **_spend(project)}
     if action == "counts":
         # The dashboard's badge, polled every five seconds: the counts and
         # nothing else, where `list` would hand it two hundred whole tasks.
-        return {"ok": True, "counts": task_store.counts()}
+        return {"ok": True, "counts": task_store.counts(turns)}
     if action == "watching":
         # Scheduled wake-ups specifically, not everything parked in `blocked`:
         # a quota-blocked retry is the system waiting on itself, while a watch
@@ -2895,7 +2901,9 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
         # seconds, and this asks git, so folding it in would run a survey
         # twice a minute to answer a question that only changes when you
         # merge something.
-        rows = branches.survey(_filter(list(task_store.all().values())),
+        # Every record of the project, turns too: a branch is a branch.
+        rows = branches.survey([t for t in task_store.all().values()
+                                if not project or (t.get("project") or "") == project],
                                scope_for=project_store.scope_for)
         return {"ok": True, "unmerged": rows, "summary": branches.line(rows)}
     if action == "overview":
@@ -2906,14 +2914,14 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
         return {"ok": True, **board.overview(
             everyone, list(task_store.all().values()), unmerged_rows=board_survey(),
             releases_by_slug={p["slug"]: board_release(p["slug"]) for p in live},
-            health_rows=health_rows() or ())}
+            health_rows=health_rows() or (), turns=turns)}
     if action == "board":
         # One project's columns -- or every project's, or board.UNFILED's.
         prec = project_store.get(project) if project and project != board.UNFILED else None
         return {"ok": True, "project": project, **board.board(
             list(task_store.all().values()), project,
             role=payload.get("role") or "", state=payload.get("state") or "",
-            q=payload.get("q") or "", unmerged_rows=board_survey()),
+            q=payload.get("q") or "", unmerged_rows=board_survey(), turns=turns),
             # For the header and the new-task form: what the project is called
             # and whether an implementor filed here would run or be held.
             "info": {"slug": prec["slug"], "title": prec.get("title") or prec["slug"],

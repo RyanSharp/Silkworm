@@ -8,7 +8,8 @@
     silkworm harvest                run the learning harvester now
     silkworm summarize [--force]    (re)generate thread context summaries
     silkworm titles [--force]       name threads from their summaries
-    silkworm tasks [state]          list tasks (default: what needs you)
+    silkworm tasks [state] [--all]  list tasks (default: what needs you); --all
+                                    includes conversation turns
     silkworm tasks show <id>        one task: title, state, goal and what came of it (read-only)
     silkworm email                  scan Gmail now and propose tasks
     silkworm defer <delay> <goal>   schedule a later turn (from inside a turn)
@@ -1068,6 +1069,37 @@ def task_text(rec: dict) -> str:
     return "\n".join(lines)
 
 
+def tasks_query(argv) -> dict:
+    """`silkworm tasks [state] [--all]` as the /tasks request it makes. What it
+    lists and counts is the dashboard's (tasks.on_board); --all adds the
+    conversation turns, which are otherwise left to their threads."""
+    turns = "--all" in argv
+    rest = [a for a in argv if a != "--all"]
+    state = rest[0] if rest else ""
+    payload = ({"action": "list", "state": state} if state else {"action": "attention"})
+    if turns:
+        payload["turns"] = True
+    return payload
+
+
+def do_tasks(argv) -> int:
+    payload = tasks_query(argv)
+    r = bot_call("/tasks", payload, timeout=10)
+    if not r.get("ok"):
+        print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
+        return 1
+    items = r["tasks"]
+    print(f"{WORM} {payload.get('state') or 'needs you'}"
+          f"{' (with conversation turns)' if payload.get('turns') else ''}"
+          f" — {len(items)} task(s)")
+    for t in items:
+        print(f"  {t['state']:18} {t['id']}  {t['title'][:52]}")
+    counts = r.get("counts") or {}
+    if counts:
+        print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    return 0
+
+
 def do_tasks_show(argv) -> int:
     """`silkworm tasks show <id>`: print one task. Reads only -- the same
     /tasks `task` action the dashboard opens a card with -- so a restricted
@@ -1812,7 +1844,9 @@ def status_summary(ask) -> dict:
             .setdefault(t.get("state") or "", []).append(row)
 
     for state in ("queued", "running", "blocked"):
-        r = asked(state, {"action": "list", "state": state, "slim": True})
+        # Every running, queued and blocked task, conversation turns too: the
+        # operator decides whether a restart would cut one off.
+        r = asked(state, {"action": "list", "state": state, "slim": True, "turns": True})
         out["tasks"][state] = [_row(t, "project", "role")
                                for t in (r or {}).get("tasks") or []]
 
@@ -2227,7 +2261,8 @@ def operator_deploy_refusal(call, after_turn: bool, skip_tests: bool) -> str:
     if rev.get("state") != "stale" or not (rev.get("behind") or 0) > 0:
         return (f"main is not ahead of the running revision "
                 f"({rev.get('state') or 'unknown'}); there is nothing to deploy")
-    running = (call("/tasks", {"action": "list", "state": "running"}) or {})
+    # Conversation turns too: a running one is exactly what must finish first.
+    running = (call("/tasks", {"action": "list", "state": "running", "turns": True}) or {})
     if "tasks" not in running:
         return "could not list running tasks"
     me = os.environ.get("SILKWORM_THREAD", "")
@@ -2932,19 +2967,7 @@ def main() -> None:
     elif cmd == "tasks" and len(args) > 1 and args[1] == "show":
         sys.exit(do_tasks_show(args[2:]))
     elif cmd == "tasks":
-        state = args[1] if len(args) > 1 else ""
-        r = bot_call("/tasks", {"action": "list", "state": state} if state
-                     else {"action": "attention"}, timeout=10)
-        if not r.get("ok"):
-            print(f"  {R}✘{N} {r.get('error', 'bot unreachable — is it running?')}")
-        else:
-            items = r["tasks"]
-            print(f"{WORM} {state or 'needs you'} — {len(items)} task(s)")
-            for t in items:
-                print(f"  {t['state']:18} {t['id']}  {t['title'][:52]}")
-            counts = r.get("counts") or {}
-            if counts:
-                print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+        sys.exit(do_tasks(args[1:]))
     elif cmd == "watching":
         r = bot_call("/tasks", {"action": "watching"})
         rows = r.get("watching") or []

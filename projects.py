@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 import jsonstore
+import tasks as tasks_mod
 
 log = logging.getLogger("silkworm.projects")
 
@@ -512,6 +513,10 @@ def summarise(projects: list[dict], tasks: list[dict],
             continue
         row = by_slug.setdefault(slug, {"open": 0, "needs": 0, "total": 0,
                                         "proposed": 0})
+        # Counted as the board counts (tasks.on_board): a conversation turn
+        # only while it waits on you. Its project is still listed.
+        if not tasks_mod.on_board(t):
+            continue
         row["total"] += 1
         if t.get("state") in needs_attention:
             row["needs"] += 1

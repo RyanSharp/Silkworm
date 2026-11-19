@@ -235,6 +235,52 @@ def is_wakeup(rec: dict) -> bool:
     return (rec or {}).get("source") == WAKE_SOURCE
 
 
+#: Sources a conversation turn is filed under: a Slack message ("slack"), a
+#: message typed into the dashboard's chat ("ui", see TURN_NEEDS_REF), and a
+#: scheduled wake-up or the operator's daily sweep (WAKE_SOURCE).
+TURN_SOURCES = ("slack", "ui", WAKE_SOURCE)
+
+#: Sources that are a turn only when they name the message they answer. Work
+#: filed from the dashboard's task form was stamped "ui" before it was
+#: "dashboard", and never carried a message ts; every chat message does
+#: (handle_prompt files it with source_ref=msg_ts).
+TURN_NEEDS_REF = ("ui",)
+
+#: Roles that are scoped work whatever started them: never a conversation turn.
+WORK_ROLES = ("implementor", "reviewer", roles.RESEARCHER, "ideator")
+
+#: The states a conversation turn is still shown on the board in: it is
+#: waiting on you (a needs_user step, or a turn that failed).
+TURN_NEEDS_YOU = (NEEDS_INPUT, FAILED)
+
+
+def is_turn(rec: dict) -> bool:
+    """Whether a task is a conversation turn rather than a piece of work.
+
+    Every message a thread takes is recorded as a task -- restart recovery,
+    cost and the turn lock all need it -- but it is the conversation, not
+    work on the board. The one place that says which is which; the board,
+    the overview, the Slack board, the digest and `silkworm tasks` all ask it.
+
+    Read from `source`, `source_ref` and `role`, never the title (the model
+    writes that) and never `driver`: a turn orphaned by a restart is handed
+    to the queue runner (close_out_orphans) and stays a turn.
+    """
+    rec = rec or {}
+    if (rec.get("role") or "") in WORK_ROLES:
+        return False
+    source = rec.get("source") or ""
+    if source not in TURN_SOURCES:
+        return False
+    return source not in TURN_NEEDS_REF or bool(rec.get("source_ref"))
+
+
+def on_board(rec: dict, turns: bool = False) -> bool:
+    """Whether a task is listed and counted: all work, and a conversation turn
+    only when `turns` is asked for or it is waiting on you."""
+    return turns or not is_turn(rec) or (rec or {}).get("state") in TURN_NEEDS_YOU
+
+
 def wake_overdue(rec: dict, now: float) -> float | None:
     """Seconds a wake-up has been due without being claimed, or None.
 
@@ -1359,9 +1405,13 @@ class TaskStore:
                                 "late_s": round(late)})
         return sorted(out, key=lambda w: -w["late_s"])
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, turns: bool = False) -> dict[str, int]:
+        """{state: n} over what the board lists (on_board): conversation
+        turns only when `turns`, or while they wait on you."""
         with self._lock:
             out: dict[str, int] = {}
             for rec in self._data.values():
+                if not on_board(rec, turns):
+                    continue
                 out[rec.get("state", "?")] = out.get(rec.get("state", "?"), 0) + 1
         return out

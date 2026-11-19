@@ -32,8 +32,8 @@ MAX_FILES = 10
 #: How many finished turns the open thread is told about.
 RECENT_TURNS = 5
 #: Sources whose task is one message in a conversation (handle_prompt makes
-#: "slack" and "ui" ones; a deferred wake-up is "defer").
-CONVERSATION_SOURCES = ("slack", "ui", "defer")
+#: "slack" and "ui" ones; a deferred wake-up is "defer"): tasks.TURN_SOURCES.
+CONVERSATION_SOURCES = tasks.TURN_SOURCES
 
 
 class Refused(ValueError):

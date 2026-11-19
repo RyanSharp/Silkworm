@@ -436,6 +436,19 @@ holds tasks and conversations under no project. The branch survey and release
 plans behind it are cached for a minute (`board.py`), so polling does not walk
 git. 📋 Tasks still opens on what needs you.
 
+**Conversation turns stay with their threads.** Every message a thread takes —
+a Slack or dashboard chat message, a scheduled wake-up, the operator's sweep —
+is recorded as a task (restart recovery, cost and the turn lock need it), but it
+is the conversation, not work. The board, the overview, 📋 Tasks, the Slack
+board, the digest and `silkworm tasks` leave those out and count without them;
+a running turn shows as its thread's running indicator. One waiting on you — a
+step it handed you, or a turn that failed — is still in Needs you. What counts
+as a turn is one predicate, `tasks.is_turn`: source `slack`, `defer`, or `ui`
+with a message ts, and not an implementor, reviewer, researcher or ideator
+(anything filed with `silkworm task` is work). **Show conversation turns** on
+the board lists them too (remembered per device, off by default);
+`silkworm tasks --all` does the same on the command line.
+
 **Releasing in one click.** A project with release targets has a
 **Release…** button on its card and its board header: per target what is
 pending and its first commits, a patch/minor choice each (major or an exact
@@ -954,7 +967,7 @@ before retrying, since the change may have been made before it failed.
 
 These names are subcommands now, so a session titled with one of them needs
 `--dir` first: `silkworm --dir . land the parser fix`. `status --json` lists at
-most 200 queued, running or blocked tasks each (the oldest 200: the bot's `list`
+most 200 queued, running or blocked tasks each, conversation turns included (the oldest 200: the bot's `list`
 cap); needs-you items are not capped.
 
 `silkworm status --json` prints one line of JSON:

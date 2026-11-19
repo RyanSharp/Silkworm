@@ -2269,8 +2269,14 @@ def test_ideation():
     check("so an assistant task typed into it is work on the board",
           S.is_work(asked),
           "it was asked for from the task form, not said in a conversation")
+    # A web chat turn names the message it answers (handle_prompt files it
+    # with source_ref=msg_ts); what the old form filed under `ui` never did.
     check("while a web chat turn still is not",
-          not S.is_work({"role": "assistant", "source": "ui"}))
+          not S.is_work({"role": "assistant", "source": "ui",
+                         "source_ref": "1784068538.524369"}))
+    check("and an assistant task the old form filed under `ui` is work",
+          S.is_work({"role": "assistant", "source": "ui", "source_ref": ""}),
+          "no message ts: it was typed into the task form, not the chat")
 
     # `update` always stamps `updated`, so age the record directly.
     stale = dict(ts.get(said_no["id"]),
@@ -34892,6 +34898,422 @@ def test_dashshots_has_a_trader_view_fed_by_the_fixture():
           and [w["id"] for w in doc["watch"]] == ["daemon", "dispatch", "guards", "equity", "bars", "jobs",
                                                  "gateway", "alerts", "backups", "uptime"]
           and all({"id", "status", "label", "reason"} <= set(w) for w in doc["watch"]))
+
+
+# --- conversation turns off the board -------------------------------------------
+
+def _turn_records():
+    """Representative records of every kind, shaped as production files them:
+    {name: (record, is it a conversation turn)}."""
+    return {
+        "slack turn": ({"role": "assistant", "source": "slack", "driver": "inline",
+                        "source_ref": "1784068538.1"}, True),
+        "slack turn handed to the runner": ({"role": "assistant", "source": "slack",
+                                             "driver": "queue", "source_ref": "1784068538.2"},
+                                            True),
+        "operator's Slack turn": ({"role": "operator", "source": "slack", "driver": "inline",
+                                   "source_ref": "1784068538.3"}, True),
+        "web chat turn": ({"role": "assistant", "source": "ui", "driver": "inline",
+                           "source_ref": "1784068538.4"}, True),
+        "operator's web chat turn": ({"role": "operator", "source": "ui",
+                                      "driver": "inline", "source_ref": "1784068538.5"}, True),
+        "scheduled wake-up": ({"role": "assistant", "source": "defer", "driver": "queue",
+                               "source_ref": ""}, True),
+        "operator sweep": ({"role": "operator", "source": "defer", "driver": "queue",
+                            "source_ref": "operator-sweep"}, True),
+        "a turn the model titled like work": ({"role": "assistant", "source": "slack",
+                                               "title": "Implement the release button",
+                                               "source_ref": "1784068538.6"}, True),
+        "scoped implementor": ({"role": "implementor", "source": "scoped",
+                                "driver": "queue"}, False),
+        "scoped assistant": ({"role": "assistant", "source": "scoped", "driver": "queue"},
+                             False),
+        "reviewer": ({"role": "reviewer", "source": "review", "driver": "queue"}, False),
+        "rework": ({"role": "implementor", "source": "rework", "driver": "queue"}, False),
+        "proposal": ({"role": "implementor", "source": "ideation", "driver": "queue"}, False),
+        "nightly ideator": ({"role": "ideator", "source": "ideation", "driver": "queue"}, False),
+        "research": ({"role": "researcher", "source": "scoped", "driver": "queue"}, False),
+        "research next step": ({"role": "implementor", "source": "research",
+                                "driver": "queue"}, False),
+        "dashboard form": ({"role": "assistant", "source": "dashboard", "driver": "queue"},
+                           False),
+        "old dashboard form under ui": ({"role": "assistant", "source": "ui",
+                                         "driver": "queue", "source_ref": ""}, False),
+        "old form implementor under ui": ({"role": "implementor", "source": "ui",
+                                           "driver": "queue"}, False),
+        "an implementor role on a slack source": ({"role": "implementor", "source": "slack",
+                                                   "source_ref": "1784068538.7"}, False),
+        "a researcher on a wake-up source": ({"role": "researcher", "source": "defer"}, False),
+        "health fix": ({"role": "assistant", "source": "health", "driver": "queue"}, False),
+        "github issue": ({"role": "assistant", "source": "github", "driver": "inline"}, False),
+        "a failing base's item": ({"role": "assistant", "source": "base-red",
+                                   "driver": "queue", "source_ref": "silkworm"}, False),
+    }
+
+
+def test_conversation_turn_predicate():
+    import tasks as T
+    print("\nwhat a conversation turn is: one predicate, from recorded fields")
+    for name, (rec, want) in _turn_records().items():
+        check(f"{name}: {'a turn' if want else 'work'}", T.is_turn(rec) is want, rec)
+    check("no record at all is not a turn", T.is_turn({}) is False and T.is_turn(None) is False)
+    turn = _turn_records()["slack turn"][0]
+    work = _turn_records()["scoped implementor"][0]
+    for state in T.STATES:
+        shown = T.on_board(dict(turn, state=state))
+        check(f"a turn {state} is {'shown' if shown else 'left to its thread'}",
+              shown is (state in (T.NEEDS_INPUT, T.FAILED)))
+        check(f"work {state} is always shown", T.on_board(dict(work, state=state)) is True)
+        check(f"and with turns asked for, a turn {state} is too",
+              T.on_board(dict(turn, state=state), turns=True) is True)
+    # One definition: the nightly pass and the web thread read it, not lists
+    # of their own.
+    import scoping as S, webthread as W
+    check("the web thread's sources are the predicate's",
+          W.CONVERSATION_SOURCES is T.TURN_SOURCES)
+    check("scoping.CONVERSATION_SOURCES is gone, not a second copy",
+          not hasattr(S, "CONVERSATION_SOURCES"))
+    for name, (rec, want) in _turn_records().items():
+        if rec.get("role") not in S.MACHINERY_ROLES:
+            check(f"is_work agrees for {name}", S.is_work(rec) is (not want))
+
+
+def _turns_fixture():
+    """The board fixture plus a conversation turn in every state that matters,
+    all on alpha's thread C1:9.9. {name: id} of the turns."""
+    import tasks as T
+    ts, ps, ids, survey, d = _board_fixture()
+    turn = lambda goal, **kw: ts.create(goal, title=goal, project="alpha", thread="C1:9.9",
+                                        **kw)["id"]
+    t = {}
+    t["running"] = turn("hi, what's the paper book doing", role="assistant",
+                        source="slack", source_ref="1784068538.1", state=T.RUNNING)
+    t["queued"] = turn("and the rejects?", role="assistant", source="ui",
+                       source_ref="1784068538.2", state=T.QUEUED)
+    t["done"] = turn("thanks", role="assistant", source="slack",
+                     source_ref="1784068538.3", state=T.DONE)
+    t["wake"] = turn("look again in two hours", role="assistant", source="defer",
+                     driver="queue", state=T.BLOCKED)
+    ts.update(t["wake"], retry_at=time.time() + 7200)
+    t["sweep"] = turn("Operator sweep", role="operator", source="defer",
+                      source_ref="operator-sweep", driver="queue", state=T.DONE)
+    t["asks"] = turn("release it", role="assistant", source="slack",
+                     source_ref="1784068538.4", state=T.NEEDS_INPUT)
+    ts.update(t["asks"], needs_user={"action": "!release alpha all", "why": "yours"})
+    t["failed"] = turn("why did that fail", role="assistant", source="ui",
+                       source_ref="1784068538.5", state=T.FAILED)
+    return ts, ps, ids, survey, d, t
+
+
+def test_conversation_turns_off_the_board():
+    import board as B, tasks as T, home, digest
+    print("\nconversation turns are left to their threads, unless they need you")
+    ts, ps, ids, survey, _, t = _turns_fixture()
+    recs = list(ts.all().values())
+    hidden = {t[k] for k in ("running", "queued", "done", "wake", "sweep")}
+    needy = {t["asks"], t["failed"]}
+
+    def on(answer):
+        return {c["id"]: col for col, cs in answer["columns"].items() for c in cs}
+
+    for proj in ("alpha", ""):
+        where = on(B.board(recs, proj, unmerged_rows=survey))
+        check(f"board {proj or 'all'}: no turn that does not need you",
+              not (hidden & set(where)), sorted(hidden & set(where)))
+        check(f"board {proj or 'all'}: a turn waiting on you is in Needs you",
+              all(where.get(i) == "needs" for i in needy), where)
+        check(f"board {proj or 'all'}: every piece of work is still there",
+              {ids["proposed"], ids["queued"], ids["running"], ids["awaiting"],
+               ids["failed"], ids["landed"]} <= set(where))
+        where = on(B.board(recs, proj, unmerged_rows=survey, turns=True))
+        check(f"board {proj or 'all'}, turns shown: every turn is on it",
+              (hidden - {t["wake"]}) | needy <= set(where)
+              and where.get(t["running"]) == "running", where)
+    check("and a role filter offers no role only turns carry",
+          "operator" not in B.board(recs, "alpha")["roles"]
+          and "operator" in B.board(recs, "alpha", turns=True)["roles"])
+
+    ov = B.overview(ps.all(include_archived=False), recs, unmerged_rows=survey)
+    alpha = next(p for p in ov["projects"] if p["slug"] == "alpha")
+    check("overview: a running turn is not a running card",
+          t["running"] not in {r["id"] for r in alpha["running"]}
+          and ids["running"] in {r["id"] for r in alpha["running"]}, alpha["running"])
+    check("overview: turns waiting on you count as needing you",
+          alpha["needs"] == 4, alpha["counts"])     # awaiting, failed, asks, failed turn
+    ov_all = B.overview(ps.all(include_archived=False), recs, unmerged_rows=survey, turns=True)
+    alpha_all = next(p for p in ov_all["projects"] if p["slug"] == "alpha")
+    check("overview, turns shown: the running turn is listed",
+          t["running"] in {r["id"] for r in alpha_all["running"]})
+    check("overview, turns shown: and counted",
+          sum(alpha_all["counts"].values()) - sum(alpha["counts"].values()) == len(hidden))
+
+    # The Slack board message.
+    view = json.dumps(home.render(recs, now=time.time()))
+    check("Slack board: no turn that does not need you",
+          "the paper book" not in view and "and the rejects?" not in view
+          and "look again in two hours" not in view, view[:300])
+    check("Slack board: a turn waiting on you is listed",
+          "release it" in view and "why did that fail" in view)
+
+    # One predicate, so every count agrees: the dashboard's, the overview's,
+    # the Slack board's, the digest's and the CLI's.
+    ht, _ = _turns_route(ts, ps, survey)
+    for turns in (False, True):
+        counts = ht({"action": "counts", **({"turns": True} if turns else {})})["counts"]
+        listed = ht({"action": "list", **({"turns": True} if turns else {})})["tasks"]
+        by_state = {}
+        for r in listed:
+            by_state[r["state"]] = by_state.get(r["state"], 0) + 1
+        check(f"counts agree with what is listed (turns={turns})", counts == by_state,
+              (counts, by_state))
+        want = {s: n for s, n in by_state.items()}
+        check(f"and with the store's own counts (turns={turns})",
+              ts.counts(turns) == want)
+    alpha_list = ht({"action": "list", "project": "alpha"})["tasks"]
+    per = {}
+    for r in alpha_list:
+        per[r["state"]] = per.get(r["state"], 0) + 1
+    check("the overview counts what the project's list lists", per == alpha["counts"],
+          (per, alpha["counts"]))
+    attention = ht({"action": "attention"})["tasks"]
+    check("needs you lists the turns waiting on you, and no other turn",
+          needy <= {r["id"] for r in attention}
+          and not (hidden & {r["id"] for r in attention}))
+    hv = home.render(recs, now=time.time())
+    head = next(b for b in hv["blocks"] if b.get("type") == "context"
+                and "need you" in json.dumps(b))
+    head = head["elements"][0]["text"]
+    running = sum(1 for r in recs if r["state"] == T.RUNNING and T.on_board(r))
+    queued = sum(1 for r in recs if r["state"] == T.QUEUED and T.on_board(r))
+    check("the Slack board counts as the dashboard does",
+          f"*{len(attention)}* need you" in head and f"*{running}* running" in head
+          and f"*{queued}* queued" in head, head)
+    sec = digest.sections(recs, time.time())
+    waiting = " ".join((sec.get("alpha") or {}).get("waiting") or [])
+    check("the digest counts waiting as the dashboard does",
+          f"{per.get(T.NEEDS_INPUT, 0)} needs input" in waiting
+          and f"{per.get(T.AWAITING_APPROVAL, 0)} awaiting approval" in waiting, waiting)
+    # Where the predicate changes the digest: a turn sitting in a waiting state
+    # it cannot be waiting on you in, and a turn that ran twice in the window.
+    now = time.time()
+    odd = dict(ts.get(t["done"]), id="tsk_oddturn", state=T.AWAITING_APPROVAL,
+               title="a turn parked awaiting approval")
+    twice = dict(ts.get(t["done"]), id="tsk_twice", title="a turn run twice", attempts=2,
+                 events=[{"at": now - 60, "kind": T.RUNNING}])
+    work_twice = dict(ts.get(ids["landed"]), id="tsk_worktwice", title="work run twice",
+                      attempts=2, events=[{"at": now - 60, "kind": T.RUNNING}])
+    sec2 = (digest.sections(recs + [odd, twice, work_twice], now).get("alpha") or {})
+    check("the digest does not count a turn as awaiting your approval",
+          f"{per.get(T.AWAITING_APPROVAL, 0)} awaiting approval"
+          in " ".join(sec2.get("waiting") or []), sec2.get("waiting"))
+    reran = " ".join(sec2.get("reran") or [])
+    check("nor list a turn as run more than once, while work still is",
+          "a turn run twice" not in reran and "work run twice" in reran, reran)
+
+    import projects as P
+    picker = {r["slug"]: r for r in P.summarise(ps.all(include_archived=False), recs,
+                                                T.NEEDS_ATTENTION)}
+    check("the Tasks panel's project picker counts as the list does",
+          picker["alpha"]["total"] == len(alpha_list)
+          and picker["alpha"]["needs"] == sum(1 for r in alpha_list
+                                              if r["state"] in T.NEEDS_ATTENTION),
+          (picker["alpha"], len(alpha_list)))
+    only_turns = dict(ts.get(t["done"]), id="tsk_lone", project="chatty")
+    lone = {r["slug"]: r for r in P.summarise([], [only_turns], T.NEEDS_ATTENTION)}
+    check("and a project holding only turns is still listed, with nothing open",
+          lone.get("chatty", {}).get("total") == 0 and lone["chatty"]["open"] == 0, lone)
+
+    cli = _load_cli()
+    check("silkworm tasks asks for no turns", "turns" not in cli.tasks_query([]))
+    check("silkworm tasks --all asks for them",
+          cli.tasks_query(["--all"]) == {"action": "attention", "turns": True})
+    check("with a state too, either side of it",
+          cli.tasks_query(["running", "--all"]) == cli.tasks_query(["--all", "running"])
+          == {"action": "list", "state": "running", "turns": True})
+    out = io.StringIO()
+    cli.bot_call = lambda path, payload, timeout=10: ht(payload)
+    with contextlib.redirect_stdout(out):
+        rc = cli.do_tasks(["running"])
+    printed = out.getvalue()
+    check("silkworm tasks running lists the running work and not the turn",
+          rc == 0 and ids["running"] in printed and t["running"] not in printed, printed)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.do_tasks(["running", "--all"])
+    check("silkworm tasks running --all lists the turn too", t["running"] in out.getvalue())
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.do_tasks([])
+    check("silkworm tasks says the same number the dashboard does",
+          f"— {len(attention)} task(s)" in out.getvalue(), out.getvalue())
+    # Deploy's wait and status --json must see every running turn.
+    src = (BASE / "bin" / "silkworm").read_text()
+    check("deploy waits on running turns too",
+          '{"action": "list", "state": "running", "turns": True}' in src)
+    check("status --json lists turns too",
+          '"slim": True, "turns": True}' in src)
+
+
+def _turns_route(ts, ps, survey):
+    import board as B, tasks as T, costs, branches, worktrees, holding, roles
+    ns = {"task_store": ts, "project_store": ps, "board": B, "tasks": T, "costs": costs,
+          "branches": branches, "worktrees": worktrees, "holding": holding, "roles": roles,
+          "projects": __import__("projects"), "scoping": __import__("scoping"),
+          "unmerged_survey": lambda recs: survey,
+          "tell_thread": lambda *a: None, "stop_task": lambda tid: True,
+          "research": __import__("research"), "slacklinks": __import__("slacklinks"),
+          "log": logging.getLogger("test"), "time": time}
+    _bot_fns({"handle_tasks", "board_survey", "board_release", "_board_survey",
+              "_board_releases", "_with_costs", "_spend"}, ns)
+    return ns["handle_tasks"], ns
+
+
+def test_conversation_turns_through_the_route():
+    import tasks as T
+    print("\n/tasks hides conversation turns unless asked")
+    ts, ps, ids, survey, _, t = _turns_fixture()
+    ht, _ = _turns_route(ts, ps, survey)
+    for action in ("board", "overview"):
+        plain = json.dumps(ht({"action": action, "project": "alpha"}))
+        shown = json.dumps(ht({"action": action, "project": "alpha", "turns": True}))
+        check(f"{action}: the running turn is off by default", t["running"] not in plain)
+        check(f"{action}: and on when asked", t["running"] in shown)
+    plain = {r["id"] for r in ht({"action": "list"})["tasks"]}
+    shown = {r["id"] for r in ht({"action": "list", "turns": True})["tasks"]}
+    check("list: turns only when asked, bar the ones that need you",
+          set(t.values()) & plain == {t["asks"], t["failed"]}
+          and set(t.values()) <= shown)
+    route = (BASE / "bot.py").read_text()
+    body = route[route.index("def handle_tasks("):route.index("def handle_projects(")]
+    check("the route asks tasks.on_board, not a rule of its own",
+          "tasks.on_board(t, turns)" in body and "counts(turns)" in body)
+
+
+TURNS_DRIVER = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const seed = process.argv[3];          // what this device's storage already holds
+function el(id) {
+  return {id, innerHTML: "", textContent: "", value: "", title: "", className: "",
+          style: {}, disabled: false, checked: false, dataset: {}, children: [],
+          classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+          appendChild() {}, removeChild() {}, remove() {}, addEventListener() {},
+          insertAdjacentHTML(_, h) { this.innerHTML += h; }, focus() {}, scrollIntoView() {},
+          querySelector() { return null; }, querySelectorAll() { return []; }};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+globalThis.document = {getElementById: byId, createElement: () => el("new"),
+                       querySelector: () => null, querySelectorAll: () => [],
+                       addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+const store = seed === "-" ? {} : {"silkworm.showTurns": seed};
+globalThis.localStorage = {getItem: k => (k in store ? store[k] : null),
+                           setItem(k, v) { store[k] = String(v); }};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+const calls = [];
+const card = (id, title, state) => ({id, title, state, role: "assistant", project: "alpha",
+                                     goal: title, created: 1, updated: 1});
+globalThis.fetch = async (url, opts) => {
+  const body = opts && opts.body ? JSON.parse(opts.body) : {};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions: [], slack: {}};
+  else if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  else if (url.startsWith("/api/projects")) out = {ok: true, projects: []};
+  else if (url.startsWith("/api/tasks")) {
+    calls.push(body);
+    if (body.action === "board") out = {ok: true, columns: {
+        backlog: [], review: [], needs: [], done: [],
+        running: [card("tsk_work", "Real work", "running")].concat(
+          body.turns ? [card("tsk_turn", "Just a chat turn", "running")] : [])},
+      counts: {}, roles: ["assistant"]};
+    else if (body.action === "overview") out = {ok: true, projects: [], unfiled: null, archived: []};
+    else if (body.action === "counts") out = {ok: true, counts: body.turns ? {failed: 2} : {failed: 1}};
+    else if (body.action === "list" || body.action === "attention") out = {ok: true, tasks: [], counts: {}};
+    else if (body.action === "roles") out = {ok: true, roles: []};
+  }
+  return {json: async () => out, text: async () => ""};
+};
+(0, eval)(src + `
+;globalThis.__t = {setBoardProject, toggleBoard, setShowTurns, refreshTaskBadge,
+                   get on() { return showTurns; }};`);
+const tick = async () => { for (let i = 0; i < 4; i++) await new Promise(r => setImmediate(r)); };
+(async () => {
+  const P = globalThis.__t, out = {};
+  out.startsOn = P.on;
+  byId("boardmodal").style.display = "none";
+  P.toggleBoard(); await tick();
+  out.overviewCall = calls.filter(c => c.action === "overview").slice(-1)[0];
+  P.setBoardProject("alpha"); await tick();
+  out.boxBefore = byId("bturns").checked;
+  out.boardCallBefore = calls.filter(c => c.action === "board").slice(-1)[0];
+  out.boardBefore = byId("bboard").innerHTML;
+  // Ticking the box: what the checkbox's onchange calls.
+  byId("bturns").checked = true;
+  P.setShowTurns(byId("bturns").checked); await tick();
+  out.stored = store["silkworm.showTurns"];
+  out.boardCallAfter = calls.filter(c => c.action === "board").slice(-1)[0];
+  out.countsCallAfter = calls.filter(c => c.action === "counts").slice(-1)[0];
+  out.boardAfter = byId("bboard").innerHTML;
+  out.badgeAfter = byId("taskbadge").textContent;
+  P.setShowTurns(false); await tick();
+  out.storedOff = store["silkworm.showTurns"];
+  out.boxOff = byId("bturns").checked;
+  out.boardOff = byId("bboard").innerHTML;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_show_conversation_turns_toggle():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe board's 'Show conversation turns' toggle, in the page's own javascript")
+    box = re.search(r'<input type="checkbox" id="bturns"[^>]*>', V.PAGE)
+    check("the board has the toggle", bool(box) and "Show conversation turns" in V.PAGE)
+    check("and it is off in the markup", box and "checked" not in box.group(0).replace(
+        "this.checked", ""), box and box.group(0))
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(TURNS_DRIVER)
+
+    def run(seed):
+        p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), seed],
+                           capture_output=True, text=True, timeout=60)
+        check(f"the page runs (storage {seed!r})", p.returncode == 0, p.stderr[-800:])
+        return json.loads(p.stdout or "{}")
+
+    fresh = run("-")
+    check("off by default on a new device", fresh.get("startsOn") is False)
+    check("the overview does not ask for turns", "turns" not in (fresh.get("overviewCall") or {"turns": 1}))
+    check("nor the board", "turns" not in (fresh.get("boardCallBefore") or {"turns": 1}),
+          fresh.get("boardCallBefore"))
+    check("the box shows unticked", fresh.get("boxBefore") is False)
+    check("the board shows the work and not the turn",
+          "Real work" in fresh.get("boardBefore", "")
+          and "Just a chat turn" not in fresh.get("boardBefore", ""))
+    check("ticking it is remembered on this device", fresh.get("stored") == "1")
+    check("and asks the board for turns", (fresh.get("boardCallAfter") or {}).get("turns") is True)
+    check("and the badge's counts too", (fresh.get("countsCallAfter") or {}).get("turns") is True)
+    check("the turn is drawn", "Just a chat turn" in fresh.get("boardAfter", ""))
+    check("unticking is remembered too, and the turn goes",
+          fresh.get("storedOff") == "0" and fresh.get("boxOff") is False
+          and "Just a chat turn" not in fresh.get("boardOff", ""))
+    again = run("1")
+    check("a device that ticked it starts with it on", again.get("startsOn") is True)
+    check("asks for turns from the first draw",
+          (again.get("overviewCall") or {}).get("turns") is True
+          and (again.get("boardCallBefore") or {}).get("turns") is True)
+    check("and shows the box ticked", again.get("boxBefore") is True)
+    off = run("0")
+    check("a device that unticked it starts with it off", off.get("startsOn") is False)
 
 
 if __name__ == "__main__":

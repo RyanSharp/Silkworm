@@ -439,13 +439,17 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     kids = research.children_by_parent(items)
     items = [dict(t, research_children=kids[t.get("id")]) if t.get("id") in kids else t
              for t in items]
+    # What is listed and counted is the board's (tasks.on_board): conversation
+    # turns are their threads', unless one is waiting on you. Spend is every
+    # record's, turns included.
+    shown = [t for t in items if tasks.on_board(t)]
     attention = sorted(
-        (t for t in items if t.get("state") in tasks.NEEDS_ATTENTION),
+        (t for t in shown if t.get("state") in tasks.NEEDS_ATTENTION),
         key=lambda t: (ORDER.index(t["state"]) if t["state"] in ORDER else 9,
                        -(t.get("updated") or t.get("created") or 0)))
-    running = sorted((t for t in items if t.get("state") == tasks.RUNNING),
+    running = sorted((t for t in shown if t.get("state") == tasks.RUNNING),
                      key=lambda t: -(t.get("updated") or 0))
-    queued = [t for t in items if t.get("state") == tasks.QUEUED]
+    queued = [t for t in shown if t.get("state") == tasks.QUEUED]
     reviews = costs.reviews_by_parent(items)
 
     def cost_of(t):

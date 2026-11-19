@@ -283,8 +283,12 @@ def unmerged_of(row: dict | None) -> dict | None:
 
 def board(records, project: str = "", *, role: str = "", state: str = "",
           q: str = "", unmerged_rows=(), now: float | None = None,
-          done_days: float = DONE_DAYS) -> dict:
+          done_days: float = DONE_DAYS, turns: bool = False) -> dict:
     """{columns: {name: [card]}, counts: {column: n}, roles: [...]}.
+
+    Conversation turns are left off unless `turns` (tasks.on_board): they are
+    shown on their thread, and a running one as its thread's indicator. One
+    waiting on you -- a step handed to you, or a turn that failed -- stays.
 
     Backlog and the open columns are oldest first -- the queue runs in that
     order, and the oldest open item is the one most likely forgotten. Done is
@@ -300,7 +304,7 @@ def board(records, project: str = "", *, role: str = "", state: str = "",
     cols: dict = {c: [] for c in COLUMNS}
     roles_seen = set()
     for rec in records:
-        if not in_project(rec, project):
+        if not in_project(rec, project) or not tasks.on_board(rec, turns):
             continue
         col = column(rec, reviewers, now, done_days)
         if col is None:
@@ -409,15 +413,19 @@ def _last_landed(recs) -> dict | None:
     return best
 
 
-def _summary(slug: str, title: str, recs: list, spend: dict, unmerged_rows) -> dict:
+def _summary(slug: str, title: str, recs: list, spend: dict, unmerged_rows,
+             turns: bool = False) -> dict:
+    # Counted and listed as the board is (tasks.on_board); landings and spend
+    # are read off every record.
+    shown = [r for r in recs if tasks.on_board(r, turns)]
     counts: dict = {}
-    for r in recs:
+    for r in shown:
         if r.get("role") == "reviewer":
             continue
         counts[r.get("state") or "?"] = counts.get(r.get("state") or "?", 0) + 1
     running = [{"id": r.get("id"), "title": r.get("title") or "", "role": r.get("role"),
                 "thread": r.get("thread") or ""}
-               for r in recs if r.get("state") == tasks.RUNNING
+               for r in shown if r.get("state") == tasks.RUNNING
                and r.get("role") != "reviewer"]
     branches_ = [u for u in unmerged_rows if (u.get("project") or "") == (
         "" if slug == UNFILED else slug)]
@@ -435,7 +443,7 @@ def _summary(slug: str, title: str, recs: list, spend: dict, unmerged_rows) -> d
 
 
 def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=None,
-             now: float | None = None, health_rows=()) -> dict:
+             now: float | None = None, health_rows=(), turns: bool = False) -> dict:
     """One card per active project, plus the unfiled lane's.
 
     `releases_by_slug` is {slug: release_status(...)}, supplied already
@@ -461,7 +469,7 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
             continue
         slug = p["slug"]
         row = _summary(slug, p.get("title") or slug, by_slug.get(slug, []), spend,
-                       unmerged_rows)
+                       unmerged_rows, turns)
         row["readiness"] = {
             "test_cmd": (p.get("test_cmd") or "").strip(),
             "auto_merge": bool(p.get("auto_merge")),
@@ -484,11 +492,13 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
         row["health"] = health.board_line(health_by.get(slug, ()))
         out.append(row)
     out.sort(key=lambda r: (-r["needs"], -len(r["running"]), r["title"].lower()))
-    unfiled = _summary(UNFILED, "Unfiled", by_slug.get(UNFILED, []), spend, unmerged_rows)
+    unfiled = _summary(UNFILED, "Unfiled", by_slug.get(UNFILED, []), spend, unmerged_rows,
+                       turns)
     # Archived projects are off the overview but not gone: listed, small, so
     # they can be brought back from the same page they were archived on.
     archived = sorted(({"slug": p["slug"], "title": p.get("title") or p["slug"],
-                        "tasks": len(by_slug.get(p["slug"], []))}
+                        "tasks": sum(tasks.on_board(r, turns)
+                                     for r in by_slug.get(p["slug"], []))}
                        for p in project_records if p.get("archived")),
                       key=lambda r: r["title"].lower())
     return {"projects": out, "unfiled": unfiled, "archived": archived, "note": costs.NOTE}
