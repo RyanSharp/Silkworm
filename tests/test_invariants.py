@@ -35078,6 +35078,21 @@ S.jobs.jobs[0].label = evil; S.env.keys[0].value = evil; S.shadow.blend.reason =
   out.tip = {text: byId("trtip").textContent, display: byId("trtip").style.display};
   T.trShowTip({closest: () => null}, 0, 0);
   out.tipHidden = byId("trtip").style.display;
+  // A phone tap: no pointermove, pointerleave on lift, then click.
+  const tb = byId("trbody");
+  out.tapWired = !!(tb.on && tb.on.click);
+  if (out.tapWired) {
+    tb.on.pointerleave({pointerType: "touch"});
+    tb.on.click({target, clientX: 50, clientY: 60});
+    out.tapTip = {text: byId("trtip").textContent, display: byId("trtip").style.display};
+    tb.on.pointerleave({pointerType: "touch"});
+    out.tapStays = byId("trtip").style.display;
+    tb.on.click({target: {closest: () => null}, clientX: 0, clientY: 0});
+    out.tapOff = byId("trtip").style.display;
+    T.trShowTip(target, 100, 200);
+    tb.on.pointerleave({pointerType: "mouse"});
+    out.mouseLeave = byId("trtip").style.display;
+  }
   out.asked = asked.filter(a => a.url === "/api/trader" || a.method !== "GET" || a.body);
   console.log(JSON.stringify(out));
 })();
@@ -35223,6 +35238,11 @@ def test_trader_tabs_draw_each_tab():
           "Blend shadow" in o["afterTab"] and o["tabAsked"] == 0 and "What to watch" in o["bogusAfter"])
     check("the tooltip shows the point's words, and hides off a point",
           o["tip"] == {"text": "2026-11-16 · $146,848", "display": "block"} and o["tipHidden"] == "none", o["tip"])
+    check("on a phone a tap shows the tip, the lift's pointerleave keeps it, tapping off hides it",
+          o.get("tapWired") and o.get("tapTip") == {"text": "2026-11-16 · $146,848", "display": "block"}
+          and o.get("tapStays") == "block" and o.get("tapOff") == "none",
+          {k: o.get(k) for k in ("tapWired", "tapTip", "tapStays", "tapOff")})
+    check("a mouse leaving the charts still hides the tip", o.get("mouseLeave") == "none", o.get("mouseLeave"))
     check("every request was a GET of /api/trader, with no body",
           o["asked"] and all(x == {"url": "/api/trader", "method": "GET", "body": False} for x in o["asked"]), o["asked"])
 

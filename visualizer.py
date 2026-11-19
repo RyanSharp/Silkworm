@@ -5586,7 +5586,7 @@ function drawTrader() {
   trHideTip();
 }
 // The charts' hover tooltip: the words a point carries in data-tip, beside
-// the pointer (a tap does the same on a phone). Drawing only.
+// the pointer, or the finger on a phone (a tap; see the listeners below). Drawing only.
 function trShowTip(target, x, y) {
   const tip = document.getElementById("trtip"), el = target && target.closest ? target.closest("[data-tip]") : null;
   if (!tip) return;
@@ -5621,8 +5621,13 @@ if (typeof window !== "undefined" && window.addEventListener)
 {
   const tb = typeof document !== "undefined" && document.getElementById("trbody");
   if (tb && tb.addEventListener) {
+    // A mouse hovers; a finger only taps. A tap may send no pointermove, and
+    // its lift sends pointerleave straight after -- so a tap shows the tip on
+    // click (which comes after that leave), tapping off a point hides it, and
+    // only a mouse or pen leaving the charts hides it.
     tb.addEventListener("pointermove", e => trShowTip(e.target, e.clientX, e.clientY));
-    tb.addEventListener("pointerleave", trHideTip);
+    tb.addEventListener("click", e => trShowTip(e.target, e.clientX, e.clientY));
+    tb.addEventListener("pointerleave", e => { if (!e || e.pointerType !== "touch") trHideTip(); });
   }
 }
 
