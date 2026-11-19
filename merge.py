@@ -56,6 +56,10 @@ BASE_FAILING = "base-failing"
 #: checkout passes, not refused. See basered.py's checkout section.
 CHECKOUT_FAILING = "checkout-failing"
 
+#: A landing that broke the base and whose reset back then failed: the base
+#: is left on the merged, failing tree. Needs a person, never a hold.
+RESET_FAILED = "reset-failed"
+
 
 def _fail(stage: str, detail: str) -> dict:
     return {"landed": False, "stage": stage, "detail": detail.strip()[-600:]}
@@ -386,6 +390,22 @@ def land(worktree, repo, branch: str, base: str, run_tests,
                     (Path(repo) / rel).write_bytes(data)
                 except OSError:
                     log.exception("could not put back %s after the reset", rel)
+        # Neither reset's word is taken for it: a held index.lock, a file the
+        # checkout cannot write -- and the base is still the merged, failing
+        # tree. Testing it again at 5b would then be testing the merge, not
+        # the base, and could hold the landing as the checkout's own failure;
+        # and "it was put back" would be untrue. Say what is true instead.
+        now = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        if now != before:
+            log.error("landing %s broke %s and the reset back to %s failed; "
+                      "it is at %s", branch, base_name, before[:8], now[:8] or "?")
+            return {**_tests_failed(
+                        RESET_FAILED,
+                        f"merging broke the base, and it could NOT be put back: "
+                        f"{base_name!r} is still at {now[:8] or 'an unreadable HEAD'}, "
+                        f"not {before[:8]} -- reset it by hand",
+                        after_merge),
+                    "base": base_name, "onto": before}
         # 5b. Who broke it? The tree that just failed here is the tree that
         # passed in the worktree at step 2, file for file, so a failure only
         # here can come from what this checkout has and the worktree does not

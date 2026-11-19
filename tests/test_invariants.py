@@ -22277,6 +22277,47 @@ def _checkout_rig():
     return root, repo, g, branch
 
 
+def test_a_failed_reset_after_merge_is_not_tested_or_called_put_back():
+    import merge as M, verify as V
+    print("\na landing whose reset back fails says so, and skips step 5b")
+    root, repo, g, branch = _checkout_rig()
+    # Fails in the checkout whenever the checkout has the branch's file -- with
+    # or without the branch otherwise, which 5b would read as the checkout's.
+    (repo / "live.txt").write_text("checkout only\n")
+    CMD = ("sh -c 'if [ -f live.txt ]; then echo \"  ✘ test_live\"; exit 1; fi;"
+           " echo \"  ✔ fine\"'")
+    lock = repo / ".git" / "index.lock"
+    seen = []
+
+    def tests(cwd):
+        seen.append(str(cwd))
+        out = V.run(CMD, cwd)
+        if str(cwd) == str(repo):
+            lock.write_text("")             # a git process holding the index
+        return out
+
+    before = g(repo, "rev-parse", "HEAD").stdout.strip()
+    wt, name = branch()
+    try:
+        r = M.land(wt, repo, name, "main", tests, generated=[])
+        head = g(repo, "rev-parse", "HEAD").stdout.strip()
+    finally:
+        lock.unlink(missing_ok=True)
+    check("refused as reset-failed, not held as the checkout's",
+          r.get("stage") == M.RESET_FAILED and not r.get("landed"), str(r)[:300])
+    check("the base really was left on the merged tree", head != before, head)
+    check("the merged tree was not tested again as if it were the base",
+          seen.count(str(repo)) == 1, str(seen))
+    check("it says the base could not be put back, never that it was",
+          "could NOT be put back" in r.get("detail", "")
+          and "was put back" not in r.get("detail", "")
+          and before[:8] in r["detail"] and head[:8] in r["detail"], r.get("detail"))
+    check("naming the failed test, with the base it should be at",
+          r.get("failed") == ["test_live"] and r.get("onto") == before)
+    check("and it needs a person",
+          M.needs_a_person({**r, "eligible": True}))
+
+
 def test_a_failure_only_in_the_checkout_is_the_checkouts():
     import merge as M, verify as V
     print("\na test failing only in the project's checkout is not the branch's fault")
