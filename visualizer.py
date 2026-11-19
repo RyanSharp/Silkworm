@@ -966,7 +966,8 @@ def run_trader_status(cwd: str, timeout: float = TRADER_TIMEOUT_S) -> tuple:
         # Its own process group: on a timeout the whole group is killed, so a
         # child it started (plutil, netstat) cannot keep the pipe -- and this
         # request -- open past the limit.
-        p = subprocess.Popen([str(py), TRADER_SCRIPT, "--json"], cwd=str(root),
+        # No flag: JSON is all it prints (trader 8d47517 refuses --json).
+        p = subprocess.Popen([str(py), TRADER_SCRIPT], cwd=str(root),
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, errors="replace",
                              start_new_session=True)
@@ -1878,6 +1879,8 @@ PAGE = r"""<!doctype html>
                              vertical-align: top; }
   .tr-card th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
   .tr-card .r { text-align: right; }
+  .tr-card .tr-nw { white-space: nowrap; }
+  .tr-card .tr-sl { overflow-wrap: anywhere; }
   .tr-card p { margin: 0 0 6px; }
   .tr-st { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600;
            padding: 1px 7px; border-radius: 9px; white-space: nowrap; max-width: 100%;
@@ -4730,15 +4733,17 @@ function trBook(doc) {
     const cp = trNum(r.cash_pct) ? r.cash_pct : trNum(r.cash) && trNum(r.net_liq) && r.net_liq ? r.cash / r.net_liq : null;
     const cash = trNum(cp) ? trPct(cp, 0) + (trNum(r.cash) ? `<div class="sub">${trMoney(r.cash)}</div>` : "") : "—";
     const doing = trStr(r.doing) || trStr(r.holds) || "—";
-    return `<tr><td>${esc(trStr(r.label || r.name) || "?")}</td><td class="r">${alloc}</td>`
-      + `<td class="r">${trMoney(r.net_liq)}</td><td class="r">${cash}</td><td>${esc(doing)}</td></tr>`;
+    // What it holds goes under its name: a fifth column left no room for a
+    // long sleeve name on a phone or in a third of a laptop's width.
+    return `<tr><td class="tr-sl">${esc(trStr(r.label || r.name) || "?")}<div class="sub">${esc(doing)}</div></td>`
+      + `<td class="r tr-nw">${alloc}</td><td class="r">${trMoney(r.net_liq)}</td><td class="r">${cash}</td></tr>`;
   }).join("");
   const asOf = sm.as_of || (sec.sleeves || {}).as_of;
   const sub = [rows.length ? `${rows.length} sleeve${rows.length === 1 ? "" : "s"}` : "no sleeves reported",
     asOf ? "as of " + trFmt(asOf) : ""].filter(Boolean).join(" · ");
   return `<div class="tr-card"><h4>Book</h4><div class="tr-big">${trMoney(total)}</div>`
     + `<div class="sub">${esc(sub)}</div>`
-    + (rows.length ? `<table><tr><th>sleeve</th><th class="r">alloc</th><th class="r">net liq</th><th class="r">cash</th><th>holds / doing</th></tr>${body}</table>`
+    + (rows.length ? `<table><tr><th>sleeve</th><th class="r">alloc</th><th class="r">net liq</th><th class="r">cash</th></tr>${body}</table>`
                    : `<p class="sub">${trBadge("unknown", "no sleeve data")} ${esc(trStr((sec.sleeves || {}).reason))}</p>`)
     + `</div>`;
 }
@@ -4761,9 +4766,12 @@ function trDrawdown(doc) {
       + `<div class="sub">${trBadge(st, words)} · amber tick = ${trPct(target, 0)} target, red = ${trPct(halt, 0)} halt</div></div>`;
   }).join("");
   const note = sl.peak_note || "Peak is the in-memory one, re-seeded each restart (DURABLE_PEAK is off), so this can understate the true drawdown.";
+  // Not in the document: say whose figures the lines are.
+  const levels = trNum(sl.halt) && trNum(sl.target) ? ""
+    : "The halt and target lines are the design's 40% and 34%; trader_status.py doesn't report them.";
   return `<div class="tr-card"><h4>Drawdown vs the ${trPct(halt, 0)} halt</h4>`
     + (meters || `<p class="sub">${trBadge("unknown", "no sleeve data")}</p>`)
-    + `<div class="tr-note">${esc(trStr(note))}</div></div>`;
+    + `<div class="tr-note">${esc(trStr(note))}${levels ? " " + esc(levels) : ""}</div></div>`;
 }
 function trDoing(doc) {
   const sec = doc.sections || {}, sm = sec.summary || {};
@@ -5171,10 +5179,246 @@ const TRADER_TAB_DRAW = {sleeves: trSleevesTab, activity: trActivityTab, plumbin
 function trTabName(t) { return TRADER_TABS.some(x => x[0] === t) ? t : "summary"; }
 // The whole view -- the tab `tab`, summary by default -- from one /api/trader
 // answer, at `now` (seconds). Pure, so the tests draw fixtures with it.
+// --- reading trader_status.py's own document ---
+// What trader's scripts/trader_status.py (trader 8d47517) prints differs in its
+// field names from what the cards above were written against. This reads the
+// real document under the cards' names, filling a name only where the
+// document lacks it, from a value the document actually carries -- never a
+// default number. What it does not carry (alert delivery, backups, the halt and
+// target levels, the history behind the charts) stays missing and is shown so.
+function trSchedule(s) {
+  if (Array.isArray(s)) return s.map(trSchedule).filter(Boolean).join(", ");
+  if (typeof s === "string") return s;
+  if (!s || typeof s !== "object") return "";
+  const p = n => String(n).padStart(2, "0");
+  if (trNum(s.StartInterval)) {
+    const v = s.StartInterval;
+    return "every " + (v % 3600 === 0 ? v / 3600 + "h" : v % 60 === 0 ? v / 60 + "m" : v + "s");
+  }
+  const at = trNum(s.Hour) ? p(s.Hour) + ":" + p(trNum(s.Minute) ? s.Minute : 0) : trNum(s.Minute) ? "hourly at :" + p(s.Minute) : "";
+  const day = trNum(s.Weekday) ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][s.Weekday] || ""
+    : trNum(s.Day) ? "day " + s.Day : at && trNum(s.Hour) ? "daily" : "";
+  return [day, at].filter(Boolean).join(" ") || "";
+}
+function trNormalize(doc) {
+  if (!doc || typeof doc !== "object" || !doc.sections || typeof doc.sections !== "object") return doc;
+  const d = JSON.parse(JSON.stringify(doc)), S = d.sections;
+  const put = (o, k, v) => { if (o && typeof o === "object" && o[k] === undefined && v !== undefined && v !== null) o[k] = v; };
+  const sec = k => S[k] && typeof S[k] === "object" && !Array.isArray(S[k]) ? S[k] : null;
+  const sm = sec("summary"), sl = sec("sleeves"), gate = sec("gate"), uni = sec("universe"), dis = sec("dispatches"),
+        fil = sec("fills"), job = sec("jobs"), fr = sec("freshness"), hl = sec("health"), host = sec("host"),
+        sh = sec("shadow"), env = sec("env");
+  const genAt = trWhen(d.generated_at);
+  const days = iso => { const t = trWhen(iso); return t != null && genAt != null ? Math.floor((genAt - t) / 86400) : null; };
+
+  // Sleeves: allocation, drawdown, peak, what each holds.
+  const rows = sl && Array.isArray(sl.sleeves) ? sl.sleeves.filter(r => r && typeof r === "object") : [];
+  for (const r of rows) {
+    put(r, "alloc", r.capital_pct); put(r, "drawdown", r.drawdown_from_state_peak);
+    put(r, "peak", r.peak_value); put(r, "state_as_of", r.saved_at);
+    if (Array.isArray(r.positions)) {
+      r.positions = r.positions.map(p => {
+        if (!p || typeof p !== "object") return p;
+        const q = Object.assign({}, p);
+        put(q, "qty", q.quantity); put(q, "mark", q.price);
+        if (q.upnl === undefined && trNum(q.qty) && trNum(q.mark) && trNum(q.avg_cost)) q.upnl = (q.mark - q.avg_cost) * q.qty;
+        return q;
+      });
+      const own = r.holds !== undefined || r.doing !== undefined;     // the view's own names: left alone
+      put(r, "holds", r.positions.filter(p => p && p.symbol).map(p => (trNum(p.qty) ? p.qty + " " : "") + p.symbol));
+      if (!own)
+        r.doing = [r.halted === true ? "HALTED" : "", r.paused === true ? "paused on a pending order" : "",
+          r.positions.length ? "holds " + trStr(r.holds) : "all cash"].filter(Boolean).join("; ");
+    }
+  }
+  if (sm) put(sm, "book_total", trNum(sm.total_net_liq) ? sm.total_net_liq : sl && trNum(sl.total_net_liq) ? sl.total_net_liq : undefined);
+
+  // The verdict: the document gives only its word; the sections say why.
+  if (typeof d.verdict === "string") {
+    const by = sm && sm.by_section && typeof sm.by_section === "object" ? sm.by_section : null;
+    const st = trStatus(d.verdict);
+    const pick = s => by ? Object.keys(by).filter(k => by[k] === s) : [];
+    const bad = pick("bad"), warn = pick("warn"), unk = pick("unknown");
+    // The banner stays short: a bad section's first clause, the rest by name.
+    // The tiles and tabs carry the full reasons.
+    const brief = t => { const c = trStr(t).split(/;\s+/)[0]; return c.length > 140 ? c.slice(0, 139) + "…" : c; };
+    const why = k => k + ": " + (sec(k) && sec(k).reason ? brief(sec(k).reason) : "no reason given");
+    const n = (x, one, many) => x + " " + (x === 1 ? one : many);
+    const headline = st === "ok" ? "Trading normally"
+      : st === "bad" ? "Not OK" + (bad.length ? ": " + n(bad.length, "section", "sections") + " bad" : "")
+          + (warn.length ? ", " + n(warn.length, "thing", "things") + " to look at" : "")
+      : st === "warn" ? "OK, with " + n(warn.length || 1, "thing", "things") + " to look at"
+      : "Status unknown";
+    d.verdict = {status: st, headline, lines: bad.map(why),
+                 look_at: warn.concat(unk.map(k => k + " (unknown)"))};
+  }
+
+  // What it is doing, in words the document already has.
+  if (sm && sm.doing === undefined) {
+    const lines = rows.map(r => trStr(r.label || r.name) + ": " + trStr(r.doing || r.reason))
+      .concat(gate && gate.reason ? ["Credit gate: " + trStr(gate.reason).replace(/^credit gate\s+/i, "")] : [])
+      .concat(fil && fil.reason ? ["Fills: " + trStr(fil.reason)] : []);
+    if (lines.length) sm.doing = lines;
+  }
+
+  // The drill-down tabs' names.
+  if (gate) {
+    put(gate, "on", typeof gate.gate_open === "boolean" ? gate.gate_open : undefined);
+    put(gate, "ma", gate.ratio_ma); put(gate, "window", gate.ma_days);
+    if (gate.margin === undefined && trNum(gate.ratio) && trNum(gate.ratio_ma) && gate.ratio_ma) gate.margin = gate.ratio / gate.ratio_ma - 1;
+  }
+  const side = x => x && typeof x === "object" ? {mode: x.mode, decided: x.decided || x.as_of, n: x.names} : undefined;
+  if (uni) { put(uni, "running", side(uni.loaded)); put(uni, "disk", side(uni.on_disk)); }
+  if (dis && dis.slots === undefined && (Array.isArray(dis.recent) || Array.isArray(dis.missed_slots))) {
+    const done = (Array.isArray(dis.recent) ? dis.recent : []).filter(x => x && typeof x === "object").map(x => ({
+      at: x.at, slot: x.timing, live: x.live, quotes: x.total, fallback: x.stored_close_fallback,
+      dropped: x.dropped, orders: x.orders}));
+    const missed = (Array.isArray(dis.missed_slots) ? dis.missed_slots : []).map(x => x && typeof x === "object"
+      ? {at: x.at || x.slot_at || x.date, slot: x.timing || x.slot, skipped: true, note: x.reason || x.note}
+      : {at: trStr(x), skipped: true});
+    dis.slots = done.concat(missed).sort((a, b) => trStr(a.at) < trStr(b.at) ? -1 : trStr(a.at) > trStr(b.at) ? 1 : 0);
+  }
+  if (fil && fil.fills === undefined && Array.isArray(fil.recent))
+    fil.fills = fil.recent.filter(x => x && typeof x === "object").map(x => ({
+      at: x.opened_at || x.at, sleeve: x.strategy, side: x.side, symbol: x.symbol, qty: x.quantity, price: x.fill_price}));
+  const rvd = host && host.running_vs_disk && typeof host.running_vs_disk === "object" ? host.running_vs_disk : {};
+  const commits = Array.isArray(rvd.commits_since_start) ? rvd.commits_since_start.length : null;
+  const dm = host && host.daemon && typeof host.daemon === "object" ? host.daemon : null;
+  const envAfter = dm && env && trWhen(env.as_of) != null && trWhen(dm.started) != null ? trWhen(env.as_of) > trWhen(dm.started) : null;
+  if (host) {
+    if (dm) {
+      put(dm, "since", dm.started); put(dm, "head", rvd.head);
+      put(dm, "commits_since", commits); put(dm, "env_edited", env ? env.as_of : undefined);
+      put(dm, "env_after_start", envAfter == null ? undefined : envAfter);
+    }
+    const gw = host.gateway && typeof host.gateway === "object" ? host.gateway : null;
+    if (gw) put(gw, "addr", trNum(gw.port) ? "port " + gw.port : undefined);
+    put(host, "boot", host.boot_time);
+  }
+  if (fr) {
+    const snap = fr.snapshot && typeof fr.snapshot === "object" ? fr.snapshot : null;
+    const bars = fr.bars && typeof fr.bars === "object" ? fr.bars : null;
+    if (snap) put(fr, "equity", {newest: snap.last_date});
+    if (bars && fr.groups === undefined)
+      fr.groups = [{name: "bars", label: "live symbols", status: bars.ok === true ? "ok" : bars.ok === false ? "warn" : "unknown",
+                    note: bars.ok === true ? "fresh" : bars.ok === false ? "stale" : "unknown"}];
+  }
+  if (job && Array.isArray(job.jobs))
+    job.jobs = job.jobs.map(x => {
+      if (!x || typeof x !== "object") return x;
+      const y = Object.assign({}, x);
+      if (y.schedule && typeof y.schedule === "object") y.schedule = trSchedule(y.schedule) || "—";
+      put(y, "last_ran", y.last_output); put(y, "exit", y.last_exit);
+      if (y.running === undefined && "pid" in y) y.running = y.pid != null;
+      if (y.note === undefined && y.status && y.status !== "ok" && y.reason) y.note = trStr(y.reason);
+      return y;
+    });
+  if (hl && Array.isArray(hl.checks) && hl.checks.some(c => c && typeof c === "object")) {
+    const cs = hl.checks.filter(c => c && typeof c === "object" && c.name);
+    hl.checks = cs.map(c => c.name);
+    if (hl.runs === undefined) {
+      const run = hl.last_scheduled_run && typeof hl.last_scheduled_run === "object" ? hl.last_scheduled_run : {};
+      hl.runs = [{at: hl.as_of || run.log_mtime,
+                  checks: Object.fromEntries(cs.map(c => [c.name, c.ok === true ? "ok" : c.ok === false ? "fail" : null]))}];
+      put(hl, "note", "Checks as this status run found them (one column: trader_status.py reports no history).");
+    }
+  }
+  if (env && env.keys === undefined && env.values && typeof env.values === "object")
+    env.keys = Object.entries(env.values).map(([key, value]) => ({key, value}));
+  if (sh) {
+    const vm = sh.vm_multi_asset && typeof sh.vm_multi_asset === "object" ? sh.vm_multi_asset : null;
+    const rec = sh.vm_multi_asset_recorded && typeof sh.vm_multi_asset_recorded === "object" ? sh.vm_multi_asset_recorded : null;
+    const stat = (name, x) => x && typeof x === "object" ? {name, total: x.total, vol: x.vol, max_dd: x.mdd} : null;
+    if (vm && sh.c1 === undefined)
+      sh.c1 = {start: vm.start, end: vm.end, days: vm.days, report_at: vm.as_of, correlation: vm.correlation,
+               tracking_error: vm.tracking_error, stats: [stat("shadow", vm.shadow), stat("backtest", vm.backtest)].filter(Boolean),
+               note: rec ? `recorded book newest ${trStr(rec.newest)}` + (trNum(rec.sessions_behind) ? `, ${rec.sessions_behind} session(s) behind` : "") : undefined};
+    const bc = sh.blend_curve && typeof sh.blend_curve === "object" ? sh.blend_curve : null;
+    if (bc && sh.blend === undefined) {
+      const sb = bc.sessions_behind;
+      sh.blend = {status: trNum(sb) ? (sb <= 1 ? "ok" : "warn") : "unknown",
+                  label: trNum(sb) ? (sb ? sb + " session(s) behind" : "current") : "unknown",
+                  reason: `data/shadow_blend/curve.csv: ${trNum(bc.rows) ? bc.rows + " rows, " : ""}newest ${trStr(bc.newest) || "unknown"}`,
+                  last: bc.newest};
+    }
+  }
+
+  // The ten watch tiles, from the sections that carry each one.
+  if (d.watch === undefined) {
+    const w = [];
+    const add = (id, status, label, reason) => w.push({id, status, label, reason});
+    if (dm) {
+      const loaded = uni && uni.loaded && typeof uni.loaded === "object" ? uni.loaded : {};
+      const disk = uni && uni.on_disk && typeof uni.on_disk === "object" ? uni.on_disk : {};
+      const differ = loaded.mode && disk.mode && loaded.mode !== disk.mode;
+      if (dm.pid == null) add("daemon", "bad", "daemon not running", trStr(dm.error) || trStr(host && host.reason));
+      else {
+        const pending = (commits || 0) > 0 || envAfter === true || differ;
+        add("daemon", pending ? "warn" : commits == null && envAfter == null ? "unknown" : "ok",
+            pending ? "restart pending" : commits == null && envAfter == null ? "unknown" : "running = disk",
+            [`PID ${dm.pid}` + (dm.started ? ` up since ${trFmt(dm.started)}` : ""),
+             commits != null ? `${commits} commit(s) since` : "",
+             envAfter === true ? ".env edited after it started" : "",
+             loaded.mode ? `loaded ${loaded.mode} universe` + (disk.mode ? `; disk says ${disk.mode}` : "") : ""]
+              .filter(Boolean).join(" · "));
+      }
+    }
+    if (dis && Array.isArray(dis.recent)) {
+      const rec = (Array.isArray(dis.recent) ? dis.recent : []).filter(x => x && typeof x === "object");
+      const last = rec[rec.length - 1], missed = Array.isArray(dis.missed_slots) ? dis.missed_slots.length : null;
+      const win = trNum(dis.window_sessions) ? ` in ${dis.window_sessions} sessions` : "";
+      if (last) add("dispatch", dis.status, `${trStr(last.timing) || "slot"} ${trFmt(last.at)}`,
+        `${trNum(last.live) ? last.live : "?"}/${trNum(last.total) ? last.total : "?"} live quotes, `
+        + `${trNum(last.stored_close_fallback) ? last.stored_close_fallback : "?"} fallback, ${trNum(last.dropped) ? last.dropped : "?"} dropped, `
+        + `${trNum(last.orders) ? last.orders : "?"} order(s). `
+        + (missed == null ? "Skipped slots unknown." : missed ? `${missed} skipped slot(s)${win}.` : `No skipped slot${win}.`));
+      else add("dispatch", dis.status, "none recorded", trStr(dis.reason));
+    }
+    if (sl && rows.length && rows.some(r => typeof r.halted === "boolean" || typeof r.paused === "boolean")) {
+      const halted = rows.filter(r => r.halted === true), paused = rows.filter(r => r.paused === true);
+      const msgs = hl && Array.isArray(doc.sections.health.checks)
+        ? doc.sections.health.checks.filter(c => c && (c.name === "halt" || c.name === "paused")).map(c => trStr(c.message)) : [];
+      add("guards", halted.length ? "bad" : paused.length ? "warn" : "ok",
+          halted.length ? "halted: " + halted.map(r => r.name).join(", ") : paused.length ? "paused: " + paused.map(r => r.name).join(", ") : "none tripped",
+          msgs.length ? msgs.join("; ") : trStr(sl.reason));
+    }
+    if (fr && fr.snapshot && typeof fr.snapshot === "object") {
+      const s = fr.snapshot, age = days(s.last_date), nan = Array.isArray(s.nan_dates) ? s.nan_dates : [];
+      add("equity", s.ok === true ? "ok" : s.ok === false ? "bad" : "unknown",
+          s.last_date ? `newest ${s.last_date}` + (age != null ? ` (${age}d)` : "") : "no snapshot",
+          [s.ok === false ? trStr(s.message) : "", nan.length ? `NaN rows on ${nan.join(", ")}` : ""].filter(Boolean).join("; ") || "on schedule");
+    }
+    if (fr && fr.bars && typeof fr.bars === "object")
+      add("bars", fr.bars.ok === true ? "ok" : fr.bars.ok === false ? "warn" : "unknown",
+          fr.bars.ok === true ? "fresh" : fr.bars.ok === false ? "stale" : "unknown", trStr(fr.bars.message));
+    if (job && Array.isArray(job.jobs)) {
+      const js = doc.sections.jobs.jobs.filter(x => x && typeof x === "object");
+      const missed = js.filter(x => x.missed === true).length, failing = js.filter(x => x.status && x.status !== "ok").length;
+      add("jobs", job.status, missed ? `${missed} missed` : failing ? `${failing} exited non-zero` : `${js.length} ok`, trStr(job.reason));
+    }
+    if (host && host.gateway && typeof host.gateway === "object") {
+      const g = host.gateway, port = trNum(g.port) ? "port " + g.port : "gateway";
+      add("gateway", g.listening === true ? "ok" : g.listening === false ? "bad" : "unknown",
+          g.listening === true ? port + " up" : g.listening === false ? port + " down" : "unknown", trStr(g.detail));
+    }
+    const envv = env && env.values && typeof env.values === "object" ? env.values : {};
+    add("alerts", "unknown", "not reported", "trader_status.py doesn't report alert delivery (the last page, data/alert_state.json)"
+      + (envv.ALERT_WEBHOOK_URL === "(set)" ? "; ALERT_WEBHOOK_URL is set in .env" : "") + ".");
+    add("backups", "unknown", "not reported", "trader_status.py doesn't report backups (data/journal/*.bak-*, data/paper_state.bak-*)"
+      + (host && trNum(host.disk_free_gb) ? `; ${host.disk_free_gb} GB free` : "") + ".");
+    if (host && host.boot_time) {
+      const t = trWhen(host.boot_time);
+      add("uptime", t != null ? "ok" : "unknown", t != null && genAt != null ? "up " + dur(Math.max(0, Math.round(genAt - t))) : "unknown",
+          `Last boot ${trFmt(host.boot_time)}.`);
+    }
+    d.watch = w;
+  }
+  return d;
+}
 function traderHtml(a, now, tab) {
   if (!a || typeof a !== "object") a = {ok: false, error: "no answer from the dashboard"};
-  if (a.ok && a.doc) return trDoc(a.doc, tab);
-  const doc = a.last_good, gen = doc ? trWhen(doc.generated_at) : null;
+  if (a.ok && a.doc) return trDoc(trNormalize(a.doc), tab);
+  const doc = trNormalize(a.last_good), gen = doc ? trWhen(doc.generated_at) : null;
   const ageFrom = gen != null ? gen : a.last_good_at;
   const head = `<div class="tr-stale">${trBadge("unknown", "status unavailable:")} `
     + `${esc(trStr(a.error) || "unknown reason")}`

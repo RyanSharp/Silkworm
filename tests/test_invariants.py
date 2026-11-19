@@ -34337,9 +34337,10 @@ def test_trader_route_runs_caches_and_times_out():
     argv_log = Path(tempfile.mkdtemp()) / "argv"
     cwd = _fake_trader(f"echo \"$PWD $*\" > '{argv_log}'; exec cat '{TRADER_FIXTURE}'")
     V.run_trader_status(cwd)
-    check("it runs <cwd>/.venv/bin/python3 scripts/trader_status.py --json in the checkout",
-          argv_log.read_text().split() == [str(Path(cwd).resolve()), "scripts/trader_status.py", "--json"]
-          or argv_log.read_text().split() == [cwd, "scripts/trader_status.py", "--json"],
+    # No --json: JSON is all trader 8d47517's script prints, and it refuses the flag.
+    check("it runs <cwd>/.venv/bin/python3 scripts/trader_status.py, no flags, in the checkout",
+          argv_log.read_text().split() == [str(Path(cwd).resolve()), "scripts/trader_status.py"]
+          or argv_log.read_text().split() == [cwd, "scripts/trader_status.py"],
           argv_log.read_text())
     # A hang in a child of the script: the whole group goes, not just the script.
     t0 = time.monotonic()
@@ -34877,8 +34878,9 @@ def test_dashshots_has_a_trader_view_fed_by_the_fixture():
     print("\nbin/dashshots photographs the trader view from the fixture")
     src = (BASE / "bin" / "dashshots").read_text()
     check("a trader view at ?view=trader", '("trader", "/?view=trader")' in src)
-    check("fed by tests/fixtures/trader_status.json through a stand-in checkout",
-          'TRADER_FIXTURE = REPO / "tests" / "fixtures" / "trader_status.json"' in src
+    check("fed by the real-shape capture through a stand-in checkout, another by --trader-fixture",
+          'TRADER_FIXTURE = REPO / "tests" / "fixtures" / "trader_status_real.json"' in src
+          and '"--trader-fixture"' in src
           and "def stand_in_trader" in src and "trader_projects(home, tmp, trader_live)" in src)
     doc = json.loads(TRADER_FIXTURE.read_text())
     sections = {"summary", "sleeves", "gate", "universe", "dispatches", "fills", "jobs",
@@ -34886,8 +34888,8 @@ def test_dashshots_has_a_trader_view_fed_by_the_fixture():
     check("the fixture is a v1 document with every section the emitter promises",
           doc["v"] == 1 and set(doc["sections"]) == sections
           and all({"status", "reason", "source", "as_of"} <= set(s) for s in doc["sections"].values()))
-    # It is the example the emitter's goal points at, so it carries every
-    # field the view reads, in the shape the amendment to tsk_8b1c77e711 states.
+    # The view's own names for every optional field, which the tabs' tests
+    # draw; what trader really prints is trader_status_real.json.
     check("the fixture has every field the view reads",
           {"status", "headline", "lines", "look_at"} <= set(doc["verdict"])
           and isinstance(doc["sections"]["summary"]["book_total"], (int, float))
@@ -34898,6 +34900,129 @@ def test_dashshots_has_a_trader_view_fed_by_the_fixture():
           and [w["id"] for w in doc["watch"]] == ["daemon", "dispatch", "guards", "equity", "bars", "jobs",
                                                  "gateway", "alerts", "backups", "uptime"]
           and all({"id", "status", "label", "reason"} <= set(w) for w in doc["watch"]))
+
+
+
+# --- the Trader view against what trader_status.py really prints ---------------
+# tests/fixtures/trader_status_real.json is trader 8d47517's own output, captured
+# from the live checkout. The cards were written against their own field names;
+# trNormalize reads the real ones under them. Only what the document does not
+# carry may show as missing.
+
+TRADER_REAL_FIXTURE = BASE / "tests" / "fixtures" / "trader_status_real.json"
+
+TRADER_REAL_DRIVER = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const doc = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const contract = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+function el(id) {
+  return {id, textContent: "", value: "", innerHTML: "", style: {}, dataset: {}, children: [],
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) { return c; }, addEventListener() {}, querySelector() { return null; },
+    querySelectorAll() { return []; }, focus() {}, setAttribute() {}};
+}
+const els = {};
+globalThis.document = {getElementById: id => els[id] || (els[id] = el(id)), createElement: () => el("n"),
+  hidden: false, querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.fetch = async url => ({status: 200, headers: {get: () => null}, json: async () =>
+  url.startsWith("/api/sessions") ? {sessions: [], slack: {}}
+  : url.startsWith("/api/stats") ? {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []} : {ok: true}});
+(0, eval)(src + `;globalThis.__t = {traderHtml, trNormalize, TRADER_TABS};`);
+const T = globalThis.__t, now = Date.parse(doc.generated_at) / 1000;
+const out = {tabs: {}};
+for (const [k] of T.TRADER_TABS) out.tabs[k] = T.traderHtml({ok: true, doc}, now, k);
+out.failed = T.traderHtml({ok: false, error: "timed out", last_good: doc}, now + 3600);
+// Filling names never overwrites: the view's own document comes back as it went in.
+out.contractSame = JSON.stringify(T.trNormalize(contract)) === JSON.stringify(contract);
+out.inputUntouched = JSON.stringify(doc) === fs.readFileSync(process.argv[3], "utf8").trim()
+  || JSON.stringify(doc) === JSON.stringify(JSON.parse(fs.readFileSync(process.argv[3], "utf8")));
+out.watch = T.trNormalize(doc).watch;
+console.log(JSON.stringify(out));
+"""
+
+
+def test_trader_view_reads_what_trader_status_really_prints():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe Trader view draws trader_status.py's real document")
+    doc = json.loads(TRADER_REAL_FIXTURE.read_text())
+    check("the capture is trader's own shape: verdict a word, no watch list",
+          doc["v"] == 1 and isinstance(doc["verdict"], str) and "watch" not in doc
+          and "total_net_liq" in doc["sections"]["summary"]
+          and "drawdown_from_state_peak" in doc["sections"]["sleeves"]["sleeves"][0])
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(TRADER_REAL_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(TRADER_REAL_FIXTURE),
+                        str(TRADER_FIXTURE)], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, TZ="America/Los_Angeles"))
+    if p.returncode != 0:
+        check("the view's javascript runs on the real document", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    ICON = '<span aria-hidden="true">'
+    g = o["tabs"]["summary"]
+    text = re.sub(r"<[^>]+>", " ", g)
+    check("the verdict is the document's word, with a headline from its section counts",
+          'class="tr-verdict bad"' in g and ICON + "✕</span> not OK</span> Not OK: 2 sections bad, 5 things to look at</h3>" in g
+          and "<p>freshness: last equity snapshot 2026-11-16 — more sessions behind than the daily report leaves it</p>" in g
+          and "<b>Look at:</b> universe; jobs; host; shadow; env</p>" in g, g[:700])
+    check("the book card: total, then each sleeve's allocation, net liq, cash and holdings",
+          "$196,999" in g and "75% · 1.0x" in g and "25% · 1.0x" in g and "$146,848" in g
+          and "$50,152" in g and "100%" in g and "91%" in g and "all cash" in g and "holds 45 VNQ" in g, text[:900])
+    check("drawdown meters from the state peak, against the 40% halt and 34% tick",
+          "22.9% from peak $190,510" in g and "3.5% from peak $51,970" in g
+          and "17.1pp to the halt" in g and "36.5pp to the halt" in g
+          and g.count('<u style="left:68.0%">') == 2 and g.count('<b style="left:80.0%">') == 2)
+    check("and says the halt and target lines are not from the document",
+          "The halt and target lines are the design&#39;s" in g or "The halt and target lines are the design's" in g)
+    check("what it is doing, in the document's own words",
+          "CreditGatedMomentum: all cash" in g and "CrossAssetTrend: holds 45 VNQ" in g
+          and "Credit gate: CLOSED — momentum rebalances to cash" in g and "Fills: 5 fills in the last 7 days" in g)
+    want = {"daemon": ("warn", "restart pending"), "dispatch": ("ok", "open Thu Nov 19 06:33"),
+            "guards": ("ok", "none tripped"), "equity": ("bad", "newest 2026-11-16 (3d)"),
+            "bars": ("ok", "fresh"), "jobs": ("warn", "4 exited non-zero"),
+            "gateway": ("ok", "port 4002 up"), "alerts": ("unknown", "not reported"),
+            "backups": ("unknown", "not reported"), "uptime": ("ok", "up 16d19")}
+    got = {w["id"]: (w["status"], w["label"]) for w in o["watch"]}
+    check("all ten tiles come from the document, in the audit's order",
+          [w["id"] for w in o["watch"]] == list(want) and got == want, got)
+    tiles = re.findall(r'<div class="tr-w" data-watch="(\w+)">(.*?)</span></div>', g)
+    check("every tile drawn with its icon and label",
+          [t[0] for t in tiles] == list(want)
+          and all(re.search(r'class="tr-st (ok|warn|bad|unknown)"[^>]*><span aria-hidden="true">[✓!✕?]</span> \S', h)
+                  for _, h in tiles))
+    check("only what the document lacks is 'not reported': alert delivery and backups",
+          g.count("not reported") == 2 and "doesn&#39;t report alert delivery" in g.replace("'", "&#39;")
+          and "No skipped slot in 10 sessions" in g and "PID 84984 up since Sun Nov 15 08:00" in g, text[-1500:])
+    for k, h in o["tabs"].items():
+        # "NaN rows" is the document's own words; a NaN figure is not.
+        bad = [x for x in ("[object Object]", "$NaN", "NaN%", ">NaN<", "NaNpp", "undefined", ">null<", "Infinity") if x in h]
+        check(f"the {k} tab draws the real document with no {', '.join(bad) or 'stray value'}", not bad)
+    t = o["tabs"]
+    check("Sleeves: positions, credit gate state and window, universe running vs disk",
+          "VNQ" in t["sleeves"] and "95.19" in t["sleeves"] and "OFF (risk-off)" in t["sleeves"]
+          and "100-day avg 0.7465" in t["sleeves"] and "running ≠ disk" in t["sleeves"])
+    check("Activity: the dispatch slots and journal fills",
+          t["activity"].count("62/62") >= 6 and "DBC" in t["activity"] and "positions not reported" not in t["activity"])
+    check("Plumbing: launchd schedules in words, health checks, non-secret .env",
+          "daily 18:30" in t["plumbing"] and "every 2m" in t["plumbing"] and "Mon 08:00" in t["plumbing"]
+          and "snapshot" in t["plumbing"] and "MOMENTUM_UNIVERSE" in t["plumbing"] and "(set)" in t["plumbing"])
+    check("Shadow: the C1 shadow's span and stats, the blend curve's state",
+          "2026-10-26 → 2026-11-13" in t["shadow"] and "−2.5%" in t["shadow"] and "2026-11-16" in t["shadow"])
+    check("a failed run draws the real last good document the same way",
+          "status unavailable:" in o["failed"] and "$196,999" in o["failed"] and "restart pending" in o["failed"])
+    check("filling names never overwrites: the view's own fixture comes back unchanged", o["contractSame"])
 
 
 # --- conversation turns off the board -------------------------------------------

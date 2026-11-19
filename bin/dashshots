@@ -22,7 +22,8 @@ real bot (the task board, projects, roles, learnings) and refuses every
 action; a release plan is a fixed sample, since a real one fetches origin.
 Transcripts are read where they are, as the dashboard always does.
 
-The trader view is fed tests/fixtures/trader_status.json: the copy's
+The trader views are fed tests/fixtures/trader_status_real.json (what
+trader's status script really prints; --trader-fixture names another): the copy's
 projects.json points the trader project at a stand-in checkout whose
 scripts/trader_status.py "runs" by printing that fixture, so the dashboard's
 own subprocess, cache and render path are what is photographed. With
@@ -67,8 +68,11 @@ READ_LEARNINGS = {"list"}
 #: Routes that only ever read: whether the bot is up, and a thread's live turn.
 READ_ROUTES = {"/status", "/thread-state"}
 
-#: The trader status document the trader view draws (visualizer /api/trader).
-TRADER_FIXTURE = REPO / "tests" / "fixtures" / "trader_status.json"
+#: The trader status document the trader views draw (visualizer /api/trader):
+#: what trader's scripts/trader_status.py really prints (captured from trader
+#: 8d47517). --trader-fixture names another, e.g. tests/fixtures/
+#: trader_status.json, which carries every optional field the tabs can draw.
+TRADER_FIXTURE = REPO / "tests" / "fixtures" / "trader_status_real.json"
 
 #: A release plan to draw, shaped as releases.plan answers.
 SAMPLE_PLAN = {
@@ -173,7 +177,7 @@ def forward(port: str, path: str, payload: dict) -> dict:
 
 # --- the dashboard copy --------------------------------------------------------
 
-def stand_in_trader(tmp: Path) -> Path:
+def stand_in_trader(tmp: Path, fixture: Path = None) -> Path:
     """A trader checkout that only prints the fixture: .venv/bin/python3 is a
     shell script that cats it, whatever it is asked to run."""
     root = tmp / "trader-standin"
@@ -181,7 +185,7 @@ def stand_in_trader(tmp: Path) -> Path:
     (root / "scripts").mkdir(exist_ok=True)
     (root / "scripts" / "trader_status.py").write_text("# stand-in: see .venv/bin/python3\n")
     py = root / ".venv" / "bin" / "python3"
-    py.write_text(f"#!/bin/sh\nexec cat '{TRADER_FIXTURE}'\n")
+    py.write_text(f"#!/bin/sh\nexec cat '{fixture or TRADER_FIXTURE}'\n")
     py.chmod(0o755)
     return root
 
@@ -408,9 +412,14 @@ def main():
     ap.add_argument("--project", default="silkworm")
     ap.add_argument("--wait", type=float, default=5.0, help="seconds per view to settle")
     ap.add_argument("--list", action="store_true", help="print the views and exit")
+    ap.add_argument("--trader-fixture", default="",
+                    help="the status document the trader views draw (default: the real-shape capture)")
     ap.add_argument("--trader-live", action="store_true",
                     help="draw the trader view from the real trader checkout, not the fixture")
     a = ap.parse_args()
+    if a.trader_fixture:
+        global TRADER_FIXTURE
+        TRADER_FIXTURE = Path(a.trader_fixture).resolve()
 
     home = live_home()
     real_port = env_value(home / ".env", "APPROVAL_PORT") or "8787"
