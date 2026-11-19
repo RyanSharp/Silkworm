@@ -7656,6 +7656,15 @@ def _task_scheduler() -> None:
     except Exception:
         log.exception("closing out interrupted tasks failed")
     try:
+        # Titles and goals filed with the operator's "--by operator" still on
+        # them, from before `silkworm task` took --by. Idempotent.
+        cleaned = task_store.strip_leaked_flags()
+        if cleaned:
+            log.info("took a leaked --by off %d task(s): %s", len(cleaned),
+                     ", ".join(cleaned))
+    except Exception:
+        log.exception("cleaning leaked --by from task titles failed")
+    try:
         # A landing runs on a daemon thread, which a restart ends mid-merge. Its
         # marker is durable, so without this the board keeps saying "landing…"
         # about something that stopped days ago.

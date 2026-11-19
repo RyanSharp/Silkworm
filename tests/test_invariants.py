@@ -34507,7 +34507,7 @@ REAL_GOALS = (
     "Test flight build doesn't have latest updates to the code base. We should release these.",
     "Look over the Trader project and propose work worth doing.\n\nRead what is actually there before suggesting anything.",
     "Make SupabaseSyncService.push() testable, and stop it swallowing every error it hits",
-    "--by operator Keep an ops plan open until the user actually answers it",
+    "Keep an ops plan open until the user actually answers it",
     "From review: Land silkworm/tsk_76e96e9d9c (stops the daemon writing halt markers) once main has it",
     "Decide whether to drop silkworm/tsk_343f6af22a and silkworm/tsk_7b290f1a2c after tsk_5ea770d699 lands",
     "cadence: give the widget a fallback card when there is nothing due today",
@@ -36203,6 +36203,161 @@ def test_viz_chat_keeps_its_place():
     check("with no ResizeObserver, the keyboard opening still keeps the latest message shown",
           n["keyboard-open:bottom"]["gap"] <= 1 and n["keyboard-open:bottom"]["latestShown"]
           and abs(n["keyboard-open:up"]["moved"]) <= 1, (n["keyboard-open:bottom"], n["keyboard-open:up"]))
+
+
+def _cli_file(cli, argv, w, key="D7:7.0", role="operator"):
+    """do_file_task(argv) against the shared route; (exit code, output, sent)."""
+    sent = []
+    cli.bot_call = lambda path, payload, timeout=3: (sent.append((path, payload)) or
+                                                     w.file(dict(payload, key=key)))
+    env = {"SILKWORM_THREAD": key, "SILKWORM_ROLE": role, "SILKWORM_TASK_ID": ""}
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                cli.do_file_task(argv)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+            except Exception as e:  # a crash is a failure to check, not to raise
+                code = f"raised {type(e).__name__}"
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return code, buf.getvalue(), sent
+
+
+def test_task_cli_takes_by_and_refuses_unknown_options():
+    print("\nfiling: `silkworm task --by operator` files the goal, not the flag")
+    cli = _load_cli()
+    goal = ("Executing the operator's recommendation: refile the trader status "
+            "emitter under trader")
+    # The shape of the 2026-11-19 04:10 filing that became tsk_8b1c77e711.
+    w = _requested_world()
+    code, out, sent = _cli_file(cli, ["--project", "beta", "--role", "implementor",
+                                      "--propose", "--by", "operator", goal], w)
+    check("--by is taken as an option", code == 0 and sent
+          and sent[0][1]["goal"] == goal, (code, out, sent))
+    filed = [t for t in w.ts.all().values() if t.get("goal") == goal]
+    check("and the stored title and goal start with the work", filed
+          and not filed[0]["title"].startswith("--")
+          and filed[0]["goal"] == goal, filed)
+
+    w = _requested_world()
+    before = dict(w.ts.all())
+    code, out, sent = _cli_file(cli, ["--projct", "alpha", goal], w)
+    check("an unknown option is refused by name, exit 2", code == 2
+          and "unknown option --projct" in out and not sent, (code, out))
+    code, out, sent = _cli_file(cli, [goal, "--notes"], w)
+    check("an option missing its value is refused, not filed as goal text",
+          code == 2 and "--notes needs a value" in out and not sent, (code, out))
+    check("nothing filed by either", w.ts.all() == before)
+    code, out, sent = _cli_file(cli, ["--propose", "--", "--dry-run mode for the "
+                                      "importer, so it reports without writing"], w)
+    check("after --, words that look like options go to the route as goal",
+          sent and sent[0][1]["goal"].startswith("--dry-run"), (code, out))
+    check("where the shared check refuses a goal that opens with an option",
+          code == 1 and "an option rather than the work" in out, (code, out))
+
+
+def test_a_goal_starting_with_an_option_is_refused_at_every_door():
+    import scoping as S
+    print("\nfiling: a goal that starts with a leaked --option is refused")
+    for goal in ("--by operator Executing the operator's recommendation on tasks pending",
+                 "--notes User said yes --by operator do the thing now please"):
+        err = S.validate(goal)
+        check(f"{goal[:30]!r} refused as an option", "an option rather than the work" in err, err)
+    check("a single-dash list item is still work",
+          S.validate("- sometimes when cropping an image, after saving it doesn't save") == "")
+    check("an option later in the goal is fine",
+          S.validate("Run git branch --show-current and report it back") == "")
+    w = _requested_world()
+    before = dict(w.ts.all())
+    out = w.file({"key": "D7:7.0", "goal": "--by operator Make the plain-yes parser lenient",
+                  "project": "alpha"})
+    check("the shared route refuses it and files nothing",
+          not out["ok"] and "an option" in out.get("error", "") and w.ts.all() == before, out)
+
+
+def test_strip_leaked_flags_cleans_the_shapes_the_leak_made():
+    import tasks as T
+    from tasks import TaskStore
+    print("\ntasks: a leaked --by is taken off stored titles and goals, once")
+    path = Path(tempfile.mkdtemp()) / "t.json"
+    ts = TaskStore(path)
+    work = ts.create("--by operator Executing the operator's recommendation on tasks "
+                     "pending the owner's input: refile it", driver="queue", project="trader")
+    ts.transition(work["id"], T.RUNNING, "claimed")
+    ts.transition(work["id"], T.DONE, "done")
+    review = ts.create("Goal that was given:\n--by operator Executing the operator's "
+                       "recommendation", title="Review: --by operator Executing the op",
+                       driver="queue", role="reviewer")
+    follow = ts.create("A review of tsk_8b1c77e711 (--by operator Executing the op…) "
+                       "found this", title="From review: the goal names a missing file",
+                       driver="queue")
+    nested = ts.create("Goal that was given:\nA review of tsk_06b789e3ff (--by operator Keep "
+                       "an ops plan open) found this", driver="queue", role="reviewer")
+    notes = ts.create("--by operator --notes User 2026-10-26: 'You should be able to run "
+                      "these yourself'. Give the operator a way", driver="queue")
+    keep = ts.create("Run pwd and git branch --show-current, then sleep 30", driver="queue")
+    keep2 = ts.create("- sometimes when cropping an image it doesn't save", driver="queue")
+    keep_before = (ts.get(keep["id"]), ts.get(keep2["id"]))
+    changed = ts.strip_leaked_flags()
+    check("every leaked shape is changed, nothing else",
+          sorted(changed) == sorted([work["id"], review["id"], follow["id"],
+                                     nested["id"], notes["id"]]), changed)
+    check("a review of a follow-up loses it inside both prefixes",
+          ts.get(nested["id"])["goal"].startswith(
+              "Goal that was given:\nA review of tsk_06b789e3ff (Keep"), ts.get(nested["id"]))
+    check("a --notes leaked behind it goes too",
+          ts.get(notes["id"])["goal"].startswith("User 2026-10-26:")
+          and ts.get(notes["id"])["title"].startswith("User 2026-10-26:"), ts.get(notes["id"]))
+    w = ts.get(work["id"])
+    check("a finished task's goal and title lose the flag",
+          w["goal"].startswith("Executing the operator's") and w["title"].startswith("Executing")
+          and w["state"] == T.DONE, w)
+    r = ts.get(review["id"])
+    check("a review keeps its own prefix",
+          r["title"] == "Review: Executing the op"
+          and r["goal"].startswith("Goal that was given:\nExecuting"), r)
+    f = ts.get(follow["id"])
+    check("a follow-up's quoted parent loses it",
+          f["goal"].startswith("A review of tsk_8b1c77e711 (Executing")
+          and f["title"] == "From review: the goal names a missing file", f)
+    check("the change is recorded as an event",
+          w["events"][-1]["kind"] == "edited" and "--by" in w["events"][-1]["detail"])
+    check("goals with options mid-text are untouched",
+          (ts.get(keep["id"]), ts.get(keep2["id"])) == keep_before)
+    check("saved to disk", TaskStore(path).get(work["id"])["goal"] == w["goal"])
+    check("a second pass changes nothing", ts.strip_leaked_flags() == [])
+    # A failed save leaves memory as it was, as every other store write does.
+    ts.create("--by operator another leaked filing for the save test", driver="queue")
+    real = ts._save
+    ts._save = lambda: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        ts.strip_leaked_flags()
+        raised = False
+    except OSError:
+        raised = True
+    ts._save = real
+    check("a failed save raises and restores the record", raised and any(
+        t["goal"].startswith("--by operator another") for t in ts.all().values()))
+
+
+def test_startup_cleans_leaked_flags():
+    import ast
+    print("\nstartup: the leaked --by repair runs with the other restart repairs")
+    src = (BASE / "bot.py").read_text()
+    calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "strip_leaked_flags"]
+    check("bot.py calls task_store.strip_leaked_flags()", len(calls) == 1
+          and isinstance(calls[0].func.value, ast.Name)
+          and calls[0].func.value.id == "task_store")
 
 if __name__ == "__main__":
     tests = discover()

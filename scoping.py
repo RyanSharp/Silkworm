@@ -193,6 +193,14 @@ def shape_refusal(goal: str) -> str:
     an edit, a review's follow-ups -- refuses the same things.
     """
     words = (goal or "").split()
+    if words and words[0].startswith("--"):
+        # A command-line option that reached the goal: the filer's flags, not
+        # the work. Refused at every door so it is never filed again as
+        # "--by operator <goal>" was, ~40 times, before the CLI took --by.
+        return (f"the goal starts with {words[0]!r}, an option "
+                "rather than the work -- check the command's flags; "
+                "`silkworm task` takes --project, --role, --propose, --health, "
+                "--requested-by-user, --notes and --by.")
     if words:
         rest = words[1:]
         if (words[0].strip(_PUNCT).lower() in LOOKUP_VERBS

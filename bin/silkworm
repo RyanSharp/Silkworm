@@ -1130,28 +1130,51 @@ def do_file_task(argv) -> None:
         raise SystemExit(1)
     project, role, goal, propose, check = "", "", [], False, ""
     requested, notes = False, ""
+    usage = ('usage: silkworm task [--propose] [--project <slug>] '
+             '[--role implementor|assistant|researcher] '
+             '[--health <project>/<check>] '
+             '[--requested-by-user --notes "<the user\'s request>"] '
+             '[--by <name>] "<goal>"')
+    valued = ("--notes", "--project", "--role", "--health", "--by")
     i = 0
     while i < len(argv):
-        if argv[i] == "--propose":
+        a = argv[i]
+        if a == "--":
+            # Everything after is goal, even words that look like options.
+            goal.extend(argv[i + 1:]); break
+        if a == "--propose":
             propose = True; i += 1
-        elif argv[i] == "--requested-by-user":
+        elif a == "--requested-by-user":
             requested = True; i += 1
-        elif argv[i] == "--notes" and i + 1 < len(argv):
-            notes = argv[i + 1]; i += 2
-        elif argv[i] == "--project" and i + 1 < len(argv):
-            project = argv[i + 1]; i += 2
-        elif argv[i] == "--role" and i + 1 < len(argv):
-            role = argv[i + 1]; i += 2
-        elif argv[i] == "--health" and i + 1 < len(argv):
-            check = argv[i + 1]; i += 2
+        elif a in valued:
+            if i + 1 >= len(argv):
+                print(f"not filed: {a} needs a value\n{usage}")
+                raise SystemExit(2)
+            v = argv[i + 1]
+            if a == "--notes":
+                notes = v
+            elif a == "--project":
+                project = v
+            elif a == "--role":
+                role = v
+            elif a == "--health":
+                check = v
+            # --by is taken because every other action takes it and the
+            # operator is told to pass it; who filed a task is recorded from
+            # the run itself (bot.filer_role), not from this. Before it was
+            # taken here, "--by operator" fell through into the goal and
+            # opened ~40 stored titles and goals (tsk_8b1c77e711 and others).
+            i += 2
+        elif a.startswith("--"):
+            # An option this command does not know is a mistake, not goal
+            # text: refuse it rather than file it at the front of the goal.
+            print(f"not filed: unknown option {a}\n{usage}")
+            raise SystemExit(2)
         else:
-            goal.append(argv[i]); i += 1
+            goal.append(a); i += 1
     goal = " ".join(goal).strip()
     if not goal:
-        print('usage: silkworm task [--propose] [--project <slug>] '
-              '[--role implementor|assistant|researcher] '
-              '[--health <project>/<check>] '
-              '[--requested-by-user --notes "<the user\'s request>"] "<goal>"')
+        print(usage)
         raise SystemExit(2)
     if requested and not notes.strip():
         print("not filed: --requested-by-user needs --notes quoting what the user asked for")

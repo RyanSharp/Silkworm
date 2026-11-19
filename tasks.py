@@ -13,6 +13,7 @@ means "old record" or "nothing happened".
 
 import copy
 import logging
+import re
 import threading
 import time
 import uuid
@@ -201,6 +202,16 @@ RUNNING_BUSY = "it is running; wait for it to finish, or cancel it"
 #: How a step handed to you is said in the event that parks the task, so the
 #: digest can tell it from a task held for a reason of the system's own.
 NEEDS_USER_PREFIX = "yours to do: "
+
+
+#: The front of a title or goal that `silkworm task` filed with the caller's
+#: "--by <name>" still on it (see TaskStore.strip_leaked_flags): at the very
+#: start, after a review's "Review: " or "Goal that was given:\n", inside a
+#: follow-up's "A review of tsk_… (", or both (a review of a follow-up). One
+#: filing (tsk_57bb9d4968) also carried "--notes " straight after it, its
+#: note's words run into the goal. Group 1 is what stays.
+_LEAKED_BY = re.compile(r"^((?:Review: |Goal that was given:\n)?"
+                        r"(?:A review of tsk_[0-9a-f]+ \()?)--by \S+ (?:--notes )?")
 
 
 #: Where a task's goal, project and role can still change: it has not run.
@@ -1236,6 +1247,47 @@ class TaskStore:
             rec["updated"] = time.time()
             self._save_or_restore(tid, prior)
             return dict(rec)
+
+    def strip_leaked_flags(self) -> list[str]:
+        """Take a leaked `--by <name>` off the front of stored titles and goals.
+
+        Until `silkworm task` took --by, the operator's "--by operator" fell
+        through into the goal it filed, and from there into the title, the
+        review's "Review: …" title and "Goal that was given:" text, and a
+        follow-up's "A review of tsk_… (…)". It is the filer's flag, not the
+        work, so taking it off changes nothing anyone was asked to do; unlike
+        an edit, this is allowed on work that already ran. Only the exact
+        shapes the leak produced are touched, each recorded as an event.
+        Idempotent: a second pass finds nothing. Returns the ids it changed.
+        """
+        changed = []
+        with self._lock:
+            priors = {}
+            for tid, rec in self._data.items():
+                diff = {}
+                for k in ("title", "goal"):
+                    v = rec.get(k)
+                    if isinstance(v, str):
+                        clean = _LEAKED_BY.sub(r"\1", v, count=1)
+                        if clean != v:
+                            diff[k] = clean
+                if not diff:
+                    continue
+                priors[tid] = copy.deepcopy(rec)
+                rec.update(diff)
+                events = rec.setdefault("events", [])
+                events.append({"at": time.time(), "kind": "edited",
+                               "detail": "cleaned: a leaked '--by' option taken off the "
+                                         f"{' and '.join(diff)}"})
+                del events[:-50]
+                changed.append(tid)
+            if changed:
+                try:
+                    self._save()
+                except BaseException:
+                    self._data.update(priors)
+                    raise
+        return changed
 
     def requeue_interrupted(self) -> int:
         """Return tasks left mid-run by a restart to the queue.
