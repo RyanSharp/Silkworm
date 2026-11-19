@@ -1901,6 +1901,54 @@ PAGE = r"""<!doctype html>
           font-size: 13.5px; min-width: 0; }
   .tr-w .k { font-size: 11.5px; color: var(--muted); }
   .tr-w .sub { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+  /* the Trader drill-down tabs */
+  .tr-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 4px; }
+  .tr-tab { background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 14px;
+            font: inherit; font-size: 13px; padding: 3px 11px; cursor: pointer; }
+  .tr-tab.on { background: var(--panel); border-color: #ffffff40; font-weight: 600; }
+  .tr-card.wide { grid-column: 1 / -1; }
+  .tr-card h4 .tr-st { text-transform: none; letter-spacing: 0; font-size: 11px; margin-left: 4px; }
+  .tr-card h4.tr-name { text-transform: none; letter-spacing: 0; font-size: 15px; color: var(--ink); margin-bottom: 2px; }
+  .tr-card h4.tr-sh { margin: 12px 0 4px; }
+  .tr-nums { display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0 6px; }
+  .tr-nums .tr-big { font-size: 20px; }
+  .tr-x { overflow-x: auto; max-width: 100%; }
+  .tr-card table.tr-kv th { color: var(--muted); font-weight: 500; width: 7.5em; font-size: 12.5px; }
+  .tr-card table.tr-kv th.mono { width: auto; white-space: nowrap; }
+  .tr-card .mono, .tr-rej .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .tr-card td.tr-wrap { overflow-wrap: anywhere; min-width: 12em; }
+  .tr-card tr.tr-skip td { background: #E5546B26; color: #F2A3B0; }
+  .tr-card td.tr-when { white-space: nowrap; }
+  .tr-card tr.tr-nanrow td { background: #E5546B14; }
+  .tr-chart { display: block; width: 100%; height: auto; margin: 4px 0 2px; }
+  .tr-chart.empty { padding: 6px 0; }
+  .tr-chart .l { fill: none; stroke: #6FB4E8; stroke-width: 1.6; }
+  .tr-chart .l2 { fill: none; stroke: #C9A8CC; stroke-width: 1.2; stroke-dasharray: 3 3; }
+  .tr-chart .g { stroke: #ffffff14; }
+  .tr-chart .ax { fill: #B9A3BC; font: 9px var(--mono); }
+  .tr-chart .ref { stroke: #E5546B; stroke-width: 1.2; stroke-dasharray: 4 3; }
+  .tr-chart .reft { fill: #E5546B; font: 9px var(--mono); }
+  .tr-chart .nan { fill: #E5546B; opacity: .45; }
+  .tr-chart .dot { fill: #6FB4E8; }
+  .tr-chart .hit { fill: transparent; }
+  .tr-chart .hit:hover { fill: #ffffff10; }
+  .tr-tbl summary { cursor: pointer; color: var(--muted); font-size: 12px; margin: 2px 0 4px; }
+  .tr-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 8px; }
+  .tr-chip { font: 11.5px var(--mono); border-radius: 5px; padding: 1px 5px; }
+  .tr-chip.in { color: #2EB67D; background: #2EB67D1f; }
+  .tr-chip.out { color: #E5546B; background: #E5546B22; }
+  .tr-rej > div { padding: 4px 0; border-bottom: 1px solid #57265B80; }
+  .tr-hgrid td, .tr-hgrid th { text-align: center; padding: 3px 2px; }
+  .tr-hgrid td:first-child, .tr-hgrid th:first-child { text-align: left; padding-right: 8px; }
+  .tr-hgrid th.c { font: 9.5px var(--mono); writing-mode: vertical-rl; transform: rotate(180deg); }
+  .tr-hc { display: inline-block; width: 16px; height: 16px; line-height: 16px; border-radius: 3px;
+           font-size: 10px; font-weight: 700; }
+  .tr-hc.ok { background: #2EB67D; color: #0b2a1c; }
+  .tr-hc.bad { background: #E5546B; color: #2a0b10; }
+  .tr-hc.none { background: #ffffff12; color: var(--muted); }
+  .tr-lead { margin: 2px 0 10px; }
+  .tr-tip { position: fixed; display: none; z-index: 60; pointer-events: none; max-width: 230px;
+            background: #000000e0; color: #fff; font: 11.5px var(--mono); padding: 4px 7px; border-radius: 6px; }
   /* projects overview and per-project boards */
   #boardmodal { position: fixed; inset: 0; background: #14041699; z-index: 40;
                 display: none; align-items: flex-start; justify-content: center; padding: 30px 16px; }
@@ -2486,7 +2534,9 @@ PAGE = r"""<!doctype html>
   <div class="box">
     <button class="ghost xclose" onclick="toggleTrader()" title="close">✕</button>
     <h2>📈 Trader <span class="ro">read-only</span> <span class="asof" id="trasof"></span></h2>
+    <div class="tr-tabs" role="tablist"><button id="trtab-summary" class="tr-tab on" role="tab" onclick="trTab('summary')">Summary</button><button id="trtab-sleeves" class="tr-tab" role="tab" onclick="trTab('sleeves')">Sleeves</button><button id="trtab-activity" class="tr-tab" role="tab" onclick="trTab('activity')">Activity</button><button id="trtab-plumbing" class="tr-tab" role="tab" onclick="trTab('plumbing')">Plumbing</button><button id="trtab-shadow" class="tr-tab" role="tab" onclick="trTab('shadow')">Shadow</button></div>
     <div id="trbody"><div class="hint">Reading trader's status…</div></div>
+    <div id="trtip" class="tr-tip" role="tooltip"></div>
   </div>
 </div>
 <div id="learnmodal" onclick="if(event.target.id==='learnmodal')toggleLearn()">
@@ -4742,17 +4792,384 @@ function trWatch(doc) {
     return `<div class="tr-w" data-watch="${id}"><div class="k">${i + 1}. ${esc(title)}</div>${badge}<span class="sub">${esc(reason)}</span></div>`;
   }).join("");
 }
-function trDoc(doc) {
+function trDoc(doc, tab) {
+  const draw = TRADER_TAB_DRAW[trTabName(tab)];
+  if (draw) return draw(doc);
   return trVerdict(doc)
     + `<div class="tr-grid">${trBook(doc)}${trDrawdown(doc)}${trDoing(doc)}</div>`
     + `<h4 class="tr-h">What to watch (resilience audit, tsk_6949469ad6)</h4>`
     + `<div class="tr-watch">${trWatch(doc)}</div>`;
 }
-// The whole view from one /api/trader answer, at `now` (seconds). Pure, so
-// the tests draw fixtures with it.
-function traderHtml(a, now) {
+// --- the drill-down tabs: Sleeves, Activity, Plumbing, Shadow ---
+// Drawn from the same document as the summary. They read these optional
+// fields, and say "not reported" (with the section's own reason) when a
+// section or field is missing -- never a default number:
+//   sections.sleeves.sleeves[]: history:[{date, net_liq, drawdown}] (null =
+//     a NaN row), positions:[{symbol, qty, avg_cost, mark, upnl}],
+//     state_as_of; sections.sleeves.history_note
+//   sections.gate: on, since, ratio, ma, margin, window, history:[{date,
+//     ratio, ma}], note
+//   sections.universe: running/disk:{mode, decided, n, fresh}, going_in:[],
+//     going_out:[], next_restart, last_rebalance
+//   sections.dispatches: slots:[{at, slot, live, quotes, fallback, dropped,
+//     orders, skipped, note}], events:[{at, level, text}], note
+//   sections.fills: fills:[{at, sleeve, side, symbol, qty, price}],
+//     rejections:[{kind: rejected|trimmed, at, text}], rejections_note
+//   sections.host: daemon:{pid, since, head, commits_since, env_edited,
+//     env_after_start}, next_restart, gateway:{listening, addr}, boot,
+//     disk_free_gb, backups:[{name, at, age_days, status}], off_box,
+//     last_page:{at, via}
+//   sections.freshness: groups:[{name, label, n, oldest, newest, status,
+//     note}], integrity, equity:{newest, nan_rows}
+//   sections.jobs: jobs:[{label, schedule, last_ran, exit, running, missed,
+//     note}], note
+//   sections.health: checks:[name], runs:[{at, checks:{name: ok|fail}}], note
+//   sections.env: keys:[{key, value}] (a secret's value is "(set)")
+//   sections.shadow: c1:{label, status, start, end, days, report_at,
+//     series:[{date, shadow, backtest}], stats:[{name, total, vol, max_dd}],
+//     correlation, tracking_error, note}, blend:{status, label, reason, last}
+const TRADER_TABS = [["summary", "Summary"], ["sleeves", "Sleeves"], ["activity", "Activity"],
+  ["plumbing", "Plumbing"], ["shadow", "Shadow"]];
+const trList = v => Array.isArray(v) ? v.filter(x => x != null) : [];
+const trObj = v => v && typeof v === "object" && !Array.isArray(v) ? v : {};
+const trSec = (doc, k) => trObj((trObj(doc).sections || {})[k]);
+const trCell = v => v == null || v === "" ? "—" : esc(trStr(v));
+function trSigned(v, d) {
+  if (!trNum(v)) return "—";
+  const t = Math.abs(v * 100).toFixed(d == null ? 1 : d), zero = Number(t) === 0;
+  return (zero ? "" : v > 0 ? "+" : "−") + t + "%";
+}
+const trFix = (v, d) => trNum(v) ? v.toFixed(d) : "—";
+// A table's time: "Nov 18 13:00" in this device's zone, kept on one line.
+function trShort(v) { const f = trFmt(v); return /^[A-Z][a-z]{2} [A-Z]/.test(f) ? f.slice(4) : f; }
+// A section, or a field of one, that isn't there: said, with the section's reason.
+function trMissing(doc, k, what) {
+  const s = (trObj(doc).sections || {})[k];
+  const why = s && s.reason ? `${k}: ${trStr(s.reason)}`
+    : s && typeof s === "object" ? `the ${k} section has no such field` : `no ${k} section`;
+  return `<p class="sub">${trBadge("unknown", (what || k) + " not reported")} ${esc(why)}</p>`;
+}
+// Its own words for a section, next to its card title.
+function trSecBadge(doc, k) {
+  const s = (trObj(doc).sections || {})[k];
+  return s ? trBadge(s.status, TRADER_STATES[trStatus(s.status)][1]) : trBadge("unknown", "not reported");
+}
+function trScroll(table) { return `<div class="tr-x">${table}</div>`; }
+// A line chart as SVG. rows: [{x, y}] (y null = a NaN row, marked in red and
+// left as a gap); opts: fmt (a y value as text), ref and refLabel (a dashed red
+// line, e.g. the halt), y2 (a second, dashed series) and y2Label. Each point
+// carries its words in data-tip (the hover tooltip) and a <title>.
+function trChart(rows, opts) {
+  opts = opts || {};
+  const W = 520, H = 150, L = 46, R = 8, T = 8, B = 20;
+  const fmt = opts.fmt || (v => trNum(v) ? Math.round(v).toLocaleString("en-US") : "—");
+  const ys = [];
+  rows.forEach(r => { if (trNum(r.y)) ys.push(r.y); if (trNum(r.y2)) ys.push(r.y2); });
+  if (trNum(opts.ref)) ys.push(opts.ref);
+  if (!rows.length || !ys.length)
+    return `<div class="tr-chart empty">${trBadge("unknown", "no points to draw")}</div>`;
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  if (hi === lo) { hi += Math.abs(hi) * 0.01 || 1; lo -= Math.abs(lo) * 0.01 || 1; }
+  const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+  const n = rows.length, step = n > 1 ? (W - L - R) / (n - 1) : 0;
+  const X = i => n > 1 ? L + i * step : (L + W - R) / 2;
+  const Y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  const path = key => {
+    let d = "", pen = false;
+    rows.forEach((r, i) => {
+      if (!trNum(r[key])) { pen = false; return; }
+      d += (pen ? "L" : "M") + X(i).toFixed(1) + " " + Y(r[key]).toFixed(1);
+      pen = true;
+    });
+    return d;
+  };
+  const bw = Math.max(2, Math.min(8, step || 8));
+  const isNan = r => r.nan !== undefined ? !!r.nan : r.y == null;
+  const nan = rows.map((r, i) => isNan(r)
+    ? `<rect class="nan" x="${(X(i) - bw / 2).toFixed(1)}" y="${T}" width="${bw.toFixed(1)}" height="${H - T - B}"></rect>` : "").join("");
+  const grid = [hi - pad, (hi + lo) / 2, lo + pad].map(v =>
+    `<line class="g" x1="${L}" x2="${W - R}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"></line>`
+    + `<text class="ax" x="${L - 4}" y="${(Y(v) + 3).toFixed(1)}" text-anchor="end">${esc(fmt(v))}</text>`).join("");
+  const ref = trNum(opts.ref)
+    ? `<line class="ref" x1="${L}" x2="${W - R}" y1="${Y(opts.ref).toFixed(1)}" y2="${Y(opts.ref).toFixed(1)}"></line>`
+      + `<text class="reft" x="${W - R}" y="${(Y(opts.ref) - 3).toFixed(1)}" text-anchor="end">${esc(trStr(opts.refLabel))}</text>` : "";
+  const lastI = rows.map(r => trNum(r.y)).lastIndexOf(true);
+  const dot = lastI >= 0 ? `<circle class="dot" cx="${X(lastI).toFixed(1)}" cy="${Y(rows[lastI].y).toFixed(1)}" r="2.5"></circle>` : "";
+  const hit = rows.map((r, i) => {
+    const words = trStr(r.x) + " · " + (isNan(r) ? "NaN row (no value recorded)" : r.y == null ? "not reported" : fmt(r.y))
+      + (opts.y2 && r.y2 !== undefined ? ` · ${trStr(opts.y2Label)} ${fmt(r.y2)}` : "");
+    const x0 = n > 1 ? X(i) - step / 2 : L, w = n > 1 ? step : W - L - R;
+    return `<rect class="hit" x="${x0.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${H}" data-tip="${esc(words)}"><title>${esc(words)}</title></rect>`;
+  }).join("");
+  const xl = `<text class="ax" x="${L}" y="${H - 5}">${esc(trStr(rows[0].x))}</text>`
+    + (n > 1 ? `<text class="ax" x="${W - R}" y="${H - 5}" text-anchor="end">${esc(trStr(rows[n - 1].x))}</text>` : "");
+  const label = esc(trStr(opts.label || "chart"));
+  return `<svg class="tr-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}">${grid}${nan}${ref}`
+    + (opts.y2 ? `<path class="l2" d="${path("y2")}"></path>` : "")
+    + `<path class="l" d="${path("y")}"></path>${dot}${hit}${xl}</svg>`;
+}
+// A chart's rows as a table, folded under it.
+function trTable(head, rows) {
+  if (!rows.length) return "";
+  return `<details class="tr-tbl"><summary>table</summary>${trScroll(`<table><tr>${head.map((h, i) =>
+    `<th${i ? ' class="r"' : ""}>${esc(h)}</th>`).join("")}</tr>${rows.map(r => `<tr${r.nan ? ' class="tr-nanrow"' : ""}>`
+    + r.cells.map((c, i) => `<td${i ? ' class="r"' : ""}>${c}</td>`).join("") + "</tr>").join("")}</table>`)}</details>`;
+}
+function trSleeveCard(doc, r, halt) {
+  const hist = trList(r.history).filter(h => typeof h === "object");
+  const nanRows = hist.filter(h => !trNum(h.net_liq)).length;
+  const head = `<h4 class="tr-name"><b>${esc(trStr(r.label || r.name) || "?")}</b>`
+    + (r.label && r.name ? ` · ${esc(trStr(r.name))}` : "") + `</h4>`;
+  const sub = [trNum(r.alloc) ? trPct(r.alloc, 0) + " of capital" : "", trNum(r.leverage) ? r.leverage.toFixed(1) + "x" : "",
+    r.state_as_of ? "state file " + trFmt(r.state_as_of) : ""].filter(Boolean).join(" · ");
+  const nums = `<div class="tr-nums"><div><div class="sub">net liq</div><div class="tr-big">${trMoney(r.net_liq)}</div></div>`
+    + `<div><div class="sub">cash</div><div class="tr-big">${trMoney(r.cash)}</div></div>`
+    + `<div><div class="sub">from peak</div><div class="tr-big">${trNum(r.drawdown) ? trSigned(-r.drawdown) : "—"}</div></div></div>`;
+  let charts;
+  if (!hist.length) charts = `<p class="sub">${trBadge("unknown", "history not reported")}</p>`;
+  else {
+    const nl = hist.map(h => ({x: h.date, y: trNum(h.net_liq) ? h.net_liq : null}));
+    const dd = hist.map(h => ({x: h.date, y: trNum(h.drawdown) ? -h.drawdown * 100 : null, nan: !trNum(h.net_liq)}));
+    const pctFmt = v => trNum(v) ? v.toFixed(0) + "%" : "—";
+    const drawn = nanRows < hist.length;
+    charts = `<p class="sub">Net liq, daily snapshots${nanRows ? ` · ${trBadge("bad", nanRows + " NaN row" + (nanRows === 1 ? "" : "s"))}${drawn ? " marked red" : ""}` : ""}</p>`
+      + trChart(nl, {label: `${trStr(r.label || r.name)} net liq`})
+      + `<p class="sub">Drawdown from the snapshots' running peak (dashed red = the ${trPct(halt, 0)} halt)</p>`
+      + trChart(dd, {label: `${trStr(r.label || r.name)} drawdown`, fmt: pctFmt, ref: -halt * 100,
+                     refLabel: `halt −${trPct(halt, 0)}`})
+      + trTable(["date", "net liq", "drawdown"], hist.map(h => ({nan: !trNum(h.net_liq),
+          cells: [esc(trStr(h.date)), trNum(h.net_liq) ? trMoney(h.net_liq) : trBadge("bad", "NaN"), trNum(h.drawdown) ? trSigned(-h.drawdown) : "—"]})));
+  }
+  let pos;
+  if (!Array.isArray(r.positions)) pos = `<p class="sub">${trBadge("unknown", "positions not reported")}</p>`;
+  else if (!r.positions.length) pos = `<p class="sub">no positions: all cash</p>`;
+  else pos = trScroll(`<table><tr><th>pos</th><th class="r">qty</th><th class="r">avg cost</th><th class="r">mark</th><th class="r">uPnL</th></tr>`
+    + trList(r.positions).map(p => `<tr><td>${trCell(p.symbol)}</td><td class="r">${trNum(p.qty) ? p.qty : "—"}</td>`
+      + `<td class="r">${trFix(p.avg_cost, 2)}</td><td class="r">${trFix(p.mark, 2)}</td>`
+      + `<td class="r">${trNum(p.upnl) ? (Math.round(p.upnl) > 0 ? "+" : Math.round(p.upnl) < 0 ? "−" : "") + Math.abs(Math.round(p.upnl)).toLocaleString("en-US") : "—"}</td></tr>`).join("")
+    + `</table>`);
+  return `<div class="tr-card">${head}<div class="sub">${esc(sub) || "—"}</div>${nums}${charts}<h4 class="tr-sh">Positions</h4>${pos}</div>`;
+}
+function trGateCard(doc) {
+  const g = trSec(doc, "gate");
+  let body;
+  if (!Object.keys(g).length) body = trMissing(doc, "gate");
+  else {
+    const st = g.on === true ? trBadge("ok", "ON (risk-on)") : g.on === false ? trBadge("bad", "OFF (risk-off)") : trBadge("unknown", "state unknown");
+    const avg = trNum(g.window) ? g.window + "-day avg" : "moving avg (window not reported)";
+    const line = [g.since ? "since " + trStr(g.since) : "flip date unknown",
+      trNum(g.ratio) ? `ratio ${g.ratio.toFixed(4)} vs ${avg} ${trFix(g.ma, 4)}` + (trNum(g.margin) ? ` (${trSigned(g.margin, 2)})` : "") : ""]
+      .filter(Boolean).join(" · ");
+    const h = trList(g.history).filter(x => typeof x === "object");
+    body = `<p>${st} ${esc(line)}</p>`
+      + (h.length ? `<p class="sub">HYG/LQD close ratio (solid) vs its ${trNum(g.window) ? g.window + "-day" : "moving"} average (dashed)</p>`
+          + trChart(h.map(x => ({x: x.date, y: trNum(x.ratio) ? x.ratio : null, y2: trNum(x.ma) ? x.ma : null})),
+                    {label: "credit gate ratio", fmt: v => trNum(v) ? v.toFixed(3) : "—", y2: true, y2Label: avg})
+          + trTable(["date", "ratio", "avg", "gate"], h.map(x => ({cells: [esc(trStr(x.date)), trFix(x.ratio, 4), trFix(x.ma, 4),
+              trNum(x.ratio) && trNum(x.ma) ? (x.ratio > x.ma ? trBadge("ok", "on") : trBadge("bad", "off")) : "—"]})))
+        : `<p class="sub">${trBadge("unknown", "history not reported")}</p>`)
+      + (g.note ? `<div class="tr-note">${esc(trStr(g.note))}</div>` : "");
+  }
+  return `<div class="tr-card"><h4>Credit gate (momentum's on/off switch) ${trSecBadge(doc, "gate")}</h4>${body}</div>`;
+}
+function trUniverseCard(doc) {
+  const u = trSec(doc, "universe");
+  let body;
+  if (!Object.keys(u).length) body = trMissing(doc, "universe");
+  else {
+    const run = trObj(u.running), disk = trObj(u.disk);
+    const known = run.mode && disk.mode;
+    const same = known && run.mode === disk.mode && run.decided === disk.decided;
+    const st = !known ? trBadge("unknown", "running vs disk unknown") : same ? trBadge("ok", "running = disk") : trBadge("warn", "running ≠ disk");
+    const desc = (x, who) => x.mode ? `${who} <b>${esc(trStr(x.mode))}</b>` + (x.decided ? ` (decided ${esc(trStr(x.decided))})` : "")
+      + (trNum(x.n) ? `, ${x.n} names` : "") + (trNum(x.fresh) ? `, pool ${trPct(x.fresh, 0)} fresh` : "") : `${who} unknown`;
+    const ins = trList(u.going_in), outs = trList(u.going_out);
+    const chips = ins.map(t => `<span class="tr-chip in">+${esc(trStr(t))}</span>`).join("")
+      + outs.map(t => `<span class="tr-chip out">−${esc(trStr(t))}</span>`).join("");
+    const moves = Array.isArray(u.going_in) || Array.isArray(u.going_out)
+      ? `<p>At the next restart${u.next_restart ? " (" + esc(trFmt(u.next_restart)) + ")" : ""}: <b>${ins.length} in, ${outs.length} out</b></p>`
+        + (chips ? `<div class="tr-chips">${chips}</div>` : "")
+      : `<p class="sub">${trBadge("unknown", "names in/out not reported")}</p>`;
+    body = `<p>${st} ${desc(run, "daemon loaded")}; ${desc(disk, "disk says")}</p>`
+      + (!known && u.reason ? `<p class="sub">universe: ${esc(trStr(u.reason))}</p>` : "") + moves
+      + (u.last_rebalance ? `<p class="sub">Latest rebalance: ${esc(trStr(u.last_rebalance))}</p>` : "");
+  }
+  return `<div class="tr-card"><h4>Momentum universe ${trSecBadge(doc, "universe")}</h4>${body}</div>`;
+}
+function trSleevesTab(doc) {
+  const sl = trSec(doc, "sleeves"), rows = trSleeves(doc);
+  const halt = trNum(sl.halt) ? sl.halt : 0.40;
+  const cards = rows.length ? rows.map(r => trSleeveCard(doc, r, halt)).join("")
+    : `<div class="tr-card"><h4>Sleeves</h4>${trMissing(doc, "sleeves", "sleeves")}</div>`;
+  return (sl.history_note ? `<div class="tr-note tr-lead">${esc(trStr(sl.history_note))}</div>` : "")
+    + `<div class="tr-grid">${cards}${trGateCard(doc)}${trUniverseCard(doc)}</div>`;
+}
+function trDispatchCard(doc) {
+  const d = trSec(doc, "dispatches");
+  let body;
+  if (!Array.isArray(d.slots)) body = trMissing(doc, "dispatches", "dispatch slots");
+  else if (!d.slots.length) body = `<p class="sub">no dispatches recorded</p>`;
+  else body = trScroll(`<table><tr><th>when</th><th>slot</th><th>live quotes</th><th class="r">fallback</th><th class="r">dropped</th><th class="r">orders</th></tr>`
+    + trList(d.slots).map(s => s.skipped
+      ? `<tr class="tr-skip"><td class="tr-when">${trCell(trShort(s.at))}</td><td>${trCell(s.slot)}</td><td colspan="4">${trBadge("bad", "SKIPPED")} ${esc(trStr(s.note) || "no dispatch")}</td></tr>`
+      : `<tr><td class="tr-when">${trCell(trShort(s.at))}</td><td>${trCell(s.slot)}</td><td>${trNum(s.live) && trNum(s.quotes)
+          ? trBadge(s.live === s.quotes ? "ok" : "warn", s.live + "/" + s.quotes) : "—"}</td>`
+        + `<td class="r">${trNum(s.fallback) ? s.fallback : "—"}</td><td class="r">${trNum(s.dropped) ? s.dropped : "—"}</td>`
+        + `<td class="r">${trNum(s.orders) ? s.orders : "—"}</td></tr>`).join("") + `</table>`);
+  return `<div class="tr-card"><h4>Dispatches ${trSecBadge(doc, "dispatches")}</h4>${body}`
+    + (d.note ? `<div class="tr-note">${esc(trStr(d.note))}</div>` : "") + `</div>`;
+}
+function trFillsCard(doc) {
+  const f = trSec(doc, "fills");
+  let body;
+  if (!Array.isArray(f.fills)) body = trMissing(doc, "fills", "fills");
+  else if (!f.fills.length) body = `<p class="sub">no fills in the journal</p>`;
+  else body = trScroll(`<table><tr><th>when</th><th>sleeve</th><th>side</th><th>sym</th><th class="r">qty</th><th class="r">price</th></tr>`
+    + trList(f.fills).map(x => `<tr><td class="tr-when">${trCell(trShort(x.at))}</td><td>${trCell(x.sleeve)}</td><td>${trCell(x.side)}</td>`
+      + `<td>${trCell(x.symbol)}</td><td class="r">${trNum(x.qty) ? x.qty : "—"}</td><td class="r">${trFix(x.price, 2)}</td></tr>`).join("")
+    + `</table>`);
+  let rej;
+  if (!Array.isArray(f.rejections)) rej = trMissing(doc, "fills", "rejections and trims");
+  else if (!f.rejections.length) rej = `<p class="sub">none recorded</p>`;
+  else rej = `<div class="tr-rej">` + trList(f.rejections).map(x => {
+    const k = x.kind === "trimmed" ? trBadge("warn", "trimmed") : trBadge("bad", x.kind ? trStr(x.kind) : "rejected");
+    return `<div>${k} <span class="mono">${esc(trStr(x.text))}</span>${x.at ? ` <span class="sub">${esc(trFmt(x.at))}</span>` : ""}</div>`;
+  }).join("") + `</div>`;
+  return `<div class="tr-card"><h4>Fills (journal) ${trSecBadge(doc, "fills")}</h4>${body}`
+    + `<h4 class="tr-sh">Rejections and trims</h4>${rej}`
+    + (f.rejections_note ? `<div class="tr-note">${esc(trStr(f.rejections_note))}</div>` : "") + `</div>`;
+}
+function trEventsCard(doc) {
+  const d = trSec(doc, "dispatches");
+  let body;
+  if (!Array.isArray(d.events)) body = trMissing(doc, "dispatches", "daemon events");
+  else if (!d.events.length) body = `<p class="sub">no warnings, starts or stops</p>`;
+  else body = trScroll(`<table><tr><th>when</th><th>level</th><th>what</th></tr>` + trList(d.events).map(e => {
+    const lv = trStr(e.level).toUpperCase();
+    const b = lv === "ERROR" ? trBadge("bad", "ERROR") : lv === "WARNING" ? trBadge("warn", "WARNING") : esc(lv || "—");
+    return `<tr><td class="tr-when">${trCell(trShort(e.at))}</td><td>${b}</td><td class="tr-wrap">${esc(trStr(e.text))}</td></tr>`;
+  }).join("") + `</table>`);
+  return `<div class="tr-card"><h4>Daemon events</h4>${body}</div>`;
+}
+function trActivityTab(doc) {
+  return `<div class="tr-grid">${trDispatchCard(doc)}${trFillsCard(doc)}${trEventsCard(doc)}</div>`;
+}
+function trHostCard(doc) {
+  const h = trSec(doc, "host");
+  if (!Object.keys(h).length) return `<div class="tr-card"><h4>Daemon and host</h4>${trMissing(doc, "host")}</div>`;
+  const dm = trObj(h.daemon), gw = trObj(h.gateway), pg = trObj(h.last_page);
+  const row = (k, v) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`;
+  const rows = [];
+  rows.push(row("daemon", dm.pid != null ? `PID ${esc(trStr(dm.pid))}` + (dm.since ? `, up since ${esc(trFmt(dm.since))}` : "") : trBadge("unknown", "not reported")));
+  rows.push(row("code", dm.head || trNum(dm.commits_since)
+    ? (dm.head ? `main is ${esc(trStr(dm.head))}` : "") + (trNum(dm.commits_since)
+        ? `; ${dm.commits_since} commit(s) newer than the running process ` + (dm.commits_since > 0 ? trBadge("warn", "restart pending") : trBadge("ok", "running = disk")) : "")
+    : "—"));
+  rows.push(row(".env", dm.env_edited ? `edited ${esc(trFmt(dm.env_edited))}` + (dm.env_after_start === true
+    ? ` ${trBadge("warn", "after the daemon started: not loaded")}` : dm.env_after_start === false ? ` ${trBadge("ok", "loaded")}` : "") : "—"));
+  rows.push(row("next restart", h.next_restart ? esc(trFmt(h.next_restart)) : "—"));
+  rows.push(row("gateway", gw.listening === true ? trBadge("ok", (trStr(gw.addr) || "port") + " listening")
+    : gw.listening === false ? trBadge("bad", (trStr(gw.addr) || "port") + " not listening") : trBadge("unknown", "unknown")));
+  rows.push(row("mini", [h.boot ? "booted " + esc(trFmt(h.boot)) : "", trNum(h.disk_free_gb) ? h.disk_free_gb + " GB free" : ""].filter(Boolean).join(" · ") || "—"));
+  const bk = trList(h.backups).map(b => trBadge(b.status, trStr(b.name) + (trNum(b.age_days) ? ` ${b.age_days}d` : "")));
+  rows.push(row("backups", (bk.length ? bk.join(" ") : Array.isArray(h.backups) ? trBadge("bad", "none found") : trBadge("unknown", "not reported"))
+    + (h.off_box === false ? " · none off-box" : h.off_box === true ? " · copied off-box" : "")));
+  rows.push(row("last page", pg.at ? esc(trFmt(pg.at)) + (pg.via ? " via " + esc(trStr(pg.via)) : "") : "—"));
+  return `<div class="tr-card"><h4>Daemon and host ${trSecBadge(doc, "host")}</h4><table class="tr-kv">${rows.join("")}</table></div>`;
+}
+function trFreshCard(doc) {
+  const f = trSec(doc, "freshness");
+  let body;
+  if (!Array.isArray(f.groups)) body = trMissing(doc, "freshness", "bar freshness");
+  else body = trScroll(`<table><tr><th>group</th><th class="r">n</th><th>oldest</th><th>newest</th><th></th></tr>`
+    + trList(f.groups).map(g => `<tr><td>${trCell(g.label || g.name)}</td><td class="r">${trNum(g.n) ? g.n : "—"}</td>`
+      + `<td>${trCell(g.oldest)}</td><td>${trCell(g.newest)}</td><td>${trBadge(g.status, g.note)}</td></tr>`).join("") + `</table>`);
+  const eq = trObj(f.equity);
+  const extra = (f.integrity ? `<p class="sub">Integrity: ${esc(trStr(f.integrity))}</p>` : "")
+    + (eq.newest || trNum(eq.nan_rows) ? `<p class="sub">Equity snapshots: newest ${trCell(eq.newest)}`
+       + (trNum(eq.nan_rows) ? ` · ${eq.nan_rows} NaN row${eq.nan_rows === 1 ? "" : "s"}` : "") + `</p>` : "");
+  return `<div class="tr-card"><h4>Bar freshness ${trSecBadge(doc, "freshness")}</h4>${body}${extra}</div>`;
+}
+function trJobsCard(doc) {
+  const j = trSec(doc, "jobs");
+  let body;
+  if (!Array.isArray(j.jobs)) body = trMissing(doc, "jobs", "launchd jobs");
+  else body = trScroll(`<table><tr><th>job</th><th>schedule</th><th>last ran</th><th>exit</th><th>missed</th></tr>`
+    + trList(j.jobs).map(x => {
+      const ex = x.running === true ? trBadge("ok", "running") : x.exit === 0 ? trBadge("ok", "exit 0")
+        : trNum(x.exit) ? trBadge("bad", "exit " + x.exit) : trBadge("unknown", "unknown");
+      const ms = x.missed === true ? trBadge("bad", "missed") : x.missed === false ? "no" : trBadge("unknown", "unknown");
+      return `<tr><td>${trCell(x.label)}${x.note ? ` ${trBadge("warn", x.note)}` : ""}</td><td class="mono">${trCell(x.schedule)}</td>`
+        + `<td>${x.last_ran ? esc(trFmt(x.last_ran)) : "no log"}</td><td>${ex}</td><td>${ms}</td></tr>`;
+    }).join("") + `</table>`);
+  return `<div class="tr-card wide"><h4>Launchd jobs ${trSecBadge(doc, "jobs")}</h4>${body}`
+    + (j.note ? `<div class="tr-note">${esc(trStr(j.note))}</div>` : "") + `</div>`;
+}
+function trHealthCard(doc) {
+  const h = trSec(doc, "health");
+  const runs = trList(h.runs).filter(r => typeof r === "object");
+  let body;
+  if (!Array.isArray(h.runs)) body = trMissing(doc, "health", "health-check history");
+  else if (!runs.length) body = `<p class="sub">no health-check runs recorded</p>`;
+  else {
+    const names = trList(h.checks).length ? trList(h.checks) : [...new Set(runs.flatMap(r => Object.keys(trObj(r.checks))))];
+    const cell = (r, k) => {
+      const v = trObj(r.checks)[k], s = v === "ok" ? "ok" : v === "fail" ? "bad" : "none";
+      const g = s === "ok" ? "✓" : s === "bad" ? "✕" : "·";
+      const words = `${trStr(k)} at ${trFmt(r.at)}: ${s === "ok" ? "OK" : s === "bad" ? "FAIL" : "not run"}`;
+      return `<td><span class="tr-hc ${s}" data-tip="${esc(words)}" title="${esc(words)}">${g}</span></td>`;
+    };
+    body = trScroll(`<table class="tr-hgrid"><tr><th>check</th>${runs.map(r => `<th class="c" title="${esc(trFmt(r.at))}">${esc(trStr(r.at).slice(5, 10))}</th>`).join("")}</tr>`
+      + names.map(k => `<tr><td>${esc(trStr(k))}</td>${runs.map(r => cell(r, k)).join("")}</tr>`).join("") + `</table>`)
+      + `<p class="sub">Last ${runs.length} runs, oldest → newest. ✓ OK · ✕ failed · · not run.</p>`;
+  }
+  return `<div class="tr-card wide"><h4>Health checks ${trSecBadge(doc, "health")}</h4>${body}`
+    + (h.note ? `<div class="tr-note">${esc(trStr(h.note))}</div>` : "") + `</div>`;
+}
+function trEnvCard(doc) {
+  const e = trSec(doc, "env");
+  const body = Array.isArray(e.keys)
+    ? `<table class="tr-kv">${trList(e.keys).map(k => `<tr><th class="mono">${trCell(k.key)}</th><td class="mono">${trCell(k.value)}</td></tr>`).join("")}</table>`
+      + `<p class="sub">Only non-secret keys show a value; every other key shows as (set).</p>`
+    : trMissing(doc, "env", ".env keys");
+  return `<div class="tr-card"><h4>.env (non-secret keys) ${trSecBadge(doc, "env")}</h4>${body}</div>`;
+}
+function trPlumbingTab(doc) {
+  return `<div class="tr-grid">${trHostCard(doc)}${trFreshCard(doc)}${trJobsCard(doc)}${trHealthCard(doc)}${trEnvCard(doc)}</div>`;
+}
+function trShadowTab(doc) {
+  const s = trSec(doc, "shadow"), c = trObj(s.c1), b = trObj(s.blend);
+  let c1;
+  if (!Object.keys(c).length) c1 = trMissing(doc, "shadow", "C1 shadow");
+  else {
+    const ser = trList(c.series).filter(x => typeof x === "object");
+    const span = [c.start && c.end ? `${trStr(c.start)} → ${trStr(c.end)}` : "", trNum(c.days) ? c.days + " days" : "",
+      c.report_at ? "report " + trStr(c.report_at) : ""].filter(Boolean).join(" · ");
+    const stats = trList(c.stats);
+    c1 = `<p class="sub">${esc(span) || "—"}</p>`
+      + (ser.length ? `<p class="sub">Shadow book (solid) vs its backtest over the same days (dashed), rebased</p>`
+          + trChart(ser.map(x => ({x: x.date, y: trNum(x.shadow) ? x.shadow : null, y2: trNum(x.backtest) ? x.backtest : null})),
+                    {label: "C1 shadow vs backtest", y2: true, y2Label: "backtest"})
+          + trTable(["date", "shadow", "backtest"], ser.map(x => ({nan: !trNum(x.shadow), cells: [esc(trStr(x.date)), trMoney(x.shadow), trMoney(x.backtest)]})))
+        : `<p class="sub">${trBadge("unknown", "curve not reported")}</p>`)
+      + (stats.length ? trScroll(`<table><tr><th></th><th class="r">total</th><th class="r">vol</th><th class="r">max DD</th></tr>`
+          + stats.map(x => `<tr><td>${trCell(x.name)}</td><td class="r">${trSigned(x.total)}</td><td class="r">${trPct(x.vol)}</td><td class="r">${trSigned(x.max_dd)}</td></tr>`).join("")
+          + `</table>`) : "")
+      + `<p class="sub">correlation ${trFix(c.correlation, 2)} · tracking error ${trPct(c.tracking_error)}${c.note ? ". " + esc(trStr(c.note)) : ""}</p>`;
+  }
+  const blend = Object.keys(b).length
+    ? `<p>${trBadge(b.status, b.label)}</p><p class="sub">${esc(trStr(b.reason))}</p>` + (b.last ? `<p class="sub">Curve's last day: ${esc(trStr(b.last))}</p>` : "")
+    : trMissing(doc, "shadow", "blend shadow");
+  return `<div class="tr-grid"><div class="tr-card"><h4>${esc(trStr(c.label) || "Vol-managed multi-asset (C1) shadow")} ${c.status ? trBadge(c.status, TRADER_STATES[trStatus(c.status)][1]) : trSecBadge(doc, "shadow")}</h4>${c1}</div>`
+    + `<div class="tr-card"><h4>Blend shadow</h4>${blend}</div></div>`;
+}
+const TRADER_TAB_DRAW = {sleeves: trSleevesTab, activity: trActivityTab, plumbing: trPlumbingTab, shadow: trShadowTab};
+function trTabName(t) { return TRADER_TABS.some(x => x[0] === t) ? t : "summary"; }
+// The whole view -- the tab `tab`, summary by default -- from one /api/trader
+// answer, at `now` (seconds). Pure, so the tests draw fixtures with it.
+function traderHtml(a, now, tab) {
   if (!a || typeof a !== "object") a = {ok: false, error: "no answer from the dashboard"};
-  if (a.ok && a.doc) return trDoc(a.doc);
+  if (a.ok && a.doc) return trDoc(a.doc, tab);
   const doc = a.last_good, gen = doc ? trWhen(doc.generated_at) : null;
   const ageFrom = gen != null ? gen : a.last_good_at;
   const head = `<div class="tr-stale">${trBadge("unknown", "status unavailable:")} `
@@ -4760,7 +5177,7 @@ function traderHtml(a, now) {
     + `<div class="sub">${doc ? `Below is the last good document, ${esc(trAgeWords(ageFrom != null ? now - ageFrom : null))}`
         + (doc.generated_at ? ` (generated ${esc(trFmt(doc.generated_at))})` : "") + "."
         : "No good document since the dashboard started, so there is nothing older to show."}</div></div>`;
-  return head + (doc && doc.sections ? `<div class="tr-old">${trDoc(doc)}</div>` : "");
+  return head + (doc && doc.sections ? `<div class="tr-old">${trDoc(doc, tab)}</div>` : "");
 }
 function traderIsOpen() {
   return document.getElementById("tradermodal").style.display === "flex";
@@ -4769,7 +5186,37 @@ function toggleTrader() {
   const m = document.getElementById("tradermodal");
   const open = !traderIsOpen();
   m.style.display = open ? "flex" : "none";
-  if (open) refreshTrader();
+  if (open) { trTab(traderTab); refreshTrader(); }
+}
+// Which tab is shown: only what is drawn changes, from the answer already held.
+function trTab(t) {
+  traderTab = trTabName(t);
+  for (const [k] of TRADER_TABS) {
+    const b = document.getElementById("trtab-" + k);
+    if (b) { b.className = "tr-tab" + (k === traderTab ? " on" : ""); b.setAttribute && b.setAttribute("aria-selected", String(k === traderTab)); }
+  }
+  drawTrader();
+}
+function drawTrader() {
+  if (!traderAnswer) return;
+  setHTML(document.getElementById("trbody"), traderHtml(traderAnswer, Date.now() / 1000, traderTab));
+  trHideTip();
+}
+// The charts' hover tooltip: the words a point carries in data-tip, beside
+// the pointer (a tap does the same on a phone). Drawing only.
+function trShowTip(target, x, y) {
+  const tip = document.getElementById("trtip"), el = target && target.closest ? target.closest("[data-tip]") : null;
+  if (!tip) return;
+  if (!el) { trHideTip(); return; }
+  tip.textContent = el.getAttribute("data-tip");
+  tip.style.display = "block";
+  const w = (typeof window !== "undefined" && window.innerWidth) || 1000;
+  tip.style.left = Math.max(4, Math.min(x + 12, w - 240)) + "px";
+  tip.style.top = (y + 14) + "px";
+}
+function trHideTip() {
+  const tip = document.getElementById("trtip");
+  if (tip) tip.style.display = "none";
 }
 async function refreshTrader() {
   const ask = ++traderAsk;
@@ -4779,15 +5226,22 @@ async function refreshTrader() {
   if (ask !== traderAsk) return;
   if (a && a.ok && a.doc) lastTrader = a.doc;
   else if (a && !a.last_good && lastTrader) a = Object.assign({}, a, {last_good: lastTrader});
-  const now = Date.now() / 1000;
-  setHTML(document.getElementById("trbody"), traderHtml(a, now));
+  traderAnswer = a || {ok: false, error: "no answer from the dashboard"};
+  drawTrader();
   const doc = a && a.ok ? a.doc : null;
   document.getElementById("trasof").textContent = doc && doc.generated_at
     ? "data as of " + trFmt(doc.generated_at) : "";
 }
-let lastTrader = null;
+let lastTrader = null, traderAnswer = null, traderTab = "summary";
 if (typeof window !== "undefined" && window.addEventListener)
   window.addEventListener("focus", () => { if (traderIsOpen()) refreshTrader(); });
+{
+  const tb = typeof document !== "undefined" && document.getElementById("trbody");
+  if (tb && tb.addEventListener) {
+    tb.addEventListener("pointermove", e => trShowTip(e.target, e.clientX, e.clientY));
+    tb.addEventListener("pointerleave", trHideTip);
+  }
+}
 
 // --- projects overview and per-project boards ---
 // The task panel answers "what needs me"; this answers "where is each project".
@@ -5689,7 +6143,8 @@ if (window.addEventListener)
 //   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
 //     [&drawer=1] [&tools=open] [&files=1]  ...its attachments drawer, its longest turn's calls
 //                                         open, or its newest message with files in view
-//   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings | trader
+//   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
+//   ?view=trader[&tab=sleeves|activity|plumbing|shadow]
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
 //   ?q=<words>                            transcript search
@@ -5752,7 +6207,8 @@ async function openLink(q) {
   } else if (view === "learnings") {
     toggleLearn();
   } else if (view === "trader") {
-    if (!traderIsOpen()) toggleTrader();
+    traderTab = trTabName(q.get("tab") || "");
+    if (!traderIsOpen()) toggleTrader(); else trTab(traderTab);
   }
   if (card) openCard(card);
   if (modal === "new-thread") newThreadForm();

@@ -34529,11 +34529,14 @@ def test_trader_view_draws_the_document():
           "const TRADER_POLL_MS = 60000;" in js and "setInterval(pollTrader, TRADER_POLL_MS)" in js
           and "traderIsOpen() ? refreshTrader()" in js and 'addEventListener("focus"' in js
           and "pollBoard(); pollTrader(); }" in js)
-    # Nothing on the view posts: its markup has one button (close) and no form.
+    # Nothing on the view posts: its markup's buttons are its close button and
+    # the five tabs (which only change what is drawn), and it has no form.
     modal = re.search(r'<div id="tradermodal".*?\n</div>\n', V.PAGE, re.S).group(0)
-    check("the view's markup has no form, no input and only its close button",
+    handlers = re.findall(r'<button[^>]*onclick="([^"]*)"', modal)
+    check("the view's markup has no form, no input and only its close button and tabs",
           "<form" not in modal and "<input" not in modal and "<select" not in modal
-          and modal.count("<button") == 1 and 'onclick="toggleTrader()"' in modal, modal)
+          and modal.count("<button") == 6 and handlers == ["toggleTrader()"] + [
+              f"trTab('{t}')" for t in ("summary", "sleeves", "activity", "plumbing", "shadow")], modal)
     block = js[js.index("// --- trader ---"):js.index("// --- projects overview")]
     check("the view's script posts nothing and calls no action",
           "POST" not in block and "taskCall" not in block and "taskAction" not in block
@@ -34614,6 +34617,254 @@ def test_trader_view_draws_the_document():
             break
     else:
         check("a drawn document has no buttons, forms or handlers", True)
+
+
+
+TRADER_TABS_DRIVER = r"""
+// Draws each Trader tab with the page's own functions against a stub DOM:
+// from the fixture, from a document missing sections, from an all-unknown
+// one, and through the deep link and the tab buttons -- recording requests.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const fixture = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+function el(id) {
+  return {id, textContent: "", value: "", innerHTML: "", style: {}, dataset: {}, children: [], className: "",
+    attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; },
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) { return c; }, addEventListener(k, f) { (this.on = this.on || {})[k] = f; },
+    querySelector() { return null; }, querySelectorAll() { return []; }, focus() {}};
+}
+const els = {};
+const byId = id => els[id] || (els[id] = el(id));
+globalThis.document = {getElementById: byId, createElement: () => el("new"), hidden: false,
+  querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}, innerWidth: 1280};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+const asked = [];
+globalThis.fetch = async (url, opts) => {
+  asked.push({url, method: (opts && opts.method) || "GET", body: !!(opts && opts.body)});
+  if (url === "/api/trader") return {status: 200, headers: {get: () => null}, json: async () => ({ok: true, doc: fixture})};
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {sessions: [], slack: {}};
+  if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  return {status: 200, headers: {get: () => null}, json: async () => out};
+};
+(0, eval)(src + `;globalThis.__t = {traderHtml, trTab, trShowTip, openLink, traderIsOpen, TRADER_TABS};`);
+const T = globalThis.__t, tick = () => new Promise(r => setImmediate(r));
+const now = Date.parse("2026-11-18T15:10:00-08:00") / 1000;
+const TABS = ["sleeves", "activity", "plumbing", "shadow"];
+const clone = x => JSON.parse(JSON.stringify(x));
+// Missing sections: the whole of gate, dispatches, jobs and shadow are gone,
+// and the rest keep only their status and reason (no drill-down fields).
+const missing = clone(fixture);
+for (const k of ["gate", "dispatches", "jobs", "shadow"]) delete missing.sections[k];
+for (const k of Object.keys(missing.sections)) {
+  const s = missing.sections[k];
+  missing.sections[k] = {status: s.status, reason: s.reason, source: s.source, as_of: s.as_of};
+}
+// ...except the sleeves themselves, which keep their summary figures but lose
+// their history and positions.
+missing.sections.sleeves.sleeves = fixture.sections.sleeves.sleeves.map(r => {
+  const c = clone(r); delete c.history; delete c.positions; delete c.state_as_of; return c; });
+const unknownDoc = {v: 1, generated_at: null, verdict: "unknown", sections: Object.fromEntries(
+  ["summary", "sleeves", "gate", "universe", "dispatches", "fills", "jobs", "freshness", "health",
+   "host", "shadow", "env"].map(k => [k, {status: "unknown", reason: k + " source unreadable", source: null, as_of: null}]))};
+const evil = '<img src=x onerror=alert(1)>"';
+const bad = clone(fixture), S = bad.sections;
+S.sleeves.sleeves[0].history[0].date = evil; S.sleeves.sleeves[1].positions[0].symbol = evil;
+S.universe.going_in[0] = evil; S.dispatches.events[0].text = evil; S.fills.rejections[0].text = evil;
+S.jobs.jobs[0].label = evil; S.env.keys[0].value = evil; S.shadow.blend.reason = evil; S.health.checks[0] = evil;
+(async () => {
+  const out = {good: {}, missing: {}, unknown: {}, empty: {}, failed: {}, escaped: {}};
+  for (const t of TABS) {
+    out.good[t] = T.traderHtml({ok: true, doc: fixture}, now, t);
+    out.missing[t] = T.traderHtml({ok: true, doc: missing}, now, t);
+    out.unknown[t] = T.traderHtml({ok: true, doc: unknownDoc}, now, t);
+    out.empty[t] = T.traderHtml({ok: true, doc: {v: 1, sections: {}}}, now, t);
+    out.failed[t] = T.traderHtml({ok: false, error: "timed out", last_good: fixture}, now, t);
+    out.escaped[t] = T.traderHtml({ok: true, doc: bad}, now, t);
+  }
+  out.bogusTab = T.traderHtml({ok: true, doc: fixture}, now, "nope");
+  // Odd documents the review turned up.
+  const noWin = clone(fixture); delete noWin.sections.gate.window;
+  out.noWindow = T.traderHtml({ok: true, doc: noWin}, now, "sleeves");
+  out.fieldGone = T.traderHtml({ok: true, doc: {v: 1, sections: {fills: {status: "ok", fills: []},
+    dispatches: {status: "ok", slots: []}}}}, now, "activity");
+  const odd = clone(fixture), sl = odd.sections.sleeves.sleeves;
+  sl[0].history = [{date: "a", net_liq: 100, drawdown: 0.1}, {date: "b", net_liq: 101}];
+  sl[1].history = [{date: "c", net_liq: null}, {date: "d", net_liq: null}];
+  sl[1].positions = [{symbol: "Z", qty: 1, avg_cost: 1, mark: 1, upnl: -0.4}];
+  out.odd = T.traderHtml({ok: true, doc: odd}, now, "sleeves");
+  out.summary = T.traderHtml({ok: true, doc: fixture}, now);
+  for (let i = 0; i < 20; i++) await tick();
+  asked.length = 0;
+  await T.openLink(new URLSearchParams("view=trader&tab=plumbing"));
+  for (let i = 0; i < 4; i++) await tick();
+  out.linkOpen = T.traderIsOpen();
+  out.linkBody = byId("trbody").innerHTML;
+  out.linkTabClass = byId("trtab-plumbing").className + "|" + byId("trtab-summary").className;
+  const before = asked.length;
+  T.trTab("shadow");
+  out.afterTab = byId("trbody").innerHTML;
+  out.tabAsked = asked.length - before;
+  T.trTab("bogus");
+  out.bogusAfter = byId("trbody").innerHTML;
+  // The tooltip shows the words of the point under the pointer.
+  const pt = el("pt"); pt.attrs["data-tip"] = "2026-11-16 · $146,848";
+  const target = {closest: sel => sel === "[data-tip]" ? pt : null};
+  T.trShowTip(target, 100, 200);
+  out.tip = {text: byId("trtip").textContent, display: byId("trtip").style.display};
+  T.trShowTip({closest: () => null}, 0, 0);
+  out.tipHidden = byId("trtip").style.display;
+  out.asked = asked.filter(a => a.url === "/api/trader" || a.method !== "GET" || a.body);
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+def test_trader_tabs_draw_each_tab():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe Trader view's four drill-down tabs draw from the same document, and act on nothing")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    for name in ("trSleevesTab", "trActivityTab", "trPlumbingTab", "trShadowTab", "trChart", "trTab", "trShowTip"):
+        check(f"{name}() is defined", re.search(rf"function\s+{name}\b", js) is not None)
+    check("?view=trader&tab= picks the tab", 'traderTab = trTabName(q.get("tab") || "")' in js)
+    check("bin/dashshots photographs each tab",
+          all(f'("trader-{t}", "/?view=trader&tab={t}")' in (BASE / "bin" / "dashshots").read_text()
+              for t in ("sleeves", "activity", "plumbing", "shadow")))
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(TRADER_TABS_DRIVER)
+    # Times are drawn in the device's zone; pin it so the checks don't move.
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(TRADER_FIXTURE)],
+                       capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, TZ="America/Los_Angeles"))
+    if p.returncode != 0:
+        check("the trader tabs' javascript runs", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    fx = json.loads(TRADER_FIXTURE.read_text())
+    ICON = '<span aria-hidden="true">'
+    g = o["good"]
+
+    s = g["sleeves"]
+    mom = fx["sections"]["sleeves"]["sleeves"][0]
+    nans = sum(1 for h in mom["history"] if h["net_liq"] is None)
+    check("sleeves: a net-liq and a drawdown chart per sleeve",
+          s.count('<svg class="tr-chart"') == 5 and 'aria-label="Momentum net liq"' in s
+          and 'aria-label="Trend drawdown"' in s, s.count("<svg"))
+    momcard = s[s.index("<b>Momentum</b>"):s.index("<b>Trend</b>")]
+    check("sleeves: NaN rows are marked, in the chart and as a badge",
+          momcard.count('<rect class="nan"') == nans * 2 and f"{nans} NaN rows" in momcard
+          and "NaN row (no value recorded)" in momcard, momcard.count('class="nan"'))
+    check("sleeves: the drawdown chart draws the 40% halt line",
+          s.count('<line class="ref"') == 2 and s.count("halt −40%") >= 2)
+    check("sleeves: every point has a hover tooltip, and each chart a table",
+          'data-tip="2026-11-16 · ' in s and "<title>" in s and s.count('<details class="tr-tbl"><summary>table</summary>') == 3)
+    check("sleeves: the numbers, positions and an all-cash sleeve",
+          "$146,848" in s and "−22.9%" in s and "no positions: all cash" in s
+          and "<td>VNQ</td><td class=\"r\">45</td><td class=\"r\">95.19</td><td class=\"r\">95.36</td><td class=\"r\">+8</td>" in s)
+    check("sleeves: the credit gate's chart, state and the date it last flipped",
+          'aria-label="credit gate ratio"' in s and ICON + "✓</span> ON (risk-on)" in s and "since 2026-11-12" in s
+          and "100-day avg" in s and '<path class="l2"' in s)
+    check("sleeves: the universe, running vs disk, and the names in and out",
+          ICON + "!</span> running ≠ disk" in s and "daemon loaded <b>static</b>" in s and "disk says <b>pit</b>" in s
+          and "<b>16 in, 16 out</b>" in s and s.count('class="tr-chip in"') == 16 and s.count('class="tr-chip out"') == 16
+          and "+MRVL" in s and "−SMCI" in s)
+
+    a = g["activity"]
+    check("activity: a row per dispatch slot",
+          a[:a.index("Fills (journal)")].count('<tr><td class="tr-when">') == len(fx["sections"]["dispatches"]["slots"]) - 1
+          and ICON + "✓</span> 62/62" in a and "<td class=\"tr-when\">Nov 18 13:00</td><td>close</td>" in a)
+    check("activity: a skipped slot is its own red row, with words",
+          a.count('<tr class="tr-skip">') == 1 and ICON + "✕</span> SKIPPED" in a)
+    check("activity: journal fills, rejections and trims, and daemon events",
+          "Fills (journal)" in a and "<td>DBC</td>" in a and "29.52" in a
+          and ICON + "✕</span> rejected" in a and ICON + "!</span> trimmed" in a and "Insufficient buying power" in a
+          and "Daemon events" in a and ICON + "!</span> WARNING" in a and "Runner started" in a)
+
+    pl = g["plumbing"]
+    check("plumbing: daemon, code, .env, gateway, host, backups and last page",
+          "PID 84984" in pl and "restart pending" in pl and "not loaded" in pl
+          and ICON + "✓</span> 127.0.0.1:4002 listening" in pl and "140 GB free" in pl
+          and ICON + "✕</span> trades.db 93d" in pl and "none off-box" in pl and "via ntfy" in pl)
+    check("plumbing: bar freshness split ETFs vs pool names",
+          "ETFs (dataupdate)" in pl and "Momentum names (pooldata)" in pl and ICON + "!</span> 1 session late" in pl
+          and "Integrity:" in pl)
+    check("plumbing: the launchd job table with schedule, last ran, exit and missed",
+          "<th>schedule</th><th>last ran</th><th>exit</th><th>missed</th>" in pl
+          and ICON + "✕</span> exit 1" in pl and ICON + "✓</span> running" in pl and "wkdays 13:30" in pl
+          and pl.count("<td>no</td>") >= 10 and "no log" in pl)
+    runs = fx["sections"]["health"]["runs"]
+    cells = len(runs) * len(fx["sections"]["health"]["checks"])
+    check("plumbing: the health-check history grid, a glyph in every cell",
+          pl.count('<span class="tr-hc ') == cells and '<span class="tr-hc bad"' in pl and "✕</span>" in pl
+          and f"Last {len(runs)} runs" in pl, pl.count("tr-hc "))
+    check("plumbing: .env shows non-secret values, secrets only as (set)",
+          "MOMENTUM_UNIVERSE" in pl and ">pit<" in pl and pl.count(">(set)<") == 3)
+
+    sh = g["shadow"]
+    check("shadow: C1 vs its backtest, with its stats",
+          'aria-label="C1 shadow vs backtest"' in sh and '<path class="l2"' in sh and "−2.5%" in sh
+          and "16.7%" in sh and "full backtest 2008→" in sh and "correlation 0.98" in sh)
+    check("shadow: the blend shadow's state, with words",
+          ICON + "✕</span> crashing nightly since Oct 26" in sh and "Decimal/float" in sh)
+
+    for kind in ("missing", "unknown", "empty"):
+        for t, html in o[kind].items():
+            check(f"a {kind} document draws the {t} tab, with no NaN, undefined, null or $0",
+                  len(html) > 100 and all(x not in html for x in ("NaN<", ">NaN", "undefined", "null", "$0"))
+                  and "not reported" in html, html[:300])
+    m = o["missing"]
+    check("missing sections say so, with the section's own reason",
+          "gate not reported</span> no gate section" in m["sleeves"]
+          and "dispatch slots not reported</span> no dispatches section" in m["activity"]
+          and "launchd jobs not reported</span> no jobs section" in m["plumbing"]
+          and "C1 shadow not reported</span> no shadow section" in m["shadow"]
+          and "fills not reported</span> fills: " + fx["sections"]["fills"]["reason"] in m["activity"]
+          and "history not reported" in m["sleeves"] and "positions not reported" in m["sleeves"])
+    check("a failed run draws the tab from the last good document, dimmed",
+          all("status unavailable" in o["failed"][t] and 'class="tr-old"' in o["failed"][t] for t in o["failed"])
+          and "PID 84984" in o["failed"]["plumbing"])
+    check("a gate without its window invents no 100-day figure",
+          "100-day" not in o["noWindow"] and "moving avg (window not reported)" in o["noWindow"], "")
+    check("a field missing from a present section is not called a missing section",
+          "no fills section" not in o["fieldGone"] and "no dispatches section" not in o["fieldGone"]
+          and "rejections and trims not reported</span> the fills section has no such field" in o["fieldGone"])
+    od = o["odd"]
+    mom_odd = od[od.index("<b>Momentum</b>"):od.index("<b>Trend</b>")]
+    trend_odd = od[od.index("<b>Trend</b>"):od.index("Credit gate")]
+    check("a row with net liq but no drawdown is not marked NaN",
+          'class="nan"' not in mom_odd and "b · not reported" in mom_odd and "NaN row" not in mom_odd, "")
+    check("all-NaN history says so without claiming red marks on a chart with none",
+          "2 NaN rows</span></p>" in trend_odd and "marked red" not in trend_odd)
+    check("a value rounding to zero shows no sign", '<td class="r">0</td></tr>' in trend_odd and "−0" not in od)
+    check("an unknown tab name draws the summary", o["bogusTab"] == o["summary"] and "What to watch" in o["summary"])
+    esc_ok = all("<img" not in h for h in o["escaped"].values())
+    n_esc = sum(h.count("&lt;img src=x onerror=alert(1)&gt;&quot;") for h in o["escaped"].values())
+    check("document strings are escaped on every tab, never markup", esc_ok and n_esc >= 9, n_esc)
+    for t, html in g.items():
+        if "onclick" in html or "<button" in html or "<form" in html or "<input" in html:
+            check("a drawn tab has no buttons, forms, inputs or handlers", False, t)
+            break
+    else:
+        check("a drawn tab has no buttons, forms, inputs or handlers", True)
+    check("?view=trader&tab=plumbing opens that tab", o["linkOpen"] and "Launchd jobs" in o["linkBody"]
+          and o["linkTabClass"] == "tr-tab on|tr-tab", o["linkTabClass"])
+    check("a tab button redraws from the answer held, asking nothing",
+          "Blend shadow" in o["afterTab"] and o["tabAsked"] == 0 and "What to watch" in o["bogusAfter"])
+    check("the tooltip shows the point's words, and hides off a point",
+          o["tip"] == {"text": "2026-11-16 · $146,848", "display": "block"} and o["tipHidden"] == "none", o["tip"])
+    check("every request was a GET of /api/trader, with no body",
+          o["asked"] and all(x == {"url": "/api/trader", "method": "GET", "body": False} for x in o["asked"]), o["asked"])
 
 
 def test_dashshots_has_a_trader_view_fed_by_the_fixture():

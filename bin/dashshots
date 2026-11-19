@@ -314,6 +314,10 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("release", f"/?view=projects&modal=release&slug={p}"),
         ("learnings", "/?view=learnings"),
         ("trader", "/?view=trader"),
+        ("trader-sleeves", "/?view=trader&tab=sleeves"),
+        ("trader-activity", "/?view=trader&tab=activity"),
+        ("trader-plumbing", "/?view=trader&tab=plumbing"),
+        ("trader-shadow", "/?view=trader&tab=shadow"),
     ]
 
 

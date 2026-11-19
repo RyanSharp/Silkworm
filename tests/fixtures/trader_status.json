@@ -1,186 +1,2701 @@
 {
-  "v": 1,
-  "generated_at": "2026-11-18T15:09:00-08:00",
-  "verdict": {
-    "status": "warn",
-    "headline": "Trading normally, with 3 things to look at",
-    "lines": [
-      "The daemon dispatched both slots today with every quote live. No sleeve is halted or tripped."
-    ],
-    "look_at": [
-      "equity snapshots run two sessions behind (newest is 2026-11-16, with NaN gaps)",
-      "the 12 ETFs are a session late every evening",
-      "the running daemon still uses the static universe although .env now says pit (applies at the Sunday restart)"
-    ]
-  },
-  "sections": {
-    "summary": {
-      "status": "warn",
-      "reason": "Trading normally, with 3 things to look at",
-      "source": "data/paper_state/",
-      "as_of": "2026-11-18T13:00:00-08:00",
-      "book_total": 196999,
-      "doing": [
-        "Momentum sold all 15 names at the Nov 2 monthly rebalance because the credit gate (HYG/LQD vs its 100-day average) was off that day. The gate turned back on Nov 12, by a hair. The next decision is the Dec 1 rebalance.",
-        "Trend trades most closes (8 orders in the last 10 sessions): now holds 45 VNQ; sold DBC today."
-      ]
-    },
-    "sleeves": {
-      "status": "ok",
-      "reason": "No halt marker, no daily-loss trip today, nothing paused on a pending order.",
-      "source": "data/paper_state/",
-      "as_of": "2026-11-18T13:00:00-08:00",
-      "halt": 0.4,
-      "target": 0.34,
-      "sleeves": [
-        {
-          "name": "CreditGatedMomentum",
-          "label": "Momentum",
-          "alloc": 0.75,
-          "leverage": 1.0,
-          "net_liq": 146848,
-          "cash": 146848,
-          "holds": [],
-          "doing": "all cash since Nov 2",
-          "drawdown": 0.229,
-          "peak": 190510
-        },
-        {
-          "name": "CrossAssetTrend",
-          "label": "Trend",
-          "alloc": 0.25,
-          "leverage": 1.0,
-          "net_liq": 50152,
-          "cash": 45640,
-          "holds": [
-            "VNQ"
-          ],
-          "drawdown": 0.035,
-          "peak": 51970
-        }
-      ]
-    },
-    "gate": {
-      "status": "ok",
-      "reason": "credit gate on since 2026-11-12 (HYG/LQD +0.03% over its 100-day average)",
-      "source": "data/bars/daily/",
-      "as_of": "2026-11-17"
-    },
-    "universe": {
-      "status": "warn",
-      "reason": "running static, .env says pit: 16 in, 16 out at the next restart",
-      "source": "data/paper_trade.log",
-      "as_of": "2026-11-15T08:00:00-08:00"
-    },
-    "dispatches": {
-      "status": "ok",
-      "reason": "close slot ran 13:00, 62/62 live quotes",
-      "source": "data/paper_trade.log",
-      "as_of": "2026-11-18T13:00:00-08:00"
-    },
-    "fills": {
-      "status": "ok",
-      "reason": "1 fill today",
-      "source": "data/journal/trades.db",
-      "as_of": "2026-11-18T13:00:04-08:00"
-    },
-    "jobs": {
-      "status": "warn",
-      "reason": "3 jobs exited 1, none missed",
-      "source": "launchctl",
-      "as_of": "2026-11-18T15:09:00-08:00"
-    },
-    "freshness": {
-      "status": "warn",
-      "reason": "12 ETFs one session late; equity snapshot 2 sessions behind",
-      "source": "data/bars/daily/",
-      "as_of": "2026-11-18T15:09:00-08:00"
-    },
-    "health": {
-      "status": "ok",
-      "reason": "last page Wed 13:15 via ntfy",
-      "source": "data/alert_state.json",
-      "as_of": "2026-11-18T13:15:00-08:00"
-    },
-    "host": {
-      "status": "bad",
-      "reason": "trades.db backup 93 days old",
-      "source": "ps, netstat, sysctl, df",
-      "as_of": "2026-11-18T15:09:00-08:00"
-    },
-    "shadow": {
-      "status": "warn",
-      "reason": "blend shadow stuck at 2026-11-13",
-      "source": "data/shadow_blend/curve.csv",
-      "as_of": "2026-11-13"
-    },
-    "env": {
-      "status": "ok",
-      "reason": "BROKER=ibkr, MOMENTUM_UNIVERSE=pit; 9 other keys (set)",
-      "source": ".env",
-      "as_of": "2026-11-15T07:58:00-08:00"
-    }
-  },
-  "watch": [
-    {
-      "id": "daemon",
-      "status": "warn",
-      "label": "restart pending",
-      "reason": "PID up since Sun Nov 15 08:00 · loaded static universe; disk says pit. Applies at Sun Nov 22 08:00."
-    },
-    {
-      "id": "dispatch",
-      "status": "ok",
-      "label": "close Wed 13:00",
-      "reason": "62/62 live quotes, 0 fallback, 0 dropped, 1 order(s). No skipped slot in 10 sessions."
-    },
-    {
-      "id": "guards",
-      "status": "ok",
-      "label": "none tripped",
-      "reason": "No halt marker, no daily-loss trip today, nothing paused on a pending order."
-    },
-    {
-      "id": "equity",
-      "status": "warn",
-      "label": "newest 2026-11-16 (2d)",
-      "reason": "11 NaN rows in history; tracking check unavailable since Oct 26."
-    },
-    {
-      "id": "bars",
-      "status": "warn",
-      "label": "12 ETFs 1 session late",
-      "reason": "ETFs (dataupdate 18:30) newest 2026-11-16; pool names (pooldata 21:00) newest 2026-11-17."
-    },
-    {
-      "id": "jobs",
-      "status": "warn",
-      "label": "3 exited 1",
-      "reason": "paperhealth (failing checks), pooldata (pool-only defects), shadowblend (crashing nightly since Oct 26). None missed."
-    },
-    {
-      "id": "gateway",
-      "status": "ok",
-      "label": "port 4002 up",
-      "reason": "Link-loss (1100) events aren't timestamped yet; last relaunch is the nightly 23:45 IBKR restart."
-    },
-    {
-      "id": "alerts",
-      "status": "ok",
-      "label": "last page Wed 13:15",
-      "reason": "ntfy. Daemon alerts (DAILY-LOSS etc.) still go only to its log. Heartbeat silence isn't alerted off-box."
-    },
-    {
-      "id": "backups",
-      "status": "bad",
-      "label": "trades.db 93d old",
-      "reason": "Last by hand, Aug 17. Nothing off-box. 140 GB free."
-    },
-    {
-      "id": "uptime",
-      "status": "ok",
-      "label": "up 16d",
-      "reason": "Last boot Mon Nov 02 14:45 (unattended macOS update)."
-    }
+ "v": 1,
+ "generated_at": "2026-11-18T15:09:00-08:00",
+ "verdict": {
+  "status": "warn",
+  "headline": "Trading normally, with 3 things to look at",
+  "lines": [
+   "The daemon dispatched both slots today with every quote live. No sleeve is halted or tripped."
+  ],
+  "look_at": [
+   "equity snapshots run two sessions behind (newest is 2026-11-16, with NaN gaps)",
+   "the 12 ETFs are a session late every evening",
+   "the running daemon still uses the static universe although .env now says pit (applies at the Sunday restart)"
   ]
+ },
+ "sections": {
+  "summary": {
+   "status": "warn",
+   "reason": "Trading normally, with 3 things to look at",
+   "source": "data/paper_state/",
+   "as_of": "2026-11-18T13:00:00-08:00",
+   "book_total": 196999,
+   "doing": [
+    "Momentum sold all 15 names at the Nov 2 monthly rebalance because the credit gate (HYG/LQD vs its 100-day average) was off that day. The gate turned back on Nov 12, by a hair. The next decision is the Dec 1 rebalance.",
+    "Trend trades most closes (8 orders in the last 10 sessions): now holds 45 VNQ; sold DBC today."
+   ]
+  },
+  "sleeves": {
+   "status": "ok",
+   "reason": "No halt marker, no daily-loss trip today, nothing paused on a pending order.",
+   "source": "data/paper_state/",
+   "as_of": "2026-11-18T13:00:00-08:00",
+   "halt": 0.4,
+   "target": 0.34,
+   "sleeves": [
+    {
+     "name": "CreditGatedMomentum",
+     "label": "Momentum",
+     "alloc": 0.75,
+     "leverage": 1.0,
+     "net_liq": 146848,
+     "cash": 146848,
+     "holds": [],
+     "doing": "all cash since Nov 2",
+     "drawdown": 0.229,
+     "peak": 190510,
+     "history": [
+      {
+       "date": "2026-07-28",
+       "net_liq": 184566.05,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-07-29",
+       "net_liq": 184566.05,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-07-30",
+       "net_liq": 184566.05,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-07-31",
+       "net_liq": 184566.05,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-03",
+       "net_liq": 184566.05,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-04",
+       "net_liq": 184566.05,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-05",
+       "net_liq": 190220.58,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-06",
+       "net_liq": 184787.75,
+       "drawdown": 0.0286
+      },
+      {
+       "date": "2026-08-07",
+       "net_liq": 183905.14,
+       "drawdown": 0.0332
+      },
+      {
+       "date": "2026-08-10",
+       "net_liq": 184757.51,
+       "drawdown": 0.0287
+      },
+      {
+       "date": "2026-08-11",
+       "net_liq": 183929.87,
+       "drawdown": 0.0331
+      },
+      {
+       "date": "2026-08-12",
+       "net_liq": 195236.98,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-13",
+       "net_liq": 196119.86,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-14",
+       "net_liq": 198163.87,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-17",
+       "net_liq": 171012.95,
+       "drawdown": 0.137
+      },
+      {
+       "date": "2026-08-18",
+       "net_liq": 163886.34,
+       "drawdown": 0.173
+      },
+      {
+       "date": "2026-08-19",
+       "net_liq": 159508.74,
+       "drawdown": 0.1951
+      },
+      {
+       "date": "2026-08-20",
+       "net_liq": 159077.81,
+       "drawdown": 0.1972
+      },
+      {
+       "date": "2026-08-21",
+       "net_liq": 158956.89,
+       "drawdown": 0.1979
+      },
+      {
+       "date": "2026-08-24",
+       "net_liq": 155741.04,
+       "drawdown": 0.2141
+      },
+      {
+       "date": "2026-08-25",
+       "net_liq": 156410.46,
+       "drawdown": 0.2107
+      },
+      {
+       "date": "2026-08-26",
+       "net_liq": 157152.28,
+       "drawdown": 0.207
+      },
+      {
+       "date": "2026-08-27",
+       "net_liq": 155953.42,
+       "drawdown": 0.213
+      },
+      {
+       "date": "2026-08-28",
+       "net_liq": 155086.85,
+       "drawdown": 0.2174
+      },
+      {
+       "date": "2026-08-31",
+       "net_liq": 155004.82,
+       "drawdown": 0.2178
+      },
+      {
+       "date": "2026-09-01",
+       "net_liq": 156488.03,
+       "drawdown": 0.2103
+      },
+      {
+       "date": "2026-09-02",
+       "net_liq": 156830.9,
+       "drawdown": 0.2086
+      },
+      {
+       "date": "2026-09-03",
+       "net_liq": 157750.82,
+       "drawdown": 0.2039
+      },
+      {
+       "date": "2026-09-04",
+       "net_liq": 161661.43,
+       "drawdown": 0.1842
+      },
+      {
+       "date": "2026-09-07",
+       "net_liq": 162287.04,
+       "drawdown": 0.181
+      },
+      {
+       "date": "2026-09-08",
+       "net_liq": 166444.88,
+       "drawdown": 0.1601
+      },
+      {
+       "date": "2026-09-09",
+       "net_liq": 166552.85,
+       "drawdown": 0.1595
+      },
+      {
+       "date": "2026-09-10",
+       "net_liq": 162435.34,
+       "drawdown": 0.1803
+      },
+      {
+       "date": "2026-09-11",
+       "net_liq": 163162.33,
+       "drawdown": 0.1766
+      },
+      {
+       "date": "2026-09-14",
+       "net_liq": 156219.39,
+       "drawdown": 0.2117
+      },
+      {
+       "date": "2026-09-15",
+       "net_liq": 155247.4,
+       "drawdown": 0.2166
+      },
+      {
+       "date": "2026-09-16",
+       "net_liq": 155503.81,
+       "drawdown": 0.2153
+      },
+      {
+       "date": "2026-09-17",
+       "net_liq": 161033.82,
+       "drawdown": 0.1874
+      },
+      {
+       "date": "2026-09-18",
+       "net_liq": 163682.62,
+       "drawdown": 0.174
+      },
+      {
+       "date": "2026-09-21",
+       "net_liq": 170971.58,
+       "drawdown": 0.1372
+      },
+      {
+       "date": "2026-09-22",
+       "net_liq": 172017.59,
+       "drawdown": 0.1319
+      },
+      {
+       "date": "2026-09-23",
+       "net_liq": 169292.24,
+       "drawdown": 0.1457
+      },
+      {
+       "date": "2026-09-24",
+       "net_liq": 171673.18,
+       "drawdown": 0.1337
+      },
+      {
+       "date": "2026-09-25",
+       "net_liq": 171858.13,
+       "drawdown": 0.1327
+      },
+      {
+       "date": "2026-09-28",
+       "net_liq": 167868.49,
+       "drawdown": 0.1529
+      },
+      {
+       "date": "2026-09-29",
+       "net_liq": 168747.51,
+       "drawdown": 0.1484
+      },
+      {
+       "date": "2026-09-30",
+       "net_liq": 169546.04,
+       "drawdown": 0.1444
+      },
+      {
+       "date": "2026-10-01",
+       "net_liq": 170048.08,
+       "drawdown": 0.1419
+      },
+      {
+       "date": "2026-10-02",
+       "net_liq": 171145.61,
+       "drawdown": 0.1363
+      },
+      {
+       "date": "2026-10-05",
+       "net_liq": 170263.71,
+       "drawdown": 0.1408
+      },
+      {
+       "date": "2026-10-06",
+       "net_liq": 171094.78,
+       "drawdown": 0.1366
+      },
+      {
+       "date": "2026-10-07",
+       "net_liq": 170829.68,
+       "drawdown": 0.1379
+      },
+      {
+       "date": "2026-10-08",
+       "net_liq": 167716.53,
+       "drawdown": 0.1536
+      },
+      {
+       "date": "2026-10-09",
+       "net_liq": 168897.21,
+       "drawdown": 0.1477
+      },
+      {
+       "date": "2026-10-12",
+       "net_liq": 166893.12,
+       "drawdown": 0.1578
+      },
+      {
+       "date": "2026-10-13",
+       "net_liq": 166224.57,
+       "drawdown": 0.1612
+      },
+      {
+       "date": "2026-10-14",
+       "net_liq": 162023.57,
+       "drawdown": 0.1824
+      },
+      {
+       "date": "2026-10-15",
+       "net_liq": 162449.19,
+       "drawdown": 0.1802
+      },
+      {
+       "date": "2026-10-16",
+       "net_liq": 156815.38,
+       "drawdown": 0.2087
+      },
+      {
+       "date": "2026-10-19",
+       "net_liq": 159130.67,
+       "drawdown": 0.197
+      },
+      {
+       "date": "2026-10-20",
+       "net_liq": 159163.09,
+       "drawdown": 0.1968
+      },
+      {
+       "date": "2026-10-21",
+       "net_liq": 160623.32,
+       "drawdown": 0.1894
+      },
+      {
+       "date": "2026-10-22",
+       "net_liq": 157336.31,
+       "drawdown": 0.206
+      },
+      {
+       "date": "2026-10-23",
+       "net_liq": 156492.55,
+       "drawdown": 0.2103
+      },
+      {
+       "date": "2026-10-26",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-27",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-28",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-29",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-30",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-02",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-03",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-04",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-05",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-06",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-09",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-10",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-11",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-12",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-13",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      },
+      {
+       "date": "2026-11-16",
+       "net_liq": 146847.56,
+       "drawdown": 0.259
+      }
+     ],
+     "positions": [],
+     "state_as_of": "2026-11-18T13:00:00-08:00"
+    },
+    {
+     "name": "CrossAssetTrend",
+     "label": "Trend",
+     "alloc": 0.25,
+     "leverage": 1.0,
+     "net_liq": 50152,
+     "cash": 45640,
+     "holds": [
+      "VNQ"
+     ],
+     "drawdown": 0.035,
+     "peak": 51970,
+     "history": [
+      {
+       "date": "2026-07-28",
+       "net_liq": 19952.68,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-07-29",
+       "net_liq": 19898.42,
+       "drawdown": 0.0027
+      },
+      {
+       "date": "2026-07-30",
+       "net_liq": 19825.01,
+       "drawdown": 0.0064
+      },
+      {
+       "date": "2026-07-31",
+       "net_liq": 19999.14,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-03",
+       "net_liq": 20013.71,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-04",
+       "net_liq": 20013.71,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-05",
+       "net_liq": 20185.39,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-06",
+       "net_liq": 20141.74,
+       "drawdown": 0.0022
+      },
+      {
+       "date": "2026-08-07",
+       "net_liq": 20227.65,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-10",
+       "net_liq": 20242.18,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-11",
+       "net_liq": 20231.64,
+       "drawdown": 0.0005
+      },
+      {
+       "date": "2026-08-12",
+       "net_liq": 20309.65,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-13",
+       "net_liq": 20354.26,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-14",
+       "net_liq": 20366.91,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-17",
+       "net_liq": 51145.8,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-18",
+       "net_liq": 52618.7,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-19",
+       "net_liq": 52734.23,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-20",
+       "net_liq": 52704.95,
+       "drawdown": 0.0006
+      },
+      {
+       "date": "2026-08-21",
+       "net_liq": 52964.56,
+       "drawdown": 0.0
+      },
+      {
+       "date": "2026-08-24",
+       "net_liq": 52806.2,
+       "drawdown": 0.003
+      },
+      {
+       "date": "2026-08-25",
+       "net_liq": 52921.36,
+       "drawdown": 0.0008
+      },
+      {
+       "date": "2026-08-26",
+       "net_liq": 52847.48,
+       "drawdown": 0.0022
+      },
+      {
+       "date": "2026-08-27",
+       "net_liq": 52940.79,
+       "drawdown": 0.0004
+      },
+      {
+       "date": "2026-08-28",
+       "net_liq": 52661.62,
+       "drawdown": 0.0057
+      },
+      {
+       "date": "2026-08-31",
+       "net_liq": 52622.71,
+       "drawdown": 0.0065
+      },
+      {
+       "date": "2026-09-01",
+       "net_liq": 52566.1,
+       "drawdown": 0.0075
+      },
+      {
+       "date": "2026-09-02",
+       "net_liq": 52602.33,
+       "drawdown": 0.0068
+      },
+      {
+       "date": "2026-09-03",
+       "net_liq": 52819.73,
+       "drawdown": 0.0027
+      },
+      {
+       "date": "2026-09-04",
+       "net_liq": 52869.68,
+       "drawdown": 0.0018
+      },
+      {
+       "date": "2026-09-07",
+       "net_liq": 52818.5,
+       "drawdown": 0.0028
+      },
+      {
+       "date": "2026-09-08",
+       "net_liq": 52908.25,
+       "drawdown": 0.0011
+      },
+      {
+       "date": "2026-09-09",
+       "net_liq": 52746.24,
+       "drawdown": 0.0041
+      },
+      {
+       "date": "2026-09-10",
+       "net_liq": 52554.76,
+       "drawdown": 0.0077
+      },
+      {
+       "date": "2026-09-11",
+       "net_liq": 52706.78,
+       "drawdown": 0.0049
+      },
+      {
+       "date": "2026-09-14",
+       "net_liq": 52479.62,
+       "drawdown": 0.0092
+      },
+      {
+       "date": "2026-09-15",
+       "net_liq": 52375.78,
+       "drawdown": 0.0111
+      },
+      {
+       "date": "2026-09-16",
+       "net_liq": 52161.18,
+       "drawdown": 0.0152
+      },
+      {
+       "date": "2026-09-17",
+       "net_liq": 52487.18,
+       "drawdown": 0.009
+      },
+      {
+       "date": "2026-09-18",
+       "net_liq": 52377.2,
+       "drawdown": 0.0111
+      },
+      {
+       "date": "2026-09-21",
+       "net_liq": 52736.44,
+       "drawdown": 0.0043
+      },
+      {
+       "date": "2026-09-22",
+       "net_liq": 52799.03,
+       "drawdown": 0.0031
+      },
+      {
+       "date": "2026-09-23",
+       "net_liq": 52512.63,
+       "drawdown": 0.0085
+      },
+      {
+       "date": "2026-09-24",
+       "net_liq": 52486.95,
+       "drawdown": 0.009
+      },
+      {
+       "date": "2026-09-25",
+       "net_liq": 52563.99,
+       "drawdown": 0.0076
+      },
+      {
+       "date": "2026-09-28",
+       "net_liq": 52327.49,
+       "drawdown": 0.012
+      },
+      {
+       "date": "2026-09-29",
+       "net_liq": 52217.96,
+       "drawdown": 0.0141
+      },
+      {
+       "date": "2026-09-30",
+       "net_liq": 52248.93,
+       "drawdown": 0.0135
+      },
+      {
+       "date": "2026-10-01",
+       "net_liq": 52259.4,
+       "drawdown": 0.0133
+      },
+      {
+       "date": "2026-10-02",
+       "net_liq": 52435.34,
+       "drawdown": 0.01
+      },
+      {
+       "date": "2026-10-05",
+       "net_liq": 52577.07,
+       "drawdown": 0.0073
+      },
+      {
+       "date": "2026-10-06",
+       "net_liq": 52611.17,
+       "drawdown": 0.0067
+      },
+      {
+       "date": "2026-10-07",
+       "net_liq": 52389.82,
+       "drawdown": 0.0109
+      },
+      {
+       "date": "2026-10-08",
+       "net_liq": 52256.98,
+       "drawdown": 0.0134
+      },
+      {
+       "date": "2026-10-09",
+       "net_liq": 52402.85,
+       "drawdown": 0.0106
+      },
+      {
+       "date": "2026-10-12",
+       "net_liq": 52350.87,
+       "drawdown": 0.0116
+      },
+      {
+       "date": "2026-10-13",
+       "net_liq": 52299.23,
+       "drawdown": 0.0126
+      },
+      {
+       "date": "2026-10-14",
+       "net_liq": 51982.78,
+       "drawdown": 0.0185
+      },
+      {
+       "date": "2026-10-15",
+       "net_liq": 52010.59,
+       "drawdown": 0.018
+      },
+      {
+       "date": "2026-10-16",
+       "net_liq": 51861.28,
+       "drawdown": 0.0208
+      },
+      {
+       "date": "2026-10-19",
+       "net_liq": 51891.65,
+       "drawdown": 0.0203
+      },
+      {
+       "date": "2026-10-20",
+       "net_liq": 51918.83,
+       "drawdown": 0.0197
+      },
+      {
+       "date": "2026-10-21",
+       "net_liq": 51989.98,
+       "drawdown": 0.0184
+      },
+      {
+       "date": "2026-10-22",
+       "net_liq": 51769.45,
+       "drawdown": 0.0226
+      },
+      {
+       "date": "2026-10-23",
+       "net_liq": 51824.87,
+       "drawdown": 0.0215
+      },
+      {
+       "date": "2026-10-26",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-27",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-28",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-29",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-10-30",
+       "net_liq": 51576.68,
+       "drawdown": 0.0262
+      },
+      {
+       "date": "2026-11-02",
+       "net_liq": 51372.54,
+       "drawdown": 0.0301
+      },
+      {
+       "date": "2026-11-03",
+       "net_liq": 51308.33,
+       "drawdown": 0.0313
+      },
+      {
+       "date": "2026-11-04",
+       "net_liq": 50984.84,
+       "drawdown": 0.0374
+      },
+      {
+       "date": "2026-11-05",
+       "net_liq": 50760.53,
+       "drawdown": 0.0416
+      },
+      {
+       "date": "2026-11-06",
+       "net_liq": 50353.5,
+       "drawdown": 0.0493
+      },
+      {
+       "date": "2026-11-09",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-11-10",
+       "net_liq": 50574.68,
+       "drawdown": 0.0451
+      },
+      {
+       "date": "2026-11-11",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-11-12",
+       "net_liq": null,
+       "drawdown": null
+      },
+      {
+       "date": "2026-11-13",
+       "net_liq": 50500.38,
+       "drawdown": 0.0465
+      },
+      {
+       "date": "2026-11-16",
+       "net_liq": 50191.07,
+       "drawdown": 0.0524
+      }
+     ],
+     "positions": [
+      {
+       "symbol": "VNQ",
+       "qty": 45,
+       "avg_cost": 95.19,
+       "mark": 95.36,
+       "upnl": 7.69
+      }
+     ],
+     "state_as_of": "2026-11-18T13:00:00-08:00"
+    }
+   ],
+   "history_note": "Daily snapshots from data/paper_equity.csv; steps are capital moves, not P&L. Two sessions behind."
+  },
+  "gate": {
+   "status": "ok",
+   "reason": "credit gate on since 2026-11-12 (HYG/LQD +0.03% over its 100-day average)",
+   "source": "data/bars/daily/",
+   "as_of": "2026-11-16",
+   "on": true,
+   "since": "2026-11-12",
+   "ratio": 0.7464,
+   "ma": 0.74618,
+   "margin": 0.0003,
+   "window": 100,
+   "history": [
+    {
+     "date": "2026-05-15",
+     "ratio": 0.7367,
+     "ma": 0.72901
+    },
+    {
+     "date": "2026-05-18",
+     "ratio": 0.73881,
+     "ma": 0.72913
+    },
+    {
+     "date": "2026-05-19",
+     "ratio": 0.74076,
+     "ma": 0.72927
+    },
+    {
+     "date": "2026-05-20",
+     "ratio": 0.73979,
+     "ma": 0.72941
+    },
+    {
+     "date": "2026-05-21",
+     "ratio": 0.73865,
+     "ma": 0.72955
+    },
+    {
+     "date": "2026-05-22",
+     "ratio": 0.73738,
+     "ma": 0.72968
+    },
+    {
+     "date": "2026-05-26",
+     "ratio": 0.73708,
+     "ma": 0.72979
+    },
+    {
+     "date": "2026-05-27",
+     "ratio": 0.73561,
+     "ma": 0.72986
+    },
+    {
+     "date": "2026-05-28",
+     "ratio": 0.7343,
+     "ma": 0.72992
+    },
+    {
+     "date": "2026-05-29",
+     "ratio": 0.73436,
+     "ma": 0.72997
+    },
+    {
+     "date": "2026-06-01",
+     "ratio": 0.73295,
+     "ma": 0.73002
+    },
+    {
+     "date": "2026-06-02",
+     "ratio": 0.73133,
+     "ma": 0.73005
+    },
+    {
+     "date": "2026-06-03",
+     "ratio": 0.73133,
+     "ma": 0.73005
+    },
+    {
+     "date": "2026-06-04",
+     "ratio": 0.73116,
+     "ma": 0.73008
+    },
+    {
+     "date": "2026-06-05",
+     "ratio": 0.73207,
+     "ma": 0.7301
+    },
+    {
+     "date": "2026-06-08",
+     "ratio": 0.73383,
+     "ma": 0.73016
+    },
+    {
+     "date": "2026-06-09",
+     "ratio": 0.7322,
+     "ma": 0.73021
+    },
+    {
+     "date": "2026-06-10",
+     "ratio": 0.73251,
+     "ma": 0.73027
+    },
+    {
+     "date": "2026-06-11",
+     "ratio": 0.73063,
+     "ma": 0.73027
+    },
+    {
+     "date": "2026-06-12",
+     "ratio": 0.73109,
+     "ma": 0.73026
+    },
+    {
+     "date": "2026-06-15",
+     "ratio": 0.73214,
+     "ma": 0.73028
+    },
+    {
+     "date": "2026-06-16",
+     "ratio": 0.73118,
+     "ma": 0.7303
+    },
+    {
+     "date": "2026-06-17",
+     "ratio": 0.73078,
+     "ma": 0.73032
+    },
+    {
+     "date": "2026-06-18",
+     "ratio": 0.73133,
+     "ma": 0.73035
+    },
+    {
+     "date": "2026-06-22",
+     "ratio": 0.73264,
+     "ma": 0.73038
+    },
+    {
+     "date": "2026-06-23",
+     "ratio": 0.73112,
+     "ma": 0.73041
+    },
+    {
+     "date": "2026-06-24",
+     "ratio": 0.7276,
+     "ma": 0.73039
+    },
+    {
+     "date": "2026-06-25",
+     "ratio": 0.72728,
+     "ma": 0.73037
+    },
+    {
+     "date": "2026-06-26",
+     "ratio": 0.72682,
+     "ma": 0.73032
+    },
+    {
+     "date": "2026-06-29",
+     "ratio": 0.72713,
+     "ma": 0.73029
+    },
+    {
+     "date": "2026-06-30",
+     "ratio": 0.73097,
+     "ma": 0.73029
+    },
+    {
+     "date": "2026-07-01",
+     "ratio": 0.7324,
+     "ma": 0.73035
+    },
+    {
+     "date": "2026-07-02",
+     "ratio": 0.73229,
+     "ma": 0.73039
+    },
+    {
+     "date": "2026-07-06",
+     "ratio": 0.73356,
+     "ma": 0.73043
+    },
+    {
+     "date": "2026-07-07",
+     "ratio": 0.73791,
+     "ma": 0.73054
+    },
+    {
+     "date": "2026-07-08",
+     "ratio": 0.73842,
+     "ma": 0.73065
+    },
+    {
+     "date": "2026-07-09",
+     "ratio": 0.73898,
+     "ma": 0.7308
+    },
+    {
+     "date": "2026-07-10",
+     "ratio": 0.74033,
+     "ma": 0.73099
+    },
+    {
+     "date": "2026-07-13",
+     "ratio": 0.74202,
+     "ma": 0.7312
+    },
+    {
+     "date": "2026-07-14",
+     "ratio": 0.74178,
+     "ma": 0.73139
+    },
+    {
+     "date": "2026-07-15",
+     "ratio": 0.74043,
+     "ma": 0.73157
+    },
+    {
+     "date": "2026-07-16",
+     "ratio": 0.74089,
+     "ma": 0.73175
+    },
+    {
+     "date": "2026-07-17",
+     "ratio": 0.73909,
+     "ma": 0.73193
+    },
+    {
+     "date": "2026-07-20",
+     "ratio": 0.74219,
+     "ma": 0.73214
+    },
+    {
+     "date": "2026-07-21",
+     "ratio": 0.744,
+     "ma": 0.73235
+    },
+    {
+     "date": "2026-07-22",
+     "ratio": 0.74404,
+     "ma": 0.73258
+    },
+    {
+     "date": "2026-07-23",
+     "ratio": 0.74418,
+     "ma": 0.73282
+    },
+    {
+     "date": "2026-07-24",
+     "ratio": 0.74439,
+     "ma": 0.73304
+    },
+    {
+     "date": "2026-07-27",
+     "ratio": 0.74281,
+     "ma": 0.73326
+    },
+    {
+     "date": "2026-07-28",
+     "ratio": 0.74199,
+     "ma": 0.73345
+    },
+    {
+     "date": "2026-07-29",
+     "ratio": 0.74456,
+     "ma": 0.73367
+    },
+    {
+     "date": "2026-07-30",
+     "ratio": 0.74539,
+     "ma": 0.7339
+    },
+    {
+     "date": "2026-07-31",
+     "ratio": 0.7466,
+     "ma": 0.73415
+    },
+    {
+     "date": "2026-08-03",
+     "ratio": 0.74638,
+     "ma": 0.73435
+    },
+    {
+     "date": "2026-08-04",
+     "ratio": 0.74408,
+     "ma": 0.73449
+    },
+    {
+     "date": "2026-08-05",
+     "ratio": 0.74394,
+     "ma": 0.73464
+    },
+    {
+     "date": "2026-08-06",
+     "ratio": 0.74603,
+     "ma": 0.73479
+    },
+    {
+     "date": "2026-08-07",
+     "ratio": 0.74611,
+     "ma": 0.73496
+    },
+    {
+     "date": "2026-08-10",
+     "ratio": 0.74904,
+     "ma": 0.73516
+    },
+    {
+     "date": "2026-08-11",
+     "ratio": 0.74911,
+     "ma": 0.73536
+    },
+    {
+     "date": "2026-08-12",
+     "ratio": 0.74913,
+     "ma": 0.73558
+    },
+    {
+     "date": "2026-08-13",
+     "ratio": 0.7478,
+     "ma": 0.73575
+    },
+    {
+     "date": "2026-08-14",
+     "ratio": 0.75007,
+     "ma": 0.73595
+    },
+    {
+     "date": "2026-08-17",
+     "ratio": 0.75211,
+     "ma": 0.73618
+    },
+    {
+     "date": "2026-08-18",
+     "ratio": 0.75036,
+     "ma": 0.73639
+    },
+    {
+     "date": "2026-08-19",
+     "ratio": 0.74691,
+     "ma": 0.73656
+    },
+    {
+     "date": "2026-08-20",
+     "ratio": 0.74908,
+     "ma": 0.73675
+    },
+    {
+     "date": "2026-08-21",
+     "ratio": 0.75055,
+     "ma": 0.737
+    },
+    {
+     "date": "2026-08-24",
+     "ratio": 0.74955,
+     "ma": 0.73721
+    },
+    {
+     "date": "2026-08-25",
+     "ratio": 0.74684,
+     "ma": 0.73738
+    },
+    {
+     "date": "2026-08-26",
+     "ratio": 0.74721,
+     "ma": 0.73757
+    },
+    {
+     "date": "2026-08-27",
+     "ratio": 0.74728,
+     "ma": 0.73774
+    },
+    {
+     "date": "2026-08-28",
+     "ratio": 0.74873,
+     "ma": 0.73792
+    },
+    {
+     "date": "2026-08-31",
+     "ratio": 0.75038,
+     "ma": 0.73811
+    },
+    {
+     "date": "2026-09-01",
+     "ratio": 0.75166,
+     "ma": 0.73831
+    },
+    {
+     "date": "2026-09-02",
+     "ratio": 0.75083,
+     "ma": 0.7385
+    },
+    {
+     "date": "2026-09-03",
+     "ratio": 0.75071,
+     "ma": 0.7387
+    },
+    {
+     "date": "2026-09-04",
+     "ratio": 0.75037,
+     "ma": 0.73889
+    },
+    {
+     "date": "2026-09-08",
+     "ratio": 0.74999,
+     "ma": 0.73908
+    },
+    {
+     "date": "2026-09-09",
+     "ratio": 0.74988,
+     "ma": 0.73925
+    },
+    {
+     "date": "2026-09-10",
+     "ratio": 0.75325,
+     "ma": 0.73946
+    },
+    {
+     "date": "2026-09-11",
+     "ratio": 0.75335,
+     "ma": 0.73968
+    },
+    {
+     "date": "2026-09-14",
+     "ratio": 0.75282,
+     "ma": 0.73989
+    },
+    {
+     "date": "2026-09-15",
+     "ratio": 0.75153,
+     "ma": 0.74008
+    },
+    {
+     "date": "2026-09-16",
+     "ratio": 0.75069,
+     "ma": 0.74026
+    },
+    {
+     "date": "2026-09-17",
+     "ratio": 0.74847,
+     "ma": 0.74041
+    },
+    {
+     "date": "2026-09-18",
+     "ratio": 0.74995,
+     "ma": 0.74055
+    },
+    {
+     "date": "2026-09-21",
+     "ratio": 0.74859,
+     "ma": 0.7407
+    },
+    {
+     "date": "2026-09-22",
+     "ratio": 0.7485,
+     "ma": 0.74082
+    },
+    {
+     "date": "2026-09-23",
+     "ratio": 0.75166,
+     "ma": 0.74096
+    },
+    {
+     "date": "2026-09-24",
+     "ratio": 0.75501,
+     "ma": 0.74114
+    },
+    {
+     "date": "2026-09-25",
+     "ratio": 0.75428,
+     "ma": 0.74131
+    },
+    {
+     "date": "2026-09-28",
+     "ratio": 0.75661,
+     "ma": 0.74152
+    },
+    {
+     "date": "2026-09-29",
+     "ratio": 0.75529,
+     "ma": 0.74173
+    },
+    {
+     "date": "2026-09-30",
+     "ratio": 0.75553,
+     "ma": 0.74195
+    },
+    {
+     "date": "2026-10-01",
+     "ratio": 0.7537,
+     "ma": 0.74214
+    },
+    {
+     "date": "2026-10-02",
+     "ratio": 0.75528,
+     "ma": 0.74235
+    },
+    {
+     "date": "2026-10-05",
+     "ratio": 0.75597,
+     "ma": 0.74256
+    },
+    {
+     "date": "2026-10-06",
+     "ratio": 0.75651,
+     "ma": 0.74277
+    },
+    {
+     "date": "2026-10-07",
+     "ratio": 0.75593,
+     "ma": 0.74297
+    },
+    {
+     "date": "2026-10-08",
+     "ratio": 0.75281,
+     "ma": 0.74313
+    },
+    {
+     "date": "2026-10-09",
+     "ratio": 0.75413,
+     "ma": 0.74328
+    },
+    {
+     "date": "2026-10-12",
+     "ratio": 0.75346,
+     "ma": 0.74341
+    },
+    {
+     "date": "2026-10-13",
+     "ratio": 0.75173,
+     "ma": 0.74353
+    },
+    {
+     "date": "2026-10-14",
+     "ratio": 0.7482,
+     "ma": 0.74362
+    },
+    {
+     "date": "2026-10-15",
+     "ratio": 0.74522,
+     "ma": 0.7437
+    },
+    {
+     "date": "2026-10-16",
+     "ratio": 0.74333,
+     "ma": 0.74377
+    },
+    {
+     "date": "2026-10-19",
+     "ratio": 0.74679,
+     "ma": 0.74388
+    },
+    {
+     "date": "2026-10-20",
+     "ratio": 0.74433,
+     "ma": 0.74398
+    },
+    {
+     "date": "2026-10-21",
+     "ratio": 0.74586,
+     "ma": 0.74409
+    },
+    {
+     "date": "2026-10-22",
+     "ratio": 0.73936,
+     "ma": 0.74416
+    },
+    {
+     "date": "2026-10-23",
+     "ratio": 0.74194,
+     "ma": 0.74426
+    },
+    {
+     "date": "2026-10-26",
+     "ratio": 0.74216,
+     "ma": 0.74437
+    },
+    {
+     "date": "2026-10-27",
+     "ratio": 0.74401,
+     "ma": 0.7445
+    },
+    {
+     "date": "2026-10-28",
+     "ratio": 0.74556,
+     "ma": 0.74463
+    },
+    {
+     "date": "2026-10-29",
+     "ratio": 0.74439,
+     "ma": 0.74474
+    },
+    {
+     "date": "2026-10-30",
+     "ratio": 0.74259,
+     "ma": 0.74484
+    },
+    {
+     "date": "2026-11-02",
+     "ratio": 0.74139,
+     "ma": 0.74493
+    },
+    {
+     "date": "2026-11-03",
+     "ratio": 0.74219,
+     "ma": 0.74505
+    },
+    {
+     "date": "2026-11-04",
+     "ratio": 0.74182,
+     "ma": 0.74516
+    },
+    {
+     "date": "2026-11-05",
+     "ratio": 0.73839,
+     "ma": 0.74522
+    },
+    {
+     "date": "2026-11-06",
+     "ratio": 0.73883,
+     "ma": 0.74529
+    },
+    {
+     "date": "2026-11-09",
+     "ratio": 0.74052,
+     "ma": 0.74539
+    },
+    {
+     "date": "2026-11-10",
+     "ratio": 0.74297,
+     "ma": 0.74551
+    },
+    {
+     "date": "2026-11-11",
+     "ratio": 0.74404,
+     "ma": 0.74562
+    },
+    {
+     "date": "2026-11-12",
+     "ratio": 0.74702,
+     "ma": 0.74578
+    },
+    {
+     "date": "2026-11-13",
+     "ratio": 0.74837,
+     "ma": 0.74599
+    },
+    {
+     "date": "2026-11-16",
+     "ratio": 0.7464,
+     "ma": 0.74618
+    }
+   ],
+   "note": "At the Nov 2 rebalance the gate was off, so the sleeve went to cash for the month. The gate is read only at the monthly rebalance."
+  },
+  "universe": {
+   "status": "warn",
+   "reason": "running static, .env says pit: 16 in, 16 out at the next restart",
+   "source": "data/paper_trade.log",
+   "as_of": "2026-11-15T08:00:00-08:00",
+   "running": {
+    "mode": "static",
+    "decided": "2026-06-02",
+    "n": 50
+   },
+   "disk": {
+    "mode": "pit",
+    "decided": "2026-11-14",
+    "n": 50,
+    "fresh": 0.87
+   },
+   "going_in": [
+    "MRVL",
+    "LITE",
+    "STX",
+    "WDC",
+    "BE",
+    "DELL",
+    "LRCX",
+    "CAT",
+    "NOW",
+    "HOOD",
+    "PANW",
+    "APP",
+    "TXN",
+    "CRWD",
+    "COHR",
+    "GS"
+   ],
+   "going_out": [
+    "SMCI",
+    "CRCL",
+    "COIN",
+    "BRK.A",
+    "DIS",
+    "BA",
+    "HD",
+    "CVX",
+    "SHOP",
+    "ADBE",
+    "PFE",
+    "UBER",
+    "RIVN",
+    "PYPL",
+    "MA",
+    "RBLX"
+   ],
+   "next_restart": "2026-11-22T08:00:00-08:00",
+   "last_rebalance": "Nov 2: sold 15, bought 0. The Dec 1 rebalance picks from whichever list the daemon has loaded then."
+  },
+  "dispatches": {
+   "status": "ok",
+   "reason": "close slot ran 13:00, 62/62 live quotes",
+   "source": "data/paper_trade.log",
+   "as_of": "2026-11-18T13:00:00-08:00",
+   "slots": [
+    {
+     "at": "2026-11-18T21:00:36Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 1
+    },
+    {
+     "at": "2026-11-18T14:32:45Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-17T21:00:36Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 1
+    },
+    {
+     "at": "2026-11-17T14:32:51Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-16T21:00:37Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 1
+    },
+    {
+     "at": "2026-11-16T14:32:51Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-13T21:00:00Z",
+     "slot": "close",
+     "skipped": true,
+     "live": null,
+     "quotes": null,
+     "fallback": null,
+     "dropped": null,
+     "orders": null,
+     "note": "no dispatch line for this NYSE session slot"
+    },
+    {
+     "at": "2026-11-13T14:33:25Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-12T21:00:38Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 1
+    },
+    {
+     "at": "2026-11-12T14:32:51Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-11T21:00:38Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 1
+    },
+    {
+     "at": "2026-11-11T14:32:36Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-10T21:00:35Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 1
+    },
+    {
+     "at": "2026-11-10T14:32:17Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-09T21:00:36Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 3
+    },
+    {
+     "at": "2026-11-09T14:33:01Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-06T21:00:37Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-06T14:32:25Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    },
+    {
+     "at": "2026-11-05T21:00:36Z",
+     "slot": "close",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 3
+    },
+    {
+     "at": "2026-11-05T14:32:26Z",
+     "slot": "open",
+     "live": 62,
+     "quotes": 62,
+     "fallback": 0,
+     "dropped": 0,
+     "orders": 0
+    }
+   ],
+   "events": [
+    {
+     "at": "2026-11-15T16:00:05Z",
+     "level": "INFO",
+     "text": "Runner started"
+    },
+    {
+     "at": "2026-11-15T16:00:05Z",
+     "level": "WARNING",
+     "text": "Broker returned NO positions but the journal has 69 open trades — leaving them OPEN (this is a disconnect, not a flat account): ['AAPL', 'AMAT', 'UNH', 'AAPL', 'UNH', 'AMD', 'BAC', 'CSCO', 'INTC', 'MU', 'NBIS', 'SNDK', 'QQQ', 'SNDK', 'MU', "
+    },
+    {
+     "at": "2026-11-15T16:00:03Z",
+     "level": "INFO",
+     "text": "Runner stopped"
+    },
+    {
+     "at": "2026-11-08T16:00:06Z",
+     "level": "INFO",
+     "text": "Runner started"
+    },
+    {
+     "at": "2026-11-08T16:00:06Z",
+     "level": "WARNING",
+     "text": "Broker returned NO positions but the journal has 67 open trades — leaving them OPEN (this is a disconnect, not a flat account): ['AAPL', 'AMAT', 'UNH', 'AAPL', 'UNH', 'AMD', 'BAC', 'CSCO', 'INTC', 'MU', 'NBIS', 'SNDK', 'QQQ', 'SNDK', 'MU', "
+    },
+    {
+     "at": "2026-11-08T16:00:04Z",
+     "level": "INFO",
+     "text": "Runner stopped"
+    },
+    {
+     "at": "2026-11-02T22:51:06Z",
+     "level": "INFO",
+     "text": "Runner started"
+    },
+    {
+     "at": "2026-11-02T22:51:06Z",
+     "level": "WARNING",
+     "text": "Broker returned NO positions but the journal has 59 open trades — leaving them OPEN (this is a disconnect, not a flat account): ['AAPL', 'AMAT', 'UNH', 'AAPL', 'UNH', 'AMD', 'BAC', 'CSCO', 'INTC', 'MU', 'NBIS', 'SNDK', 'SNDK', 'MU', 'AMD', "
+    },
+    {
+     "at": "2026-11-01T16:00:03Z",
+     "level": "INFO",
+     "text": "Runner started"
+    },
+    {
+     "at": "2026-11-01T16:00:01Z",
+     "level": "INFO",
+     "text": "Runner stopped"
+    }
+   ],
+   "note": "A missed slot leaves no log line; the emitter works it out from the NYSE calendar."
+  },
+  "fills": {
+   "status": "ok",
+   "reason": "1 fill today",
+   "source": "data/journal/trades.db",
+   "as_of": "2026-11-18T13:00:04-08:00",
+   "fills": [
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "DBC",
+     "qty": 143,
+     "price": 29.52,
+     "at": "2026-11-18T21:00:36.884408+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "SPY",
+     "qty": 5,
+     "price": 730.87,
+     "at": "2026-11-17T21:00:36.912818+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "EFA",
+     "qty": 40,
+     "price": 102.62,
+     "at": "2026-11-16T21:00:37.929136+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "QQQ",
+     "qty": 6,
+     "price": 678.76,
+     "at": "2026-11-13T21:00:38.559637+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "IWM",
+     "qty": 14,
+     "price": 278.59,
+     "at": "2026-11-12T21:00:38.671018+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "QQQ",
+     "qty": 6,
+     "price": 691.48,
+     "at": "2026-11-11T21:00:38.116379+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "QQQ",
+     "qty": 6,
+     "price": 673.37,
+     "at": "2026-11-10T21:00:35.582211+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "EFA",
+     "qty": 40,
+     "price": 105.05,
+     "at": "2026-11-09T21:00:36.217333+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "IWM",
+     "qty": 14,
+     "price": 283.1,
+     "at": "2026-11-09T21:00:36.214869+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "QQQ",
+     "qty": 6,
+     "price": 680.7,
+     "at": "2026-11-09T21:00:36.210999+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "EFA",
+     "qty": 40,
+     "price": 102.81,
+     "at": "2026-11-05T21:00:36.256660+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "IWM",
+     "qty": 15,
+     "price": 270.82,
+     "at": "2026-11-05T21:00:36.254273+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "QQQ",
+     "qty": 6,
+     "price": 649.98,
+     "at": "2026-11-05T21:00:36.250615+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "EFA",
+     "qty": 40,
+     "price": 105.71,
+     "at": "2026-11-04T21:00:35.440872+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "sell",
+     "symbol": "EFA",
+     "qty": 41,
+     "price": 103.06,
+     "at": "2026-11-03T21:00:50.443847+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "VNQ",
+     "qty": 45,
+     "price": 95.19,
+     "at": "2026-11-02T21:00:39.646139+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "EFA",
+     "qty": 41,
+     "price": 103.71,
+     "at": "2026-11-02T21:00:39.644994+00:00"
+    },
+    {
+     "sleeve": "Trend",
+     "side": "buy",
+     "symbol": "IWM",
+     "qty": 15,
+     "price": 279.55,
+     "at": "2026-11-02T21:00:39.643679+00:00"
+    },
+    {
+     "sleeve": "Momentum",
+     "side": "sell",
+     "symbol": "AMZN",
+     "qty": 42,
+     "price": 246.52,
+     "at": "2026-11-02T21:00:39.639506+00:00"
+    },
+    {
+     "sleeve": "Momentum",
+     "side": "sell",
+     "symbol": "QCOM",
+     "qty": 57,
+     "price": 162.38,
+     "at": "2026-11-02T21:00:39.638299+00:00"
+    }
+   ],
+   "rejections": [
+    {
+     "kind": "rejected",
+     "at": null,
+     "text": "buy 11x LLY | reason=Insufficient buying power"
+    },
+    {
+     "kind": "rejected",
+     "at": null,
+     "text": "buy 32x V | reason=Insufficient buying power"
+    },
+    {
+     "kind": "trimmed",
+     "at": null,
+     "text": "buy 40x EFA trimmed to 36x | reason=cash cap"
+    }
+   ],
+   "rejections_note": "REJECTED/FILLED/trim lines carry no timestamp in paper_trade.log yet, so they can't be dated."
+  },
+  "jobs": {
+   "status": "warn",
+   "reason": "3 jobs exited 1, none missed",
+   "source": "launchctl",
+   "as_of": "2026-11-18T15:09:00-08:00",
+   "jobs": [
+    {
+     "label": "dataupdate",
+     "schedule": "daily 18:30",
+     "last_ran": "2026-11-17T18:38:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "gatewaywatch",
+     "schedule": "every 2m",
+     "last_ran": "2026-11-16T23:45:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "guidancefwd",
+     "schedule": "Mon 08:00",
+     "last_ran": "2026-11-16T08:01:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "heartbeat",
+     "schedule": "every 30m",
+     "last_ran": null,
+     "exit": 0,
+     "running": false,
+     "missed": false,
+     "note": "logs nothing locally"
+    },
+    {
+     "label": "newsfwd",
+     "schedule": "wkdays 13:50",
+     "last_ran": "2026-11-18T13:51:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "paperhealth",
+     "schedule": "wkdays 06:15 12:50 13:15",
+     "last_ran": "2026-11-18T13:15:00-08:00",
+     "exit": 1,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "paperreport",
+     "schedule": "wkdays 13:30",
+     "last_ran": "2026-11-18T13:30:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "papertrade",
+     "schedule": "KeepAlive",
+     "last_ran": "2026-11-18T13:00:00-08:00",
+     "exit": null,
+     "running": true,
+     "missed": false
+    },
+    {
+     "label": "pooldata",
+     "schedule": "daily 21:00",
+     "last_ran": "2026-11-17T21:04:00-08:00",
+     "exit": 1,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "restart",
+     "schedule": "Sun 08:00",
+     "last_ran": "2026-11-15T08:00:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "shadowblend",
+     "schedule": "daily 18:30",
+     "last_ran": null,
+     "exit": 1,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "shadowvm",
+     "schedule": "wkdays 19:00",
+     "last_ran": null,
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "stocktwits",
+     "schedule": "wkdays 13:45",
+     "last_ran": "2026-11-18T13:45:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "universebuild",
+     "schedule": "Sat 19:30",
+     "last_ran": "2026-11-14T19:30:00-08:00",
+     "exit": 0,
+     "running": false,
+     "missed": false
+    },
+    {
+     "label": "weeklysummary",
+     "schedule": null,
+     "last_ran": null,
+     "exit": 0,
+     "running": false,
+     "missed": null,
+     "note": "plist not valid XML for plistlib"
+    }
+   ],
+   "note": "Last ran is the job log's modified time. Missed is a calendar slot that passed with no run."
+  },
+  "freshness": {
+   "status": "warn",
+   "reason": "12 ETFs one session late; equity snapshot 2 sessions behind",
+   "source": "data/bars/daily/",
+   "as_of": "2026-11-18T15:09:00-08:00",
+   "groups": [
+    {
+     "name": "etfs",
+     "label": "ETFs (dataupdate)",
+     "n": 12,
+     "oldest": "2026-11-16",
+     "newest": "2026-11-16",
+     "status": "warn",
+     "note": "1 session late"
+    },
+    {
+     "name": "pool",
+     "label": "Momentum names (pooldata)",
+     "n": 50,
+     "oldest": "2026-11-17",
+     "newest": "2026-11-17",
+     "status": "ok",
+     "note": "current"
+    }
+   ],
+   "integrity": "0 defects on 62 symbols, scanned to 2026-11-13 (integrity/live.json)",
+   "equity": {
+    "newest": "2026-11-16",
+    "nan_rows": 11
+   }
+  },
+  "health": {
+   "status": "ok",
+   "reason": "last page Wed 13:15 via ntfy",
+   "source": "data/alert_state.json",
+   "as_of": "2026-11-18T13:15:00-08:00",
+   "checks": [
+    "daemon",
+    "gateway",
+    "halt",
+    "snapshot",
+    "universe",
+    "bars",
+    "freshness",
+    "dispatch",
+    "news",
+    "paused"
+   ],
+   "runs": [
+    {
+     "at": "2026-11-12T06:15:04",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "fail",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-12T12:50:05",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "fail",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-12T13:15:02",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "fail",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-13T06:15:03",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "fail",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-13T12:50:02",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "fail",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-13T13:15:00",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "fail",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-16T06:15:00",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-16T12:50:05",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-16T13:15:00",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-17T06:15:04",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-17T12:50:03",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-17T13:15:00",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "ok",
+      "universe": "fail",
+      "bars": "ok",
+      "freshness": "fail",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-18T06:15:03",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "fail",
+      "universe": "ok",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-18T12:50:04",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "fail",
+      "universe": "ok",
+      "bars": "ok",
+      "freshness": "ok",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    },
+    {
+     "at": "2026-11-18T13:15:00",
+     "checks": {
+      "daemon": "ok",
+      "gateway": "ok",
+      "halt": "ok",
+      "paused": "ok",
+      "snapshot": "fail",
+      "universe": "ok",
+      "bars": "ok",
+      "freshness": "fail",
+      "dispatch": "ok",
+      "news": "ok"
+     }
+    }
+   ],
+   "note": "paperhealth runs weekdays 06:15, 12:50 and 13:15 PT only. Nothing checks overnight or at weekends."
+  },
+  "host": {
+   "status": "bad",
+   "reason": "trades.db backup 93 days old",
+   "source": "ps, netstat, sysctl, df",
+   "as_of": "2026-11-18T15:09:00-08:00",
+   "daemon": {
+    "pid": 84984,
+    "since": "2026-11-15T08:00:00-08:00",
+    "head": "ca4c326",
+    "commits_since": 5,
+    "env_edited": "2026-11-17T15:16:00-08:00",
+    "env_after_start": true
+   },
+   "next_restart": "2026-11-22T08:00:00-08:00",
+   "gateway": {
+    "listening": true,
+    "addr": "127.0.0.1:4002"
+   },
+   "boot": "2026-11-02T14:45:00-08:00",
+   "disk_free_gb": 140,
+   "backups": [
+    {
+     "name": "trades.db",
+     "at": "2026-08-17T17:11:00-07:00",
+     "age_days": 93,
+     "status": "bad"
+    },
+    {
+     "name": "paper_state",
+     "at": "2026-08-18T00:11:00-07:00",
+     "age_days": 92,
+     "status": "bad"
+    }
+   ],
+   "off_box": false,
+   "last_page": {
+    "at": "2026-11-18T13:15:00-08:00",
+    "via": "ntfy"
+   }
+  },
+  "shadow": {
+   "status": "warn",
+   "reason": "blend shadow stuck at 2026-11-13",
+   "source": "data/shadow_blend/curve.csv",
+   "as_of": "2026-11-13",
+   "c1": {
+    "label": "Vol-managed multi-asset (C1): shadow, no capital",
+    "status": "ok",
+    "start": "2026-10-26",
+    "end": "2026-11-13",
+    "days": 15,
+    "report_at": "2026-11-17",
+    "series": [
+     {
+      "date": "2026-10-26",
+      "shadow": 199964.37,
+      "backtest": 199964.37
+     },
+     {
+      "date": "2026-10-27",
+      "shadow": 201248.44,
+      "backtest": 201644.48
+     },
+     {
+      "date": "2026-10-28",
+      "shadow": 201571.47,
+      "backtest": 202398.91
+     },
+     {
+      "date": "2026-10-29",
+      "shadow": 200445.53,
+      "backtest": 200665.46
+     },
+     {
+      "date": "2026-10-30",
+      "shadow": 196860.55,
+      "backtest": 195932.76
+     },
+     {
+      "date": "2026-11-02",
+      "shadow": 196157.1,
+      "backtest": 194590.74
+     },
+     {
+      "date": "2026-11-03",
+      "shadow": 196145.59,
+      "backtest": 195070.95
+     },
+     {
+      "date": "2026-11-04",
+      "shadow": 198538.06,
+      "backtest": 197182.83
+     },
+     {
+      "date": "2026-11-05",
+      "shadow": 193553.96,
+      "backtest": 189933.09
+     },
+     {
+      "date": "2026-11-06",
+      "shadow": 194129.32,
+      "backtest": 191018.95
+     },
+     {
+      "date": "2026-11-09",
+      "shadow": 197288.82,
+      "backtest": 195071.55
+     },
+     {
+      "date": "2026-11-10",
+      "shadow": 195895.52,
+      "backtest": 194158.84
+     },
+     {
+      "date": "2026-11-11",
+      "shadow": 196915.39,
+      "backtest": 195785.66
+     },
+     {
+      "date": "2026-11-12",
+      "shadow": 195575.15,
+      "backtest": 195051.0
+     },
+     {
+      "date": "2026-11-13",
+      "shadow": 194918.86,
+      "backtest": 194232.73
+     },
+     {
+      "date": "2026-11-16",
+      "shadow": 193226.78,
+      "backtest": 191985.74
+     }
+    ],
+    "stats": [
+     {
+      "name": "shadow",
+      "total": -0.0252,
+      "vol": 0.1671,
+      "max_dd": -0.0398
+     },
+     {
+      "name": "backtest",
+      "total": -0.0287,
+      "vol": 0.224,
+      "max_dd": -0.0616
+     },
+     {
+      "name": "full backtest 2008→",
+      "total": null,
+      "vol": 0.105,
+      "max_dd": -0.193
+     }
+    ],
+    "correlation": 0.98,
+    "tracking_error": 0.0687,
+    "note": "15 days is far too short to judge."
+   },
+   "blend": {
+    "status": "bad",
+    "label": "crashing nightly since Oct 26",
+    "last": "2026-11-13",
+    "reason": "com.traderjoe.shadowblend exits 1 on the same Decimal/float error that disabled paper_report's tracking check. Its curve stops at 2026-11-13."
+   }
+  },
+  "env": {
+   "status": "ok",
+   "reason": "BROKER=ibkr, MOMENTUM_UNIVERSE=pit; 9 other keys (set)",
+   "source": ".env",
+   "as_of": "2026-11-15T07:58:00-08:00",
+   "keys": [
+    {
+     "key": "BROKER",
+     "value": "ibkr"
+    },
+    {
+     "key": "IBKR_HOST",
+     "value": "127.0.0.1"
+    },
+    {
+     "key": "IBKR_PORT",
+     "value": "4002"
+    },
+    {
+     "key": "IBKR_CLIENT_ID",
+     "value": "7"
+    },
+    {
+     "key": "IBKR_PAPER",
+     "value": "true"
+    },
+    {
+     "key": "TASTYTRADE_PAPER",
+     "value": "true"
+    },
+    {
+     "key": "ANTHROPIC_MODEL",
+     "value": "claude-opus-5"
+    },
+    {
+     "key": "MOMENTUM_UNIVERSE",
+     "value": "pit"
+    },
+    {
+     "key": "ANTHROPIC_API_KEY",
+     "value": "(set)"
+    },
+    {
+     "key": "NTFY_TOPIC",
+     "value": "(set)"
+    },
+    {
+     "key": "TASTYTRADE_SECRET",
+     "value": "(set)"
+    }
+   ]
+  }
+ },
+ "watch": [
+  {
+   "id": "daemon",
+   "status": "warn",
+   "label": "restart pending",
+   "reason": "PID up since Sun Nov 15 08:00 · loaded static universe; disk says pit. Applies at Sun Nov 22 08:00."
+  },
+  {
+   "id": "dispatch",
+   "status": "ok",
+   "label": "close Wed 13:00",
+   "reason": "62/62 live quotes, 0 fallback, 0 dropped, 1 order(s). No skipped slot in 10 sessions."
+  },
+  {
+   "id": "guards",
+   "status": "ok",
+   "label": "none tripped",
+   "reason": "No halt marker, no daily-loss trip today, nothing paused on a pending order."
+  },
+  {
+   "id": "equity",
+   "status": "warn",
+   "label": "newest 2026-11-16 (2d)",
+   "reason": "11 NaN rows in history; tracking check unavailable since Oct 26."
+  },
+  {
+   "id": "bars",
+   "status": "warn",
+   "label": "12 ETFs 1 session late",
+   "reason": "ETFs (dataupdate 18:30) newest 2026-11-16; pool names (pooldata 21:00) newest 2026-11-17."
+  },
+  {
+   "id": "jobs",
+   "status": "warn",
+   "label": "3 exited 1",
+   "reason": "paperhealth (failing checks), pooldata (pool-only defects), shadowblend (crashing nightly since Oct 26). None missed."
+  },
+  {
+   "id": "gateway",
+   "status": "ok",
+   "label": "port 4002 up",
+   "reason": "Link-loss (1100) events aren't timestamped yet; last relaunch is the nightly 23:45 IBKR restart."
+  },
+  {
+   "id": "alerts",
+   "status": "ok",
+   "label": "last page Wed 13:15",
+   "reason": "ntfy. Daemon alerts (DAILY-LOSS etc.) still go only to its log. Heartbeat silence isn't alerted off-box."
+  },
+  {
+   "id": "backups",
+   "status": "bad",
+   "label": "trades.db 93d old",
+   "reason": "Last by hand, Aug 17. Nothing off-box. 140 GB free."
+  },
+  {
+   "id": "uptime",
+   "status": "ok",
+   "label": "up 16d",
+   "reason": "Last boot Mon Nov 02 14:45 (unattended macOS update)."
+  }
+ ]
 }
