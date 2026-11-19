@@ -64,7 +64,7 @@ def add_run(rec: dict | None, usd, now: float | None = None) -> dict:
     # the earlier runs (turncost.py) must survive it, or it is lost -- and so
     # must who decided the work should run (tasks.record_decision).
     for kept in ("cost_uncorrected", "cost_runs_uncorrected", "decided_by", "decided_ts",
-                 "decided_via"):
+                 "decided_via", "decided_lift"):
         if kept in result:
             out[kept] = result[kept]
     return out

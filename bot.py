@@ -1128,7 +1128,7 @@ HELP = """*Commands* (send inside a thread):
 • `!sessions` — list all active thread sessions
 • `!help` — this message
 • `!operator` — make this thread the operator's home: Silkworm's head agent, which works the routine pile (and sweeps daily); `!operator where` says which thread it is
-• `!approve <accept|release|publish|trader-config|delete> <task id or project>` — let the operator do that one held-back thing, once (within a day); `!approve` lists what is approved (or just tell the operator what you decided, in its thread)
+• `!approve <accept|release|publish|trader-config|delete> <task id or project>` — let the operator do that one held-back thing, once (within a day); `!approve` lists what is approved. Never needed: tell the operator in its thread, or say yes to its plan (a trader live-config landing or publish lifts on a yes to its entry, or your message naming it: `land tsk_…`)
 • `!project <name>` — file this thread's tasks under a project
 • `!project github create` — make a private GitHub repo for this thread's project and push it
 • `!project new <Name> [path] [--github] [--adopt] -- <purpose>` — make (or adopt) a project's directory, git repo and CLAUDE.md, register it, and move this thread there; `--github` also creates a private GitHub repo
@@ -2834,6 +2834,7 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
         # (operator_refused stamps them).
         payload.pop("_guard_state", None)
         payload.pop("_user_grant", None)
+        payload.pop("_lift", None)
         # Asked only of a request made from inside a turn (the CLI stamps
         # those); the dashboard and your own CLI never carry the stamp.
         if payload.get("caller_role") or payload.get("caller_thread"):
@@ -2841,11 +2842,19 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
             if refused:
                 return refused
             grant = payload.pop("_user_grant", None)
+            lift = payload.pop("_lift", None)
             if grant:
                 # On your word: the action itself, then the record of who
                 # decided it, on what it was done to.
-                return record_user_decision(grant, action, payload,
-                                            handle_tasks(payload, _decided=grant))
+                try:
+                    out = handle_tasks(payload, _decided=grant)
+                except Exception:
+                    if lift:
+                        release_lift(lift)
+                    raise
+                if lift and not (out or {}).get("ok"):
+                    release_lift(lift)          # nothing happened: still yours to give
+                return record_user_decision(grant, action, payload, out, lift)
     project = payload.get("project") or ""
     # Conversation turns are recorded as tasks but listed with their thread,
     # not as work (tasks.on_board); `turns` asks for them too -- the board's
@@ -3182,15 +3191,35 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
     return {"ok": False, "error": f"unknown action {action!r}"}
 
 
-def handle_projects(payload: dict) -> dict:
-    """Route for /projects — list, create and archive (localhost-trusted)."""
+def handle_projects(payload: dict, _lifted: dict | None = None) -> dict:
+    """Route for /projects — list, create and archive (localhost-trusted).
+
+    `_lifted` is never a request's: the lift operator_refused let this go
+    ahead on (publish, on your word), when it runs the action and records it."""
     action = payload.get("action", "list")
     # Asked only of a request made from inside a turn (the CLI stamps those);
     # the dashboard and your own CLI never carry the stamp.
-    if payload.get("caller_role") or payload.get("caller_thread"):
+    if _lifted is None:
+        payload.pop("_user_grant", None)
+        payload.pop("_lift", None)
+    if _lifted is None and (payload.get("caller_role") or payload.get("caller_thread")):
         refused = operator_refused("projects", action, payload)
         if refused:
             return refused
+        grant, lift = payload.pop("_user_grant", None), payload.pop("_lift", None)
+        if lift:
+            try:
+                out = handle_projects(payload, _lifted=lift)
+            except Exception:
+                release_lift(lift)
+                raise
+            if not (out or {}).get("ok"):
+                release_lift(lift)
+                return out
+            log.info("operator: %s %s on the word of %s (%s)%s", action,
+                     payload.get("slug"), (grant or {}).get("user"), lift["via"],
+                     operator_role.lift_note(lift))
+            return dict(out, decided_via=lift["via"], lifted=lift)
     if action == "list":
         return {"ok": True,
                 # So the nightly panel can show a project as paused rather
@@ -3965,6 +3994,45 @@ def handle_ops(payload: dict) -> dict:
     return {"ok": True, "run": rec}
 
 
+def guarded_plan_entry(action: str, item: str) -> tuple[dict | None, str]:
+    """A plan entry for a guarded action, or (None, why not): land or approve
+    a task whose branch changes its project's live configuration (needs
+    trader-config), or turn publish on where it is off (needs publish). With
+    the guard it needs and a one-line summary of what changes live, for the
+    user to read before saying yes. One that needs neither is refused: the
+    user's plain word already covers it."""
+    item = item.strip().strip("`").lower()
+    if not re.fullmatch(r"[a-z0-9_][a-z0-9_.-]{0,80}", item):
+        return None, f"`{item}` is not a task id or project"
+    if action in ("land", "approve"):
+        task = task_store.get(item)
+        if not task:
+            return None, f"no task {item}"
+        paths = task_live_paths(task)
+        if not paths:
+            return None, (f"{item} changes none of its project's live configuration, so "
+                          f"it needs no plan entry: the user's word ({action} {item}) "
+                          "covers it")
+        shown = ", ".join(paths[:6]) + (f" and {len(paths) - 6} more" if len(paths) > 6 else "")
+        summary = (f"lands {branches.name_for(task)} into {task_base(task) or 'its base'}; "
+                   f"changes {task.get('project') or 'its project'}'s live config: {shown}")
+        return {"name": action, "args": [item], "guard": "trader-config",
+                "summary": summary}, ""
+    if action == "publish":
+        rec = project_store.get(item)
+        if not rec:
+            return None, f"unknown project {item!r}"
+        if item in operator_role.LIVE_CONFIG:
+            return None, (f"{item}'s settings are its live configuration: that needs "
+                          f"`!approve trader-config {item}`")
+        if rec.get("publish"):
+            return None, f"publish is already on for {item}"
+        return {"name": "publish", "args": [item], "guard": "publish",
+                "summary": (f"turns publish on for {item}: every landing there is "
+                            "pushed to origin from then on")}, ""
+    return None, f"`{action}` is not a guarded action a plan records (land, approve, publish)"
+
+
 def record_ops_plan(payload: dict) -> dict:
     """/ops plan: the ops the operator just proposed to you, recorded as the
     one pending plan (operator_role.State.set_plan), numbered from 1.
@@ -3972,7 +4040,9 @@ def record_ops_plan(payload: dict) -> dict:
     Only an operator turn in its home thread records one -- a sweep's
     included: it proposes, and nothing runs until a turn you start answers it.
     Each entry is checked as a run would be (ops.plan), and must change
-    something: what only reads needs no one's yes."""
+    something: what only reads needs no one's yes. An entry may instead be a
+    guarded action -- {action: land|approve|publish, item} -- that needs
+    trader-config or publish lifted (guarded_plan_entry)."""
     thread = OPERATOR.thread()
     # Its home thread is where only its turns run (caller_is_operator reads
     # the thread as the operator's), and where your answer will come.
@@ -3987,6 +4057,12 @@ def record_ops_plan(payload: dict) -> dict:
                 "error": f"at most {operator_role.MAX_PLAN} ops in one plan"}
     clean = []
     for i, e in enumerate(entries, 1):
+        if isinstance(e, dict) and e.get("action"):
+            entry, why = guarded_plan_entry(str(e.get("action")), str(e.get("item") or ""))
+            if why:
+                return {"ok": False, "error": f"entry {i}: {why}", "refused": "args"}
+            clean.append(entry)
+            continue
         if not isinstance(e, dict) or not isinstance(e.get("args") or [], list):
             return {"ok": False, "error": f"entry {i} is not {{name, args}}", "refused": "args"}
         try:
@@ -4002,6 +4078,13 @@ def record_ops_plan(payload: dict) -> dict:
                             task=str(payload.get("caller_task") or ""))
     log.info("ops: plan %s recorded by %s: %s", rec["id"], by,
              "; ".join(operator_role.plan_lines(rec)))
+    if any(e.get("guard") for e in rec["entries"]):
+        # A yes to a guarded entry lands trader's live config or turns
+        # publishing on: you read the entries as Silkworm recorded them, not
+        # only as the operator retells them.
+        tell_thread(thread, ":clipboard: Plan recorded -- a yes in this thread "
+                    "(\"do 2\", \"all but 1\") approves these, as Silkworm has them:\n"
+                    + "\n".join(operator_role.plan_lines(rec)))
     return {"ok": True, "plan": rec, "lines": operator_role.plan_lines(rec)}
 
 
@@ -7168,19 +7251,24 @@ def user_grant(payload: dict) -> dict | None:
                                str(payload.get("caller_task") or ""))
 
 
-def record_user_decision(grant: dict, action: str, payload: dict, out: dict) -> dict:
+def record_user_decision(grant: dict, action: str, payload: dict, out: dict,
+                         lift: dict | None = None) -> dict:
     """After an action the operator took on your word went ahead: the task
     it was on (or the one it filed) records your message, where it came
-    from, and decided_by -- and the reply says whose word it went ahead on."""
+    from, and decided_by -- and, when your word lifted trader-config or
+    publish for it (`lift`), how: the plan id and entry, or your message
+    naming it -- and the reply says whose word it went ahead on."""
     if not (out or {}).get("ok"):
         return out
-    out = dict(out, decided_via=operator_role.grant_source(grant))
+    out = dict(out, decided_via=operator_role.grant_source(grant),
+               **({"lifted": lift} if lift else {}))
     tid = str(payload.get("id") or "") or str(((out.get("task") or {}).get("id")) or "")
     if tid and tid != "new":
         try:
-            task_store.record_decision(tid, operator_role.decision_note(grant, action, payload),
+            task_store.record_decision(tid, operator_role.decision_note(grant, action, payload)
+                                       + operator_role.lift_note(lift),
                                        operator_role.DECIDED_BY, grant["ts"],
-                                       via=operator_role.grant_source(grant))
+                                       via=operator_role.grant_source(grant), lift=lift)
         except Exception:
             # The action happened; failing to say who decided must not
             # report it as not done.
@@ -7212,6 +7300,20 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         guard = operator_role.projects_guard(action, payload)
     else:
         guard = operator_role.releases_guard(action, payload)
+    task_view = dict(rec, id=payload.get("id")) if rec else None
+    if guard and guard[0] in operator_role.PLAN_GUARDS:
+        # trader-config on a landing, and publish: your word lifts them for
+        # one item, once -- a plan entry you said yes to, or your message
+        # naming it (plan_guard_refused). Else an `!approve` of it still does.
+        out = plan_guard_refused(route, action, payload, task_view, guard)
+        if out is None:
+            return None
+        if not operator_role.check(OPERATOR, guard, consume=True, action=action):
+            log.info("operator: %s %s went ahead on your approval of %s %s",
+                     route, action, *guard)
+            return None
+        log.info("operator refused: %s %s (%s)", route, action, guard)
+        return out
     # Your own words, in a turn you started in its home thread, lift what
     # SAID_GUARDS covers -- before any approval is looked at, so one you gave
     # for something else is not spent on what you just said.
@@ -7228,7 +7330,8 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
             log.info("operator: %s %s on the word of %s (message %s): %s", route, action,
                      grant["user"], grant["ts"], str(payload.get("notes") or "")[:200])
             return None
-    if said and said == operator_role.refusal("trader-config", str(payload.get("id") or "")):
+    if said and said == operator_role.refusal("trader-config", str(payload.get("id") or ""),
+                                              action):
         # Refused on your word for trader's live configuration: what could
         # still lift it is an approval of that, not one of the accept guard
         # the request first hit -- left over, that would land it unasked.
@@ -7241,6 +7344,59 @@ def operator_refused(route: str, action: str, payload: dict) -> dict | None:
         log.info("operator: %s %s went ahead on your approval of %s %s",
                  route, action, *guard)
     return None
+
+
+def plan_guard_refused(route: str, action: str, payload: dict, task: dict | None,
+                       guard: tuple) -> dict | None:
+    """The refusal of a request that hit trader-config or publish, or None:
+    your word lifted it for this one item (operator_role.guard_lift), and
+    that lift is now claimed -- once -- and handed on in the payload
+    (`_lift`, with `_user_grant`) for the action's record.
+
+    Only in a turn you started in the operator's thread (user_grant): never
+    a sweep or a wake-up. It must say what you decided (--notes)."""
+    item = str(guard[1] or "")
+    grant = user_grant(payload)
+    no = {"ok": False, "refused": guard[0]}
+    if not grant or operator_role.GUARDED_ACTIONS.get(action) != guard[0]:
+        # No turn of yours, or a guarded thing no word lifts (trader's
+        # settings): the refusal says what does.
+        return dict(no, error=operator_role.refusal(guard[0], item, action))
+    if not str(payload.get("notes") or "").strip():
+        return dict(no, error=("refused for the operator: acting on the user's word needs "
+                               "--notes quoting or paraphrasing what they decided"))
+    # What else a landing needs -- the accept an Approve also is, or landing
+    # work dismissed from review -- is an accept guard, which this same word
+    # of yours, with --notes, lifts (said_refusal asks nothing more of a
+    # landing or a publish).
+    lift, why = operator_role.guard_lift(grant, guard[0], action, item,
+                                         OPERATOR.plan(spent=True))
+    if not lift:
+        return dict(no, error=why)
+    if lift["how"] == "plan":
+        claimed = OPERATOR.use_plan_entry(lift["plan_id"], lift["entry"],
+                                          run_by=str(payload.get("caller_task") or ""))
+    else:
+        claimed = OPERATOR.use_said_lift(lift["ts"], guard[0], item)
+    if not claimed:
+        return dict(no, error=(f"refused: the user's word lifted {guard[0]} for {item} "
+                               "once, and that has been used; record a plan entry and "
+                               "ask again"))
+    payload["_user_grant"], payload["_lift"] = grant, lift
+    log.info("operator: %s %s %s on the word of %s (%s)%s", route, action, item,
+             grant["user"], lift["via"], operator_role.lift_note(lift))
+    return None
+
+
+def release_lift(lift: dict) -> None:
+    """Give back a lift whose action did not happen: it is still yours to use."""
+    try:
+        if lift.get("how") == "plan":
+            OPERATOR.release_plan_entry(lift["plan_id"], lift["entry"])
+        else:
+            OPERATOR.release_said_lift(lift["ts"], lift["guard"], lift["item"])
+    except Exception:
+        log.exception("operator: could not give back the lift %s", lift)
 
 
 _CLI = {}
@@ -7357,8 +7513,9 @@ def operator_command(arg: str, key: str) -> str:
             "Silkworm's head agent, with live state rebuilt into every turn." + sweep
             + moved + " It may land, retry, rework, drop proven-redundant branches, "
             "tidy and deploy on its own; accepting, releasing and real deletions "
-            "wait for you to tell it here (or `!approve`), and publishing and "
-            "trader's live config for your `!approve`.")
+            "wait for you to tell it here, and publishing and trader's live "
+            "config for your word on that one item: a yes to its plan entry, or "
+            "naming it (\"land tsk_…\"). `!approve` still works.")
 
 
 def approve_command(text: str, user: str, event: dict) -> str:

@@ -73,9 +73,12 @@ DRIVERS = ("inline", "queue")
 #: `decided_by` and `decided_ts` say a person decided it, and by which message
 #: (record_decision): two short strings, and the only record of who.
 #: `decided_via` says where that message came from (Slack or the dashboard).
+#: `decided_lift`: how that message lifted trader-config or publish for it --
+#: the plan id and entry it said yes to, or that it named the task.
 RESULT_KEEPS = ("cost", "review", "landed", "landing",
                 "cost_runs", "cost_reported_total", "cost_uncorrected",
-                "cost_runs_uncorrected", "decided_by", "decided_ts", "decided_via")
+                "cost_runs_uncorrected", "decided_by", "decided_ts", "decided_via",
+                "decided_lift")
 
 #: States a blocker never comes back from on its own. A task waiting on one of
 #: these will never be released by it, so the store releases it instead; see
@@ -1009,12 +1012,13 @@ class TaskStore:
             return dict(rec)
 
     def record_decision(self, tid: str, detail: str, decided_by: str, ts: str,
-                        via: str = "") -> dict | None:
+                        via: str = "", lift: dict | None = None) -> dict | None:
         """Note on a task that a person decided what was just done to it:
         an event naming their message, and `result.decided_by` / `decided_ts`
         (and `decided_via`, where the message came from: "Slack message <ts>"
-        or "dashboard message <ts> (<login> on <device>)"), in one save. None
-        if there is no such task."""
+        or "dashboard message <ts> (<login> on <device>)"), in one save --
+        and `decided_lift` when that message lifted trader-config or publish
+        for it (a plan entry, or naming it). None if there is no such task."""
         with self._lock:
             rec = self._data.get(tid)
             if rec is None:
@@ -1022,7 +1026,13 @@ class TaskStore:
             prior = copy.deepcopy(rec)
             rec["result"] = {**(rec.get("result") or {}),
                              "decided_by": decided_by, "decided_ts": ts,
-                             **({"decided_via": via[:200]} if via else {})}
+                             **({"decided_via": via[:200]} if via else {}),
+                             **({"decided_lift": {k: lift.get(k) for k in (
+                                 "guard", "how", "plan_id", "entry", "ts", "via")
+                                 if lift.get(k) not in (None, "")}} if lift else {})}
+            if not lift:
+                # A later decision's record is that decision's, not a stale lift.
+                rec["result"].pop("decided_lift", None)
             rec["updated"] = time.time()
             events = rec.setdefault("events", [])
             events.append({"at": time.time(), "kind": "decided", "detail": detail[:200],

@@ -44,9 +44,11 @@
     silkworm ops list | log | run <name> [args] [--notes N] [--plan-entry N]
                                     named operations on this machine (ops.py): the
                                     operator runs these on your word
-    silkworm ops plan <op> [args] [--op <op> [args]]… --by operator
-                                    record the ops the operator proposed, numbered, so
-                                    a plain "yes" or "do 2" from you runs them
+    silkworm ops plan <op> [args] [--op <op> [args]]… [--land|--approve|--publish <item>]… --by operator
+                                    record the ops (and the guarded landings or publish
+                                    it needs your word for) the operator proposed,
+                                    numbered, so a plain "yes" or "do 2" from you runs them
+    silkworm publish <project> on|off [--notes N]   push landings to origin, or stop
     silkworm push [status|test|forget-all]  phone notifications: what is set up, send a
                                     test to every subscribed device, or drop them all
     silkworm deploy [--now] [--skip-tests] [--max-wait 2h]
@@ -1499,7 +1501,13 @@ def do_release(argv: list, ask=None, state=None) -> int:
 
 OPS_USAGE = ("usage: silkworm ops list [--json] | log [-n N] [--json] | "
              "run <name> [args …] [--notes TEXT] [--by NAME] [--plan-entry N] | "
-             "plan [<name> [args …] [--op <name> [args …]]… --by NAME] [--json]")
+             "plan [<name> [args …] [--op <name> [args …]]… "
+             "[--land|--approve <task id>]… [--publish <project>]… --by NAME] [--json]")
+#: `ops plan` options that record a guarded action, not an op: landing or
+#: approving work that changes trader's live configuration (trader-config),
+#: or turning publish on where it is off (publish). Your answer to the plan
+#: lifts that guard for exactly that item, once.
+PLAN_GUARDED = ("--land", "--approve", "--publish")
 #: Beyond an op's own timeout, how long the CLI waits on the bot's answer.
 OPS_SLACK_S = 60
 
@@ -1540,10 +1548,21 @@ def parse_ops_run(argv: list) -> dict:
 
 def parse_ops_plan(argv: list) -> dict:
     """The /ops plan payload from the arguments after `plan`: entries split
-    at each --op, and --by. Raises ValueError with the usage line."""
+    at each --op, guarded actions (--land/--approve/--publish <item>) each an
+    entry of their own, in order, and --by. Raises ValueError with the usage
+    line."""
     payload, entries, cur, i = {"action": "plan", "by": default_by()}, [], [], 0
     while i < len(argv):
         a = argv[i]
+        if a in PLAN_GUARDED:
+            if i + 1 >= len(argv) or not argv[i + 1].strip() or argv[i + 1].startswith("--"):
+                raise ValueError(f"{a} needs a task id or project\n{OPS_USAGE}")
+            if cur:
+                entries.append(cur)
+                cur = []
+            entries.append({"action": a[2:], "item": argv[i + 1].strip()})
+            i += 2
+            continue
         if a == "--by":
             if i + 1 >= len(argv) or not argv[i + 1].strip() or argv[i + 1].startswith("--"):
                 raise ValueError(f"--by needs a value\n{OPS_USAGE}")
@@ -1562,7 +1581,8 @@ def parse_ops_plan(argv: list) -> dict:
         entries.append(cur)
     if not entries:
         raise ValueError(OPS_USAGE)
-    payload["entries"] = [{"name": e[0], "args": e[1:]} for e in entries]
+    payload["entries"] = [e if isinstance(e, dict) else {"name": e[0], "args": e[1:]}
+                          for e in entries]
     return payload
 
 
@@ -1690,6 +1710,8 @@ def do_ops_plan(rest: list, ask) -> int:
             print(str(e), file=sys.stderr)
             return EXIT_USAGE
         for i, e in enumerate(payload["entries"], 1):
+            if e.get("action"):
+                continue                  # a guarded action: the bot checks it
             try:
                 ops.lookup(e["name"])
             except ops.Refused as err:
@@ -1717,9 +1739,53 @@ def do_ops_plan(rest: list, ask) -> int:
         return EXIT_OK
     head = ("recorded" if payload["action"] == "plan" else "pending") + f" plan {plan['id']}"
     print(head + " -- show the user these, numbered; a plain 'yes' runs them all, "
-          "'do 2' just that one, 'all but 1' the rest:")
+          "'do 2' just that one, 'all but 1' the rest (a guarded entry, once approved, "
+          "you carry out with its own command and --notes):")
     for line in r.get("lines") or []:
         print(line)
+    return EXIT_OK
+
+
+PUBLISH_USAGE = "usage: silkworm publish <project> on|off [--notes N] [--by NAME]"
+
+
+def do_publish(argv: list, ask=None) -> int:
+    """`silkworm publish <project> on|off`: the dashboard's publish switch --
+    whether landings in a project are pushed to origin. For the operator,
+    turning it on is refused unless the user's word lifted publish for that
+    project (a plan entry they said yes to, or their message naming it), or
+    an `!approve publish <project>`; the bot decides, with --notes."""
+    ask = ask or bot_ask
+    payload, pos, i = {"action": "publish", "by": default_by()}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--notes", "--by"):
+            if i + 1 >= len(argv) or not argv[i + 1].strip():
+                print(f"{a} needs a value\n{PUBLISH_USAGE}", file=sys.stderr)
+                return EXIT_USAGE
+            payload[a[2:]] = argv[i + 1].strip()
+            i += 2
+        elif a.startswith("-"):
+            print(f"unknown option {a}\n{PUBLISH_USAGE}", file=sys.stderr)
+            return EXIT_USAGE
+        else:
+            pos.append(a)
+            i += 1
+    if len(pos) != 2 or pos[1] not in ("on", "off"):
+        print(PUBLISH_USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    payload["slug"], payload["on"] = pos[0].strip().lower(), pos[1] == "on"
+    try:
+        r = ask("/projects", payload)
+    except BotUnreachable as e:
+        print(f"not done: {e}", file=sys.stderr)
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        print(f"refused: publish {payload['slug']}: {r.get('error') or 'the bot gave no reason'}",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    extra = f" (on the user's word: {r['decided_via']})" if r.get("decided_via") else ""
+    print(f"ok: publish {payload['slug']} {pos[1]}{extra}")
     return EXIT_OK
 
 
@@ -3112,6 +3178,8 @@ def main() -> None:
         sys.exit(do_tailscale(args[1:]))          # args[0] is the subcommand
     elif cmd == "ops":
         sys.exit(do_ops(args[1:]))                # args[0] is the subcommand
+    elif cmd == "publish":
+        sys.exit(do_publish(args[1:]))            # args[0] is the subcommand
     elif cmd == "push":
         sys.exit(do_push(args[1:]))               # args[0] is the subcommand
     elif cmd == "health":

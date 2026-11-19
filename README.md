@@ -1071,9 +1071,33 @@ mean. This rests on a grant the bot makes for that turn alone and forgets when
 it ends, handed to the turn's CLI in its environment and checked against the
 turn and thread it was made for — so the daily sweep, a wake-up, a deploy
 note or the web chat, none of which you started, carries none, and is refused
-as before. Even on your word: publishing where publish is off and trader's
-live configuration still need `!approve`, a running task is cancelled only if
-your message named it, and dismissing never deletes a branch.
+as before. Even on your word a running task is cancelled only if your message
+named it, and dismissing never deletes a branch.
+
+**trader's live configuration and publish, one item at a time.** Your word in
+general does not lift these two; your word on the one item does, once. The
+operator records them as plan entries beside any ops — `silkworm ops plan
+--land tsk_…` (or `--approve tsk_…`, `--publish <project>`) — each printed
+with the guard it needs and what changes live (the branch, its base and the
+live-config files it touches; or that landings will be pushed). Your answer
+to the plan in its thread, from Slack or the dashboard ("yes", "do 2", "all
+but 1"), lifts exactly the entries it approves, and the operator then runs
+`silkworm land tsk_… --notes …` or `silkworm publish <project> on --notes …`
+in that turn. Or your message names the action and the item in a clause that
+says nothing else ("land tsk_b921b84c73", "please approve tsk_…", "publish
+cadence"); a question, a quote, or any other word in it ("I don't think we
+should land tsk_…", "land tsk_… once the backtest passes") names nothing.
+`land` and `approve` are different requests: approving work still under
+review closes it unlanded, so an entry or a message for one never lifts the
+other. When a plan holds such an entry, Silkworm posts the entries to the
+thread itself, as it recorded them.
+The task records `result.decided_lift`: the plan id and entry, or that your
+message named it, with your message's ts and where it came from. A sweep or
+wake-up never lifts them, a plan lapses after a day, and anything neither
+planned nor named is refused with the advice to record a plan. Nobody needs
+to type `!approve` for these any more; it still works. trader's project
+settings (its base, its publish switch) remain `!approve trader-config
+trader`.
 
 Work you ask it for in so many words it files with `silkworm task
 --requested-by-user --notes "<your request>" "<goal>"`: straight to the queue

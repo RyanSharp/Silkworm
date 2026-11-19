@@ -158,6 +158,9 @@ OPERATOR_TOOLS = " ".join([
     # Records the ops it proposes as a numbered plan you answer in plain
     # words; recording runs nothing (operator_role.State.set_plan).
     "Bash({bin} ops plan:*)",
+    # The publish switch. Turning it on is refused unless your word lifted
+    # publish for that project (operator_role.guard_lift) or you `!approve`d it.
+    "Bash({bin} publish:*)",
 ])
 
 OPERATOR_SYSTEM = (
@@ -227,9 +230,21 @@ OPERATOR_SYSTEM = (
     "Report each action with its "
     "task id and the result. Never decide anything on your own judgement: "
     "if it is unclear which items they mean, ask before acting. Still "
-    "refused even then: publishing where publish is off and trader's live "
-    "configuration (those need `!approve`), and cancelling a running task "
-    "their message did not name. Dismissing never deletes a branch.\n\n"
+    "refused even then: cancelling a running task their message did not "
+    "name. Dismissing never deletes a branch.\n\n"
+    "Two things their general word does not lift, only their word on the one "
+    "item: landing or approving work whose branch changes trader's live "
+    "configuration (trader-config), and turning publish on where it is off "
+    "(publish, with `{bin} publish <project> on`). Record each as an entry "
+    "of the plan -- `{bin} ops plan --land <task id>` (or `--approve`, "
+    "`--publish <project>`), alongside any ops -- which prints the guard it "
+    "needs and what it changes live; show the user those lines. When their "
+    "answer to the plan approves the entry (\"yes\", \"do 2\"), carry it "
+    "out with its own command (`{bin} land <id> --by operator --notes "
+    "\"<their words>\"`) in that turn. Or, when their message itself names "
+    "the action and the item (\"land tsk_…\", \"publish cadence\"), do "
+    "that. Either lifts it once. Never ask them to type `!approve`: record a "
+    "plan instead (it still works for anyone who sends one).\n\n"
     "Commands on this machine: never hand the user a shell step you have an "
     "op for -- run it yourself with `{bin} ops run <name> [args] --by "
     "operator` (`{bin} ops list` shows them, `{bin} ops log` the recent runs). "
@@ -265,10 +280,10 @@ OPERATOR_SYSTEM = (
     "each run's commands, exit codes and the tail of its output. What no op "
     "covers is still the user's to run: say exactly what.\n\n"
     "In any other turn -- your daily sweep, a wake-up, a deploy note, the web "
-    "chat -- none of that is lifted. A refusal names the `!approve <what> "
-    "<item>` that lifts it for that one item; ask the user for exactly that "
-    "(or for them to tell you in this thread), with the reason, and do not "
-    "look for another way round."
+    "chat -- none of that is lifted. Record what needs their word as a plan "
+    "(ops and guarded entries alike) and ask them to answer it in this "
+    "thread, or to tell you; with the reason, and do not look for another "
+    "way round."
 )
 
 #: The role for investigation whose findings you review and decide on. See

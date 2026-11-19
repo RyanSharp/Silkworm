@@ -31,7 +31,8 @@ changing trader's live configuration, and deleting anything not proven redundant
 lifted for exactly one item by an approval you create with your own Slack
 message (`!approve <what> <item>`), used once and gone within a day. A model
 can ask you for one; it cannot make one -- no route writes them, only a Slack
-message from a person does.
+message from a person does. You need never type one: your word lifts them all
+(below).
 
 Or by saying so. A turn you start yourself, with your message in its home
 thread -- a Slack message, or one typed in the dashboard's chat that the
@@ -44,9 +45,15 @@ dig, rework, land, drop, file, release -- on the items you named, each with
 --notes saying what you decided (`said_refusal`), and the task records your
 message, where it came from, and `decided_by`. A sweep, a wake-up, a deploy
 note, or a dashboard message it cannot vouch for starts no turn of yours and
-carries none. Publishing where it is off and
-trader's live configuration still wait for `!approve`, and a running task is
-cancelled only if your message named it.
+carries none. A running task is cancelled only if your message named it.
+
+Publishing where it is off, and landing work that changes trader's live
+configuration, your general word does not lift (PLAN_GUARDS): only your word
+on that one item, once (`guard_lift`) -- an entry of its plan (`ops plan
+--land tsk_X`, which shows the guard and the live files it changes) that
+your answer approves, or your message naming the action and the item ("land
+tsk_X"). The task records the plan id and entry, your message and where it
+came from.
 
 Your word can be plain. Ops it proposes are recorded as a numbered pending
 plan (`State.set_plan`), and a "yes" or "do 2" in the message of yours that
@@ -116,8 +123,20 @@ GUARDS = {
 }
 
 #: The guards your own words lift, in a turn you started in its home thread
-#: (`Grants`). Not publish or trader-config: those stay `!approve`-only.
+#: (`Grants`), on whatever items your message is about. Not publish or
+#: trader-config: those are lifted item by item (PLAN_GUARDS).
 SAID_GUARDS = frozenset({"accept", "release", "delete"})
+#: The guards a turn you started lifts only for one named item, once: by an
+#: entry of the plan your message said yes to (`ops plan --land/--approve/
+#: --publish`), or by your message naming the action and the item ("land
+#: tsk_b921b84c73", "publish cadence") -- `guard_lift`. Never in a sweep or a
+#: wake-up, which carry no grant. `!approve <guard> <item>` still lifts them too.
+PLAN_GUARDS = frozenset({"trader-config", "publish"})
+#: A plan entry's action -> the guard it lifts. An entry lifts it for its own
+#: action only: land is not approve (approving work still under review closes
+#: it unlanded, a decision of its own).
+GUARDED_ACTIONS = {"land": "trader-config", "approve": "trader-config",
+                   "publish": "publish"}
 #: Where a turn you started finds its grant: set by the bot for that turn
 #: alone, sent back by bin/silkworm as `caller_grant`.
 GRANT_VAR = "SILKWORM_USER_GRANT"
@@ -149,8 +168,24 @@ def caller_is_operator(payload: dict, home_thread: str = "") -> bool:
     return bool(home_thread) and str(payload.get("caller_thread") or "") == home_thread
 
 
-def refusal(guard: str, target: str) -> str:
-    """The words a refusal is given in, naming the approval that lifts it."""
+def refusal(guard: str, target: str, action: str = "") -> str:
+    """The words a refusal is given in, naming what lifts it.
+
+    trader-config on a landing, and publish, are lifted by a plan entry the
+    user says yes to, or by their message naming the action and the item: the
+    refusal says so, and no longer asks them for `!approve` (which still
+    works). trader-config on a project setting has no plan entry, and still
+    names `!approve`."""
+    if guard in PLAN_GUARDS and (GUARDED_ACTIONS.get(action) == guard
+                                 or (guard == "publish" and not action)):
+        verb = action if action in GUARDED_ACTIONS else "publish"
+        return (f"refused for the operator ({guard}): {GUARDS[guard]}, and only the "
+                f"user's word on this one item lifts it -- never a sweep, a wake-up or "
+                f"your own judgement. Record it as a plan entry (`silkworm ops plan "
+                f"--{verb} {target} --by operator`, alongside any ops), show the user "
+                f"the numbered entry and what it changes, and carry it out in the turn "
+                f"their answer starts (\"yes\", \"do 2\"); or in a turn whose message "
+                f"names it (\"{verb} {target}\"). Either lifts it once")
     return (f"refused for the operator: {GUARDS[guard]}. Ask the user to send "
             f"`!approve {guard} {target}` in Slack (it lifts this once), or to "
             "do it themselves")
@@ -244,10 +279,122 @@ def said_refusal(action: str, payload: dict, task: dict | None, grant: dict,
             and tid.lower() not in str(grant.get("text") or "").lower()):
         return (f"refused for the operator: {tid} is running, and cancelling it "
                 "kills its child; the user's message has to name it")
-    # Approving lands too (bot.approve_task).
+    # Approving lands too (bot.approve_task). Your word in general never
+    # lifts trader-config; guard_lift, for the one item, does.
     if action in ("land", "approve") and task and live_paths and live_paths(task):
-        return refusal("trader-config", tid)
+        return refusal("trader-config", tid, action)
     return ""
+
+
+# --- the guards your word lifts one item at a time --------------------------------
+#
+# On 2026-11-19 two trader landings (tsk_b921b84c73, tsk_e8758becd0) waited on
+# a typed `!approve trader-config`: the one thing left that needed Slack. Now
+# the operator records them as plan entries -- `ops plan --land tsk_X`, each
+# showing the guard and the live-config files it changes -- and your answer
+# ("yes", "do 2", from Slack or the dashboard) lifts exactly those entries,
+# once; or your message names the action and the item ("land tsk_X").
+
+#: Verbs that name a guarded action in your message, and the request actions
+#: each names. "land"/"merge" is a landing; "approve" is approving reviewed
+#: work (which lands it): not the same request -- approving work still under
+#: review closes it unlanded -- so neither names the other.
+_NAMED_VERBS = {"trader-config": {"land": ("land",), "merge": ("land",),
+                                  "approve": ("approve",)},
+                "publish": {"publish": ("publish",)}}
+#: The only other words a clause naming an item may hold: asking and
+#: joining. Any word beyond these, the verb and the items -- "think",
+#: "should", "once", "why", "investigate", "failed" -- means the clause says
+#: more than "do this to these", and it names nothing (as plan_approval
+#: refuses an answer that says more than yes).
+_NAMED_FILLER = frozenset({
+    "please", "pls", "and", "also", "too", "now", "go", "ahead", "ok", "okay", "yes",
+    "yeah", "yep", "sure", "just", "the", "task", "tasks", "branch", "work", "it"})
+#: For publish only: "turn publish on for cadence", "turn on publishing for".
+_PUBLISH_FILLER = frozenset({"turn", "switch", "on", "for", "in"})
+#: A word of your message as names_action reads it: task ids and slugs whole.
+_NAMED_TOKEN = re.compile(r"[a-z0-9_][a-z0-9_'-]*")
+_TASK_ID = re.compile(r"tsk_[a-z0-9]+")
+
+
+def names_action(text: str, guard: str, item: str, action: str = "") -> bool:
+    """Whether your message names `item` for the guarded `action` (any of
+    the guard's, if not given): some clause of it is nothing but the verb
+    ("land", "merge", "approve"; "publish"), the items, and asking or joining
+    words -- "land tsk_x", "please approve tsk_x and tsk_y", "go ahead and
+    merge tsk_x", "turn publish on for cadence". Fail closed: any other word
+    in the clause ("I don't think we should land tsk_x", "land tsk_x once the
+    backtest passes", "land tsk_a and investigate tsk_x", "the landing of
+    tsk_x failed"), a question, or a quoted line ("> land tsk_x") names
+    nothing; a plan entry is the way to ask."""
+    item = str(item or "").strip().lower()
+    verbs = _NAMED_VERBS.get(guard) or {}
+    if not item or not verbs:
+        return False
+    filler = _NAMED_FILLER | (_PUBLISH_FILLER if guard == "publish" else frozenset())
+    for line in str(text or "").splitlines():
+        if line.lstrip().startswith(">"):
+            continue                      # quoted, not said
+        for clause in re.split(r"[.;!]+(?:\s|$)|\bthen\b", normalise_answer(line)):
+            if "?" in clause:
+                continue
+            toks = _NAMED_TOKEN.findall(clause)
+            said = [t for t in toks if t in verbs]
+            if (item not in toks or len(set(said)) != 1
+                    or (action and action not in verbs[said[0]])):
+                continue
+            items = [t for t in toks if t not in verbs and t not in filler]
+            if all(t == item or (guard != "publish" and _TASK_ID.fullmatch(t))
+                   for t in items):
+                return True
+    return False
+
+
+def guard_lift(grant: dict | None, guard: str, action: str, item: str,
+               live: dict | None) -> tuple[dict | None, str]:
+    """How your word lifts `guard` (a PLAN_GUARDS one) for `action` on
+    `item`, or (None, why not). Checks only: the bot claims it, once
+    (State.use_plan_entry / use_said_lift).
+
+    `grant`: the live grant of the turn you started (none in a sweep or a
+    wake-up). `live`: the pending plan now (State.plan). Lifted by an entry
+    of that plan for this guard and item, if your message is the answer that
+    approved it (plan_approval) -- or by your message naming the action and
+    the item (names_action)."""
+    item = str(item or "").strip().lower()
+    if not grant:
+        return None, refusal(guard, item, action)
+    base = {"guard": guard, "item": item, "action": action,
+            "ts": str(grant.get("ts") or ""), "via": grant_source(grant)}
+    gp = grant.get("plan") or None
+    if (gp and live and live.get("id") == gp.get("id")
+            and str(live.get("answered") or "") == str(grant.get("ts") or "")):
+        entries = live.get("entries") or []
+        ok, _ = plan_approval(grant.get("text") or "", len(entries), plan_words(entries))
+        for e in entries:
+            if (e.get("guard") == guard and e.get("name") == action
+                    and [str(a).lower() for a in e.get("args") or []] == [item]):
+                if e.get("used"):
+                    return None, (f"refused: entry {e['n']} of the plan (`{e['name']} "
+                                  f"{item}`) has already been carried out; it lifts "
+                                  f"{guard} once")
+                if e["n"] in ok:
+                    return dict(base, how="plan", plan_id=live["id"], entry=e["n"]), ""
+    if names_action(grant.get("text") or "", guard, item, action):
+        return dict(base, how="named"), ""
+    said = " ".join(str(grant.get("text") or "").split())[:120]
+    return None, (f"{refusal(guard, item, action)}. The user's message ({said!r}) neither "
+                  f"approves a plan entry for {item} nor names it")
+
+
+def lift_note(lift: dict | None) -> str:
+    """How a guard was lifted, for the task's record."""
+    if not lift:
+        return ""
+    if lift.get("how") == "plan":
+        return (f"; {lift['guard']} lifted by entry {lift['entry']} of plan "
+                f"{lift['plan_id']}")
+    return f"; {lift['guard']} lifted by the message naming it"
 
 
 class Grants:
@@ -790,6 +937,11 @@ def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> s
     entry = next((e for e in live.get("entries") or [] if e.get("n") == n), None)
     if not entry:
         return f"refused: the plan has no entry {n}"
+    if entry.get("guard"):
+        item = " ".join(entry.get("args") or [])
+        return (f"refused: entry {n} of the plan is `{entry['name']} {item}`, not an op: "
+                f"carry it out with `silkworm {entry['name']} {item} --by operator "
+                "--notes …`")
     if entry.get("used"):
         return f"refused: entry {n} of the plan has already run"
     want = f"{entry['name']} {' '.join(entry.get('args') or [])}".strip()
@@ -807,9 +959,13 @@ def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> s
 
 
 def plan_lines(rec: dict) -> list:
-    """A plan's entries as the operator's reply numbers them."""
+    """A plan's entries as the operator's reply numbers them: a guarded
+    action with the guard it needs and what it changes live."""
     return [f"{e['n']}. `{' '.join([e['name'], *e.get('args', [])])}`"
-            + (" (ran)" if e.get("used") else "")
+            + (f" -- needs {e['guard']}: {e.get('summary') or ''}".rstrip(": ")
+               if e.get("guard") else "")
+            + (" (done)" if e.get("used") and e.get("guard") else
+               " (ran)" if e.get("used") else "")
             for e in (rec or {}).get("entries") or []]
 
 
@@ -947,8 +1103,12 @@ class State:
             raise ValueError("a plan names its ops, who recorded it and its thread")
         rec = {"id": "plan_" + secrets.token_hex(5), "at": now, "by": by,
                "thread": thread, "task": task,
-               "entries": [{"n": i, "name": str(e["name"]),
-                            "args": [str(a) for a in e.get("args") or []], "used": None}
+               "entries": [dict({"n": i, "name": str(e["name"]),
+                                 "args": [str(a) for a in e.get("args") or []],
+                                 "used": None},
+                                **({"guard": str(e["guard"]),
+                                    "summary": str(e.get("summary") or "")[:300]}
+                                   if e.get("guard") else {}))
                            for i, e in enumerate(entries, 1)]}
         with _STATE_LOCK:
             data = self._load()
@@ -956,9 +1116,11 @@ class State:
             self._save(data)
         return rec
 
-    def plan(self, now: float | None = None) -> dict | None:
+    def plan(self, now: float | None = None, spent: bool = False) -> dict | None:
         """The pending plan, while it is live: recorded in the current home
-        thread less than PLAN_TTL_S ago, and with an entry not yet run."""
+        thread less than PLAN_TTL_S ago, and with an entry not yet run --
+        or, with `spent`, even if every entry has (so a second use of one
+        can be told it was used, rather than that there is no plan)."""
         now = time.time() if now is None else now
         data = self._load()
         p = data.get("plan")
@@ -968,7 +1130,7 @@ class State:
             return None
         if not data.get("thread") or p.get("thread") != data.get("thread"):
             return None
-        if all(e.get("used") for e in p["entries"]):
+        if not spent and all(e.get("used") for e in p["entries"]):
             return None
         return p
 
@@ -984,7 +1146,9 @@ class State:
         if not p or float(p.get("at") or 0) >= sent:
             return None
         return {"id": p["id"], "at": p["at"],
-                "entries": [{"n": e["n"], "name": e["name"], "args": list(e["args"])}
+                "entries": [dict({"n": e["n"], "name": e["name"], "args": list(e["args"])},
+                                 **({"guard": e["guard"], "summary": e.get("summary") or ""}
+                                    if e.get("guard") else {}))
                             for e in p["entries"]]}
 
     def answer_plan(self, ts, text: str, now: float | None = None) -> dict | None:
@@ -1038,6 +1202,32 @@ class State:
                     self._save(data)
                     return True
         return False
+
+    def use_said_lift(self, ts: str, guard: str, item: str,
+                      now: float | None = None) -> bool:
+        """Claim the one lift of `guard` for `item` your message (sent at
+        `ts`) gave by naming it (guard_lift's "named"). True if claimed now;
+        False if that message already lifted it once."""
+        now = time.time() if now is None else now
+        key = [str(ts), guard, str(item).lower()]
+        with _STATE_LOCK:
+            data = self._load()
+            kept = [x for x in data.get("said_lifts") or [] if isinstance(x, dict)
+                    and now - float(x.get("at") or 0) < APPROVAL_TTL_S]
+            if any(x.get("key") == key for x in kept):
+                return False
+            data["said_lifts"] = kept + [{"key": key, "at": now}]
+            self._save(data)
+            return True
+
+    def release_said_lift(self, ts: str, guard: str, item: str) -> None:
+        """Undo a claim whose action never happened."""
+        key = [str(ts), guard, str(item).lower()]
+        with _STATE_LOCK:
+            data = self._load()
+            data["said_lifts"] = [x for x in data.get("said_lifts") or []
+                                  if isinstance(x, dict) and x.get("key") != key]
+            self._save(data)
 
     def release_plan_entry(self, plan_id: str, n: int) -> None:
         """Undo a claim whose run never started (the op was already running)."""
@@ -1099,7 +1289,7 @@ def _plus_minutes(at: str, minutes: int) -> str:
 
 
 def check(state: State, guard_item, now: float | None = None,
-          consume: bool = False) -> str:
+          consume: bool = False, action: str = "") -> str:
     """The refusal for a guarded request, or "" if it may go ahead.
 
     `consume`: the bot uses the approval up as it acts. The CLI only looks.
@@ -1108,7 +1298,7 @@ def check(state: State, guard_item, now: float | None = None,
         return ""
     guard, item = guard_item
     ok = (state.consume(guard, item, now) if consume else state.has(guard, item, now))
-    return "" if ok else refusal(guard, item)
+    return "" if ok else refusal(guard, item, action)
 
 
 # --- what it may do: drop a branch only once main holds its change ----------------
@@ -1430,8 +1620,13 @@ SWEEP_GOAL = (
     "or research findings either way -- accepting, approving, dismissing, "
     "closing or digging on them -- dismissing or cancelling a queued, blocked, "
     "failed or running task that is not your own, releases, publishing, "
-    "trader's live configuration, deleting anything not proven redundant. Those are refused unless the user approved that one "
-    "item -- ask them for it. This sweep is not a turn the user started, so "
+    "trader's live configuration, deleting anything not proven redundant. Those "
+    "wait for the user's word -- ask them for it. A landing that changes "
+    "trader's live configuration, or publish to turn on, record as a plan "
+    "entry (`{bin} ops plan --land <id>`, `--approve <id>`, `--publish "
+    "<project>`, alongside any ops) and list it under Needs you numbered as "
+    "it prints, with what it changes; their \"yes\" in this thread lifts it "
+    "for that item. This sweep is not a turn the user started, so "
     "nothing the user said earlier lifts them now.")
 
 SWEEP_NOTE = (
@@ -1442,8 +1637,9 @@ SWEEP_NOTE = (
     "the same single message, and is read on a phone: first what you did "
     "(one short line per action, with task ids -- fix proposals you filed "
     "for health checks included), then *Needs you:* one line per item with "
-    "the specific decision or question, or the exact `!approve …` to send "
-    "(or that they can simply tell you in this thread). "
+    "the specific decision or question, numbered plan entries included "
+    "(they answer in this thread: \"yes\", \"do 2\") -- never ask them to "
+    "type `!approve`. "
     "If nothing needs them, say so in one line. Do not schedule a wake-up "
     "for this.")
 

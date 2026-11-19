@@ -73,7 +73,7 @@ SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey"
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
                   "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows",
                   "user_grant", "record_user_decision", "outage_summary",
-                  "dashboard_owner", "grant_starter")
+                  "dashboard_owner", "grant_starter", "plan_guard_refused", "release_lift")
 
 
 def _helper_modules(nodes, ns) -> None:
@@ -22939,7 +22939,7 @@ def _operator_bot(repo=None):
     server.route("/tasks", ns["handle_tasks"])
     server.start()
     return types.SimpleNamespace(port=port, store=st, state=state, ns=ns, tmp=tmp,
-                                 landings=landings, steps=steps,
+                                 landings=landings, steps=steps, server=server,
                                  statefile=tmp / "operator.json")
 
 
@@ -30198,20 +30198,27 @@ def test_operator_on_your_word_needs_notes():
 
 
 def test_operator_on_your_word_never_publishes_or_touches_trader():
-    print("\nthe operator, on your word: publishing where it is off and trader's live "
-          "config still need !approve")
+    print("\nthe operator, on your word in general: publishing where it is off and trader's "
+          "live config stay refused unless the item itself is named or planned")
     import tasks as T
     repo = _op_repo()
     bot = _said_bot()
     st = bot.store
-    g = _say(bot, "turn publish on for cadence, set trader's base, and land the trader fix")
+    g = _say(bot, "turn on everything for cadence, set trader's base, and land the trader fix")
     me = {"caller_role": "operator", "caller_thread": HOME, "caller_grant": g,
           "caller_task": bot.turn, "by": "operator", "notes": "you said so"}
     refused = bot.ns["operator_refused"]
     out = refused("projects", "publish", {**me, "slug": "cadence", "on": True})
-    check("publish where it is off is refused", out and out["refused"] == "publish", str(out))
+    check("publish where it is off is refused, telling it to record a plan, not to ask "
+          "for !approve", out and out["refused"] == "publish"
+          and "ops plan --publish cadence" in out["error"] and "!approve" not in out["error"],
+          str(out))
     out = refused("projects", "base", {**me, "slug": "trader"})
     check("trader's settings are refused", out and out["refused"] == "trader-config", str(out))
+    out = refused("projects", "base", {**me, "slug": "trader", "notes": ""})
+    check("saying what does lift them (`!approve`), not asking for --notes that cannot",
+          out and "!approve trader-config trader" in out["error"]
+          and "--notes" not in out["error"], str(out))
     live = st.create("Work for tsk_live", role="implementor", project="trader",
                      scope={"cwd": str(repo), "repo": str(repo)})["id"]
     st.update(live, branch="silkworm/tsk_live")
@@ -30241,6 +30248,352 @@ def test_operator_on_your_word_never_publishes_or_touches_trader():
     bot.state.approve("trader-config", "trader", by="U_ME")
     check("an !approve still lifts it, as before",
           refused("projects", "base", {**me, "slug": "trader"}) is None)
+
+
+# --- trader-config and publish on your word: a plan entry, or naming it ---------
+# 2026-11-19: tsk_b921b84c73 and tsk_e8758becd0 waited on a typed
+# `!approve trader-config`. Now a yes to the plan entry, or a message naming
+# the landing, lifts it for that one item, once -- from Slack or the dashboard.
+
+
+class _Projects:
+    """A project store with a publish switch, for /projects publish."""
+
+    def __init__(self, recs):
+        self.recs = {r["slug"]: dict(r) for r in recs}
+
+    def get(self, slug):
+        r = self.recs.get(slug)
+        return dict(r) if r else None
+
+    def ensure(self, slug, **kw):
+        self.recs[slug].update(kw)
+        return dict(self.recs[slug])
+
+    def scope_for(self, slug):
+        return {"branch": "main"}
+
+
+def _lift_bot(repo):
+    """_said_bot also serving /ops (plans) and /projects (publish), as shipped."""
+    import ops as OPS
+    bot = _said_bot()
+    bot.projects = _Projects([
+        {"slug": "cadence", "auto_merge": True, "publish": False},
+        {"slug": "trader", "auto_merge": True, "publish": False}])
+    shared = {k: v for k, v in bot.ns.items() if not k.startswith("__")}
+    bot.told = []
+    shared.update(project_store=bot.projects, ops=OPS, re=_re,
+                  tell_thread=lambda key, text: bot.told.append((key, text)),
+                  install_git_guards=lambda slug: None,
+                  ops_context=lambda: OPS.Context(
+                      project=lambda slug: None, python=sys.executable, silkworm_bin="/s",
+                      uid=os.getuid(), launch_agents=Path(tempfile.mkdtemp())))
+    ns2 = bot_functions("handle_ops", "record_ops_plan", "guarded_plan_entry",
+                        "handle_projects", **shared)
+    bot.ns2 = ns2
+    bot.server.route("/ops", ns2["handle_ops"])
+    bot.server.route("/projects", ns2["handle_projects"])
+    bot.repo = repo
+    return bot
+
+
+def _live_task(bot, branch="silkworm/tsk_live", state=None, title="Lever up"):
+    """A trader task whose branch changes scripts/paper_trade.py."""
+    import tasks as T
+    st = bot.store
+    tid = st.create(f"{title} ({branch})", role="implementor", project="trader",
+                    scope={"cwd": str(bot.repo), "repo": str(bot.repo)})["id"]
+    st.update(tid, branch=branch)
+    st.transition(tid, T.RUNNING); st.transition(tid, state or T.DONE)
+    return tid
+
+
+def _answer(bot, text, via=None):
+    """Your message's turn, answering the live plan as handle_prompt does."""
+    ts = f"{time.time() + 1:.6f}"
+    return bot.ns["OPERATOR_GRANTS"].open(HOME, ts, "U_ME", text, bot.turn,
+                                          plan=bot.state.answer_plan(ts, text), via=via), ts
+
+
+def _plan(bot, *argv):
+    return _op_cli(bot, "ops", "plan", *argv, "--by", "operator", thread=HOME,
+                   task="tsk_sweep")
+
+
+def test_operator_trader_landing_lifts_on_a_yes_to_its_plan_entry():
+    import tasks as T
+    print("\nthe operator: a trader live-config landing lifts on your yes to its plan entry, once")
+    repo = _op_repo()
+    _op_git(repo, "branch", "silkworm/tsk_live2", "silkworm/tsk_live")
+    bot = _lift_bot(repo)
+    st = bot.store
+    live, other = _live_task(bot), _live_task(bot, "silkworm/tsk_live2", title="Lever more")
+    plain = _live_task(bot, "silkworm/tsk_new", title="New work")
+    g0, _ = _answer(bot, "yes")
+    r = _as_user(bot, g0, "land", live, "--notes", "you said yes")
+    check("with no plan, your 'yes' does not land it; the refusal says to record a plan",
+          r.returncode == 1 and live not in bot.landings and "trader-config" in r.stderr
+          and f"ops plan --land {live}" in r.stderr and "!approve" not in r.stderr,
+          r.stdout + r.stderr)
+    r = _as_sweep(bot, "land", live, "--notes", "the user wants it")
+    check("a sweep is refused the same way", r.returncode == 1 and live not in bot.landings
+          and f"ops plan --land {live}" in r.stderr, r.stdout + r.stderr)
+    r = _plan(bot, "--land", plain)
+    check("a landing that touches no live config needs no plan entry",
+          r.returncode == 1 and "needs no plan entry" in r.stderr, r.stdout + r.stderr)
+    r = _plan(bot, "--land", "tsk_nosuch")
+    check("nor can a task that does not exist be planned",
+          r.returncode == 1 and "no task tsk_nosuch" in r.stderr, r.stdout + r.stderr)
+    r = _plan(bot, "--land", live)
+    shown = (f"1. `land {live}` -- needs trader-config: lands silkworm/tsk_live into main; "
+             "changes trader's live config: scripts/paper_trade.py")
+    check("a sweep records it, showing the guard and the live files it changes",
+          r.returncode == 0 and shown in r.stdout, r.stdout + r.stderr)
+    check("and Silkworm itself posts the entries to the thread, not only the operator",
+          bot.told and bot.told[-1][0] == HOME and shown in bot.told[-1][1], bot.told)
+    r = _as_sweep(bot, "land", live, "--notes", "planned")
+    check("the sweep that recorded it still cannot land it",
+          r.returncode == 1 and live not in bot.landings, r.stdout + r.stderr)
+    g, ts = _answer(bot, "yes")
+    r = _as_user(bot, g, "land", other, "--notes", "you said yes")
+    check("your yes lifts nothing for a task not in the plan",
+          r.returncode == 1 and other not in bot.landings
+          and "ops plan --land" in r.stderr, r.stdout + r.stderr)
+    r = _as_user(bot, g, "land", live)
+    check("--notes are still needed", r.returncode == 1 and live not in bot.landings
+          and "--notes" in r.stderr, r.stdout + r.stderr)
+    r = _as_user(bot, g, "land", live, "--notes", "you said yes")
+    res = (st.get(live) or {}).get("result") or {}
+    lift = res.get("decided_lift") or {}
+    ev = [e for e in st.get(live)["events"] if e["kind"] == "decided"]
+    check("after your yes, the planned landing goes ahead",
+          r.returncode == 0 and bot.landings.count(live) == 1, r.stdout + r.stderr)
+    check("and the task records the plan id, the entry, your message and where it came from",
+          lift.get("how") == "plan" and lift.get("plan_id", "").startswith("plan_")
+          and lift.get("entry") == 1 and lift.get("ts") == ts and lift.get("guard")
+          == "trader-config" and "Slack message" in lift.get("via", "")
+          and res.get("decided_ts") == ts and ev and lift["plan_id"] in ev[-1]["detail"], res)
+    check("which compaction keeps", "decided_lift" in T.RESULT_KEEPS)
+    r = _as_user(bot, g, "land", live, "--notes", "you said yes")
+    check("and only once: the same yes does not land it again",
+          r.returncode == 1 and bot.landings.count(live) == 1
+          and "already been carried out" in r.stderr, r.stdout + r.stderr)
+
+    # "do 2" lifts entry 2 only.
+    two = _live_task(bot, "silkworm/tsk_live2", state=T.AWAITING_APPROVAL,
+                     title="Lever again")
+    r = _plan(bot, "--land", other, "--approve", two)
+    check("a plan can name several, land and approve alike",
+          r.returncode == 0 and f"2. `approve {two}` -- needs trader-config" in r.stdout,
+          r.stdout + r.stderr)
+    g2, _ = _answer(bot, "do 2")
+    r = _as_user(bot, g2, "land", other, "--notes", "you said do 2")
+    check("'do 2' does not lift entry 1", r.returncode == 1 and other not in bot.landings,
+          r.stdout + r.stderr)
+    out = bot.ns["handle_tasks"]({"action": "land", "id": two, "caller_role": "operator",
+                                  "caller_thread": HOME, "caller_grant": g2,
+                                  "caller_task": bot.turn, "notes": "you said do 2"})
+    check("an approve entry does not lift a land of it", not out["ok"]
+          and two not in bot.landings, str(out))
+    r = _as_user(bot, g2, "approve", two, "--notes", "you said do 2")
+    check("and lifts entry 2 for its approve", r.returncode == 0 and two in bot.landings,
+          r.stdout + r.stderr)
+
+    # A landing that never starts gives its entry back.
+    r = _plan(bot, "--land", other)
+    g3, _ = _answer(bot, "go ahead")
+    keep = bot.ns["start_landing"]
+    bot.ns["start_landing"] = lambda tid, **k: False
+    r = _as_user(bot, g3, "land", other, "--notes", "you said go ahead")
+    check("a landing that could not start is refused", r.returncode == 1
+          and other not in bot.landings, r.stdout + r.stderr)
+    check("and the entry is still unused", not ((bot.state.plan() or {}).get("entries") or [{"used": 1}])[0]["used"],
+          bot.state.plan())
+    bot.ns["start_landing"] = keep
+    r = _as_user(bot, g3, "land", other, "--notes", "you said go ahead")
+    check("so the same yes lands it when it can", r.returncode == 0
+          and other in bot.landings, r.stdout + r.stderr)
+    g4, _ = _answer(bot, f"land {plain}")
+    check("an entry for another turn's message is not this one's",
+          not bot.ns["handle_tasks"]({"action": "land", "id": live, "caller_role": "operator",
+                                      "caller_thread": HOME, "caller_grant": g4,
+                                      "caller_task": bot.turn, "notes": "x"})["ok"])
+
+
+def test_operator_trader_landing_lifts_when_your_message_names_it():
+    import tasks as T
+    print("\nthe operator: a trader live-config landing lifts when your message names it, "
+          "from Slack or the dashboard, once")
+    repo = _op_repo()
+    bot = _lift_bot(repo)
+    st = bot.store
+    a, b = _live_task(bot), _live_task(bot, title="Lever twice")
+    rev = _live_task(bot, state=T.AWAITING_APPROVAL, title="Lever reviewed")
+    via = {"via": "dashboard", "login": "me@example.com", "node": "phone", "peer": "100.64.0.9"}
+    g, ts = _answer(bot, f"land {a}", via=via)
+    r = _as_user(bot, g, "land", b, "--notes", f"you said land {a}")
+    check("a message naming one landing lifts nothing for another",
+          r.returncode == 1 and b not in bot.landings, r.stdout + r.stderr)
+    r = _as_user(bot, g, "land", a, "--notes", f"you said land {a}")
+    res = st.get(a)["result"]
+    check("a dashboard message naming it lands it", r.returncode == 0 and a in bot.landings,
+          r.stdout + r.stderr)
+    check("recording that the message named it, and where it came from",
+          res.get("decided_lift", {}).get("how") == "named"
+          and "dashboard message" in res.get("decided_via", "")
+          and "me@example.com" in res.get("decided_via", "") and res.get("decided_ts") == ts,
+          res)
+    r = _as_user(bot, g, "land", a, "--notes", f"you said land {a}")
+    check("once", r.returncode == 1 and bot.landings.count(a) == 1, r.stdout + r.stderr)
+    g2, _ = _answer(bot, f"don't land {b} yet")
+    r = _as_user(bot, g2, "land", b, "--notes", "x")
+    check("'don't land' names nothing", r.returncode == 1 and b not in bot.landings,
+          r.stdout + r.stderr)
+    g3, _ = _answer(bot, f"should we land {b}?")
+    r = _as_user(bot, g3, "land", b, "--notes", "x")
+    check("nor does a question", r.returncode == 1 and b not in bot.landings,
+          r.stdout + r.stderr)
+    g4, _ = _answer(bot, f"approve {rev}")
+    r = _as_user(bot, g4, "approve", rev, "--notes", f"you said approve {rev}")
+    check("naming reviewed work approves and lands it (its accept on your word too)",
+          r.returncode == 0 and rev in bot.landings
+          and st.get(rev)["state"] != T.AWAITING_APPROVAL, r.stdout + r.stderr)
+    out = bot.ns["handle_tasks"]({"action": "land", "id": b, "caller_role": "operator",
+                                  "caller_thread": HOME, "caller_task": "tsk_wake",
+                                  "notes": f"land {b}"})
+    check("a wake-up, with no grant, is refused", not out["ok"]
+          and out["refused"] == "trader-config" and b not in bot.landings, str(out))
+    bot.state.approve("trader-config", b, by="U_ME")
+    r = _as_sweep(bot, "land", b, "--notes", "approved")
+    check("`!approve trader-config` keeps working", r.returncode == 0 and b in bot.landings,
+          r.stdout + r.stderr)
+
+
+def test_operator_publish_lifts_on_your_word_for_that_project():
+    print("\nthe operator: publish on lifts on a yes to its plan entry, or your message "
+          "naming it; never a sweep")
+    bot = _lift_bot(_op_repo())
+    pub = lambda: bot.projects.recs["cadence"]["publish"]
+    r = _op_cli(bot, "publish", "cadence", "on", "--by", "operator", "--notes", "x",
+                thread=HOME, task="tsk_sweep")
+    check("a sweep turning publish on is refused, saying to record a plan",
+          r.returncode == 1 and not pub() and "ops plan --publish cadence" in r.stderr,
+          r.stdout + r.stderr)
+    r = _plan(bot, "--publish", "trader")
+    check("trader's publish is its live config: not plannable as publish",
+          r.returncode == 1 and "trader-config" in r.stderr, r.stdout + r.stderr)
+    r = _plan(bot, "tailscale-on", "--publish", "cadence")
+    check("publish is planned beside an op, numbered after it",
+          r.returncode == 0 and "1. `tailscale-on`" in r.stdout
+          and "2. `publish cadence` -- needs publish: turns publish on for cadence"
+          in r.stdout, r.stdout + r.stderr)
+    g, ts = _answer(bot, "do 1")
+    r = _as_user(bot, g, "publish", "cadence", "on", "--notes", "you said do 1")
+    check("'do 1' does not lift entry 2", r.returncode == 1 and not pub(), r.stdout + r.stderr)
+    r = _plan(bot, "--publish", "cadence")
+    g, ts = _answer(bot, "yes")
+    r = _as_user(bot, g, "publish", "cadence", "on", "--notes", "you said yes")
+    check("your yes to it turns publish on", r.returncode == 0 and pub()
+          and "on the user's word" in r.stdout, r.stdout + r.stderr)
+    bot.projects.recs["cadence"]["publish"] = False
+    r = _as_user(bot, g, "publish", "cadence", "on", "--notes", "you said yes")
+    check("once", r.returncode == 1 and not pub(), r.stdout + r.stderr)
+    g2, _ = _answer(bot, "turn publish on for cadence")
+    r = _as_user(bot, g2, "publish", "cadence", "on", "--notes", "you said turn it on")
+    check("a message naming it turns it on", r.returncode == 0 and pub(), r.stdout + r.stderr)
+    bot.projects.recs["cadence"]["publish"] = False
+    r = _as_user(bot, g2, "publish", "cadence", "on", "--notes", "you said turn it on")
+    check("also once", r.returncode == 1 and not pub(), r.stdout + r.stderr)
+    r = _as_sweep(bot, "publish", "cadence", "off", "--notes", "x")
+    check("turning it off was never guarded", r.returncode == 0, r.stdout + r.stderr)
+    bot.projects.recs["cadence"]["auto_merge"] = False
+    _plan(bot, "--publish", "cadence")
+    g3, _ = _answer(bot, "yes")
+    r = _as_user(bot, g3, "publish", "cadence", "on", "--notes", "you said yes")
+    check("a publish the switch refuses (auto-merge off) does not happen",
+          r.returncode == 1 and not pub() and "auto-merge" in r.stderr, r.stdout + r.stderr)
+    check("and gives its entry back", not ((bot.state.plan() or {}).get("entries") or [{"used": 1}])[0]["used"],
+          bot.state.plan())
+
+
+def test_guard_lift_rules():
+    import operator_role as O
+    print("\nguard_lift: a plan entry your answer approved, or your message naming it")
+    yes = lambda t: [O.names_action(x, "trader-config", "tsk_ab12") for x in t]
+    check("names: a clause that is only the verb, the items, and asking or joining",
+          yes(["land tsk_ab12", "please `land tsk_ab12`.", "land tsk_x and tsk_ab12",
+               "land tsk_x, tsk_ab12", "Go ahead and merge tsk_ab12 👍",
+               "approve tsk_ab12 please", "thanks. land tsk_ab12"]) == [True] * 7)
+    no = ["don't land tsk_ab12", "never land tsk_ab12", "land tsk_ab12?",
+          "land tsk_x but not tsk_ab12", "dismiss tsk_ab12", "land tsk_ab123",
+          "tsk_ab12 looks fine", "land tsk_x. close tsk_ab12",
+          "I don't think we should land tsk_ab12 yet", "I'm not sure we want to land tsk_ab12",
+          "do not, under any circumstances, land tsk_ab12", "Should I land tsk_ab12",
+          "what would happen if we land tsk_ab12",
+          "the landing of tsk_ab12 failed last night, what happened",
+          "merge conflicts in tsk_ab12 look bad",
+          "land tsk_cd34 and investigate tsk_ab12",
+          "land tsk_cd34 and explain why tsk_ab12 is risky",
+          "land tsk_ab12 once the backtest from tsk_cd34 passes",
+          "> land tsk_ab12\nwhy did you suggest this"]
+    said = yes(no)
+    check("not: a no, a question, any other word in the clause, a quote",
+          said == [False] * len(no), [t for t, y in zip(no, said) if y])
+    check("land names a landing, approve an approval: not each other",
+          not O.names_action("land tsk_ab12", "trader-config", "tsk_ab12", "approve")
+          and not O.names_action("approve tsk_ab12", "trader-config", "tsk_ab12", "land")
+          and O.names_action("merge tsk_ab12", "trader-config", "tsk_ab12", "land"))
+    check("publish: 'publish cadence', 'turn publish on for cadence'",
+          O.names_action("turn publish on for cadence", "publish", "cadence")
+          and O.names_action("publish cadence", "publish", "cadence")
+          and not O.names_action("land cadence", "publish", "cadence")
+          and not O.names_action("publishing cadence broke yesterday", "publish", "cadence")
+          and not O.names_action("publish alpha and cadence", "publish", "alpha")
+          and not O.names_action("publish cadence", "trader-config", "cadence"))
+    plan = {"id": "plan_x", "answered": "5.0",
+            "entries": [{"n": 1, "name": "land", "args": ["tsk_ab12"], "guard": "trader-config"},
+                        {"n": 2, "name": "publish", "args": ["cadence"], "guard": "publish"}]}
+    g = {"ts": "5.0", "user": "U_ME", "text": "yes", "plan": {"id": "plan_x"}, "via": "slack"}
+    lift, why = O.guard_lift(g, "trader-config", "land", "tsk_ab12", plan)
+    check("a yes to entry 1 lifts it", lift and lift["entry"] == 1 and lift["how"] == "plan",
+          why)
+    check("for its own action only", not O.guard_lift(g, "trader-config", "approve",
+                                                     "tsk_ab12", plan)[0])
+    check("not for publish of it, an action of another guard",
+          not O.guard_lift(g, "trader-config", "publish", "tsk_ab12", plan)[0])
+    check("nor a sweep (no grant)", not O.guard_lift(None, "trader-config", "land",
+                                                    "tsk_ab12", plan)[0])
+    check("nor once the plan was answered by another message",
+          not O.guard_lift(g, "trader-config", "land", "tsk_ab12",
+                           dict(plan, answered="6.0"))[0])
+    check("nor once replaced", not O.guard_lift(g, "trader-config", "land", "tsk_ab12",
+                                                dict(plan, id="plan_y"))[0])
+    used = dict(plan, entries=[dict(plan["entries"][0], used=1.0)])
+    check("nor once used", not O.guard_lift(g, "trader-config", "land", "tsk_ab12", used)[0])
+    g2 = dict(g, text="do 2")
+    check("'do 2' lifts publish cadence, not entry 1",
+          O.guard_lift(g2, "publish", "publish", "cadence", plan)[0]
+          and not O.guard_lift(g2, "trader-config", "land", "tsk_ab12", plan)[0])
+    check("naming trader does not lift its live config for a project setting",
+          not O.guard_lift(dict(g, text="land trader"), "trader-config", "publish",
+                           "trader", plan)[0])
+    check("a project setting of trader stays !approve-only",
+          not O.guard_lift(dict(g, text="set base trader"), "trader-config", "base",
+                           "trader", plan)[0]
+          and "!approve trader-config trader" in O.refusal("trader-config", "trader", "base"))
+    tmp = Path(tempfile.mkdtemp())
+    st = O.State(tmp / "operator.json")
+    check("a named lift is claimed once per message",
+          st.use_said_lift("5.0", "publish", "cadence")
+          and not st.use_said_lift("5.0", "publish", "cadence")
+          and st.use_said_lift("6.0", "publish", "cadence"))
+    st.release_said_lift("5.0", "publish", "cadence")
+    check("and given back if its action did not happen",
+          st.use_said_lift("5.0", "publish", "cadence"))
+    check("the prompts no longer send the user to type !approve",
+          "never ask them to type `!approve`" in O.SWEEP_NOTE
+          and "Never ask them to type `!approve`" in __import__("roles").OPERATOR_SYSTEM)
 
 
 def test_operator_grant_is_made_only_for_your_own_message():
