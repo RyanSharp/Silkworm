@@ -35441,6 +35441,159 @@ def test_show_conversation_turns_toggle():
     check("a device that unticked it starts with it off", off.get("startsOn") is False)
 
 
+TRADER_ERRPATH_DRIVER = r"""// Draws every Trader tab from what trader's own scripts/trader_status.py
+// printed, and from that document bent down each error path the script has:
+// a missed slot, each section absent or _unknown, a stopped or unfindable
+// daemon, an unreadable plist, a git failure, an unused gate, no C1 report,
+// odd launchd schedules, an option position, and strings that would be markup.
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const doc = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+function el(id) {
+  return {id, textContent: "", innerHTML: "", style: {}, dataset: {}, className: "", attrs: {},
+    setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; },
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) { return c; }, addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; }};
+}
+const els = {};
+globalThis.document = {getElementById: id => els[id] || (els[id] = el(id)), createElement: () => el("new"), hidden: false,
+  querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}, innerWidth: 1280};
+globalThis.setInterval = () => 0; globalThis.setTimeout = () => 0;
+process.on("unhandledRejection", e => { console.error(e); process.exit(1); });
+globalThis.fetch = async url => {
+  let out = {ok: true};
+  if (url.startsWith("/api/sessions")) out = {sessions: [], slack: {}};
+  if (url.startsWith("/api/stats")) out = {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []};
+  return {status: 200, headers: {get: () => null}, json: async () => out};
+};
+(0, eval)(src + `;globalThis.__t = {traderHtml};`);
+const T = globalThis.__t, now = Date.parse(doc.generated_at) / 1000;
+const clone = x => JSON.parse(JSON.stringify(x));
+const TABS = ["summary", "sleeves", "activity", "plumbing", "shadow"];
+const out = {live: {}, skipped: "", without: {}, escaped: {}};
+for (const t of TABS) out.live[t] = T.traderHtml({ok: true, doc}, now, t);
+const sk = clone(doc);
+sk.sections.dispatches.missed_slots = [{session: "2026-11-13", timing: "close",
+  slot: "2026-11-13T16:00:00-05:00", logged_as: null}];
+out.skipped = T.traderHtml({ok: true, doc: sk}, now, "activity");
+// A section trader_status.py can't build is its _unknown shape, never an
+// absent key; both are drawn.
+out.unknownSec = {};
+for (const k of Object.keys(doc.sections)) {
+  const d = clone(doc); delete d.sections[k];
+  out.without[k] = TABS.map(t => T.traderHtml({ok: true, doc: d}, now, t)).join("\n");
+  const u = clone(doc);
+  u.sections[k] = {status: "unknown", reason: k + " could not read: ImportError boom", source: null, as_of: null};
+  // Only the tab that owns the section: the summary repeats every reason.
+  const own = {summary: "summary", sleeves: "sleeves", gate: "sleeves", universe: "sleeves", dispatches: "activity",
+    fills: "activity", jobs: "plumbing", freshness: "plumbing", health: "plumbing", host: "plumbing", env: "plumbing",
+    shadow: "shadow"}[k] || "summary";
+  out.unknownSec[k] = T.traderHtml({ok: true, doc: u}, now, own);
+}
+// The error paths the script has (the review's cases).
+const V = {};
+const vary = (tab, f) => { const d = clone(doc); f(d.sections); return T.traderHtml({ok: true, doc: d}, now, tab); };
+const job = (S, name) => S.jobs.jobs.find(j => j.label.endsWith("." + name));
+V.daemonDown = vary("plumbing", S => { job(S, "papertrade").pid = null; job(S, "papertrade").status = "bad";
+  job(S, "papertrade").reason = "KeepAlive job has no running PID"; S.host.daemon = {pid: null, started: null, checkout: null, error: null}; });
+V.lookupFailed = vary("plumbing", S => { S.host.daemon = {pid: null, started: null, checkout: null, error: "RuntimeError: launchctl exited 1"}; });
+V.pidAndError = vary("plumbing", S => { S.host.daemon.error = "RuntimeError: ps exited 1"; });
+V.plistBad = vary("plumbing", S => { S.jobs.jobs.push({plist: "/x/com.traderjoe.zzz.plist", label: "com.traderjoe.zzz",
+  status: "unknown", reason: "plist unreadable: ValueError"}); });
+V.failingNull = vary("plumbing", S => { S.health.last_scheduled_run.failing = null; });
+V.gitError = vary("plumbing", S => { S.host.running_vs_disk = {head: "abc1234 2026-11-19T10:00:00-08:00 x",
+  git_error: "RuntimeError: git exited 128", env_newer_than_daemon: false}; });
+V.noGateSleeve = vary("sleeves", S => { S.gate = {status: "ok", reason: "no deployed sleeve uses the credit gate", source: null, as_of: null}; });
+V.noReport = vary("shadow", S => { delete S.shadow.vm_multi_asset; });
+V.schedules = vary("plumbing", S => { const j = S.jobs.jobs;
+  j[0].schedule = {StartInterval: 30}; j[1].schedule = {Minute: 0}; j[2].schedule = [{Hour: 9}, {Weekday: 1, Hour: 10}];
+  j[3].schedule = [{Weekday: 1, Hour: 8, Minute: 0}, {Weekday: 5, Hour: 16, Minute: 0}]; j[4].schedule = {StartInterval: 90}; });
+V.option = vary("sleeves", S => { S.sleeves.sleeves[1].positions = [{symbol: "SPY 2026-12-18 600C", quantity: 2, avg_cost: 5.0,
+  price: 6.0, market_value: 1200.0}]; });
+out.variants = V;
+const evil = '<img src=x onerror=alert(1)>"', bad = clone(doc), S = bad.sections;
+S.sleeves.sleeves[1].positions[0].symbol = evil; S.universe.loaded.mode = evil; S.fills.recent[0].symbol = evil;
+S.jobs.jobs[0].label = evil; S.health.checks[0].message = evil; S.env.values.BROKER = evil;
+S.host.gateway.detail = evil; S.host.running_vs_disk.commits_since_start[0] = evil; S.dispatches.recent[0].timing = evil;
+S.freshness.bars.message = evil;
+for (const t of TABS) out.escaped[t] = T.traderHtml({ok: true, doc: bad}, now, t);
+console.log(JSON.stringify(out));
+"""
+
+
+def test_trader_tabs_follow_trader_status_down_its_error_paths():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe Trader tabs say what trader_status.py says, on its error paths too")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(TRADER_ERRPATH_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(TRADER_REAL_FIXTURE)],
+                       capture_output=True, text=True, timeout=60, env=dict(os.environ, TZ="America/Los_Angeles"))
+    if p.returncode != 0:
+        check("the trader tabs' javascript runs down trader_status.py's error paths", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    words = lambda h: re.sub(r"\s+", " ", re.sub(r"<title>.*?</title>|<[^>]+>", " ", h))
+    L = {k: words(v) for k, v in o["live"].items()}
+    va = {k: words(v) for k, v in o["variants"].items()}
+    # NaN only ever in the words "NaN date(s)" / "NaN row(s)" / "NaN rows on".
+    stray = lambda h: re.search(r"NaN(?! (dates?|rows?)\b)", words(h))
+    for t, h in o["live"].items():
+        check(f"the {t} tab prints no undefined, null or stray NaN", "undefined" not in h and "null" not in h and not stray(h), t)
+    for k, h in o["without"].items():
+        check(f"without its {k} section every tab still draws, with no undefined, null or NaN",
+              "undefined" not in h and "null" not in h and not stray(h) and h.count("tr-") > 50, k)
+    for k, h in o["unknownSec"].items():
+        check(f"an unknown {k} section shows its own reason on its own tab",
+              f"{k} could not read: ImportError boom" in h and "undefined" not in h and "null" not in h and not stray(h), k)
+    pl, sh, a = L["plumbing"], L["shadow"], L["activity"]
+    check("dispatches run newest first, by real time across offsets",
+          a.index("Nov 19 06:33 open") < a.index("Nov 18 13:00 close") < a.index("Nov 16 13:00 close"))
+    sk = words(o["skipped"])
+    check("a missed slot keeps its own time and sits in time order",
+          "Nov 13 13:00 close ✕ SKIPPED no dispatch heartbeat for this NYSE session slot" in sk
+          and sk.index("Nov 16 13:00 close") < sk.index("Nov 13 13:00 close"), sk[:400])
+    check("a KeepAlive daemon with no PID is the script's bad, not a green exit 0",
+          "papertrade ! KeepAlive job has no running PID KeepAlive Thu Nov 19 06:33 ✕ exit 0 n/a" in va["daemonDown"]
+          and "daemon ✕ NOT RUNNING" in va["daemonDown"])
+    check("a failed daemon lookup is unknown, not 'not running' or 'not reported'",
+          "daemon ? lookup failed RuntimeError: launchctl exited 1" in va["lookupFailed"]
+          and "NOT RUNNING" not in va["lookupFailed"] and "daemon ? not reported" not in va["lookupFailed"])
+    check("a PID with a lookup error keeps the error",
+          "PID 84984, up since Sun Nov 15 08:00 ? lookup failed RuntimeError: ps exited 1" in va["pidAndError"])
+    check("an unreadable plist shows the script's reason", "zzz ! plist unreadable: ValueError" in va["plistBad"])
+    check("a git error is shown, not hidden behind HEAD", "? git failed RuntimeError: git exited 128" in va["gitError"])
+    check("a gate no sleeve uses says so, with no 'state unknown' beside an OK",
+          "✓ OK no deployed sleeve uses the credit gate" in va["noGateSleeve"] and "state unknown" not in va["noGateSleeve"])
+    check("interval and KeepAlive jobs can't miss a slot: n/a, not unknown",
+          "gatewaywatch every 2m Wed Nov 18 23:46 ✓ exit 0 n/a" in pl and "papertrade KeepAlive Thu Nov 19 06:33 ✓ running n/a" in pl
+          and "? unknown" not in pl[pl.index("Launchd jobs"):pl.index("Health checks")])
+    check("a job's exit badge is the script's own status (exit 1 is its warn)",
+          "paperhealth ! last exited 1 wkdays 06:15 12:50 13:15 Thu Nov 19 06:15 ! exit 1 no" in pl)
+    check("launchd schedules in words, as launchd reads them",
+          "every 30s" in va["schedules"] and "every 90s" in va["schedules"] and "gatewaywatch hourly at :00" in va["schedules"]
+          and "daily 09:**; Mon 10:**" in va["schedules"] and "Mon 08:00; Fri 16:00" in va["schedules"]
+          and "newsfwd wkdays 13:50" in pl and "every 0m" not in va["schedules"])
+    check("the equity snapshot has its own freshness row, and says it is behind",
+          "equity snapshot — — 2026-11-16 ✕ behind" in pl)
+    check("two sessions behind is within trader's SHADOW_MAX_SESSIONS_BEHIND",
+          "Blend shadow ✓ 2 session(s) behind" in sh)
+    check("with no C1 report the recorded curve's freshness still shows",
+          "vm_multi_asset_recorded newest 2026-11-13, 3 sessions behind" in va["noReport"])
+    check("an option's uPnL carries the multiplier its market value shows",
+          "SPY 2026-12-18 600C 2 5.00 6.00 +200" in va["option"])
+    n = sum(h.count("&lt;img src=x onerror=alert(1)&gt;&quot;") for h in o["escaped"].values())
+    check("strings in trader_status.py's own fields are escaped, never markup",
+          all("<img" not in h for h in o["escaped"].values()) and n >= 10, n)
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

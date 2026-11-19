@@ -4855,6 +4855,15 @@ const trFix = (v, d) => trNum(v) ? v.toFixed(d) : "—";
 // A table's time: "Nov 18 13:00" in this device's zone, kept on one line.
 function trShort(v) { const f = trFmt(v); return /^[A-Z][a-z]{2} [A-Z]/.test(f) ? f.slice(4) : f; }
 // A section, or a field of one, that isn't there: said, with the section's reason.
+// A section trader_status.py could only give as a status and reason (its
+// _unknown/guard() shape, or a path with nothing to measure): say that, not a
+// card of "unknown" rows.
+function trBare(doc, k, keys) {
+  const s = trSec(doc, k);
+  if (!Object.keys(s).length || keys.some(x => s[x] !== undefined)) return "";
+  // The card's title already carries the section's status badge.
+  return `<p>${esc(trStr(s.reason) || "no " + k + " data")}</p>`;
+}
 function trMissing(doc, k, what) {
   const s = (trObj(doc).sections || {})[k];
   const why = s && s.reason ? `${k}: ${trStr(s.reason)}`
@@ -4964,8 +4973,10 @@ function trSleeveCard(doc, r, halt) {
 }
 function trGateCard(doc) {
   const g = trSec(doc, "gate");
+  const bare = trBare(doc, "gate", ["on", "gate_open", "ratio", "history"]);
   let body;
   if (!Object.keys(g).length) body = trMissing(doc, "gate");
+  else if (bare) body = bare;
   else {
     const st = g.on === true ? trBadge("ok", "ON (risk-on)") : g.on === false ? trBadge("bad", "OFF (risk-off)") : trBadge("unknown", "state unknown");
     const avg = trNum(g.window) ? g.window + "-day avg" : "moving avg (window not reported)";
@@ -5069,14 +5080,22 @@ function trActivityTab(doc) {
 function trHostCard(doc) {
   const h = trSec(doc, "host");
   if (!Object.keys(h).length) return `<div class="tr-card"><h4>Daemon and host</h4>${trMissing(doc, "host")}</div>`;
-  const dm = trObj(h.daemon), gw = trObj(h.gateway), pg = trObj(h.last_page);
+  const bare = trBare(doc, "host", ["daemon", "gateway", "running_vs_disk", "boot", "boot_time", "disk_free_gb", "backups"]);
+  if (bare) return `<div class="tr-card"><h4>Daemon and host ${trSecBadge(doc, "host")}</h4>${bare}</div>`;
+  const dm = trObj(h.daemon), gw = trObj(h.gateway), pg = trObj(h.last_page), rv = trObj(h.running_vs_disk);
   const row = (k, v) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`;
   const rows = [];
-  rows.push(row("daemon", dm.pid != null ? `PID ${esc(trStr(dm.pid))}` + (dm.since ? `, up since ${esc(trFmt(dm.since))}` : "") : trBadge("unknown", "not reported")));
+  // As trader_status.py judges it: a failed lookup is unknown (whatever PID
+  // came back); no PID and no error is the daemon NOT RUNNING.
+  const lookup = dm.error ? ` ${trBadge("unknown", "lookup failed")} ${esc(trStr(dm.error))}` : "";
+  rows.push(row("daemon", h.daemon === undefined ? trBadge("unknown", "not reported")
+    : dm.pid != null ? `PID ${esc(trStr(dm.pid))}` + (dm.since ? `, up since ${esc(trFmt(dm.since))}` : "") + lookup
+    : dm.error ? lookup.trim() : trBadge("bad", "NOT RUNNING")));
   rows.push(row("code", dm.head || trNum(dm.commits_since)
     ? (dm.head ? `main is ${esc(trStr(dm.head))}` : "") + (trNum(dm.commits_since)
         ? `; ${dm.commits_since} commit(s) newer than the running process ` + (dm.commits_since > 0 ? trBadge("warn", "restart pending") : trBadge("ok", "running = disk")) : "")
-    : "—"));
+      + (rv.git_error ? ` ${trBadge("unknown", "git failed")} ${esc(trStr(rv.git_error))}` : "")
+    : rv.git_error ? `${trBadge("unknown", "git failed")} ${esc(trStr(rv.git_error))}` : "—"));
   rows.push(row(".env", dm.env_edited ? `edited ${esc(trFmt(dm.env_edited))}` + (dm.env_after_start === true
     ? ` ${trBadge("warn", "after the daemon started: not loaded")}` : dm.env_after_start === false ? ` ${trBadge("ok", "loaded")}` : "") : "—"));
   rows.push(row("next restart", h.next_restart ? esc(trFmt(h.next_restart)) : "—"));
@@ -5108,9 +5127,14 @@ function trJobsCard(doc) {
   if (!Array.isArray(j.jobs)) body = trMissing(doc, "jobs", "launchd jobs");
   else body = trScroll(`<table><tr><th>job</th><th>schedule</th><th>last ran</th><th>exit</th><th>missed</th></tr>`
     + trList(j.jobs).map(x => {
-      const ex = x.running === true ? trBadge("ok", "running") : x.exit === 0 ? trBadge("ok", "exit 0")
-        : trNum(x.exit) ? trBadge("bad", "exit " + x.exit) : trBadge("unknown", "unknown");
-      const ms = x.missed === true ? trBadge("bad", "missed") : x.missed === false ? "no" : trBadge("unknown", "unknown");
+      // The status is trader_status.py's own when it gives one -- a KeepAlive
+      // job with no PID is bad even at exit 0 -- with launchd's word as label.
+      const words = x.running === true ? "running" : trNum(x.exit) ? "exit " + x.exit : "unknown";
+      const ex = trBadge(x.status ? x.status : x.running === true || x.exit === 0 ? "ok" : trNum(x.exit) ? "bad" : "unknown", words);
+      // Only calendar jobs have slots to miss: an interval job ("every 2m",
+      // trSchedule's words for StartInterval) or KeepAlive can't.
+      const ms = x.missed === true ? trBadge("bad", "missed") : x.missed === false ? "no"
+        : /^(KeepAlive$|every \d)/.test(trStr(x.schedule)) ? "n/a" : trBadge("unknown", "unknown");
       return `<tr><td>${trCell(x.label)}${x.note ? ` ${trBadge("warn", x.note)}` : ""}</td><td class="mono">${trCell(x.schedule)}</td>`
         + `<td>${x.last_ran ? esc(trFmt(x.last_ran)) : "no log"}</td><td>${ex}</td><td>${ms}</td></tr>`;
     }).join("") + `</table>`);
@@ -5186,20 +5210,38 @@ function trTabName(t) { return TRADER_TABS.some(x => x[0] === t) ? t : "summary"
 // document lacks it, from a value the document actually carries -- never a
 // default number. What it does not carry (alert delivery, backups, the halt and
 // target levels, the history behind the charts) stays missing and is shown so.
+const TR_DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 function trSchedule(s) {
-  if (Array.isArray(s)) return s.map(trSchedule).filter(Boolean).join(", ");
   if (typeof s === "string") return s;
-  if (!s || typeof s !== "object") return "";
-  const p = n => String(n).padStart(2, "0");
-  if (trNum(s.StartInterval)) {
-    const v = s.StartInterval;
-    return "every " + (v % 3600 === 0 ? v / 3600 + "h" : v % 60 === 0 ? v / 60 + "m" : v + "s");
+  const p2 = n => String(n).padStart(2, "0");
+  // One calendar entry: its days and its time, as launchd reads them (a
+  // missing key is "every": no Minute is every minute of that hour).
+  const when = x => trNum(x.Hour) ? p2(x.Hour) + ":" + (trNum(x.Minute) ? p2(x.Minute) : "**")
+    : trNum(x.Minute) ? "hourly at :" + p2(x.Minute) : "every minute";
+  const day = x => trNum(x.Weekday) ? TR_DAYS[x.Weekday % 7] : trNum(x.Day) ? "day " + x.Day : trNum(x.Hour) ? "daily" : "";
+  const order = d => { const i = TR_DAYS.indexOf(d); return i < 0 ? 99 : i === 0 ? 7 : i; };
+  if (Array.isArray(s) || (s && typeof s === "object" && !Array.isArray(s) && !trNum(s.StartInterval)
+      && ["Hour", "Minute", "Weekday", "Day"].some(k => k in s))) {
+    const xs = (Array.isArray(s) ? s : [s]).filter(x => x && typeof x === "object");
+    if (!xs.length) return "";
+    // Group by time; if every time runs on the same days, say "days times".
+    const byTime = new Map();
+    for (const x of xs) { const t = when(x); if (!byTime.has(t)) byTime.set(t, new Set()); byTime.get(t).add(day(x)); }
+    const daysOf = t => [...byTime.get(t)].sort((a, b) => order(a) - order(b) || a.localeCompare(b));
+    const keys = [...byTime.keys()].sort(), first = daysOf(keys[0]).join(",");
+    const words = ds => ds === "Mon,Tue,Wed,Thu,Fri" ? "wkdays" : ds;
+    const say = (d, t) => d ? d + " " + t : t;
+    if (keys.every(t => daysOf(t).join(",") === first)) return say(words(first), keys.join(" "));
+    return xs.map(x => say(day(x), when(x))).join("; ");
   }
-  const at = trNum(s.Hour) ? p(s.Hour) + ":" + p(trNum(s.Minute) ? s.Minute : 0) : trNum(s.Minute) ? "hourly at :" + p(s.Minute) : "";
-  const day = trNum(s.Weekday) ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][s.Weekday] || ""
-    : trNum(s.Day) ? "day " + s.Day : at && trNum(s.Hour) ? "daily" : "";
-  return [day, at].filter(Boolean).join(" ") || "";
+  const o = trObj(s);
+  if (trNum(o.StartInterval)) {
+    const n = o.StartInterval;
+    return n % 3600 === 0 ? `every ${n / 3600}h` : n % 60 === 0 ? `every ${n / 60}m` : `every ${n}s`;
+  }
+  return s == null ? "" : trStr(JSON.stringify(s));
 }
+const TR_SHADOW_MAX_BEHIND = 2;
 function trNormalize(doc) {
   if (!doc || typeof doc !== "object" || !doc.sections || typeof doc.sections !== "object") return doc;
   const d = JSON.parse(JSON.stringify(doc)), S = d.sections;
@@ -5221,7 +5263,11 @@ function trNormalize(doc) {
         if (!p || typeof p !== "object") return p;
         const q = Object.assign({}, p);
         put(q, "qty", q.quantity); put(q, "mark", q.price);
-        if (q.upnl === undefined && trNum(q.qty) && trNum(q.mark) && trNum(q.avg_cost)) q.upnl = (q.mark - q.avg_cost) * q.qty;
+        // market_value carries the contract multiplier (x100 for an option);
+        // read it back from there rather than assume 1.
+        const mult = trNum(q.market_value) && trNum(q.qty) && trNum(q.mark) && q.qty * q.mark
+          ? Math.round(q.market_value / (q.qty * q.mark)) || 1 : 1;
+        if (q.upnl === undefined && trNum(q.qty) && trNum(q.mark) && trNum(q.avg_cost)) q.upnl = (q.mark - q.avg_cost) * q.qty * mult;
         return q;
       });
       const own = r.holds !== undefined || r.doing !== undefined;     // the view's own names: left alone
@@ -5274,9 +5320,13 @@ function trNormalize(doc) {
       at: x.at, slot: x.timing, live: x.live, quotes: x.total, fallback: x.stored_close_fallback,
       dropped: x.dropped, orders: x.orders}));
     const missed = (Array.isArray(dis.missed_slots) ? dis.missed_slots : []).map(x => x && typeof x === "object"
-      ? {at: x.at || x.slot_at || x.date, slot: x.timing || x.slot, skipped: true, note: x.reason || x.note}
+      // trader_status.py: {session, timing, slot (the slot's ISO time), logged_as}.
+      ? {at: x.slot || x.at || x.session, slot: x.timing, skipped: true,
+         note: x.logged_as ? trStr(x.logged_as) : "no dispatch heartbeat for this NYSE session slot"}
       : {at: trStr(x), skipped: true});
-    dis.slots = done.concat(missed).sort((a, b) => trStr(a.at) < trStr(b.at) ? -1 : trStr(a.at) > trStr(b.at) ? 1 : 0);
+    // By real time, newest first: the ISO strings carry different offsets
+    // (a slot's -05:00, a heartbeat's +00:00), so they can't be compared as text.
+    dis.slots = done.concat(missed).sort((a, b) => (trWhen(b.at) || 0) - (trWhen(a.at) || 0));
   }
   if (fil && fil.fills === undefined && Array.isArray(fil.recent))
     fil.fills = fil.recent.filter(x => x && typeof x === "object").map(x => ({
@@ -5299,9 +5349,12 @@ function trNormalize(doc) {
     const snap = fr.snapshot && typeof fr.snapshot === "object" ? fr.snapshot : null;
     const bars = fr.bars && typeof fr.bars === "object" ? fr.bars : null;
     if (snap) put(fr, "equity", {newest: snap.last_date});
-    if (bars && fr.groups === undefined)
-      fr.groups = [{name: "bars", label: "live symbols", status: bars.ok === true ? "ok" : bars.ok === false ? "warn" : "unknown",
-                    note: bars.ok === true ? "fresh" : bars.ok === false ? "stale" : "unknown"}];
+    if ((bars || snap) && fr.groups === undefined)
+      fr.groups = [bars && {name: "bars", label: "live symbols", status: bars.ok === true ? "ok" : bars.ok === false ? "warn" : "unknown",
+                            note: bars.ok === true ? "fresh" : bars.ok === false ? "stale" : "unknown"},
+                   snap && {name: "snapshot", label: "equity snapshot", newest: snap.last_date,
+                            status: snap.ok === true ? "ok" : snap.ok === false ? "bad" : "unknown",
+                            note: snap.ok === true ? "current" : snap.ok === false ? "behind" : "unknown"}].filter(Boolean);
   }
   if (job && Array.isArray(job.jobs))
     job.jobs = job.jobs.map(x => {
@@ -5336,7 +5389,8 @@ function trNormalize(doc) {
     const bc = sh.blend_curve && typeof sh.blend_curve === "object" ? sh.blend_curve : null;
     if (bc && sh.blend === undefined) {
       const sb = bc.sessions_behind;
-      sh.blend = {status: trNum(sb) ? (sb <= 1 ? "ok" : "warn") : "unknown",
+      // trader's SHADOW_MAX_SESSIONS_BEHIND: two sessions behind is still fine.
+      sh.blend = {status: trNum(sb) ? (sb <= TR_SHADOW_MAX_BEHIND ? "ok" : "warn") : "unknown",
                   label: trNum(sb) ? (sb ? sb + " session(s) behind" : "current") : "unknown",
                   reason: `data/shadow_blend/curve.csv: ${trNum(bc.rows) ? bc.rows + " rows, " : ""}newest ${trStr(bc.newest) || "unknown"}`,
                   last: bc.newest};
