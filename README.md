@@ -1505,8 +1505,25 @@ A local web dashboard for every thread session (localhost-only):
   `/?view=stats|tasks|projects|learnings` (`&tab=all` for every task),
   `/?view=project&slug=<slug>` (`all`, `unfiled`), `&card=<task id>` (a task's
   detail), `/?modal=new-thread|new-project|new-task|settings|release|alerts`
-  (`&slug=` for the last two), `/?q=<words>` (search). The address is cleared
-  once read, so a reload opens the list.
+  (`&slug=` for the last two), `/?q=<words>` (search), `&theme=dark|light|auto`
+  (that view only). The address is cleared once read, so a reload opens the list.
+- **Look and feel** — one design system: CSS custom properties at `:root` for
+  spacing, type, radii, elevation, one accent (the silk gold) with ok / warn /
+  bad / info, and motion (120–240ms). Nothing below them writes a value out, and
+  a test holds that. Dark is the default; ⋯ › Theme picks Light or Auto (follows
+  the system), kept on the device. Motion is transform and opacity only, and is
+  absent under *Reduce Motion*: panels rise in over a dimmed backdrop (a sheet
+  sliding up on a phone) and leave the same way; a thread slides in, and the list
+  slides back. Lists fade in. A card or row that changes column or place glides
+  there, and one that leaves fades where it stood. Grey shimmering shapes stand
+  in while anything loads. Every button gives under a press.
+- **Touch** — swipe a proposal card or row right to accept or left to dismiss.
+  It goes at once, a toast offers *Undo*, and the action is sent five seconds
+  later, or at once if the app is put away. A refusal puts the card back and
+  says why. A hidden thread goes at once too, and its toast's *Undo* shows it
+  again. Irreversible actions
+  (Stop agent, Drop, Reset, settings that change what lands) still ask first.
+  Pull a list down past its top on a phone to refresh it.
 
 ### Screenshots of every view
 
@@ -1515,6 +1532,7 @@ bin/dashshots                          # artifacts/dashshots/<view>-<width>.png
 bin/dashshots --widths 375 --views board,card
 bin/dashshots --source /path/to/other/checkout --out /tmp/before
 bin/dashshots --scroll-probe --widths 430,375 --before /tmp/main-export --out /tmp/probe
+bin/dashshots --perf --before /tmp/main-export --perf-runs 5 --out /tmp/perf
 ```
 
 Mobile Safari in an iOS Simulator at 375px (iPhone SE (3rd generation)) and
@@ -1542,6 +1560,13 @@ something above growing late -- once read at the bottom and once scrolled up.
 It prints `ok`/`JUMP` per case, writes what it measured to
 `probe-<width>[-before|-after].json`, and photographs every phase (a burst of
 frames right after each trigger) into `frames-<width>…/`. `--runs` picks triggers.
+
+`--perf` measures instead. `bin/perfprobe.js` reads the browser's paint timing
+and when the session list's first card was drawn. It counts frames while the
+list, the task panel, a board and the longest thread are scrolled along a fixed
+path, and while a panel or a thread opens. With `--before`, both copies run
+`--perf-runs` times each into `perf-<width>.json`. Phone widths only: the
+laptop's offscreen WebKit view runs no animation clock.
 
 ## Notes & limits
 

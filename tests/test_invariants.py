@@ -6339,7 +6339,7 @@ def test_held_checkouts():
           "function held(t)" in js and "${held(t)}" in js,
           "approving that row is the moment the work becomes unreachable")
     marked = js.find("await renderHolding();")
-    drawn = js.find("setHTML(list, r.tasks.map")
+    drawn = js.find("drawKeyed(list, r.tasks.map")      # the rows' one draw (keyed, so it animates)
     body = js[js.index("async function renderHolding()"):js.index("function updateTaskBadge")]
     check("and a failed survey costs the marker, never the list of rows",
           "try {" in body and body.index("try {") < body.index('taskCall({action: "holding"'),
@@ -36398,6 +36398,743 @@ def test_startup_cleans_leaked_flags():
     check("bot.py calls task_store.strip_leaked_flags()", len(calls) == 1
           and isinstance(calls[0].func.value, ast.Name)
           and calls[0].func.value.id == "task_store")
+
+# A small DOM for the dashboard's motion and touch: elements with classes,
+# attributes, a selector engine (compound, descendant, attribute equality),
+# events dispatched capture-first, Element.animate recorded, and timers the
+# driver advances. argv[3] == "reduced" answers prefers-reduced-motion.
+MOTION_HARNESS = r"""const fs = require("fs");
+const SRC = fs.readFileSync(process.argv[2], "utf8");
+const REDUCED = process.argv[3] === "reduced";
+// --- a small DOM: elements, selectors, events, animations, timers ---
+const all = [];
+let timers = [], now = 0;
+globalThis.setTimeout = (f, ms) => { timers.push({f, at: now + (ms || 0)}); return timers.length; };
+globalThis.clearTimeout = id => { if (timers[id - 1]) timers[id - 1].f = null; };
+globalThis.setInterval = () => 0;
+globalThis.requestAnimationFrame = f => setTimeout(() => f(now), 16);
+function runTimers(until) {
+  for (let guard = 0; guard < 500; guard++) {
+    const due = timers.map((t, i) => [t, i]).filter(([t]) => t.f && (until === undefined || t.at <= until))
+      .sort((a, b) => a[0].at - b[0].at)[0];
+    if (!due) break;
+    const [t] = due; now = Math.max(now, t.at); const f = t.f; t.f = null; f();
+  }
+  if (until !== undefined) now = Math.max(now, until);
+}
+const anims = [];
+let animTotal = 0;
+function matchesOne(el, simple) {
+  const re = /([#.]?[\w-]+)|\[([\w-]+)(?:="([^"]*)")?\]/g;
+  let m, any = false;
+  while ((m = re.exec(simple))) {
+    any = true;
+    if (m[1]) {
+      const t = m[1];
+      if (t[0] === "#") { if (el.id !== t.slice(1)) return false; }
+      else if (t[0] === ".") { if (!el.cls.has(t.slice(1))) return false; }
+      else if ((el.tagName || "").toLowerCase() !== t.toLowerCase()) return false;
+    } else {
+      const v = el.getAttribute(m[2]);
+      if (v === null || v === undefined) return false;
+      if (m[3] !== undefined && v !== m[3]) return false;
+    }
+  }
+  return any;
+}
+function matches(el, sel) {
+  if (typeof sel !== "string" || !sel) return false;
+  return sel.split(",").some(part => {
+    const chain = part.trim().split(/\s+/).filter(x => x !== ">");
+    if (!matchesOne(el, chain[chain.length - 1])) return false;
+    let a = el.parentNode;
+    for (let i = chain.length - 2; i >= 0; i--) {
+      while (a && !matchesOne(a, chain[i])) a = a.parentNode;
+      if (!a) return false;
+      a = a.parentNode;
+    }
+    return true;
+  });
+}
+function E(tag, props) {
+  const cls = new Set(), attrs = {};
+  const e = {tagName: tag || "DIV", id: "", cls, attrs, children: [], parentNode: null, style: {},
+    dataset: {}, value: "", _text: "", _inner: "", scrollTop: 0, offsetWidth: 300,
+    get textContent() { return this._text; },
+    set textContent(v) { this._text = String(v); this.children.forEach(c => c.parentNode = null); this.children = []; },
+    listeners: {}, rect: {top: 0, left: 0, width: 300, height: 40},
+    classList: {add: (...c) => c.forEach(x => cls.add(x)), remove: (...c) => c.forEach(x => cls.delete(x)),
+      contains: c => cls.has(c), toggle: (c, on) => { if (on === undefined ? !cls.has(c) : on) cls.add(c); else cls.delete(c); return cls.has(c); }},
+    get className() { return [...cls].join(" "); },
+    set className(v) { cls.clear(); String(v).split(/\s+/).filter(Boolean).forEach(x => cls.add(x)); },
+    get innerHTML() { return this._inner; },
+    set innerHTML(v) { this._inner = v; this.children.forEach(c => c.parentNode = null); this.children = [];
+                       if (this.onHTML) this.onHTML(v); },
+    getAttribute(k) { if (k === "id") return this.id || null; if (k === "class") return this.className;
+                      if (k.startsWith("data-")) { const d = k.slice(5).replace(/-(\w)/g, (_, c) => c.toUpperCase());
+                        return this.dataset[d] !== undefined ? this.dataset[d] : null; }
+                      return k in attrs ? attrs[k] : null; },
+    setAttribute(k, v) { if (k === "id") this.id = v; else attrs[k] = String(v); },
+    removeAttribute(k) { if (k === "id") this.id = ""; else delete attrs[k]; },
+    appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.children.push(c);
+                     if (!all.includes(c)) all.push(c); return c; },
+    removeChild(c) { this.children = this.children.filter(x => x !== c); c.parentNode = null; return c; },
+    remove() { if (this.parentNode) this.parentNode.removeChild(this); },
+    contains(o) { for (let a = o; a; a = a.parentNode) if (a === this) return true; return false; },
+    closest(sel) { for (let a = this; a && a.tagName; a = a.parentNode) if (matches(a, sel)) return a; return null; },
+    matches(sel) { return matches(this, sel); },
+    querySelectorAll(sel) { return all.filter(x => x !== this && this.contains(x) && matches(x, sel)); },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    addEventListener(k, f) { (this.listeners[k] = this.listeners[k] || []).push(f); },
+    getBoundingClientRect() { return Object.assign({}, this.rect, {bottom: this.rect.top + this.rect.height}); },
+    animate(frames, opts) { const a = {el: this, frames, opts, onfinish: null, playState: "running",
+                                       cancel() { this.playState = "idle"; }, finish() { this.playState = "finished"; if (this.onfinish) this.onfinish(); }};
+                            anims.push(a); animTotal++; return a; },
+    cloneNode() { const c = E(this.tagName); c.id = this.id; c.className = this.className; c._inner = this._inner;
+                  Object.assign(c.style, this.style); c.cloned = true; return c; },
+    setPointerCapture() {}, focus() {}, scrollIntoView() {}, insertAdjacentHTML(_, h) { this._inner += h; }};
+  Object.assign(e, props || {});
+  return e;
+}
+const docListeners = {};
+const body = E("BODY");
+const html = E("HTML"); html.dataset.theme = "dark";
+const byIdMap = {};
+const byId = id => {
+  if (!byIdMap[id]) { const e = E("DIV"); e.id = id; byIdMap[id] = e; body.appendChild(e); }
+  return byIdMap[id];
+};
+const metas = {theme: E("META")}; metas.theme.setAttribute("content", "#2C0E2E");
+globalThis.document = {
+  getElementById: byId, body, documentElement: html, hidden: false, createElement: t => E(t.toUpperCase()),
+  addEventListener(k, f, o) { (docListeners[k] = docListeners[k] || []).push({f, capture: !!(o === true || (o && o.capture))}); },
+  querySelectorAll(sel) { return all.filter(x => x.parentNode && matches(x, sel)); },
+  querySelector(sel) { if (sel === 'meta[name="theme-color"]') return metas.theme; return this.querySelectorAll(sel)[0] || null; },
+};
+all.push(body);
+body.appendChild(E("HEADER"));        // the page's document click closes the header's ⋯ menu
+function fire(type, ev) {
+  ev = Object.assign({type, stopped: false, prevented: false,
+    stopPropagation() { this.stopped = true; }, preventDefault() { this.prevented = true; }}, ev);
+  for (const l of (docListeners[type] || []).filter(l => l.capture)) l.f(ev);
+  if (!ev.stopped) for (const l of (docListeners[type] || []).filter(l => !l.capture)) l.f(ev);
+  return ev;
+}
+const store = {};
+globalThis.localStorage = {getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.history = {state: null, replaceState() {}, pushState() {}, back() {}};
+globalThis.location = {search: "", href: "http://x/"};
+let PHONE = true, LIGHT = false;
+globalThis.matchMedia = q => ({matches: q === "(max-width: 700px)" ? PHONE
+  : q === "(prefers-reduced-motion: reduce)" ? REDUCED : q === "(prefers-color-scheme: light)" ? LIGHT : false});
+Object.defineProperty(globalThis, "navigator", {value: {vibrate() { return true; }}, configurable: true});
+globalThis.getComputedStyle = () => ({});
+globalThis.CSS = {escape: s => s};
+const calls = [];
+const BASE = url => url.startsWith("/api/sessions") ? {bot_online: true, sessions: [], slack: {}}
+  : url.startsWith("/api/stats") ? {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []}
+  : {ok: true, tasks: [], counts: {}, projects: []};
+let answer = BASE, gate = null;
+globalThis.fetch = async (url, opts) => {
+  const b = opts && opts.body ? JSON.parse(opts.body) : null;
+  calls.push({url, body: b});
+  if (gate) await gate;
+  const out = answer(url, b);
+  if (out instanceof Error) throw out;
+  return {status: 200, headers: {get: () => null}, json: async () => out, text: async () => ""};
+};
+// the markup the script reads at load: the session list's skeleton and the panels
+const list = byId("list");
+const listskel = E("DIV"); listskel.id = "listskel"; byIdMap.listskel = listskel; list.appendChild(listskel);
+for (const id of ["taskmodal", "boardmodal", "learnmodal", "tradermodal", "fmodal"]) {
+  const m = byId(id); m.style.display = "none";
+  const box = E("DIV"); box.className = id === "fmodal" ? "fbox" : "box"; m.appendChild(box);
+  if (id !== "fmodal") { const h = E("DIV"); h.className = "hint"; box.appendChild(h); }
+}
+byId("bdetail").style.display = "none";
+byId("tproj").value = "";
+const toastEl = byId("toast");
+toastEl.onHTML = v => {
+  if (!/class="undo"/.test(v)) return;
+  const m = E("SPAN"); m.className = "tmsg"; toastEl.appendChild(m);
+  const u = E("BUTTON"); u.className = "undo"; u.textContent = "Undo"; toastEl.appendChild(u);
+};
+Object.defineProperty(toastEl, "text", {get() {
+  return this.children.length ? this.children.map(c => c.textContent).join(" ") : this.textContent; }});
+
+(0, eval)(SRC + `
+;globalThis.__m = {pendingGone, deferTask, toast, toggleTasks, closeModal, openModal, closeDetail, renderList,
+  loadList, hideThread, taskAction, cycleTheme, theme, applyTheme, unstick, drawKeyed, skel, skelIfEmpty,
+  setHTML, canAnimate, renderColumns, boardCard, taskButtons, swapIn, sendAllDeferred, renderTasks,
+  get lastSessions() { return lastSessions; }};`);
+const M = globalThis.__m, out = {};
+out.skelAtLoad = list.children.includes(listskel);
+const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+
+(async () => {
+  // --- swipe and undo ---
+  const col = byId("bcolx");
+  function card(id, title) {
+    const c = E("DIV"); c.className = "bcard"; c.dataset.id = id; c.dataset.swipe = "1";
+    const t = E("DIV"); t.className = "tt"; t.textContent = title; c.appendChild(t);
+    col.appendChild(c); return {c, t};
+  }
+  const drag = (target, dx, dy, kind) => {
+    fire("pointerdown", {pointerType: kind || "touch", target, pointerId: 7, clientX: 200, clientY: 100});
+    fire("pointermove", {pointerId: 7, clientX: 200 + dx * 0.3, clientY: 100 + dy * 0.3});
+    fire("pointermove", {pointerId: 7, clientX: 200 + dx, clientY: 100 + dy});
+  };
+  const up = () => fire("pointerup", {pointerId: 7});
+  const posts = () => calls.filter(c => c.url === "/api/tasks" && c.body && (c.body.action === "accept" || c.body.action === "dismiss"));
+  const finishAll = () => { for (const a of anims.splice(0)) if (a.playState === "running") a.finish(); };
+
+  const a = card("tsk_a", "Tidy the board");
+  drag(a.t, -200, 4);
+  out.during = {transform: a.c.style.transform, dismissShown: a.c.classList.contains("to-dismiss"),
+                armed: a.c.classList.contains("armed"), swiping: a.c.classList.contains("swiping")};
+  up();
+  out.flewOut = anims.some(x => x.el === a.c && JSON.stringify(x.frames).includes("-110%"));
+  finishAll();
+  out.afterSwipe = {pending: M.pendingGone.has("tsk_a") && M.pendingGone.get("tsk_a").action, posted: posts().length,
+                    toast: toastEl.text, undoable: toastEl.classList.contains("undoable"),
+                    display: toastEl.style.display};
+  // The click a swipe ends with does not also open the card.
+  const clk = fire("click", {target: a.c});
+  out.clickSwallowed = clk.stopped && clk.prevented;
+  // Undo: nothing is sent, the card is drawn again.
+  toastEl.children.find(c => c.className === "undo").onclick();
+  runTimers(now + 6000);
+  out.afterUndo = {pending: M.pendingGone.has("tsk_a"), posted: posts().length};
+
+  // A swipe right past the threshold accepts -- once the undo window is up.
+  const b = card("tsk_b", "Ship it");
+  drag(b.t, 220, -3); up(); finishAll();
+  out.acceptPending = M.pendingGone.get("tsk_b") && M.pendingGone.get("tsk_b").action;
+  runTimers(now + 4000);
+  out.beforeWindow = posts().length;
+  runTimers(now + 2000); await flushAsync();
+  out.afterWindow = {posts: posts().map(c => c.body), pending: M.pendingGone.has("tsk_b")};
+
+  // The server refuses: the card comes back and the toast says why.
+  answer = (url, body) => (body && body.action === "dismiss") ? {ok: false, error: "already running"} : BASE(url);
+  const c = card("tsk_c", "Refused one");
+  drag(c.t, -250, 0); up(); finishAll();
+  runTimers(now + 5100); await flushAsync();
+  out.refused = {toast: toastEl.text, bad: toastEl.classList.contains("bad"), pending: M.pendingGone.has("tsk_c")};
+  answer = BASE;
+
+  // Put away before Undo ran out: it is sent at once.
+  const d = card("tsk_d", "Away");
+  drag(d.t, -250, 0); up(); finishAll();
+  const n0 = posts().length;
+  const lateUndo = toastEl.children.find(c => c.className === "undo");
+  out.swipedCardRemoved = !d.c.parentNode;
+  document.hidden = true; fire("visibilitychange", {}); document.hidden = false;
+  await flushAsync();
+  out.sentOnHide = posts().length - n0 === 1 && posts().slice(-1)[0].body.id === "tsk_d";
+  out.undoToastGoesWithTheSend = toastEl.classList.contains("leaving") || toastEl.style.display === "none";
+  runTimers(now + 300);
+  lateUndo.onclick();                       // the toast's Undo, tapped once it was already sent
+  runTimers(now + 10);
+  out.lateUndo = {toast: toastEl.text, bad: toastEl.classList.contains("bad"), posts: posts().length - n0,
+                  pending: M.pendingGone.has("tsk_d")};
+
+  // Undo tapped while the action is on its way to the server: too late too.
+  const g = card("tsk_g2", "In flight");
+  drag(g.t, -250, 0); up(); finishAll();
+  const flightUndo = toastEl.children.find(c => c.className === "undo");
+  let open_; gate = new Promise(ok => { open_ = ok; });
+  document.hidden = true; fire("visibilitychange", {}); document.hidden = false;
+  await flushAsync();
+  flightUndo.onclick(); runTimers(now + 10);
+  out.inFlightUndo = {toast: toastEl.text, pendingWhileSending: M.pendingGone.has("tsk_g2")};
+  gate = null; open_(); await flushAsync();
+  out.inFlightSent = posts().filter(c => c.body.id === "tsk_g2").length;
+
+  // Not far enough: it springs back, nothing is pending.
+  const e = card("tsk_e", "Almost");
+  drag(e.t, -60, 0); up(); finishAll();
+  out.short = {pending: M.pendingGone.has("tsk_e"), transform: e.c.style.transform,
+               swiping: e.c.classList.contains("swiping")};
+  // Mostly vertical: a scroll, not a swipe.
+  const f = card("tsk_f", "Scroll");
+  drag(f.t, -40, 160); up(); finishAll();
+  out.vertical = {pending: M.pendingGone.has("tsk_f"), swiping: f.c.classList.contains("swiping")};
+  // A mouse is not a finger: the buttons are its way.
+  drag(f.t, -250, 0, "mouse"); up(); finishAll();
+  out.mouse = M.pendingGone.has("tsk_f");
+  // A swipe that starts on a button is that button's.
+  const btn = E("BUTTON"); f.c.appendChild(btn);
+  drag(btn, -250, 0); up(); finishAll();
+  out.onButton = M.pendingGone.has("tsk_f");
+
+  // While Undo runs, the card is left out of every redraw (polls included).
+  M.deferTask("tsk_g", "dismiss", "Dismissed: g");
+  const cols = M.renderColumns({columns: {backlog: [{id: "tsk_g", title: "g", state: "proposed", role: "implementor", created: 0},
+                                                    {id: "tsk_h", title: "h", state: "proposed", role: "implementor", created: 0}]}});
+  out.redraw = {hidesPending: !cols.includes('data-id="tsk_g"'), keepsOther: cols.includes('data-id="tsk_h"'),
+                count: /Backlog<b>1<\/b>/.test(cols), swipeMarked: cols.includes('data-id="tsk_h" data-swipe="1"')};
+  toastEl.children.find(c => c.className === "undo").onclick();
+  out.reviewerNotSwiped = !M.boardCard({id: "r1", title: "r", state: "proposed", role: "reviewer", created: 0}).includes("data-swipe");
+  out.queuedNotSwiped = !M.boardCard({id: "q1", title: "q", state: "queued", role: "implementor", created: 0}).includes("data-swipe");
+
+  // --- sheets ---
+  const tm = byId("taskmodal");
+  M.toggleTasks();
+  out.sheetOpen = {display: tm.style.display, skeleton: byId("tlist").innerHTML.includes("skel skel-row")};
+  await flushAsync();
+  out.skeletonReplaced = !byId("tlist").innerHTML.includes("skel");
+  const before = body.children.length;
+  M.toggleTasks();
+  const ghost = body.children.slice(before).find(g => g.classList.contains("sheet-ghost"));
+  out.sheetClose = {display: tm.style.display, ghost: !!ghost, ghostCloned: !!(ghost && ghost.cloned),
+                    ghostInert: !!(ghost && ghost.getAttribute("inert") !== null && ghost.getAttribute("aria-hidden") === "true")};
+  runTimers(now + 600);
+  out.ghostGone = !body.children.some(g => g.classList.contains("sheet-ghost"));
+  M.openModal("<p>form</p>", null);
+  out.formOpen = byId("fmodal").style.display;
+  const b2 = body.children.length;
+  M.closeModal();
+  out.formClose = {display: byId("fmodal").style.display,
+                   ghost: body.children.slice(b2).some(g => g.classList.contains("sheet-ghost"))};
+  byId("bdetail").style.display = "block";
+  const b3 = body.children.length;
+  M.closeDetail();
+  out.detailClose = {display: byId("bdetail").style.display,
+                     ghost: body.children.slice(b3).some(g => g.classList.contains("ghost-detail"))};
+  runTimers(now + 600);
+
+  // --- toast ---
+  M.toast("Saved");
+  out.toast = {text: toastEl.text, show: toastEl.classList.contains("show"), display: toastEl.style.display};
+  runTimers(now + 2600);
+  out.toastLeaving = REDUCED ? toastEl.style.display : toastEl.classList.contains("leaving");
+  runTimers(now + 300);
+  out.toastGone = toastEl.style.display;
+
+  // --- the session list: skeleton first, then cards that fade in; one hidden goes at once ---
+  out.listSkel = list.children.includes(listskel);
+  const sessions = [1, 2, 3].map(i => ({key: `D1:${i}.0`, title: `Thread ${i}`, kind: "thread", turns: 2,
+                                       updated: 1e9, cost: 0, summary: "", hidden: false}));
+  answer = url => url.startsWith("/api/sessions") ? {bot_online: true, sessions, slack: {}}
+                : url.startsWith("/api/hide") ? {ok: true} : BASE(url);
+  anims.length = 0;
+  await M.loadList(); await flushAsync();
+  out.listDrawn = {skelGone: !list.children.includes(listskel), cards: list.children.length,
+                   fadedIn: anims.filter(x => JSON.stringify(x.frames).includes('"opacity":0')).length};
+  const hidePromise = M.hideThread("D1:2.0", true);
+  out.hiddenAtOnce = list.children.length;   // before the server has answered
+  await hidePromise; await flushAsync();
+  out.hideToast = {text: toastEl.text, undoable: toastEl.classList.contains("undoable"),
+                   sent: calls.filter(c => c.url === "/api/hide").map(c => c.body)};
+  toastEl.children.find(c => c.className === "undo").onclick();
+  await flushAsync();
+  out.hideUndone = calls.filter(c => c.url === "/api/hide").slice(-1)[0].body;
+  // The server cannot be reached: the card comes back and it says so.
+  answer = url => url.startsWith("/api/hide") ? new Error("offline")
+                : url.startsWith("/api/sessions") ? {bot_online: true, sessions: sessions.map(s => Object.assign({}, s, {hidden: false})), slack: {}}
+                : BASE(url);
+  await M.hideThread("D1:3.0", true); await flushAsync();
+  out.hideFailed = {hidden: (M.lastSessions.find(s => s.key === "D1:3.0") || {}).hidden, toast: toastEl.text,
+                    bad: toastEl.classList.contains("bad"), cards: list.children.length};
+  answer = BASE;
+
+  // --- an action marks its row busy until the server answers ---
+  const row = E("DIV"); row.className = "task"; row.dataset.task = "tsk_z"; body.appendChild(row);
+  let busyDuring = null;
+  answer = (url, b) => { if (b && b.action === "retry") busyDuring = row.classList.contains("busy"); return BASE(url); };
+  await M.taskAction("tsk_z", "retry");
+  out.busy = {during: busyDuring, after: row.classList.contains("busy")};
+  answer = BASE;
+
+  // --- the task panel's rows are keyed, so a redraw animates them too ---
+  const tl = byId("tlist");
+  byId("taskmodal").style.display = "flex";
+  let rowsPlan = [];
+  tl.onHTML = () => { for (const [k, top] of rowsPlan) { const x = E("DIV"); x.className = "task"; x.dataset.task = k;
+                      x.rect = {top, left: 0, width: 300, height: 60}; tl.appendChild(x); } };
+  const T = (id, state) => ({id, title: id, state, source: "ui", created: 0, attempts: 1, role: "implementor"});
+  answer = (url, b) => b && b.action === "attention" ? {ok: true, counts: {}, tasks: [T("t1", "proposed"), T("t2", "failed")]} : BASE(url);
+  rowsPlan = [["t1", 0], ["t2", 60]];
+  await M.renderTasks(); await flushAsync();
+  anims.length = 0;
+  answer = (url, b) => b && b.action === "attention" ? {ok: true, counts: {}, tasks: [T("t2", "failed")]} : BASE(url);
+  rowsPlan = [["t2", 0]];
+  await M.renderTasks(); await flushAsync();
+  out.taskRowsFlip = anims.filter(x => x.el.dataset && x.el.dataset.task === "t2").map(x => JSON.stringify(x.frames[0]));
+  byId("taskmodal").style.display = "none"; tl.onHTML = null; answer = BASE;
+
+  // --- flip: a keyed redraw animates only what moved, only when it changed ---
+  const box = byId("flipbox");
+  let plan = [];
+  box.onHTML = () => { for (const [k, top] of plan) { const x = E("DIV"); x.className = "bcard"; x.dataset.id = k;
+                       x.rect = {top, left: 0, width: 300, height: 40}; box.appendChild(x); } };
+  plan = [["a", 0], ["b", 50], ["c", 100]];
+  M.drawKeyed(box, "<one>", ".bcard[data-id]", "data-id");
+  anims.length = 0;
+  plan = [["b", 0], ["a", 50], ["c", 100], ["d", 150]];
+  M.drawKeyed(box, "<two>", ".bcard[data-id]", "data-id");
+  const moved = k => anims.filter(x => x.el.dataset.id === k).map(x => JSON.stringify(x.frames[0]));
+  out.flip = {a: moved("a"), b: moved("b"), c: moved("c"), d: moved("d")};
+  anims.length = 0;
+  out.flipSame = M.drawKeyed(box, "<two>", ".bcard[data-id]", "data-id") === false && anims.length === 0;
+
+  // --- unstick: an animation held at its first frame is finished; a spinner is not ---
+  const held = E("DIV");
+  const stuck = {playState: "running", currentTime: 0, effect: {getComputedTiming: () => ({iterations: 1})},
+                 finish() { this.playState = "finished"; }};
+  const spinner = {playState: "running", currentTime: 0, effect: {getComputedTiming: () => ({iterations: Infinity})},
+                   finish() { this.playState = "finished"; }};
+  const moving_ = {playState: "running", currentTime: 90, effect: {getComputedTiming: () => ({iterations: 1})},
+                   finish() { this.playState = "finished"; }};
+  held.getAnimations = () => [stuck, spinner, moving_];
+  M.unstick(held, 500);
+  runTimers(now + 600);
+  out.unstick = [stuck.playState, spinner.playState, moving_.playState];
+
+  // --- theme ---
+  out.theme0 = M.theme();
+  const seen = [];
+  for (let i = 0; i < 3; i++) { M.cycleTheme(); seen.push([html.dataset.theme, store["sw-theme"], metas.theme.getAttribute("content")]); }
+  out.themes = seen;
+  out.themeLabel = byId("themelbl").textContent;
+  M.applyTheme("nonsense");
+  out.themeBad = html.dataset.theme;
+  M.applyTheme("light", false);
+  out.themeLink = [html.dataset.theme, store["sw-theme"]];
+  M.applyTheme("dark", false);
+
+  // --- pull to refresh, on the phone's session list ---
+  const ptr = byId("ptr");
+  const pull = (dy, scrollTop) => {
+    list.scrollTop = scrollTop || 0;
+    fire("touchstart", {target: list, touches: [{clientY: 100}]});
+    fire("touchmove", {touches: [{clientY: 100 + dy}]});
+    fire("touchend", {});
+  };
+  const loads = () => calls.filter(c => c.url.startsWith("/api/sessions")).length;
+  let n = loads(); pull(220); await flushAsync();
+  out.pullFar = loads() - n;
+  runTimers(now + 400);
+  out.ringAfterRefresh = [ptr.style.opacity, ptr.style.transform];
+  n = loads();
+  list.scrollTop = 0;
+  fire("touchstart", {target: list, touches: [{clientY: 100}]});
+  fire("touchmove", {touches: [{clientY: 104}]});
+  out.ringBarelyPulled = ptr.style.opacity;
+  fire("touchmove", {touches: [{clientY: 160}]});
+  fire("touchend", {});
+  await flushAsync();
+  out.pullShort = loads() - n;
+  out.ringAfterShort = ptr.style.opacity;
+  runTimers(now + 400);
+  out.ringRested = [ptr.style.opacity, ptr.style.transform];
+  // A scroller inside the list scrolled down: its drag, not a pull.
+  const inner = E("DIV"); inner.scrollTop = 30; list.appendChild(inner);
+  const leaf = E("DIV"); inner.appendChild(leaf);
+  n = loads(); list.scrollTop = 0;
+  fire("touchstart", {target: leaf, touches: [{clientY: 100}]});
+  fire("touchmove", {touches: [{clientY: 330}]}); fire("touchend", {});
+  await flushAsync();
+  out.pullNested = loads() - n;
+  n = loads(); pull(220, 40); await flushAsync();
+  out.pullScrolled = loads() - n;
+  PHONE = false; n = loads(); pull(220); await flushAsync(); PHONE = true;
+  out.pullLaptop = loads() - n;
+
+  // --- skeleton helpers ---
+  const empty = E("DIV"), full = E("DIV"); full._inner = "<p>x</p>";
+  M.skelIfEmpty(empty, "card", 3); M.skelIfEmpty(full, "card", 3);
+  out.skel = {empty: (empty.innerHTML.match(/skel skel-card/g) || []).length, full: full.innerHTML,
+              hidden: empty.innerHTML.includes('aria-hidden="true"')};
+  out.canAnimate = M.canAnimate(E("DIV"));
+  out.animTotal = animTotal;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def _motion_run(js, mode=""):
+    node = shutil.which("node")
+    if not node:
+        return None
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(MOTION_HARNESS)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), mode],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        return {"error": p.stderr.strip()[-900:]}
+    return json.loads(p.stdout)
+
+
+def test_dashboard_design_system():
+    import re
+    import visualizer as V
+    print("\nthe dashboard has one design system: tokens for every measure, colour and motion")
+    css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
+    root = css[:css.index(':root[data-theme="light"]')]
+    light = css[css.index(':root[data-theme="light"]'):css.index("@media (prefers-color-scheme: light)")]
+    auto = css[css.index("@media (prefers-color-scheme: light)"):css.index("* { box-sizing")]
+    rules = css[css.index("* { box-sizing"):]
+    defined = set(re.findall(r"(--[\w-]+):", root))
+    want = ({f"--sp-{k}" for k in ("05", "1", "15", "2", "25", "3", "35", "4", "5", "6", "8")}
+            | {f"--fs-{k}" for k in ("2xs", "xs", "sm", "md", "base", "lg", "xl", "2xl")}
+            | {f"--r-{k}" for k in ("xs", "sm", "md", "lg", "xl", "pill")}
+            | {"--el-1", "--el-2", "--el-3", "--accent", "--on-accent", "--accent-soft", "--accent-line",
+               "--dur-1", "--dur-2", "--dur-3", "--ease-std", "--ease-out", "--ease-in"}
+            | {f"--{h}{v}" for h in ("ok", "warn", "bad", "info") for v in ("", "-soft", "-line")})
+    check("the root declares the spacing, type, radius, elevation, accent, semantic and motion tokens",
+          want <= defined, sorted(want - defined))
+    durs = [int(x) for x in re.findall(r"--dur-\d: (\d+)ms", root)]
+    check("motion runs 120-240ms", durs and all(120 <= d <= 240 for d in durs), durs)
+    light_vars = set(re.findall(r"(--[\w-]+):", light))
+    auto_vars = set(re.findall(r"(--[\w-]+):", auto))
+    check("light re-mixes the same tokens dark declares (and Auto is the same list as Light)",
+          light_vars and light_vars <= defined and light_vars == auto_vars, sorted(light_vars ^ auto_vars))
+    check("light is chosen (data-theme) or follows the system on Auto; dark stays the default",
+          "color-scheme: dark;" in root and ':root[data-theme="auto"]' in auto
+          and 'localStorage.getItem("sw-theme") || "dark"' in V.PAGE)
+    # Everything after the token blocks is written in tokens: no colour, font
+    # size or radius written out (the SVG chart's own label size excepted).
+    values = re.findall(r"[\w-]+\s*:\s*([^;{}]+)", re.sub(r"[^{}]+\{", "{", rules))
+    hexes = [h for v in values for h in re.findall(r"#[0-9A-Fa-f]{3,8}\b", v)]
+    check("no colour is written out below the tokens", not hexes, hexes[:10])
+    sizes = re.findall(r"font-size:\s*[\d.]+px", rules)
+    check("no font size is written out below the tokens", not sizes, sizes[:10])
+    fonts = [m for m in re.findall(r"([^{}]+)\{[^}]*font:\s*[\d.]+px", rules)
+             if ".tr-chart" not in m and ".tr-hgrid" not in m]
+    check("...the trader chart's SVG labels the only exception", not fonts, fonts[:5])
+    radii = re.findall(r"border-radius:[^;]*\b\d+px", rules)
+    check("no radius is written out below the tokens", not radii, radii[:10])
+    weights = re.findall(r"font-weight:\s*\d+", rules)
+    check("no font weight is written out below the tokens", not weights, weights[:10])
+    inline = [m for m in re.findall(r'style="([^"$]*)"', V.PAGE) if re.search(r"\d+px|#[0-9A-Fa-f]{3}", m)]
+    check("no markup carries a one-off inline size or colour", not inline, inline[:5])
+    check("the stats chart's bars are not the segmented control (one .seg each)",
+          'class="bar"' in V.PAGE and "\n  .bar {" in css and 'class="seg" style=' not in V.PAGE)
+    # The theme is set on <html> before the stylesheet, by a script the page's
+    # own extraction (the first bare <script>) never mistakes for the page's.
+    head = V.PAGE[:V.PAGE.index("<style>")]
+    check("the theme is applied before the first paint, from <head>", '<script id="themeinit">' in head)
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    check("...and the page's script is still the first bare <script>", "function toast(" in js and "cycleTheme" in js)
+    check("⋯ offers Theme", 'id="themebtn" onclick="cycleTheme()"' in V.PAGE)
+    check("a light theme launches the home-screen app with the dark-on-light status bar",
+          'setAttribute("content", "default")' in head and head.index("apple-mobile-web-app-status-bar-style")
+          < head.index('<script id="themeinit">'))
+    def contrast(a, b):
+        def lum(h):
+            c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+            return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+        x, y = sorted((lum(a), lum(b)))
+        return (y + 0.05) / (x + 0.05)
+    tok = lambda block, name: re.search(rf"{name}: (#[0-9A-Fa-f]{{6}})\b", block).group(1)
+    for theme, block in (("dark", root), ("light", light)):
+        bg = tok(block, "--bg")
+        low = {n: round(contrast(tok(block, n), bg), 2) for n in ("--ink", "--muted", "--accent", "--ok", "--warn", "--bad", "--info")}
+        check(f"{theme}: text and every semantic colour read at 4.5:1 or better on the page",
+              all(v >= 4.5 for v in low.values()), low)
+    phone = css[css.index("@media (max-width: 700px)"):]
+    check("on a phone the Trader's tabs are one sideways row of 44pt targets",
+          re.search(r"\.tr-tabs \{ flex-wrap: nowrap; overflow-x: auto;", phone) is not None
+          and re.search(r"\.tr-tab \{[^}]*min-height: var\(--tap\)", phone) is not None)
+    check("a panel's ✕ is a tap target at every width", re.search(r"button\.xclose \{ min-width: var\(--tap\); min-height: var\(--tap\);", css) is not None)
+    check("a panel's title row sticks to its top", re.search(r"\.box > h2 \{ position: sticky; top: 0;", css) is not None)
+
+
+def test_dashboard_motion():
+    import re
+    import visualizer as V
+    print("\nthe dashboard moves by transform and opacity: sheets, lists, skeletons -- and not at all under reduced motion")
+    css = re.search(r"<style>(.*?)</style>", V.PAGE, re.S).group(1)
+    frames = dict(re.findall(r"@keyframes ([\w-]+) \{(.*?\})\s*\}", css, re.S))
+    props = {k: set(re.findall(r"([a-z-]+)\s*:", v)) for k, v in frames.items()}
+    want = {"sheet-in", "sheet-out", "sheet-up", "sheet-down", "from-right", "to-right", "view-in", "item-in",
+            "shimmer", "toast-in", "toast-out", "fade-in", "fade-out", "pop"}
+    check("the sheets', lists', toasts' and skeletons' keyframes exist", want <= set(frames), sorted(want - set(frames)))
+    check("every keyframe moves only transform and opacity",
+          all(v <= {"transform", "opacity"} for v in props.values()), {k: v for k, v in props.items() if not v <= {"transform", "opacity"}})
+    trans = re.findall(r"transition:\s*([^;]+);", css)
+    bad = [t for t in trans for part in t.split(",")
+           if part.strip().split()[0] not in ("transform", "opacity", "color", "background-color", "border-color",
+                                               "box-shadow", "filter", "grid-template-rows", "visibility", "none")]
+    check("transitions are transform/opacity (colours and the chat's fold aside), never layout", not bad, bad[:5])
+    rm = css[css.rfind("@media (prefers-reduced-motion: reduce)"):]
+    check("reduced motion zeroes every duration token and drops the closing copies",
+          "--dur-1: 0ms; --dur-2: 0ms; --dur-3: 0ms;" in rm and ".sheet-ghost, #fxlayer > * { display: none !important; }" in rm
+          and "animation: none !important" in rm)
+    for sel in ("#taskmodal, #boardmodal, #learnmodal, #tradermodal, #fmodal, #alertsheet.open {\n    animation: fade-in",
+                "#taskmodal .box, #boardmodal .box, #learnmodal .box, #tradermodal .box, #fmodal .fbox {\n    animation: sheet-in",
+                "#bdetail { animation: from-right"):
+        check(f"opening animates: {sel.split('{')[0].strip()[:40]}…", sel in css)
+    phone = css[css.index("@media (max-width: 700px)"):]
+    check("on a phone a panel is a sheet that slides up, and back down",
+          "animation-name: sheet-up;" in phone and "animation-name: sheet-down !important;" in phone)
+    check("on a phone the list and a thread slide in from their sides",
+          "body.reading main { animation: view-in" in phone and "body.back .listcol {" in phone)
+    check("the session list has a skeleton in the markup, until its first draw",
+          '<nav id="list"><div id="listskel" class="skels" aria-hidden="true"><div class="skel skel-card">' in V.PAGE)
+    check("so does the Trader view", '<div id="trbody"><div class="hint">Reading trader\'s status…</div><div class="skels"' in V.PAGE)
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    check("a thread opening draws the shape of a chat until its first read",
+          'm0.innerHTML = skel("chat", 2);' in js
+          and js.index('m0.innerHTML = skel("chat", 2);') < js.index('if (from === 0 || data.reset || want.error) {\n        msgs.innerHTML = "";'))
+    check("a row's disclosure loads behind a skeleton", '<div class="hint">loading…</div>${skel("lines")}' in js)
+    o = _motion_run(js)
+    if o is None:
+        print("  … node not installed — the motion and touch code checked by text only")
+        return
+    if "error" in o:
+        check("the motion harness runs the page's script", False, o["error"])
+        return
+    check("a panel opens at once and shows a skeleton until its list arrives",
+          o["sheetOpen"] == {"display": "flex", "skeleton": True} and o["skeletonReplaced"], o["sheetOpen"])
+    check("closing, it is gone at once, and an inert copy of it slides away and is removed",
+          o["sheetClose"] == {"display": "none", "ghost": True, "ghostCloned": True, "ghostInert": True}
+          and o["ghostGone"], o["sheetClose"])
+    check("a form sheet and the card's detail panel close the same way",
+          o["formOpen"] == "flex" and o["formClose"] == {"display": "none", "ghost": True}
+          and o["detailClose"] == {"display": "none", "ghost": True}, (o["formClose"], o["detailClose"]))
+    check("a toast rises in, then leaves", o["toast"] == {"text": "Saved", "show": True, "display": "block"}
+          and o["toastLeaving"] is True and o["toastGone"] == "none", (o["toast"], o["toastLeaving"]))
+    check("the list's skeleton is there at load and gone at its first draw; the cards fade in",
+          o["skelAtLoad"] and o["listDrawn"] == {"skelGone": True, "cards": 3, "fadedIn": 3}, o["listDrawn"])
+    check("a keyed redraw glides what moved, raises what is new, leaves what stayed",
+          o["flip"]["a"] == ['{"transform":"translate(0px, -50px)"}'] and o["flip"]["b"] == ['{"transform":"translate(0px, 50px)"}']
+          and o["flip"]["c"] == [] and o["flip"]["d"] == ['{"opacity":0,"transform":"scale(.97)"}'], o["flip"])
+    check("a redraw that changed nothing measures and animates nothing", o["flipSame"])
+    check("the task panel's rows are keyed: a row left behind by a dismissal glides up",
+          o["taskRowsFlip"] == ['{"transform":"translate(0px, 60px)"}'], o["taskRowsFlip"])
+    check("an animation held at its first frame is finished (a spinner, or one under way, is left)",
+          o["unstick"] == ["finished", "running", "running"], o["unstick"])
+    check("skeletons fill only what is empty, hidden from assistive tech",
+          o["skel"] == {"empty": 3, "full": "<p>x</p>", "hidden": True}, o["skel"])
+    r = _motion_run(js, "reduced")
+    if "error" in r:
+        check("the motion harness runs under reduced motion", False, r["error"])
+        return
+    check("reduced motion: nothing is animated at all -- no sheet copy, no fade, no glide, no flight",
+          r["animTotal"] == 0 and r["canAnimate"] is False and not r["sheetClose"]["ghost"]
+          and not r["formClose"]["ghost"] and not r["detailClose"]["ghost"] and r["listDrawn"]["fadedIn"] == 0
+          and r["flip"] == {"a": [], "b": [], "c": [], "d": []} and r["flewOut"] is False,
+          {k: r[k] for k in ("animTotal", "canAnimate", "sheetClose", "flip", "flewOut")})
+    check("reduced motion: a toast just appears and just goes",
+          r["toast"]["show"] is False and r["toastLeaving"] == "none", r["toast"])
+    check("reduced motion: every state is still reached -- a swipe still dismisses, sheets still close, skeletons still draw",
+          r["afterSwipe"]["pending"] == "dismiss" and r["sheetClose"]["display"] == "none"
+          and r["sheetOpen"]["skeleton"] and r["listDrawn"]["skelGone"], r["afterSwipe"])
+
+
+def test_dashboard_swipe_undo_and_optimism():
+    import re
+    import visualizer as V
+    print("\nthe dashboard: swipe a proposal, undo it; hide a thread at once; refusals put things back")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    check("a proposal's card and row are swipeable; nothing else is",
+          '${t.state === "proposed" && t.role !== "reviewer" ? \' data-swipe="1"\' : ""}' in js
+          and '${t.state === "proposed" ? \' data-swipe="1"\' : ""}' in js)
+    check("a swiped card is drawn by nobody while its Undo runs", "r.tasks = r.tasks.filter(notGone);" in js
+          and "cols[k] = (v || []).filter(notGone);" in js)
+    o = _motion_run(js)
+    if o is None:
+        print("  … node not installed — swipe and undo checked by text only")
+        return
+    if "error" in o:
+        check("the swipe harness runs the page's script", False, o["error"])
+        return
+    check("a finger dragging a card left moves it and shows Dismiss underneath, armed past a third",
+          o["during"] == {"transform": "translateX(-200px)", "dismissShown": True, "armed": True, "swiping": True}, o["during"])
+    check("let go past the threshold, it flies out", o["flewOut"])
+    check("...and nothing is sent yet: an Undo toast says what happened",
+          o["afterSwipe"] == {"pending": "dismiss", "posted": 0, "toast": "Dismissed: Tidy the board Undo",
+                              "undoable": True, "display": "flex"}, o["afterSwipe"])
+    check("the tap a swipe ends with does not also open the card", o["clickSwallowed"])
+    check("Undo: nothing was ever sent, and it is drawn again", o["afterUndo"] == {"pending": False, "posted": 0}, o["afterUndo"])
+    check("a swipe right accepts -- sent once the undo window is up, not before",
+          o["acceptPending"] == "accept" and o["beforeWindow"] == 0
+          and o["afterWindow"] == {"posts": [{"action": "accept", "id": "tsk_b"}], "pending": False}, o["afterWindow"])
+    check("refused by the server, the card comes back and the toast says why",
+          o["refused"] == {"toast": "Not dismissed: already running — it is back", "bad": True, "pending": False}, o["refused"])
+    check("put away before Undo ran out (the app hidden), the action is sent at once", o["sentOnHide"])
+    check("an Undo tapped while the action is on its way says it is too late, and the action is sent once",
+          o["inFlightUndo"] == {"toast": "Already sent — that one can't be undone here", "pendingWhileSending": True}
+          and o["inFlightSent"] == 1, (o["inFlightUndo"], o["inFlightSent"]))
+    check("a swiped card is out of the page before the redraw, so nothing fades it a second time",
+          o["swipedCardRemoved"])
+    check("once sent, its Undo toast goes; an Undo tapped after that says it was too late, and sends nothing more",
+          o["undoToastGoesWithTheSend"] and o["lateUndo"] == {"toast": "Already sent — that one can't be undone here",
+                                                               "bad": True, "posts": 1, "pending": False}, o["lateUndo"])
+    check("not far enough, it springs back and nothing is pending",
+          o["short"] == {"pending": False, "transform": "", "swiping": False}, o["short"])
+    check("a mostly vertical drag is a scroll, not a swipe", o["vertical"] == {"pending": False, "swiping": False})
+    check("a mouse is not a finger (the buttons are its way); a drag from a button is the button's",
+          o["mouse"] is False and o["onButton"] is False)
+    check("while Undo runs, a poll's redraw leaves the card out and counts without it",
+          o["redraw"] == {"hidesPending": True, "keepsOther": True, "count": True, "swipeMarked": True}, o["redraw"])
+    check("a reviewer's proposal and queued work are not swipeable", o["reviewerNotSwiped"] and o["queuedNotSwiped"])
+    check("hiding a thread takes its card away before the server answers", o["hiddenAtOnce"] == 2, o["hiddenAtOnce"])
+    check("...then offers Undo, which shows it again",
+          o["hideToast"] == {"text": "Hidden: Thread 2 Undo", "undoable": True, "sent": [{"action": "hide", "key": "D1:2.0"}]}
+          and o["hideUndone"] == {"action": "unhide", "key": "D1:2.0"}, (o["hideToast"], o["hideUndone"]))
+    check("a hide that cannot reach the server is rolled back and said",
+          o["hideFailed"] == {"hidden": False, "toast": "Could not hide that thread — nothing changed", "bad": True, "cards": 3},
+          o["hideFailed"])
+    check("a button's row dims at the tap and comes back once the server answers",
+          o["busy"] == {"during": True, "after": False}, o["busy"])
+    check("pulled down past its top on a phone, the list fetches again -- not short of the mark, not scrolled, not on a laptop",
+          o["pullFar"] == 1 and o["pullShort"] == 0 and o["pullScrolled"] == 0 and o["pullLaptop"] == 0,
+          {k: o[k] for k in ("pullFar", "pullShort", "pullScrolled", "pullLaptop")})
+    check("the ring shows as far as the finger has pulled, and is put back out of sight after every touch",
+          o["ringBarelyPulled"] == "0" and o["ringAfterShort"] == "0" and o["ringRested"] == ["", ""]
+          and o["ringAfterRefresh"] == ["", ""], {k: o[k] for k in ("ringBarelyPulled", "ringAfterShort", "ringRested", "ringAfterRefresh")})
+    check("dragging a scroller inside the list (a long goal) is not a pull", o["pullNested"] == 0)
+    check("⋯ › Theme cycles dark, light, Auto; it is kept on the device and the status bar follows",
+          o["theme0"] == "dark" and o["themes"] == [["light", "light", "#F8F3F7"], ["auto", "auto", "#2C0E2E"],
+                                                     ["dark", "dark", "#2C0E2E"]]
+          and o["themeLabel"] == " Dark" and o["themeBad"] == "dark", o["themes"])
+    check("a ?theme= link draws that theme for the view and leaves the device's choice alone",
+          o["themeLink"] == ["light", "dark"], o["themeLink"])
+
+
+def test_dashshots_perf_probe():
+    import importlib.machinery
+    import importlib.util
+    import re
+    import shutil
+    import subprocess as _sp
+    import tempfile
+    print("\nbin/dashshots --perf: the performance probe goes into a copy's page, and only answers ?perf=")
+    root = Path(__file__).resolve().parent.parent
+    loader = importlib.machinery.SourceFileLoader("dashshots_p", str(root / "bin" / "dashshots"))
+    spec = importlib.util.spec_from_loader("dashshots_p", loader)
+    D = importlib.util.module_from_spec(spec)
+    loader.exec_module(D)
+    with tempfile.TemporaryDirectory() as td:
+        viz = Path(td) / "visualizer.py"
+        shutil.copy2(root / "visualizer.py", viz)
+        D.inject_probe(viz, 4322, D.PERF_JS)
+        page = viz.read_text()
+    probe, own = page.find('const BOT = "http://127.0.0.1:4322"'), page.find("function setHTML(")
+    check("the perf probe is in the copy's page, before the page's own script",
+          0 < probe < own and "perfprobe" in str(D.PERF_JS) and "__BOT__" not in page[probe - 200:own])
+    src = (root / "bin" / "perfprobe.js").read_text()
+    check("it answers only to ?perf=", re.search(r"if \(!/\[\?&\]perf=/\.test\(location\.search\)\) return;", src) is not None)
+    check("it reads paint timing and counts frames on the list, the task panel, a board and a thread",
+          all(x in src for x in ('getEntriesByType("paint")', "scroll_list", "scroll_tasks", "scroll_board",
+                                 "scroll_thread", "sheet_open")))
+    check("it changes nothing: no POST but its own report to the stand-in bot",
+          src.count("method: \"POST\"") == 1 and "taskCall" not in src and "taskAction" not in src)
+    d = (root / "bin" / "dashshots").read_text()
+    check("dashshots --perf runs it on the phone widths, both copies, alternating runs",
+          'ap.add_argument("--perf"' in d and "def perf_phone(" in d and "perf-{width}.json" in d)
+    node = shutil.which("node")
+    if node:
+        r = _sp.run([node, "--check", str(root / "bin" / "perfprobe.js")], capture_output=True, text=True)
+        check("bin/perfprobe.js parses", r.returncode == 0, r.stderr[-400:])
+
 
 if __name__ == "__main__":
     tests = discover()

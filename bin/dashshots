@@ -3,6 +3,7 @@
 
     bin/dashshots [--out DIR] [--views sessions,board,...] [--widths 375,430,1280]
                   [--source DIR] [--before DIR] [--wait 5] [--list]
+    bin/dashshots --perf [--before DIR] [--perf-runs 3] [--widths 375,430]
 
 Mobile Safari in an iOS Simulator for the phone widths (375: iPhone SE (3rd
 generation), 430: iPhone 16 Plus), and WebKit itself (a WKWebView snapshot,
@@ -29,6 +30,13 @@ scripts/trader_status.py "runs" by printing that fixture, so the dashboard's
 own subprocess, cache and render path are what is photographed. With
 --trader-live the copy points at the real trader checkout instead (its status
 script only reads).
+
+--perf measures instead of photographing: bin/perfprobe.js, injected into
+the copy, reads the browser's paint timing and counts frames while the list,
+the task panel, a board and the longest thread are scrolled along a fixed
+path, and while a panel opens; with --before both copies run, alternating,
+--perf-runs times each, into DIR/perf-<width>.json. Phone widths only: the
+laptop's WKWebView is drawn offscreen, where no animation clock runs.
 
 The simulators are this script's own ("Silkworm Shots 375" / "... 430",
 made on first use) and are shut down at the end. It refuses to touch any
@@ -250,16 +258,18 @@ def trader_projects(home: Path, tmp: Path, live: bool) -> None:
 
 
 PROBE_JS = REPO / "bin" / "scrollprobe.js"
+PERF_JS = REPO / "bin" / "perfprobe.js"
 
 
-def inject_probe(viz: Path, bot_port: int) -> None:
-    """The copy's page runs bin/scrollprobe.js ahead of its own script (it
-    does nothing unless the address carries ?probe=)."""
+def inject_probe(viz: Path, bot_port: int, probe_js: Path = PROBE_JS) -> None:
+    """The copy's page runs a probe -- bin/scrollprobe.js, or with --perf
+    bin/perfprobe.js -- ahead of its own script (each does nothing unless the
+    address asks for it: ?probe= or ?perf=)."""
     src = viz.read_text()
     marker = "\n<script>\n"
     at = src.index("PAGE = r\"\"\"")
     i = src.index(marker, at)
-    js = PROBE_JS.read_text().replace("__BOT__", f"http://127.0.0.1:{bot_port}")
+    js = probe_js.read_text().replace("__BOT__", f"http://127.0.0.1:{bot_port}")
     assert '"""' not in js
     viz.write_text(src[:i] + "\n<script>" + js + "</script>" + src[i:])
 
@@ -270,7 +280,7 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
     for f in source.glob("*.py"):
         shutil.copy2(f, tmp / f.name)
     if probe:
-        inject_probe(tmp / "visualizer.py", bot_port)
+        inject_probe(tmp / "visualizer.py", bot_port, probe if isinstance(probe, Path) else PROBE_JS)
     if (source / "assets").is_dir():
         shutil.copytree(source / "assets", tmp / "assets")
     for name in ("sessions.json",):
@@ -383,6 +393,10 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("trader-activity", "/?view=trader&tab=activity"),
         ("trader-plumbing", "/?view=trader&tab=plumbing"),
         ("trader-shadow", "/?view=trader&tab=shadow"),
+        # The light theme (⋯ › Theme), a list, a thread and a board in it.
+        ("light-sessions", "/?theme=light"),
+        ("light-thread", f"/?thread={quote(ex['thread'])}&theme=light"),
+        ("light-board", f"/?view=project&slug={p}&theme=light"),
     ]
 
 
@@ -503,6 +517,53 @@ def probe_phone(width: int, targets, out: Path, runs: str, timeout: float = 600)
     return results
 
 
+def perf_phone(width: int, targets, out: Path, runs: int = 3, timeout: float = 180):
+    """Each target's page runs the performance probe in Mobile Safari `runs`
+    times, alternating targets so neither always goes first; what it measured
+    is written to out/perf-<width>.json, every run kept."""
+    udid = device_for(width)
+    print(f"  {DEVICES[width][0]} ({udid})")
+    state = json.loads(simctl("list", "devices", "-j"))
+    booted_before = any(d["udid"] == udid and d["state"] == "Booted"
+                        for devs in state["devices"].values() for d in devs)
+    results = {suffix or "page": [] for suffix, _ in targets}
+    try:
+        if not booted_before:
+            simctl("boot", udid)
+        simctl("bootstatus", udid, "-b")
+        simctl("ui", udid, "appearance", "dark", check=False)
+        for _, base in targets:                 # Safari's first open is slow on a fresh boot
+            simctl("openurl", udid, base + "/")
+            time.sleep(8)
+        for n in range(runs):
+            for suffix, base in targets:
+                PROBE.reset()
+                simctl("openurl", udid, f"{base}/?perf=1&n={n}")
+                t0, got = time.time(), None
+                while time.time() - t0 < timeout:
+                    with PROBE.lock:
+                        log = list(PROBE.log)
+                    if any(e.get("phase") in ("done", "error") for e in log):
+                        got = next((e for e in log if e.get("phase") == "perf"), None)
+                        err = next((e for e in log if e.get("phase") == "error"), None)
+                        if err:
+                            print("    probe error:", err.get("error"))
+                        break
+                    time.sleep(0.25)
+                results[suffix or "page"].append(got)
+                if got:
+                    print(f"    {suffix or 'page'} run {n + 1}: list drawn {got.get('list_drawn_ms')}ms, "
+                          f"fcp {got.get('paint', {}).get('first-contentful-paint')}ms, "
+                          + ", ".join(f"{k} {v.get('fps')}fps/p95 {v.get('p95_ms')}ms"
+                                      for k, v in got.items() if isinstance(v, dict) and "fps" in v))
+                else:
+                    print(f"    {suffix or 'page'} run {n + 1}: no answer")
+        (out / f"perf-{width}.json").write_text(json.dumps(results, indent=1))
+    finally:
+        simctl("shutdown", udid, check=False)
+    return results
+
+
 def snapper(tmp: Path) -> Path:
     cache = Path.home() / ".cache" / "silkworm-dashshots"
     cache.mkdir(parents=True, exist_ok=True)
@@ -542,6 +603,10 @@ def main():
                     help="run the chat's scroll probe (bin/scrollprobe.js) on the phone widths "
                          "instead of shooting views")
     ap.add_argument("--runs", default="", help="with --scroll-probe: only these triggers")
+    ap.add_argument("--perf", action="store_true",
+                    help="measure first paint and scroll/sheet frame rates (bin/perfprobe.js) on the "
+                         "phone widths instead of shooting views; with --before, both, alternating")
+    ap.add_argument("--perf-runs", type=int, default=3, help="with --perf: runs per target")
     ap.add_argument("--trader-live", action="store_true",
                     help="draw the trader view from the real trader checkout, not the fixture")
     a = ap.parse_args()
@@ -560,7 +625,7 @@ def main():
         threading.Thread(target=bot.serve_forever, daemon=True).start()
         port = free_port()
         proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port, a.trader_live,
-                               a.scroll_probe)
+                               PERF_JS if a.perf else a.scroll_probe)
         base = f"http://127.0.0.1:{port}"
         procs, targets = [proc], [("", base)]
         try:
@@ -569,8 +634,13 @@ def main():
                 btmp.mkdir()
                 bport = free_port()
                 procs.append(start_dashboard(Path(a.before).resolve(), home, btmp, bot_port, bport,
-                                             a.trader_live, a.scroll_probe))
+                                             a.trader_live, PERF_JS if a.perf else a.scroll_probe))
                 targets = [("-before", f"http://127.0.0.1:{bport}"), ("-after", base)]
+            if a.perf:
+                print(f"perf probe: dashboard copy at {base} (stand-in bot :{bot_port}) -> {out}")
+                for w in [int(x) for x in a.widths.split(",") if x and int(x) in DEVICES]:
+                    perf_phone(w, targets, out, a.perf_runs)
+                return
             if a.scroll_probe:
                 print(f"scroll probe: dashboard copy at {base} (stand-in bot :{bot_port}) -> {out}")
                 for w in [int(x) for x in a.widths.split(",") if x and int(x) in DEVICES]:
