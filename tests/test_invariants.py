@@ -45,30 +45,35 @@ def tmp_store():
     return SessionStore(Path(tempfile.mkdtemp()) / "s.json")
 
 
-def bot_functions(*names, **globals_):
-    """Lift named functions out of bot.py and run them against fakes.
+_BOT_TREE = None
 
-    Importing bot.py needs a Slack token and would open the live tasks.json, so
-    most checks here read it as text. Compiling just the functions under test
-    into a namespace we control buys the real thing instead: the code actually
-    runs, against a scratch store, and a mistake in it fails rather than merely
-    reading differently.
-    """
-    tree = ast.parse((BASE / "bot.py").read_text())
-    wanted = [n for n in tree.body
-              if isinstance(n, ast.FunctionDef) and n.name in names]
-    missing = set(names) - {n.name for n in wanted}
-    assert not missing, f"bot.py has no {', '.join(sorted(missing))}"
-    wanted += _shared_helpers(tree, wanted, set(names) | set(globals_))
-    ns = {"log": logging.getLogger("test"), "time": time, **globals_}
-    _helper_modules(wanted, ns)
-    exec(compile(ast.Module(body=wanted, type_ignores=[]), "bot.py", "exec"), ns)
-    return ns
+
+def _bot_tree():
+    """bot.py's syntax tree, parsed once for every lift in the run."""
+    global _BOT_TREE
+    if _BOT_TREE is None:
+        _BOT_TREE = ast.parse((BASE / "bot.py").read_text())
+    return _BOT_TREE
+
+
+def _binds(node) -> set:
+    """The module-level names a top-level bot.py statement binds."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, ast.Assign):
+        return {n.id for t in node.targets for n in ast.walk(t)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    if isinstance(node, ast.AnnAssign):     # `_landing_now: set[str] = set()`
+        return {node.target.id} if isinstance(node.target, ast.Name) else set()
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return {(a.asname or a.name).split(".")[0] for a in node.names}
+    return set()
 
 
 #: Helpers other lifted functions call as part of their own behaviour, so a
 #: lifted caller gets the real one rather than a stub or a NameError. Sending
 #: work back is one mechanism shared by the dashboard and the review gate.
+#: Pulled in transitively, unless the test supplied its own.
 SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey",
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
                   "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows",
@@ -76,72 +81,161 @@ SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey"
                   "dashboard_owner", "grant_starter", "plan_guard_refused", "release_lift")
 
 
-def _helper_modules(nodes, ns) -> None:
-    """The real modules a lifted shared helper reads, unless a test supplied
-    its own. unreviewed_role asks roles.needs_review; a test lifting a landing
-    path for another reason should not have to know that."""
-    # The nightly review's lenses (ideation.py) are pure: any lifted function
-    # that reads them -- run_ideation, the filing route tagging a proposal
-    # with its lens, the lens override -- gets the real module.
-    if any(isinstance(x, ast.Name) and x.id == "ideation"
-           for n in nodes for x in ast.walk(n)):
-        import ideation as _ideation
-        ns.setdefault("ideation", _ideation)
-    if any(n.name == "unreviewed_role" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import roles as _roles
-        ns.setdefault("roles", _roles)
+#: What a lifted function gets for a bot.py global that is not a module and
+#: the test did not supply -- the state an install that set nothing up has.
+#: Everything else it reads must be supplied, lifted, or one of bot.py's own
+#: imports (supplied as the real module), or the lift fails naming it.
+STAND_INS = {
+    "log": lambda: logging.getLogger("test"),
     # filer_role asks who the operator is; a test that never set one up has
     # no operator, so nothing it files is the operator's.
-    if any(n.name == "filer_role" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import operator_role as _op
-        ns.setdefault("operator_role", _op)
-        ns.setdefault("OPERATOR", types.SimpleNamespace(thread=lambda: ""))
-    # claude_env strips any grant it would otherwise inherit (GRANT_VAR).
-    if any(n.name == "claude_env" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import operator_role as _op
-        ns.setdefault("operator_role", _op)
-    # dashboard_owner reads what the dashboard vouched for against
-    # VIZ_TAILSCALE_LOGIN (the environment, else .env -- here, none).
-    if any(n.name == "dashboard_owner" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import dashowner as _do, envfile as _ef
-        ns.setdefault("dashowner", _do)
-        ns.setdefault("envfile", _ef)
-        ns.setdefault("os", os)
-        ns.setdefault("BASE_DIR", Path(tempfile.mkdtemp()))
-    if any(n.name == "grant_starter" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import operator_role as _op
-        ns.setdefault("operator_role", _op)
+    "OPERATOR": lambda: types.SimpleNamespace(thread=lambda: ""),
     # user_grant asks the bot's live grants; a test that made none has none,
     # so nothing it asks for is on the user's word.
-    if any(n.name == "user_grant" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import operator_role as _op
-        ns.setdefault("operator_role", _op)
-        ns.setdefault("OPERATOR_GRANTS", _op.Grants())
-    # handle_status reports the outage log and the pinned checkout (outages.py,
-    # live.py) and when this process booted; a test that set none up reads an
-    # empty install.
-    if any(n.name == "handle_status" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import live as _live, outages as _outages
-        ns.setdefault("BOOTED", 0.0)
-        ns.setdefault("CODE_DIR", BASE)
-        ns.setdefault("live", _live)
-        ns.setdefault("outages", _outages)
-    # send_digest reads the outage log from the install.
-    if any(n.name == "send_digest" for n in nodes if isinstance(n, ast.FunctionDef)):
-        import outages as _outages
-        ns.setdefault("outages", _outages)
-        ns.setdefault("BASE_DIR", Path(tempfile.mkdtemp()))
+    "OPERATOR_GRANTS": lambda: __import__("operator_role").Grants(),
+    # dashboard_owner reads VIZ_TAILSCALE_LOGIN from the environment, else
+    # .env under BASE_DIR -- here, an empty directory, so none; send_digest
+    # reads the outage log there.
+    "BASE_DIR": lambda: Path(tempfile.mkdtemp()),
+    # handle_status reports the pinned checkout and when this process booted.
+    "BOOTED": lambda: 0.0,
+    "CODE_DIR": lambda: BASE,
     # health_rows reads the bot's health store; a test that set none up has
     # none, which reads as "could not be read", never as "all healthy".
-    if any(n.name == "health_rows" for n in nodes if isinstance(n, ast.FunctionDef)):
-        ns.setdefault("HEALTH", None)
+    "HEALTH": lambda: None,
+}
 
 
-def _shared_helpers(tree, nodes, supplied) -> list:
-    used = {n.id for f in nodes for n in ast.walk(f) if isinstance(n, ast.Name)}
-    return [n for n in tree.body if isinstance(n, ast.FunctionDef)
-            and n.name in SHARED_HELPERS and n.name in used
-            and n.name not in supplied]
+#: Names each router reads, in its own body, on routes a test of one other
+#: route does not drive -- declared absent (see lift) rather than supplied.
+#: A test that drives one of these routes supplies the name instead.
+TASK_ROUTES = ("CLAUDE_CWD", "_spend", "_with_costs", "approve_task", "board_release",
+               "board_survey", "decide_findings", "land_or_drop", "operator_refused",
+               "project_store", "run_email_ingest", "stop_task", "task_contained",
+               "tell_thread", "tidy_checkout")
+PROJECT_ROUTES = ("GITHUB_OWNER", "install_git_guards", "operator_refused",
+                  "set_ideate_lenses", "task_store", "unregistered_repos")
+LANDING_ROUTES = ("LANDING_UNDERWAY", "hold_landing_for_base", "hold_landing_for_checkout",
+                  "record_landing", "repo_guard", "task_store")
+#: take_step's, lifted along with handle_tasks: landing and releasing.
+STEP_ROUTES = ("LANDING_UNDERWAY", "RELEASE_STARTED", "release_command")
+
+
+class LiftError(NameError):
+    """A lifted function reads a name nothing will bind."""
+
+
+def _global_reads(nodes) -> tuple:
+    """(names the code reads as globals, names it binds at module level)."""
+    import symtable
+    src = ast.unparse(ast.Module(body=list(nodes), type_ignores=[]))
+    top = symtable.symtable(src, "<lift>", "exec")
+    reads, binds = set(), set()
+
+    def walk(t, is_top):
+        for s in t.get_symbols():
+            name = s.get_name()
+            # Compiler bookkeeping, not bot.py's names: Python 3.14 records
+            # __conditional_annotations__ as read by any `x: T = ...`.
+            if name.startswith("__") and name.endswith("__"):
+                continue
+            if is_top:
+                if s.is_assigned() or s.is_imported():
+                    binds.add(name)
+                elif s.is_referenced():
+                    reads.add(name)
+            elif s.is_global():
+                if s.is_referenced():
+                    reads.add(name)
+                if s.is_declared_global() and s.is_assigned():
+                    binds.add(name)
+        for c in t.get_children():
+            walk(c, False)
+    walk(top, True)
+    return reads, binds
+
+
+def lift(*names, ns=None, stub=None, absent=(), **supplied) -> dict:
+    """Lift named functions and module-level assignments out of bot.py and
+    run them against fakes.
+
+    Importing bot.py needs a Slack token and would open the live tasks.json, so
+    most checks here read it as text. Compiling just the pieces under test into
+    a namespace we control buys the real thing instead: the code actually runs,
+    against a scratch store, and a mistake in it fails rather than merely
+    reading differently.
+
+    `names` are strings or iterables of them; `ns` is the namespace to fill
+    (a new dict if not given), `supplied` more entries for it. The test's own
+    entries always win. A free name the lifted code reads is resolved, in
+    order, from: what the test supplied, the builtins, SHARED_HELPERS (lifted
+    too), bot.py's own top-level imports (the real module), STAND_INS. Any
+    left over raise one LiftError naming them all, here, rather than a
+    NameError later on the one path that happens to read it -- unless `stub`
+    is given, in which case every name the test did not supply, bot.py's
+    imports and STAND_INS included, becomes stub(name) instead.
+
+    `absent` declares names the lifted code reads only on paths this test
+    does not drive (a router's other routes). They stay unbound -- reaching
+    one is the NameError it always was -- but each is a decision written
+    down, not a gap nobody saw. Anything supplied or lifted wins over a
+    declaration (so the shared *_ROUTES tuples serve tests that drive one of
+    those routes), and declaring a name the code never reads is an error,
+    so the declarations cannot outlive the code.
+
+    Returns the namespace; ns["__lifted__"] is the set of names compiled in.
+    """
+    import builtins
+    want = set()
+    for n in names:
+        want.update([n] if isinstance(n, str) else n)
+    ns = {} if ns is None else ns
+    ns.update(supplied)
+    tree = _bot_tree()
+    defs = [n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Assign, ast.AnnAssign))]
+    nodes = [n for n in defs if _binds(n) & want]
+    missing = want - {b for n in nodes for b in _binds(n)}
+    assert not missing, f"bot.py has no {', '.join(sorted(missing))}"
+    helpers = {n.name: n for n in defs
+               if isinstance(n, ast.FunctionDef) and n.name in SHARED_HELPERS}
+    imports = {b: n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))
+               for b in _binds(n)}
+    while True:
+        reads, binds = _global_reads(nodes)
+        more = [helpers[r] for r in sorted(reads - binds - set(ns)) if r in helpers]
+        if not more:
+            break
+        nodes += more
+    absent = set(absent)
+    unread = absent - reads
+    if unread:
+        raise LiftError(f"lifting {', '.join(sorted(want))} out of bot.py: "
+                        f"declared absent but never read: {', '.join(sorted(unread))}")
+    unresolved = []
+    for name in sorted(reads - binds - set(ns) - set(dir(builtins))):
+        if name in absent:
+            continue
+        if stub is not None:
+            ns[name] = stub(name)
+        elif name in imports:
+            node = imports[name]
+            got = {}
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "bot.py", "exec"), got)
+            ns[name] = got[name]
+        elif name in STAND_INS:
+            ns[name] = STAND_INS[name]()
+        else:
+            unresolved.append(name)
+    if unresolved:
+        raise LiftError(f"lifting {', '.join(sorted(want))} out of bot.py: nothing "
+                        f"supplies {', '.join(unresolved)} -- pass it, declare it "
+                        "absent= if this test never reaches it, or add it to "
+                        "STAND_INS if every test wants the same one")
+    nodes.sort(key=lambda n: n.lineno)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "bot.py", "exec"), ns)
+    ns["__lifted__"] = {b for n in nodes for b in _binds(n)}
+    return ns
 
 
 def discover():
@@ -420,12 +514,7 @@ def test_dashboard_classifiers():
 def test_watermark():
     print("\nredelivery watermark")
     store = tmp_store()
-    src = ast.parse((BASE / "bot.py").read_text())
-    fn = next(n for n in src.body if isinstance(n, ast.FunctionDef)
-              and n.name == "_already_handled")
-    ns = {"store": store}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<x>", "exec"), ns)
-    handled = ns["_already_handled"]
+    handled = lift("_already_handled", store=store)["_already_handled"]
 
     check("unknown thread is never blocked", not handled("C:9", "1785644289.053039"))
     store.update("C:1", last_msg_ts="1785644289.053039")
@@ -907,12 +996,14 @@ def test_review_sees_the_work():
     git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
 
     st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
-    ns = bot_functions("record_branch", "review_branch", "resolve_review",
+    ns = lift("record_branch", "review_branch", "resolve_review",
                        roles=roles, tasks=T, task_store=st, worktrees=W,
                        branches=__import__("branches"),
                        project_store=types.SimpleNamespace(scope_for=lambda slug: {}),
                        task_state=lambda tid, state, detail="": st.transition(
-                           tid, state, detail))
+                           tid, state, detail),
+              absent=('CLAUDE_CWD', 'app', 'file_followups', 'land_and_record', 'rework_conflict',
+                      'rework_flagged_review', 'tell_thread'))
 
     # An implementor's turn, for real: its own checkout, a commit in it, the
     # branch written down on the way out, and the checkout released.
@@ -1139,7 +1230,7 @@ def test_review_sees_the_work():
     git(repo, "branch", "-D", f"{W.BRANCH_PREFIX}{gone}")
     st.transition(orphan["id"], T.RUNNING)
     review_turn(st.get(orphan["id"]),
-                refuse_review=bot_functions(
+                refuse_review=lift(
                     "refuse_review", roles=roles, tasks=T, task_store=st,
                     log=logging.getLogger("test"),
                     task_state=lambda tid_, s_, d="": st.transition(tid_, s_, d),
@@ -1176,7 +1267,7 @@ def test_review_sees_the_work():
     # blocked it is non-terminal and kept anyway, so the check would pass on
     # its own and prove nothing.
     st.transition(tid, T.CANCELLED, "changed my mind mid-review")
-    keeping = bot_functions("live_worktree_tasks", tasks=T, task_store=st,
+    keeping = lift("live_worktree_tasks", tasks=T, task_store=st,
                             RUNNING_TASKS={child["id"]: object()}
                             )["live_worktree_tasks"]()
     check("a cancelled task is no longer kept on its own account",
@@ -1265,53 +1356,10 @@ def test_email_ingest():
           'if not (GMAIL_USER and GMAIL_APP_PASSWORD):' in bot)
 
 
-def _bot_fns(names, ns):
-    """Compile named top-level functions out of bot.py into `ns`.
-
-    bot.py needs Slack tokens to import, so the pieces under test are lifted
-    out of it the way _repo_guard_impl does. Returns the names it found, so a
-    missing one fails a named check rather than raising.
-    """
-    tree = ast.parse((BASE / "bot.py").read_text())
-
-    def defines(n):
-        if isinstance(n, ast.FunctionDef):
-            return {n.name}
-        if isinstance(n, ast.Assign):
-            return {t.id for t in n.targets if isinstance(t, ast.Name)}
-        if isinstance(n, ast.AnnAssign):        # `_landing_now: set[str] = set()`
-            return {n.target.id} if isinstance(n.target, ast.Name) else set()
-        return set()
-
-    nodes = [n for n in tree.body if defines(n) & set(names)]
-    nodes += _shared_helpers(tree, nodes, set(names) | set(ns))
-    _helper_modules(nodes, ns)
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<bot>", "exec"), ns)
-    return {name for n in nodes for name in defines(n)}
-
-
 def _repo_guard_impl():
     """Loaded from bot.py without importing it (bot.py needs Slack tokens)."""
-    import ast, types, contextlib, threading, logging
-    from pathlib import Path as _P
-    src = (BASE / "bot.py").read_text()
-    tree = ast.parse(src)
-    want = {"_repo_lock", "repo_guard"}
-    nodes = [n for n in tree.body
-             if isinstance(n, ast.FunctionDef) and n.name in want]
-    wanted = ("_repo_locks", "_repo_locks_guard")
-    def names(n):
-        if isinstance(n, ast.Assign):
-            return [getattr(t, "id", "") for t in n.targets]
-        if isinstance(n, ast.AnnAssign):      # `_repo_locks: dict[...] = {}`
-            return [getattr(n.target, "id", "")]
-        return []
-    assigns = [n for n in tree.body if any(x in wanted for x in names(n))]
     mod = types.ModuleType("guard")
-    mod.__dict__.update(contextlib=contextlib, threading=threading, Path=_P,
-                        log=logging.getLogger("test"))
-    exec(compile(ast.Module(body=assigns + nodes, type_ignores=[]), "<guard>", "exec"),
-         mod.__dict__)
+    lift("_repo_lock", "repo_guard", "_repo_locks", "_repo_locks_guard", ns=mod.__dict__)
     return mod
 
 
@@ -2500,9 +2548,6 @@ def _run_ideation_impl():
     import projects as P, scoping as S, tasks as T
     from tasks import TaskStore
 
-    src = (BASE / "bot.py").read_text()
-    fn = next(n for n in ast.parse(src).body
-              if isinstance(n, ast.FunctionDef) and n.name == "run_ideation")
     root = Path(tempfile.mkdtemp())
     ts, ps = TaskStore(root / "t.json"), P.ProjectStore(root / "p.json")
     mod = types.ModuleType("ideating")
@@ -2511,8 +2556,7 @@ def _run_ideation_impl():
         time=time, ideation=__import__("ideation"),
         log=logging.getLogger("test"), CLAUDE_CWD=root, SILKWORM_BIN="silkworm",
         branches=types.SimpleNamespace(survey=lambda _t, **_: []))
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<ideating>", "exec"),
-         mod.__dict__)
+    lift("run_ideation", ns=mod.__dict__)
     return mod.run_ideation, ts, ps
 
 
@@ -2645,7 +2689,7 @@ def test_nightly_review_rotates_its_lens():
     ps = projects.ProjectStore(root / "p.json")
     ps.ensure("Trader", test_cmd="pytest", auto_merge=True)
     hp = {"projects": projects, "project_store": ps, "log": logging.getLogger("test")}
-    _bot_fns({"handle_projects", "set_ideate_lenses"}, hp)
+    lift({"handle_projects", "set_ideate_lenses"}, ns=hp, absent=PROJECT_ROUTES)
     r = hp["handle_projects"]({"action": "ideate-lenses", "slug": "trader",
                                "lenses": "features,correctness"})
     check("the dashboard can set a project's lenses",
@@ -2801,20 +2845,8 @@ def _file_task_impl():
     import projects as P, roles as R, scoping as S, tasks as T
     from tasks import TaskStore
 
-    src = (BASE / "bot.py").read_text()
-    tree = ast.parse(src)
     want = ("handle_file_task", "filed_by_restricted_role", "_filed_this_turn",
             "begin_turn", "unmerged_survey", "research_parent", "filer_role")
-    def named(n):
-        if isinstance(n, ast.FunctionDef):
-            return n.name
-        if isinstance(n, ast.AnnAssign):
-            return getattr(n.target, "id", "")
-        return ""
-    nodes = [n for n in tree.body if named(n) in want]
-    assert len(nodes) == len(want), \
-        f"expected all of {want}, found {[named(n) for n in nodes]}"
-
     ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     # Naming a project writes: a record, and a home directory on disk. Recorded
     # rather than stubbed away, so a filing that gets refused can be shown to
@@ -2837,8 +2869,7 @@ def _file_task_impl():
             home=lambda n, create=False: made.append(n),
             scope_for=lambda n: None),
     )
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<filing>", "exec"),
-         mod.__dict__)
+    lift(want, ns=mod.__dict__, absent=('HEALTH_WARN_DAYS', 'requested_filing'))
     return mod.handle_file_task, mod._filed_this_turn, mod.begin_turn, ts, made
 
 
@@ -3290,47 +3321,17 @@ def _bot_func(name, **namespace):
     driven by handing it only the few things the behaviour under test turns
     on -- and so a name the function stops using is not silently still stubbed.
     """
-    import builtins
     from unittest.mock import MagicMock
-    tree = ast.parse((BASE / "bot.py").read_text())
-    node = next(n for n in tree.body
-                if isinstance(n, ast.FunctionDef) and n.name == name)
-    bound = {a.arg for a in node.args.args}
-    for n in ast.walk(node):
-        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
-            bound.add(n.id)
-        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            bound.add(n.name)
-            bound.update(a.arg for a in n.args.args)
-        elif isinstance(n, ast.ExceptHandler) and n.name:
-            bound.add(n.name)
-    free = {n.id for n in ast.walk(node)
-            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    mod = types.ModuleType(f"bot_{name}")
-    for free_name in free - bound - set(dir(builtins)):
-        mod.__dict__[free_name] = MagicMock(name=free_name)
     # Pure arithmetic over records, with nothing to stub: a mock here would
     # only turn a cost into an object the store cannot serialise.
-    for real in ("costs", "dedup"):
-        if real in free:
-            mod.__dict__[real] = __import__(real)
-    # The shared helpers compiled in alongside it read globals of their own
-    # (task_base reads `branches` and `project_store`), which the caller has
-    # as little reason to supply as the function's own -- stub those too.
-    helpers = _shared_helpers(tree, [node], set(namespace))
-    for h in helpers:
-        own = {a.arg for a in h.args.args} | {
-            n.id for n in ast.walk(h)
-            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))}
-        for free_name in ({n.id for n in ast.walk(h) if isinstance(n, ast.Name)
-                           and isinstance(n.ctx, ast.Load)}
-                          - own - set(dir(builtins)) - set(mod.__dict__)
-                          - {x.name for x in helpers}):
-            mod.__dict__[free_name] = MagicMock(name=free_name)
+    real = {r: __import__(r) for r in ("costs", "dedup")}
+    mod = types.ModuleType(f"bot_{name}")
     mod.__dict__.update(namespace)
-    exec(compile(ast.Module(body=[node] + helpers,
-                            type_ignores=[]), f"<{name}>", "exec"),
-         mod.__dict__)
+    # The shared helpers lifted alongside it read globals of their own
+    # (task_base reads `branches` and `project_store`), which the caller has
+    # as little reason to supply as the function's own -- stubbed too.
+    lift(name, ns=mod.__dict__,
+         stub=lambda free: real[free] if free in real else MagicMock(name=free))
     return mod.__dict__[name]
 
 
@@ -3544,7 +3545,7 @@ def _run_a_task(conv_record):
                                      session_id="sess")
     execute_task = _bot_func(
         "execute_task", tasks=T, task_store=st, store=sess, roles=roles,
-        review_branch=bot_functions("review_branch",
+        review_branch=lift("review_branch",
                                     task_store=st)["review_branch"],
         worktrees=W, Path=Path, run_turn=run_turn, shutil=shutil,
         OUTBOX_ROOT=root / "outbox", SILKWORM_BIN="/x/silkworm",
@@ -3703,9 +3704,10 @@ def test_cancel_stops_the_child():
     st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     running_tasks = {}
     import holding as H
-    ns = bot_functions("stop_task", "handle_tasks", "live_worktree_tasks",
+    ns = lift("stop_task", "handle_tasks", "live_worktree_tasks",
                        tasks=T, task_store=st, RUNNING_TASKS=running_tasks,
-                       holding=H)
+                       holding=H,
+              absent=TASK_ROUTES + STEP_ROUTES)
     tasks_route, stop_task = ns["handle_tasks"], ns["stop_task"]
 
     def running_task(**fields):
@@ -3786,7 +3788,7 @@ def test_worktree_survives_leaving_running():
 
     st = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     running_tasks = {}
-    keep = bot_functions("live_worktree_tasks", tasks=T, task_store=st,
+    keep = lift("live_worktree_tasks", tasks=T, task_store=st,
                          RUNNING_TASKS=running_tasks)["live_worktree_tasks"]
 
     def task_in(state):
@@ -5153,14 +5155,7 @@ def test_supersede_stale_failures():
 def test_file_uploads_are_handled():
     print("\nfile uploads")
     src = (BASE / "bot.py").read_text()
-    tree = ast.parse(src)
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
-              and n.name == "should_handle")
-    subs = next(n for n in tree.body if isinstance(n, ast.Assign)
-                and getattr(n.targets[0], "id", "") == "HANDLED_SUBTYPES")
-    ns = {"BOT_USER_ID": "UBOT"}
-    exec(compile(ast.Module(body=[subs, fn], type_ignores=[]), "<x>", "exec"), ns)
-    should = ns["should_handle"]
+    should = lift("should_handle", "HANDLED_SUBTYPES", BOT_USER_ID="UBOT")["should_handle"]
 
     upload = {"channel_type": "im", "user": "U1", "subtype": "file_share",
               "files": [{"name": "shot.png"}], "text": "what is wrong here?"}
@@ -6220,10 +6215,11 @@ def test_held_checkouts():
     class FakeClient:
         def chat_postMessage(self, **kw): posted.append(kw)
 
-    ns = bot_functions("handle_tasks", "approve_task", "stop_task", "tell_thread",
+    ns = lift("handle_tasks", "approve_task", "stop_task", "tell_thread",
                        tasks=T, task_store=st, holding=H, RUNNING_TASKS={},
                        start_landing=lambda tid: None,
-                       app=types.SimpleNamespace(client=FakeClient()))
+                       app=types.SimpleNamespace(client=FakeClient()),
+              absent=TASK_ROUTES + STEP_ROUTES)
     route = ns["handle_tasks"]
 
     r = route({"action": "approve", "id": waiting})
@@ -6265,7 +6261,7 @@ def test_held_checkouts():
     check("nor is a task that never had one", H.for_task({"scope": {}}) is None)
 
     # --- the sweeper stops re-announcing what it cannot act on --------------
-    keep = bot_functions("live_worktree_tasks", tasks=T, task_store=st,
+    keep = lift("live_worktree_tasks", tasks=T, task_store=st,
                          RUNNING_TASKS={})["live_worktree_tasks"]
     stuck, wt_stuck = task_in(T.DONE)
     dirty(wt_stuck, "still-here.txt")
@@ -6808,7 +6804,7 @@ def test_landing_is_visible():
     import branches as B
     gate = {"project_store": Projects({"auto_merge": True, "test_cmd": "true"}),
             "worktrees": W, "merge": M, "branches": B, "log": LOG}
-    _bot_fns({"land_if_ready", "landing_enabled"}, gate)
+    lift({"land_if_ready", "landing_enabled"}, ns=gate, absent=LANDING_ROUTES)
     t = {"id": "tsk_guard", "project": "p", "role": "implementor",
          "scope": {"cwd": "/nowhere"}}
 
@@ -6840,7 +6836,7 @@ def test_landing_is_visible():
     # --- the refusal has somewhere durable to live ----------------------------
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     rec_ns = {"task_store": store, "log": LOG, "time": time}
-    _bot_fns({"record_landing"}, rec_ns)
+    lift({"record_landing"}, ns=rec_ns)
     record_landing = rec_ns.get("record_landing")
 
     task = store.create("do the thing", project="p")
@@ -6884,7 +6880,7 @@ def test_landing_is_visible():
     app_ns = {"task_store": store, "tasks": T, "log": LOG,
               "holding": __import__("holding"),
               "start_landing": lambda tid, approved=False: bool(started.append((tid, approved)))}
-    _bot_fns({"approve_task"}, app_ns)
+    lift({"approve_task"}, ns=app_ns, absent=('tell_thread',))
     approve = app_ns.get("approve_task")
 
     def parked(state, detail=""):
@@ -6938,9 +6934,10 @@ def test_landing_is_visible():
               "project_store": types.SimpleNamespace(get=lambda slug: None,
                                                        scope_for=lambda slug: {}),
               "tell_thread": lambda key, text: posted.append({"text": text})}
-    _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
+    lift({"resolve_review", "rework_flagged_review", "rework_conflict",
               "send_back", "review_addendum", "_unsupervised", "MAX_REVIEW_REWORKS",
-              "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, rev_ns)
+              "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, ns=rev_ns,
+         absent=('CLAUDE_CWD', 'conflict_addendum', 'file_followups'))
     resolve_review = rev_ns.get("resolve_review")
     PASS = '```json\n{"ok": true, "summary": "fine", "findings": []}\n```'
 
@@ -6977,8 +6974,8 @@ def test_landing_is_visible():
     # would keep saying "landing…" about something that stopped days ago.
     import subprocess as _sp
     sweep_ns = {"task_store": store, "log": LOG, "subprocess": _sp, "time": time}
-    _bot_fns({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY",
-              "_interrupted_landing_detail"}, sweep_ns)
+    lift({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY",
+              "_interrupted_landing_detail"}, ns=sweep_ns)
     sweep = sweep_ns.get("clear_interrupted_landings")
     mid = store.create("do the thing", project="p")
     store.update(mid["id"], result={"landing": {
@@ -7064,8 +7061,8 @@ def test_landing_is_visible():
                 "land_and_record": lambda tid, c, t, **kw: (threads_run.append(tid),
                                                       holding.set(),
                                                       release.wait(5))}
-    _bot_fns({"start_landing", "record_landing", "LANDING_UNDERWAY",
-              "_landing_now", "_landing_guard"}, start_ns)
+    lift({"start_landing", "record_landing", "LANDING_UNDERWAY",
+              "_landing_now", "_landing_guard"}, ns=start_ns, absent=('rework_finished',))
     start_landing = start_ns.get("start_landing")
     slow = store.create("do the thing", project="p")
     first = start_landing(slow["id"]) if start_landing else False
@@ -7087,7 +7084,7 @@ def test_landing_is_visible():
     boom = {"task_store": store, "tasks": T, "log": LOG,
             "holding": __import__("holding"),
             "start_landing": lambda tid: (_ for _ in ()).throw(OSError("disk full"))}
-    _bot_fns({"approve_task"}, boom)
+    lift({"approve_task"}, ns=boom, absent=('tell_thread',))
     approve_boom = boom.get("approve_task")
     unlucky = parked(T.AWAITING_APPROVAL, "a review flagged this")
     try:
@@ -8488,15 +8485,10 @@ def test_review_followups():
 
     # --- filing ---------------------------------------------------------------
     store = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
-    src = ast.parse((BASE / "bot.py").read_text())
-    fn = next(n for n in src.body if isinstance(n, ast.FunctionDef)
-              and n.name == "file_followups")
     ns = {"task_store": store, "scoping": scoping, "tasks": T, "log": logging.getLogger("t"),
           "dedup": __import__("dedup"), "branches": __import__("branches"),
           "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
-    exec(compile(ast.Module(body=[fn] + _shared_helpers(src, [fn], set(ns)),
-                            type_ignores=[]), "<x>", "exec"), ns)
-    file_followups = ns["file_followups"]
+    file_followups = lift("file_followups", ns=ns)["file_followups"]
 
     parent = store.create("do the thing", title="Do the thing", project="silkworm",
                           scope={"cwd": "/repo", "worktree": "/tmp/wt-gone"})
@@ -8670,8 +8662,6 @@ def test_review_followups():
     # --- the gate itself, driven rather than read -----------------------------
     # The reported failure was end to end: a verdict came back ok with findings
     # and the task went to done with nothing anywhere. Run that exact input.
-    gate_fn = next(n for n in src.body if isinstance(n, ast.FunctionDef)
-                   and n.name == "resolve_review")
     posted = []
     gns = dict(ns)
     gns.update({
@@ -8688,8 +8678,8 @@ def test_review_followups():
         "rework_flagged_review": lambda *a: False,
         "rework_conflict": lambda *a: False,
     })
-    exec(compile(ast.Module(body=[gate_fn], type_ignores=[]), "<x>", "exec"), gns)
-    resolve = gns["resolve_review"]
+    resolve = lift("resolve_review", ns=gns,
+                   absent=('CLAUDE_CWD', 'tell_thread'))["resolve_review"]
 
     # Its own project: the checks above have filled silkworm's board to the
     # standing limit, and a full board refusing this finding is correct there.
@@ -8902,7 +8892,7 @@ def test_state_files_have_one_reader_and_one_writer():
         def ingest(self, *a, **kw):
             return {}
 
-    ns = bot_functions("run_email_ingest",
+    ns = lift("run_email_ingest",
                        GMAIL_USER="u", GMAIL_APP_PASSWORD="p", GMAIL_HOST="h",
                        GMAIL_MAX_PER_RUN=1, GMAIL_TRIAGE=False, GMAIL_MAILBOX="INBOX",
                        CLAUDE_BIN="claude", NAMING_MODEL="haiku",
@@ -9072,9 +9062,10 @@ def test_home_tab():
 
     # --- clicks, through the real handle_tasks and a real store ---------------
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
-    ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
+    ns = lift("handle_tasks", "approve_task", task_store=store, tasks=T,
                        holding=__import__("holding"),
-                       stop_task=lambda tid: False, start_landing=lambda tid: None)
+                       stop_task=lambda tid: False, start_landing=lambda tid: None,
+              absent=TASK_ROUTES + STEP_ROUTES)
     prop = store.create("a proposal worth accepting", state=T.PROPOSED)["id"]
     need = store.create("a task that asked a question", state=T.QUEUED)["id"]
     store.transition(need, T.RUNNING); store.transition(need, T.NEEDS_INPUT)
@@ -9274,9 +9265,6 @@ def _dashboard_create_impl():
     import roles as R, tasks as T
     from tasks import TaskStore
 
-    tree = ast.parse((BASE / "bot.py").read_text())
-    fn = next(n for n in tree.body
-              if isinstance(n, ast.FunctionDef) and n.name == "handle_tasks")
     ts = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     made: list = []
     mod = types.ModuleType("dashboard")
@@ -9293,10 +9281,8 @@ def _dashboard_create_impl():
             get=lambda n: None,
             scope_for=lambda n: None, all=lambda: []),
     )
-    body = [fn] + _shared_helpers(tree, [fn], set())
-    _helper_modules(body, mod.__dict__)
-    exec(compile(ast.Module(body=body, type_ignores=[]), "<dashboard>", "exec"),
-         mod.__dict__)
+    lift("handle_tasks", ns=mod.__dict__,
+         absent=TASK_ROUTES + STEP_ROUTES)
     return mod.handle_tasks, ts, made
 
 
@@ -9649,7 +9635,7 @@ def test_revision_drift():
           "the warning has to name the remedy")
 
     # And the predicate itself, run rather than read.
-    own = bot_functions("_is_own_checkout", Path=Path, BASE_DIR=BASE)["_is_own_checkout"]
+    own = lift("_is_own_checkout", Path=Path, BASE_DIR=BASE)["_is_own_checkout"]
     check("its own checkout is recognised", own(str(BASE)) is True)
     check("through a non-canonical path", own(str(BASE / "tests" / "..")) is True)
     check("another project's checkout is not", own(str(BASE / "tests")) is False)
@@ -9729,7 +9715,7 @@ def _sweeper_ns(outbox, *, forget=None, compact=None):
             if compact:
                 raise compact
 
-    ns = bot_functions("_sweep_pass", "_sweeper", store=Store(), task_store=Tasks(),
+    ns = lift("_sweep_pass", "_sweeper", store=Store(), task_store=Tasks(),
                        OUTBOX_ROOT=outbox, shutil=_shutil,
                        SESSION_MAX_AGE_DAYS=30, TASK_COMPACT_AFTER_DAYS=14,
                        ARTIFACTS_ROOT=Path(tempfile.mkdtemp()), artifacts=artifacts,
@@ -9921,7 +9907,7 @@ def test_dead_background_threads_are_reported():
         for t in _threading.enumerate():
             if t.name == "sweeper":
                 t.join(5)
-        ns = bot_functions(
+        ns = lift(
             "handle_status", store=types.SimpleNamespace(all=lambda: {}), RUNNING={},
             RUNNER_HOLD=__import__("retry").Hold(), DRAIN=__import__("drain").Drain(),
             credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
@@ -10016,8 +10002,9 @@ def test_board_channel():
 
     d = Path(tempfile.mkdtemp())
     store = T.TaskStore(d / "t.json")
-    ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
-                       stop_task=lambda tid: False, start_landing=lambda tid: None)
+    ns = lift("handle_tasks", "approve_task", task_store=store, tasks=T,
+                       stop_task=lambda tid: False, start_landing=lambda tid: None,
+              absent=TASK_ROUTES + STEP_ROUTES)
     def board(**kw):
         return home.Board(state_path=d / "board.json", bot_user="B_BOT", store=store,
                           call=ns["handle_tasks"], allowed_users={"U_ME"}, **kw)
@@ -10406,7 +10393,7 @@ def test_nothing_to_land_is_not_a_refusal():
             return None                                # stop before git merges anything
     ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
           "branches": B, "log": logging.getLogger("test")}
-    _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    lift({"land_if_ready", "landing_enabled"}, ns=ns, absent=LANDING_ROUTES)
     land = ns["land_if_ready"]
     base = {"project": "p", "role": "implementor", "verified": True,
             "scope": {"cwd": str(repo)}}
@@ -10502,7 +10489,7 @@ def test_remote_only_work_lands():
             return None                                # stop before git merges anything
     ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
           "branches": B, "log": logging.getLogger("test")}
-    _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    lift({"land_if_ready", "landing_enabled"}, ns=ns, absent=LANDING_ROUTES)
     land = ns["land_if_ready"]
     base = {"project": "p", "role": "implementor", "verified": True,
             "scope": {"cwd": str(repo)}}
@@ -10601,7 +10588,7 @@ def test_uncommitted_work_is_sent_back():
     ns = {"task_store": store, "tasks": T, "app": types.SimpleNamespace(client=client),
           "log": logging.getLogger("test"),
           "task_state": lambda tid, st, detail="": store.transition(tid, st, detail)}
-    _bot_fns({"send_back_uncommitted", "MAX_COMMIT_ATTEMPTS"}, ns)
+    lift({"send_back_uncommitted", "MAX_COMMIT_ATTEMPTS"}, ns=ns)
     tid = store.create("implement it", state=T.QUEUED, role="implementor")["id"]
     store.transition(tid, T.RUNNING)
     check("first time: sent back", ns["send_back_uncommitted"](store.get(tid) | {"id": tid},
@@ -10674,7 +10661,7 @@ def test_approval_lands_on_any_project():
             attached.append(branch); return None
     ns = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
           "branches": B, "log": logging.getLogger("test")}
-    _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    lift({"land_if_ready", "landing_enabled"}, ns=ns, absent=LANDING_ROUTES)
     land = ns["land_if_ready"]
     t = {"id": "tsk_work", "project": "p", "role": "implementor",
          "scope": {"cwd": str(repo)}}
@@ -10700,7 +10687,7 @@ def test_approval_lands_on_any_project():
            "start_landing": lambda tid, approved=False: begun.append((tid, approved)) or True,
            "record_landing": lambda task, out: recorded.append(out),
            "repo_guard": lambda cwd: contextlib.nullcontext()}
-    _bot_fns({"land_or_drop"}, ns2)
+    lift({"land_or_drop"}, ns=ns2)
     lod = ns2.get("land_or_drop")
     check("there is a Land/Drop action", bool(lod))
     run = store.create("still going", state=T.QUEUED)["id"]
@@ -10752,7 +10739,7 @@ def test_unsupervised_work_needs_a_ready_project():
     ns = {"projects": P, "project_store": ps, "tasks": T, "task_store": ts,
           "task_state": lambda tid, st, detail="": ts.transition(tid, st, detail),
           "tell_thread": lambda key, text: told.append(text)}
-    _bot_fns({"hold_unsupervised"}, ns)
+    lift({"hold_unsupervised"}, ns=ns)
     hold = ns["hold_unsupervised"]
     def claimed(project, role="implementor"):
         tid = ts.create("do it", project=project, role=role, state=T.QUEUED, driver="queue")["id"]
@@ -10779,7 +10766,7 @@ def test_unsupervised_work_needs_a_ready_project():
     # Ideation: refused when switched on, skipped when already on, and not
     # filed even if asked for directly.
     hp = {"projects": P, "project_store": ps, "log": logging.getLogger("test")}
-    _bot_fns({"handle_projects"}, hp)
+    lift({"handle_projects"}, ns=hp, absent=PROJECT_ROUTES)
     r = hp["handle_projects"]({"action": "ideate", "slug": "saga", "at": "02:00"})
     check("ideation cannot be switched on for an unready project",
           r.get("ok") is False and "test command" in r.get("error", ""), str(r))
@@ -11056,8 +11043,8 @@ after = ["backend"]
           "log": logging.getLogger("test"),
           "repo_guard": lambda cwd: contextlib.nullcontext(), "DRAIN": __import__("drain").Drain()}
     ns["board"] = __import__("board")
-    _bot_fns({"release_command", "release_plan", "run_release", "_releasing", "_releasing_guard",
-              "_board_releases", "release_checkout"}, ns)
+    lift({"release_command", "release_plan", "run_release", "_releasing", "_releasing_guard",
+              "_board_releases", "release_checkout"}, ns=ns, absent=('RELEASE_STARTED',))
     cmd = ns["release_command"]
     check("no arguments: usage", "Usage" in cmd("", print))
     check("an unknown project is named", "no repository" in cmd("nope", print))
@@ -11309,9 +11296,10 @@ def test_board_is_compact():
     # Picking an action opens its confirmation, with the full detail; only
     # submitting it acts.
     store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
-    ns = bot_functions("handle_tasks", "approve_task", task_store=store, tasks=T,
+    ns = lift("handle_tasks", "approve_task", task_store=store, tasks=T,
                        stop_task=lambda tid: False, start_landing=lambda tid, **kw: None,
-                       holding=__import__("holding"), tell_thread=lambda *a: None)
+                       holding=__import__("holding"), tell_thread=lambda *a: None,
+              absent=TASK_ROUTES + STEP_ROUTES)
     aw = store.create("work to approve", state=T.QUEUED, role="implementor")["id"]
     store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
     store.update(aw, result={"review": {"summary": "ok-ish",
@@ -12817,8 +12805,8 @@ def test_resume_edge_cases():
     ns = {"task_store": st, "tasks": T, "app": types.SimpleNamespace(client=client),
           "log": logging.getLogger("test"), "verify": __import__("verify"), "os": os,
           "task_state": lambda tid, s_, d="": st.transition(tid, s_, d)}
-    _bot_fns({"send_back_uncommitted", "send_back_for_tests",
-              "MAX_COMMIT_ATTEMPTS", "MAX_VERIFY_ATTEMPTS"}, ns)
+    lift({"send_back_uncommitted", "send_back_for_tests",
+              "MAX_COMMIT_ATTEMPTS", "MAX_VERIFY_ATTEMPTS"}, ns=ns)
     a = stale("loose")
     ns["send_back_uncommitted"](st.get(a), ["x.txt"], "C1", "1.0")
     b = stale("failing")
@@ -12875,9 +12863,10 @@ def test_flagged_work_fixes_itself_once():
           "tell_thread": lambda key, text: said.append((key, text)),
           "land_and_record": lambda tid, ch, ts: outcome,
           "file_followups": lambda *a, **k: []}
-    got = _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
+    got = lift({"resolve_review", "rework_flagged_review", "rework_conflict",
                     "conflict_addendum", "send_back", "review_addendum", "_unsupervised",
-                    "MAX_REVIEW_REWORKS", "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, ns)
+                    "MAX_REVIEW_REWORKS", "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES"}, ns=ns,
+               absent=('CLAUDE_CWD',))["__lifted__"]
     check("the gate and its send-backs were lifted out of bot.py",
           {"resolve_review", "rework_flagged_review", "rework_conflict",
            "send_back"} <= got, str(sorted(got)))
@@ -13237,7 +13226,7 @@ def test_proposals_are_deduplicated():
           "log": logging.getLogger("t"), "dedup": dedup,
           "branches": __import__("branches"),
           "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
-    _bot_fns({"file_followups"}, ns)
+    lift({"file_followups"}, ns=ns)
     file_followups = ns["file_followups"]
     open_one = store.create(a, title=a[:70], project="proj", role="implementor",
                             state=T.PROPOSED)
@@ -13271,7 +13260,7 @@ def test_proposals_are_deduplicated():
     # The gate records it on the parent and says it in the thread.
     store2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     ns2 = dict(ns, task_store=store2)
-    _bot_fns({"file_followups"}, ns2)
+    lift({"file_followups"}, ns=ns2)
     store2.create(a, title="Atomic saves — and survive a corrupt file",
                   project="proj", role="implementor", state=T.PROPOSED)
     impl = store2.create("the implementor's job", title="Impl", project="proj",
@@ -13423,7 +13412,7 @@ def test_task_costs():
     ns = {"task_store": ts, "costs": costs, "board": __import__("board"),
           "research": __import__("research"), "slacklinks": __import__("slacklinks"),
           "tasks": T}
-    _bot_fns({"_with_costs", "_spend"}, ns)
+    lift({"_with_costs", "_spend"}, ns=ns)
     handle.__globals__.update(_with_costs=ns["_with_costs"], _spend=ns["_spend"])
     r = handle({"action": "attention"})
     row = next(t for t in r["tasks"] if t["id"] == impl["id"])
@@ -13509,14 +13498,11 @@ def test_a_rerun_adds_to_a_tasks_cost():
 
 def _review_roles():
     """REVIEW_ROLES as bot.py defines it, evaluated rather than retyped."""
-    tree = ast.parse((BASE / "bot.py").read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.Assign)
-                and any(isinstance(t, ast.Name) and t.id == "REVIEW_ROLES" for t in n.targets))
-    return eval(compile(ast.Expression(node.value), "bot.py", "eval"))
+    return lift("REVIEW_ROLES")["REVIEW_ROLES"]
 
 
 def _lanes(review_workers=1, wake_workers=1):
-    return bot_functions("lane_filter", REVIEW_WORKERS=review_workers,
+    return lift("lane_filter", REVIEW_WORKERS=review_workers,
                          WAKE_WORKERS=wake_workers,
                          REVIEW_ROLES=_review_roles())["lane_filter"]
 
@@ -13735,7 +13721,7 @@ def _wake(st, thread="C:w", due_ago=5.0):
 
 def _busy_threads(locks=None, running=None):
     import threading as th
-    return bot_functions("busy_threads", _thread_locks=locks if locks is not None else {},
+    return lift("busy_threads", _thread_locks=locks if locks is not None else {},
                          _thread_locks_guard=th.Lock(),
                          RUNNING=running if running is not None else {})["busy_threads"]
 
@@ -13909,7 +13895,7 @@ def test_a_wakeup_waits_for_its_own_thread_and_for_drain():
     held = _wake(st5, thread="C:repo")
     st5.update(held["id"], created=1.0, scope={"cwd": str(repo)})
     free = _wake(st5, thread="C:elsewhere")
-    ns = bot_functions("wake_skip", "busy_threads", "_repo_lock",
+    ns = lift("wake_skip", "busy_threads", "_repo_lock",
                        _thread_locks={}, _thread_locks_guard=th.Lock(), RUNNING={},
                        _repo_locks={}, _repo_locks_guard=th.Lock(), task_store=st5,
                        tasks=T, CLAUDE_CWD=Path(tempfile.mkdtemp()), Path=Path,
@@ -13978,7 +13964,7 @@ def test_a_late_wakeup_is_reported():
     st_late = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     gone = st_late.create("check it", driver="queue", source=T.WAKE_SOURCE, thread="C:2",
                           state=T.BLOCKED, retry_at=time.time() - 3600)
-    out = bot_functions(
+    out = lift(
         "handle_status", store=types.SimpleNamespace(all=lambda: {}), RUNNING={},
         RUNNER_HOLD=__import__("retry").Hold(), DRAIN=__import__("drain").Drain(),
         credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
@@ -13998,7 +13984,7 @@ def _turn_runner(st, sessions, locks, RUNNING, RUNNING_TASKS, run_turn, resolve_
     """execute_task as the workers run it, sharing the real per-turn bookkeeping."""
     import roles
     import tasks as T
-    release = bot_functions("release_turn", RUNNING=RUNNING, RUNNING_TASKS=RUNNING_TASKS,
+    release = lift("release_turn", RUNNING=RUNNING, RUNNING_TASKS=RUNNING_TASKS,
                             store=sessions, recovery=recovery)["release_turn"]
 
     class Progress:
@@ -14028,7 +14014,7 @@ def _turn_runner(st, sessions, locks, RUNNING, RUNNING_TASKS, run_turn, resolve_
 
 def _real_locks():
     import threading as th
-    return bot_functions("_thread_lock", "_repo_lock", "repo_guard",
+    return lift("_thread_lock", "_repo_lock", "repo_guard",
                          threading=th, Path=Path, contextlib=contextlib,
                          _thread_locks={}, _thread_locks_guard=th.Lock(),
                          _repo_locks={}, _repo_locks_guard=th.Lock())
@@ -14413,10 +14399,11 @@ def test_daily_digest_posts_to_the_dm_never_the_board():
     board = types.SimpleNamespace(channel=lambda cl: "G9", channel_name="silkworm-board")
     home = {"ch": "D777"}
     import digest as digest_mod
-    ns = bot_functions("send_digest", digest=digest_mod, task_store=st,
+    ns = lift("send_digest", digest=digest_mod, task_store=st,
                        app=types.SimpleNamespace(client=client), BOARD=board,
                        home_channel=lambda: home["ch"], datetime=datetime,
-                       digest_inputs=lambda recs: ([], {}))
+                       digest_inputs=lambda recs: ([], {}),
+              absent=('project_store', 'unregistered_repos'))
     sched = digest_mod.Schedule(Path(tempfile.mkdtemp()) / "d.json", "08:00")
     ns["send_digest"](sched, datetime(2026, 10, 2, 8, 0))
     check("send_digest: posted to the home DM", [p["channel"] for p in client.posts] == ["D777"],
@@ -14468,7 +14455,7 @@ def test_a_landing_outcome_is_dated():
     import tasks as T
     st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     t = st.create("x", project="p")
-    ns = bot_functions("record_landing", task_store=st)
+    ns = lift("record_landing", task_store=st)
     before = time.time()
     ns["record_landing"](t, {"eligible": True, "landed": False, "stage": "rebase",
                              "detail": "conflict"})
@@ -14835,7 +14822,7 @@ def test_unreviewed_roles_never_land():
           "start_landing": lambda tid, approved=False: begun.append((tid, approved)) or True,
           "record_landing": lambda task, out: recorded.append(out),
           "repo_guard": lambda cwd: contextlib.nullcontext()}
-    got = _bot_fns({"land_or_drop", "approve_task", "unreviewed_role"}, ns)
+    got = lift({"land_or_drop", "approve_task", "unreviewed_role"}, ns=ns)["__lifted__"]
     check("Land, Approve and the role gate were lifted out of bot.py",
           {"land_or_drop", "approve_task", "unreviewed_role"} <= got, str(sorted(got)))
 
@@ -14877,7 +14864,7 @@ def test_unreviewed_roles_never_land():
         def attach(self, cwd, tid, branch): attached.append(branch); return None
     gate = {"project_store": Projects(), "worktrees": Worktrees(), "merge": M,
             "branches": B, "roles": roles, "log": logging.getLogger("test")}
-    _bot_fns({"land_if_ready", "landing_enabled", "unreviewed_role"}, gate)
+    lift({"land_if_ready", "landing_enabled", "unreviewed_role"}, ns=gate, absent=LANDING_ROUTES)
     for approved in (False, True):
         r = gate["land_if_ready"]({"id": "tsk_r", "project": "p", "role": roles.RESEARCHER,
                                    "verified": True, "scope": {"cwd": "/nowhere"}},
@@ -14891,7 +14878,7 @@ def test_guard_env_reaches_task_turns_only():
     import git_guard as GG
     import roles as R_
     print("\nimplementor git guard: who carries the role")
-    ns = bot_functions("claude_env", git_guard=GG, os=os, APPROVAL_PORT=1,
+    ns = lift("claude_env", git_guard=GG, os=os, APPROVAL_PORT=1,
                        CLAUDE_APPROVAL_MODE="skip", APPROVAL_TIMEOUT=1)
     saved = {k: os.environ.get(k) for k in (GG.ROLE_VAR, GG.ID_VAR)}
     # As if this process had itself been started from inside a task turn.
@@ -15025,14 +15012,15 @@ def test_conflicting_landings_go_back_to_their_implementor():
           "repo_guard": lambda *a, **k: contextlib.nullcontext(),
           "file_followups": lambda *a, **k: [], "REVISION": {"sha": ""},
           "BASE_DIR": root / "elsewhere", "Path": Path}
-    got = _bot_fns({"resolve_review", "rework_flagged_review", "rework_conflict",
+    got = lift({"resolve_review", "rework_flagged_review", "rework_conflict",
                     "rework_finished", "conflict_addendum", "send_back",
                     "review_addendum", "_unsupervised", "MAX_REVIEW_REWORKS",
                     "MAX_CONFLICT_REWORKS", "CONFLICT_STAGES", "land_and_record",
                     "land_if_ready", "landing_enabled", "record_landing",
                     "_is_own_checkout", "start_landing", "approve_task",
                     "land_or_drop", "LANDING_UNDERWAY", "_landing_now",
-                    "_landing_guard"}, ns)
+                    "_landing_guard"}, ns=ns,
+               absent=LANDING_ROUTES + ('CLAUDE_CWD',))["__lifted__"]
     check("the gate, both landing doors and the rework were lifted out of bot.py",
           {"resolve_review", "rework_conflict", "rework_finished", "start_landing",
            "approve_task", "land_or_drop"} <= got, str(sorted(got)))
@@ -15492,8 +15480,8 @@ def test_one_suite_run_per_project_at_a_time():
               "worktrees": W, "merge": M, "branches": B, "verify": V,
               "log": logging.getLogger("test"), "repo_guard": G.repo_guard,
               "record_landing": lambda *a, **k: None}
-        got = _bot_fns({"land_if_ready", "landing_enabled", "verify_work",
-                        "LANDING_UNDERWAY"}, ns)
+        got = lift({"land_if_ready", "landing_enabled", "verify_work",
+                        "LANDING_UNDERWAY"}, ns=ns, absent=LANDING_ROUTES)["__lifted__"]
         check("the landing and the verification were lifted out of bot.py",
               {"land_if_ready", "verify_work"} <= got, str(sorted(got)))
         task = {"id": "tsk_lands", "project": "cadence", "role": "implementor",
@@ -15659,8 +15647,8 @@ def test_a_simulator_that_would_not_launch_gets_one_more_go():
               "log": logging.getLogger("test"),
               "repo_guard": lambda *a, **k: contextlib.nullcontext(),
               "record_landing": lambda *a, **k: None}
-        _bot_fns({"land_if_ready", "landing_enabled", "verify_work",
-                  "LANDING_UNDERWAY"}, ns)
+        lift({"land_if_ready", "landing_enabled", "verify_work",
+                  "LANDING_UNDERWAY"}, ns=ns, absent=LANDING_ROUTES)
         r = ns["land_if_ready"]({"id": "tsk_flaky", "project": "cadence",
                                  "role": "implementor", "verified": True,
                                  "scope": {"cwd": str(repo), "branch": "main"}})
@@ -15758,7 +15746,7 @@ def test_artifact_retention():
         def files_upload_v2(self, **kw):
             if kw["title"] == "clip.mp4":
                 raise RuntimeError("upload refused")
-    ub = bot_functions("upload_outbox", ARTIFACTS_ROOT=arch, artifacts=artifacts, Path=Path,
+    ub = lift("upload_outbox", ARTIFACTS_ROOT=arch, artifacts=artifacts, Path=Path,
                        shutil=shutil, store=tmp_store())
     ub["log"].disabled = True
     ub["upload_outbox"](Client(), ob, "C1", "1.0", "C1:1.0")
@@ -15775,7 +15763,7 @@ def test_artifact_retention():
     for key, entry in sessions.items():
         st.update(key, **entry)
     before = st.get("C1:1.0")["updated"]
-    ns = bot_functions("_sweep_pass", store=st, task_store=types.SimpleNamespace(
+    ns = lift("_sweep_pass", store=st, task_store=types.SimpleNamespace(
                            all=lambda: {}, compact_older_than=lambda d: None),
                        OUTBOX_ROOT=Path(tempfile.mkdtemp()), shutil=shutil,
                        SESSION_MAX_AGE_DAYS=30, TASK_COMPACT_AFTER_DAYS=14,
@@ -15943,7 +15931,7 @@ def test_a_tasks_base_is_its_projects_current_base():
           "repo_guard": lambda cwd, progress=None: contextlib.nullcontext(),
           "record_landing": lambda t, o: recorded.append(o),
           "LANDING_UNDERWAY": "landing", "log": logging.getLogger("test")}
-    got = _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+    got = lift({"land_if_ready", "landing_enabled"}, ns=ns, absent=LANDING_ROUTES)["__lifted__"]
     check("the landing gate and its base resolver were lifted out of bot.py",
           {"land_if_ready", "task_base"} <= got, str(sorted(got)))
     land = ns["land_if_ready"]
@@ -15960,7 +15948,7 @@ def test_a_tasks_base_is_its_projects_current_base():
 
     # --- reruns ------------------------------------------------------------------------
     ns2 = {"project_store": ps, "branches": B}
-    _bot_fns({"task_base"}, ns2)
+    lift({"task_base"}, ns=ns2)
     rerun = W.create(repo, "tsk_rerun", fetch=False, base=ns2["task_base"](work))
     check("a rerun starts from the current base",
           rerun and git(rerun, "rev-parse", "HEAD").stdout.strip() == sha("main"),
@@ -16013,7 +16001,7 @@ def test_a_tasks_base_is_its_projects_current_base():
           len(dups) >= 2 and all(len(c.args) > 2 and ast.unparse(c.args[2]) == "unmerged_survey"
                                  for c in dups), str([ast.unparse(c) for c in dups]))
     ns3 = {"project_store": ps, "branches": B}
-    _bot_fns({"unmerged_survey"}, ns3)
+    lift({"unmerged_survey"}, ns=ns3)
     check("which measures a stale-base task against the current base",
           [r["id"] for r in ns3["unmerged_survey"]([again])] == []
           and [r["id"] for r in B.survey([again])] == [again["id"]])
@@ -16523,7 +16511,7 @@ def test_the_correction_runs_once_at_startup():
     ns = {"task_store": ts, "store": ss, "turncost": turncost,
           "jsonstore": __import__("jsonstore"), "COST_CORRECTION_FILE": d / "marker.json",
           "log": logging.getLogger("test"), "time": time, "Path": Path}
-    _bot_fns({"correct_costs_once"}, ns)
+    lift({"correct_costs_once"}, ns=ns)
     first = ns["correct_costs_once"]()
     check("the first start corrects", first and first["tasks_changed"] == 3, str(first))
     check("and marks that it has", (d / "marker.json").exists())
@@ -16540,7 +16528,7 @@ def test_the_correction_runs_once_at_startup():
     broken["COST_CORRECTION_FILE"] = d / "other.json"
     broken["log"] = logging.getLogger("test.expected-failure")
     broken["log"].disabled = True
-    _bot_fns({"correct_costs_once"}, broken)
+    lift({"correct_costs_once"}, ns=broken)
     check("a failure does not stop the bot, and is retried next start",
           broken["correct_costs_once"]() is None and not (d / "other.json").exists())
 
@@ -16573,7 +16561,7 @@ def test_a_failed_correction_still_seeds_session_totals():
           "jsonstore": __import__("jsonstore"), "COST_CORRECTION_FILE": d / "marker.json",
           "log": logging.getLogger("test.expected-failure"), "time": time, "Path": Path}
     ns["log"].disabled = True
-    _bot_fns({"correct_costs_once"}, ns)
+    lift({"correct_costs_once"}, ns=ns)
     check("the failure is not marked as done",
           ns["correct_costs_once"]() is None and not (d / "marker.json").exists())
     thread = ss.get("C:1")
@@ -16853,11 +16841,12 @@ def test_project_new_from_slack_and_dashboard():
                                        if not k.startswith("__")})
     fake_ws.create = functools.partial(workspaces.create, gh=gh, root=root / "workspace")
     fake_ws.github_repo = functools.partial(workspaces.github_repo, gh=gh)
-    ns = bot_functions("new_project_from_thread", "github_for_thread_project",
+    ns = lift("new_project_from_thread", "github_for_thread_project",
                        "handle_projects",
                        store=st, project_store=ps, workspaces=fake_ws, GITHUB_OWNER="me",
                        repos=__import__("repos"), Path=Path, projects=projects,
-                       install_git_guards=lambda *a: None, RUNNING={"C:busy": object()})
+                       install_git_guards=lambda *a: None, RUNNING={"C:busy": object()},
+              absent=PROJECT_ROUTES)
     st.update("C:busy", cwd=str(root))
     st.update("C:pend", cwd=str(root), pending={"ts": "1"})
     busy = [ns["new_project_from_thread"](k, f"Busy{i}") for i, k in
@@ -16935,7 +16924,7 @@ def test_threads_and_tasks_filed_by_directory():
     t_prop = ts.create("x", role="implementor", state="proposed",
                        scope={"cwd": str(root / "ws/b")})
     tstamp = {k: v["updated"] for k, v in ts.all().items()}
-    ns = bot_functions("file_existing_by_directory", "file_by_directory",
+    ns = lift("file_existing_by_directory", "file_by_directory",
                        store=st, task_store=ts, project_store=ps, workspaces=workspaces,
                        CLAUDE_CWD=root / "ws/Silkworm/workspace")
     first = ns["file_existing_by_directory"]()
@@ -17229,7 +17218,7 @@ def test_filing_a_thread_never_rewrites_a_projects_scope():
     try:
         ps = projects.ProjectStore(root / "projects.json")
         st = SessionStore(root / "s.json")
-        ns = bot_functions("file_thread_under", store=st, project_store=ps, Path=Path)
+        ns = lift("file_thread_under", store=st, project_store=ps, Path=Path)
         # Production, 2026-10-09: `!project Silkworm` in a fresh DM thread
         # turned silkworm's scope into {cwd: ~/workspace/projects/silkworm}.
         repo = root / "Silkworm"
@@ -17387,8 +17376,8 @@ def test_a_renamed_project_keeps_one_record():
               and not (root / "workspace" / "trading-bot").exists(), refused)
 
         # The dashboard rename refuses a name another project already has.
-        ns = bot_functions("handle_projects", project_store=ps, projects=projects,
-                           scoping=__import__("scoping"))
+        ns = lift("handle_projects", project_store=ps, projects=projects,
+                           scoping=__import__("scoping"), absent=PROJECT_ROUTES)
         r = ns["handle_projects"]({"action": "title", "slug": "kyoto", "title": "trading  BOT"})
         check("renaming to another project's name is refused",
               not r["ok"] and "trader" in r["error"] and ps.get("kyoto")["title"] == "Kyoto", r)
@@ -17507,8 +17496,9 @@ def test_board_routes_through_handle_tasks():
           "unmerged_survey": lambda recs: surveyed.append(1) or survey,
           "tell_thread": lambda *a: None, "stop_task": lambda tid: True,
           "log": logging.getLogger("test"), "time": time}
-    found = _bot_fns({"handle_tasks", "board_survey", "board_release", "_board_survey",
-                      "_board_releases", "_with_costs", "_spend"}, ns)
+    found = lift({"handle_tasks", "board_survey", "board_release", "_board_survey",
+                      "_board_releases", "_with_costs", "_spend"}, ns=ns,
+                 absent=TASK_ROUTES + STEP_ROUTES)["__lifted__"]
     check("the routes and their caches are in bot.py",
           {"board_survey", "board_release", "_board_survey", "_board_releases"} <= found)
     ht = ns["handle_tasks"]
@@ -17808,9 +17798,10 @@ def _edit_routes(tmp=None):
           "stop_task": lambda tid: True, "install_git_guards": guards.append,
           "unregistered_repos": lambda: [], "GITHUB_OWNER": "",
           "CLAUDE_CWD": d / "scratch", "log": logging.getLogger("test"), "time": time}
-    found = _bot_fns({"handle_tasks", "handle_projects", "edit_task", "held_reason",
+    found = lift({"handle_tasks", "handle_projects", "edit_task", "held_reason",
                       "_task_title", "board_survey", "board_release", "_board_survey",
-                      "_board_releases", "_with_costs", "_spend"}, ns)
+                      "_board_releases", "_with_costs", "_spend"}, ns=ns,
+                 absent=TASK_ROUTES + PROJECT_ROUTES + STEP_ROUTES)["__lifted__"]
     return ns, ts, ps, found
 
 
@@ -18828,14 +18819,15 @@ def test_taking_the_step_from_the_board():
             return "A release of `busy` is already running."
         started["then"] = then
         return ":rocket: Releasing `cadence` (everything pending, minor)…"
-    ns = bot_functions("handle_tasks", "approve_task", task_store=st, tasks=T,
+    ns = lift("handle_tasks", "approve_task", task_store=st, tasks=T,
                        holding=__import__("holding"), task_state=state,
                        release_command=release_command, RELEASE_STARTED=":rocket:",
                        LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
                        roles=__import__("roles"),
                        tell_thread=lambda key, text: said.append(text),
                        stop_task=lambda tid: False,
-                       start_landing=lambda tid, **k: landings.append((tid, k)))
+                       start_landing=lambda tid, **k: landings.append((tid, k)),
+              absent=TASK_ROUTES)
     route = ns["handle_tasks"]
 
     def parked(asks, project="cadence"):
@@ -18944,9 +18936,10 @@ def test_a_running_task_refuses_a_persons_send_back():
     import tasks as T
     st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     state = _bot_func("task_state", task_store=st, tasks=T, log=logging.getLogger("t"))
-    ns = bot_functions("handle_tasks", "approve_task", task_store=st, tasks=T,
+    ns = lift("handle_tasks", "approve_task", task_store=st, tasks=T,
                        holding=__import__("holding"), stop_task=lambda tid: True,
-                       start_landing=lambda tid: None, tell_thread=lambda *a: None)
+                       start_landing=lambda tid: None, tell_thread=lambda *a: None,
+              absent=TASK_ROUTES + STEP_ROUTES)
     route = ns["handle_tasks"]
 
     def running(goal="the job"):
@@ -19088,11 +19081,11 @@ commands = ["exit 3"]
           "app": types.SimpleNamespace(client=Client()),
           "board_release": lambda slug: B.release_status(ps.scope_for(slug).get("cwd")),
           "DRAIN": __import__("drain").Drain()}
-    _bot_fns({"release_command", "release_plan", "run_release", "_releasing",
+    lift({"release_command", "release_plan", "run_release", "_releasing",
               "_releasing_guard", "release_steps", "_release_runs", "release_allowed",
               "_release_names", "release_offer", "start_release", "release_thread",
               "releasable_projects", "handle_releases", "_board_releases",
-              "release_checkout", "RELEASE_STARTED"}, ns)
+              "release_checkout", "RELEASE_STARTED"}, ns=ns, absent=('operator_refused',))
     return types.SimpleNamespace(ns=ns, repo=repo, origin=origin, root=root, g=g,
                                  commit=commit, log=log_, posts=posts, ps=ps)
 
@@ -19332,13 +19325,14 @@ def test_no_release_starts_while_a_deploy_drains():
     fx = _release_fixture()
     st = T.TaskStore(fx.root / "t.json")
     told = []
-    ns = bot_functions("handle_tasks", task_store=st, tasks=T,
+    ns = lift("handle_tasks", task_store=st, tasks=T,
                        holding=__import__("holding"), task_state=_task_state_for(st),
                        release_command=fx.ns["release_command"], RELEASE_STARTED=":rocket:",
                        LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
                        roles=__import__("roles"),
                        tell_thread=lambda key, text: told.append(text),
-                       stop_task=lambda tid: False, start_landing=lambda tid, **k: None)
+                       stop_task=lambda tid: False, start_landing=lambda tid, **k: None,
+              absent=TASK_ROUTES)
     t = st.create("Ship it", role="implementor", project="alpha", thread="C1:1.0")
     st.transition(t["id"], T.RUNNING)
     st.update(t["id"], needs_user={"action": "!release alpha ios", "why": "",
@@ -20069,11 +20063,12 @@ def test_findings_actions_from_the_board():
     import research, tasks as T
     st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     state = _task_state_for(st)
-    ns = bot_functions("handle_tasks", "decide_findings", task_store=st, tasks=T,
+    ns = lift("handle_tasks", "decide_findings", task_store=st, tasks=T,
                        research=research, holding=__import__("holding"), task_state=state,
                        merge=__import__("merge"), roles=__import__("roles"),
                        tell_thread=lambda *a: None, stop_task=lambda tid: False,
-                       start_landing=lambda *a, **k: None)
+                       start_landing=lambda *a, **k: None,
+              absent=TASK_ROUTES + STEP_ROUTES)
     route = ns["handle_tasks"]
 
     a = _research_parked(st)
@@ -20290,11 +20285,12 @@ def test_findings_clicks_tell_rounds_apart():
     import home, research, tasks as T
     st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     state = _task_state_for(st)
-    ns = bot_functions("handle_tasks", "decide_findings", "send_back", task_store=st,
+    ns = lift("handle_tasks", "decide_findings", "send_back", task_store=st,
                        tasks=T, research=research, holding=__import__("holding"),
                        task_state=state, merge=__import__("merge"),
                        roles=__import__("roles"), tell_thread=lambda *a: None,
-                       stop_task=lambda tid: False, start_landing=lambda *a, **k: None)
+                       stop_task=lambda tid: False, start_landing=lambda *a, **k: None,
+              absent=TASK_ROUTES + STEP_ROUTES)
     route = ns["handle_tasks"]
 
     def repark(tid):
@@ -20361,7 +20357,7 @@ def test_findings_clicks_tell_rounds_apart():
     check("board cards and the detail view carry the round the page sends back",
           B.card(st.get(c)).get("round") == research.round_of(st.get(c))
           == B.detail(st.get(c), list(st.all().values())).get("round"))
-    w = bot_functions("_with_costs", task_store=st, costs=__import__("costs"),
+    w = lift("_with_costs", task_store=st, costs=__import__("costs"),
                       research=research, board=B, slacklinks=__import__("slacklinks"),
                       tasks=__import__("tasks"))
     check("as do the task panel's rows",
@@ -20415,12 +20411,13 @@ def test_release_and_dismiss_on_findings_tell_rounds_apart():
     def release_command(arg, post, then=None):
         started["then"] = then
         return ":rocket: Releasing `alpha`…"
-    ns = bot_functions("handle_tasks", "decide_findings", task_store=st, tasks=T,
+    ns = lift("handle_tasks", "decide_findings", task_store=st, tasks=T,
                        research=research, holding=__import__("holding"), task_state=state,
                        release_command=release_command, RELEASE_STARTED=":rocket:",
                        LANDING_UNDERWAY="in-progress", merge=__import__("merge"),
                        roles=__import__("roles"), tell_thread=lambda *a: None,
-                       stop_task=lambda tid: False, start_landing=lambda *a, **k: None)
+                       stop_task=lambda tid: False, start_landing=lambda *a, **k: None,
+              absent=TASK_ROUTES)
     route = ns["handle_tasks"]
     asks = {"action": "!release alpha all", "why": "", "release": "alpha all"}
 
@@ -20635,7 +20632,7 @@ def test_landing_frees_its_own_generated_only_checkout():
               "repo_guard": lambda cwd: contextlib.nullcontext(),
               "record_landing": lambda task, out: recorded.append(out),
               "LANDING_UNDERWAY": "in-progress", "log": logging.getLogger("test")}
-        _bot_fns({"land_if_ready", "landing_enabled"}, ns)
+        lift({"land_if_ready", "landing_enabled"}, ns=ns, absent=LANDING_ROUTES)
         land = ns["land_if_ready"]
         base = {"project": "cadence", "role": "implementor", "verified": True,
                 "scope": {"cwd": str(repo)}}
@@ -20812,7 +20809,7 @@ def test_generated_paths_setting():
             check(f"{bad!r} is refused", True)
 
     hp = {"projects": P, "project_store": ps2, "log": logging.getLogger("test")}
-    _bot_fns({"handle_projects"}, hp)
+    lift({"handle_projects"}, ns=hp, absent=PROJECT_ROUTES)
     r = hp["handle_projects"]({"action": "generated", "slug": "cadence",
                                "paths": ", ".join(_GEN)})
     check("the dashboard route sets them", r.get("ok") and ps2.get("cadence")["generated"] == _GEN, str(r))
@@ -20822,7 +20819,7 @@ def test_generated_paths_setting():
     # The bot's lookup: by the project whose checkout this is.
     ps2.ensure("cadence", scope={"cwd": str(d)})
     gp = {"project_store": ps2, "Path": Path}
-    _bot_fns({"generated_paths"}, gp)
+    lift({"generated_paths"}, ns=gp)
     check("the bot's lookup finds a project by its checkout",
           gp["generated_paths"](d) == _GEN and gp["generated_paths"](d / "x") == [])
     src = (BASE / "bot.py").read_text()
@@ -21195,7 +21192,7 @@ def test_task_panel_slim_rows():
     ns = {"task_store": ts, "costs": costs, "board": B,
           "research": __import__("research"), "slacklinks": __import__("slacklinks"),
           "tasks": __import__("tasks")}
-    _bot_fns({"_with_costs"}, ns)
+    lift({"_with_costs"}, ns=ns)
     full = ns["_with_costs"](sorted(recs, key=lambda t: -(t.get("created") or 0)))
     slim = [B.panel_row(t) for t in full]
     big, small = len(json.dumps(full)), len(json.dumps(slim))
@@ -21488,7 +21485,7 @@ def _action_cli_bot():
         survey=survey,
         line=lambda rows: f"{len(rows)} branch(es)")
     hold, dr = retry.Hold(), drain.Drain()
-    ns = bot_functions(
+    ns = lift(
         "handle_tasks", "approve_task", "decide_findings", "land_or_drop",
         "_with_costs", "_spend", "handle_status",
         tasks=T, task_store=st, research=research, holding=__import__("holding"),
@@ -21506,7 +21503,8 @@ def _action_cli_bot():
         slack=types.SimpleNamespace(status=lambda now: {"connected": True}),
         credentials=types.SimpleNamespace(state=lambda has_token: {"mode": "token"}),
         daemons=types.SimpleNamespace(status=lambda: {"count": 1, "alive": 1}),
-        RUNNER_HOLD=hold, DRAIN=dr, os=os)
+        RUNNER_HOLD=hold, DRAIN=dr, os=os,
+        absent=TASK_ROUTES + STEP_ROUTES + ('record_landing', 'repo_guard'))
     with _socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -22112,7 +22110,7 @@ def _base_glue(ps, ts, *, suite, base=("main", "b" * 40), moved=True, verify_ok=
 
     wt = types.SimpleNamespace(is_repo=lambda p: True, drop_scratch=lambda *a: True,
                                attach=lambda *a, **k: Path(tempfile.mkdtemp()))
-    ns = bot_functions(
+    ns = lift(
         "ask_base", "hold_for_base", "hold_landing_for_base", "release_base",
         "reverify_held", "announce_red", "release_held",
         project_store=ps, task_store=ts, basered=_br, verify=_V, merge=_merge,
@@ -22482,7 +22480,7 @@ def _checkout_glue(ps, ts, suite_ok=False):
         calls["suite"].append(cwd)
         return {"ran": True, "ok": state["ok"], "output": "" if state["ok"] else "  ✘ t1\n"}
     state = {"ok": suite_ok}
-    ns = bot_functions(
+    ns = lift(
         "hold_landing_for_checkout", "announce_checkout", "release_checkout_hold",
         "release_held_checkout", "_probe_checkout", "probe_failing_checkouts",
         project_store=ps, task_store=ts, basered=_br, merge=_merge, tasks=_T,
@@ -22805,7 +22803,7 @@ def test_base_is_the_local_commit_a_landing_merges_into():
     local = g(clone, "rev-parse", "HEAD")
     g(up, "commit", "-q", "--allow-empty", "-m", "two, not pulled")
     g(clone, "fetch", "-q", "origin")
-    ns = bot_functions("current_base", worktrees=W, branches=BR, subprocess=subprocess,
+    ns = lift("current_base", worktrees=W, branches=BR, subprocess=subprocess,
                        task_base=lambda t: "main")
     name, sha = ns["current_base"](str(clone), {"project": "p"})
     check("origin ahead and not pulled: still the local commit",
@@ -22916,7 +22914,7 @@ def _operator_bot(repo=None):
     st = T.TaskStore(tmp / "t.json")
     state = O.State(tmp / "operator.json")
     landings, steps = [], []
-    ns = bot_functions(
+    ns = lift(
         "handle_tasks", "approve_task", "decide_findings", "land_or_drop", "_with_costs",
         "_spend", "operator_refused", "task_contained", "task_live_paths", "task_base",
         tasks=T, task_store=st, research=research, holding=__import__("holding"),
@@ -22931,7 +22929,7 @@ def _operator_bot(repo=None):
         start_landing=lambda tid, **k: landings.append(tid) or True,
         repo_guard=lambda *a, **k: contextlib.nullcontext(),
         discard=types.SimpleNamespace(drop=lambda repo, br: (True, "discarded/x", "")),
-        record_landing=lambda *a, **k: None, os=os)
+        record_landing=lambda *a, **k: None, os=os, absent=TASK_ROUTES)
     with _socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -23060,8 +23058,9 @@ def test_operator_publish_and_trader_settings_are_refused():
     print("\nthe operator: publishing where it is off, and trader's settings, are refused")
     tmp = Path(tempfile.mkdtemp())
     state = O.State(tmp / "operator.json")
-    refused = bot_functions("operator_refused", operator_role=O, OPERATOR=state,
-                            task_store=types.SimpleNamespace(get=lambda tid: None))["operator_refused"]
+    refused = lift("operator_refused", operator_role=O, OPERATOR=state,
+                            task_store=types.SimpleNamespace(get=lambda tid: None),
+                   absent=('task_contained', 'task_live_paths'))["operator_refused"]
     me = {"caller_role": "operator"}
     out = refused("projects", "publish", {**me, "slug": "cadence", "on": True})
     check("switching publish on is refused", out and out["refused"] == "publish", str(out))
@@ -23193,7 +23192,7 @@ def test_operator_approvals_come_only_from_a_person_in_slack():
     check("a guard with no item is refused", O.parse_approve("!approve accept")[2])
     tmp = Path(tempfile.mkdtemp())
     state = O.State(tmp / "operator.json")
-    ns = bot_functions("approve_command", operator_role=O, OPERATOR=state,
+    ns = lift("approve_command", operator_role=O, OPERATOR=state,
                        BOT_USER_ID="UBOT", ALLOWED_USERS={"U_ME"},
                        fmt_age=lambda ts: "now")
     approve = ns["approve_command"]
@@ -23330,7 +23329,7 @@ def test_operator_context_is_live_and_within_budget():
             return {"ok": True, "tasks": [{"id": "tsk_1", "project": "a",
                                            "state": "proposed", "title": "x"}]}
         return {"ok": True, "tasks": [], "unmerged": [], "watching": []}
-    ns = bot_functions("operator_status", "_cli_module", _CLI={},
+    ns = lift("operator_status", "_cli_module", _CLI={},
                        SILKWORM_BIN=str(BASE / "bin" / "silkworm"), handle_tasks=fake_tasks,
                        handle_status=lambda p: {"online": True,
                                                 "revision": {"state": "stale", "behind": 2}})
@@ -23340,7 +23339,7 @@ def test_operator_context_is_live_and_within_budget():
           and got["needs_you"] == {"a": {"proposed": [{"id": "tsk_1", "title": "x",
                                                        "state": "proposed", "role": None}]}},
           str(got))
-    ns = bot_functions("operator_status", "_cli_module", _CLI={},
+    ns = lift("operator_status", "_cli_module", _CLI={},
                        SILKWORM_BIN=str(BASE / "nonexistent"), handle_tasks=fake_tasks,
                        handle_status=lambda p: {})
     check("and when it cannot be, that is None, not an empty board",
@@ -23372,7 +23371,7 @@ def test_operator_sweep_is_daily_after_the_digest_and_posts_once():
     check("due after both", state.sweep_due(morning, "08:30", "2026-10-13"))
 
     st = T.TaskStore(tmp / "t.json")
-    ns = bot_functions("file_operator_sweep", task_store=st, tasks=T, operator_role=O,
+    ns = lift("file_operator_sweep", task_store=st, tasks=T, operator_role=O,
                        OPERATOR=state, BASE_DIR=tmp, datetime=datetime, SILKWORM_BIN="/s")
     filed = []
     for minute in range(0, 60, 5):           # the scheduler's beat, for an hour
@@ -23403,7 +23402,7 @@ def test_operator_sweep_is_daily_after_the_digest_and_posts_once():
           late.sweep_due(datetime(2026, 10, 13, 23, 59), "22:30", "2026-10-12")
           and not late.sweep_due(datetime(2026, 10, 13, 23, 58), "22:30", "2026-10-12"))
     lst = T.TaskStore(tmp / "late-t.json")
-    lns = bot_functions("file_operator_sweep", task_store=lst, tasks=T, operator_role=O,
+    lns = lift("file_operator_sweep", task_store=lst, tasks=T, operator_role=O,
                         OPERATOR=late, BASE_DIR=tmp, datetime=datetime, SILKWORM_BIN="/s")
     lrec = lst.get(lns["file_operator_sweep"](datetime(2026, 10, 13, 11, 30), digest_missed=True))
     check("a sweep without the digest says so on the board and to the operator",
@@ -23886,7 +23885,7 @@ def test_operator_drops_nothing_reverted_and_tidies_only_finished_task_checkouts
     wt = types.SimpleNamespace(**{k: getattr(W, k) for k in dir(W) if not k.startswith("__")})
     wt.ROOT = root
     wt.age_s = lambda p: ages.get(Path(p).name, 99999)
-    ns = bot_functions("tidy_checkout", task_store=st, tasks=T, worktrees=wt,
+    ns = lift("tidy_checkout", task_store=st, tasks=T, worktrees=wt,
                        live_worktree_tasks=lambda: set(),
                        repo_guard=lambda *a, **k: contextlib.nullcontext(), Path=Path)
     tidy = ns["tidy_checkout"]
@@ -25593,8 +25592,12 @@ def _web_bot(tmp: Path):
             kw["on_init"]("sid-new" if session_id is None else session_id)
         return types.SimpleNamespace(session_id=session_id or "sid-new", cost_usd=0.01,
                                      text="the reply", duration_ms=5)
-    cmd = bot_functions("handle_command", "file_thread_under", store=st, project_store=ps,
-                        RUNNING=running, HELP="help", Path=Path)
+    cmd = lift("handle_command", "file_thread_under", store=st, project_store=ps,
+                        RUNNING=running, HELP="help", Path=Path,
+               absent=('CLAUDE_CWD', 'CLAUDE_MODEL', 'COST_NOTE', 'fmt_age',
+                       'github_for_thread_project', 'install_git_guards', 'kill_terminal',
+                       'learnings', 'new_project_from_thread', 'operator_command',
+                       'release_command', 'set_ideate_lenses'))
     shared = dict(store=st, task_store=ts, tasks=T, webthread=webthread, RUNNING=running,
                   RUNNING_TASKS={}, app=app, Path=Path, UPLOADS_ROOT=tmp / "uploads",
                   OUTBOX_ROOT=tmp / "outbox", CLAUDE_CWD=tmp / "scratch")
@@ -28025,7 +28028,7 @@ def test_health_scheduler_is_off_the_hot_path_and_swallows_failures():
                                          info=lambda *a, **k: None, error=lambda *a, **k: None)
         store = Store()
         import threading
-        ns = bot_functions("_health_scheduler", HEALTH_AT=at, HEALTH_SCHEDULE="x",
+        ns = lift("_health_scheduler", HEALTH_AT=at, HEALTH_SCHEDULE="x",
                            HEALTH_BUSY=threading.Event(),
                            HEALTH=store, health=H, run_health=run,
                            datetime=types.SimpleNamespace(now=lambda: next(times)),
@@ -29633,7 +29636,7 @@ def test_probe_mini_is_checked_and_the_cli_can_probe_now():
     fake_h = types.SimpleNamespace(
         run_all=lambda store, ts, recs, gh, **kw: calls.setdefault("recs", list(recs)) and [],
         gh_cli=None, OK="ok")
-    ns = bot_functions("run_health", HEALTH=object(), task_store=None, health=fake_h,
+    ns = lift("run_health", HEALTH=object(), task_store=None, health=fake_h,
                        health_probes=P, project_store=types.SimpleNamespace(
                            all=lambda include_archived=False: [{"slug": "cadence"}],
                            scope_for=lambda s: {}),
@@ -30289,8 +30292,8 @@ def _lift_bot(repo):
                   ops_context=lambda: OPS.Context(
                       project=lambda slug: None, python=sys.executable, silkworm_bin="/s",
                       uid=os.getuid(), launch_agents=Path(tempfile.mkdtemp())))
-    ns2 = bot_functions("handle_ops", "record_ops_plan", "guarded_plan_entry",
-                        "handle_projects", **shared)
+    ns2 = lift("handle_ops", "record_ops_plan", "guarded_plan_entry",
+                        "handle_projects", **shared, absent=PROJECT_ROUTES + ('OPS_LOG',))
     bot.ns2 = ns2
     bot.server.route("/ops", ns2["handle_ops"])
     bot.server.route("/projects", ns2["handle_projects"])
@@ -30599,7 +30602,7 @@ def test_guard_lift_rules():
 def test_operator_grant_is_made_only_for_your_own_message():
     import operator_role as O
     print("\nthe operator's grant: made for your Slack message's turn in its thread, and no other")
-    ns = bot_functions("user_started", BOT_USER_ID="UBOT", ALLOWED_USERS={"U_ME"})
+    ns = lift("user_started", BOT_USER_ID="UBOT", ALLOWED_USERS={"U_ME"})
     started = ns["user_started"]
     check("your Slack message starts a turn of yours", started({"ts": "1.0"}, "U_ME"))
     check("the web chat does not, unless the dashboard vouched it was you",
@@ -30664,7 +30667,7 @@ def test_operator_release_cli_is_the_release_button():
     grants = O.Grants()
     fx.ns.update(operator_role=O, OPERATOR=state, OPERATOR_GRANTS=grants,
                  task_store=T.TaskStore(tmp / "t.json"))
-    _bot_fns({"operator_refused", "user_grant", "task_contained", "task_live_paths"}, fx.ns)
+    lift({"operator_refused", "user_grant", "task_contained", "task_live_paths"}, ns=fx.ns)
     asked = []
     hr = fx.ns["handle_releases"]
 
@@ -30825,11 +30828,12 @@ def _ops_world():
                  "beta": {"slug": "beta", "scope": {"cwd": str(alpha)}, "test_cmd": ""}}
     state = O.State(tmp / "operator.json")
     state.set_thread("D1:1.0")
-    ns = bot_functions("handle_ops", "ops_context", "user_grant", "record_ops_plan",
+    ns = lift("handle_ops", "ops_context", "user_grant", "record_ops_plan",
                        ops=OPS, OPS_LOG=tmp / "ops.jsonl", sys=sys, os=os, Path=Path,
                        git_guard=git_guard, operator_role=O, OPERATOR=state,
                        OPERATOR_GRANTS=O.Grants(), SILKWORM_BIN=str(BASE / "bin" / "silkworm"),
-                       project_store=types.SimpleNamespace(get=lambda s: projects_.get(s)))
+                       project_store=types.SimpleNamespace(get=lambda s: projects_.get(s)),
+              absent=('guarded_plan_entry', 'tell_thread'))
     real_context = ns["ops_context"]
     ctx = OPS.Context(project=lambda s: projects_.get(s), python=sys.executable,
                       silkworm_bin=str(BASE / "bin" / "silkworm"), uid=501,
@@ -33151,7 +33155,7 @@ def _requested_world():
     state = O.State(tmp / "operator.json")
     state.set_thread("D5:5.0")
     grants = O.Grants()
-    ns = bot_functions(
+    ns = lift(
         "handle_file_task", "filed_by_restricted_role", "begin_turn", "research_parent",
         "requested_filing",
         _filed_this_turn={}, re=__import__("re"), roles=R, scoping=S, tasks=T, projects=P,
@@ -33366,14 +33370,14 @@ def test_your_turn_carries_the_plan_you_answered():
           and [getattr(a, "id", "") for a in plan_kw[0].value.args] == ["msg_ts", "text"],
           ast.dump(plan_kw[0]) if plan_kw else "no plan= keyword")
     import operator_role as O
-    ns = bot_functions("pending_plan", OPERATOR=types.SimpleNamespace(
+    ns = lift("pending_plan", OPERATOR=types.SimpleNamespace(
         answer_plan=lambda ts, text: (_ for _ in ()).throw(OSError("unreadable"))))
     check("a plan that cannot be read costs your turn nothing: no plan, no raise",
           ns["pending_plan"]("1.0", "yes") is None)
     st = O.State(Path(tempfile.mkdtemp()) / "operator.json")
     st.set_thread("D1:1.0")
     st.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
-    ns = bot_functions("pending_plan", OPERATOR=st)
+    ns = lift("pending_plan", OPERATOR=st)
     check("and a readable one is attached", (ns["pending_plan"](f"{time.time() + 1:.6f}", "yes")
                                              or {}).get("entries", [{}])[0].get("name")
           == "tailscale-on")
@@ -34048,7 +34052,7 @@ def test_bot_opens_your_grant_for_a_vouched_dashboard_message():
     saved = os.environ.get("VIZ_TAILSCALE_LOGIN")
     os.environ["VIZ_TAILSCALE_LOGIN"] = OWNER
     try:
-        ns = bot_functions("user_started", "grant_starter", BOT_USER_ID="UBOT",
+        ns = lift("user_started", "grant_starter", BOT_USER_ID="UBOT",
                            ALLOWED_USERS={"U_ME"})
         started, starter = ns["user_started"], ns["grant_starter"]
         vouched = {"login": "owner@example.com", "peer": PHONE, "node": "iphone182"}
@@ -34174,9 +34178,10 @@ def test_bot_takes_dashboard_owner_only_from_the_visualizer():
 
     # The bot's route: the field dropped unless from_visualizer says so.
     delivered = []
-    ns = bot_functions("handle_web_message", dashowner=D,
+    ns = lift("handle_web_message", dashowner=D,
                        deliver_web_message=lambda p: delivered.append(p) or {"ok": True},
-                       WEB_SENDS=None, webthread=None, WEB_PEER_PROBE=_VizProbe(opener=777))
+                       WEB_SENDS=None, webthread=None, WEB_PEER_PROBE=_VizProbe(opener=777),
+              absent=('WEB_REPEAT_WAIT_S',))
     vouched = {"login": "owner@example.com", "peer": PHONE, "node": "iphone182"}
     ns["handle_web_message"]({"key": "D1:1.0", "text": "accept tsk_1",
                               "dashboard_owner": vouched}, c, s)
@@ -35661,8 +35666,9 @@ def _turns_route(ts, ps, survey):
           "tell_thread": lambda *a: None, "stop_task": lambda tid: True,
           "research": __import__("research"), "slacklinks": __import__("slacklinks"),
           "log": logging.getLogger("test"), "time": time}
-    _bot_fns({"handle_tasks", "board_survey", "board_release", "_board_survey",
-              "_board_releases", "_with_costs", "_spend"}, ns)
+    lift({"handle_tasks", "board_survey", "board_release", "_board_survey",
+              "_board_releases", "_with_costs", "_spend"}, ns=ns,
+         absent=TASK_ROUTES + STEP_ROUTES)
     return ns["handle_tasks"], ns
 
 
