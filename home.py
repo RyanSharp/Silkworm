@@ -1,9 +1,15 @@
-"""The Slack Home tab: the task board, reachable wherever Slack is.
+"""The Slack task board, reachable wherever Slack is.
 
 The dashboard binds loopback, so away from the house the board was out of
 reach -- and the board is where decisions wait. This puts the "what needs me"
-view in the app's Home tab instead: no server to expose, no second login, and
-the bot already holds the socket that publishes it.
+view in Slack instead: no server to expose, no second login, and the bot
+already holds the socket that posts it.
+
+Where it lives is `Board`: one message in a private channel, edited in place.
+It began as the app's Home tab (`Home`, which `Board` extends), and moved
+because the Home tab made Slack's Threads view send Reply to the app instead of
+the thread. The manifest keeps the Home tab off; see `Board` for why it must
+stay that way.
 
 Deliberately the attention view, not the backlog. It shows what is waiting on
 you, what is running, and what is scheduled to wake, and nothing else; the
@@ -720,7 +726,12 @@ def rework_modal(task: dict, answer: bool, dig: bool = False) -> dict:
 # --- wiring -------------------------------------------------------------------
 
 class Home:
-    """Publishes the view and relays clicks. `call` is bot.handle_tasks."""
+    """Publishes the view and relays clicks. `call` is bot.handle_tasks.
+
+    On its own this is the Home-tab board (`views_publish` on
+    `app_home_opened`), which bot.py no longer registers: what runs is
+    `Board`, which keeps the click handling and replaces where it is drawn.
+    """
 
     NOTICE_S = 90      # how long a result line stays at the top of the tab
     UNMERGED_S = 300   # the survey asks git about every branch; cache it
@@ -1085,8 +1096,9 @@ class Board(Home):
     What a message loses is privacy. A Home tab is drawn per person; a channel
     message is read by everyone in the channel. So the board is only posted
     where every member is on the allowlist, and taken down if that stops being
-    true. Results of a click go to the person who clicked, ephemerally, rather
-    than onto the shared board.
+    true. The result of a click is shown on the board itself for a short
+    while (see `current_notice`), not posted under it; only someone off the
+    allowlist who clicks gets a private, ephemeral refusal.
     """
 
     #: Slack caps a message at 50 blocks, half what a Home view may hold.

@@ -2,8 +2,8 @@
 
 Status: steps 1-4 built, and step 5 in part. Every Slack turn is a task, a
 queue runner executes tasks with no live message, and the dashboard (and the
-Slack Home tab) opens on what needs you. Queued implementor work runs in its
-own worktree, is verified by the project's own test command, and is gated behind an
+Slack board, a message kept current in a private channel) opens on what needs
+you. Queued implementor work runs in its own worktree, is verified by the project's own test command, and is gated behind an
 independent read-only review. Projects that opt in land reviewed, verified work
 on their base branch themselves (rebase, retest, fast-forward, retest, revert).
 Pushing the result is a separate opt-in. Of step 5, email ingestion, worktree

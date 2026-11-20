@@ -219,6 +219,7 @@ All via `.env` — see `.env.example` for the full annotated list. Highlights:
 | `OPERATOR_SWEEP_AT` | `08:30` | Local time of the operator's daily sweep, once the digest has gone out; caught up after a restart; `off` to stop (see [The operator](#the-operator)) |
 | `HEALTH_LEAD` | `15m` | Project health checks run once a day, this long before `OPERATOR_SWEEP_AT` (08:15 by default), so the sweep's brief reads that morning's results; still at that time when the sweep is off (anchored to the default sweep time); caught up after a restart, and the resolved schedule is logged at startup. `0` runs them at the sweep's own time, `off` stops them. Replaces `HEALTH_EVERY`, which is no longer read (a leftover one is warned about at startup). Checks (health.py; first `ci`: the latest GitHub Actions run of each workflow on the base branch, via `gh`): a failing one is one needs-you item per project and check, closed when it passes; `unknown` (gh missing, offline, rate-limited) never pages. Project-specific probes (health_probes.py, mapped by the explicit table in `health.toml`): trader `dispatching`, `gateway`, `healthcheck`; Supabase `backend-drift` (also flags production schema no base-branch migration creates, and skipped migration numbers -- a hand-applied, unrecorded migration); App Store `app-store`, `testflight`; and the project `mini` (Mac mini, registered at startup if absent, home Silkworm's checkout)'s `credentials`, `disk` and `tailscale` (the phone's way to the dashboard: tailscaled running and logged in, MagicDNS and HTTPS on, serve forwarding this machine's current name to the visualizer, Funnel off; the same tailnet.py `silkworm tailscale status` reads). Results in the sweep's brief, the digest, the dashboard, the operator's context and `silkworm health` (`--probe` runs them now without recording, refused to restricted roles; `--brief` prints the sweep's brief) |
 | `HEALTH_WARN_DAYS` | `3` | A check warning this long may get one fix proposal from the operator (`silkworm task --propose --health <project>/<check>`); a failing one may at once. Once per (project, check) and trouble, never while one is open, and through the ordinary proposed gate, caps and dedup. Checks whose trouble is the owner's decision (a backend release, App Review, a credential, a login, disk, Tailscale on the mini) are stated as decisions and never filed |
+| `SILKWORM_BOARD_CHANNEL` | `silkworm-board` | Private channel the task board is kept in, by name or id (see [The task board in Slack](#the-task-board-in-slack)); must be private with only the bot and allowlisted members, or the board is taken down |
 | `MAX_OPEN_PROPOSALS` | `4` | Untriaged proposals a project may hold before its nightly review pauses |
 
 ## Authentication for headless turns
@@ -795,7 +796,7 @@ every setting, list the projects: `-d '{"action":"list"}'`.
 ### 3. What a landing does
 
 A landing runs when **the review passes**. It also runs when you **Approve** a
-task that is in `awaiting_approval`, from the dashboard or the Slack Home tab,
+task that is in `awaiting_approval`, from the dashboard or the Slack board,
 because approving flagged work counts as a decision it is fine. Approving a task
 that is still `blocked` on its review doesn't land it.
 
@@ -1234,23 +1235,50 @@ keep going. If the bot is down, the session starts untracked.
 ## The task board in Slack
 
 Away from the house, the dashboard is out of reach -- and it is where decisions
-wait. The app's **Home tab** carries the same "what needs me" board: work
-awaiting approval (with the reviewer's findings), tasks that asked you
-something, failures and proposals, then what is running and what is scheduled
-to wake. Open it by clicking the app's name in Slack, on any device.
+wait. The bot keeps the same "what needs me" board as **one message in a private
+channel**, edited in place rather than reposted: work awaiting approval (with
+the reviewer's findings), tasks that asked you something, failures and
+proposals, then what is running and what is scheduled to wake. Pin the channel
+and it is a tap away on any device.
+
+Setting it up:
+
+1. Create a **private** channel named `silkworm-board` (or set
+   `SILKWORM_BOARD_CHANNEL` to another name, or to the channel's id).
+2. Invite the bot to it. Until it is in a channel by that name, it logs a
+   warning and posts nothing.
+3. Keep the members to the bot and people on `SLACK_ALLOWED_USERS`.
+
+A channel message is read by everyone in the channel, and the board carries
+task goals and review findings. So the bot checks, every pass (once a minute)
+and again the moment anyone joins (the `member_joined_channel` event), that the
+channel is private and that every member is the bot or on the allowlist. If
+either stops being true -- the channel is made public, or someone off the
+allowlist joins -- it **deletes the board** and posts nothing until it is true
+again, logging why. A public channel is never used: anyone in the workspace can
+read one without joining. (With `SLACK_ALLOWED_USERS` empty everyone is
+allowed, so only the private check applies.) If the bot is removed from the
+channel, it can no longer delete its last board message; delete that by hand.
 
 Its buttons are the dashboard's, state for state, and go through the same
 route, so Approve still lands the branch and Cancel still stops a running
 agent. Approve and Dismiss ask first. A button only acts if the task is still
-in the state it was drawn for; if it has moved on since, the tab says so and
-does nothing. People off `SLACK_ALLOWED_USERS` see none of it.
+in the state it was drawn for; if it has moved on since, it says so and does
+nothing. A click's result shows at the top of the board for about a minute and
+a half, rather than as a reply under it. Someone off the allowlist who clicks
+gets only a private (ephemeral) refusal, visible to them alone.
 
 It is the attention view, not the backlog: a large board is cut to fit Slack's
-limits and says how many are left for the dashboard.
+50-block message limit and says how many are left for the dashboard. It is
+redrawn when what it shows changes, and every ten minutes so relative times
+stay right. The daily digest and other bot messages never go to this channel.
 
-Needs `home_tab_enabled` and the `app_home_opened` event, both in
-`manifest.json`; an app created from an older manifest needs the new one pasted
-in (below).
+**The app's Home tab must stay off** (`home_tab_enabled: false` in
+`manifest.json`). The board used to live there, and with the Home tab on,
+Slack's Threads view sent **Reply** to the app's Home instead of to the thread
+-- turning it off is what fixed that. Don't re-enable it or subscribe to
+`app_home_opened`. An app created from an older manifest needs the new one
+pasted in (above): it turns the Home tab off and adds `member_joined_channel`.
 
 ## Reaching the dashboard from another machine
 
