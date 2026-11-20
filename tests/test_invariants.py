@@ -8936,25 +8936,56 @@ def test_state_files_have_one_reader_and_one_writer():
 
 
 
-# --- the Home tab: the task board, away from the local network ---------------
+# --- the Slack board: the task board, away from the local network ------------
 # The dashboard binds loopback, so decisions that waited on it waited until you
-# were home. The Home tab is the same board in Slack. What must not happen is
+# were home. The Slack board is the same board in Slack (it began as the app's
+# Home tab, now gone). What must not happen is
 # for the two to disagree about what a click may do, for the board to leak to
 # someone off the allowlist, or for an oversized backlog to make Slack refuse
 # the whole view and show nothing.
 
+class _BoardSlack:
+    """Just enough Slack for a channel Board: a private channel holding only
+    the bot and the allowlist. Each redraw lands in `published` as a view."""
+    def __init__(self, members=("U_ME",)):
+        self.members = list(members) + ["B_BOT"]
+        self.published, self.opened, self.ephemeral, self.n = [], [], [], 0
+    def conversations_info(self, channel, **kw):
+        return {"channel": {"id": channel, "is_private": True}}
+    def conversations_members(self, channel, **kw):
+        return {"members": self.members, "response_metadata": {}}
+    def chat_postMessage(self, channel, text, blocks):
+        self.n += 1
+        self.published.append((channel, {"blocks": blocks}))
+        return {"ts": f"1.{self.n}"}
+    def chat_update(self, channel, ts, text, blocks):
+        self.published.append((channel, {"blocks": blocks}))
+    def chat_postEphemeral(self, channel, user, text):
+        self.ephemeral.append((user, text))
+    def views_open(self, trigger_id, view):
+        self.opened.append(view)
+        return {"view": {"id": "V1"}}
+    def views_update(self, view_id, view):
+        self.opened.append(view)
+
+
+def _board_for(store, call, allowed_users=("U_ME",), **kw):
+    """A Board on a configured channel id, as the click tests drive it."""
+    import home
+    return home.Board(state_path=Path(tempfile.mkdtemp()) / "board.json",
+                      channel="GBOARD", bot_user="B_BOT", store=store, call=call,
+                      allowed_users=allowed_users, **kw)
+
+
+def _board_view(board) -> dict:
+    """What the board shows now, as the view a redraw would post."""
+    return {"blocks": board.blocks()}
+
+
 def test_home_tab():
     import home
     import tasks as T
-    print("\nthe Home tab")
-
-    class Client:
-        def __init__(self):
-            self.published, self.opened = [], []
-        def views_publish(self, user_id, view):
-            self.published.append((user_id, view))
-        def views_open(self, trigger_id, view):
-            self.opened.append(view)
+    print("\nthe Slack board: rendering and clicks")
 
     def texts(view):
         return json.dumps(view, ensure_ascii=False)
@@ -9074,8 +9105,8 @@ def test_home_tab():
         calls.append(p)
         return ns["handle_tasks"](p)
 
-    h = home.Home(store=store, call=call, allowed_users={"U_ME"})
-    c = Client()
+    h = _board_for(store, call, {"U_ME"})
+    c = _BoardSlack()
     click = lambda user, action, tid: {"user": {"id": user}, "trigger_id": "trig",
                                        "actions": [{"action_id": f"home_{action}", "value": tid}]}
     acked = []
@@ -9084,13 +9115,14 @@ def test_home_tab():
     h.on_direct(ack, click("U_STRANGER", "accept", prop), c)
     check("someone off the allowlist cannot act", not calls
           and store.get(prop)["state"] == T.PROPOSED)
-    check("and is shown nothing of the board",
-          "a proposal worth" not in texts(c.published[-1][1]))
+    check("and is shown nothing of the board, only told why, privately",
+          not c.published and c.ephemeral and c.ephemeral[-1][0] == "U_STRANGER"
+          and "a proposal worth" not in c.ephemeral[-1][1])
 
     h.on_direct(ack, click("U_ME", "accept", prop), c)
     check("Accept moves the real task to queued", store.get(prop)["state"] == T.QUEUED)
     check("attributed to the Slack user", "slack:U_ME" in json.dumps(store.get(prop)["events"]))
-    check("the result is shown at the top of the tab",
+    check("the result is shown at the top of the board",
           "Accepted" in texts(c.published[-1][1]))
 
     h.on_direct(ack, click("U_ME", "accept", prop), c)          # already queued
@@ -9120,7 +9152,7 @@ def test_home_tab():
     # is running -- two agents on one checkout -- and a stale Approve closes it.
     fl = store.create("a task that failed once", state=T.QUEUED)["id"]
     store.transition(fl, T.RUNNING); store.transition(fl, T.FAILED)
-    shown = h.view_for("U_ME")
+    shown = home.render([dict(r, id=k) for k, r in store.all().items()], now=time.time())
     retry = next(e for b in shown["blocks"] if b.get("block_id") == f"a:{fl}"
                  for e in b["elements"] if e["action_id"] == "home_retry")
     store.transition(fl, T.QUEUED); store.transition(fl, T.RUNNING)   # retried elsewhere
@@ -9132,7 +9164,7 @@ def test_home_tab():
     check("and says so", "moved on" in texts(c.published[-1][1]))
     aw = store.create("work to approve", state=T.QUEUED)["id"]
     store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
-    shown = h.view_for("U_ME")
+    shown = home.render([dict(r, id=k) for k, r in store.all().items()], now=time.time())
     rework = next(e for b in shown["blocks"] if b.get("block_id") == f"a:{aw}"
                   for e in b["elements"] if e["action_id"] == "home_rework")
     h.on_modal(ack, {"user": {"id": "U_ME"}, "trigger_id": "t",
@@ -9146,11 +9178,25 @@ def test_home_tab():
     check("a send-back form opened before it was approved does not reopen it",
           len(calls) == before and store.get(aw)["state"] == T.DONE)
 
-    h.on_opened({"tab": "messages", "user": "U_ME"}, c)
-    n = len(c.published)
-    h.on_opened({"tab": "home", "user": "U_ME"}, c)
-    check("opening the Home tab publishes it; the Messages tab does not",
-          len(c.published) == n + 1)
+    # The Home tab is gone, not merely unregistered: nothing can draw there,
+    # and nothing but the channel Board can be wired to Slack.
+    src = (BASE / "home.py").read_text()
+    check("nothing publishes a Home view or answers app_home_opened",
+          "views_publish(" not in src and "(\"app_home_opened\")" not in src
+          and not hasattr(home.Home, "on_opened") and not hasattr(home.Home, "view_for"))
+    try:
+        home.Home(store=store, call=call, allowed_users={"U_ME"}).publish(c, "U_ME")
+        drew = True
+    except NotImplementedError:
+        drew = False
+    check("a bare Home draws nowhere", not drew)
+    try:
+        home.register(types.SimpleNamespace(), home.Home(store=store, call=call,
+                                                         allowed_users={"U_ME"}))
+        wired = True
+    except TypeError:
+        wired = False
+    check("and register() refuses anything but the Board", not wired)
 
 
 
@@ -11304,10 +11350,9 @@ def test_board_is_compact():
     store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
     store.update(aw, result={"review": {"summary": "ok-ish",
                                         "findings": [f"issue number {i}" for i in range(7)]}})
-    opened, posted = [], []
-    client = types.SimpleNamespace(views_open=lambda trigger_id, view: opened.append(view),
-                                   views_publish=lambda **kw: posted.append(kw))
-    h = home.Home(store=store, call=ns["handle_tasks"], allowed_users={"U_ME"})
+    client = _BoardSlack()
+    opened = client.opened
+    h = _board_for(store, ns["handle_tasks"], {"U_ME"})
     pick = lambda user, value: {"user": {"id": user}, "trigger_id": "t",
                                 "actions": [{"action_id": "home_menu",
                                              "selected_option": {"value": value}}]}
@@ -19303,8 +19348,8 @@ def test_no_release_starts_while_a_deploy_drains():
     # The Slack board's Release
     fx = _release_fixture()
     hr = fx.ns["handle_releases"]
-    hub = home.Home(store=T.TaskStore(fx.root / "t.json"), call=lambda p: {"ok": True},
-                    allowed_users={"U_ME"}, release_call=hr)
+    hub = _board_for(T.TaskStore(fx.root / "t.json"), lambda p: {"ok": True},
+                     {"U_ME"}, release_call=hr)
     hub._spawn = lambda fn: fn()
     hub.publish = lambda *a, **k: None
     meta = {"slug": "alpha", "level": "patch",
@@ -19365,15 +19410,14 @@ def test_release_from_the_slack_board():
             self.calls.append(("update", view_id, view))
         def chat_postEphemeral(self, **kw):
             self.calls.append(("ephemeral", kw))
-        def views_publish(self, **kw):
-            self.calls.append(("publish", kw))
 
     import tasks as T
     store = T.TaskStore(fx.root / "t.json")
-    hub = home.Home(store=store, call=lambda p: {"ok": True}, allowed_users={"U_ME"},
-                    releasable=lambda: hr({"action": "list"})["projects"], release_call=hr)
+    hub = _board_for(store, lambda p: {"ok": True}, {"U_ME"},
+                     releasable=lambda: hr({"action": "list"})["projects"], release_call=hr)
     hub._spawn = lambda fn: fn()
-    view = hub.view_for("U_ME")
+    hub.publish = lambda *a, **k: None          # the redraw is test_board_channel's
+    view = _board_view(hub)
     dumped = json.dumps(view)
     check("a project with something to release is on the board",
           "Ready to release" in dumped and '"release|alpha|"' in dumped
@@ -19470,9 +19514,10 @@ def test_release_from_the_slack_board():
     # The board's own check, not only the route's: with a route that would
     # accept anything, an outsider's click still never reaches it.
     asked = []
-    lax = home.Home(store=store, call=lambda p: {"ok": True}, allowed_users={"U_ME"},
-                    release_call=lambda p: asked.append(p) or {"ok": True})
+    lax = _board_for(store, lambda p: {"ok": True}, {"U_ME"},
+                     release_call=lambda p: asked.append(p) or {"ok": True})
     lax._spawn = lambda fn: fn()
+    lax.publish = lambda *a, **k: None
     lax.on_release(lambda **k: None, body("U_STEPH"), Slack(), view_(meta))
     lax.on_menu(lambda **k: None, menu("U_STEPH", "release|alpha|"), Slack())
     check("the board itself refuses an outsider before asking the route", asked == [], asked)
@@ -20185,10 +20230,8 @@ def test_findings_actions_on_the_slack_board():
     class Client:
         def views_open(self, trigger_id, view):
             opened.append(view)
-        def views_publish(self, **k):
-            pass
-    h = home.Home(store=st, call=lambda p: calls.append(p) or {"ok": True},
-                  allowed_users=[])
+    h = _board_for(st, lambda p: calls.append(p) or {"ok": True}, allowed_users=[])
+    h.publish = lambda *a, **k: None
     body = lambda value: {"user": {"id": "U1"}, "trigger_id": "t",
                           "actions": [{"selected_option": {"value": value}}]}
     h.on_menu(lambda **k: None, body(f"dig|{rid}|needs_input"), Client())
@@ -20371,12 +20414,12 @@ def test_findings_clicks_tell_rounds_apart():
           drawn)
     dig_and_repark(d, home.seen_round(drawn))
     calls, notes = [], []
-    h = home.Home(store=st, call=lambda p: calls.append(p) or {"ok": True}, allowed_users=[])
+    h = _board_for(st, lambda p: calls.append(p) or {"ok": True}, allowed_users=[])
     h.note = lambda user, text: notes.append(text)
+    h.publish = lambda *a, **k: None
 
     class Client:
         def views_open(self, trigger_id, view): pass
-        def views_publish(self, **k): pass
     h.on_confirm(lambda **k: None, {"user": {"id": "U1"}}, Client(),
                  {"private_metadata": json.dumps({"action": "close", "id": d, "seen": drawn})})
     view = {"private_metadata": json.dumps({"id": d, "dig": True, "answer": False, "seen": drawn}),

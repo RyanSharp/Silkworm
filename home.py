@@ -6,10 +6,10 @@ view in Slack instead: no server to expose, no second login, and the bot
 already holds the socket that posts it.
 
 Where it lives is `Board`: one message in a private channel, edited in place.
-It began as the app's Home tab (`Home`, which `Board` extends), and moved
-because the Home tab made Slack's Threads view send Reply to the app instead of
-the thread. The manifest keeps the Home tab off; see `Board` for why it must
-stay that way.
+It began as the app's Home tab, and moved because the Home tab made Slack's
+Threads view send Reply to the app instead of the thread; `Home`, which `Board`
+extends, is what is left of it: the click handling, with nowhere to draw. The
+manifest keeps the Home tab off; see `Board` for why it must stay that way.
 
 Deliberately the attention view, not the backlog. It shows what is waiting on
 you, what is running, and what is scheduled to wake, and nothing else; the
@@ -426,19 +426,14 @@ def confirm_modal(task: dict, action: str) -> dict:
 
 
 def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
-           base_url: str = "", notice: str = "", allowed: bool = True,
+           base_url: str = "", notice: str = "",
            max_blocks: int = MAX_BLOCKS, max_attention: int = MAX_ATTENTION,
            compact: bool = False, releasable=()) -> dict:
-    """The Home view for one user.
+    """The board: what needs you, what runs, what wakes, what can ship.
 
-    `allowed=False` renders nothing of the board: task goals and reviewer
-    findings are private to whoever runs the bot, and the Home tab is visible
-    to anyone in the workspace who opens the app.
+    Only drawn for the allowlist -- `Board` posts it only where every member
+    is on it -- so nothing here hides task goals or reviewer findings.
     """
-    if not allowed:
-        return {"type": "home", "blocks": [{"type": "section", "text": _text(
-            "This bot's task board is only visible to the people on its allowlist.")}]}
-
     items = list(all_tasks)
     # A research task's next steps are its children; attached to the copy
     # rendered, so the line and the detail can list them.
@@ -726,14 +721,17 @@ def rework_modal(task: dict, answer: bool, dig: bool = False) -> dict:
 # --- wiring -------------------------------------------------------------------
 
 class Home:
-    """Publishes the view and relays clicks. `call` is bot.handle_tasks.
+    """Relays clicks to `call` (bot.handle_tasks) and keeps their results.
 
-    On its own this is the Home-tab board (`views_publish` on
-    `app_home_opened`), which bot.py no longer registers: what runs is
-    `Board`, which keeps the click handling and replaces where it is drawn.
+    Where the board is drawn is a subclass's: `publish` is the one thing a
+    click handler asks of it. The only one is `Board`. This began as the
+    app's Home tab, and the code that drew it there (`views_publish` on
+    `app_home_opened`) is gone rather than left unregistered: the Home tab
+    sent Slack's Threads-view Reply to the app instead of the thread, and
+    an unused path to it is one registration away from bringing that back.
     """
 
-    NOTICE_S = 90      # how long a result line stays at the top of the tab
+    NOTICE_S = 90      # how long a click's result line stays on the board
     UNMERGED_S = 300   # the survey asks git about every branch; cache it
 
     def __init__(self, *, store, call, allowed_users, base_url="",
@@ -787,35 +785,11 @@ class Home:
         with self._lock:
             self._notices[user] = (text, time.time())
 
-    def view_for(self, user: str) -> dict:
-        now = time.time()
-        if not self.allowed(user):
-            return render((), now=now, allowed=False)
-        with self._lock:
-            text, at = self._notices.get(user, ("", 0))
-            if now - at > self.NOTICE_S:
-                self._notices.pop(user, None)
-                text = ""
-        try:
-            watching = self._watching() or []
-        except Exception:
-            log.exception("watching list failed")
-            watching = []
-        items = tasks.mark_no_retry([dict(r, id=tid) for tid, r in self.store.all().items()])
-        return render(items, now=now, watching=watching, unmerged=self.unmerged(),
-                      base_url=self.base_url, notice=text, releasable=self.releasable())
-
     def publish(self, client, user: str) -> None:
-        try:
-            client.views_publish(user_id=user, view=self.view_for(user))
-        except Exception:
-            log.exception("could not publish the Home tab for %s", user)
+        """Redraw the board after `user`'s click, with its result in it."""
+        raise NotImplementedError("a Home draws nowhere; use Board")
 
     # -- handlers --
-
-    def on_opened(self, event, client):
-        if event.get("tab") == "home":
-            self.publish(client, event["user"])
 
     def on_refresh(self, ack, body, client):
         ack()
@@ -1329,11 +1303,11 @@ class Board(Home):
         self.sync(client, force=True)
 
 
-def register(app, home: Home) -> None:
-    if isinstance(home, Board):
-        app.event("member_joined_channel")(home.on_member_joined)
-    else:
-        app.event("app_home_opened")(home.on_opened)
+def register(app, home: Board) -> None:
+    if not isinstance(home, Board):
+        # Not a fallback to the Home tab: that path is gone (see Home).
+        raise TypeError("register() takes the channel Board")
+    app.event("member_joined_channel")(home.on_member_joined)
     app.action("home_refresh")(home.on_refresh)
     app.action("home_thread")(home.on_link)
     for action in DIRECT:
