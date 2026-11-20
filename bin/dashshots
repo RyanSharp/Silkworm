@@ -31,6 +31,18 @@ own subprocess, cache and render path are what is photographed. With
 --trader-live the copy points at the real trader checkout instead (its status
 script only reads).
 
+--deploy photographs a deploy landing while the app is open: Mobile Safari
+loads a copy of --deploy-from's code (default: --source's) labelled "rev A",
+goes to the background, the copy is stopped and --source's starts on the same
+port labelled "rev B" (each label changes the page, so each is a revision of
+its own), and Safari comes back -- resumed, not navigated, as the home-screen
+app is when it is reopened from the app switcher. DIR/deploy-<width>-<run>-
+1-open.png, -2-resumed.png, then -3-fresh.png after a plain navigation, the
+control that says what the server was serving. Runs: "plain", and "draft",
+which leaves words typed in a new thread's composer before the deploy; there
+the page's update banner is tapped by the injected script (no tap automation)
+and -2b-banner-tapped.png shows where that left the draft.
+
 --perf measures instead of photographing: bin/perfprobe.js, injected into
 the copy, reads the browser's paint timing and counts frames while the list,
 the task panel, a board and the longest thread are scrolled along a fixed
@@ -274,13 +286,59 @@ def inject_probe(viz: Path, bot_port: int, probe_js: Path = PROBE_JS) -> None:
     viz.write_text(src[:i] + "\n<script>" + js + "</script>" + src[i:])
 
 
+#: --deploy's revision label, and its draft: with ?shotsdraft=1 (read before the
+#: page's own script takes the query off the address bar) words are typed into
+#: the composer once the thread has opened. Inline, before the page's script.
+DEPLOY_JS = """(function () {
+  const label = "__LABEL__";
+  const draft = /[?&]shotsdraft=1/.test(location.search);
+  addEventListener("DOMContentLoaded", () => {
+    const d = document.createElement("div");
+    d.id = "shotsrev";
+    d.textContent = "page code: " + label;
+    d.style.cssText = "position:fixed;left:12px;bottom:140px;z-index:2147483647;"
+      + "background:#c0262d;color:#fff;font:700 20px -apple-system,sans-serif;"
+      + "padding:8px 12px;border-radius:10px;pointer-events:none";
+    document.body.appendChild(d);
+    if (draft) setTimeout(() => {
+      const b = document.getElementById("reply");
+      if (b) { b.value = "A draft typed before the deploy"; b.dispatchEvent(new Event("input")); }
+    }, 2500);
+    // The simulator has no taps: once an update banner has been up for
+    // __TAPMS__ms (after the harness photographs it), it is tapped here.
+    if (draft) {
+      let seen = 0;
+      setInterval(() => {
+        const bar = document.getElementById("updbar");
+        if (!bar || !bar.classList.contains("on")) return;
+        if (!seen) seen = Date.now();
+        else if (Date.now() - seen >= __TAPMS__ && !bar.dataset.tapped) { bar.dataset.tapped = 1; bar.click(); }
+      }, 250);
+    }
+  });
+})();"""
+
+
+def inject_label(viz: Path, label: str, tap_ms: int = 8000) -> None:
+    """The copy's page shows `label` and can type a draft (DEPLOY_JS). The
+    page's text changes with the label, so each label is its own revision."""
+    src = viz.read_text()
+    marker = "\n<script>\n"
+    i = src.index(marker, src.index("PAGE = r\"\"\""))
+    viz.write_text(src[:i] + "\n<script>" + DEPLOY_JS.replace("__LABEL__", label).replace("__TAPMS__", str(tap_ms))
+                   + "</script>" + src[i:])
+
+
 def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: int,
-                    trader_live: bool = False, probe: bool = False):
+                    trader_live: bool = False, probe: bool = False, label: str = "",
+                    tap_ms: int = 8000):
     trader_projects(home, tmp, trader_live)
     for f in source.glob("*.py"):
         shutil.copy2(f, tmp / f.name)
     if probe:
         inject_probe(tmp / "visualizer.py", bot_port, probe if isinstance(probe, Path) else PROBE_JS)
+    if label:
+        inject_label(tmp / "visualizer.py", label, tap_ms)
     if (source / "assets").is_dir():
         shutil.copytree(source / "assets", tmp / "assets")
     for name in ("sessions.json",):
@@ -564,6 +622,59 @@ def perf_phone(width: int, targets, out: Path, runs: int = 3, timeout: float = 1
     return results
 
 
+def deploy_phone(width: int, old: Path, new: Path, home: Path, tmp: Path, bot_port: int,
+                 out: Path, wait: float, trader_live: bool = False):
+    """A deploy while the app is open (see --deploy): open on rev A,
+    background, swap the server to rev B on the same port, resume, shoot."""
+    udid = device_for(width)
+    print(f"  {DEVICES[width][0]} ({udid})")
+    state = json.loads(simctl("list", "devices", "-j"))
+    booted_before = any(d["udid"] == udid and d["state"] == "Booted"
+                        for devs in state["devices"].values() for d in devs)
+    try:
+        if not booted_before:
+            simctl("boot", udid)
+        simctl("bootstatus", udid, "-b")
+        simctl("ui", udid, "appearance", "dark", check=False)
+        for run, path in (("plain", "/"), ("draft", f"/?thread={quote(NEW_THREAD)}&shotsdraft=1")):
+            port = free_port()
+            base = f"http://127.0.0.1:{port}"
+            a_tmp, b_tmp = tmp / f"deploy-{width}-{run}-a", tmp / f"deploy-{width}-{run}-b"
+            a_tmp.mkdir(); b_tmp.mkdir()
+            # Rev A's banner is tapped once it has been up 1.6 waits: after the
+            # resumed photograph, before the tapped one.
+            a = start_dashboard(old, home, a_tmp, bot_port, port, trader_live, label="rev A",
+                                tap_ms=int(wait * 1600))
+            b = None
+            try:
+                simctl("openurl", udid, base + path)
+                time.sleep(wait * 2)
+                shot = lambda step: (simctl("io", udid, "screenshot", str(
+                    out / f"deploy-{width}-{run}-{step}.png")), print(f"    deploy-{width}-{run}-{step}.png"))
+                shot("1-open")
+                # Away, as the phone's app switcher leaves it: suspended, not closed.
+                simctl("launch", udid, "com.apple.Preferences")
+                time.sleep(2)
+                a.terminate(); a.wait(timeout=10)
+                b = start_dashboard(new, home, b_tmp, bot_port, port, trader_live, label="rev B")
+                # Back: the same tab, resumed. No navigation is made here.
+                simctl("launch", udid, "com.apple.mobilesafari")
+                time.sleep(wait)
+                shot("2-resumed")
+                if run == "draft":
+                    time.sleep(wait * 2)
+                    shot("2b-banner-tapped")
+                simctl("openurl", udid, base + "/")
+                time.sleep(wait)
+                shot("3-fresh")
+            finally:
+                for pr in (a, b):
+                    if pr is not None and pr.poll() is None:
+                        pr.terminate()
+    finally:
+        simctl("shutdown", udid, check=False)
+
+
 def snapper(tmp: Path) -> Path:
     cache = Path.home() / ".cache" / "silkworm-dashshots"
     cache.mkdir(parents=True, exist_ok=True)
@@ -607,6 +718,10 @@ def main():
                     help="measure first paint and scroll/sheet frame rates (bin/perfprobe.js) on the "
                          "phone widths instead of shooting views; with --before, both, alternating")
     ap.add_argument("--perf-runs", type=int, default=3, help="with --perf: runs per target")
+    ap.add_argument("--deploy", action="store_true",
+                    help="photograph a deploy landing while the app is open (phone widths)")
+    ap.add_argument("--deploy-from", default="",
+                    help="with --deploy: the checkout the app is open on before it (default --source)")
     ap.add_argument("--trader-live", action="store_true",
                     help="draw the trader view from the real trader checkout, not the fixture")
     a = ap.parse_args()
@@ -623,6 +738,16 @@ def main():
         bot_port = free_port()
         bot = ThreadingHTTPServer(("127.0.0.1", bot_port), stand_in(real_port))
         threading.Thread(target=bot.serve_forever, daemon=True).start()
+        if a.deploy:
+            print(f"deploy: {a.deploy_from or a.source} -> {a.source} while open -> {out}")
+            try:
+                for w in [int(x) for x in a.widths.split(",") if x and int(x) in DEVICES]:
+                    deploy_phone(w, Path(a.deploy_from or a.source).resolve(),
+                                 Path(a.source).resolve(), home, tmp, bot_port, out, a.wait,
+                                 a.trader_live)
+            finally:
+                bot.shutdown()
+            return
         port = free_port()
         proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port, a.trader_live,
                                PERF_JS if a.perf else a.scroll_probe)

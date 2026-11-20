@@ -86,16 +86,22 @@ MANIFEST = json.dumps({
               for p, (_, s) in ICONS.items() if p.startswith("/icons/")],
 }, indent=1).encode()
 
-#: The service worker, at /sw.js so its scope is the whole dashboard. It caches
-#: nothing: task state a minute stale is worse than an honest error, and the
-#: page itself is one request. What it adds is a page that says why, when the
-#: dashboard cannot be reached at all -- usually Tailscale being off. It only
-#: answers navigations; every other request (/api/*, actions, icons) goes
-#: straight to the network as if there were no worker. Below the fetch
-#: handler: web push (push.py) -- show the notification, and a tap opens or
-#: focuses the app on its thread or task.
-SERVICE_WORKER = r"""// Silkworm dashboard service worker. Served by visualizer.py; caches nothing.
-const VERSION = "1";
+#: The service worker, at /sw.js so its scope is the whole dashboard. Pages are
+#: network-first, always: task state a minute stale is worse than an honest
+#: error, so the dashboard itself is never kept. Its one cache holds the
+#: offline page -- what a page load gets when the dashboard cannot be reached
+#: at all, usually Tailscale being off -- and is named for the build (BUILD,
+#: below the page), so a deploy changes this file's bytes, the phone installs
+#: the new worker on its next look, and activating it deletes every other
+#: cache. It only answers navigations; every other request (/api/*, actions,
+#: icons) goes straight to the network as if there were no worker. Below the
+#: fetch handler: web push (push.py) -- show the notification, and a tap opens
+#: or focuses the app on its thread or task.
+SERVICE_WORKER_SRC = r"""// Silkworm dashboard service worker. Served by visualizer.py.
+const VERSION = "__BUILD__";
+const CACHE = "silkworm-" + VERSION;
+// Not a real route: the key the offline page is kept under.
+const OFFLINE_KEY = "/__silkworm_offline__";
 
 const OFFLINE = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -112,12 +118,25 @@ border-radius:10px;padding:12px 22px;font:inherit;font-weight:600}</style></head
 Turn Tailscale on, then try again.</p>
 <button onclick="location.reload()">Try again</button></main></body></html>`;
 
-self.addEventListener("install", () => self.skipWaiting());
+function offlinePage() {
+  return new Response(OFFLINE, {status: 503, headers: {
+    "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}});
+}
+
+self.addEventListener("install", event => {
+  // A new build's worker takes over at once: there is no old page to keep
+  // serving, the page reloads onto the new code itself.
+  event.waitUntil((async () => {
+    try { await (await caches.open(CACHE)).put(OFFLINE_KEY, offlinePage()); }
+    catch (e) { /* no cache: offline falls back to the page built below */ }
+    await self.skipWaiting();
+  })());
+});
 
 self.addEventListener("activate", event => {
-  // Nothing is cached on purpose; clear anything an older worker left behind.
+  // Every cache but this build's is an older worker's: gone.
   event.waitUntil((async () => {
-    for (const key of await caches.keys()) await caches.delete(key);
+    for (const key of await caches.keys()) if (key !== CACHE) await caches.delete(key);
     await self.clients.claim();
   })());
 });
@@ -127,9 +146,14 @@ self.addEventListener("fetch", event => {
   // Only page loads. /api/* and every action go to the network untouched,
   // and fail the way they would without a worker.
   if (req.mode !== "navigate") return;
-  event.respondWith(fetch(req).catch(() => new Response(OFFLINE, {
-    status: 503, headers: {"Content-Type": "text/html; charset=utf-8",
-                           "Cache-Control": "no-store"}})));
+  // Network first; the cache is only ever the offline page.
+  event.respondWith(fetch(req).catch(async () => {
+    try {
+      const kept = await caches.match(OFFLINE_KEY, {cacheName: CACHE});
+      if (kept) return kept;
+    } catch (e) { /* below */ }
+    return offlinePage();
+  }));
 });
 
 // --- push ---
@@ -168,7 +192,7 @@ self.addEventListener("notificationclick", event => {
     await self.clients.openWindow(url);
   })());
 });
-""".replace("__THEME__", THEME).encode()
+""".replace("__THEME__", THEME)
 
 SESSIONS_FILE = BASE_DIR / "sessions.json"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -1090,6 +1114,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # On everything, so any read the page makes can notice a deploy.
+        self.send_header("X-Silkworm-Build", BUILD)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1106,6 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(304)
             self.send_header("ETag", tag)
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Silkworm-Build", BUILD)
             self.end_headers()
             return
         self._send(200, json.dumps(data).encode(), "application/json",
@@ -1170,7 +1197,20 @@ class Handler(BaseHTTPRequestHandler):
             if not LOOPBACK and qs.get("token", [""])[0] == TOKEN:
                 cookie["Set-Cookie"] = (f"silkworm_token={TOKEN}; Path=/; "
                                         "HttpOnly; SameSite=Strict; Max-Age=31536000")
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8", cookie)
+            # Revalidated on every load (no-cache), against an ETag that is
+            # the build: a deploy is a 200 with the new page, anything else a
+            # 304. Not with ?token=, whose answer must carry its cookie.
+            tag = f'"{BUILD}"'
+            held = {t.strip() for t in self.headers.get("If-None-Match", "").split(",")}
+            if tag in held and not cookie:
+                self.send_response(304)
+                self.send_header("ETag", tag)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Silkworm-Build", BUILD)
+                self.end_headers()
+                return
+            cookie.update({"ETag": tag, "Cache-Control": "no-cache"})
+            self._send(200, PAGE_BYTES, "text/html; charset=utf-8", cookie)
         elif url.path in ("/favicon.svg", "/favicon.ico"):
             # Both paths: the link tag asks for the svg, but browsers request
             # /favicon.ico on their own and a 404 for it is noise in the log.
@@ -1192,6 +1232,11 @@ class Handler(BaseHTTPRequestHandler):
             # no-cache: an updated worker must reach the phone on its next load.
             self._send(200, SERVICE_WORKER, "text/javascript; charset=utf-8",
                        {"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+        elif url.path == "/api/build":
+            # What the page asks when it comes back to the screen: is the code
+            # I am running still the code being served?
+            self._send(200, json.dumps({"build": BUILD}).encode(), "application/json",
+                       {"Cache-Control": "no-store"})
         elif url.path == "/api/sessions":
             data = load_sessions()
             self._json(data, sessions_tag(data))
@@ -1886,6 +1931,13 @@ PAGE = r"""<!doctype html>
                         cursor: pointer; font-size: var(--fs-sm); }
   #searchresults .hit:hover { background: var(--panel); }
   #searchresults .hit .k { font-family: var(--mono); font-size: var(--fs-xs); color: var(--gold); }
+  /* A deploy landed while this page was open (see "--- updates ---"). */
+  #updbar { position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 50%;
+            transform: translateX(-50%); z-index: 60; display: none; cursor: pointer;
+            background: var(--gold); color: var(--bg); border: 0; border-radius: var(--r-pill);
+            padding: var(--sp-2) var(--sp-4); font: inherit; font-weight: var(--fw-semi);
+            min-height: var(--tap, 36px); box-shadow: var(--el-3); white-space: nowrap; }
+  #updbar.on { display: block; }
   #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
            background: var(--sunken); border: 1px solid var(--gold); color: var(--ink);
            border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); font-size: var(--fs-md); display: none; z-index: 30; }
@@ -2789,6 +2841,7 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="tip"></div>
 <div id="toast"></div>
+<button id="updbar" type="button" onclick="applyUpdate()">Updated — tap to reload</button>
 <div id="fxlayer" aria-hidden="true"></div>
 <div id="ptr" aria-hidden="true"><i></i></div>
 <div id="alertsheet" onclick="if(event.target.id==='alertsheet'||(event.target.closest&&event.target.closest('#alertlist button')))closeAlerts()">
@@ -2920,6 +2973,7 @@ async function readJSON(url, opts, key) {
   const headers = Object.assign({}, (opts || {}).headers);
   if (prev) headers["If-None-Match"] = prev.etag;
   const r = await fetch(url, Object.assign({}, opts || {}, {headers, cache: "no-store"}));
+  noticeBuild(r.headers && r.headers.get ? r.headers.get("X-Silkworm-Build") : null);
   if (r.status === 304 && prev) return prev.data;
   const data = await r.json();
   const etag = r.headers && r.headers.get ? r.headers.get("ETag") : null;
@@ -7459,8 +7513,9 @@ async function openLink(q) {
     box.dispatchEvent(new Event("input"));
   }
 }
-// The service worker only adds an offline page (it caches nothing); without
-// one -- plain http, an old browser -- the dashboard works the same.
+// The service worker only adds an offline page (it never keeps the dashboard
+// itself); without one -- plain http, an old browser -- the dashboard works
+// the same.
 if (typeof navigator !== "undefined" && navigator.serviceWorker)
   navigator.serviceWorker.register("/sw.js", {scope: "/"}).catch(() => {});
 
@@ -7607,7 +7662,8 @@ async function openTask(id) {
 }
 if (typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.addEventListener)
   navigator.serviceWorker.addEventListener("message", e => {
-    if (e.data && e.data.type === "open") openTarget(e.data.url);
+    // A notification tapped: the user is here, and wants that, not a reload.
+    if (e.data && e.data.type === "open") { lastTouch = Date.now(); openTarget(e.data.url); }
   });
 if (typeof location !== "undefined"
     && /[?&](thread|task|view|card|modal|q|theme)=/.test(location.search || "")) {
@@ -7616,6 +7672,112 @@ if (typeof location !== "undefined"
   if (window.history && history.replaceState) history.replaceState(null, "", "/");
   openLink(target);
 }
+
+// --- updates ---
+// A deploy restarts the dashboard with new code, but a page already open --
+// above all the home-screen app, which iOS suspends and resumes rather than
+// reloads -- keeps running the code it loaded. Nothing cached it: it was never
+// asked for again. So the page knows its own build (PAGE_BUILD, stamped in by
+// the server), and every response says the server's (X-Silkworm-Build); coming
+// back to the screen asks outright (/api/build). When they differ the page
+// reloads once onto the new code -- at once if nobody is in the middle of
+// anything, else behind a banner -- and a draft in the composer comes along.
+const PAGE_BUILD = "__BUILD__";
+const UPDATED_TO = "silkworm-updated-to", DRAFT_KEY = "silkworm-draft";
+// Nobody touched the page for this long: reloading it takes nothing from them.
+const UPDATE_IDLE_MS = 20000;
+// How long a reload waits after noticing, so whatever brought the app back --
+// a notification tap opening a task -- lands first and is seen to be in use.
+const UPDATE_SETTLE_MS = 1200;
+let lastTouch = 0, servedBuild = "";
+// Reading counts as using it: scrolling and the wheel, not only taps and keys.
+for (const k of ["pointerdown", "keydown", "touchstart", "input", "wheel", "scroll"])
+  if (typeof document !== "undefined" && document.addEventListener)
+    document.addEventListener(k, () => { lastTouch = Date.now(); }, {capture: true, passive: true});
+function store() {
+  try { return typeof sessionStorage !== "undefined" ? sessionStorage : null; } catch (e) { return null; }
+}
+// Something a reload would lose that a draft cannot carry: a form being
+// filled in, files picked, a message still on its way -- or any panel open,
+// since the reload brings back only the thread (a task opened from a
+// notification, say, which is exactly how an idle app comes back).
+const PANELS = ["fmodal", "taskmodal", "boardmodal", "learnmodal", "tradermodal"];
+function midTask() {
+  if (staged.reply.length || staged.nt.length) return true;
+  for (const id of PANELS) {
+    const el = document.getElementById(id);
+    if (el && el.style.display === "flex") return true;
+  }
+  const sheet = document.getElementById("alertsheet");
+  if (sheet && sheet.classList.contains("open")) return true;
+  if (document.body && document.body.classList.contains("searching")) return true;
+  for (const items of outgoing.values()) if (items.some(it => it.payload)) return true;
+  return false;
+}
+function draftText() {
+  const box = document.getElementById("reply");
+  return box && box.value && box.value.trim() ? box.value : "";
+}
+function noticeBuild(b) {
+  if (!b || b === PAGE_BUILD) return;
+  const first = servedBuild !== b;
+  servedBuild = b;
+  // The new worker, now rather than at the next navigation -- once per build,
+  // not on every poll while the banner waits.
+  if (first) try {
+    if (typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.getRegistration)
+      navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {});
+  } catch (e) { /* the reload installs it all the same */ }
+  const s = store();
+  // Reloaded for this build once already and still not running it: something
+  // is serving the old page. Say so; do not reload in a loop.
+  const again = s && s.getItem(UPDATED_TO) === b;
+  const bar = document.getElementById("updbar");
+  const idle = () => !midTask() && !draftText() && Date.now() - lastTouch >= UPDATE_IDLE_MS;
+  if (again || bar.classList.contains("on") || !idle()) { bar.classList.add("on"); return; }
+  if (!first) return;          // already waiting to reload for this build
+  setTimeout(() => {
+    if (idle()) applyUpdate(); else bar.classList.add("on");
+  }, UPDATE_SETTLE_MS);
+}
+// Reload onto the new code, keeping the thread that is open and what was
+// typed into its composer (the forms, files and sends midTask() guards are
+// not carried: the banner waits for them).
+function applyUpdate() {
+  const s = store();
+  const text = draftText();
+  if (s) {
+    if (servedBuild) s.setItem(UPDATED_TO, servedBuild);
+    if (active && text) s.setItem(DRAFT_KEY, JSON.stringify({key: active.key, text}));
+  }
+  location.replace(active ? "/?thread=" + encodeURIComponent(active.key) : "/");
+}
+async function checkBuild() {
+  try {
+    const r = await fetch("/api/build", {cache: "no-store"});
+    noticeBuild((await r.json()).build);
+  } catch (e) { /* unreachable: the next poll asks again */ }
+}
+// What the last reload carried: the draft goes back into the composer of the
+// thread it was typed in (the reload opened that thread, above).
+(function () {
+  const s = store();
+  if (!s) return;
+  const raw = s.getItem(DRAFT_KEY);
+  s.removeItem(DRAFT_KEY);
+  if (s.getItem(UPDATED_TO) === PAGE_BUILD) s.removeItem(UPDATED_TO);
+  let d = null;
+  try { d = raw ? JSON.parse(raw) : null; } catch (e) { d = null; }
+  const box = document.getElementById("reply");
+  if (!d || !d.text || !box || box.value) return;
+  // `active` may not be set yet: the thread opens once the list has loaded.
+  if (active && active.key !== d.key) return;
+  box.value = d.text;
+  growReply();
+  setTimeout(growReply, 300);      // again once the thread has laid out
+})();
+if (typeof window !== "undefined" && window.addEventListener)
+  window.addEventListener("pageshow", e => { if (e && e.persisted) checkBuild(); });
 
 // --- polling ---
 // Each poll waits for its last one, so a slow tunnel queues nothing; a hidden
@@ -7641,12 +7803,23 @@ setInterval(pollLive, 1500);
 setInterval(pollBoard, 5000);
 setInterval(pollTrader, TRADER_POLL_MS);
 document.addEventListener("visibilitychange", () => {
-  if (visible()) { pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); }
+  if (visible()) { checkBuild(); pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); }
 });
 </script>
 </body>
 </html>
 """
+
+#: This code's build: a fingerprint of the page and the worker exactly as they
+#: are served, so any change to either -- a deploy, a hand edit -- is a new
+#: build, and nothing else is. The page carries it (PAGE_BUILD), every
+#: response says it (X-Silkworm-Build), the HTML's ETag is it, and the
+#: worker's cache is named for it.
+BUILD = hashlib.sha256((PAGE + "\0" + SERVICE_WORKER_SRC).encode()).hexdigest()[:16]
+PAGE = PAGE.replace("__BUILD__", BUILD)
+PAGE_BYTES = PAGE.encode()
+SERVICE_WORKER = SERVICE_WORKER_SRC.replace("__BUILD__", BUILD).encode()
+
 
 if __name__ == "__main__":
     if not LOOPBACK and not TOKEN:

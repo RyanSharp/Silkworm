@@ -21351,7 +21351,7 @@ globalThis.fetch = async (url, opts) => {
   const h = (opts && opts.headers) || {};
   asked.push([url, h["If-None-Match"] || null]);
   if (url.startsWith("/api/sessions")) {
-    if (h["If-None-Match"] === tag) return {status: 304, headers: {get: () => tag}};
+    if (h["If-None-Match"] === tag) return {status: 304, headers: {get: k => k === "ETag" ? tag : null}};
     const out = {bot_online: true, sessions: JSON.parse(JSON.stringify(sessions)), slack: {}};
     return {status: 200, headers: {get: k => k === "ETag" ? tag : null}, json: async () => out};
   }
@@ -24334,9 +24334,10 @@ exit 0
 
 
 # The dashboard as a home-screen app (Tailscale plan, step 2): a manifest,
-# icons drawn from logo.svg, and a service worker that caches nothing --
-# stale task state is worse than an offline error -- but explains, when the
-# page cannot be reached, that Tailscale is probably off.
+# icons drawn from logo.svg, and a service worker that never keeps the
+# dashboard -- stale task state is worse than an offline error -- but explains,
+# when the page cannot be reached, that Tailscale is probably off. Its one
+# cache, that offline page, is named for the build, so a deploy replaces it.
 def _png_header(data: bytes):
     """(width, height, colour type) of a PNG, or None if it is not one."""
     import struct
@@ -24479,91 +24480,404 @@ def test_viz_icons_are_generated_from_the_logo():
     check("every icon visualizer serves is a committed file", not missing, str(missing))
 
 
-def test_viz_service_worker_never_caches():
+def test_viz_service_worker_versions_its_cache():
     import shutil
     import subprocess as _sp
     import visualizer as V
-    print("\nthe service worker caches nothing and answers only failed page loads")
+    print("\nthe service worker is versioned by the build: pages network-first, one cache, "
+          "the offline page, and a new build deletes the old one")
+    src = V.SERVICE_WORKER_SRC
     sw = V.SERVICE_WORKER.decode()
-    for banned in ("caches.open", ".put(", "cache.add", "addAll("):
-        check(f"the worker never writes a cache ({banned})", banned not in sw)
+    check("the worker served is stamped with this build",
+          f'const VERSION = "{V.BUILD}";' in sw and "__BUILD__" not in sw, sw[:200])
     check("the offline page asks about Tailscale",
           "Can't reach Silkworm — is Tailscale connected?" in sw)
     node = shutil.which("node")
     if not node:
         print("  … node not installed — the worker's handlers checked by text only")
         return
+    # Two builds' workers, one after the other, over one browser's caches --
+    # as a deploy does it.
     harness = r"""
-const listeners = {}, opened = [], deleted = [], fetched = [];
-let netFails = false, claimed = false, skipped = false;
-globalThis.self = {
-  addEventListener: (k, f) => { listeners[k] = f; },
-  skipWaiting: () => { skipped = true; },
-  clients: {claim: async () => { claimed = true; }},
-};
-globalThis.caches = {
-  keys: async () => ["old-shell"],
-  delete: async k => { deleted.push(k); return true; },
-  open: async k => { opened.push(k); return {put(){}, add(){}, addAll(){}}; },
-  match: async () => undefined,
-};
+const store = new Map([["old-shell", new Map([["/", "a stale page"]])]]);
+let netFails = false, cachesFail = false;
 const NET = {network: true};
-globalThis.fetch = async req => {
-  fetched.push(req.url);
-  if (netFails) throw new TypeError("Failed to fetch");
-  return NET;
+globalThis.fetch = async req => { if (netFails) throw new TypeError("Failed to fetch"); return NET; };
+globalThis.caches = {
+  keys: async () => [...store.keys()],
+  delete: async k => store.delete(k),
+  open: async k => { if (cachesFail) throw new Error("quota");
+    if (!store.has(k)) store.set(k, new Map());
+    const c = store.get(k);
+    return {put: async (key, resp) => { c.set(key, resp); }}; },
+  match: async (key, opts) => { if (cachesFail) throw new Error("quota");
+    const c = store.get(opts && opts.cacheName); const r = c && c.get(key);
+    return r ? r.clone() : undefined; },
 };
-""" + sw + r"""
+function worker(text) {
+  const listeners = {}, state = {skipped: false, claimed: false};
+  const self = {addEventListener: (k, f) => { listeners[k] = f; },
+                skipWaiting: async () => { state.skipped = true; },
+                clients: {claim: async () => { state.claimed = true; }}};
+  new Function("self", text)(self);
+  return {listeners, state};
+}
+async function lifecycle(w) {
+  const waits = [];
+  w.listeners.install({waitUntil: p => waits.push(p)});
+  await Promise.all(waits);
+  w.listeners.activate({waitUntil: p => waits.push(p)});
+  await Promise.all(waits);
+}
+async function dispatch(w, url, mode, method) {
+  let answered = null;
+  w.listeners.fetch({request: {url, mode, method: method || "GET"}, respondWith: p => { answered = p; }});
+  return answered ? await Promise.resolve(answered) : null;
+}
+async function page(r) {
+  return {status: r.status, type: r.headers.get("content-type"), body: await r.text()};
+}
 (async () => {
   const out = {};
-  listeners.install({waitUntil(){}});
-  let waits = [];
-  listeners.activate({waitUntil: p => waits.push(p)});
-  await Promise.all(waits);
-  out.activate = {skipped, claimed, deleted};
-  async function dispatch(url, mode, method) {
-    let answered = null;
-    listeners.fetch({request: {url, mode, method: method || "GET"},
-                     respondWith: p => { answered = p; }});
-    return answered ? await Promise.resolve(answered).catch(e => "rejected: " + e) : null;
-  }
+  const A = worker(__A__), B = worker(__B__);
+  await lifecycle(A);
+  out.afterA = [...store.keys()];
+  out.aState = A.state;
+  out.onlineIsNetwork = (await dispatch(A, "/", "navigate")) === NET;
+  out.cachedAfterOnline = [...(store.get("silkworm-aaaa") || new Map()).keys()];
+  netFails = true;
+  out.offlineA = await page(await dispatch(A, "/", "navigate"));
   const apis = [];
   for (const fail of [false, true]) {
     netFails = fail;
-    for (const [u, mode, method] of [["/api/tasks", "cors", "POST"],
-                                      ["/api/sessions", "same-origin", "GET"],
-                                      ["/api/send", "same-origin", "POST"],
-                                      ["/icons/icon-192.png", "no-cors", "GET"]])
-      apis.push(await dispatch(u, mode, method));
+    for (const [u, mode, method] of [["/api/tasks", "cors", "POST"], ["/api/sessions", "same-origin"],
+                                     ["/api/send", "same-origin", "POST"], ["/sw.js", "same-origin"],
+                                     ["/icons/icon-192.png", "no-cors"]])
+      apis.push(await dispatch(A, u, mode, method));
   }
   out.apisAnswered = apis.filter(a => a !== null).length;
+  // The deploy: build B's worker installs and activates.
   netFails = false;
-  out.onlineIsNetwork = (await dispatch("/", "navigate")) === NET;
+  await lifecycle(B);
+  out.afterB = [...store.keys()];
   netFails = true;
-  const off = await dispatch("/", "navigate");
-  out.offline = {status: off.status, type: off.headers.get("content-type"),
-                 body: await off.text()};
-  out.opened = opened;
+  out.offlineB = await page(await dispatch(B, "/?thread=x", "navigate"));
+  // No cache at all (private mode, quota): still the offline page.
+  cachesFail = true;
+  out.offlineNoCache = await page(await dispatch(B, "/", "navigate"));
   process.stdout.write(JSON.stringify(out));
 })().catch(e => { console.error(e); process.exit(1); });
-"""
+""".replace("__A__", json.dumps(src.replace("__BUILD__", "aaaa"))) \
+   .replace("__B__", json.dumps(src.replace("__BUILD__", "bbbb")))
     r = _sp.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
-    check("the worker runs under a stub ServiceWorker scope", r.returncode == 0, r.stderr[-600:])
+    check("two builds' workers run under a stub ServiceWorker scope", r.returncode == 0,
+          r.stderr[-600:])
     if r.returncode:
         return
     out = json.loads(r.stdout)
-    check("installing/activating claims the page and clears any old cache",
-          out["activate"] == {"skipped": True, "claimed": True, "deleted": ["old-shell"]},
-          str(out["activate"]))
-    check("/api/* and other non-page requests are never intercepted, online or off",
-          out["apisAnswered"] == 0, str(out))
+    check("installing build A takes over at once and leaves only its own cache "
+          "(the old 'old-shell' is deleted)",
+          out["afterA"] == ["silkworm-aaaa"] and out["aState"] == {"skipped": True, "claimed": True},
+          str(out))
     check("an online page load is the network's own response, not a copy",
           out["onlineIsNetwork"] is True, str(out))
-    off = out["offline"]
-    check("offline, a page load gets a 503 HTML page about Tailscale",
-          off["status"] == 503 and off["type"].startswith("text/html")
-          and "is Tailscale connected?" in off["body"], str(off)[:300])
-    check("no cache was ever opened", out["opened"] == [], str(out["opened"]))
+    check("the dashboard itself is never cached: the cache holds only the offline page",
+          out["cachedAfterOnline"] == ["/__silkworm_offline__"], str(out["cachedAfterOnline"]))
+    check("/api/*, actions, the worker and icons are never intercepted, online or off",
+          out["apisAnswered"] == 0, str(out))
+    check("a new build's worker deletes the old build's cache and keeps only its own",
+          out["afterB"] == ["silkworm-bbbb"], str(out["afterB"]))
+    for k in ("offlineA", "offlineB", "offlineNoCache"):
+        off = out[k]
+        check(f"offline ({k}), a page load gets a 503 HTML page about Tailscale",
+              off["status"] == 503 and off["type"].startswith("text/html")
+              and "is Tailscale connected?" in off["body"], str(off)[:300])
+
+
+def test_viz_build_changes_with_the_code():
+    import subprocess as _sp
+    import visualizer as V
+    print("\nthe build fingerprint is the served page and worker: change either and it changes")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        src = (BASE / "visualizer.py").read_text()
+        variants = {"same": src,
+                    "page": src.replace("<title>Silkworm — Sessions</title>",
+                                        "<title>Silkworm — Sessions!</title>", 1),
+                    "worker": src.replace("// Silkworm dashboard service worker.",
+                                          "// Silkworm dashboard service worker!", 1)}
+        check("each variant really changes the code it names",
+              variants["page"] != src and variants["worker"] != src
+              and "Sessions!" not in V.SERVICE_WORKER_SRC)
+        builds = {}
+        for name, text in variants.items():
+            d = tmp / name
+            d.mkdir()
+            (d / "visualizer.py").write_text(text)
+            r = _sp.run([sys.executable, "-c",
+                         "import sys; sys.path[:0] = [sys.argv[1], sys.argv[2]]; import visualizer as V;"
+                         "print(V.BUILD, V.SERVICE_WORKER.decode().count(V.BUILD),"
+                         " V.PAGE.count(V.BUILD))", str(d), str(BASE)],
+                        capture_output=True, text=True, timeout=60, cwd=d)
+            check(f"the {name} copy imports", r.returncode == 0, r.stderr[-400:])
+            builds[name] = r.stdout.split()
+        check("the same code is the same build (deterministic)",
+              builds["same"][0] == V.BUILD, str(builds))
+        check("a change to the page is a new build", builds["page"][0] != V.BUILD, str(builds))
+        check("a change to the worker is a new build", builds["worker"][0] != V.BUILD, str(builds))
+        check("the build is stamped into the worker and the page",
+              all(int(b[1]) >= 1 and int(b[2]) >= 1 for b in builds.values()), str(builds))
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_viz_page_is_revalidated_by_build():
+    import threading
+    import urllib.error
+    import urllib.request
+    import visualizer as V
+    print("\nthe page is never held stale: no-cache, its ETag is the build, every answer names the build")
+    saved = (V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.ENV_FILE, V.bot_call)
+    saved_env = os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "sessions.json").write_text("{}")
+    srv = None
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.SESSIONS_FILE, V.ENV_FILE = tmp / "sessions.json", tmp / "no.env"
+        V.bot_call = lambda path, payload, timeout=1.0: {"ok": True}
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def get(path, headers=None):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, dict(r.headers), r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers), e.read()
+
+        code, h, body = get("/")
+        tag = f'"{V.BUILD}"'
+        check("the page: 200, Cache-Control no-cache, ETag the build, X-Silkworm-Build",
+              code == 200 and h.get("Cache-Control") == "no-cache" and h.get("ETag") == tag
+              and h.get("X-Silkworm-Build") == V.BUILD, f"{code} {h}")
+        check("the page's script carries the same build",
+              f'const PAGE_BUILD = "{V.BUILD}";' in body.decode() and b"__BUILD__" not in body)
+        code, h, body = get("/", {"If-None-Match": tag})
+        check("revalidating the same build is a 304 with no body",
+              code == 304 and body == b"" and h.get("ETag") == tag, f"{code} {h}")
+        code, h, body = get("/", {"If-None-Match": '"some-older-build"'})
+        check("an older build's ETag gets the new page", code == 200 and len(body) > 1000, str(code))
+        code, h, _ = get("/sw.js")
+        check("the worker is no-cache and names the build",
+              code == 200 and "no-cache" in h.get("Cache-Control", "")
+              and h.get("X-Silkworm-Build") == V.BUILD, f"{code} {h}")
+        code, h, body = get("/api/build")
+        check("/api/build answers the build, never cached",
+              code == 200 and json.loads(body) == {"build": V.BUILD}
+              and h.get("Cache-Control") == "no-store", f"{code} {h} {body[:100]}")
+        code, h, _ = get("/api/sessions")
+        etag = h.get("ETag")
+        code, h, _ = get("/api/sessions", {"If-None-Match": etag})
+        check("a 304 from a polled read still names the build",
+              code == 304 and h.get("X-Silkworm-Build") == V.BUILD, f"{code} {h}")
+        # Token mode: the answer to ?token= must carry its cookie, so it is
+        # never a 304.
+        V.LOOPBACK, V.TOKEN = False, "tok123"
+        code, h, _ = get("/?token=tok123", {"If-None-Match": tag})
+        check("?token= is answered in full, cookie and all, even when the build is held",
+              code == 200 and "silkworm_token=tok123" in h.get("Set-Cookie", ""), f"{code} {h}")
+    finally:
+        V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.ENV_FILE, V.bot_call = saved
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+        if saved_env is not None:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved_env
+
+
+#: The page's own script, loaded in node over a small DOM that keeps each
+#: element's state, a sessionStorage that outlives the "load" (it is passed in
+#: and handed back), and a fetch that answers /api/build and /api/probe with
+#: the build the "server" is serving. __JS__ is the script, __STATE__ the
+#: load's inputs, __SCENARIO__ what happens after it loads.
+UPDATE_HARNESS = r"""
+process.on("unhandledRejection", () => {});
+const STATE = __STATE__;
+const els = {}, docListeners = {}, winListeners = {}, replaced = [], updates = [];
+function mk(id) {
+  const cls = new Set();
+  return {id, style: {}, dataset: {}, value: "", children: [], placeholder: "", rows: 0,
+    classList: {add: c => cls.add(c), remove: c => cls.delete(c), contains: c => cls.has(c),
+                toggle(c, on) { (on === undefined ? !cls.has(c) : on) ? cls.add(c) : cls.delete(c); }},
+    addEventListener(){}, removeEventListener(){}, querySelectorAll: () => [], querySelector: () => null,
+    appendChild(){}, insertAdjacentHTML(){}, set innerHTML(v){}, get innerHTML(){ return ""; },
+    scrollIntoView(){}, focus(){}, setAttribute(){}, getBoundingClientRect: () => ({top: 0, height: 0}),
+    dispatchEvent(){}, scrollHeight: 0, scrollTop: 0, clientHeight: 0};
+}
+globalThis.document = {getElementById: id => els[id] || (els[id] = mk(id)),
+  addEventListener: (k, f) => { (docListeners[k] = docListeners[k] || []).push(f); },
+  querySelectorAll: () => [], querySelector: () => null, createElement: mk, hidden: false,
+  body: mk("body"), documentElement: mk("html")};
+globalThis.history = {state: null, replaceState(s) { this.state = s; }, pushState(s) { this.state = s; },
+                      back(){}};
+const store = new Map(Object.entries(STATE.session || {}));
+globalThis.sessionStorage = {getItem: k => store.has(k) ? store.get(k) : null,
+  setItem: (k, v) => { store.set(k, String(v)); }, removeItem: k => { store.delete(k); }};
+globalThis.localStorage = {getItem: () => null, setItem(){}, removeItem(){}};
+globalThis.location = {search: STATE.search || "", href: "http://x/" + (STATE.search || ""),
+                       replace: u => { replaced.push(u); }, reload: () => { replaced.push("reload"); }};
+globalThis.window = {addEventListener: (k, f) => { winListeners[k] = f; }, history: globalThis.history,
+                     location: globalThis.location, innerHeight: 800, innerWidth: 390};
+globalThis.matchMedia = q => ({matches: false, addEventListener(){}});
+const swListeners = {};
+Object.defineProperty(globalThis, "navigator", {configurable: true, value: {userAgent: "node",
+  serviceWorker: {register: () => Promise.resolve(), addEventListener: (k, f) => { swListeners[k] = f; },
+    getRegistration: () => Promise.resolve({update: () => { updates.push(1); return Promise.resolve(); }})}}});
+// Timers never fire, except the update's settle delay, which runs when the
+// scenario calls settleUpdate() -- so a scenario can act inside the window.
+const settles = [];
+globalThis.setInterval = () => 0; globalThis.clearTimeout = () => {};
+globalThis.setTimeout = (f, ms) => { if (ms === __SETTLE__) settles.push(f); return 0; };
+const settleUpdate = () => { while (settles.length) settles.shift()(); };
+globalThis.requestAnimationFrame = () => 0;
+let served = STATE.served;
+const answer = url => ({status: 200,
+  headers: {get: k => k === "X-Silkworm-Build" ? served : null},
+  json: async () => url.startsWith("/api/build") ? {build: served} : {}});
+globalThis.fetch = url => (url.startsWith("/api/build") || url.startsWith("/api/probe"))
+  ? Promise.resolve(answer(url)) : new Promise(() => {});
+const settle = () => new Promise(ok => setImmediate(ok));
+(0, eval)(__JS__ + `
+;globalThis.__p = {setActive: a => { active = a; }, getActive: () => active, applyUpdate,
+                   readJSON, staged, build: PAGE_BUILD};`);
+const P = globalThis.__p;
+const fire = (k) => (docListeners[k] || []).forEach(f => f({}));
+(async () => {
+  const out = {};
+  await settle();
+  __SCENARIO__
+  await settle(); await settle();
+  settleUpdate();
+  await settle();
+  out.replaced = replaced;
+  out.banner = els.updbar ? els.updbar.classList.contains("on") : false;
+  out.reply = els.reply ? els.reply.value : "";
+  out.session = Object.fromEntries(store);
+  out.updates = updates.length;
+  out.build = P.build;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+
+
+def test_viz_page_reloads_onto_a_new_build():
+    import re
+    import shutil
+    import subprocess as _sp
+    import visualizer as V
+    print("\na deploy reaches an open page: it notices the new build and reloads once onto it, "
+          "or asks first when something is being typed -- and the draft survives")
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — skipped")
+        return
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    OLD, NEW = V.BUILD, "f00dfacecafe0001"
+    new_js = js.replace(f'const PAGE_BUILD = "{OLD}";', f'const PAGE_BUILD = "{NEW}";')
+    settle_ms = re.search(r"const UPDATE_SETTLE_MS = (\d+);", js).group(1)
+    check("the page's script has one PAGE_BUILD to stamp", new_js != js and new_js.count(NEW) == 1)
+
+    def load(script, served, scenario, session=None, search=""):
+        h = (UPDATE_HARNESS.replace("__JS__", json.dumps(script))
+             .replace("__STATE__", json.dumps({"served": served, "session": session or {},
+                                               "search": search}))
+             .replace("__SCENARIO__", scenario)
+             .replace("__SETTLE__", settle_ms))
+        r = _sp.run([node, "-e", h], capture_output=True, text=True, timeout=60)
+        check("the page's script runs in the update harness", r.returncode == 0, r.stderr[-800:])
+        return json.loads(r.stdout) if r.returncode == 0 else None
+
+    # Same build everywhere: nothing happens.
+    out = load(js, OLD, 'fire("visibilitychange"); await P.readJSON("/api/probe");')
+    if out is None:
+        return
+    check("the same build: no reload, no banner",
+          out["replaced"] == [] and out["banner"] is False and out["build"] == OLD, str(out))
+
+    # The deploy, noticed on coming back to the screen (iOS resumes the app).
+    out = load(js, NEW, 'fire("visibilitychange");')
+    check("back on screen after a deploy, an idle page with nothing typed reloads once, to /",
+          out["replaced"] == ["/"] and out["banner"] is False, str(out))
+    check("it asks the worker to update and remembers which build it reloaded for",
+          out["updates"] >= 1 and out["session"].get("silkworm-updated-to") == NEW, str(out))
+    # ... or by any polled read's header.
+    out = load(js, NEW, 'await P.readJSON("/api/probe");')
+    check("a polled read's X-Silkworm-Build is enough to notice it", out["replaced"] == ["/"], str(out))
+
+    # Next load: the new code, served the new build -- no second reload.
+    out = load(new_js, NEW, 'fire("visibilitychange"); await P.readJSON("/api/probe");',
+               session={"silkworm-updated-to": NEW})
+    check("the reloaded page runs the new build and does not reload again",
+          out["build"] == NEW and out["replaced"] == [] and out["banner"] is False, str(out))
+    check("and forgets the reload marker", "silkworm-updated-to" not in out["session"], str(out))
+
+    # Reloaded for NEW and still served the old page: a banner, never a loop.
+    out = load(js, NEW, 'fire("visibilitychange");', session={"silkworm-updated-to": NEW})
+    check("reloaded once and still old: banner, not a reload loop",
+          out["replaced"] == [] and out["banner"] is True, str(out))
+
+    # Someone mid-message: a banner, and the draft goes with the reload.
+    out = load(js, NEW, '''
+      P.setActive({key: "C1:123.456"});
+      document.getElementById("reply").value = "half a thought";
+      fire("visibilitychange");
+      await settle(); await settle(); settleUpdate();
+      out.bannerFirst = document.getElementById("updbar").classList.contains("on");
+      out.replacedFirst = replaced.slice();
+      P.applyUpdate();''')
+    check("a draft in the composer: the banner, no reload under it",
+          out["bannerFirst"] is True and out["replacedFirst"] == [], str(out))
+    check("tapping it reloads onto the same thread and keeps the draft",
+          out["replaced"] == ["/?thread=C1%3A123.456"]
+          and json.loads(out["session"].get("silkworm-draft", "{}"))
+          == {"key": "C1:123.456", "text": "half a thought"}, str(out))
+    carried = out["session"]
+    out = load(new_js, NEW, "", session=carried, search="?thread=C1%3A123.456")
+    check("after the reload the draft is back in the composer, once",
+          out["reply"] == "half a thought" and "silkworm-draft" not in out["session"]
+          and out["replaced"] == [], str(out))
+
+    # Touched a moment ago, files picked, a form open: banner, not a reload.
+    # Back from a notification tap: the build check and the worker's "open"
+    # message race; the open lands inside the settle window -> banner, the task stays.
+    out = load(js, NEW, '''
+      fire("visibilitychange");
+      await settle(); await settle();
+      swListeners.message({data: {type: "open", url: "/?task=tsk_1"}});''')
+    check("a notification tap landing while a reload waits: the banner, no reload",
+          out["replaced"] == [] and out["banner"] is True, str(out))
+    # A thread's notification opens no panel: the tap itself must count.
+    out = load(js, NEW, '''
+      fire("visibilitychange");
+      await settle(); await settle();
+      swListeners.message({data: {type: "open", url: "/?thread=C9%3A1.2"}});''')
+    check("a thread notification landing while a reload waits: the banner, no reload",
+          out["replaced"] == [] and out["banner"] is True, str(out))
+    out = load(js, NEW, 'fire("visibilitychange"); await settle(); await P.readJSON("/api/probe");'
+                        'await P.readJSON("/api/probe");')
+    check("the worker is asked to update once per new build, not once per poll",
+          out["updates"] == 1 and out["replaced"] == ["/"], str(out))
+    for name, setup in (("touched", 'fire("pointerdown");'),
+                        ("scrolled", 'fire("scroll");'),
+                        ("board open", 'document.getElementById("boardmodal").style.display = "flex";'),
+                        ("task panel open", 'document.getElementById("taskmodal").style.display = "flex";'),
+                        ("files", 'P.staged.reply.push({name: "a.png", size: 1});'),
+                        ("form", 'document.getElementById("fmodal").style.display = "flex";')):
+        out = load(js, NEW, setup + ' fire("visibilitychange");')
+        check(f"{name}: the banner, no reload", out["replaced"] == [] and out["banner"] is True, str(out))
 
 
 def test_viz_phone_layout():
@@ -27163,7 +27477,9 @@ def test_sw_push_and_notificationclick():
     import visualizer as V
     print("\nthe service worker shows a push and a tap opens or focuses the app on its thread or task")
     sw = V.SERVICE_WORKER.decode()
-    check("the worker still writes no cache", not any(b in sw for b in ("caches.open", ".put(", "addAll(")))
+    check("the worker's only cache write is the offline page, into this build's cache",
+          sw.count(".put(") == 1 and "put(OFFLINE_KEY, offlinePage())" in sw
+          and sw.count("caches.open(") == 1 and "caches.open(CACHE)" in sw and "addAll(" not in sw)
     node = shutil.which("node")
     if not node:
         print("  … node not installed — the worker's push handlers checked by text only")
