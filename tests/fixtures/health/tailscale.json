@@ -5,7 +5,7 @@
  "serve_empty": {},
  "serve_funnel": {
   "AllowFunnel": {
-   "ryans-mini-2.tail0000.ts.net:443": true
+   "old-mini.tail0000.ts.net:443": true
   },
   "TCP": {
    "443": {
@@ -13,7 +13,7 @@
    }
   },
   "Web": {
-   "ryans-mini-2.tail0000.ts.net:443": {
+   "old-mini.tail0000.ts.net:443": {
     "Handlers": {
      "/": {
       "Proxy": "http://127.0.0.1:8790"
@@ -29,7 +29,7 @@
    }
   },
   "Web": {
-   "ryans-mini-2.tail0000.ts.net:443": {
+   "old-mini.tail0000.ts.net:443": {
     "Handlers": {
      "/": {
       "Proxy": "http://127.0.0.1:8790"
@@ -58,7 +58,7 @@
    "DNSName": "",
    "ExitNode": false,
    "ExitNodeOption": false,
-   "HostName": "Ryans-Mini-2.home",
+   "HostName": "Old-Mini.home",
    "ID": "",
    "InEngine": false,
    "InMagicSock": false,
@@ -89,7 +89,7 @@
   "AuthURL": "",
   "BackendState": "Running",
   "CertDomains": [
-   "ryans-mac-mini-2.tail0000.ts.net"
+   "mac-mini.tail0000.ts.net"
   ],
   "ClientVersion": null,
   "CurrentTailnet": {
@@ -109,7 +109,7 @@
     "AllowedIPs": [],
     "Created": "2026-10-14T17:31:38.998012183Z",
     "CurAddr": "",
-    "DNSName": "iphone182.tail0000.ts.net.",
+    "DNSName": "phone1.tail0000.ts.net.",
     "ExitNode": false,
     "ExitNodeOption": false,
     "HostName": "localhost",
@@ -160,10 +160,10 @@
    ],
    "Created": "2026-10-14T17:33:10.442260027Z",
    "CurAddr": "",
-   "DNSName": "ryans-mac-mini-2.tail0000.ts.net.",
+   "DNSName": "mac-mini.tail0000.ts.net.",
    "ExitNode": false,
    "ExitNodeOption": false,
-   "HostName": "Ryans-Mac-mini-2",
+   "HostName": "Mac-mini",
    "ID": "[id]",
    "InEngine": false,
    "InMagicSock": false,
@@ -206,7 +206,7 @@
   "AuthURL": "",
   "BackendState": "Stopped",
   "CertDomains": [
-   "ryans-mac-mini-2.tail0000.ts.net"
+   "mac-mini.tail0000.ts.net"
   ],
   "ClientVersion": null,
   "CurrentTailnet": {
@@ -226,7 +226,7 @@
     "AllowedIPs": [],
     "Created": "2026-10-14T17:31:38.998012183Z",
     "CurAddr": "",
-    "DNSName": "iphone182.tail0000.ts.net.",
+    "DNSName": "phone1.tail0000.ts.net.",
     "ExitNode": false,
     "ExitNodeOption": false,
     "HostName": "localhost",
@@ -277,10 +277,10 @@
    ],
    "Created": "2026-10-14T17:33:10.442260027Z",
    "CurAddr": "",
-   "DNSName": "ryans-mac-mini-2.tail0000.ts.net.",
+   "DNSName": "mac-mini.tail0000.ts.net.",
    "ExitNode": false,
    "ExitNodeOption": false,
-   "HostName": "Ryans-Mac-mini-2",
+   "HostName": "Mac-mini",
    "ID": "[id]",
    "InEngine": false,
    "InMagicSock": false,

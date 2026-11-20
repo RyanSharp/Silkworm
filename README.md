@@ -1392,7 +1392,7 @@ restart between the two sends forgets them.)
 On the machine you browse *from*:
 
 ```sh
-./bin/silkworm-tunnel install ryansharp@your-mini.local
+./bin/silkworm-tunnel install you@your-mini.local
 ```
 
 That installs a launchd agent holding an SSH tunnel to the dashboard port, which
@@ -1405,8 +1405,11 @@ agent has no terminal to answer a passphrase prompt.
 **The host is resolved on every dial, not fixed at install time.** A DHCP lease
 change used to break the tunnel permanently and silently, because the plist
 baked one address into the ssh command line. The agent now runs a small dialer
-that tries, in order: the host you installed with, the mDNS `.local` name,
-whatever answered last time, and finally an ARP lookup by hardware address.
+that tries, in order: the host you installed with, the mDNS `.local` name
+(`SILKWORM_HOST`, if you installed against an IP), whatever answered last time,
+and finally an ARP lookup by the address in `SILKWORM_MAC`, if you set one.
+Nothing about your machine is built in; with neither an argument nor
+`SILKWORM_HOST`, install refuses.
 
 ### If the host's address keeps moving
 

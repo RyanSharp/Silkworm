@@ -28929,7 +28929,7 @@ def _healthcheck_home(log_text):
     agents = d / "home" / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
     (agents / "com.traderjoe.paperhealth.plist").write_text(
-        R["paperhealth_plist"].replace("/Users/ryansharp/workspace/trader/data/paper_health.log",
+        R["paperhealth_plist"].replace("/Users/owner/workspace/trader/data/paper_health.log",
                                        str(log)))
     return d, rec
 
@@ -29571,7 +29571,7 @@ def test_probe_results_never_carry_a_secret():
     log.write_text("paper healthcheck 2026-10-20T13:15:05\n"
                    f"  [FAIL] webhook: ALERT_WEBHOOK_URL rejected {secrets['anth']}\n")
     (agents / "com.traderjoe.paperhealth.plist").write_text(
-        R["paperhealth_plist"].replace("/Users/ryansharp/workspace/trader/data/paper_health.log",
+        R["paperhealth_plist"].replace("/Users/owner/workspace/trader/data/paper_health.log",
                                        str(log)))
     trader = home / "trader"
     (trader / ".venv" / "bin").mkdir(parents=True)
@@ -29732,7 +29732,7 @@ def test_probe_tailscale_reads_the_phone_dashboards_path():
         return res, P._decide_tailscale(res), s
 
     check("the recording is the live one: the node is renamed, serve still has the old name",
-          stale != dns and stale.startswith("ryans-mini-2.") and dns.startswith("ryans-mac-mini-2."),
+          stale != dns and stale.startswith("old-mini.") and dns.startswith("mac-mini."),
           (stale, dns))
     r, d, s = run(running)
     check("Running, logged in, MagicDNS and HTTPS on, serve forwarding this name to :8790, "
@@ -33766,19 +33766,19 @@ def test_a_review_closes_with_its_task():
 # the same grant a Slack message does -- recording which it was.
 
 OWNER = "Owner@Example.com"
-PHONE, MINI = "100.123.15.15", "100.99.197.50"
+PHONE, MINI = "100.64.0.2", "100.64.0.1"
 
 
 class _FakeProbe:
     """The machine, as dashowner.verify reads it: the mini's own tailnet
     addresses, who Tailscale says a peer is, and who opened the socket."""
 
-    def __init__(self, mine=(MINI, "fd7a:115c:a1e0::e52f:c533"), conn=None, whois=None):
+    def __init__(self, mine=(MINI, "fd7a:115c:a1e0::1"), conn=None, whois=None):
         self.mine = frozenset(mine)
         self.conn = ({"pid": 321, "uid": 0, "name": "tailscaled",
                       "path": "/opt/tailscale/bin/tailscaled"} if conn is None else conn)
-        self.who = {PHONE: {"login": "owner@example.com", "node": "iphone182"},
-                    MINI: {"login": "owner@example.com", "node": "ryans-mac-mini-2"}
+        self.who = {PHONE: {"login": "owner@example.com", "node": "phone1"},
+                    MINI: {"login": "owner@example.com", "node": "mac-mini"}
                     } if whois is None else whois
         self.asked = []
 
@@ -33833,12 +33833,12 @@ def test_dashboard_vouches_only_for_the_owner_from_another_device():
           "from another tailnet device, on tailscaled's connection")
     owner, why = _verify(_serve_headers())
     check("your login, through serve, from your phone: vouched for, with its device",
-          owner == {"login": OWNER, "peer": PHONE, "node": "iphone182"} and not why,
+          owner == {"login": OWNER, "peer": PHONE, "node": "phone1"} and not why,
           (owner, why))
     owner, why = _verify(_serve_headers(peer=MINI))
     check("the same login from the mini's own tailnet address is not (an agent's)",
           owner is None and "this machine itself" in why, why)
-    owner, why = _verify(_serve_headers(peer="fd7a:115c:a1e0::e52f:c533"))
+    owner, why = _verify(_serve_headers(peer="fd7a:115c:a1e0::1"))
     check("nor from its v6 address", owner is None and "this machine itself" in why, why)
     owner, why = _verify({"Content-Type": "application/json"})
     check("a loopback request with no Tailscale identity is not",
@@ -33939,8 +33939,8 @@ def test_dashboard_reads_the_socket_owner_from_netstat():
         def ts_run(argv, timeout):
             seen.append(argv)
             if argv[1] == "whois":
-                return 0, json.dumps({"Node": {"Name": "iphone182.tail.ts.net.",
-                                               "ComputedName": "iphone182"},
+                return 0, json.dumps({"Node": {"Name": "phone1.tail.ts.net.",
+                                               "ComputedName": "phone1"},
                                       "UserProfile": {"LoginName": "owner@example.com"}}), ""
             return 0, json.dumps({"Self": {"TailscaleIPs": [MINI, "not-an-ip"]}}), ""
         seen = []
@@ -33949,7 +33949,7 @@ def test_dashboard_reads_the_socket_owner_from_netstat():
         check("whois asks `tailscale whois --json <ip>` -- the flag before the address, "
               "which tailscale otherwise reads as a second peer",
               ["/x/tailscale", "whois", "--json", PHONE] in seen
-              and who == {"login": "owner@example.com", "node": "iphone182"}, (seen, who))
+              and who == {"login": "owner@example.com", "node": "phone1"}, (seen, who))
         check("and the mini's own addresses come from `tailscale status --json`",
               pr.self_ips("/x/tailscale") == frozenset({MINI}))
         check("a non-address is never handed to whois", pr.whois("-x", "/x/tailscale") == {}
@@ -34014,7 +34014,7 @@ def test_viz_send_vouches_for_the_owner_only():
         code, payload = send(_serve_headers())
         check("from your phone through serve: relayed with who sent it",
               code == 200 and payload and payload.get("dashboard_owner")
-              == {"login": OWNER, "peer": PHONE, "node": "iphone182"}, (code, payload))
+              == {"login": OWNER, "peer": PHONE, "node": "phone1"}, (code, payload))
         conn = [a for a in probe.asked if isinstance(a, tuple) and a[0] == "conn"]
         check("the socket asked about is this request's own",
               conn and conn[-1][2] == ("127.0.0.1", port) and conn[-1][1][0] == "127.0.0.1",
@@ -34069,13 +34069,13 @@ def test_bot_opens_your_grant_for_a_vouched_dashboard_message():
         ns = lift("user_started", "grant_starter", BOT_USER_ID="UBOT",
                            ALLOWED_USERS={"U_ME"})
         started, starter = ns["user_started"], ns["grant_starter"]
-        vouched = {"login": "owner@example.com", "peer": PHONE, "node": "iphone182"}
+        vouched = {"login": "owner@example.com", "peer": PHONE, "node": "phone1"}
         ev = {"_web": True, "_web_owner": vouched}
         check("a vouched dashboard message starts a turn of yours", started(ev, ""))
         check("its grant is your login, from the dashboard, with the device",
               starter(ev, "") == ("owner@example.com", {
                   "via": "dashboard", "login": "owner@example.com", "peer": PHONE,
-                  "node": "iphone182"}), starter(ev, ""))
+                  "node": "phone1"}), starter(ev, ""))
         check("a Slack message's grant says Slack",
               starter({"ts": "1.0"}, "U_ME") == ("U_ME", {"via": "slack"}))
         check("even one carrying the dashboard's field (only a dashboard message is vouched for)",
@@ -34107,13 +34107,13 @@ def test_bot_opens_your_grant_for_a_vouched_dashboard_message():
           "who, via = grant_starter(event, user)" in hp and "via=via" in hp)
     gs = O.Grants()
     t = gs.open("D1:1.0", "5.0", "owner@example.com", "accept tsk_1", "tsk_turn",
-                via={"via": "dashboard", "login": "owner@example.com", "node": "iphone182",
+                via={"via": "dashboard", "login": "owner@example.com", "node": "phone1",
                      "peer": PHONE})
     g = gs.get(t, "D1:1.0", "tsk_turn")
     check("a dashboard grant records where it came from",
-          g["via"] == "dashboard" and g["node"] == "iphone182" and g["peer"] == PHONE
+          g["via"] == "dashboard" and g["node"] == "phone1" and g["peer"] == PHONE
           and O.grant_source(g) == f"dashboard message 5.0 (owner@example.com on "
-                                   f"iphone182, {PHONE})", O.grant_source(g))
+                                   f"phone1, {PHONE})", O.grant_source(g))
     t2 = gs.open("D1:1.0", "6.0", "U_ME", "accept tsk_1", "tsk_turn")
     check("a Slack one says so", gs.get(t2, "D1:1.0", "tsk_turn")["via"] == "slack"
           and O.grant_source(gs.get(t2, "D1:1.0", "tsk_turn")) == "Slack message 6.0")
@@ -34196,7 +34196,7 @@ def test_bot_takes_dashboard_owner_only_from_the_visualizer():
                        deliver_web_message=lambda p: delivered.append(p) or {"ok": True},
                        WEB_SENDS=None, webthread=None, WEB_PEER_PROBE=_VizProbe(opener=777),
               absent=('WEB_REPEAT_WAIT_S',))
-    vouched = {"login": "owner@example.com", "peer": PHONE, "node": "iphone182"}
+    vouched = {"login": "owner@example.com", "peer": PHONE, "node": "phone1"}
     ns["handle_web_message"]({"key": "D1:1.0", "text": "accept tsk_1",
                               "dashboard_owner": vouched}, c, s)
     check("a dashboard_owner posted by another process is dropped; the message still goes",
@@ -34272,7 +34272,7 @@ def _dash_say(bot, text, turn=None, ts="1763400000.000100"):
     """Open a grant as handle_prompt does for a dashboard message it vouched for."""
     return bot.ns["OPERATOR_GRANTS"].open(
         HOME, ts, "owner@example.com", text, turn or bot.turn,
-        via={"via": "dashboard", "login": "owner@example.com", "node": "iphone182",
+        via={"via": "dashboard", "login": "owner@example.com", "node": "phone1",
              "peer": PHONE})
 
 
@@ -34293,14 +34293,14 @@ def test_dashboard_grant_accepts_and_records_where_it_came_from():
     check("your dashboard message lets the accept through",
           r.returncode == 0 and rec.get("state") != T.PROPOSED, r.stdout + r.stderr)
     check("the reply says whose word, from where",
-          "dashboard message 1763400000.000100 (owner@example.com on iphone182" in r.stdout,
+          "dashboard message 1763400000.000100 (owner@example.com on phone1" in r.stdout,
           r.stdout)
     check("the task records decided_by, its message and the dashboard provenance",
           res.get("decided_by") == "user via operator"
           and res.get("decided_ts") == "1763400000.000100"
           and "dashboard message" in (res.get("decided_via") or "")
           and ev and "dashboard message" in ev[-1]["detail"]
-          and "iphone182" in ev[-1].get("via", ""), rec)
+          and "phone1" in ev[-1].get("via", ""), rec)
     check("compaction keeps where it came from", "decided_via" in T.RESULT_KEEPS)
     import costs
     st.update(a, result={"text": "done", **costs.add_run(st.get(a), 0.5)})
@@ -34322,7 +34322,7 @@ def test_dashboard_grant_files_on_request():
     g = w.grants.open(HOME_, "1763400000.000200", "owner@example.com",
                       "file the universe rebuild", "tsk_turn",
                       via={"via": "dashboard", "login": "owner@example.com",
-                           "node": "iphone182", "peer": PHONE})
+                           "node": "phone1", "peer": PHONE})
     out = w.file({"key": HOME_, "goal": "Rebuild the universe point-in-time", "project": "alpha",
                   "caller_role": "operator", "caller_task": "tsk_turn", "caller_grant": g,
                   "requested_by_user": True, "notes": "user: 'file the universe rebuild'"})
@@ -34332,7 +34332,7 @@ def test_dashboard_grant_files_on_request():
           out.get("ok") and out.get("state") == T.QUEUED, out)
     check("the reply and the record name the dashboard message",
           "dashboard message 1763400000.000200" in (out.get("decided_via") or "")
-          and rq.get("via") == "dashboard" and "iphone182" in rq.get("source", "")
+          and rq.get("via") == "dashboard" and "phone1" in rq.get("source", "")
           and any("dashboard message" in e.get("detail", "") for e in rec.get("events") or []),
           (out, rec))
     out = w.file({"key": HOME_, "goal": "Another", "project": "alpha",
@@ -34352,7 +34352,7 @@ def test_dashboard_grant_answers_an_ops_plan():
         g = w.grants.open("D1:1.0", ts, "owner@example.com", "yes", "tsk_turn_mine",
                           plan=w.state.answer_plan(ts, "yes"),
                           via={"via": "dashboard", "login": "owner@example.com",
-                               "node": "iphone182", "peer": PHONE})
+                               "node": "phone1", "peer": PHONE})
         r = _ops_as_user(w, g, "trader-env-set", "MOMENTUM_UNIVERSE", "static",
                          "--notes", "user: yes")
         check("an op not in the plan, and not named, is still refused",
@@ -34364,7 +34364,7 @@ def test_dashboard_grant_answers_an_ops_plan():
         runs = [x for x in OPS.read_log(w.log, 100) if x.get("plan_entry") and not x.get("refused")]
         check("the ops log records it was the dashboard, and which device",
               runs and "dashboard message" in runs[-1].get("decided_via", "")
-              and "iphone182" in runs[-1]["decided_via"], runs)
+              and "phone1" in runs[-1]["decided_via"], runs)
         r = _ops_cli(w, "log")
         check("and `silkworm ops log` shows it", "dashboard message" in r.stdout, r.stdout)
         r = _plan_run(w, "", 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
@@ -34380,15 +34380,15 @@ def test_digest_says_which_message_decided():
     a = st.create("Add an appearance preference", project="alpha")["id"]
     b = st.create("Retry sync on 429", project="alpha")["id"]
     st.record_decision(a, "accept decided by owner@example.com (dashboard message 9.1 "
-                       "(owner@example.com on iphone182, 100.123.15.15)) via operator: yes",
+                       "(owner@example.com on phone1, 100.64.0.2)) via operator: yes",
                        "user via operator", "9.1",
-                       via="dashboard message 9.1 (owner@example.com on iphone182, 100.123.15.15)")
+                       via="dashboard message 9.1 (owner@example.com on phone1, 100.64.0.2)")
     st.record_decision(b, "dismiss decided by U_ME (Slack message 9.2) via operator: no",
                        "user via operator", "9.2", via="Slack message 9.2")
     text = D.render(st.all().values(), time.time())
     check("each is listed under what was done on your word, with where it came from",
           "done on your word" in text and "accept, dashboard message 9.1" in text
-          and "iphone182" in text and "dismiss, Slack message 9.2" in text, text)
+          and "phone1" in text and "dismiss, Slack message 9.2" in text, text)
 
 
 

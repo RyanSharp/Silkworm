@@ -6,7 +6,7 @@
 # the mini's dashboard port and re-dials whenever it drops — on wake from
 # sleep, on Wi-Fi changes, on reboot — so http://127.0.0.1:8790 just works.
 #
-#   ./silkworm-tunnel install [user@]host     # default: Ryans-Mac-mini-2.local
+#   ./silkworm-tunnel install [user@]host     # default: $SILKWORM_HOST
 #   ./silkworm-tunnel status
 #   ./silkworm-tunnel uninstall
 #
@@ -18,19 +18,20 @@ LABEL="com.silkworm.tunnel"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOGDIR="$HOME/Library/Logs/silkworm"
 PORT="${SILKWORM_VIZ_PORT:-8790}"
-# The mini's LocalHostName is "Ryans-Mac-mini-2", so this is its real mDNS
-# name. An earlier default of "Ryans-Mini-2.local" named nothing at all,
-# which is why .local "did not work" -- it was never being asked for.
-DEFAULT_HOST="Ryans-Mac-mini-2.local"
-# Last resort when neither a name nor the cached address answers: find the host
-# by the address it actually presents on the network.
+# The mini's mDNS name: its LocalHostName plus .local (System Settings >
+# General > Sharing shows it; `scutil --get LocalHostName` prints it). Use the
+# real LocalHostName -- a guessed one names nothing, and .local then "does not
+# work" because it was never being asked for. Also kept as the dialer's
+# fallback name when you install against a literal IP.
+DEFAULT_HOST="${SILKWORM_HOST:-}"
+# Optional last resort when neither a name nor the cached address answers: find
+# the host by the address it actually presents on the network.
 #
-# Note this is NOT the mini's hardware MAC (1c:f6:4c:76:e8:09). macOS Private
-# Wi-Fi Address is on, so the router only ever sees a randomised address -- and
-# a DHCP reservation made against the hardware MAC would silently never match.
-# If Private Wi-Fi Address is turned off for this network, the hardware MAC
-# becomes the right value here and this fallback stops being fragile.
-DEFAULT_MAC="${SILKWORM_MAC:-d2:a8:29:0a:b8:bf}"
+# With macOS Private Wi-Fi Address on (the default), that is NOT the mini's
+# hardware MAC: the router only ever sees a randomised per-network address, so
+# use the one shown under Wi-Fi > Details on the mini. A DHCP reservation made
+# against the hardware MAC would silently never match either.
+DEFAULT_MAC="${SILKWORM_MAC:-}"
 STATE="$HOME/.silkworm"
 DIALER="$STATE/tunnel-dial"
 
@@ -39,7 +40,7 @@ say() { printf '%s🪱 silkworm-tunnel:%s %s\n' "$Y" "$N" "$1"; }
 ok()  { printf '  %s✔%s %s\n' "$G" "$N" "$1"; }
 bad() { printf '  %s✘%s %s\n' "$R" "$N" "$1"; }
 
-target() { printf '%s' "${1:-${SILKWORM_HOST:-$DEFAULT_HOST}}"; }
+target() { printf '%s' "${1:-$DEFAULT_HOST}"; }
 
 check_ssh() {
   local host="$1"
@@ -102,8 +103,8 @@ reachable() {
       "$1" true 2>/dev/null
 }
 
-# Strip leading zeros from each octet: `arp -an` prints 1c:f6:4c:76:e8:9, not
-# ...:09, so the two only compare equal in that form. macOS ships BWK awk,
+# Strip leading zeros from each octet: `arp -an` prints 0a:1b:2c:3d:4e:5, not
+# ...:05, so the two only compare equal in that form. macOS ships BWK awk,
 # which has no strtonum, so this is done textually.
 norm_mac() {
   printf '%s' "$1" | tr 'A-Z' 'a-z' | awk -F: '
@@ -193,6 +194,10 @@ wait_for_port() {
 case "${1:-install}" in
   install)
     host="$(target "${2:-}")"
+    if [ -z "$host" ]; then
+      bad "no host: pass [user@]host, or set SILKWORM_HOST (e.g. your-mini.local)"
+      exit 1
+    fi
     say "installing tunnel to $host (dashboard port $PORT)"
     check_ssh "$host" || exit 1
     write_dialer "$host" "$DEFAULT_MAC"

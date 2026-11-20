@@ -24,8 +24,13 @@ import re
 import sys
 from pathlib import Path
 
-#: The tailnet's name is not a secret, but it is not this repo's either.
-TAILNET = ("tail84ebd7", "tail0000")
+#: The tailnet's name is not a secret, but it is not this repo's either. Read
+#: from the capture's MagicDNSSuffix (tailXXXX.ts.net) by main(), never typed here.
+TAILNET = ["", "tail0000"]
+
+
+def tailnet_of(running):
+    return (running.get("MagicDNSSuffix") or "").split(".", 1)[0]
 
 
 def scrub(obj):
@@ -55,12 +60,44 @@ def scrub(obj):
     if isinstance(obj, list):
         return [scrub(v) for v in obj]
     if isinstance(obj, str):
-        return obj.replace(*TAILNET)
+        obj = obj.replace(*TAILNET) if TAILNET[0] else obj
+        for real in sorted(NAMES, key=len, reverse=True):
+            obj = obj.replace(real, NAMES[real])
+        return obj
     return obj
 
 
+#: Machine names -> placeholders, filled in by machine_names() from the raw
+#: captures themselves, so the real names are never written into this file.
+NAMES = {}
+
+
+def machine_names(running, serve, fresh):
+    """The mini's tailnet and OS names (current, and the stale one serve still
+    holds), and the kept peer's, each mapped to a stand-in."""
+    label = lambda dns: (dns or "").split(".", 1)[0]
+    names = {}
+    me = running.get("Self") or {}
+    names[label(me.get("DNSName"))] = "mac-mini"
+    names[me.get("HostName") or ""] = "Mac-mini"
+    for i, peer in enumerate((running.get("Peer") or {}).values(), 1):
+        names.setdefault(label(peer.get("DNSName")), f"phone{i}")
+        if (peer.get("HostName") or "localhost") != "localhost":
+            names.setdefault(peer["HostName"], f"Phone{i}")
+    for host in serve.get("Web") or {}:
+        names.setdefault(label(host), "old-mini")
+    names.setdefault(label((fresh.get("Self") or {}).get("HostName")), "Old-Mini")
+    names.pop("", None)
+    return names
+
+
 def main(raw: Path):
-    load = lambda name: scrub(json.loads((raw / name).read_text()))
+    read = lambda name: json.loads((raw / name).read_text())
+    TAILNET[0] = tailnet_of(read("status_running.json"))
+    assert TAILNET[0].startswith("tail"), TAILNET[0]
+    NAMES.update(machine_names(read("status_running.json"), read("serve_live.json"),
+                               read("status_fresh.json")))
+    load = lambda name: scrub(read(name))
     running = load("status_running.json")
     # One peer is enough to show the shape; the rest are other people's machines.
     peers = running.get("Peer") or {}
@@ -90,10 +127,17 @@ def main(raw: Path):
     blob = out.read_text()
     raw_text = "".join((raw / n).read_text() for n in ("status_running.json", "status_fresh.json"))
     ids = set(re.findall(r'"(?:UserID|ID|NodeID)": "?(\w{6,})', raw_text))
-    # Keys, public and LAN addresses, the tailnet, the account, every id.
-    for bad in (r"nodekey:[0-9a-f]{8}", r"\b(?:47|192)\.\d+\.\d+\.\d+", TAILNET[0],
-                "ryansharp", "@github", *ids):
-        assert not re.search(bad, blob), bad
+    # Keys, public and LAN addresses, the tailnet, the account, every id,
+    # and every machine's name.
+    for bad in (r"nodekey:[0-9a-f]{8}", r"\b(?:47|192)\.\d+\.\d+\.\d+",
+                re.escape(tailnet_of(read("status_running.json"))),
+                *(re.escape(u[k].split("@")[0]) for u in
+                  (read("status_running.json").get("User") or {}).values()
+                  for k in ("LoginName",) if u.get(k)),
+                "@github", *ids, *map(re.escape, machine_names(
+                    read("status_running.json"), read("serve_live.json"),
+                    read("status_fresh.json")))):
+        assert not re.search(bad, blob, re.I), bad
     print(f"wrote {out}")
 
 
