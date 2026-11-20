@@ -29889,8 +29889,9 @@ def test_probe_config_maps_projects_explicitly():
     check("the five apps, by App Store Connect id",
           sorted(cfg.get("apps") or {}) == ["cadence", "fathom", "mondays", "saga", "silkswing"]
           and all(str(v).isdigit() for v in cfg["apps"].values()))
-    check("the three Supabase backends, each with its ref and directory",
-          sorted(cfg.get("supabase") or {}) == ["cadence", "mondays", "saga"]
+    check("the Supabase backends, each with its ref and directory -- not Saga's, dropped "
+          "2026-11-19 until it heads to review",
+          sorted(cfg.get("supabase") or {}) == ["cadence", "mondays"]
           and all(v.get("ref") and v.get("dir") for v in cfg["supabase"].values()))
     text = (BASE / "health.toml").read_text()
     check("and no credential in it", not _re.search(r"sbp_|sb_secret|sk-ant|BEGIN|PASSWORD=",
@@ -29905,11 +29906,24 @@ def test_probe_config_maps_projects_explicitly():
     check("each applies only where the table says",
           applies == {"app-store": ["cadence", "saga", "mondays", "fathom", "silkswing"],
                       "testflight": ["cadence", "saga", "mondays", "fathom", "silkswing"],
-                      "backend-drift": ["cadence", "saga", "mondays"],
+                      "backend-drift": ["cadence", "mondays"],
                       "dispatching": ["trader"], "gateway": ["trader"],
                       "healthcheck": ["trader"], "credentials": ["mini"], "disk": ["mini"],
                       "tailscale": ["mini"], "revision": ["mini"]},
           applies)
+    import health as H
+    saga = {"slug": "saga"}
+    check("a project with no Supabase table has no backend-drift row at all, not an "
+          "unknown or a config error -- its other checks still run",
+          [c.name for c in H.checks_for(saga, reg)] == ["app-store", "testflight"]
+          and reg["backend-drift"].applies(saga) is False,
+          [c.name for c in H.checks_for(saga, reg)])
+    hs, ts, _ = _health_stores()
+    hs.record("saga", "backend-drift", H.unknown("no credentials for Supabase project"), 1)
+    hs.record("saga", "testflight", H.result(H.OK, "build 43 valid"), 1)
+    H.retire(hs, ts, {H.key("saga", c.name) for c in H.checks_for(saga, reg)})
+    check("and the old unknown row is retired on the next pass; the rest kept",
+          hs.get("saga", "backend-drift") is None and hs.get("saga", "testflight") is not None)
 
 
 # --- the operator acts on your word, in a turn you started ---------------------

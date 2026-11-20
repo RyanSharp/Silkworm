@@ -23,9 +23,13 @@ dispatch_grace_minutes = 60
 ref = "glwhwbsyjpqmdajkntrp"
 dir = "supabase"
 
-[supabase.saga]
-ref = "jlwovmozhisqywlkqxzy"
-dir = "backend/supabase"
+# Saga: dropped 2026-11-19 at the owner's request; re-enable when Saga heads to
+# App Store review, after adding the project credential file
+# (~/.supabase/projects/jlwovmozhisqywlkqxzy.env). Nothing of Saga's is live, and
+# without that file the check could only ever say it can't look.
+# [supabase.saga]
+# ref = "jlwovmozhisqywlkqxzy"
+# dir = "backend/supabase"
 
 [supabase.mondays]
 ref = "twqhvixtqgdpwgmljnvm"
