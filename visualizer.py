@@ -4206,13 +4206,15 @@ function holdAnchor() {
 // The thread's box or what is in it changed size outside a draw -- the
 // keyboard opening or closing, the composer growing a line, an image or a
 // font arriving, a line unfolding: a reader following the end is kept at
-// it, and one reading further up keeps their place.
+// it, and one reading further up keeps their place. With no thread open
+// there is no end to follow: main holds only the stats (a laptop's panel
+// taller than the window loading or redrawing), left where it is read.
 let boxHeight = -1;
 function reflow() {
   const m = scroller();
   if (!m) return;
   boxHeight = m.clientHeight;
-  if (pinned) { if (!gliding && m.scrollHeight - m.scrollTop - m.clientHeight > 1) m.scrollTop = m.scrollHeight; }
+  if (pinned) { if (active && !gliding && m.scrollHeight - m.scrollTop - m.clientHeight > 1) m.scrollTop = m.scrollHeight; }
   else holdAnchor();
 }
 function onScroll() {

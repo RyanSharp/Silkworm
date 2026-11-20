@@ -36031,7 +36031,7 @@ const content = () => HEAD + tmsgs.children.reduce((a, c) => a + c.h, 0) + liveH
 const main = plain("__main");
 let top_ = 0;
 Object.defineProperty(main, "clientHeight", {get: () => vvh});
-Object.defineProperty(main, "scrollHeight", {get: () => Math.max(content(), vvh)});
+Object.defineProperty(main, "scrollHeight", {get: () => Math.max(content(), vvh), configurable: true});
 Object.defineProperty(main, "scrollTop", {get: () => top_, set(v) {
   const t = Math.max(0, Math.min(v, main.scrollHeight - main.clientHeight));
   if (t !== top_) { top_ = t; pendingScroll = true; }
@@ -36060,8 +36060,25 @@ globalThis.requestAnimationFrame = () => 0;
 globalThis.fetch = () => new Promise(() => {});
 globalThis.getComputedStyle = () => ({});
 (0, eval)(__JS__ + `
-;globalThis.__p = {keepEnd, toEnd, atEnd, onScroll, isPinned: () => pinned};`);
+;globalThis.__p = {keepEnd, toEnd, atEnd, onScroll, isPinned: () => pinned, setActive: a => { active = a; }};`);
 const P = globalThis.__p, out = {};
+// No thread open: main holds only the stats, taller than the window, read
+// from the top; the panel loading or redrawing (the observer firing) leaves
+// them there -- there is no end to follow.
+{
+  let stats = 1600;
+  const drawn = tmsgs.children.length;
+  tmsgs.children.length = 0;
+  const sh = Object.getOwnPropertyDescriptor(main, "scrollHeight");
+  Object.defineProperty(main, "scrollHeight", {get: () => Math.max(stats, vvh), configurable: true});
+  main.scrollTop = 0; flush();
+  const was = P.isPinned();
+  layout(); stats = 2400; layout();
+  out.noThread = {top: main.scrollTop, pinnedBefore: was};
+  Object.defineProperty(main, "scrollHeight", sh);
+  tmsgs.children.length = drawn;
+}
+P.setActive({key: "T", kind: "thread"});                // a thread open from here on
 // The keyboard, as iOS opens it: the visual viewport shrinks and says so.
 function keyboard(open) { vv.height = open ? 460 : 800; vvListeners.resize(); layout(); }
 // Thirty messages; read at the end, or scrolled up to the middle.
@@ -36237,6 +36254,8 @@ def test_viz_chat_keeps_its_place():
           o["underHeader"]["sameMessage"] and abs(o["underHeader"]["moved"]) <= 1, o["underHeader"])
     check("read above the messages (the stats), what grows there does not scroll the reader",
           o["aboveMessages"]["top"] == 0, o["aboveMessages"])
+    check("no thread open: the stats panel loading or redrawing does not scroll main to its bottom",
+          o["noThread"]["pinnedBefore"] and o["noThread"]["top"] == 0, o["noThread"])
     # A WebKit without ResizeObserver (before iOS 13.4): the keyboard is still
     # followed, from the visual viewport's own resize.
     n = scroll_harness(js, resize_observer=False)
