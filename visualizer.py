@@ -5353,6 +5353,13 @@ function costText(t) {
   return ` · <span title="${c.complete ? "this task and its reviews"
     : "a lower bound: some runs recorded no cost"} (API list-price equivalent, not billed)">${s}${c.complete ? "" : "+"}</span>`;
 }
+// Which rows and cards take a swipe: one rule for the task list and the
+// board. A proposal, but not a review: a review is the machinery's, made
+// queued for a task that is waiting on it, and a stray thumb should not be
+// able to throw one away.
+function swipeAttr(t) {
+  return t.state === "proposed" && t.role !== "reviewer" ? ' data-swipe="1"' : "";
+}
 function taskButtons(t) {
   const b = [];
   if (t.state === "proposed") {
@@ -5432,7 +5439,7 @@ async function renderTasks() {
           why ? `<div class="why">${esc(why)}</div>` : ""}${
           more ? `<div class="lazy" id="more-${esc(t.id)}"><div class="hint">loading…</div>${skel("lines")}</div>` : ""}</details>`
       : esc(t.title);
-    return `<div class="task" data-task="${esc(t.id)}"${t.state === "proposed" ? ' data-swipe="1"' : ""}>
+    return `<div class="task" data-task="${esc(t.id)}"${swipeAttr(t)}>
       <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="tt">${title}
         <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
@@ -6721,7 +6728,7 @@ function cardButtons(t) {
 }
 function boardCard(t) {
   const cost = fmtCost(t.cost_total);
-  return `<div class="bcard" data-id="${esc(t.id)}"${t.state === "proposed" && t.role !== "reviewer" ? ' data-swipe="1"' : ""} onclick="openCard('${esc(t.id)}')">
+  return `<div class="bcard" data-id="${esc(t.id)}"${swipeAttr(t)} onclick="openCard('${esc(t.id)}')">
     <div class="tt">${esc(t.title || t.id)}</div>
     <div class="sub">${t.project && boardProject === "" ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
       esc(t.role)}${t.lens ? ` · <span class="lens" title="the nightly review lens it came from">${esc(t.lens)}</span>` : ""}${t.state === "blocked" || t.state === "proposed" || t.state === "failed"

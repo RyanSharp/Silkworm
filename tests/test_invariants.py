@@ -36945,7 +36945,7 @@ Object.defineProperty(toastEl, "text", {get() {
 ;globalThis.__m = {pendingGone, deferTask, toast, toggleTasks, closeModal, openModal, closeDetail, renderList,
   loadList, hideThread, taskAction, cycleTheme, theme, applyTheme, unstick, drawKeyed, skel, skelIfEmpty,
   setHTML, canAnimate, renderColumns, boardCard, taskButtons, swapIn, sendAllDeferred, renderTasks,
-  get lastSessions() { return lastSessions; }};`);
+  swipeAttr, get lastSessions() { return lastSessions; }};`);
 const M = globalThis.__m, out = {};
 out.skelAtLoad = list.children.includes(listskel);
 const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
@@ -37078,6 +37078,11 @@ const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r
   toastEl.children.find(c => c.className === "undo").onclick();
   out.reviewerNotSwiped = !M.boardCard({id: "r1", title: "r", state: "proposed", role: "reviewer", created: 0}).includes("data-swipe");
   out.queuedNotSwiped = !M.boardCard({id: "q1", title: "q", state: "queued", role: "implementor", created: 0}).includes("data-swipe");
+  // The task list's rows go by the same rule as the board's cards.
+  out.sameRule = ["implementor", "reviewer", "researcher"].every(role => ["proposed", "queued"].every(state =>
+    M.boardCard({id: "x1", title: "x", state, role, created: 0}).includes("data-swipe")
+      === (M.swipeAttr({state, role}) !== "")))
+    && M.swipeAttr({state: "proposed", role: "reviewer"}) === "" && M.swipeAttr({state: "proposed", role: "implementor"}) !== "";
 
   // --- sheets ---
   const tm = byId("taskmodal");
@@ -37433,9 +37438,8 @@ def test_dashboard_swipe_undo_and_optimism():
     import visualizer as V
     print("\nthe dashboard: swipe a proposal, undo it; hide a thread at once; refusals put things back")
     js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
-    check("a proposal's card and row are swipeable; nothing else is",
-          '${t.state === "proposed" && t.role !== "reviewer" ? \' data-swipe="1"\' : ""}' in js
-          and '${t.state === "proposed" ? \' data-swipe="1"\' : ""}' in js)
+    check("a proposal's card and row are swipeable by one rule; nothing else is",
+          js.count("${swipeAttr(t)}") == 2 and js.count('data-swipe="1"') == 1)
     check("a swiped card is drawn by nobody while its Undo runs", "r.tasks = r.tasks.filter(notGone);" in js
           and "cols[k] = (v || []).filter(notGone);" in js)
     o = _motion_run(js)
@@ -37482,6 +37486,7 @@ def test_dashboard_swipe_undo_and_optimism():
     check("while Undo runs, a poll's redraw leaves the card out and counts without it",
           o["redraw"] == {"hidesPending": True, "keepsOther": True, "count": True, "swipeMarked": True}, o["redraw"])
     check("a reviewer's proposal and queued work are not swipeable", o["reviewerNotSwiped"] and o["queuedNotSwiped"])
+    check("the task list and the board swipe by one rule", o["sameRule"])
     check("hiding a thread takes its card away before the server answers", o["hiddenAtOnce"] == 2, o["hiddenAtOnce"])
     check("...then offers Undo, which shows it again",
           o["hideToast"] == {"text": "Hidden: Thread 2 Undo", "undoable": True, "sent": [{"action": "hide", "key": "D1:2.0"}]}
