@@ -5796,8 +5796,8 @@ function trDoc(doc, tab) {
 //   sections.health: checks:[name], runs:[{at, checks:{name: ok|fail}}], note
 //   sections.env: keys:[{key, value}] (a secret's value is "(set)")
 //   sections.shadow: c1:{label, status, start, end, days, report_at,
-//     series:[{date, shadow, backtest}], stats:[{name, total, vol, max_dd}],
-//     correlation, tracking_error, note}, blend:{status, label, reason, last}
+//     series:[{date, shadow, backtest}], series_note, stats:[{name, total,
+//     vol, max_dd}], correlation, tracking_error, note}, blend:{status, label, reason, last}
 const TRADER_TABS = [["summary", "Summary"], ["sleeves", "Sleeves"], ["activity", "Activity"],
   ["plumbing", "Plumbing"], ["shadow", "Shadow"]];
 const trList = v => Array.isArray(v) ? v.filter(x => x != null) : [];
@@ -6136,7 +6136,8 @@ function trShadowTab(doc) {
   let c1;
   if (!Object.keys(c).length) c1 = trMissing(doc, "shadow", "C1 shadow");
   else {
-    const ser = trList(c.series).filter(x => typeof x === "object");
+    // A day with neither figure draws nothing, so a series of only such days is no curve.
+    const ser = trList(c.series).filter(x => typeof x === "object" && (trNum(x.shadow) || trNum(x.backtest)));
     const span = [c.start && c.end ? `${trStr(c.start)} → ${trStr(c.end)}` : "", trNum(c.days) ? c.days + " days" : "",
       c.report_at ? "report " + trStr(c.report_at) : ""].filter(Boolean).join(" · ");
     const stats = trList(c.stats);
@@ -6145,7 +6146,7 @@ function trShadowTab(doc) {
           + trChart(ser.map(x => ({x: x.date, y: trNum(x.shadow) ? x.shadow : null, y2: trNum(x.backtest) ? x.backtest : null})),
                     {label: "C1 shadow vs backtest", y2: true, y2Label: "backtest"})
           + trTable(["date", "shadow", "backtest"], ser.map(x => ({nan: !trNum(x.shadow), cells: [esc(trStr(x.date)), trMoney(x.shadow), trMoney(x.backtest)]})))
-        : `<p class="sub">${trBadge("unknown", "curve not reported")}</p>`)
+        : `<p class="sub">${trBadge("unknown", "not reported")} shadow vs backtest curve${c.series_note ? ": " + esc(trStr(c.series_note)) : ""}</p>`)
       + (stats.length ? trScroll(`<table><tr><th></th><th class="r">total</th><th class="r">vol</th><th class="r">max DD</th></tr>`
           + stats.map(x => `<tr><td>${trCell(x.name)}</td><td class="r">${trSigned(x.total)}</td><td class="r">${trPct(x.vol)}</td><td class="r">${trSigned(x.max_dd)}</td></tr>`).join("")
           + `</table>`) : "")
@@ -6344,6 +6345,8 @@ function trNormalize(doc) {
       sh.c1 = {start: vm.start, end: vm.end, days: vm.days, report_at: vm.as_of, correlation: vm.correlation,
                tracking_error: vm.tracking_error, stats: [stat("shadow", vm.shadow), stat("backtest", vm.backtest)].filter(Boolean),
                note: rec ? `recorded book newest ${trStr(rec.newest)}` + (trNum(rec.sessions_behind) ? `, ${rec.sessions_behind} session(s) behind` : "") : undefined};
+    // trader_status.py's series is already the cards' shape: [{date, shadow, backtest}].
+    if (vm && sh.c1 && typeof sh.c1 === "object") { put(sh.c1, "series", vm.series); put(sh.c1, "series_note", vm.series_note); }
     const bc = sh.blend_curve && typeof sh.blend_curve === "object" ? sh.blend_curve : null;
     if (bc && sh.blend === undefined) {
       const sb = bc.sessions_behind;

@@ -35800,6 +35800,96 @@ def test_trader_view_reads_what_trader_status_really_prints():
     check("filling names never overwrites: the view's own fixture comes back unchanged", o["contractSame"])
 
 
+TRADER_C1_DRIVER = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const doc = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+function el(id) {
+  return {id, textContent: "", value: "", innerHTML: "", style: {}, dataset: {}, children: [],
+    classList: {add() {}, remove() {}, toggle() {}, contains() { return false; }},
+    appendChild(c) { return c; }, addEventListener() {}, querySelector() { return null; },
+    querySelectorAll() { return []; }, focus() {}, setAttribute() {}};
+}
+const els = {};
+globalThis.document = {getElementById: id => els[id] || (els[id] = el(id)), createElement: () => el("n"),
+  hidden: false, querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, body: el("body")};
+globalThis.window = {addEventListener() {}, location: {search: ""}};
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.fetch = async url => ({status: 200, headers: {get: () => null}, json: async () =>
+  url.startsWith("/api/sessions") ? {sessions: [], slack: {}}
+  : url.startsWith("/api/stats") ? {total_cost: 0, cache_rate: null, threads: 0, days: [], models: []} : {ok: true}});
+(0, eval)(src + `;globalThis.__t = {traderHtml, trNormalize};`);
+const T = globalThis.__t, now = Date.parse(doc.generated_at) / 1000;
+const vary = f => { const d = JSON.parse(JSON.stringify(doc)); f(d.sections.shadow.vm_multi_asset); return d; };
+const draw = d => T.traderHtml({ok: true, doc: d}, now, "shadow");
+console.log(JSON.stringify({
+  c1: T.trNormalize(doc).sections.shadow.c1,
+  real: draw(doc),
+  missing: draw(vary(vm => { delete vm.series; vm.series_note = "recorded.csv not found"; })),
+  nul: draw(vary(vm => { vm.series = null; delete vm.series_note; })),
+  empty: draw(vary(vm => { vm.series = []; })),
+  blank: draw(vary(vm => { vm.series = vm.series.map(x => ({date: x.date, shadow: null, backtest: null})); })),
+}));
+"""
+
+
+def test_trader_shadow_tab_draws_the_c1_curve():
+    import re
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe Shadow tab draws C1's shadow vs backtest curve from trader_status.py's series")
+    doc = json.loads(TRADER_REAL_FIXTURE.read_text())
+    ser = doc["sections"]["shadow"]["vm_multi_asset"]["series"]
+    check("the capture carries trader_status.py's shadow.vm_multi_asset.series [{date, shadow, backtest}]",
+          isinstance(ser, list) and len(ser) == 15
+          and all(set(x) == {"date", "shadow", "backtest"} and isinstance(x["shadow"], (int, float)) for x in ser),
+          ser[:2])
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — cannot run the page's own javascript")
+        return
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(TRADER_C1_DRIVER)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), str(TRADER_REAL_FIXTURE)],
+                       capture_output=True, text=True, timeout=60, env=dict(os.environ, TZ="America/Los_Angeles"))
+    if p.returncode != 0:
+        check("the view's javascript runs on the real document", False, p.stderr.strip()[-800:])
+        return
+    o = json.loads(p.stdout)
+    check("trNormalize carries the series into shadow.c1 unchanged", o["c1"].get("series") == ser,
+          str(o["c1"].get("series"))[:200])
+
+    def chart(h):
+        m = re.search(r'<svg class="tr-chart"[^>]*aria-label="C1 shadow vs backtest">(.*?)</svg>', h, re.S)
+        if not m:
+            return None
+        paths = dict(re.findall(r'<path class="(l2?)" d="([^"]*)"', m.group(1)))
+        pts = {k: len(re.findall(r"[ML]", v)) for k, v in paths.items()}
+        return {"shadow": pts.get("l", 0), "backtest": pts.get("l2", 0),
+                "tips": len(re.findall(r'class="hit"', m.group(1)))}
+
+    h = o["real"]
+    c = chart(h)
+    check("the C1 chart draws a point for every day, shadow and backtest",
+          c == {"shadow": 15, "backtest": 15, "tips": 15}, c)
+    check("its tips read the first and last days in dollars, with the backtest beside",
+          'data-tip="2026-10-26 · 199,964 · backtest 199,964"' in h and 'data-tip="2026-11-13 · ' in h,
+          re.findall(r'data-tip="[^"]*"', h)[:2])
+    check("no 'not reported' when the curve is there", "not reported" not in h.split("Blend shadow")[0])
+    for k in ("missing", "nul", "empty", "blank"):
+        g = o[k]
+        c1 = g.split("Blend shadow")[0]
+        check(f"a {k} series shows 'not reported', not an empty chart",
+              chart(g) is None and "no points to draw" not in c1
+              and '<span class="tr-st unknown"' in c1 and "not reported</span> shadow vs backtest curve" in c1
+              and "2026-10-26 → 2026-11-13" in c1, c1[-500:])
+    check("a missing series says why, in trader_status.py's own words",
+          "shadow vs backtest curve: recorded.csv not found" in o["missing"])
+
+
 # --- conversation turns off the board -------------------------------------------
 
 def _turn_records():
