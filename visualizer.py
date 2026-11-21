@@ -5499,6 +5499,14 @@ function landing(t) {
   if (l.landed)
     return `<div class="land ok">landed ${esc((l.head || "").slice(0, 8))}</div>`;
   if (l.stage === "in-progress") return `<div class="land">landing…</div>`;
+  // Its own stage (ci.py): the rebased commit is on origin as silkworm/<id>,
+  // and the base moves only once GitHub's runs on it are green.
+  if (l.stage === "ci-wait")
+    return `<div class="land ci">waiting for CI…${l.detail
+      ? ` <span class="d">${esc(String(l.detail).slice(-200))}</span>` : ""}</div>`;
+  if (l.stage === "ci-timeout")
+    return `<div class="land bad">not landed (CI timed out) — Land again to resume waiting${
+      l.detail ? `<div class="d">${esc(String(l.detail).slice(-300))}</div>` : ""}</div>`;
   const d = l.detail ? `<div class="d">${esc(String(l.detail).slice(-300))}</div>` : "";
   // Never a candidate (unverified, no suite) versus git asked and refused.
   // Only the second leaves a branch for anyone to do something about.

@@ -824,7 +824,7 @@ the previous one succeeded:
    refuses.
 
 A landing takes the same checkout lock a conversation turn does, so it never
-runs alongside a turn in that repo.
+runs alongside a turn in that repo (except while it waits for GitHub CI, below).
 
 A successful landing replies `:shipit: Landed on main (a1b2c3d4, local only, not
 pushed)` and completes the task. The new commit is stored on the task record as
@@ -841,6 +841,83 @@ base to `origin` last, after the post-merge tests. If the push fails, the landin
 stays and the reply says it wasn't pushed, with git's error underneath. To check
 whether a push that reported failure actually took, Silkworm asks `origin`
 instead of trusting the exit code.
+
+### 4. Gating on GitHub CI (`ci_gate`)
+
+The project's test command runs on this machine. A project whose GitHub
+Actions run elsewhere can also make **those** the gate, so main moves only once
+GitHub's runs are green on the exact commit being landed. Cadence is the case
+this exists for: its iOS `Tests` and `Backend tests` workflows used to run
+after main had already been pushed, and in November 2026 three kinds of red
+reached main that way.
+
+```
+!project ci all                      # every workflow that runs for the change
+!project ci Tests, Backend tests     # just these, by name: or file name
+!project ci                          # show it
+!project ci off
+```
+
+or `{"action":"ci-gate","slug":"cadence","gate":"all"}` to `/projects`. It is
+on (`all`) for Cadence and off everywhere else by default; turning it off sticks.
+
+With it on, step 3 above is followed by:
+
+- **Push the rebased commit to origin as `silkworm/<task-id>`**, never as the
+  base. It is pushed with `--force`, and only ever under that name.
+- **Wait for the required workflow runs on that exact commit**, polling
+  `gh api` every 30 s for up to 45 minutes. This happens in the bot's landing
+  thread, never inside a Claude turn, and the landing **lets go of the
+  checkout lock while it waits** (another landing in the same checkout still
+  waits its turn). The record says `waiting for CI` meanwhile, and the CLI
+  (`silkworm tasks`, `tasks show`, `status --json`), the dashboard and the
+  daily digest show it as that, not as `landing…`. Once the wait is over the
+  checkout is checked again for uncommitted edits and for being on the base.
+- **Only if every one is green** does the landing carry on to step 4: the
+  fast-forward, the post-merge tests, and pushing main.
+
+Which workflows count is read from the commit being landed, under
+`.github/workflows/`, with GitHub's own rules for `branches`, `branches-ignore`,
+`paths` and `paths-ignore` (needs `ruby`, which macOS ships, to read the YAML):
+
+- A workflow whose path filter matches nothing the landing changes **counts as
+  passed**, and the landing record (`result.landing.ci.skipped`) and its reply
+  say so by name, with the reason.
+- A workflow that **would run on pushes to the base but is not triggered by
+  `silkworm/<task-id>`** refuses the landing as `ci-config`. Passing it would
+  be the after-the-fact red all over again. `branches: ["*"]` is the usual
+  cause: `*` does not match a `/`, so use `"**"`. A branch that fixes the
+  trigger is judged by the workflow file it fixes it to.
+- With `all`, a run that GitHub started for the push which the filters did not
+  predict must pass too.
+
+A pass on that commit is a pass whichever attempt it was, so a re-run on
+GitHub counts. A failed run that was already there before this landing pushed
+(an earlier attempt's flake) does not refuse the retry; the fresh run decides.
+The branch must still be on the commit CI passed when the wait ends, or the
+landing refuses as `branch-moved`. A refusal for a workflow that is also red
+on the base's own commit says so (`ci.base_red`), since then the change may not
+be what broke it.
+
+After the landing, or a refusal other than a timeout, `silkworm/<task-id>` is
+deleted from origin; dropping the task deletes it too. A copy an earlier
+attempt left at another commit is deleted before the next push, so GitHub
+filters paths against the task's own change rather than the base's.
+
+The outcome is on the record under `result.landing.ci`: `commit`, `required`,
+`passed`, `skipped`, the `failure` if any (workflow, job, step, test, URL),
+and whether the pushed branch was `deleted`; `result.landing.ci_pushed` names a
+branch still on origin.
+
+**Auto-merge on a CI-gated project closes the task first.** The ordinary
+auto-merge lands inside the review lane before closing the task, and parks it
+in `awaiting_approval` if the landing refuses. Waiting up to 45 minutes there
+would hold every project's reviews, so a gated project's landing starts on its
+own thread once the review has passed and the task is closed, the way Approve's
+does. A refusal is then on the record, the board (`not landed (ci) — … waiting
+for you`, with Land and Drop) and the digest, not in the task's state. GitHub
+reads only the first 300 changed files for `paths:` filters; a bigger change is
+judged on all of them here and may time out if GitHub chose not to run.
 
 ### When a landing refuses
 
@@ -880,6 +957,11 @@ The stages, and what each means:
 | `errored` | The landing itself raised an error. See the bot log |
 | `interrupted` | A restart killed the landing. The record says nothing was merged, but if the restart came during the post-merge tests, the base may already be fast-forwarded and not reverted. Check it |
 | `in-progress` | Not a refusal: an Approve-started landing is running. The dashboard shows `landing…` |
+| `ci-wait` | Not a refusal: the rebased commit is on origin as `silkworm/<task-id>` and the landing is waiting for GitHub CI. Shown as `waiting for CI` |
+| `ci` | A required GitHub workflow failed on the rebased commit. The detail names the workflow, the failing job and step, the first failing test read off the job's log, and the run's URL. Nothing was merged |
+| `ci-timeout` | CI had not finished after 45 minutes, or `gh` could not be reached (its last error is quoted). **Retryable**: the pushed branch is kept, so Land picks up the same runs |
+| `branch-moved` | The task's branch moved while CI ran, so what passed is not what would merge |
+| `ci-config` | The gate cannot be evaluated: origin is not on GitHub, a workflow can't be read, a named one doesn't exist, or one runs on the base but not on `silkworm/<task-id>` |
 
 A rebase changes the branch itself. If a landing refuses after step 2, the
 branch you find has already been rebased onto the base.

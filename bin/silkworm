@@ -1055,7 +1055,8 @@ def task_text(rec: dict) -> str:
         told = True
     elif (result.get("landing") or {}).get("stage"):
         landing = result["landing"]
-        lines.append(f"  landing: {landing.get('stage')} — {str(landing.get('detail') or '')[:300]}")
+        lines.append(f"  landing: {landing_label(landing.get('stage'))} — "
+                     f"{str(landing.get('detail') or '')[:300]}")
         told = True
     needs = rec.get("needs_user") or {}
     if needs.get("action"):
@@ -1069,6 +1070,19 @@ def task_text(rec: dict) -> str:
     if not told:
         lines.append("  nothing yet")
     return "\n".join(lines)
+
+
+#: Landing stages as a person reads them, where the key is not already that.
+#: The CI ones mirror ci.label, which the bot and digest use.
+LANDING_LABELS = {"in-progress": "landing…", "ci-wait": "waiting for CI",
+                  "ci": "CI failed", "ci-timeout": "CI timed out",
+                  "ci-config": "CI gate misconfigured"}
+#: The ones worth a word on a one-line task row: still going, or a CI refusal.
+LANDING_SHOWN = ("in-progress", "ci-wait", "ci", "ci-timeout", "ci-config")
+
+
+def landing_label(stage) -> str:
+    return LANDING_LABELS.get(stage or "", stage or "")
 
 
 def tasks_query(argv) -> dict:
@@ -1095,7 +1109,9 @@ def do_tasks(argv) -> int:
           f"{' (with conversation turns)' if payload.get('turns') else ''}"
           f" — {len(items)} task(s)")
     for t in items:
-        print(f"  {t['state']:18} {t['id']}  {t['title'][:52]}")
+        stage = (((t.get("result") or {}).get("landing")) or {}).get("stage") or ""
+        tail = f"  [{landing_label(stage)}]" if stage in LANDING_SHOWN else ""
+        print(f"  {t['state']:18} {t['id']}  {t['title'][:52]}{tail}")
     counts = r.get("counts") or {}
     if counts:
         print("  " + " · ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
@@ -1946,7 +1962,9 @@ def status_summary(ask) -> dict:
             "id": b.get("id"), "title": b.get("title"), "branch": b.get("branch"),
             "base": b.get("base"), "commits": b.get("commits"),
             # The last landing's outcome, "" when none was ever tried.
-            "stage": landing.get("stage") or "", "detail": landing.get("detail") or ""})
+            "stage": landing.get("stage") or "",
+            "label": landing_label(landing.get("stage")),
+            "detail": landing.get("detail") or ""})
 
     r = asked("watching", {"action": "watching"})
     out["watching"] = [{k: w.get(k) for k in ("id", "in_s", "goal", "thread")}

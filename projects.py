@@ -80,6 +80,12 @@ FIELDS: dict[str, tuple] = {
     # keeps origin and the local base in step -- which is what lets the next
     # task's worktree, cut from origin, see work that has already landed.
     "publish": (False, "push the base to origin after landing, so the next task sees it"),
+    # Whether GitHub CI is the landing gate (ci.py): "" for off, "all" for
+    # every workflow that runs for the change, or a list of workflow names.
+    # When on, the rebased commit is pushed as silkworm/<task id> and the base
+    # moves only once those runs are green on that exact commit -- Cadence's
+    # Actions ran after main was pushed, and three kinds of red reached it.
+    "ci_gate": ("",    "GitHub workflows that must pass before landing: all, names, or off"),
     # Out-of-hours ideation. "HH:MM" local time, or "" for off. `ideate_on` is
     # the last date the night was *decided* -- run, or deliberately skipped
     # because the project's proposal backlog was already at its standing
@@ -125,6 +131,14 @@ FIELDS: dict[str, tuple] = {
 #: predate it. Never re-applied once a record carries the field.
 SEED_GENERATED = {
     "cadence": ["ios/Cadence/Info.plist", "ios/CadenceWidget/Info.plist"],
+}
+
+
+#: CI gates already decided when the field was added (2026-11-21), for
+#: records that predate it. Never re-applied once a record carries the field,
+#: so turning it off sticks.
+SEED_CI_GATE = {
+    "cadence": "all",
 }
 
 
@@ -176,6 +190,8 @@ class ProjectStore:
             # user has since edited -- or cleared -- is never put back.
             if "generated" not in rec and slug in SEED_GENERATED:
                 rec["generated"] = list(SEED_GENERATED[slug])
+            if "ci_gate" not in rec and slug in SEED_CI_GATE:
+                rec["ci_gate"] = SEED_CI_GATE[slug]
             for f in FIELDS:
                 rec.setdefault(f, default(f))
             self._data[slug] = rec

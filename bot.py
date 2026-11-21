@@ -34,6 +34,7 @@ import backfill
 import basered
 import board
 import branches
+import ci
 import costs
 import credentials
 import daemons
@@ -1750,6 +1751,30 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
                               if paths else
                               f":gear: *{slug}* has no generated paths now."),
                         thread_ts=thread_ts)
+        elif arg.lower() == "ci" or arg.lower().startswith("ci "):
+            # Whether GitHub CI gates this project's landings (ci.py): the
+            # rebased commit is pushed as silkworm/<id>, and the base moves
+            # only once the named workflows -- or all that run -- are green.
+            slug = entry.get("project") or ""
+            want = arg[2:].strip()
+            if not slug:
+                say(text="File this thread under a project first: `!project <name>`.",
+                    thread_ts=thread_ts)
+            elif not want:
+                cur = (project_store.get(slug) or {}).get("ci_gate")
+                say(text=(f"*{slug}* lands only once GitHub CI passes: "
+                          f"{ci.describe(cur)}." if ci.parse(cur) else
+                          f"*{slug}* does not wait for GitHub CI. "
+                          "`!project ci all` or `!project ci Tests, Backend tests` turns it on."),
+                    thread_ts=thread_ts)
+            else:
+                gate = ci.parse(want)
+                project_store.ensure(slug, ci_gate=gate)
+                say(text=(f":vertical_traffic_light: *{slug}* now lands only once GitHub "
+                          f"CI passes on the rebased commit: {ci.describe(gate)}."
+                          if gate else
+                          f":vertical_traffic_light: *{slug}* no longer waits for GitHub CI."),
+                    thread_ts=thread_ts)
         elif arg.lower() == "mail" or arg.lower().startswith("mail "):
             # The Gmail label whose mail belongs here. Defaults to the project's
             # title, so this is only needed when the label is named differently.
@@ -2623,10 +2648,19 @@ def land_or_drop(action: str, payload: dict) -> dict:
         deleted, tag, note = discard.drop(repo, branch)
     if not deleted:
         return {"ok": False, "error": note}
+    # The copy a CI-gated landing pushed for GitHub to test: not left on
+    # origin, where it would read as unmerged work for ever. Only that one --
+    # nothing else on the remote is the drop's to delete.
+    pushed = ((task.get("result") or {}).get("landing") or {}).get("ci_pushed")
+    extra = ""
+    if pushed:
+        extra = (f"; deleted {pushed} from origin" if ci.delete_remote(repo, pushed)
+                 else f"; could not delete {pushed} from origin")
     record_landing(task, {"eligible": False, "landed": False, "stage": "dropped",
                           "branch": branch,
                           "detail": f"kept as {tag}" if tag else "nothing on it was new"})
-    return {"ok": True, "note": f"dropped; recover with {tag}" if tag else "dropped"}
+    return {"ok": True, "note": (f"dropped; recover with {tag}" if tag
+                                 else "dropped") + extra}
 
 
 def tidy_checkout(payload: dict) -> dict:
@@ -3271,6 +3305,14 @@ def handle_projects(payload: dict, _lifted: dict | None = None) -> dict:
         except ValueError as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "project": project_store.ensure(slug, generated=paths)}
+    if action == "ci-gate":
+        # The dashboard's `!project ci`: which GitHub workflows must pass on
+        # the rebased commit before a landing moves the base.
+        slug = (payload.get("slug") or "").strip()
+        if not project_store.get(slug):
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        gate = ci.parse(payload.get("gate") or "")
+        return {"ok": True, "project": project_store.ensure(slug, ci_gate=gate)}
     if action == "base":
         # Which branch this project's tasks build on and land onto -- the
         # dashboard's `!project base`. Checked against the repository: a name
@@ -6264,28 +6306,36 @@ def resolve_review(task: dict, role_name: str, text: str,
         task_store.update(parent_id, result={**(parent.get("result") or {}),
                                              "review": verdict})
         stranded = ""
+        # A project gated on GitHub CI waits up to ci.DEADLINE_S for it, and
+        # this is the review lane: holding it that long would hold every
+        # project's reviews. So that landing runs on its own thread, started
+        # once the task is closed -- the way Approve's does, refusals and the
+        # hand-on of a conflict included (start_landing, rework_finished).
+        land_later = verdict["ok"] and bool(ci.parse(
+            (project_store.get((parent or {}).get("project") or "") or {}).get("ci_gate")))
         if verdict["ok"]:
-            # Land before completing: if the landing refuses, that is worth
-            # knowing in the same breath as the verdict rather than later.
-            outcome = land_and_record(parent_id, channel, thread_ts)
-            if merge.needs_a_person(outcome):
-                # Reviewed, proven, and still not on the base. Nobody has
-                # looked at why, and `done` would say there is nothing to
-                # look at -- which is how the same gap got implemented twice
-                # on two different nights, each time at the price of a
-                # session and a reviewer.
-                #
-                # A parent the user closed while its review was still running
-                # cannot be parked -- `done` is terminal, and task_state
-                # swallows the refusal rather than costing the reviewer its
-                # reply. The record still carries the refusal, which is what
-                # the board reads, so it does not become silent again.
-                stranded = f"review passed but the landing refused " \
-                           f"({outcome.get('stage')})"
-            # A conflict with work that merged first is the implementor's to
-            # fix, once, before it is anybody else's.
-            if stranded and rework_conflict(parent_id, outcome, channel, thread_ts):
-                return False
+            if not land_later:           # if it is, it starts below
+                # Land before completing: if the landing refuses, that is worth
+                # knowing in the same breath as the verdict rather than later.
+                outcome = land_and_record(parent_id, channel, thread_ts)
+                if merge.needs_a_person(outcome):
+                    # Reviewed, proven, and still not on the base. Nobody has
+                    # looked at why, and `done` would say there is nothing to
+                    # look at -- which is how the same gap got implemented twice
+                    # on two different nights, each time at the price of a
+                    # session and a reviewer.
+                    #
+                    # A parent the user closed while its review was still running
+                    # cannot be parked -- `done` is terminal, and task_state
+                    # swallows the refusal rather than costing the reviewer its
+                    # reply. The record still carries the refusal, which is what
+                    # the board reads, so it does not become silent again.
+                    stranded = f"review passed but the landing refused " \
+                               f"({outcome.get('stage')})"
+                # A conflict with work that merged first is the implementor's to
+                # fix, once, before it is anybody else's.
+                if stranded and rework_conflict(parent_id, outcome, channel, thread_ts):
+                    return False
         elif rework_flagged_review(task_store.get(parent_id) or parent, verdict,
                                    channel, thread_ts):
             return False
@@ -6304,6 +6354,8 @@ def resolve_review(task: dict, role_name: str, text: str,
             if ending == tasks.NEEDS_INPUT and parked.get("state") == tasks.NEEDS_INPUT:
                 tell_thread(f"{channel}:{thread_ts}",
                             roles.over_to_you(parked.get("needs_user")))
+            if land_later:
+                start_landing(parent_id)
         else:
             task_state(parent_id, tasks.AWAITING_APPROVAL, verdict["summary"][:160])
     return False
@@ -6453,13 +6505,18 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
                               "detail": "merging", "checkpointed": True,
                               "base": base_name, "base_before": before})
 
+    gate = ci_gate_for(task, proj, cwd)
     try:
-        # Landing touches the shared checkout, so take the guard a turn takes.
-        with repo_guard(cwd):
-            result = merge.land(here, cwd, branch, base,
-                                run_tests, publish=bool(proj.get("publish")),
-                                on_merge=on_merge,
-                                generated=list(proj.get("generated") or []))
+        # One landing per checkout at a time, for its whole length -- the CI
+        # wait included, during which repo_guard itself is let go -- and then
+        # the guard a turn takes, since landing touches the shared checkout.
+        with landing_serial(cwd):
+            with repo_guard(cwd):
+                result = merge.land(here, cwd, branch, base,
+                                    run_tests, publish=bool(proj.get("publish")),
+                                    on_merge=on_merge,
+                                    generated=list(proj.get("generated") or []),
+                                    ci_gate=gate)
     finally:
         worktrees.release(here)
     result = {**result, "eligible": True, "branch": branch}
@@ -6481,6 +6538,73 @@ def land_if_ready(task: dict, approved: bool = False) -> dict:
     return result
 
 
+#: One landing at a time per checkout. repo_guard alone used to do this, and
+#: still does for everything but a CI wait, which lets repo_guard go so the
+#: project's threads can use their checkout for the forty minutes it takes.
+#: Without this a second landing would slip in then, merge first, and leave
+#: the first refused as base-moved after all that waiting. Always taken before
+#: repo_guard and never wanted by a turn, so it cannot form a cycle.
+_landing_serial: dict = {}
+_landing_serial_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def landing_serial(cwd):
+    try:
+        key = str(Path(cwd).resolve())
+    except Exception:
+        key = str(cwd)
+    with _landing_serial_guard:
+        lock = _landing_serial.setdefault(key, threading.Lock())
+    with lock:
+        yield
+
+
+def ci_gate_for(task: dict, proj: dict, cwd):
+    """The landing's ci.Gate if its project gates on GitHub CI, else None.
+
+    It pushes the rebased commit as the task's own `silkworm/<id>`, waits for
+    the project's required workflows, and while it waits steps out of the
+    checkout's repo_guard (taken by land_if_ready) and records the landing as
+    waiting for CI, so the board says so rather than "landing…".
+    """
+    want = ci.parse(proj.get("ci_gate"))
+    if not want:
+        return None
+
+    @contextlib.contextmanager
+    def outside():
+        lock = _repo_lock(cwd)
+        if lock is None:
+            yield
+            return
+        lock.release()
+        try:
+            yield
+        finally:
+            lock.acquire()
+
+    def on_wait(commit, names):
+        record_landing(task, {"eligible": True, "landed": False,
+                              "stage": ci.WAITING, "branch": name,
+                              "checkpointed": True,
+                              "ci_pushed": name,
+                              "detail": f"{commit[:8]} pushed as {name}; "
+                                        f"waiting for {', '.join(names)}"})
+
+    # The task's own branch name, the way the survey names it: silkworm/<id>,
+    # or the name it took over in a rework. ci.Gate refuses anything else.
+    name = branches.name_for(task)
+    gate = ci.Gate(want, name, on_wait=on_wait, outside=outside)
+    # A copy an earlier attempt left on origin (a timeout keeps it) is this
+    # gate's to clean up too, however this attempt ends -- a refusal before
+    # the gate is reached included.
+    prior = (((task.get("result") or {}).get("landing")) or {}).get("ci_pushed")
+    if prior == name:
+        gate.pushed = name
+    return gate
+
+
 def record_landing(task: dict, outcome: dict) -> None:
     """Write what the landing did onto the record, so it outlives the message.
 
@@ -6496,12 +6620,19 @@ def record_landing(task: dict, outcome: dict) -> None:
     # anything written in between -- the review verdict, most of all.
     current = task_store.get(task["id"]) or task
     keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base",
-            "checkpointed", "base_before", "conflicts", "onto", "reworked_by")
+            "checkpointed", "base_before", "conflicts", "onto", "reworked_by",
+            "ci", "ci_pushed", "retryable")
     # Dated, so "what landed yesterday" is answerable from the record alone:
     # `updated` moves on any later write and cannot say.
-    result = {**(current.get("result") or {}),
-              "landing": {**{k: outcome[k] for k in keep if k in outcome},
-                          "at": time.time()}}
+    landing = {**{k: outcome[k] for k in keep if k in outcome}, "at": time.time()}
+    # Which branch a CI gate left on origin is known only to the attempt that
+    # pushed it. Carried over an outcome that does not say -- the "landing
+    # under way" marker, a refusal before the gate -- so Drop and the next
+    # landing can still remove it; an outcome that says "" has removed it.
+    before = ((current.get("result") or {}).get("landing")) or {}
+    if "ci_pushed" not in outcome and before.get("ci_pushed"):
+        landing["ci_pushed"] = before["ci_pushed"]
+    result = {**(current.get("result") or {}), "landing": landing}
     if outcome.get("landed"):
         result["landed"] = outcome.get("head")
     task_store.update(task["id"], result=result)
@@ -6688,7 +6819,9 @@ def clear_interrupted_landings() -> list[str]:
     stale = []
     for tid, rec in task_store.all().items():
         landing = ((rec.get("result") or {}).get("landing")) or {}
-        if landing.get("stage") != LANDING_UNDERWAY:
+        # Waiting for CI is before the fast-forward, so it reads as "nothing
+        # was merged" below -- and Land picks the same runs up again.
+        if landing.get("stage") not in (LANDING_UNDERWAY, ci.WAITING):
             continue
         try:
             record_landing(rec, {**landing, "stage": "interrupted",
@@ -7996,7 +8129,11 @@ def live_worktree_tasks() -> set:
     """
     live = ({tid for tid, r in task_store.all().items()
              if r.get("state") not in tasks.TERMINAL}
-            | set(RUNNING_TASKS))
+            | set(RUNNING_TASKS)
+            # A landing under way: its `land` checkout is in use for as long
+            # as the landing is -- up to ci.DEADLINE_S of CI wait besides the
+            # suite runs -- and the task it lands is usually done already.
+            | set(_landing_now))
     # And a review's checkout is keyed by the task it is reviewing, not by
     # itself, because the work in it is that task's. Cancelling a parent
     # mid-review is legal and drops it from the set above -- which would hand

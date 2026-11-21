@@ -103,6 +103,16 @@ STAND_INS = {
     # health_rows reads the bot's health store; a test that set none up has
     # none, which reads as "could not be read", never as "all healthy".
     "HEALTH": lambda: None,
+    # A project with no ci_gate gets no CI gate, and one landing at a time is
+    # what a test that starts one landing has anyway.
+    "ci_gate_for": lambda: (lambda *a, **k: None),
+    "landing_serial": lambda: (lambda cwd: contextlib.nullcontext()),
+    # resolve_review starts a CI-gated landing on its own thread; a test with
+    # no CI-gated project never gets there.
+    "start_landing": lambda: (lambda *a, **k: False),
+    # live_worktree_tasks keeps the checkouts of landings under way; a test
+    # that started none has none.
+    "_landing_now": lambda: set(),
 }
 
 
@@ -8487,7 +8497,8 @@ def test_review_followups():
     store = TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     ns = {"task_store": store, "scoping": scoping, "tasks": T, "log": logging.getLogger("t"),
           "dedup": __import__("dedup"), "branches": __import__("branches"),
-          "project_store": types.SimpleNamespace(scope_for=lambda p: None)}
+          "project_store": types.SimpleNamespace(scope_for=lambda p: None,
+                                                 get=lambda slug: None)}  # resolve_review asks about ci_gate
     file_followups = lift("file_followups", ns=ns)["file_followups"]
 
     parent = store.create("do the thing", title="Do the thing", project="silkworm",
@@ -38075,6 +38086,694 @@ def test_unread_dot_filter_and_badge_in_the_page():
           o["badgeCleared"] == [["clear"]] and o["titleCleared"] == "Silkworm — Sessions", (o["badgeCleared"], o["titleCleared"]))
     check("...and the Unread filter and unread first are gone: nothing to narrow",
           not o["unreadOnlyCleared"] and "unread first" not in o["filterCleared"], o["filterCleared"])
+
+
+# --- GitHub CI as the landing gate (ci.py) --------------------------------------
+# Cadence landed on the mini's own `make -C ios test`, pushed main, and only
+# then did GitHub run its workflows -- on another runner, after everybody was
+# building on the result. Three kinds of red reached main that way in 2026-11.
+# With `ci_gate` on, the rebased commit goes to origin as silkworm/<id>, never
+# as main, and main moves only once GitHub's runs on that commit are green.
+
+_FAKE_GH = r'''#!{python}
+import json, subprocess, sys
+state_path = {state!r}
+with open(state_path) as f:
+    st = json.load(f)
+args = sys.argv[1:]
+path = ([a for a in args[1:] if not a.startswith("-")] or [""])[0] if args[:1] == ["api"] else ""
+def origin_refs():
+    r = subprocess.run(["git", "--git-dir", st["origin"], "for-each-ref",
+                        "--format=%(refname) %(objectname)"],
+                       capture_output=True, text=True)
+    return dict(l.split(" ", 1) for l in r.stdout.splitlines() if l)
+call = {{"path": path, "refs": origin_refs()}}
+st.setdefault("calls", []).append(call)
+def save():
+    with open(state_path, "w") as f:
+        json.dump(st, f)
+if st.get("down"):
+    save(); sys.stderr.write("HTTP 502: Bad Gateway\n"); sys.exit(1)
+if "/actions/runs?head_sha=" in path:
+    sha = path.split("head_sha=", 1)[1].split("&", 1)[0]
+    # GitHub only has runs for a commit something pushed: before the gate's
+    # push this commit is nowhere on origin, so there is nothing yet.
+    # Runs an earlier attempt left on this commit stay on GitHub after its
+    # branch is deleted, finished and failed.
+    old = [dict(r, head_sha=sha) for r in st.get("stale", [])]
+    if sha not in call["refs"].values():
+        save(); print(json.dumps({{"workflow_runs": old}})); sys.exit(0)
+    call["gen"] = True
+    st["polls"] = st.get("polls", 0) + 1
+    runs = []
+    for i, (wf, how) in enumerate(sorted(st.get("workflows", {{}}).items())):
+        if st["polls"] < how.get("appear", 0):
+            continue                  # GitHub has not registered this run yet
+        concl = st.get("per_sha", {{}}).get(sha, how.get("conclusion"))
+        done = how.get("after", 0) <= st["polls"] and concl != "pending"
+        runs.append({{"id": 100 + i, "name": how["name"], "path": wf,
+                      "head_sha": sha, "event": "push", "head_branch": st.get("branch", ""),
+                      "status": "completed" if done else "in_progress",
+                      "conclusion": concl if done else None, "run_attempt": 1,
+                      "html_url": f"https://github.com/o/r/actions/runs/{{100 + i}}"}})
+    runs += old
+    save(); print(json.dumps({{"workflow_runs": runs}})); sys.exit(0)
+if path.endswith("/jobs?per_page=100"):
+    save()
+    print(json.dumps({{"jobs": [
+        {{"id": 7, "name": "lint", "conclusion": "success", "steps": []}},
+        {{"id": 8, "name": "test", "conclusion": "failure",
+         "html_url": "https://github.com/o/r/actions/runs/100/job/8",
+         "steps": [{{"name": "Checkout", "conclusion": "success"}},
+                   {{"name": "Run tests", "conclusion": "failure"}}]}}]}}))
+    sys.exit(0)
+if path.endswith("/jobs/8/logs"):
+    save()
+    if "--allow-escape-sequences" not in args:
+        # What gh 2.97 says, writing a coloured log anywhere but a terminal.
+        sys.stderr.write("the response contains terminal escape sequences; "
+                         "pass --allow-escape-sequences to output it anyway\n")
+        sys.exit(1)
+    print("2026-11-21T10:00:00.0000000Z Test Case '-[CadenceTests.AuthServiceTests testUpsertHangs]' started.")
+    print("2026-11-21T10:00:03.1000000Z Test Case '-[CadenceTests.AuthServiceTests testUpsertHangs]' failed (3.100 seconds).")
+    print("2026-11-21T10:00:04.0000000Z \x1b[36;1mmake ios-test\x1b[0m")
+    print("2026-11-21T10:00:04.0000000Z ##[error]Process completed with exit code 65.")
+    sys.exit(0)
+save(); sys.stderr.write(f"unexpected gh call: {{args}}\n"); sys.exit(2)
+'''
+
+
+def _ci_fixture(tests_branches='["**"]'):
+    """A repo with a bare origin, two path-filtered workflows, and a fake gh.
+
+    Returns a namespace: repo, origin, root, g (git), gh_state(), set_gh(),
+    branch(name, files) -> worktree, tests (the local suite, always green).
+    """
+    import verify as V
+    root = Path(tempfile.mkdtemp())
+    repo, origin = root / "repo", root / "origin.git"
+    def g(cwd, *a):
+        return subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, text=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], capture_output=True)
+    repo.mkdir()
+    g(repo, "init", "-q", "-b", "main")
+    g(repo, "config", "user.email", "t@t"); g(repo, "config", "user.name", "t")
+    wf = repo / ".github" / "workflows"; wf.mkdir(parents=True)
+    (wf / "tests.yml").write_text(
+        "name: Tests\non:\n  push:\n    branches: " + tests_branches + "\n"
+        "    paths: [\"ios/**\", \".github/workflows/tests.yml\"]\n"
+        "jobs:\n  test:\n    runs-on: macos-26\n    steps:\n      - run: make test\n")
+    (wf / "backend.yml").write_text(
+        "name: Backend tests\n'on':\n  push:\n    branches: [\"**\"]\n"
+        "    paths: [\"supabase/**\"]\n"
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make backend-test\n")
+    (repo / "ios").mkdir(); (repo / "ios" / "a.txt").write_text("1\n")
+    (repo / "README.md").write_text("r\n")
+    g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+    g(repo, "remote", "add", "origin", str(origin))
+    g(repo, "push", "-q", "-u", "origin", "main")
+    state = root / "gh.json"
+    state.write_text(json.dumps({"origin": str(origin), "workflows": {}}))
+    gh = root / "gh"
+    gh.write_text(_FAKE_GH.format(python=sys.executable, state=str(state)))
+    gh.chmod(0o755)
+
+    def gh_state():
+        return json.loads(state.read_text())
+
+    def set_gh(**kw):
+        st = gh_state(); st.update(kw); st["calls"] = []; st["polls"] = 0
+        state.write_text(json.dumps(st))
+
+    def branch(name, files):
+        wt = root / name.replace("/", "_")
+        g(repo, "worktree", "add", "-q", "-b", name, str(wt), "main")
+        for rel, text in files.items():
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (wt / rel).write_text(text)
+        g(wt, "add", "-A")
+        g(wt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name)
+        return wt
+
+    tests = lambda cwd: V.run("true", cwd)       # noqa: E731
+    return types.SimpleNamespace(root=root, repo=repo, origin=origin, g=g, gh=str(gh),
+                                 gh_state=gh_state, set_gh=set_gh, branch=branch,
+                                 tests=tests)
+
+
+class _Clock:
+    """Time that moves only when the gate sleeps: a 45-minute deadline in ms."""
+    def __init__(self):
+        self.t = 0.0
+        self.slept = []
+    def __call__(self):
+        return self.t
+    def sleep(self, s):
+        self.slept.append(s); self.t += s
+
+
+def _gate(fx, want, tid, **kw):
+    import ci as C
+    clock = _Clock()
+    waits = []
+    gate = C.Gate(want, f"silkworm/{tid}", slug="o/r", clock=clock, sleep=clock.sleep,
+                  deadline_s=kw.pop("deadline_s", 600), poll_s=30,
+                  on_wait=lambda commit, names: waits.append((commit, names)), **kw)
+    return gate, clock, waits
+
+
+def _origin_main(fx):
+    return fx.g(fx.origin, "rev-parse", "refs/heads/main").stdout.strip()
+
+
+def test_ci_gate_filters():
+    import ci as C
+    print("\nGitHub's workflow filters, as the CI gate reads them")
+    check("'*' does not cross a slash, so it misses a silkworm/ branch",
+          not C.matches(["*"], "silkworm/tsk_1") and C.matches(["*"], "main"))
+    check("'**' matches a name with a slash",
+          C.matches(["**"], "silkworm/tsk_1"))
+    check("a later ! pattern excludes what an earlier one included",
+          not C.matches(["**", "!silkworm/**"], "silkworm/x") and C.matches(["**", "!silkworm/**"], "main"))
+    check("'ios/**' covers files at any depth under ios/",
+          C.matches(["ios/**"], "ios/Cadence/App.swift") and not C.matches(["ios/**"], "supabase/x.ts"))
+    check("'docs/**/*.md' covers docs/a.md too",
+          C.matches(["docs/**/*.md"], "docs/a.md") and C.matches(["docs/**/*.md"], "docs/x/y.md"))
+    cfg = {"branches": ["**"], "paths": ["ios/**"]}
+    check("a path filter that no changed file matches does not fire",
+          C.fires(cfg, "silkworm/t", ["README.md"]) == (False, "no changed file matches its paths filter"))
+    check("one matching file is enough", C.fires(cfg, "silkworm/t", ["README.md", "ios/a"])[0])
+    check("a change of over 300 files is still judged by its paths",
+          not C.fires(cfg, "silkworm/t", [f"x{i}" for i in range(301)])[0])
+    check("tags without branches is tag pushes only",
+          not C.fires({"tags": ["v*"]}, "main", ["a"])[0])
+    check("paths-ignore covering every file does not fire",
+          not C.fires({"paths-ignore": ["docs/**"]}, "main", ["docs/a"])[0]
+          and C.fires({"paths-ignore": ["docs/**"]}, "main", ["docs/a", "src/b"])[0])
+    check("branches-ignore excludes by name",
+          not C.fires({"branches-ignore": ["silkworm/**"]}, "silkworm/t", ["a"])[0])
+    check("'on: push' as a bare string and as a list both count as a push trigger",
+          C.push_trigger({"on": "push"})[0] and C.push_trigger({"true": ["push", "pull_request"]})[0]
+          and not C.push_trigger({"on": {"pull_request": None}})[0])
+    check("the setting: all, names, off",
+          C.parse("all") == "all" and C.parse("Tests, Backend tests") == ["Tests", "Backend tests"]
+          and C.parse("off") == "" and C.parse("") == "" and C.parse(["Tests"]) == ["Tests"])
+
+
+def test_ci_gate_green_lands_and_main_waits_for_it():
+    import merge as M
+    print("\nwith a CI gate, main moves and is pushed only once CI is green")
+    fx = _ci_fixture()
+    fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests", "conclusion": "success",
+                                                          "after": 3}})
+    import ci as C
+    C.GH = fx.gh
+    try:
+        before = _origin_main(fx)
+        wt = fx.branch("silkworm/tsk_green", {"ios/a.txt": "2\n"})
+        gate, clock, waits = _gate(fx, "all", "tsk_green")
+        r = M.land(wt, fx.repo, "silkworm/tsk_green", "main", fx.tests, publish=True, ci_gate=gate)
+        st = fx.gh_state()
+        polls = [c for c in st["calls"] if c.get("gen")]
+        check("a green run lands", r.get("landed"), f"{r.get('stage')}: {str(r.get('detail'))[:200]}")
+        check("it polled until the run finished, sleeping on the injected clock",
+              len(polls) == 3 and clock.slept == [30, 30])
+        check("every poll saw the rebased commit on origin as silkworm/<id>",
+              polls and all(c["refs"].get("refs/heads/silkworm/tsk_green") == r.get("head")
+                            for c in polls))
+        check("and main on origin not yet moved while CI ran",
+              polls and all(c["refs"].get("refs/heads/main") == before for c in polls))
+        check("main is pushed after green", _origin_main(fx) == r.get("head") and r.get("published"))
+        check("the pushed silkworm/<id> branch is deleted from origin after landing",
+              fx.g(fx.origin, "rev-parse", "--verify", "-q",
+                   "refs/heads/silkworm/tsk_green").stdout.strip() == ""
+              and (r.get("ci") or {}).get("deleted") is True and not r.get("ci_pushed"))
+        check("the record says which workflows passed and which were not triggered",
+              (r.get("ci") or {}).get("passed") == ["Tests"]
+              and [s["name"] for s in (r.get("ci") or {}).get("skipped", [])] == ["Backend tests"])
+        check("and the landing's detail says the skipped one counted as passed",
+              "Backend tests (no changed file matches its paths filter)" in (r.get("detail") or "")
+              and "counted as passed" in (r.get("detail") or ""), r.get("detail"))
+        check("the wait was announced once, naming what it waits for",
+              waits == [(r.get("head"), ["Tests"])])
+        check("merge.summary names CI on the landed line",
+              "CI passed: Tests" in M.summary({**r, "eligible": True}, "silkworm/tsk_green"))
+    finally:
+        C.GH = "gh"
+
+
+def test_ci_gate_red_refuses_naming_the_failure():
+    import merge as M
+    import ci as C
+    print("\na red CI run refuses the landing with the workflow, job and test named")
+    fx = _ci_fixture()
+    fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests", "conclusion": "failure",
+                                                          "after": 1}})
+    C.GH = fx.gh
+    try:
+        before, local = _origin_main(fx), fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip()
+        wt = fx.branch("silkworm/tsk_red", {"ios/a.txt": "3\n"})
+        gate, _clock, _w = _gate(fx, "all", "tsk_red")
+        r = M.land(wt, fx.repo, "silkworm/tsk_red", "main", fx.tests, publish=True, ci_gate=gate)
+        d = r.get("detail") or ""
+        check("refused at stage 'ci'", not r.get("landed") and r.get("stage") == "ci", r.get("stage"))
+        check("naming the workflow, the failing job and step, and the first failing test",
+              "'Tests' failed" in d and "job 'test'" in d and "step 'Run tests'" in d
+              and "-[CadenceTests.AuthServiceTests testUpsertHangs]" in d, d)
+        check("not the job that passed, nor the ##[error] line, when a test is named",
+              "'lint'" not in d and "exit code 65" not in d)
+        check("main untouched, locally and on origin",
+              _origin_main(fx) == before and fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip() == local)
+        check("the pushed branch is cleaned up after a refusal",
+              fx.g(fx.origin, "rev-parse", "--verify", "-q",
+                   "refs/heads/silkworm/tsk_red").stdout.strip() == "")
+        check("a red refusal is not marked retryable", not r.get("retryable"))
+        check("it still needs a person", M.needs_a_person({**r, "eligible": True}))
+    finally:
+        C.GH = "gh"
+
+
+def test_ci_gate_timeout_is_retryable():
+    import merge as M
+    import ci as C
+    print("\nCI that does not finish by the deadline refuses as ci-timeout, and a retry resumes")
+    fx = _ci_fixture()
+    fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests", "conclusion": "pending"}})
+    C.GH = fx.gh
+    try:
+        before = _origin_main(fx)
+        wt = fx.branch("silkworm/tsk_slow", {"ios/a.txt": "4\n"})
+        gate, clock, _w = _gate(fx, "all", "tsk_slow", deadline_s=300)
+        r = M.land(wt, fx.repo, "silkworm/tsk_slow", "main", fx.tests, publish=True, ci_gate=gate)
+        check("refused at stage 'ci-timeout'", r.get("stage") == "ci-timeout", r.get("stage"))
+        check("marked retryable, and saying to land again", r.get("retryable")
+              and "land again" in (r.get("detail") or ""))
+        check("naming what it was still waiting for", "Tests" in (r.get("detail") or ""))
+        check("it gave up at the deadline, not before and not long after",
+              300 <= clock.t <= 330, clock.t)
+        check("main untouched on origin", _origin_main(fx) == before)
+        check("the pushed branch is kept, so a retry resumes the same runs",
+              r.get("ci_pushed") == "silkworm/tsk_slow"
+              and fx.g(fx.origin, "rev-parse", "--verify", "-q",
+                       "refs/heads/silkworm/tsk_slow").stdout.strip() != "")
+        check("merge.summary offers the retry", "Land again" in M.summary(
+            {**r, "eligible": True}, "silkworm/tsk_slow"))
+        # The runs finish; landing again picks them up on the same commit.
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "success"}})
+        gate2, _c, _w2 = _gate(fx, "all", "tsk_slow")
+        wt2 = fx.root / "again"
+        fx.g(fx.repo, "worktree", "remove", "--force", str(wt))
+        fx.g(fx.repo, "worktree", "add", "-q", str(wt2), "silkworm/tsk_slow")
+        r2 = M.land(wt2, fx.repo, "silkworm/tsk_slow", "main", fx.tests, publish=True, ci_gate=gate2)
+        check("landing again after the timeout lands", r2.get("landed"), r2.get("stage"))
+        check("and then the remote branch goes",
+              fx.g(fx.origin, "rev-parse", "--verify", "-q",
+                   "refs/heads/silkworm/tsk_slow").stdout.strip() == "")
+        # gh unreachable throughout: a timeout too, saying why.
+        fx.set_gh(down=True)
+        wt3 = fx.branch("silkworm/tsk_down", {"ios/a.txt": "5\n"})
+        gate3, _c3, _w3 = _gate(fx, "all", "tsk_down", deadline_s=60)
+        r3 = M.land(wt3, fx.repo, "silkworm/tsk_down", "main", fx.tests, ci_gate=gate3)
+        check("gh failing on every poll is a timeout that quotes gh's error",
+              r3.get("stage") == "ci-timeout" and "502" in (r3.get("detail") or ""), r3.get("detail"))
+    finally:
+        C.GH = "gh"
+
+
+def test_ci_gate_path_filtered_and_misconfigured():
+    import merge as M
+    import ci as C
+    print("\npath-filtered workflows count as passed; untriggerable ones refuse")
+    fx = _ci_fixture()
+    fx.set_gh(workflows={})
+    C.GH = fx.gh
+    try:
+        wt = fx.branch("silkworm/tsk_docs", {"README.md": "docs only\n"})
+        gate, _c, waits = _gate(fx, "all", "tsk_docs")
+        r = M.land(wt, fx.repo, "silkworm/tsk_docs", "main", fx.tests, publish=True, ci_gate=gate)
+        check("a change no workflow's paths cover lands", r.get("landed"), r.get("stage"))
+        check("without pushing a branch or asking GitHub anything",
+              fx.gh_state().get("calls") == [] and not waits)
+        check("and its record says both workflows were skipped, and why",
+              sorted(s["name"] for s in (r.get("ci") or {}).get("skipped", []))
+              == ["Backend tests", "Tests"] and "counted as passed" in (r.get("detail") or ""))
+
+        # Named workflows: one that does not exist is a configuration problem.
+        wt = fx.branch("silkworm/tsk_named", {"ios/a.txt": "6\n"})
+        gate, _c, _w = _gate(fx, ["Tests", "Lint"], "tsk_named")
+        r = M.land(wt, fx.repo, "silkworm/tsk_named", "main", fx.tests, ci_gate=gate)
+        check("a named workflow that does not exist refuses as ci-config",
+              r.get("stage") == "ci-config" and "'Lint'" in (r.get("detail") or ""), r.get("detail"))
+    finally:
+        C.GH = "gh"
+
+    # Cadence's own tests.yml, branches: ["*"], which misses silkworm/<id>:
+    # passing it would be the after-the-fact red all over again.
+    fx = _ci_fixture(tests_branches='["*"]')
+    fx.set_gh(workflows={})
+    C.GH = fx.gh
+    try:
+        before = fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip()
+        wt = fx.branch("silkworm/tsk_star", {"ios/a.txt": "7\n"})
+        gate, _c, _w = _gate(fx, "all", "tsk_star")
+        r = M.land(wt, fx.repo, "silkworm/tsk_star", "main", fx.tests, ci_gate=gate)
+        check("a workflow that would run on main but not on the pushed branch refuses",
+              r.get("stage") == "ci-config" and "'Tests'" in (r.get("detail") or "")
+              and '"**"' in (r.get("detail") or ""), r.get("detail"))
+        check("and moves nothing", fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip() == before
+              and fx.gh_state().get("calls") == [])
+        # The branch that fixes the trigger is judged by the trigger it fixes.
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "success"}})
+        yml = (fx.repo / ".github/workflows/tests.yml").read_text().replace('["*"]', '["**"]')
+        wt = fx.branch("silkworm/tsk_fix", {".github/workflows/tests.yml": yml})
+        gate, _c, _w = _gate(fx, "all", "tsk_fix")
+        r = M.land(wt, fx.repo, "silkworm/tsk_fix", "main", fx.tests, ci_gate=gate)
+        check("a branch fixing the trigger is judged by its own workflow file, and lands",
+              r.get("landed") and (r.get("ci") or {}).get("passed") == ["Tests"], r.get("detail"))
+    finally:
+        C.GH = "gh"
+
+    # Never the base: the gate refuses to push anything but silkworm/<id>.
+    gate = C.Gate("all", "main", slug="o/r")
+    out = gate.run(fx.repo, fx.repo, "main", "x", "y")
+    check("the gate refuses to push the base as its CI branch",
+          not out["ok"] and out["stage"] == "ci-config" and not gate.pushed)
+    check("delete_remote refuses anything outside silkworm/",
+          C.delete_remote(fx.repo, "main") is False)
+
+
+def test_ci_gate_releases_the_checkout_while_waiting():
+    import merge as M
+    import ci as C
+    import threading as _th
+    print("\nthe CI wait lets go of the checkout and checks it again afterwards")
+    fx = _ci_fixture()
+    fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests", "conclusion": "success",
+                                                          "after": 2}})
+    C.GH = fx.gh
+    try:
+        lock = _th.Lock()
+        held_during = []
+
+        @contextlib.contextmanager
+        def outside():
+            lock.release()
+            try:
+                yield
+            finally:
+                lock.acquire()
+        wt = fx.branch("silkworm/tsk_out", {"ios/a.txt": "8\n"})
+        gate, clock, _w = _gate(fx, "all", "tsk_out", outside=outside)
+        real_sleep = clock.sleep
+
+        def sleep(s):
+            held_during.append(lock.locked())
+            # Someone edits a tracked file in the checkout meanwhile.
+            (fx.repo / "README.md").write_text("edited while CI ran\n")
+            real_sleep(s)
+        gate.sleep = sleep
+        with lock:
+            r = M.land(wt, fx.repo, "silkworm/tsk_out", "main", fx.tests, ci_gate=gate)
+        check("the checkout's lock is free while CI is polled", held_during == [False])
+        check("and the checkout is asked again afterwards: edits made meanwhile refuse",
+              r.get("stage") == "base-dirty" and not r.get("landed"), r.get("stage"))
+        check("that refusal still cleans the remote branch up",
+              fx.g(fx.origin, "rev-parse", "--verify", "-q",
+                   "refs/heads/silkworm/tsk_out").stdout.strip() == "")
+    finally:
+        C.GH = "gh"
+
+
+def test_ci_gate_wiring_in_the_bot():
+    import ci as C
+    print("\nthe bot builds the gate from the project, records the wait, and cleans up on drop")
+    recorded = []
+    task = {"id": "tsk_wire", "project": "cadence"}
+    ns = lift("ci_gate_for", _repo_lock=lambda cwd: None,
+              record_landing=lambda t, o: recorded.append(o),
+              branches=types.SimpleNamespace(name_for=lambda t: "silkworm/tsk_wire"))
+    check("no ci_gate, no gate", ns["ci_gate_for"](task, {"ci_gate": ""}, "/x") is None)
+    gate = ns["ci_gate_for"](task, {"ci_gate": "all"}, "/x")
+    check("ci_gate 'all' builds a gate pushing the task's own branch",
+          isinstance(gate, C.Gate) and gate.want == "all" and gate.push_as == "silkworm/tsk_wire")
+    gate.on_wait("abcdef1234", ["Tests"])
+    check("the wait is recorded as its own landing stage, with the remote branch",
+          recorded and recorded[-1]["stage"] == C.WAITING
+          and recorded[-1].get("ci_pushed") == "silkworm/tsk_wire"
+          and "waiting for Tests" in recorded[-1].get("detail", ""))
+    src = (BASE / "bot.py").read_text()
+    body = src[src.index("def land_if_ready("):src.index("def record_landing(")]
+    check("land_if_ready passes the gate to merge.land, inside the landing serial lock",
+          "ci_gate=gate" in body and "with landing_serial(cwd):\n            with repo_guard(cwd):" in body)
+    keep = src[src.index("def record_landing("):src.index("def land_and_record(")]
+    check("the landing record keeps the CI fields", all(f'"{k}"' in keep for k in
+                                                       ("ci", "ci_pushed", "retryable")))
+    rr = src[src.index("def resolve_review("):src.index("def landing_enabled(")]
+    check("a CI-gated auto-merge lands on its own thread, not the review lane",
+          "land_later" in rr and "start_landing(parent_id)" in rr)
+    cl = src[src.index("def clear_interrupted_landings("):src.index("_email_lock")]
+    check("a restart while waiting for CI is cleared like any interrupted landing",
+          "ci.WAITING" in cl)
+    drop = src[src.index("def land_or_drop("):src.index("def tidy_checkout(")] \
+        if "def land_or_drop(" in src else ""
+    check("dropping a task deletes the branch its CI gate pushed",
+          "ci.delete_remote(repo, pushed)" in drop)
+    import projects as P_
+    check("cadence is seeded on, nothing else", P_.SEED_CI_GATE == {"cadence": "all"}
+          and P_.default("ci_gate") == "")
+    td = Path(tempfile.mkdtemp())
+    (td / "p.json").write_text(json.dumps({"cadence": {"slug": "cadence"},
+                                           "trader": {"slug": "trader"}}))
+    ps = P_.ProjectStore(td / "p.json")
+    check("an existing cadence record gets ci_gate on, others stay off",
+          ps.get("cadence")["ci_gate"] == "all" and ps.get("trader")["ci_gate"] == "")
+    (td / "q.json").write_text(json.dumps({"cadence": {"slug": "cadence", "ci_gate": ""}}))
+    check("turned off, it stays off", P_.ProjectStore(td / "q.json").get("cadence")["ci_gate"] == "")
+
+
+def test_ci_wait_is_its_own_stage_everywhere():
+    import digest as Dg
+    import merge as M
+    import ci as C
+    print("\n'waiting for CI' shows as its own landing stage")
+    now = time.time()
+    rec = {"id": "tsk_w", "title": "Waiting one", "project": "cadence", "state": "done",
+           "role": "implementor", "created": now - 100,
+           "result": {"landing": {"eligible": True, "landed": False, "stage": C.WAITING,
+                                  "branch": "silkworm/tsk_w", "detail": "waiting for Tests",
+                                  "at": now - 50}},
+           "events": [{"kind": "done", "at": now - 60}]}
+    out = Dg.sections([rec], now)
+    check("the digest lists it under 'waiting for CI'",
+          "Waiting one" in str(out.get("cadence", {}).get("ci")), out)
+    check("and not as a refused landing", not out.get("cadence", {}).get("refused"))
+    check("the digest's sections include it, with its label",
+          ("ci", "waiting for CI", True) in Dg.ORDER)
+    check("merge.summary says waiting for CI",
+          "Waiting for CI" in M.summary({"eligible": True, "landed": False,
+                                         "stage": C.WAITING, "detail": "x"}, "b"))
+    check("ci.label names every CI stage", C.label(C.WAITING) == "waiting for CI"
+          and C.label(C.TIMEOUT) == "CI timed out")
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("the CLI labels the stages the same way",
+          '"ci-wait": "waiting for CI"' in cli and "landing_label(stage)" in cli)
+    page = (BASE / "visualizer.py").read_text()
+    check("the dashboard shows it as waiting for CI, not landing… or refused",
+          'l.stage === "ci-wait"' in page and "waiting for CI…" in page
+          and page.index('l.stage === "ci-wait"') < page.index('if (!l.eligible)'))
+
+
+def test_ci_gate_branch_is_cleaned_up_on_drop_and_restart():
+    import tasks as T, branches as B, discard as D
+    print("\na dropped task takes its CI branch off origin; a restart clears the wait")
+    fx = _ci_fixture()
+    wt = fx.branch("silkworm/tsk_drop", {"ios/a.txt": "9\n"})
+    fx.g(wt, "push", "-q", "origin", "silkworm/tsk_drop")
+    fx.g(fx.repo, "worktree", "remove", "--force", str(wt))
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    recorded = []
+    ns = {"task_store": store, "tasks": T, "branches": B, "discard": D,
+          "log": logging.getLogger("test"),
+          "start_landing": lambda tid, approved=False: True,
+          "record_landing": lambda task, out: recorded.append(out),
+          "repo_guard": lambda cwd: contextlib.nullcontext()}
+    lift({"land_or_drop"}, ns=ns)
+    tid = store.create("gated work", state=T.QUEUED, scope={"cwd": str(fx.repo)},
+                       role="implementor", branch="silkworm/tsk_drop")["id"]
+    store.transition(tid, T.RUNNING); store.transition(tid, T.DONE)
+    store.update(tid, result={"landing": {"eligible": True, "landed": False,
+                                          "stage": "ci-timeout", "branch": "silkworm/tsk_drop",
+                                          "ci_pushed": "silkworm/tsk_drop"}})
+    on_origin = lambda: fx.g(fx.origin, "rev-parse", "--verify", "-q",   # noqa: E731
+                             "refs/heads/silkworm/tsk_drop").stdout.strip()
+    check("the fixture's CI branch is on origin to begin with", on_origin() != "")
+    r = ns["land_or_drop"]("drop", {"id": tid})
+    check("Drop deletes the branch the CI gate pushed from origin",
+          r.get("ok") and on_origin() == "" and "deleted silkworm/tsk_drop from origin"
+          in (r.get("note") or ""), r)
+    # A task whose landing never pushed anything leaves origin alone.
+    other = fx.branch("silkworm/tsk_keep", {"README.md": "k\n"})
+    fx.g(other, "push", "-q", "origin", "silkworm/tsk_keep")
+    fx.g(fx.repo, "worktree", "remove", "--force", str(other))
+    tid2 = store.create("ungated", state=T.QUEUED, scope={"cwd": str(fx.repo)},
+                        role="implementor", branch="silkworm/tsk_keep")["id"]
+    store.transition(tid2, T.RUNNING); store.transition(tid2, T.DONE)
+    ns["land_or_drop"]("drop", {"id": tid2})
+    check("a branch the gate did not push is not deleted from origin",
+          fx.g(fx.origin, "rev-parse", "--verify", "-q",
+               "refs/heads/silkworm/tsk_keep").stdout.strip() != "")
+
+    import subprocess as _sp
+    sweep_ns = {"task_store": store, "log": logging.getLogger("test"), "subprocess": _sp,
+                "time": time}
+    lift({"record_landing", "clear_interrupted_landings", "LANDING_UNDERWAY",
+          "_interrupted_landing_detail"}, ns=sweep_ns)
+    w = store.create("waiting", project="cadence")["id"]
+    store.update(w, result={"landing": {"eligible": True, "landed": False, "stage": "ci-wait",
+                                        "branch": "silkworm/" + w, "checkpointed": True,
+                                        "ci_pushed": "silkworm/" + w, "detail": "waiting"}})
+    cleared = sweep_ns["clear_interrupted_landings"]()
+    after = store.get(w)["result"]["landing"]
+    check("a restart while waiting for CI is cleared, as nothing merged",
+          w in cleared and after["stage"] == "interrupted"
+          and after["detail"].endswith("nothing was merged"), after)
+    check("keeping the CI branch's name so Drop can still remove it",
+          after.get("ci_pushed") == "silkworm/" + w)
+
+
+def test_ci_gate_retries_and_moving_parts():
+    import merge as M
+    import ci as C
+    print("\nCI gate: retries see fresh runs, a moved branch refuses, the base's red is named")
+    log = ("﻿2026-11-21T21:20:30.1Z \x1b[36;1mmake ios-test\x1b[0m\n"
+           "2026-11-21T21:20:38.2Z Failing tests:\n"
+           "2026-11-21T21:20:38.3Z \tNotificationSettingsViewModelTests.test_save()\n"
+           "2026-11-21T21:20:38.3Z \n"
+           "2026-11-21T21:20:38.4Z ** TEST FAILED **\n"
+           "2026-11-21T21:20:44.0Z ##[error]Process completed with exit code 2.\n")
+    check("xcodebuild's quiet 'Failing tests:' block names the test, past ANSI and stamps",
+          C.first_test(log) == "NotificationSettingsViewModelTests.test_save()", C.first_test(log))
+    check("with no test named, the ##[error] line stands in",
+          C.first_test("2026-11-21T1:1:1Z ##[error]boom\n") == "boom")
+    src = (BASE / "ci.py").read_text()
+    check("job logs are asked for with --allow-escape-sequences, or gh refuses them",
+          '"--allow-escape-sequences"' in src)
+
+    fx = _ci_fixture()
+    C.GH = fx.gh
+    try:
+        # A flaky red from an earlier attempt is already on this commit.
+        stale = {"id": 50, "name": "Tests", "path": ".github/workflows/tests.yml",
+                 "event": "push", "status": "completed", "conclusion": "failure",
+                 "run_attempt": 1, "html_url": "u"}
+        # And the retry's own run is not registered on the first poll, as on
+        # GitHub, where it takes seconds after the push to appear.
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "success",
+                                                              "appear": 2, "after": 3}},
+                  stale=[stale])
+        wt = fx.branch("silkworm/tsk_flaky", {"ios/a.txt": "10\n"})
+        gate, _c, _w = _gate(fx, "all", "tsk_flaky")
+        r = M.land(wt, fx.repo, "silkworm/tsk_flaky", "main", fx.tests, ci_gate=gate)
+        check("an earlier attempt's failed run does not refuse the retry; the new run decides",
+              r.get("landed"), f"{r.get('stage')}: {str(r.get('detail'))[:160]}")
+        check("a stale failed run re-run on GitHub counts again",
+              C.verdict([dict(stale, status="in_progress", conclusion=None, run_attempt=2)],
+                        frozenset({C._seen(stale)}))[0] == "pending")
+
+        # The base is red on GitHub too: said with the refusal.
+        fx.g(fx.repo, "push", "-q", "origin", "main")
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "failure"}})
+        wt = fx.branch("silkworm/tsk_both", {"ios/a.txt": "11\n"})
+        gate, _c, _w = _gate(fx, "all", "tsk_both")
+        r = M.land(wt, fx.repo, "silkworm/tsk_both", "main", fx.tests, ci_gate=gate)
+        check("a failure that is red on the base as well says so",
+              r.get("stage") == "ci" and "red on main" in (r.get("detail") or "")
+              and (r.get("ci") or {}).get("base_red"), r.get("detail"))
+        before = fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip()
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "failure"}},
+                  per_sha={before: "success"})
+        wt = fx.branch("silkworm/tsk_mine", {"ios/a.txt": "12\n"})
+        gate, _c, _w = _gate(fx, "all", "tsk_mine")
+        r = M.land(wt, fx.repo, "silkworm/tsk_mine", "main", fx.tests, ci_gate=gate)
+        check("and one green on the base does not",
+              r.get("stage") == "ci" and "red on main" not in (r.get("detail") or ""), r.get("detail"))
+
+        # A copy left on origin at another commit is deleted before the push.
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "success"}},
+                  per_sha={})
+        wt = fx.branch("silkworm/tsk_old", {"ios/a.txt": "13\n"})
+        fx.g(wt, "push", "-q", "origin", f"{before}:refs/heads/silkworm/tsk_old")
+        deleted = []
+        real = C.delete_remote
+        C.delete_remote = lambda repo, b: deleted.append(
+            (b, C.remote_sha(repo, b))) or real(repo, b)
+        try:
+            gate, _c, _w = _gate(fx, "all", "tsk_old")
+            r = M.land(wt, fx.repo, "silkworm/tsk_old", "main", fx.tests, ci_gate=gate)
+        finally:
+            C.delete_remote = real
+        check("an earlier attempt's copy at another commit is deleted before pushing",
+              r.get("landed") and deleted[:1] == [("silkworm/tsk_old", before)], deleted)
+
+        # The branch moves while CI runs: what passed is not what would merge.
+        wt = fx.branch("silkworm/tsk_moved", {"ios/a.txt": "14\n"})
+        fx.set_gh(workflows={".github/workflows/tests.yml": {"name": "Tests",
+                                                              "conclusion": "success", "after": 2}})
+        gate, clock, _w = _gate(fx, "all", "tsk_moved")
+        base_now = fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip()
+
+        def sleep(s):
+            fx.g(fx.repo, "update-ref", "refs/heads/silkworm/tsk_moved", base_now)
+            clock.t += s
+        gate.sleep = sleep
+        r = M.land(wt, fx.repo, "silkworm/tsk_moved", "main", fx.tests, ci_gate=gate)
+        check("a branch moved while CI ran refuses rather than merging untested work",
+              r.get("stage") == "branch-moved"
+              and fx.g(fx.repo, "rev-parse", "HEAD").stdout.strip() == base_now, r.get("stage"))
+    finally:
+        C.GH = "gh"
+
+
+def test_ci_gate_remembers_its_remote_branch():
+    import tasks as T
+    import ci as C
+    print("\nthe branch a CI gate left on origin is remembered until it is deleted")
+    store = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ns = lift("record_landing", task_store=store)
+    tid = store.create("gated", project="cadence")["id"]
+    rec = lambda o: ns["record_landing"](store.get(tid), o)   # noqa: E731
+    rec({"eligible": True, "landed": False, "stage": "ci-timeout", "ci_pushed": "silkworm/" + tid})
+    rec({"eligible": True, "landed": False, "stage": "in-progress", "detail": "landing under way"})
+    got = store.get(tid)["result"]["landing"]
+    check("an outcome that does not mention it keeps the pushed branch",
+          got.get("stage") == "in-progress" and got.get("ci_pushed") == "silkworm/" + tid, got)
+    rec({"eligible": True, "landed": True, "stage": "done", "ci_pushed": ""})
+    check("one that says it was deleted clears it",
+          store.get(tid)["result"]["landing"].get("ci_pushed") == "")
+
+    task = {"id": "tsk_seed", "result": {"landing": {"ci_pushed": "silkworm/tsk_seed"}}}
+    ns2 = lift("ci_gate_for", _repo_lock=lambda cwd: None, record_landing=lambda t, o: None,
+               branches=types.SimpleNamespace(name_for=lambda t: "silkworm/" + t["id"]))
+    gate = ns2["ci_gate_for"](task, {"ci_gate": "all"}, "/x")
+    check("the next landing's gate starts out owning that branch, so it cleans it up",
+          gate.pushed == "silkworm/tsk_seed")
+    other = ns2["ci_gate_for"]({"id": "tsk_o", "result": {"landing": {"ci_pushed": "silkworm/zzz"}}},
+                               {"ci_gate": "all"}, "/x")
+    check("but never a branch with another task's name", other.pushed == "")
+
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    done = st.create("landed already", state=T.QUEUED)["id"]
+    st.transition(done, T.RUNNING); st.transition(done, T.DONE)
+    keep = lift("live_worktree_tasks", tasks=T, task_store=st, RUNNING_TASKS={},
+                _landing_now={done})["live_worktree_tasks"]()
+    check("a landing under way keeps its checkout from the sweeper, task done or not",
+          done in keep)
 
 
 if __name__ == "__main__":

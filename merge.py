@@ -12,6 +12,10 @@ happened:
   retest   -- two agents once implemented the same fix independently. Each
               passed alone. Only running the suite after combining them could
               have caught that.
+  ci       -- for a project with `ci_gate`, push the rebased commit as
+              silkworm/<task id> and wait for its GitHub workflows (ci.py).
+              Cadence's ran on a different runner only after main had been
+              pushed, and three kinds of red reached main that way.
   recheck  -- the base must still be on the commit the branch was rebased
               onto, or the thing that passed is not the thing being merged.
   merge    -- fast-forward only, so history stays linear and the merge itself
@@ -29,11 +33,13 @@ It refuses rather than guesses: a dirty checkout, a conflicting rebase or a
 missing test command all stop the landing and hand it back with a reason.
 """
 
+import functools
 import logging
 import subprocess
 from pathlib import Path
 
 import branches
+import ci
 import verify
 import worktrees
 
@@ -162,8 +168,51 @@ def _refuse_held(base_name: str, paths) -> dict:
                  f"Rebuild or restore them yourself in the checkout, then land again.")
 
 
+def _dirty(repo, generated) -> dict | None:
+    """A base-dirty refusal if the checkout has uncommitted tracked work."""
+    dirty = worktrees.changes(repo, generated=generated, untracked="no")
+    if dirty is None:
+        return _fail("base-dirty",
+                     "git could not say whether the checkout has uncommitted "
+                     "changes, so nothing was merged")
+    if dirty:
+        shown = ", ".join(dirty[:6]) + (f" and {len(dirty) - 6} more"
+                                        if len(dirty) > 6 else "")
+        return _fail("base-dirty",
+                     f"the checkout has uncommitted changes ({shown}), so "
+                     "nothing was merged")
+    return None
+
+
+def _cleans_ci_branch(fn):
+    """Delete the CI gate's pushed branch from origin once a landing is over.
+
+    It would read as unmerged work there for ever. A timeout keeps it, so
+    landing again resumes waiting on the runs it already started; so does a
+    delete that failed, under `ci_pushed`, for Drop to try again.
+    """
+    @functools.wraps(fn)
+    def run(worktree, repo, *args, ci_gate=None, **kwargs):
+        try:
+            out = fn(worktree, repo, *args, ci_gate=ci_gate, **kwargs)
+        except BaseException:
+            if ci_gate is not None and ci_gate.pushed:
+                ci_gate.done(repo)
+            raise
+        if ci_gate is not None and (ci_gate.pushed or out.get("ci") is not None):
+            if out.get("stage") != ci.TIMEOUT:
+                gone = ci_gate.done(repo)
+                if out.get("ci") is not None:
+                    out["ci"] = {**out["ci"], "deleted": gone}
+            out["ci_pushed"] = ci_gate.pushed
+        return out
+    return run
+
+
+@_cleans_ci_branch
 def land(worktree, repo, branch: str, base: str, run_tests,
-         publish: bool = False, on_merge=None, generated=None) -> dict:
+         publish: bool = False, on_merge=None, generated=None,
+         ci_gate=None) -> dict:
     """Rebase, retest, fast-forward, retest, and revert if that broke it.
 
     `run_tests(cwd)` is injected so the caller owns what "the tests" means and
@@ -183,6 +232,13 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     so those files sit modified there permanently, holding injected keys. They
     do not make the base dirty, and nothing here ever writes them: a landing
     that would have to change one is refused instead.
+
+    `ci_gate` is a ci.Gate for a project whose GitHub CI must pass first, or
+    None. It pushes the rebased commit as the task's own branch, never the
+    base, and waits; nothing below it -- the fast-forward, the push of the
+    base -- happens unless every required workflow is green. The wait lets go
+    of the checkout (the gate's `outside`), so the checkout is asked again
+    afterwards whether it is still clean and still on the base.
     """
     # Tracked changes only. Running the suite leaves build droppings --
     # __pycache__, .pytest_cache, coverage files -- in the very checkout it
@@ -199,17 +255,9 @@ def land(worktree, repo, branch: str, base: str, run_tests,
     # landings in a row refused here over files no landing touches.
     generated = (worktrees.generated_for(repo) if generated is None
                  else list(generated))
-    dirty = worktrees.changes(repo, generated=generated, untracked="no")
-    if dirty is None:
-        return _fail("base-dirty",
-                     "git could not say whether the checkout has uncommitted "
-                     "changes, so nothing was merged")
+    dirty = _dirty(repo, generated)
     if dirty:
-        shown = ", ".join(dirty[:6]) + (f" and {len(dirty) - 6} more"
-                                        if len(dirty) > 6 else "")
-        return _fail("base-dirty",
-                     f"the checkout has uncommitted changes ({shown}), so "
-                     "nothing was merged")
+        return dirty
     held = worktrees.generated_changes(repo, generated)
 
     # Best-effort, and only so the base can be *named* from an up-to-date
@@ -324,6 +372,39 @@ def land(worktree, repo, branch: str, base: str, run_tests,
                                 "the change passes alone but not on top of the current base",
                                 after_rebase),
                 "base": base_name, "onto": before}
+
+    # 2b. and, where the project says so, prove it on GitHub's runners too --
+    # before anything moves the base, let alone pushes it.
+    ci_record = None
+    ci_note = ""
+    if ci_gate is not None and ci_gate.want:
+        commit = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+        gate = ci_gate.run(worktree, repo, base_name, before, commit)
+        ci_record = gate.get("ci") or {}
+        if not gate.get("ok"):
+            return {**_fail(gate["stage"], gate["detail"]), "base": base_name,
+                    "onto": before, "ci": ci_record,
+                    "retryable": bool(gate.get("retryable"))}
+        ci_note = gate.get("detail") or ""
+        # The wait let go of the checkout; whoever used it meanwhile may have
+        # left it with work in progress or on another branch.
+        dirty = _dirty(repo, generated)
+        if dirty:
+            return {**dirty, "base": base_name, "ci": ci_record}
+        on = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        if on != base_name:
+            return {**_fail("base-branch",
+                            f"the checkout moved to {on!r}, not {base_name!r}, "
+                            f"while CI ran"), "ci": ci_record}
+        # And the branch must still be the commit CI passed: the fast-forward
+        # below goes by its name, and forty minutes is long enough for
+        # something to have moved it.
+        tip = _git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").stdout.strip()
+        if tip != commit:
+            return {**_fail("branch-moved",
+                            f"{branch} moved from {commit[:8]} (the commit CI "
+                            f"passed) to {tip[:8] or 'nowhere'} while CI ran, so "
+                            f"nothing was merged"), "base": base_name, "ci": ci_record}
 
     # 3. the tested commit must be the commit that gets merged. Running the
     # suite takes minutes, and another landing (or a person) moving the base in
@@ -518,9 +599,14 @@ def land(worktree, repo, branch: str, base: str, run_tests,
 
     log.info("landed %s on %s (%s..%s)%s", branch, base_name, before[:8],
              head[:8], " and published" if published else "")
-    return {"landed": True, "stage": "done", "base": base_name,
-            "before": before, "head": head, "published": published,
-            "detail": note}
+    if ci_note:
+        note = ci_note + (f"\n{note}" if note else "")
+    out = {"landed": True, "stage": "done", "base": base_name,
+           "before": before, "head": head, "published": published,
+           "detail": note}
+    if ci_record is not None:
+        out["ci"] = ci_record
+    return out
 
 
 def needs_a_person(outcome: dict) -> bool:
@@ -555,6 +641,12 @@ def summary(result: dict, branch: str) -> str:
         if result.get("detail"):
             line += f"\n```\n{result['detail'][-800:]}\n```"
         return line
+    if result.get("stage") == ci.WAITING:
+        return f":hourglass_flowing_sand: _Waiting for CI: {result.get('detail', '')[-600:]}_"
+    if result.get("stage") == ci.TIMEOUT:
+        return (f":hourglass: _Not landed (CI timed out). Branch `{branch}` is "
+                f"waiting; Land again to resume._\n```\n"
+                f"{result.get('detail', '')[-800:]}\n```")
     if result.get("stage") in (BASE_FAILING, CHECKOUT_FAILING):
         return f":pause_button: _Landing held: {result.get('detail', '')[-600:]}_"
     if not result.get("eligible", True):
