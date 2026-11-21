@@ -3208,8 +3208,12 @@ unstick(document.body, 1500);
 // the app is put away) is the action sent. Undone, nothing was sent. A
 // refusal puts the card back and says why. Until it is sent the card stays
 // gone from every redraw (pendingGone), polls included.
-const pendingGone = new Map();         // task id -> {action, timer, label}
+// Swipes made while an Undo is still showing join it: one window for all of
+// them, restarted by each swipe, and one "Undo N" that brings them all back.
+// So no swipe is ever sent while the toast that could undo it is gone.
+const pendingGone = new Map();         // task id -> {action, label, batch, sent}
 const UNDO_MS = 5000;
+let undoBatch = null;                  // {items, timer}: the swipes the toast's Undo covers
 function notGone(t) { return !pendingGone.has(t.id); }
 function redrawWork() {
   const panel = document.getElementById("taskmodal");
@@ -3218,28 +3222,34 @@ function redrawWork() {
 }
 function deferTask(id, action, label) {
   if (pendingGone.has(id)) return;
-  const p = {action, label};
+  if (!undoBatch || undoBatch.items.every(q => q.sent)) undoBatch = {items: []};
+  const b = undoBatch, p = {id, action, label, batch: b};
   pendingGone.set(id, p);
-  p.timer = setTimeout(() => sendDeferred(id), UNDO_MS);
-  toast(label, UNDO_MS, {undo: () => {
+  b.items.push(p);
+  clearTimeout(b.timer);
+  b.timer = setTimeout(() => { for (const q of b.items) sendDeferred(q.id); }, UNDO_MS);
+  const n = b.items.length;
+  toast(n > 1 ? `${label} (and ${n - 1} more)` : label, UNDO_MS, {undoLabel: n > 1 ? `Undo ${n}` : "Undo", undo: () => {
     // Too late once it has gone to the server (the app was put away, or the
     // window ran out): said, never shown as undone.
-    if (p.sent || pendingGone.get(id) !== p) {
+    const back = b.items.filter(q => !q.sent && pendingGone.get(q.id) === q);
+    if (!back.length) {
       setTimeout(() => toast("Already sent — that one can't be undone here", 3500, {bad: true}), 0);
       return;
     }
-    clearTimeout(p.timer);
-    pendingGone.delete(id);
+    clearTimeout(b.timer);
+    for (const q of back) pendingGone.delete(q.id);
+    if (undoBatch === b) undoBatch = null;
     redrawWork();
   }});
-  toast.owner = p;
+  toast.owner = b;
 }
 async function sendDeferred(id) {
   const p = pendingGone.get(id);
   if (!p || p.sent) return;
   p.sent = true;
-  clearTimeout(p.timer);
-  if (toast.owner === p) hideToast(document.getElementById("toast"));   // its Undo is over
+  // its Undo is over once nothing it covers is still waiting
+  if (toast.owner === p.batch && p.batch.items.every(q => q.sent)) hideToast(document.getElementById("toast"));
   let r;
   try { r = await taskCall({action: p.action, id}); }
   catch (e) { r = {ok: false, error: "could not reach the dashboard"}; }
@@ -3422,15 +3432,18 @@ function md(src) {
 }
 
 // What just happened, for a moment. With `opts.undo` it carries an Undo
-// button (and stays the length of the undo window); `opts.bad` marks a
+// button (labelled `opts.undoLabel`, and stays the length of the undo
+// window); `opts.bad` marks a
 // refusal. It rises in and fades away rather than blinking.
 function toast(msg, ms, opts) {
   const t = document.getElementById("toast");
   opts = opts || {};
+  toast.owner = null;                  // whoever set the last one: deferTask claims it after
   clearTimeout(toast.timer); clearTimeout(toast.gone);
   if (opts.undo) {
     t.innerHTML = `<span class="tmsg"></span><button class="undo" type="button">Undo</button>`;
     t.querySelector(".tmsg").textContent = msg;
+    if (opts.undoLabel) t.querySelector(".undo").textContent = opts.undoLabel;
     t.querySelector(".undo").onclick = () => {
       const u = opts.undo; opts.undo = null;
       if (u) u();

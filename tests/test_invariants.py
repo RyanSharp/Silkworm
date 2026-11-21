@@ -37030,6 +37030,28 @@ const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r
   gate = null; open_(); await flushAsync();
   out.inFlightSent = posts().filter(c => c.body.id === "tsk_g2").length;
 
+  // A second swipe while the first's Undo is up joins it: neither is sent
+  // while that Undo shows, and "Undo 2" brings both back.
+  const s1 = card("tsk_s1", "First"), s2 = card("tsk_s2", "Second");
+  const s0 = posts().length;
+  drag(s1.t, -250, 0); up(); finishAll();
+  runTimers(now + 3000);
+  drag(s2.t, 250, 0); up(); finishAll();
+  out.twoToast = {text: toastEl.text, undo: toastEl.children.find(c => c.className === "undo").textContent};
+  runTimers(now + 3000); await flushAsync();       // past the first swipe's own 5s
+  out.twoBeforeWindow = {posts: posts().length - s0, pending: M.pendingGone.has("tsk_s1") && M.pendingGone.has("tsk_s2")};
+  toastEl.children.find(c => c.className === "undo").onclick();
+  runTimers(now + 6000); await flushAsync();
+  out.twoUndone = {posts: posts().length - s0, pending: M.pendingGone.has("tsk_s1") || M.pendingGone.has("tsk_s2")};
+  // Left alone, both go once the shared window is up, the toast with them.
+  const s3 = card("tsk_s3", "Third"), s4 = card("tsk_s4", "Fourth");
+  drag(s3.t, -250, 0); up(); finishAll();
+  runTimers(now + 2000);
+  drag(s4.t, -250, 0); up(); finishAll();
+  runTimers(now + 5100); await flushAsync();
+  out.twoSent = {ids: posts().slice(s0).map(c => c.body.id), pending: M.pendingGone.size,
+                 toastGone: toastEl.classList.contains("leaving") || toastEl.style.display === "none"};
+
   // Not far enough: it springs back, nothing is pending.
   const e = card("tsk_e", "Almost");
   drag(e.t, -60, 0); up(); finishAll();
@@ -37445,6 +37467,13 @@ def test_dashboard_swipe_undo_and_optimism():
     check("once sent, its Undo toast goes; an Undo tapped after that says it was too late, and sends nothing more",
           o["undoToastGoesWithTheSend"] and o["lateUndo"] == {"toast": "Already sent — that one can't be undone here",
                                                                "bad": True, "posts": 1, "pending": False}, o["lateUndo"])
+    check("a second swipe while the first's Undo is up joins it: one toast, 'Undo 2'",
+          o["twoToast"] == {"text": "Accepted: Second (and 1 more) Undo 2", "undo": "Undo 2"}, o["twoToast"])
+    check("...the first is not sent when its own 5s run out, since its Undo is still showing",
+          o["twoBeforeWindow"] == {"posts": 0, "pending": True}, o["twoBeforeWindow"])
+    check("...and 'Undo 2' brings both back with nothing sent", o["twoUndone"] == {"posts": 0, "pending": False}, o["twoUndone"])
+    check("left alone, both are sent once the shared window is up, and the toast goes",
+          o["twoSent"] == {"ids": ["tsk_s3", "tsk_s4"], "pending": 0, "toastGone": True}, o["twoSent"])
     check("not far enough, it springs back and nothing is pending",
           o["short"] == {"pending": False, "transform": "", "swiping": False}, o["short"])
     check("a mostly vertical drag is a scroll, not a swipe", o["vertical"] == {"pending": False, "swiping": False})
