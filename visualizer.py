@@ -6136,17 +6136,19 @@ function trShadowTab(doc) {
   let c1;
   if (!Object.keys(c).length) c1 = trMissing(doc, "shadow", "C1 shadow");
   else {
-    // A day with neither figure draws nothing, so a series of only such days is no curve.
-    const ser = trList(c.series).filter(x => typeof x === "object" && (trNum(x.shadow) || trNum(x.backtest)));
+    // Every day stays (a NaN day is drawn as one); a series with no figure at all is no curve.
+    const ser = trList(c.series).filter(x => typeof x === "object");
+    const curve = ser.some(x => trNum(x.shadow) || trNum(x.backtest));
     const span = [c.start && c.end ? `${trStr(c.start)} → ${trStr(c.end)}` : "", trNum(c.days) ? c.days + " days" : "",
       c.report_at ? "report " + trStr(c.report_at) : ""].filter(Boolean).join(" · ");
     const stats = trList(c.stats);
     c1 = `<p class="sub">${esc(span) || "—"}</p>`
-      + (ser.length ? `<p class="sub">Shadow book (solid) vs its backtest over the same days (dashed), rebased</p>`
+      + (curve ? `<p class="sub">Shadow book (solid) vs its backtest over the same days (dashed), rebased${c.series_note ? ". " + esc(trStr(c.series_note)) : ""}</p>`
           + trChart(ser.map(x => ({x: x.date, y: trNum(x.shadow) ? x.shadow : null, y2: trNum(x.backtest) ? x.backtest : null})),
                     {label: "C1 shadow vs backtest", y2: true, y2Label: "backtest"})
           + trTable(["date", "shadow", "backtest"], ser.map(x => ({nan: !trNum(x.shadow), cells: [esc(trStr(x.date)), trMoney(x.shadow), trMoney(x.backtest)]})))
-        : `<p class="sub">${trBadge("unknown", "not reported")} shadow vs backtest curve${c.series_note ? ": " + esc(trStr(c.series_note)) : ""}</p>`)
+        // The note is the reason only when there was no list: with one, it describes the rebase.
+        : `<p class="sub">${trBadge("unknown", "not reported")} shadow vs backtest curve${!Array.isArray(c.series) && c.series_note ? ": " + esc(trStr(c.series_note)) : ""}</p>`)
       + (stats.length ? trScroll(`<table><tr><th></th><th class="r">total</th><th class="r">vol</th><th class="r">max DD</th></tr>`
           + stats.map(x => `<tr><td>${trCell(x.name)}</td><td class="r">${trSigned(x.total)}</td><td class="r">${trPct(x.vol)}</td><td class="r">${trSigned(x.max_dd)}</td></tr>`).join("")
           + `</table>`) : "")
@@ -6346,7 +6348,11 @@ function trNormalize(doc) {
                tracking_error: vm.tracking_error, stats: [stat("shadow", vm.shadow), stat("backtest", vm.backtest)].filter(Boolean),
                note: rec ? `recorded book newest ${trStr(rec.newest)}` + (trNum(rec.sessions_behind) ? `, ${rec.sessions_behind} session(s) behind` : "") : undefined};
     // trader_status.py's series is already the cards' shape: [{date, shadow, backtest}].
-    if (vm && sh.c1 && typeof sh.c1 === "object") { put(sh.c1, "series", vm.series); put(sh.c1, "series_note", vm.series_note); }
+    // Its reason when it has none: series_note, or unknown_fields.series when recorded.csv was unreadable.
+    if (vm && sh.c1 && typeof sh.c1 === "object") {
+      put(sh.c1, "series", vm.series);
+      put(sh.c1, "series_note", vm.series_note != null ? vm.series_note : trObj(vm.unknown_fields).series);
+    }
     const bc = sh.blend_curve && typeof sh.blend_curve === "object" ? sh.blend_curve : null;
     if (bc && sh.blend === undefined) {
       const sb = bc.sessions_behind;

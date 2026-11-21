@@ -35830,6 +35830,11 @@ console.log(JSON.stringify({
   nul: draw(vary(vm => { vm.series = null; delete vm.series_note; })),
   empty: draw(vary(vm => { vm.series = []; })),
   blank: draw(vary(vm => { vm.series = vm.series.map(x => ({date: x.date, shadow: null, backtest: null})); })),
+  unreadable: draw(vary(vm => { vm.series = null; delete vm.series_note;
+    vm.unknown_fields = {series: "recorded.csv unreadable: ValueError"}; })),
+  nanDay: draw(vary(vm => { vm.series[3].shadow = null; vm.series[3].backtest = null; })),
+  shadowOnly: draw(vary(vm => { vm.series.forEach(x => { x.backtest = null; });
+    vm.series_note = "backtest.csv not found — shadow only"; })),
 }));
 """
 
@@ -35888,6 +35893,19 @@ def test_trader_shadow_tab_draws_the_c1_curve():
               and "2026-10-26 → 2026-11-13" in c1, c1[-500:])
     check("a missing series says why, in trader_status.py's own words",
           "shadow vs backtest curve: recorded.csv not found" in o["missing"])
+    check("an unreadable recorded.csv says why, from unknown_fields",
+          "shadow vs backtest curve: recorded.csv unreadable: ValueError" in o["unreadable"])
+    check("an empty list doesn't pass the rebase note off as the reason",
+          "rebased to the shadow" not in o["empty"].split("Blend shadow")[0])
+    c = chart(o["nanDay"])
+    check("a day with no figure stays: a NaN band and table row, the lines broken around it",
+          c is not None and c["tips"] == 15 and c["shadow"] == 14 and c["backtest"] == 14
+          and o["nanDay"].count('<rect class="nan"') == 1 and o["nanDay"].count('class="tr-nanrow"') == 1, c)
+    c = chart(o["shadowOnly"])
+    check("shadow only: the chart draws the shadow and says why the backtest is missing",
+          c is not None and c["shadow"] == 15 and c["backtest"] == 0
+          and "backtest.csv not found — shadow only" in o["shadowOnly"], c)
+    check("a drawn chart carries trader's rebase note", "backtest rebased to the shadow on 2026-10-26" in h)
 
 
 # --- conversation turns off the board -------------------------------------------
