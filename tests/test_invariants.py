@@ -8991,9 +8991,12 @@ def test_home_tab():
         return json.dumps(view, ensure_ascii=False)
 
     def buttons(view, tid):
+        """The actions in a task's menu, Open thread aside."""
         for b in view["blocks"]:
-            if b.get("block_id") == f"a:{tid}":
-                return [e["action_id"].removeprefix("home_") for e in b["elements"]]
+            if b.get("block_id") == f"t:{tid}":
+                opts = (b.get("accessory") or {}).get("options") or []
+                return [o["value"].split("|")[0] for o in opts
+                        if not o["value"].startswith("thread|")]
         return []
 
     now = time.time()
@@ -9045,13 +9048,15 @@ def test_home_tab():
     check("awaiting approval offers approve / send back / dismiss",
           buttons(view, "tsk_aw") == ["approve", "rework", "dismiss"])
     check("needs input offers answer", "answer" in buttons(view, "tsk_in"))
-    check("approve asks before landing", any(
-        e.get("confirm") for b in view["blocks"] if b.get("block_id") == "a:tsk_aw"
-        for e in b["elements"] if e["action_id"] == "home_approve"))
+    # Every action in the menu opens a window first (on_menu); the detail
+    # that decides it is in that window, not on the one-line row.
+    check("approve asks before landing", "approve" in home.DIRECT
+          and home.confirm_modal(board[1], "approve")["callback_id"] == home.CONFIRM_CALLBACK)
+    aw_detail = texts(home.confirm_modal(board[1], "approve"))
+    check("the review is shown before you approve", "looks close" in aw_detail
+          and all(f in aw_detail for f in ("one", "two", "three", "four")))
+    check("why it failed is shown", "code 143" in texts(home.confirm_modal(board[3], "retry")))
     s = texts(view)
-    check("the review is shown before you approve", "looks close" in s and "one" in s)
-    check("findings beyond three are counted, not dropped", "1 more finding" in s)
-    check("why it failed is shown", "code 143" in s)
     check("running work is listed", "goal of tsk_run" in s)
     check("finished work is not on the board", "tsk_done" not in s)
     order = [b["block_id"][2:] for b in view["blocks"] if b.get("block_id", "").startswith("t:")]
@@ -9107,30 +9112,41 @@ def test_home_tab():
 
     h = _board_for(store, call, {"U_ME"})
     c = _BoardSlack()
-    click = lambda user, action, tid: {"user": {"id": user}, "trigger_id": "trig",
-                                       "actions": [{"action_id": f"home_{action}", "value": tid}]}
     acked = []
     ack = lambda *a, **k: acked.append(k)
+    def pick(user, action, tid, seen=""):
+        h.on_menu(ack, {"user": {"id": user}, "trigger_id": "trig",
+                        "actions": [{"action_id": "home_menu",
+                                     "selected_option": {"value": f"{action}|{tid}|{seen}"}}]}, c)
+    def confirm(user, action, tid, seen=""):
+        h.on_confirm(ack, {"user": {"id": user}}, c, {"private_metadata": json.dumps(
+            {"action": action, "id": tid, "seen": seen})})
+    def click(user, action, tid, seen=""):
+        """Pick it from the menu, then confirm the window that opens."""
+        n = len(c.opened)
+        pick(user, action, tid, seen)
+        if len(c.opened) > n:
+            h.on_confirm(ack, {"user": {"id": user}}, c, c.opened[-1])
 
-    h.on_direct(ack, click("U_STRANGER", "accept", prop), c)
+    click("U_STRANGER", "accept", prop)
     check("someone off the allowlist cannot act", not calls
           and store.get(prop)["state"] == T.PROPOSED)
     check("and is shown nothing of the board, only told why, privately",
           not c.published and c.ephemeral and c.ephemeral[-1][0] == "U_STRANGER"
           and "a proposal worth" not in c.ephemeral[-1][1])
 
-    h.on_direct(ack, click("U_ME", "accept", prop), c)
+    click("U_ME", "accept", prop)
     check("Accept moves the real task to queued", store.get(prop)["state"] == T.QUEUED)
     check("attributed to the Slack user", "slack:U_ME" in json.dumps(store.get(prop)["events"]))
     check("the result is shown at the top of the board",
           "Accepted" in texts(c.published[-1][1]))
 
-    h.on_direct(ack, click("U_ME", "accept", prop), c)          # already queued
-    h.on_direct(ack, click("U_ME", "dismiss", "tsk_nope"), c)
+    confirm("U_ME", "accept", prop)                              # already queued
+    confirm("U_ME", "dismiss", "tsk_nope")
     check("a refused click says why rather than failing silently",
           "Couldn't dismiss" in texts(c.published[-1][1]))
 
-    h.on_modal(ack, click("U_ME", "answer", need), c)
+    pick("U_ME", "answer", need)
     modal = c.opened[-1]
     check("Answer opens a form", modal["callback_id"] == home.MODAL_CALLBACK)
     submit = lambda notes: {"private_metadata": modal["private_metadata"],
@@ -9153,22 +9169,22 @@ def test_home_tab():
     fl = store.create("a task that failed once", state=T.QUEUED)["id"]
     store.transition(fl, T.RUNNING); store.transition(fl, T.FAILED)
     shown = home.render([dict(r, id=k) for k, r in store.all().items()], now=time.time())
-    retry = next(e for b in shown["blocks"] if b.get("block_id") == f"a:{fl}"
-                 for e in b["elements"] if e["action_id"] == "home_retry")
+    retry = next(o["value"] for b in shown["blocks"] if b.get("block_id") == f"t:{fl}"
+                 for o in b["accessory"]["options"] if o["value"].startswith("retry|"))
     store.transition(fl, T.QUEUED); store.transition(fl, T.RUNNING)   # retried elsewhere
     before = len(calls)
-    h.on_direct(ack, {"user": {"id": "U_ME"}, "trigger_id": "t",
-                      "actions": [{"action_id": "home_retry", "value": retry["value"]}]}, c)
+    _, _, rest = retry.partition("|")
+    click("U_ME", "retry", *rest.split("|", 1))
     check("a stale button does not act on a task that has moved on",
           len(calls) == before and store.get(fl)["state"] == T.RUNNING)
     check("and says so", "moved on" in texts(c.published[-1][1]))
     aw = store.create("work to approve", state=T.QUEUED)["id"]
     store.transition(aw, T.RUNNING); store.transition(aw, T.AWAITING_APPROVAL)
     shown = home.render([dict(r, id=k) for k, r in store.all().items()], now=time.time())
-    rework = next(e for b in shown["blocks"] if b.get("block_id") == f"a:{aw}"
-                  for e in b["elements"] if e["action_id"] == "home_rework")
-    h.on_modal(ack, {"user": {"id": "U_ME"}, "trigger_id": "t",
-                     "actions": [{"action_id": "home_rework", "value": rework["value"]}]}, c)
+    rework = next(o["value"] for b in shown["blocks"] if b.get("block_id") == f"t:{aw}"
+                  for o in b["accessory"]["options"] if o["value"].startswith("rework|"))
+    _, _, rest = rework.partition("|")
+    pick("U_ME", "rework", *rest.split("|", 1))
     form = c.opened[-1]
     store.transition(aw, T.DONE)                                      # approved elsewhere
     before = len(calls)
@@ -9190,6 +9206,15 @@ def test_home_tab():
     except NotImplementedError:
         drew = False
     check("a bare Home draws nowhere", not drew)
+    # Nor is the full layout kept around: the board is always the one-line
+    # form, whose every action goes through the menu (on_menu), so the button
+    # rows and the handlers their clicks went to are gone with it.
+    check("no per-task button rows, nor handlers for their clicks",
+          not hasattr(home, "_task_blocks") and not hasattr(home.Home, "on_direct")
+          and not hasattr(home.Home, "on_modal") and not hasattr(home.Home, "on_link")
+          and "compact" not in home.render.__code__.co_varnames)
+    check("and render draws a message's blocks, not a Home view",
+          "type" not in home.render([], now=now))
     try:
         home.register(types.SimpleNamespace(), home.Home(store=store, call=call,
                                                          allowed_users={"U_ME"}))
@@ -10150,9 +10175,15 @@ def test_board_channel():
     s4, b5 = Slack(), board()
     b5.sync(s4)
     tid = many[0]["id"]
-    body = lambda user, v: {"user": {"id": user}, "trigger_id": "t",
-                            "actions": [{"action_id": "home_accept", "value": v}]}
-    b5.on_direct(lambda *a, **k: None, body("U_STEPH", f"{tid}|proposed"), s4)
+    def accept(user, seen):
+        """Accept picked from the task's menu, then its confirmation submitted."""
+        b5.on_menu(lambda *a, **k: None, {"user": {"id": user}, "trigger_id": "t",
+                   "actions": [{"action_id": "home_menu", "selected_option":
+                                {"value": f"accept|{tid}|{seen}"}}]}, s4)
+        b5.on_confirm(lambda *a, **k: None, {"user": {"id": user}}, s4,
+                      {"private_metadata": json.dumps({"action": "accept", "id": tid,
+                                                       "seen": seen})})
+    accept("U_STEPH", "proposed")
     check("a click from off the allowlist does nothing but say so, privately",
           store.get(tid)["state"] == T.PROPOSED
           and s4.calls[-1][0] == "ephemeral" and s4.calls[-1][2] == "U_STEPH")
@@ -10160,8 +10191,8 @@ def test_board_channel():
     # invisible to the channel's history but not to the person who clicked:
     # each one pushed the board up their screen.
     n = len(s4.calls)
-    b5.on_direct(lambda *a, **k: None, body("U_ME", f"{tid}|proposed"), s4)
-    after = s4.calls[n:]
+    accept("U_ME", "proposed")
+    after = [c for c in s4.calls[n:] if c[0] != "modal"]
     check("Accept works from the board message", store.get(tid)["state"] == T.QUEUED)
     check("nothing is posted under the board", not [c for c in after if c[0] in ("ephemeral", "post")],
           str([c[0] for c in after]))
@@ -10170,7 +10201,7 @@ def test_board_channel():
     check("at the bottom, where Slack opens", "Accepted" in json.dumps(after[-1][-1][-4:], ensure_ascii=False)
           if after else False)
     n = len(s4.calls)
-    b5.on_direct(lambda *a, **k: None, body("U_ME", f"{tid}|proposed"), s4)
+    accept("U_ME", "proposed")
     check("a stale button is still refused, in the board", "moved on" in json.dumps(s4.calls[-1][-1]))
     old_s = b5.NOTICE_S
     b5.NOTICE_S = 0
@@ -11314,7 +11345,7 @@ def test_board_is_compact():
                  "summary": "close", "findings": [f"finding {i}" for i in range(7)]}}),
              rec("tsk_in", T.NEEDS_INPUT), rec("tsk_pr", T.PROPOSED),
              rec("tsk_fl", T.FAILED, events=[{"kind": "failed", "detail": "exit 143"}])]
-    v = home.render(board, now=now, base_url="https://x.slack.com", compact=True,
+    v = home.render(board, now=now, base_url="https://x.slack.com",
                     max_blocks=50, max_attention=12)
     rows = [b for b in v["blocks"] if b.get("block_id", "").startswith("t:")]
     check("one block per task", len(rows) == 4 and not any(
@@ -11329,7 +11360,7 @@ def test_board_is_compact():
     check("the summary and Refresh are at the bottom, where Slack opens",
           "need you" in json.dumps(v["blocks"][-2:]) and "home_refresh" in json.dumps(v["blocks"][-2:]))
     many = home.render([rec(f"tsk_{i:03}", T.PROPOSED) for i in range(300)], now=now,
-                       compact=True, max_blocks=50, max_attention=12)
+                       max_blocks=50, max_attention=12)
     check("a long board still fits a message", len(many["blocks"]) <= 50)
     bstore = T.TaskStore(Path(tempfile.mkdtemp()) / "b.json")
     bstore.create("one waiting", state=T.PROPOSED)
@@ -13432,18 +13463,13 @@ def test_task_costs():
 
     # --- the board ------------------------------------------------------------
     board = [dict(r, id=k) for k, r in ts.all().items()]
-    for compact in (True, False):
-        view = home.render(board, now=now, compact=compact)
-        text = json.dumps(view)
-        row = next(b for b in view["blocks"] if b.get("block_id") == f"t:{impl['id']}")
-        rowtext = json.dumps(row) + json.dumps(
-            next((b for b in view["blocks"] if b.get("type") == "context"
-                  and impl["id"] in json.dumps(b)), {}))
-        check(f"the board shows a task's cost with its reviews ({'compact' if compact else 'full'})",
-              "$3.25+" in rowtext, rowtext[:300])
-        check(f"and the project week in its summary ({'compact' if compact else 'full'})",
-              "last 7d" in text and "proj $3.25+" in text)
-    compact = home.render(board, now=now, compact=True)
+    compact = home.render(board, now=now)
+    text = json.dumps(compact)
+    row = next(b for b in compact["blocks"] if b.get("block_id") == f"t:{impl['id']}")
+    check("the board shows a task's cost with its reviews",
+          "$3.25+" in json.dumps(row), json.dumps(row)[:300])
+    check("and the project week in its summary",
+          "last 7d" in text and "proj $3.25+" in text)
     row = next(b for b in compact["blocks"] if b.get("block_id") == f"t:{impl['id']}")
     check("a compact task is still one line of title and one of meta",
           row["text"]["text"].count("\n") == 1, row["text"]["text"])
@@ -18791,7 +18817,7 @@ def test_the_step_is_on_every_surface():
 
     check("a board card carries the step", board.card(rec).get("needs_user") == step)
 
-    line = json.dumps(home.render([rec], now=now, compact=True), ensure_ascii=False)
+    line = json.dumps(home.render([rec], now=now), ensure_ascii=False)
     # With its reason: the parking event says the command too, so the command
     # alone would pass on a line that read the event and not the step.
     check("the Slack board line names the step, and why",
@@ -19427,7 +19453,7 @@ def test_release_from_the_slack_board():
           sum(1 for x in rb if x.get("accessory")) == home.MAX_RELEASES
           and "4 more" in json.dumps(rb))
     big = home.render([store.create(f"t{i}", state=T.PROPOSED) for i in range(60)], now=time.time(),
-                      compact=True, max_blocks=50, max_attention=40,
+                      max_blocks=50, max_attention=40,
                       releasable=[{"slug": f"p{i}", "title": "P", "targets": []} for i in range(9)])
     check("and the board still fits a message", len(big["blocks"]) <= 50
           and "Ready to release" in json.dumps(big), len(big["blocks"]))
@@ -20098,7 +20124,7 @@ def test_research_children_show_on_the_board():
     check("the Slack board shows the answer and the next step",
           "the cache is never invalidated on deploy" in view and kid["id"] in view
           and "not filed" in view, view[:400])
-    line = json.dumps(home.render([dict(r) for r in recs], now=time.time(), compact=True,
+    line = json.dumps(home.render([dict(r) for r in recs], now=time.time(),
                                   base_url="https://x.slack.com"), ensure_ascii=False)
     check("and its one-line form counts them", "1 next step filed" in line, line[:400])
 
@@ -34074,12 +34100,10 @@ def test_a_review_closes_with_its_task():
         flat = json.dumps(view)
         return (f'"home_retry", "value": "{tid}|' in flat
                 or f'"retry|{tid}|' in flat)
-    for compact in (False, True):
-        view = H.render(items, now=time.time(), compact=compact, max_attention=500)
-        check(f"the rendered {'board' if compact else 'Home tab'} offers Retry "
-              "on one and not the other, and shows both",
-              offers(view, rid_w) and not offers(view, rid_f)
-              and rid_f in json.dumps(view))
+    view = H.render(items, now=time.time(), max_attention=500)
+    check("the rendered board offers Retry on one and not the other, and shows both",
+          offers(view, rid_w) and not offers(view, rid_f)
+          and rid_f in json.dumps(view))
     check("dashboard rows and cards carry the same verdict",
           why and B.panel_row(dict(st.get(rid_f), no_retry=why))["no_retry"] == why
           and B.card(st.get(rid_f), by_id=st.all())["no_retry"] == why

@@ -21,7 +21,7 @@ cancelling a running task performs are one code path rather than two that can
 drift. This module only renders and relays.
 
 Split in two so the half with the rules is testable without Slack: `render`
-is pure and returns a view; `register` wires it to Bolt.
+is pure and returns the board's blocks; `register` wires it to Bolt.
 """
 
 import json
@@ -201,59 +201,9 @@ def _text(t: str) -> dict:
     return {"type": "mrkdwn", "text": t}
 
 
-def _button(text, action, tid, style=None, confirm=None, url=None) -> dict:
-    b = {"type": "button", "text": {"type": "plain_text", "text": text[:75]},
-         "action_id": f"home_{action}", "value": tid}
-    if style:
-        b["style"] = style
-    if url:
-        b["url"] = url
-    if confirm:
-        b["confirm"] = {"title": {"type": "plain_text", "text": text.rstrip("…")[:100]},
-                        "text": _text(confirm),
-                        "confirm": {"type": "plain_text", "text": "Yes"},
-                        "deny": {"type": "plain_text", "text": "No"}}
-    return b
-
-
-def _detail(task: dict) -> str:
-    """The one thing worth reading before you decide: the review, or why it
-    stopped."""
-    state = task.get("state")
-    review = (task.get("result") or {}).get("review") or {}
-    if state == tasks.AWAITING_APPROVAL and review:
-        lines = []
-        if review.get("summary"):
-            lines.append(f"_Review:_ {esc(clip(review['summary'], 280))}")
-        findings = review.get("findings") or []
-        for f in findings[:3]:
-            lines.append(f"• {esc(clip(f, 240))}")
-        if len(findings) > 3:
-            lines.append(f"_…and {len(findings) - 3} more finding"
-                         f"{'s' if len(findings) - 3 != 1 else ''}_")
-        if review.get("earlier"):
-            lines.append(f"_…after being sent back for "
-                         f"{len(review['earlier'])} earlier finding"
-                         f"{'s' if len(review['earlier']) != 1 else ''}_")
-        if task.get("verified") is True:
-            lines.append(":test_tube: tests pass")
-        elif task.get("verified") is False:
-            lines.append(":x: tests failed")
-        return "\n".join(lines)
-    yours = _yours(task)
-    if state == tasks.NEEDS_INPUT and yours:
-        return f":raising_hand: {esc(clip(yours, 400))}"
-    if research.has_findings(task):
-        return _findings(task, 400)
-    events = task.get("events") or []
-    if state in (tasks.FAILED, tasks.NEEDS_INPUT) and events:
-        detail = (events[-1] or {}).get("detail") or ""
-        return f"_{esc(clip(detail, 300))}_" if detail else ""
-    if state == tasks.PROPOSED:
-        goal = (task.get("goal") or "").strip()
-        first, _, rest = goal.partition("\n")
-        return esc(clip(rest or "", 400)) if rest.strip() else ""
-    return ""
+def _button(text, action, value) -> dict:
+    return {"type": "button", "text": {"type": "plain_text", "text": text[:75]},
+            "action_id": f"home_{action}", "value": value}
 
 
 def _findings(task: dict, width: int) -> str:
@@ -273,37 +223,6 @@ def _findings(task: dict, width: int) -> str:
         lines.append(f"• _not filed:_ {esc(clip(h.get('goal', ''), 100))} — "
                      f"{esc(clip(h.get('why', ''), 140))}")
     return "\n".join(lines)
-
-
-def _task_blocks(task: dict, now: float, base_url: str,
-                 cost: str = "") -> list[dict]:
-    tid = task.get("id", "")
-    meta = [f"`{tid}`"]
-    if task.get("project"):
-        meta.append(esc(task["project"]))
-    if task.get("role") and task.get("role") != "assistant":
-        meta.append(esc(task["role"]))
-    meta.append(ago(task.get("updated") or task.get("created"), now))
-    if cost:
-        meta.append(cost)
-    body = f"*{esc(clip(label(task), 150))}*"
-    detail = _detail(task)
-    if detail:
-        body += "\n" + detail
-    blocks = [{"type": "section", "block_id": f"t:{tid}", "text": _text(body)},
-              {"type": "context", "elements": [_text(" · ".join(meta))]}]
-    # The value carries the state the button was drawn for; see seen_state().
-    stamp = f"{tid}|{seen_of(task)}"
-    buttons = [_button(*b[:2], stamp, style=b[2], confirm=b[3])
-               for b in buttons_for(task)]
-    url = thread_url(task.get("thread", ""), base_url)
-    if url:
-        buttons.append(_button("Discuss" if research.has_findings(task) else "Thread",
-                               "thread", tid, url=url))
-    if buttons:
-        blocks.append({"type": "actions", "block_id": f"a:{tid}",
-                       "elements": buttons[:25]})
-    return blocks
 
 
 def _summary_line(task: dict) -> str:
@@ -428,7 +347,7 @@ def confirm_modal(task: dict, action: str) -> dict:
 def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
            base_url: str = "", notice: str = "",
            max_blocks: int = MAX_BLOCKS, max_attention: int = MAX_ATTENTION,
-           compact: bool = False, releasable=()) -> dict:
+           releasable=()) -> dict:
     """The board: what needs you, what runs, what wakes, what can ship.
 
     Only drawn for the allowlist -- `Board` posts it only where every member
@@ -483,8 +402,7 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
             chunk += [{"type": "divider"},
                       {"type": "section", "text": _text(
                           f"*{HEADINGS.get(current, esc(current))}* ({count})")}]
-        chunk += ([_task_line(t, now, base_url, cost_of(t))] if compact
-                  else _task_blocks(t, now, base_url, cost_of(t)))
+        chunk.append(_task_line(t, now, base_url, cost_of(t)))
         # Room kept for the tail sections (running, watching, unmerged).
         if shown >= max_attention or (len(blocks) + len(board) + len(chunk)
                                       > max_blocks - 12 - len(shipping)):
@@ -524,17 +442,16 @@ def render(all_tasks, *, now: float, watching=(), unmerged: str = "",
     if unmerged:
         blocks += [{"type": "divider"}, {"type": "context", "elements": [
             _text(f":warning: {esc(unmerged)} — land or drop them from the dashboard")]}]
-    if compact:
-        # Slack opens a channel at the bottom of its newest message, so the
-        # summary and Refresh go where you land, not at the top you scroll to.
-        head = blocks[:5]
-        notice_b = [b for b in head if b.get("block_id") == "home:notice"]
-        summary = [b for b in head if b.get("type") == "context" and "need you" in json.dumps(b)]
-        refresh = [b for b in head if b.get("block_id") == "home:top"]
-        moved = notice_b + summary + refresh
-        blocks = [b for b in blocks if b not in moved]
-        blocks += [{"type": "divider"}] + moved
-    return {"type": "home", "blocks": blocks[:max_blocks]}
+    # Slack opens a channel at the bottom of its newest message, so the
+    # summary and Refresh go where you land, not at the top you scroll to.
+    head = blocks[:5]
+    notice_b = [b for b in head if b.get("block_id") == "home:notice"]
+    summary = [b for b in head if b.get("type") == "context" and "need you" in json.dumps(b)]
+    refresh = [b for b in head if b.get("block_id") == "home:top"]
+    moved = notice_b + summary + refresh
+    blocks = [b for b in blocks if b not in moved]
+    blocks += [{"type": "divider"}] + moved
+    return {"blocks": blocks[:max_blocks]}
 
 
 def release_blocks(releasable) -> list[dict]:
@@ -794,51 +711,6 @@ class Home:
     def on_refresh(self, ack, body, client):
         ack()
         self.publish(client, body["user"]["id"])
-
-    def on_link(self, ack):
-        ack()        # a URL button still sends an action; it needs no reply
-
-    def on_direct(self, ack, body, client):
-        ack()
-        user = body["user"]["id"]
-        act = body["actions"][0]
-        action = act["action_id"].removeprefix("home_")
-        tid, seen = seen_state(act.get("value", ""))
-        if not self.allowed(user):
-            return self.publish(client, user)
-        if action not in DIRECT:
-            return
-        if self.moved_on(user, tid, seen):
-            return self.publish(client, user)
-        try:
-            r = self.call(with_round({"action": action, "id": tid,
-                                      "by": f"slack:{user}"}, seen))
-        except Exception as e:
-            log.exception("home action %s on %s failed", action, tid)
-            r = {"ok": False, "error": str(e)}
-        self.note(user, self.outcome(action, tid, r))
-        self.publish(client, user)
-
-    def on_modal(self, ack, body, client):
-        ack()
-        user = body["user"]["id"]
-        act = body["actions"][0]
-        if not self.allowed(user):
-            return self.publish(client, user)
-        tid, seen = seen_state(act.get("value", ""))
-        task = self.store.get(tid)
-        if not task:
-            self.note(user, ":warning: That task no longer exists.")
-            return self.publish(client, user)
-        if self.moved_on(user, tid, seen):
-            return self.publish(client, user)
-        task = dict(task, id=tid)
-        try:
-            client.views_open(trigger_id=body["trigger_id"],
-                              view=rework_modal(task, act["action_id"] == "home_answer",
-                                                dig=act["action_id"] == "home_dig"))
-        except Exception:
-            log.exception("could not open the send-back modal")
 
     def on_submit(self, ack, body, client, view):
         user = body["user"]["id"]
@@ -1152,7 +1024,7 @@ class Board(Home):
         items = tasks.mark_no_retry([dict(r, id=tid) for tid, r in self.store.all().items()])
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
-                      max_attention=self.MAX_ATTENTION, compact=True,
+                      max_attention=self.MAX_ATTENTION,
                       notice=self.current_notice(),
                       releasable=self.releasable())["blocks"]
 
@@ -1309,12 +1181,6 @@ def register(app, home: Board) -> None:
         raise TypeError("register() takes the channel Board")
     app.event("member_joined_channel")(home.on_member_joined)
     app.action("home_refresh")(home.on_refresh)
-    app.action("home_thread")(home.on_link)
-    for action in DIRECT:
-        app.action(f"home_{action}")(home.on_direct)
-    app.action("home_rework")(home.on_modal)
-    app.action("home_answer")(home.on_modal)
-    app.action("home_dig")(home.on_modal)
     app.view(MODAL_CALLBACK)(home.on_submit)
     app.action("home_menu")(home.on_menu)
     app.view(CONFIRM_CALLBACK)(home.on_confirm)
