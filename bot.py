@@ -4162,6 +4162,15 @@ def handle_prompt(event: dict, say, client) -> None:
         say(text="Sorry, you're not on this bot's allowlist.", thread_ts=thread_ts)
         return
 
+    # You writing here -- a prompt or a !command, from Slack or the dashboard
+    # -- means you have read what came before it (the dashboard's unread
+    # count, unread.py). Slack's ts is when it was sent; a dashboard
+    # message's is made up, so it is now. Never at the message's cost.
+    try:
+        store.note_owner(key, None if event.get("_web") else msg_ts)
+    except Exception:
+        log.exception("could not note the owner writing in %s", key)
+
     text = MENTION_RE.sub("", event.get("text", "")).strip()
     files = event.get("files") or []
     # Files sent from the dashboard, already written into uploads/ by

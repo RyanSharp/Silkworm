@@ -345,6 +345,7 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
         if (home / name).exists():
             shutil.copy2(home / name, tmp / name)
     own_turn(tmp / "sessions.json")
+    seed_seen(home, tmp)
     (tmp / ".env").write_text(f"APPROVAL_PORT={bot_port}\n")
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("VIZ_", "SILKWORM_"))}
@@ -362,6 +363,21 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
                 raise SystemExit("dashboard copy died:\n" + (tmp / "viz.log").read_text())
             time.sleep(0.1)
     raise SystemExit("dashboard copy never answered")
+
+
+#: With no seen.json yet (unread tracking starts when one is first made, so
+#: every reply before it is read), the copy's starts this long ago instead:
+#: the photographed list has the last day's replies to show as unread.
+SEEN_SEED_S = 86400
+
+
+def seed_seen(home: Path, tmp: Path) -> None:
+    """The copy's read state (unread.py): the owner's own, copied, or one
+    begun SEEN_SEED_S ago. The real one is never written."""
+    if (home / "seen.json").exists():
+        shutil.copy2(home / "seen.json", tmp / "seen.json")
+    else:
+        (tmp / "seen.json").write_text(json.dumps({"since": time.time() - SEEN_SEED_S, "threads": {}}))
 
 
 def own_turn(sessions: Path) -> None:
@@ -422,6 +438,7 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
     p = quote(project)
     return [
         ("sessions", "/"),
+        ("sessions-unread", "/?list=unread"),
         ("stats", "/?view=stats"),
         ("thread", f"/?thread={quote(ex['thread'])}"),
         *([("thread-running", f"/?thread={quote(ex['running'])}")] if ex.get("running") else []),

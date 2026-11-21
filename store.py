@@ -241,6 +241,27 @@ class SessionStore:
                 self._save()
             return done
 
+    def note_owner(self, key: str, at=None) -> bool:
+        """The owner wrote in `key` at `at` (unix seconds, or a Slack ts;
+        None or anything unreadable is now, and nothing is later than now):
+        everything before it is read (the dashboard's unread count,
+        unread.py). Only ever forward, and not activity -- a !command must
+        not move a thread up the list -- so `updated` is left alone. False
+        for a thread not on record."""
+        now = time.time()
+        try:
+            at = min(float(at), now) if at is not None else now
+        except (TypeError, ValueError):
+            at = now
+        with self._lock:
+            rec = self._data.get(key)
+            if rec is None:
+                return False
+            if at > float(rec.get("owner_said") or 0.0):
+                rec["owner_said"] = at
+                self._save()
+            return True
+
     def set_hidden(self, key: str, hidden: bool) -> bool:
         """Hide or unhide one thread. Nothing is discarded either way."""
         with self._lock:

@@ -37680,6 +37680,403 @@ def test_dashshots_perf_probe():
         check("bin/perfprobe.js parses", r.returncode == 0, r.stderr[-400:])
 
 
+# --- unread ---------------------------------------------------------------------
+# A thread's unread count is the replies not the owner's that arrived after the
+# owner last read it at its bottom on the dashboard (seen.json, on the mini) or
+# last wrote in it (owner_said, stamped by the bot) -- unread.py.
+
+def _uline(role, ts, text="", tool=False, result=False, meta=False):
+    if role == "assistant":
+        content = ([{"type": "text", "text": text}] if text else []) + (
+            [{"type": "tool_use", "id": "t" + ts[-6:-1], "name": "Bash", "input": {"command": "ls"}}] if tool else [])
+    else:
+        content = ([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}] if result
+                   else [{"type": "text", "text": text or "hello"}])
+    d = {"type": role, "timestamp": ts, "message": {"role": role, "content": content}}
+    if meta:
+        d["isMeta"] = True
+    return json.dumps(d) + "\n"
+
+
+def _uts(sec):
+    return datetime.fromtimestamp(1795000000 + sec, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def test_unread_counts_other_authors_after_the_watermark():
+    import unread as U
+    print("\nunread: replies not the owner's, after the later of last read and the owner's last word")
+    tmp = Path(tempfile.mkdtemp())
+    t = tmp / "s.jsonl"
+    T0 = 1795000000
+    t.write_text(_uline("user", _uts(0), "owner asks")
+                 + _uline("assistant", _uts(10), "first reply")
+                 + _uline("assistant", _uts(20), tool=True)              # a tool call: not a reply
+                 + _uline("user", _uts(21), result=True)                 # its result: not the owner
+                 + _uline("assistant", _uts(30), "second reply", tool=True)
+                 + _uline("user", _uts(31), "a reminder", meta=True)
+                 + _uline("assistant", _uts(32), "meta", meta=True))
+    os.utime(t, (T0 + 40, T0 + 40))
+    idx = U.ReplyIndex()
+    check("the replies are the assistant's messages with words, in time order",
+          idx.times(t) == [T0 + 10.0, T0 + 30.0], idx.times(t))
+    check("nothing read yet: both replies are unread", U.unread(t, 0.0, idx) == 2)
+    check("read down to the first: one", U.unread(t, U.watermark(T0 + 10, None), idx) == 1)
+    check("the owner's own messages never count (one after the watermark changes nothing)",
+          U.unread(t, U.watermark(T0 + 1, None), idx) == 2)
+    check("the owner writing after both clears them, read or not",
+          U.unread(t, U.watermark(0.0, T0 + 35), idx) == 0)
+    check("...and the later of the two moments is the one used",
+          U.watermark(T0 + 35, T0 + 5) == T0 + 35 and U.watermark(T0 + 5, T0 + 35) == T0 + 35)
+    check("an owner_said recorded as Slack's ts string reads the same",
+          U.watermark(0.0, str(T0 + 35)) == T0 + 35)
+    # Appended: read from where the last read stopped; a half-written line waits.
+    with open(t, "a") as f:
+        f.write(_uline("user", _uts(50), "owner again") + _uline("assistant", _uts(60), "third"))
+        f.write(_uline("assistant", _uts(70), "still being written")[:-20])
+    os.utime(t, (T0 + 75, T0 + 75))
+    check("new replies are found incrementally, a partial line not yet",
+          idx.times(t) == [T0 + 10.0, T0 + 30.0, T0 + 60.0], idx.times(t))
+    check("an owner reply in the middle clears only what came before it",
+          U.unread(t, U.watermark(0.0, T0 + 50), idx) == 1)
+    # A transcript not written since the watermark is never opened.
+    other = tmp / "untouched.jsonl"
+    other.write_text(_uline("assistant", _uts(5), "old"))
+    os.utime(other, (T0 + 6, T0 + 6))
+    fresh = U.ReplyIndex()
+    check("a transcript older than the watermark is not read at all",
+          U.unread(other, T0 + 7, fresh) == 0 and not fresh._files, fresh._files)
+    check("no transcript: none", U.unread(None, 0.0, idx) == 0)
+    check("replies before tracking began are dropped, not counted",
+          U.unread(t, U.watermark(T0 + 1, None), U.ReplyIndex(), since=T0 + 1) == 3
+          and U.ReplyIndex().times(t, floor=T0 + 15) == [T0 + 30.0, T0 + 60.0])
+    t.write_text(_uline("assistant", _uts(90), "replaced"))
+    os.utime(t, (T0 + 95, T0 + 95))
+    check("a transcript replaced by a shorter one is read again from the top",
+          idx.times(t) == [T0 + 90.0], idx.times(t))
+
+
+def test_unread_watermark_survives_a_restart():
+    import unread as U
+    print("\nunread: seen.json holds the owner's watermarks across a restart")
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / U.SEEN_NAME
+    now = [1795001000.0]
+    s = U.Seen(path, clock=lambda: now[0])
+    check("first use begins tracking now: everything before is read",
+          s.since() == 1795001000.0 and path.exists() and s.get("D1:1") == 1795001000.0)
+    check("a watermark is stored", s.mark("D1:1", 1795001500.0 - 1000) == 1795001000.0)
+    now[0] = 1795002000.0
+    check("...and moves forward", s.mark("D1:1", 1795001900.0) == 1795001900.0)
+    check("never back", s.mark("D1:1", 1795001100.0) == 1795001900.0)
+    check("never past now (a page's clock running fast)",
+          s.mark("D2:2", 1795009999.0) <= now[0] + U.FUTURE_SLACK_S)
+    again = U.Seen(path, clock=lambda: 1795003000.0)       # the dashboard restarted
+    check("a restart reads the same watermarks", again.get("D1:1") == 1795001900.0, again.all())
+    check("...and the same start: tracking does not begin again",
+          again.since() == 1795001000.0)
+    check("written as JSON through jsonstore (with its backup)",
+          json.loads(path.read_text())["threads"]["D1:1"] == 1795001900.0
+          and (tmp / (U.SEEN_NAME + ".prev")).exists())
+    path.write_text("{not json"); (tmp / (U.SEEN_NAME + ".prev")).write_text("{nor this")
+    broken = U.Seen(path)
+    check("both copies unreadable: no counts, and nothing written over them",
+          broken.mark("D1:1", 1795002500.0) is None and broken.error
+          and path.read_text() == "{not json", broken.error)
+    check("the file is not committed", subprocess.run(
+        ["git", "check-ignore", "-q", U.SEEN_NAME], cwd=BASE).returncode == 0)
+
+
+def test_unread_in_the_sessions_list_and_the_seen_route():
+    import threading
+    import urllib.error
+    import urllib.request
+    import visualizer as V
+    print("\nunread: /api/sessions counts it; /api/seen moves it, behind the dashboard's write gates")
+    saved_env = os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+    saved = (V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.PROJECTS_DIR, V.ENV_FILE, V.bot_call)
+    tmp = Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "-w"
+    proj.mkdir(parents=True)
+    T0 = 1795000000
+    (proj / "sa.jsonl").write_text(_uline("user", _uts(0), "go") + _uline("assistant", _uts(10), "one")
+                                   + _uline("assistant", _uts(20), "two"))
+    (proj / "sb.jsonl").write_text(_uline("user", _uts(0), "go") + _uline("assistant", _uts(10), "one")
+                                   + _uline("user", _uts(30), "thanks"))
+    (tmp / "sessions.json").write_text(json.dumps({
+        "D1:1.0": {"session_id": "sa", "title": "A"},
+        "D1:2.0": {"session_id": "sb", "title": "B", "owner_said": T0 + 30},
+        "D1:3.0": {"session_id": "none", "title": "C"}}))
+    (tmp / "seen.json").write_text(json.dumps({"since": T0 - 100, "threads": {}}))
+    srv = None
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.SESSIONS_FILE, V.PROJECTS_DIR = tmp / "sessions.json", tmp / "projects"
+        V.ENV_FILE = tmp / "no.env"
+        V._seen.clear()
+        V.bot_call = lambda path, payload, timeout=1.0: {}
+        rows = {s["key"]: s for s in V.load_sessions()["sessions"]}
+        check("each row carries its count: two replies unread",
+              rows["D1:1.0"]["unread"] == 2, {k: r["unread"] for k, r in rows.items()})
+        check("a thread the owner wrote in after the reply has none", rows["D1:2.0"]["unread"] == 0)
+        check("a thread with no transcript has none", rows["D1:3.0"]["unread"] == 0)
+        tag = V.sessions_tag(V.load_sessions())
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def post(body, ctype="application/json", **headers):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/seen", method="POST",
+                                         data=json.dumps(body).encode(),
+                                         headers={"Content-Type": ctype, **headers})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read() or b"{}")
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode()
+        held = lambda: json.loads((tmp / "seen.json").read_text())["threads"]
+        serve = {"X-Forwarded-For": "100.64.0.2", "X-Forwarded-Host": "mini.tail1.ts.net"}
+        body = {"key": "D1:1.0", "ts": _uts(10)}
+        code, _ = post(body, **serve, **{"Tailscale-User-Login": "owner@example.com"})
+        check("login unset: a proxied write is refused and nothing is stored", code == 403 and not held())
+        os.environ["VIZ_TAILSCALE_LOGIN"] = "owner@example.com"
+        code, _ = post(body, **serve)
+        check("no tailnet identity: refused", code == 403 and not held())
+        code, _ = post(body, **serve, **{"Tailscale-User-Login": "intruder@example.com"})
+        check("another login: refused", code == 403 and not held())
+        code, _ = post(body, **serve, **{"Tailscale-User-Login": "owner@example.com",
+                                         "Sec-Fetch-Site": "cross-site"})
+        check("a cross-site page in the owner's browser: refused", code == 403 and not held())
+        code, _ = post(body, "text/plain", **serve, **{"Tailscale-User-Login": "owner@example.com"})
+        check("a no-preflight text/plain POST: refused", code == 403 and not held())
+        code, _ = post(body, **serve, **{"Tailscale-User-Login": "owner@example.com",
+                                         "Origin": "https://evil.example"})
+        check("a POST from another origin: refused", code == 403 and not held())
+        V.LOOPBACK, V.TOKEN = False, "s3cret"
+        code, _ = post(body)
+        check("bound wider, without the token: refused", code == 401 and not held())
+        code, r = post(body, **{"X-Silkworm-Token": "s3cret"})
+        check("...with it: stored", code == 200 and r.get("ok") and held().get("D1:1.0") == T0 + 10, r)
+        V.LOOPBACK, V.TOKEN = True, ""
+        code, r = post(body, **serve, **{"Tailscale-User-Login": "owner@example.com",
+                                         "Sec-Fetch-Site": "same-origin", "Origin": "https://mini.tail1.ts.net"})
+        check("the owner's own page through serve is let in", code == 200 and r.get("ok"), r)
+        rows = {s["key"]: s for s in V.load_sessions()["sessions"]}
+        check("read down to the first reply: one left", rows["D1:1.0"]["unread"] == 1)
+        check("...and the list's ETag moved, so a poll gets it (not a 304)",
+              V.sessions_tag(V.load_sessions()) != tag)
+        code, r = post({"key": "D1:9.9", "ts": _uts(10)})
+        check("a thread that is not one is refused", code == 200 and r.get("ok") is False
+              and "D1:9.9" not in held(), r)
+        code, r = post({"key": "D1:1.0", "ts": "yesterday"})
+        check("a time that is not one is refused", r.get("ok") is False, r)
+        post({"key": "D1:1.0", "ts": _uts(20)})
+        V._seen.clear()                          # the dashboard restarted
+        rows = {s["key"]: s for s in V.load_sessions()["sessions"]}
+        check("after a restart it is still read", rows["D1:1.0"]["unread"] == 0, rows["D1:1.0"]["unread"])
+        check("the route is one the gate tests enumerate", "/api/seen" in _viz_routes("do_POST"))
+        V._seen.clear()
+        (tmp / "seen.json").write_text("[]"); (tmp / "seen.json.prev").write_text("[]")
+        rows = {s["key"]: s for s in V.load_sessions()["sessions"]}
+        check("unreadable read state is unknown (null), not zero", rows["D1:1.0"]["unread"] is None)
+    finally:
+        V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.PROJECTS_DIR, V.ENV_FILE, V.bot_call = saved
+        V._seen.clear()
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+        if saved_env is None:
+            os.environ.pop("VIZ_TAILSCALE_LOGIN", None)
+        else:
+            os.environ["VIZ_TAILSCALE_LOGIN"] = saved_env
+
+
+def test_owner_writing_marks_a_thread_read():
+    import ast
+    import store as S
+    print("\nunread: the owner writing in a thread (Slack or the dashboard) marks what came before read")
+    tmp = Path(tempfile.mkdtemp())
+    st = S.SessionStore(tmp / "sessions.json")
+    st.update("D1:1.0", session_id="s1")
+    before = st.get("D1:1.0")["updated"]
+    time.sleep(0.01)
+    check("noted", st.note_owner("D1:1.0", 1795000100.0) and st.get("D1:1.0")["owner_said"] == 1795000100.0)
+    check("not activity: the thread does not move up the list", st.get("D1:1.0")["updated"] == before)
+    st.note_owner("D1:1.0", 1795000050.0)
+    check("only forward", st.get("D1:1.0")["owner_said"] == 1795000100.0)
+    check("a Slack ts is read as its time", st.note_owner("D1:1.0", "1795000200.000100")
+          and st.get("D1:1.0")["owner_said"] == 1795000200.0001)
+    st.note_owner("D1:1.0", 9999999999.0)
+    check("never later than now", st.get("D1:1.0")["owner_said"] <= time.time())
+    st.update("D1:2.0", session_id="s2")
+    t0 = time.time(); st.note_owner("D1:2.0"); st.note_owner("D1:2.0", "not a ts")
+    check("none, or nothing readable, is now", t0 <= st.get("D1:2.0")["owner_said"] <= time.time())
+    check("a thread not on record is not made", not st.note_owner("D9:9.9", 1.0) and st.get("D9:9.9") is None)
+    check("persisted", S.SessionStore(tmp / "sessions.json").get("D1:1.0")["owner_said"]
+          == st.get("D1:1.0")["owner_said"] > 1795000200)
+    import schema
+    check("a declared field, unknown (None) when absent", schema.default("owner_said") is None)
+    # Through the shipped handle_prompt: a message from the dashboard, and one
+    # from Slack, each stamp the thread.
+    bot = _web_bot(Path(tempfile.mkdtemp()))
+    bot.store.update("D1:111.222", session_id="sid-old", cwd=str(tmp))
+    t0 = time.time()
+    r = bot.web({"key": "D1:111.222", "text": "thanks, carry on"})
+    check("a reply from the dashboard notes the owner writing, at once",
+          r.get("ok") and _wait(lambda: (bot.store.get("D1:111.222") or {}).get("owner_said", 0) >= t0),
+          (r, bot.store.get("D1:111.222")))
+    _wait(lambda: not bot.running)
+    bot.hooks["prompt"]({"channel": "D1", "ts": "1999999999.000200", "thread_ts": "111.222",
+                         "user": "U1", "text": "!help"}, lambda **k: None, bot.client)
+    check("so does a Slack !command, never later than now",
+          t0 <= bot.store.get("D1:111.222")["owner_said"] <= time.time())
+    tree = ast.parse((BASE / "bot.py").read_text())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "handle_prompt")
+    lines = lambda pred: [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and pred(n)]
+    noted = lines(lambda n: isinstance(n.func, ast.Attribute) and n.func.attr == "note_owner"
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "store")
+    allow = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.If) and "ALLOWED_USERS" in ast.unparse(n.test)]
+    cmds = lines(lambda n: isinstance(n.func, ast.Name) and n.func.id in ("handle_command", "approve_command"))
+    check("handle_prompt notes it once, after the allowlist and before any command or prompt runs",
+          len(noted) == 1 and allow and cmds and allow[0] < noted[0] < min(cmds), (noted, allow, cmds))
+
+
+UNREAD_DRIVE = r"""
+const sess = (key, unread, extra) => Object.assign({key, title: "T " + key, kind: "thread", project: "", summary: "",
+  session_id: "s" + key, turns: 3, cost: 0, updated: 1795000000, files: 0, events: [], running: false,
+  resume_cmd: "", slack_link: "", hidden: false, unread}, extra || {});
+let rows = [sess("A", 3), sess("B", 0), sess("C", 2, {hidden: true}), sess("D", 1, {updated: 1794000000})];
+const badge = [];
+Object.defineProperty(globalThis, "navigator", {value: {vibrate() { return true; },
+  setAppBadge(n) { badge.push(["set", n]); return Promise.resolve(); },
+  clearAppBadge() { badge.push(["clear"]); return Promise.resolve(); }}, configurable: true});
+answer = (url, b) => url.startsWith("/api/sessions") ? {bot_online: true, sessions: rows.map(r => Object.assign({}, r)), slack: {}}
+  : url === "/api/seen" ? {ok: true} : BASE(url, b);
+const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+const card = key => M.cards.get(key);
+const order = () => byId("list").children.filter(c => M.cards.has && [...M.cards.values()].includes(c))
+  .map(c => [...M.cards.entries()].find(([k, v]) => v === c)[0]);
+(async () => {
+  const out = {};
+  await M.loadList(); await flushAsync();
+  out.dotA = card("A").innerHTML.includes('class="unread"') && card("A").innerHTML.includes(">3</span>");
+  out.dotB = card("B").innerHTML.includes('class="unread"');
+  out.dotInTitle = card("A").innerHTML.includes('<span class="title"><span class="unread"');
+  out.clsA = card("A").className; out.clsB = card("B").className;
+  out.title = document.title; out.badge = badge.slice();
+  out.filterBar = byId("kindfilter").innerHTML;
+  out.orderAll = order();
+  M.setUnreadOnly(true); await flushAsync();
+  out.orderUnread = order();
+  M.setUnreadOnly(false); await flushAsync();
+  M.setUnreadFirst(true); await flushAsync();
+  out.orderFirst = order();
+  out.remembered = localStorage.getItem("sw-unread-first");
+  M.setUnreadFirst(false); await flushAsync();
+  // Read: the open thread, at its bottom.
+  M.setActive("A", [{role: "user", ts: "2026-11-21T10:00:00.000Z", blocks: []},
+                    {role: "assistant", ts: "2026-11-21T10:05:00.000Z", blocks: []}], true);
+  M.markSeen(); await flushAsync();
+  out.seenPosts = calls.filter(c => c.url === "/api/seen").map(c => c.body);
+  out.dotAfterRead = card("A").innerHTML.includes('class="unread"');
+  out.titleAfterRead = document.title;
+  M.markSeen(); await flushAsync();
+  out.seenPostsAgain = calls.filter(c => c.url === "/api/seen").length;
+  // The next poll is a 304 of the same answer (the server still says 3): read here stays read.
+  await M.loadList(); await flushAsync();
+  out.dotAfterSamePoll = card("A").innerHTML.includes('class="unread"');
+  // A new reply since: the server's count moves, and it is the server's again.
+  rows[0].unread = 4; await M.loadList(); await flushAsync();
+  out.dotAfterNewReply = card("A").innerHTML.includes(">4</span>");
+  rows[0].unread = 3;
+  // A panel over the thread: not read, however far down.
+  M.setActive("D", [{role: "assistant", ts: "2026-11-21T12:00:00.000Z", blocks: []}], true);
+  byId("boardmodal").style.display = "flex";
+  M.markSeen(); await flushAsync();
+  out.postsUnderPanel = calls.filter(c => c.url === "/api/seen").length;
+  byId("boardmodal").style.display = "none";
+  // The mini refuses it: the row is unread again, and the next read asks again.
+  const was = answer;
+  answer = (url, b) => url === "/api/seen" ? {ok: false, error: "no"} : was(url, b);
+  M.markSeen(); await flushAsync();
+  out.dotAfterRefused = card("D").innerHTML.includes('class="unread"');
+  answer = was;
+  M.markSeen(); await flushAsync();
+  out.postsAfterRefused = calls.filter(c => c.url === "/api/seen").length;
+  // Scrolled up: not read.
+  M.setActive("B", [{role: "assistant", ts: "2026-11-21T11:00:00.000Z", blocks: []}], false);
+  M.markSeen(); await flushAsync();
+  out.postsWhileUp = calls.filter(c => c.url === "/api/seen").length;
+  M.clearActive();
+  rows = rows.map(r => Object.assign(r, {unread: 0}));
+  badge.length = 0;
+  await M.loadList(); await flushAsync();
+  out.badgeCleared = badge.slice(); out.titleCleared = document.title;
+  out.filterCleared = byId("kindfilter").innerHTML;
+  out.unreadOnlyCleared = /setUnreadOnly/.test(out.filterCleared);
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_unread_dot_filter_and_badge_in_the_page():
+    import re
+    import visualizer as V
+    print("\nunread on the page: a dot and count, the Unread filter, unread first, the badge and title")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    check("the app badge is set and cleared through navigator.setAppBadge / clearAppBadge",
+          "nav.setAppBadge(n)" in js and "nav.clearAppBadge()" in js)
+    check("read state is posted to /api/seen as JSON (the write gates' content type)",
+          'fetch("/api/seen", {method: "POST", headers: {"Content-Type": "application/json"}' in js)
+    check("no new per-message fetch: counts come with /api/sessions", js.count('"/api/seen"') == 1)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the unread page code checked by text only")
+        return
+    dom = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    expose = """
+;globalThis.__m = {loadList, markSeen, setUnreadOnly, setUnreadFirst, renderList, cards: cardEls,
+  setActive(key, msgs, atBottom) { active = lastSessions.find(x => x.key === key);
+    tview = {key, sid: "", cursor: 1, busy: false, error: false, msgs, files: []}; pinned = atBottom; },
+  clearActive() { active = null; }};"""
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(dom + "(0, eval)(SRC + " + json.dumps(expose) + ");\nconst M = globalThis.__m;\n"
+                                + UNREAD_DRIVE)
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js")], capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the unread harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    check("an unread thread's row has the dot and its count", o["dotA"], o)
+    check("the dot sits inside the title, which a phone sizes to the row less its ×", o["dotInTitle"])
+    check("...and reads as unread; a read one has neither",
+          "isunread" in o["clsA"] and not o["dotB"] and "isunread" not in o["clsB"], (o["clsA"], o["clsB"]))
+    check("the title carries the total (hidden threads not counted)", o["title"] == "(4) Silkworm — Sessions", o["title"])
+    check("the app icon's badge is the same total (cleared before, while the list was empty)",
+          o["badge"][-1] == ["set", 4] and ["set", 4] not in o["badge"][:-1]
+          and all(b == ["clear"] for b in o["badge"][:-1]), o["badge"])
+    check("the Unread filter counts the unread threads shown", "Unread <b>2</b>" in o["filterBar"], o["filterBar"])
+    check("the list is newest first", o["orderAll"] == ["A", "B", "D"], o["orderAll"])
+    check("Unread narrows it to the unread", o["orderUnread"] == ["A", "D"], o["orderUnread"])
+    check("unread first puts them on top, newest first within", o["orderFirst"] == ["A", "D", "B"], o["orderFirst"])
+    check("...and is remembered on the device", o["remembered"] == "1")
+    check("read at the bottom: the newest message drawn is posted for that thread",
+          o["seenPosts"] == [{"key": "A", "ts": "2026-11-21T10:05:00.000Z"}], o["seenPosts"])
+    check("...the row clears at once, and the title with it",
+          not o["dotAfterRead"] and o["titleAfterRead"] == "(1) Silkworm — Sessions", o["titleAfterRead"])
+    check("nothing new since: not posted again", o["seenPostsAgain"] == 1)
+    check("a poll answered 304 with the old count still shows it read (the cached answer is not edited)",
+          not o["dotAfterSamePoll"])
+    check("...until the server's count moves: a new reply shows again", o["dotAfterNewReply"])
+    check("a thread under an open panel is not read", o["postsUnderPanel"] == 1, o["postsUnderPanel"])
+    check("a refused post puts the row back, and the next read asks again",
+          o["dotAfterRefused"] and o["postsAfterRefused"] == 3, (o["dotAfterRefused"], o["postsAfterRefused"]))
+    check("scrolled up the thread is not read", o["postsWhileUp"] == 3, o["postsWhileUp"])
+    check("nothing unread: the badge is cleared and the title is plain",
+          o["badgeCleared"] == [["clear"]] and o["titleCleared"] == "Silkworm — Sessions", (o["badgeCleared"], o["titleCleared"]))
+    check("...and the Unread filter and unread first are gone: nothing to narrow",
+          not o["unreadOnlyCleared"] and "unread first" not in o["filterCleared"], o["filterCleared"])
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:

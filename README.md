@@ -1502,13 +1502,31 @@ A local web dashboard for every thread session (localhost-only):
   keyboard. Alerts (stale revision,
   Slack down, stalled threads, cost spikes) are never a bar on a phone: the
   header shows `⚠ <count>`, which opens them as a sheet.
+- **Unread** — a thread with replies you have not read shows a dot and how
+  many on its row, and the list has an *Unread* filter and an *unread first*
+  order (kept on the device). The total is on the home-screen app's icon
+  (`navigator.setAppBadge`: iPhone home-screen apps on iOS 16.4+, and most
+  desktop browsers), cleared when nothing is unread, and in the tab's title
+  as `(3) Silkworm`. A reply is anything in the thread not written by you —
+  Claude answering, the operator, a task's run, a wake-up reporting back — that
+  arrived after you last read the thread here at its bottom, or after you last
+  wrote in it from Slack or the dashboard (writing means you have read what
+  came before). Your own messages never count. Read state is kept on the mini,
+  in `seen.json` beside `sessions.json` (`unread.py`), so reading on the phone
+  clears the laptop and back: the page posts `/api/seen` when an open thread is
+  at its bottom, behind the same token, tailnet and cross-site checks as every
+  other dashboard write. It counts from the transcripts and polls the dashboard
+  already makes; pushes are unchanged. **Slack's own read state isn't visible
+  to bots** — Slack gives apps no read receipts — so a thread you read only in
+  Slack stays unread here until you open it on the dashboard or reply. Tracking
+  starts when `seen.json` is first made: nothing before that is unread.
 - **Deep links** — every view opens from its address, which is how a
   notification lands on a thread and how the screenshots below are taken:
   `/?thread=<key>`, `/?task=<id>` (the task panel, on that row),
   `/?view=stats|tasks|projects|learnings` (`&tab=all` for every task),
   `/?view=project&slug=<slug>` (`all`, `unfiled`), `&card=<task id>` (a task's
   detail), `/?modal=new-thread|new-project|new-task|settings|release|alerts`
-  (`&slug=` for the last two), `/?q=<words>` (search), `&theme=dark|light|auto`
+  (`&slug=` for the last two), `/?q=<words>` (search), `/?list=unread`, `&theme=dark|light|auto`
   (that view only). The address is cleared once read, so a reload opens the list.
 - **Look and feel** — one design system: CSS custom properties at `:root` for
   spacing, type, radii, elevation, one accent (the silk gold) with ok / warn /

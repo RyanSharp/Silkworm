@@ -35,6 +35,7 @@ import envfile
 import jsonstore
 import procs
 import slacklinks
+import unread
 
 #: Where this code is (assets), and where the install is (state, .env). The
 #: same place unless launchd runs this from the pinned release checkout and
@@ -462,6 +463,60 @@ def cost_anomaly(entry: dict) -> dict | None:
     return {"last": round(last, 4), "median": round(median, 4), "ratio": round(ratio, 1)}
 
 
+#: The owner's read state: seen.json beside sessions.json (unread.py).
+_seen_lock = threading.Lock()
+_seen: dict = {}
+REPLIES = unread.ReplyIndex()
+
+
+def seen_store() -> unread.Seen | None:
+    """The watermarks for the sessions.json being read, or None where there
+    is none (nothing to have read, and no seen.json made beside nothing)."""
+    if not SESSIONS_FILE.exists():
+        return None
+    path = SESSIONS_FILE.with_name(unread.SEEN_NAME)
+    with _seen_lock:
+        if path not in _seen:
+            _seen[path] = unread.Seen(path)
+        return _seen[path]
+
+
+def unread_counts(entries: dict) -> dict:
+    """{thread key: unread replies} for every thread; {} when the read state
+    cannot be read (unknown is not zero, so the page shows nothing)."""
+    seen = seen_store()
+    if seen is None:
+        return {}
+    try:
+        since = seen.since()
+        if seen.error:
+            return {}
+        out = {}
+        for key, entry in entries.items():
+            mark = unread.watermark(seen.get(key), entry.get("owner_said"))
+            out[key] = unread.unread(find_transcript(live_session(entry)), mark, REPLIES, since)
+        return out
+    except Exception as e:
+        print(f"dashboard: unread counts failed: {e!r}", file=sys.stderr, flush=True)
+        return {}
+
+
+def mark_seen(payload: dict) -> dict:
+    """POST /api/seen: the owner has read `key` down to `ts` (the newest
+    message the page has drawn, by the transcript's own clock)."""
+    key = payload.get("key")
+    at = unread.parse_ts(payload.get("ts"))
+    if not isinstance(key, str) or not key or at is None:
+        return {"ok": False, "error": "needs a thread key and the time of its newest message"}
+    seen = seen_store()
+    if seen is None or key not in raw_sessions():
+        return {"ok": False, "error": "no such thread"}
+    held = seen.mark(key, at)
+    if held is None:
+        return {"ok": False, "error": seen.error or "could not save"}
+    return {"ok": True, "key": key, "seen": held}
+
+
 def load_sessions() -> dict:
     status = bot_call("/status", {}, timeout=0.6)
     threads = status.get("threads", {})
@@ -470,6 +525,7 @@ def load_sessions() -> dict:
     live = procs.alive_sessions(
         [(e.get("pending") or {}).get("session_id") or e.get("session_id")
          for e in entries.values() if e.get("pending")])
+    counts = unread_counts(entries)
     out = []
     for key, entry in entries.items():
         channel, _, thread_ts = key.partition(":")
@@ -505,6 +561,9 @@ def load_sessions() -> dict:
             "slack_link": slacklinks.thread_link(channel, thread_ts),
             "resume_cmd": f"cd {cwd or '~'} && claude --resume {sid}",
             "has_transcript": find_transcript(sid) is not None,
+            # Replies not the owner's since they last read it here or wrote
+            # in it (unread.py); None when that is not known.
+            "unread": counts.get(key),
         })
     out.sort(key=lambda s: -s["updated"])
     # bot_online only says the local server answered; it stayed true through a
@@ -1319,6 +1378,10 @@ class Handler(BaseHTTPRequestHandler):
             # and attached files travel inside the request.
             answer = bot_call("/web-message", payload, timeout=SEND_WAIT_S)
             self._json(send_answer(answer))
+        elif url.path == "/api/seen":
+            # A write: behind the same token, tailnet and cross-site checks
+            # as every other POST, all above.
+            self._json(mark_seen(payload))
         elif url.path == "/api/push":
             # A test sends to every subscription before answering.
             answer = bot_call("/push", payload,
@@ -1539,7 +1602,16 @@ PAGE = r"""<!doctype html>
              border-left: 2px solid var(--ok); }
   .turnbar.bad { background: var(--bad-soft); border-left-color: var(--bad); }
   .badge.kind { background: var(--fill-2); color: var(--muted); border: 1px solid var(--line); }
-  .listcol { display: flex; flex-direction: column; min-width: 0; }
+  /* Unread: a dot and how many replies, before the title; the title reads
+     brighter until the thread is read. */
+  .card .unread { margin-right: var(--sp-15); vertical-align: 1px; display: inline-flex; align-items: center; gap: var(--sp-1);
+                  font-family: var(--mono); font-size: var(--fs-2xs); font-weight: var(--fw-bold);
+                  color: var(--info); }
+  .card .unread::before { content: ""; width: 8px; height: 8px; border-radius: var(--r-pill);
+                          background: var(--info); }
+  .card.isunread .key .title { font-weight: var(--fw-bold); }
+  /* As wide as the list, so the filter chips wrap rather than widen it. */
+  .listcol { display: flex; flex-direction: column; min-width: 0; flex: none; width: 350px; }
   #kindfilter { display: flex; gap: var(--sp-1); padding: var(--sp-15) var(--sp-2) var(--sp-05); flex-wrap: wrap; }
   #kindfilter button { font-size: var(--fs-xs); font-family: var(--mono); cursor: pointer;
     background: transparent; color: var(--muted); border: 1px solid var(--line);
@@ -2528,7 +2600,7 @@ PAGE = r"""<!doctype html>
 
     /* the list and the open thread take turns */
     .layout { display: block; flex: 1; overflow: hidden; }
-    .listcol { height: 100%; }
+    .listcol { height: 100%; width: auto; }
     .listtop { padding: var(--sp-25) var(--safe-r) 0 var(--safe-l); }
     #dashm { margin: var(--sp-2) var(--safe-r) 0 var(--safe-l); }
     #dashm summary { min-height: var(--tap); display: flex; align-items: center;
@@ -3537,8 +3609,106 @@ const KIND_LABEL = {thread: "Conversations", task: "Task runs"};
 // title, summary, cost history and file list.
 let showHidden = false;
 
+// --- unread ---
+// A thread's `unread` is how many replies (not yours) arrived after you last
+// read it here at its bottom, on any device, or last wrote in it (unread.py,
+// on the mini; null when that is not known). "Unread" narrows the list to
+// those; "unread first" puts them at the top (remembered on this device).
+let unreadOnly = false;
+let unreadFirst = (() => {
+  try { return localStorage.getItem("sw-unread-first") === "1"; } catch (e) { return false; }
+})();
+const BASE_TITLE = (typeof document !== "undefined" && document.title) || "Silkworm — Sessions";
+// Read here and told to the mini, which has not answered for it yet:
+// {key -> {base}}, `base` the count the server gave when it was read. While
+// the server still says exactly that, the row shows read; any other answer
+// (it caught up, or a new reply came) is the server's again. Kept apart from
+// the poll's answer, which the read cache hands back again on every 304.
+const readHere = new Map();
+function unreadOf(s) {
+  if (!s) return 0;
+  const o = readHere.get(s.key);
+  if (o && o.base === s.unread) return 0;
+  if (o) readHere.delete(s.key);
+  return s.unread > 0 ? s.unread : 0;
+}
+// Something over the open thread: a panel, a form, the alerts, the image
+// viewer, the attachments drawer. The thread under it is not being read.
+function threadCovered() {
+  for (const id of ["fmodal", "taskmodal", "boardmodal", "learnmodal", "tradermodal"]) {
+    const el = document.getElementById(id);
+    if (el && el.style.display === "flex") return true;
+  }
+  const sheet = document.getElementById("alertsheet");
+  return !!(sheet && sheet.classList.contains("open")) || viewerIsOpen() || drawerIsOpen();
+}
+function setUnreadOnly(on) { unreadOnly = !!on; loadList(); }
+function setUnreadFirst(on) {
+  unreadFirst = !!on;
+  try { localStorage.setItem("sw-unread-first", unreadFirst ? "1" : "0"); } catch (e) { /* this view only */ }
+  loadList();
+}
+// The unread threads first, newest first within each half; the server's
+// order (newest first) otherwise.
+function sortShown(shown) {
+  if (!unreadFirst) return shown;
+  return shown.map((s, i) => [s, i]).sort((a, b) =>
+    (unreadOf(b[0]) > 0) - (unreadOf(a[0]) > 0) || a[1] - b[1]).map(x => x[0]);
+}
+// The total, shown where the page is not: the home-screen app's icon
+// (navigator.setAppBadge, iOS 16.4+ home-screen apps, most desktop browsers)
+// and the tab's title. Hidden threads are put away, so they are not counted.
+let badgeShown = null;
+function showUnreadTotal(sessions) {
+  const n = (sessions || []).filter(s => !s.hidden).reduce((a, s) => a + unreadOf(s), 0);
+  const title = (n ? `(${n}) ` : "") + BASE_TITLE;
+  if (document.title !== title) document.title = title;
+  if (n === badgeShown) return n;
+  badgeShown = n;
+  const nav = typeof navigator !== "undefined" ? navigator : null;
+  try {
+    if (n && nav && nav.setAppBadge) Promise.resolve(nav.setAppBadge(n)).catch(() => {});
+    else if (!n && nav && nav.clearAppBadge) Promise.resolve(nav.clearAppBadge()).catch(() => {});
+    else if (!n && nav && nav.setAppBadge) Promise.resolve(nav.setAppBadge(0)).catch(() => {});
+  } catch (e) { /* no badge here: the title still says it */ }
+  return n;
+}
+// Read: the open thread, shown at its bottom, on a page someone is looking
+// at. Says so to the mini with the newest message drawn (by the transcript's
+// own clock, so a reply landing after the draw stays unread), once per new
+// message, and clears the row here at once.
+const seenPosted = new Map();
+function markSeen() {
+  if (!active || tview.key !== active.key || tview.error || !visible() || !pinned || threadCovered()) return;
+  const msgs = tview.msgs || [];
+  let ts = "";
+  for (let i = msgs.length - 1; i >= 0 && !ts; i--) ts = msgs[i].ts || "";
+  if (!ts) return;
+  const key = active.key, at = Date.parse(ts);
+  if (!(at > (seenPosted.get(key) || 0))) return;
+  seenPosted.set(key, at);
+  const s = lastSessions.find(x => x.key === key);
+  const redraw = () => {
+    renderKindFilter(lastSessions);
+    renderList(lastSessions.filter(matchesKind));
+    showUnreadTotal(lastSessions);
+  };
+  if (s && unreadOf(s)) { readHere.set(key, {base: s.unread}); redraw(); }
+  // Refused or unreachable: the row is the server's again, and the next
+  // read asks again.
+  const failed = () => {
+    seenPosted.delete(key);
+    if (readHere.delete(key)) redraw();
+  };
+  fetch("/api/seen", {method: "POST", headers: {"Content-Type": "application/json"},
+                      body: JSON.stringify({key, ts})})
+    .then(r => r.json()).then(r => { if (!r || r.ok === false) failed(); })
+    .catch(failed);
+}
+
 function matchesKind(s) {
   if (!showHidden && s.hidden) return false;
+  if (unreadOnly && !unreadOf(s) && !(active && active.key === s.key)) return false;
   return threadKind === "all" || (s.kind || "thread") === threadKind;
 }
 
@@ -3605,11 +3775,20 @@ function renderKindFilter(sessions) {
   const kindBtns = kinds.length < 2 ? "" :
     btn("all", "All", sessions.length) +
     kinds.map(k => btn(k, KIND_LABEL[k] || k, counts[k])).join("");
+  const nUnread = sessions.filter(s => !s.hidden && unreadOf(s)).length;
+  // Only while there is something unread (or a toggle is on): with nothing
+  // to narrow or reorder, they are noise.
+  const unreadBtns = nUnread || unreadOnly || unreadFirst
+    ? `<button class="${unreadOnly ? "on" : ""}" onclick="setUnreadOnly(${!unreadOnly})"
+         title="only threads with replies you have not read">Unread <b>${nUnread}</b></button>` +
+      `<button class="${unreadFirst ? "on" : ""}" onclick="setUnreadFirst(${!unreadFirst})"
+         title="threads with unread replies at the top">unread first</button>`
+    : "";
   const nHidden = sessions.filter(s => s.hidden).length;
   const oldRuns = sessions.filter(
     s => !s.hidden && (s.kind || "thread") === "task"
          && (Date.now() / 1000 - s.updated) > 14 * 86400).length;
-  setHTML(bar, kindBtns +
+  setHTML(bar, kindBtns + unreadBtns +
     (nHidden ? `<button class="${showHidden ? "on" : ""}" onclick="toggleHidden()"
                   title="hidden threads are kept, not deleted"
                 >hidden <b>${nHidden}</b></button>` : "") +
@@ -3646,6 +3825,7 @@ async function loadList() {
   defaultKind(data.sessions);
   renderKindFilter(data.sessions);
   renderList(data.sessions.filter(matchesKind));
+  showUnreadTotal(data.sessions);
   if (active) {
     const cur = data.sessions.find(x => x.key === active.key);
     if (cur) active = cur;
@@ -3661,8 +3841,12 @@ function cardHtml(s) {
      : t ? `<span class="badge run">running ${dur(t.age_s)}</span>`
      : s.running ? '<span class="badge run">running</span>' : "") +
     (s.checked_out ? `<span class="badge term">${s.terminal_live ? "in terminal" : "checked out"}</span>` : "");
-  const label = s.title ? `<span class="title">${esc(s.title)}</span>`
-                        : `<span class="untitled">untitled</span>`;
+  // The dot goes inside the title, which a phone sizes to the row less ×.
+  const n = unreadOf(s);
+  const dot = n ? `<span class="unread" title="${n} unread repl${n === 1 ? "y" : "ies"}"
+      aria-label="${n} unread">${n}</span>` : "";
+  const label = s.title ? `<span class="title">${dot}${esc(s.title)}</span>`
+                        : `<span class="untitled">${dot}untitled</span>`;
   const kindTag = s.kind === "task" ? `<span class="badge kind">task run</span>` : "";
   const hideBtn = `<button class="hidebtn" title="${s.hidden ? "show again" : "hide"}"
       onclick="hideThread('${s.key}', ${s.hidden ? "false" : "true"}, event)"
@@ -3686,6 +3870,7 @@ function openSession(key) {
   loadList(); loadTranscript(true);
 }
 function renderList(shown) {
+  shown = sortShown(shown);
   const nav = document.getElementById("list");
   const sk = document.getElementById("listskel");
   if (sk && sk.parentNode) sk.parentNode.removeChild(sk);
@@ -3708,7 +3893,7 @@ function renderList(shown) {
       cardEls.set(s.key, div);
       born.add(div);
     }
-    const cls = "card" + (active && active.key === s.key ? " active" : "");
+    const cls = "card" + (active && active.key === s.key ? " active" : "") + (unreadOf(s) ? " isunread" : "");
     if (div.className !== cls) div.className = cls;
     setHTML(div, cardHtml(s));
     return div;
@@ -4228,6 +4413,7 @@ function toEnd(smooth) {
   }
   else if (m) m.scrollTop = m.scrollHeight;
   showJump(false);
+  markSeen();
 }
 function showJump(on) {
   const p = document.getElementById("jumppill");
@@ -4293,7 +4479,7 @@ function onScroll() {
   if (gliding && Date.now() - gliding < 1000 && !atEnd()) return;
   gliding = 0;
   pinned = atEnd();
-  if (pinned) { anchor = null; showJump(false); }
+  if (pinned) { anchor = null; showJump(false); markSeen(); }
   else noteAnchor();
 }
 // Draws with `fn`, then keeps the reader where they were: at the end if they
@@ -4452,6 +4638,7 @@ async function loadTranscript(scroll) {
     if (drawerIsOpen()) drawDrawer();
     document.getElementById("composer").style.display = "flex";
   }, scroll);
+  markSeen();
   if (want.again && tview === want) { want.again = false; loadTranscript(false); }
 }
 
@@ -7461,6 +7648,7 @@ if (window.addEventListener)
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
 //   ?q=<words>                            transcript search
+//   ?list=unread                          the list narrowed to unread threads
 //   &theme=dark | light | auto            drawn in that theme, this view only
 // Runs `fn` with transitions held: a link lands on the state it names, not
 // on the way there (and a view never painted, as a screenshot's, would not
@@ -7482,6 +7670,7 @@ async function openLink(q) {
   const view = q.get("view") || "", slug = q.get("slug") || "", modal = q.get("modal") || "";
   const thread = q.get("thread"), card = q.get("card"), words = q.get("q");
   if (q.get("theme")) applyTheme(q.get("theme"), false);
+  if (q.get("list") === "unread") { unreadOnly = true; loadList(); }
   // A thread or a task: the notification's own way in (openTarget, below).
   if (thread || q.get("task")) await openTarget("/?" + q.toString());
   // &drawer=1: the thread's attachments drawer; &tools=open: its longest turn's
@@ -7695,7 +7884,7 @@ if (typeof navigator !== "undefined" && navigator.serviceWorker && navigator.ser
     if (e.data && e.data.type === "open") { lastTouch = Date.now(); openTarget(e.data.url); }
   });
 if (typeof location !== "undefined"
-    && /[?&](thread|task|view|card|modal|q|theme)=/.test(location.search || "")) {
+    && /[?&](thread|task|view|card|modal|q|theme|list)=/.test(location.search || "")) {
   const target = new URLSearchParams(location.search);
   // Off the address bar, so a reload opens the list rather than this again.
   if (window.history && history.replaceState) history.replaceState(null, "", "/");

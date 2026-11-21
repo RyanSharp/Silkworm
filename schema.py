@@ -54,6 +54,9 @@ FIELDS: dict[str, tuple] = {
     # summary, cost history and file list along with the session id, and a
     # thread you are done looking at is not a thread you want erased.
     "hidden":            (False, "kept, but out of the dashboard's default list"),
+    # The owner writing in a thread has read what came before: the dashboard's
+    # unread count starts after it (unread.py). None = never recorded.
+    "owner_said":        (None,  "unix time the owner last wrote in this thread"),
     "checked_out":       (False, "handed to a terminal session"),
     "terminal_live":     (False, "that terminal session is currently running"),
 }
