@@ -2050,6 +2050,9 @@ def handle_tell(payload: dict) -> dict:
     except Exception as e:
         log.exception("could not post to %s", key)
         return {"ok": False, "error": f"could not post: {e}"}
+    if payload.get("kind") == "deploy":
+        # A deploy's result, which the owner's settings may switch off.
+        PUSH.event(push.deploy_message(text, (store.get(key) or {}).get("project") or "", key))
     return {"ok": True}
 
 
@@ -4771,7 +4774,8 @@ def handle_prompt(event: dict, say, client) -> None:
         task_state(task_id, tasks.DONE)
         # The phone's notification for the reply (push.py), which Slack's own
         # used to be. Queued, never awaited: it cannot cost the turn anything.
-        PUSH.reply(key, task_id, (store.get(key) or {}).get("title") or "")
+        PUSH.reply(key, task_id, (store.get(key) or {}).get("title") or "",
+                   project=(store.get(key) or {}).get("project") or "")
         refresh_summary(key)
 
     except ClaudeStopped:
@@ -5450,7 +5454,8 @@ def execute_task(task: dict) -> None:
             # above, unannounced; reply_message refuses defer.QUIET as well.
             # One that parked for you has its needs-you notification instead.
             PUSH.reply(key, tid, (store.get(key) or {}).get("title") or "",
-                       text=result.text, source=task.get("source"))
+                       text=result.text, source=task.get("source"),
+                       project=task.get("project") or "")
         refresh_summary(key)
         refresh_brief(task.get("project", ""),
                       f"Task: {task.get('goal', '')[:500]}\n\n"
@@ -6954,6 +6959,8 @@ def land_and_record(task_id: str, channel: str = "", thread_ts: str = "",
         record_landing(task, outcome)
     except Exception:
         log.exception("recording the landing of %s failed", task_id)
+    # The phone hears how it went, Slack thread or not. Queued; never raises.
+    PUSH.event(push.landing_message(task_store.get(task_id) or task, outcome))
     if channel and outcome.get("stage") != "not-enabled":
         text = merge.summary(outcome, branch)
         # "Landed on main" reads as *this is now true*. When the repo being landed
@@ -7512,7 +7519,12 @@ def health_rows() -> list | None:
 
 def announce_health(rec: dict, item: dict, opened: bool) -> None:
     """Say once, in the home channel, that a check failed (and make that
-    message its item's thread, as base-red does), or that it passes again."""
+    message its item's thread, as base-red does), or that it passes again.
+    A failure is also the phone's notification (push.health_message), which
+    the owner's settings may switch off, hold for quiet hours, or -- a trader
+    halt, the Gateway down -- send through them."""
+    if opened:
+        PUSH.event(push.health_message(rec, item))
     channel = home_channel()
     if not channel:
         return
@@ -8702,6 +8714,9 @@ if __name__ == "__main__":
     # purpose, so its loop is only expected to persist when it is switched on.
     # Background: an orphaned turn may still be writing, so this waits on it.
     daemons.start(_recoverer, "recoverer", forever=False)
+    # Quiet hours that held notifications across this restart still end in
+    # their summary.
+    PUSH.resume()
     daemons.start(_recovery_sweeper, "rsweep")
     daemons.start(_worktree_sweeper, "wtsweep")
     daemons.start(_sweeper, "sweeper")

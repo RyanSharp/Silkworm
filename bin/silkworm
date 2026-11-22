@@ -2925,7 +2925,7 @@ def report_outcome(call, thread: str, text: str, *, outbox: Path,
     if not thread:
         return "log"
     for n in range(tries):
-        if (call("/tell", {"key": thread, "text": text}) or {}).get("ok"):
+        if (call("/tell", {"key": thread, "text": text, "kind": "deploy"}) or {}).get("ok"):
             return "thread"
         if n + 1 < tries:
             sleep(10)

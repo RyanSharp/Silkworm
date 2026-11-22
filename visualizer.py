@@ -2769,6 +2769,9 @@ PAGE = r"""<!doctype html>
   .tform .line { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-15); }
   .tform .line input[type=text] { flex: 1; }
   .tform .note { color: var(--muted); font-size: var(--fs-xs); margin-top: var(--sp-1); }
+  .tform .nsgroup { border-top: 1px solid var(--line2); margin-top: var(--sp-25); padding-top: var(--sp-1); }
+  .tform input[type=time] { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+        border-radius: var(--r-md); padding: var(--sp-1) var(--sp-2); font: inherit; }
   .tform .err { color: var(--bad); font-size: var(--fs-sm); margin-top: var(--sp-2); white-space: pre-wrap; }
   .tform .acts { margin-top: var(--sp-35); display: flex; gap: var(--sp-2); }
   .tform .rtarget { border-top: 1px solid var(--line2); margin-top: var(--sp-25); padding-top: var(--sp-15); }
@@ -3386,6 +3389,7 @@ PAGE = r"""<!doctype html>
   <button class="ghost hbtn" onclick="toggleTrader()" title="trader: is it OK, and what is it doing (read-only)">📈<span class="lbl"> Trader</span></button>
   <button class="ghost hbtn wide" onclick="nameAllThreads()" title="name every untitled thread">✎ Name untitled</button>
   <button class="ghost hbtn" id="notifybtn" onclick="enableNotifications()" title="Enable notifications">🔔<span class="lbl" id="notifylbl"> Notify</span></button>
+  <button class="ghost hbtn" id="notifyset" onclick="notifySettings()" title="notification settings: kinds, projects, quiet hours">🔕<span class="lbl"> Quiet hours</span></button>
   <button class="ghost hbtn" id="themebtn" onclick="cycleTheme()" title="theme: dark, light, or the system's">◐<span class="lbl" id="themelbl"> Dark</span></button>
   </div>
   <input id="search" placeholder="Search threads and tasks…" autocomplete="off" aria-label="Search threads and tasks (⌘K)" title="Search threads and tasks (⌘K / Ctrl-K)">
@@ -9065,6 +9069,7 @@ async function openLink(q) {
   else if (modal === "settings" && slug) projectSettings(slug);
   else if (modal === "release" && slug) releaseForm(slug);
   else if (modal === "alerts") openAlerts();
+  else if (modal === "notify") notifySettings();
   if (words) {
     document.body.classList.add("searching");     // the phone's search row
     const box = document.getElementById("search");
@@ -9167,6 +9172,84 @@ function renderNotify() {
   btn.title = words;
   btn.className = "ghost hbtn" + (support === "granted" ? " on" : "");
   if (lbl) lbl.textContent = support === "granted" ? " On" : " Notify";
+}
+// --- notification settings ---
+// What the phone is told, the owner's to choose: each kind and each project on
+// or off, and quiet hours in their own time zone, which hold everything for
+// one summary when they end -- except the urgent items ticked here (a trader
+// halt, the Gateway down), which come through. Stored by the bot in push.json
+// and applied where it sends (push.py); this screen only reads and saves it.
+function browserZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) { return ""; }
+}
+function nsBox(id, on, label, note) {
+  return `<label class="choice"><input type="checkbox" id="${id}"${on ? " checked" : ""}>
+    <span>${esc(label)}${note ? ` <span class="note">${esc(note)}</span>` : ""}</span></label>`;
+}
+function notifyHtml(r, projects) {
+  const st = r.settings || {}, kinds = st.kinds || {}, off = st.projects || {};
+  const q = st.quiet || {}, u = st.urgent || {}, picked = new Set(u.checks || []);
+  const zone = q.tz || browserZone();
+  return `<div class="tform"><h3>🔕 Notification settings</h3>
+    <div class="sub">What this mini pushes to every device with notifications on.</div>
+    <div class="nsgroup"><label>kinds</label>
+      ${(r.kinds || []).map(k => nsBox("nsk_" + k.id, kinds[k.id] !== false, k.label)).join("")}</div>
+    <div class="nsgroup"><label>projects</label>
+      ${projects.length ? projects.map((p, i) => nsBox("nsp_" + i, off[p.slug] !== false, p.title || p.slug,
+          p.title && p.title !== p.slug ? p.slug : "")).join("")
+        : `<div class="note">no projects yet</div>`}
+      <div class="note">Something with no project (a deploy, a thread outside one) follows its kind alone.</div></div>
+    <div class="nsgroup"><label>quiet hours</label>
+      ${nsBox("nsq_on", !!q.on, "Hold notifications during quiet hours",
+              "sent as one summary when they end")}
+      <div class="line">from <input type="time" id="nsq_start" value="${esc(q.start || "22:00")}">
+        to <input type="time" id="nsq_end" value="${esc(q.end || "07:00")}"></div>
+      <label>time zone</label><div class="line"><input type="text" id="nsq_tz" value="${esc(zone)}"
+        placeholder="e.g. America/Los_Angeles"></div>
+      ${r.quiet_now ? `<div class="warn">quiet hours now${r.held ? ` · ${r.held} held` : ""}</div>`
+        : r.held ? `<div class="note">${r.held} held, sent within a minute</div>` : ""}</div>
+    <div class="nsgroup"><label>urgent: may come through quiet hours</label>
+      ${nsBox("nsu_bypass", u.bypass !== false, "Let the items ticked below through")}
+      ${(r.urgent || []).map(x => nsBox("nsu_" + x.id, picked.has(x.id), x.label)).join("")}
+      <div class="note">Urgent items still need their kind and project switched on.</div></div>
+    ${modalButtons("saveNotifySettings", "Save")}</div>`;
+}
+async function notifySettings() {
+  const [r, pr] = await Promise.all([pushCall({action: "settings"}), projectCall({action: "list"})
+    .catch(() => ({projects: []}))]);
+  if (!r.ok) { toast(r.error || "bot offline"); return; }
+  const off = (r.settings || {}).projects || {};
+  const projects = ((pr && pr.projects) || []).filter(p => !p.archived)
+    .map(p => ({slug: p.slug, title: p.title || p.slug}));
+  // A project switched off and since archived stays listed, so it can be
+  // switched back on.
+  for (const slug of Object.keys(off))
+    if (!projects.find(p => p.slug === slug)) projects.push({slug, title: slug});
+  openModal(notifyHtml(r, projects), {kind: "notify", projects, answer: r});
+}
+function notifyForm() {
+  const f = boardForm || {}, r = f.answer || {};
+  const on = id => !!(document.getElementById(id) || {}).checked;
+  const val = id => String((document.getElementById(id) || {}).value || "").trim();
+  const kinds = {}, projects = {};
+  for (const k of r.kinds || []) kinds[k.id] = on("nsk_" + k.id);
+  (f.projects || []).forEach((p, i) => { if (!on("nsp_" + i)) projects[p.slug] = false; });
+  return {kinds, projects,
+          quiet: {on: on("nsq_on"), start: val("nsq_start"), end: val("nsq_end"), tz: val("nsq_tz")},
+          urgent: {bypass: on("nsu_bypass"),
+                   checks: (r.urgent || []).filter(x => on("nsu_" + x.id)).map(x => x.id)}};
+}
+async function saveNotifySettings() {
+  if (!boardForm || boardForm.kind !== "notify") return;
+  const settings = notifyForm();
+  if (settings.quiet.on && settings.quiet.start === settings.quiet.end) {
+    formError("Quiet hours start and end at the same time."); return;
+  }
+  const r = await pushCall({action: "save-settings", settings});
+  if (!r.ok) { formError(r.error || "refused"); return; }
+  closeModal();
+  toast(r.settings && r.settings.quiet && r.settings.quiet.on
+    ? `Saved — quiet ${r.settings.quiet.start}–${r.settings.quiet.end}` : "Notification settings saved");
 }
 // Already allowed: keep the bot's copy of this device's subscription current
 // (a push service can rotate it). Quietly; nothing here is asked of anyone.

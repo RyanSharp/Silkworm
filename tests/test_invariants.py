@@ -88,6 +88,9 @@ SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey"
 #: imports (supplied as the real module), or the lift fails naming it.
 STAND_INS = {
     "log": lambda: logging.getLogger("test"),
+    # The phone's notifier: a test that is not about push sends nothing.
+    "PUSH": lambda: types.SimpleNamespace(event=lambda *a, **k: None, reply=lambda *a, **k: None,
+                                          task_moved=lambda *a, **k: None, resume=lambda: None),
     # filer_role asks who the operator is; a test that never set one up has
     # no operator, so nothing it files is the operator's.
     "OPERATOR": lambda: types.SimpleNamespace(thread=lambda: ""),
@@ -41340,6 +41343,494 @@ def test_dashboard_task_page_renders():
     check("‹ Back goes to its project's page", o["back"] == {"page": None, "proj": "alpha"}, str(o["back"]))
     check("a card's detail links to the page", "openTaskPage('tsk_1')" in o["detail"])
     check("a section key the page has not is ignored", "TP_SECTIONS.includes(pageScrollTo)" in js)
+
+
+# --- notification settings: kinds, projects, quiet hours, urgent ----------------
+
+def _ns_at(text, tz="America/Los_Angeles"):
+    """The epoch seconds of a local wall time in `tz`."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    return _dt.fromisoformat(text).replace(tzinfo=ZoneInfo(tz)).timestamp()
+
+
+def _ns_rig(clock_at="2026-11-22T12:00"):
+    rig = _push_rig(Path(tempfile.mkdtemp()))
+    now = {"t": _ns_at(clock_at)}
+    rig.notifier.clock = lambda: now["t"]
+    rig.now = now
+    return rig
+
+
+def test_push_settings_suppress_by_project_and_kind():
+    print("\nnotification settings switch kinds and projects off, in push.py's send path")
+    rig = _ns_rig()
+    push = rig.push
+    rig.notifier.current = None
+    st = rig.store.settings()
+    check("by default every kind is on and no project is off",
+          all(st["kinds"].values()) and set(st["kinds"]) == set(push.KINDS) and st["projects"] == {},
+          str(st))
+    check("the kinds are the four the screen offers",
+          list(push.KINDS) == ["needs_you", "reply", "health", "results"])
+    task = {"id": "tsk_a", "state": rig.T.AWAITING_APPROVAL, "title": "Fix it", "project": "cadence"}
+    m_need = push.needs_you(task)
+    m_reply = push.reply_message("D1:1.1", "tsk_r", "Garden", project="mondays")
+    m_health = push.health_message({"project": "saga", "check": "ci", "summary": "main is red",
+                                    "fingerprint": "f1"}, {"id": "tsk_h"})
+    m_land = push.landing_message({"id": "tsk_l", "project": "cadence", "title": "Land me"},
+                                  {"landed": True, "stage": "landed", "head": "abc"})
+    m_deploy = push.deploy_message(":rocket: Deployed: the bot is running `abc`.\nLog: x", "", "D1:2.2")
+    check("each message knows its kind and project",
+          [(m["kind"], m["project"]) for m in (m_need, m_reply, m_health, m_land, m_deploy)]
+          == [("needs_you", "cadence"), ("reply", "mondays"), ("health", "saga"),
+              ("results", "cadence"), ("results", "")])
+    hitem = push.needs_you({"id": "tsk_h2", "state": rig.T.NEEDS_INPUT, "title": "saga ci: red",
+                            "project": "saga", "source": "health", "source_ref": "saga/ci@fp"})
+    check("a health item's own needs-you move counts as a health failure, not a needs-you",
+          hitem["kind"] == "health" and hitem["signals"] == ["saga/ci"], str(hitem))
+    check("a landing under way, or a project that does not land, says nothing",
+          push.landing_message({"id": "t"}, {"stage": "in-progress"}) is None
+          and push.landing_message({"id": "t"}, {"stage": "not-enabled"}) is None)
+    check("a deploy says its first line, unmarked", m_deploy["body"].startswith("rocket: Deployed")
+          or m_deploy["body"].startswith(":rocket: Deployed"), m_deploy["body"])
+
+    rig.store.set_settings({"kinds": {"reply": False}, "projects": {"cadence": False}})
+    outs = [rig.notifier.deliver(dict(m)) for m in (m_need, m_reply, m_health, m_land, m_deploy)]
+    check("a kind switched off is not sent", outs[1]["skipped"] == "reply is switched off", str(outs[1]))
+    check("a project switched off is not sent, whatever its kind",
+          outs[0]["skipped"] == "cadence is switched off" and outs[3]["skipped"] == "cadence is switched off",
+          str(outs))
+    check("the rest are", outs[2]["sent"] == 1 and outs[4]["sent"] == 1 and len(rig.service.calls) == 2,
+          str(outs))
+    check("something without a project follows its kind alone",
+          outs[4]["skipped"] == "" and outs[4]["sent"] == 1)
+    rig.store.set_settings({})
+    again = rig.notifier.deliver(dict(m_need))
+    check("switched off is not 'already sent': switched back on, the same move goes out",
+          again["sent"] == 1, str(again))
+    check("what was sent is still sent once", rig.notifier.deliver(dict(m_health))["skipped"]
+          == "already sent")
+    rig.store.set_settings({"kinds": {"results": False}})
+    check("deploy and landing results are one kind", rig.notifier.deliver(dict(m_deploy))["skipped"]
+          == "results is switched off")
+    check("the test notification ignores the settings (it is asked for)",
+          push.handle({"action": "test"}, rig.store, rig.notifier)["sent"] == 1)
+
+
+def test_push_quiet_hours_hold_and_flush():
+    print("\nquiet hours hold everything, in the owner's zone, and send one summary when they end")
+    rig = _ns_rig("2026-11-22T23:30")
+    push, ts, T = rig.push, rig.ts, rig.T
+    q = {"on": True, "start": "22:00", "end": "07:00", "tz": "America/Los_Angeles"}
+    rig.store.set_settings({"quiet": q})
+    st = rig.store.settings()
+    for wall, want in (("2026-11-22T21:59", False), ("2026-11-22T22:00", True),
+                       ("2026-11-23T00:30", True), ("2026-11-23T06:59", True),
+                       ("2026-11-23T07:00", False), ("2026-11-23T12:00", False)):
+        check(f"{wall[11:]} LA is {'quiet' if want else 'not quiet'} (past midnight is handled)",
+              push.in_quiet(st, _ns_at(wall)) is want)
+    check("the zone is the owner's: 23:30 in LA is 07:30 UTC, not quiet in a UTC window of the same hours",
+          not push.in_quiet(dict(st, quiet=dict(q, tz="UTC")), _ns_at("2026-11-22T23:30")))
+    day = dict(q, start="09:00", end="17:00")
+    check("a window within one day", push.in_quiet({"quiet": day}, _ns_at("2026-11-23T10:00"))
+          and not push.in_quiet({"quiet": day}, _ns_at("2026-11-23T08:00")))
+    check("switched off, never quiet", not push.in_quiet({"quiet": dict(q, on=False)},
+                                                         _ns_at("2026-11-22T23:30")))
+
+    a = ts.create("g", title="Approve me", project="cadence")
+    ts.transition(a["id"], T.RUNNING)
+    ts.transition(a["id"], T.AWAITING_APPROVAL)
+    b = ts.create("g", title="Moves on", project="cadence")
+    ts.transition(b["id"], T.RUNNING)
+    ts.transition(b["id"], T.NEEDS_INPUT)
+    outs = [rig.notifier.deliver(dict(push.needs_you(ts.get(x["id"])), at=0)) for x in (a, b)]
+    outs.append(rig.notifier.deliver(push.reply_message("D1:1.1", "tsk_r", "Garden", project="x")))
+    check("during quiet hours nothing is sent; each is held",
+          rig.service.calls == [] and all(o["skipped"] == "held for quiet hours" for o in outs), str(outs))
+    check("held messages are claimed: the same move does not queue twice",
+          rig.notifier.deliver(dict(push.needs_you(ts.get(a["id"])), at=0))["skipped"] == "already sent")
+    check("and are on disk: a restart keeps them",
+          len(push.PushStore(Path(rig.store._path)).held()) == 3)
+    check("while it is still quiet, flushing sends nothing", rig.notifier.flush() is None
+          and len(rig.store.held()) == 3)
+    ts.transition(b["id"], T.QUEUED, "answered in the night")
+    rig.now["t"] = _ns_at("2026-11-23T07:01")
+    out = rig.notifier.flush()
+    got = _read_pushes(rig)
+    check("once they end: one notification, not three", len(got) == 1 and out["sent"] == 1, str(got))
+    check("a summary of what is still news (the task that moved on is left out)",
+          out["held"] == 3 and out["summarised"] == 2
+          and got[0]["title"] == "2 notifications from quiet hours"
+          and "Ready for your approval · cadence" in got[0]["body"] and "Silkworm replied" in got[0]["body"]
+          and got[0]["url"] == "/?view=inbox", str(got))
+    check("sent urgently, since it carries a task", rig.service.calls[0]["urgency"] == "high")
+    check("and nothing is held after", rig.store.held() == []
+          and push.PushStore(Path(rig.store._path)).held() == [])
+    check("flushing again sends nothing", rig.notifier.flush() is None and len(rig.service.calls) == 1)
+
+    rig.now["t"] = _ns_at("2026-11-23T23:00")
+    rig.notifier.deliver(push.reply_message("D1:1.1", "tsk_r2", "Garden"))
+    rig.now["t"] = _ns_at("2026-11-24T08:00")
+    rig.notifier.flush()
+    one = _read_pushes(rig)[-1]
+    check("one held is sent as itself", one["title"] == "Silkworm replied" and one["url"] == "/?thread=D1:1.1",
+          str(one))
+    rig.now["t"] = _ns_at("2026-11-24T23:00")
+    rig.notifier.deliver(push.reply_message("D1:1.1", "tsk_r3", "Garden", project="mondays"))
+    rig.store.set_settings({"quiet": q, "projects": {"mondays": False}})
+    rig.now["t"] = _ns_at("2026-11-25T08:00")
+    n = len(rig.service.calls)
+    left = rig.notifier.flush()
+    check("a project switched off during the night stays off at the flush",
+          left["skipped"] == "nothing left to say" and len(rig.service.calls) == n, str(left))
+    # The network down when they end: kept, and sent at the next try.
+    rig.store.set_settings({"quiet": q})
+    rig.now["t"] = _ns_at("2026-11-25T23:00")
+    rig.notifier.deliver(push.reply_message("D1:1.1", "tsk_r4", "Garden"))
+    rig.notifier.deliver(push.reply_message("D1:1.1", "tsk_r5", "Garden"))
+    rig.now["t"] = _ns_at("2026-11-26T08:00")
+    ep = rig.browsers[0][1]["endpoint"]
+    rig.service.raises = {ep}
+    down = rig.notifier.flush()
+    check("a summary nobody took is kept, not lost", down["sent"] == 0
+          and len(rig.store.held()) == 2, str(down))
+    rig.service.raises = set()
+    up = rig.notifier.flush()
+    check("and sent at the next try", up["sent"] == 1 and rig.store.held() == []
+          and _read_pushes(rig)[-1]["title"] == "2 notifications from quiet hours", str(up))
+    # A health failure in the night that passes again before morning.
+    h = ts.create("h", title="saga ci", project="saga", state=T.NEEDS_INPUT, source="health")
+    rig.now["t"] = _ns_at("2026-11-26T23:00")
+    held = rig.notifier.deliver(push.health_message(
+        {"project": "saga", "check": "ci", "summary": "red", "fingerprint": "x"}, h))
+    ts.transition(h["id"], T.DONE, "the ci check is ok again")
+    rig.now["t"] = _ns_at("2026-11-27T08:00")
+    n = len(rig.service.calls)
+    gone = rig.notifier.flush()
+    check("a health failure that passed again overnight is not in the morning's summary",
+          held["skipped"] == "held for quiet hours" and gone["skipped"] == "nothing left to say"
+          and len(rig.service.calls) == n, f"{held} {gone}")
+    many = push.summary_message([{"title": f"t{i}"} for i in range(7)])
+    check("a long night is a count and the first few", many["title"] == "7 notifications from quiet hours"
+          and many["body"] == "t0; t1; t2; and 4 more", many["body"])
+
+
+def test_push_quiet_hours_flush_from_the_sender_and_after_restart():
+    print("\nthe sender itself sends the summary once quiet hours end, restart or not")
+    tmp = Path(tempfile.mkdtemp())
+    rig = _push_rig(tmp)
+    push = rig.push
+    now = {"t": _ns_at("2026-11-22T23:30")}
+    rig.store.set_settings({"quiet": {"on": True, "start": "22:00", "end": "07:00",
+                                      "tz": "America/Los_Angeles"}})
+    night = now["t"]
+    # The process before the restart: it never sees the morning.
+    rig.notifier.clock = lambda: night
+    rig.notifier.poll = 0.05
+    rig.notifier.reply("D1:1.1", "tsk_q", "Garden")
+    _wait(lambda: rig.store.held())
+    time.sleep(0.2)
+    check("queued at night: held, nothing sent", len(rig.store.held()) == 1 and rig.service.calls == [])
+    # A restart in the night: a new store and notifier on the same file.
+    store2 = push.PushStore(tmp / "push.json")
+    n2 = push.Notifier(store2, tmp / "vapid", sender=rig.service, clock=lambda: now["t"], poll=0.05)
+    n2.resume()
+    check("resume starts the sender when something is held", n2._worker is not None and n2._worker.is_alive())
+    idle = push.Notifier(push.PushStore(Path(tempfile.mkdtemp()) / "p.json"), tmp / "vapid")
+    idle.resume()
+    check("and starts nothing when nothing is", idle._worker is None)
+    now["t"] = _ns_at("2026-11-23T07:00")
+    _wait(lambda: rig.service.calls)
+    time.sleep(0.2)
+    check("when they end, the restarted sender sends it on its own, once",
+          len(rig.service.calls) == 1 and store2.held() == [], str(len(rig.service.calls)))
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    main = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "PUSH.resume"]
+    check("the bot resumes held notifications at startup", len(main) == 1)
+
+
+def test_push_urgent_bypasses_quiet_hours():
+    print("\nurgent needs-you items (a trader halt, the Gateway down) come through quiet hours, by setting")
+    rig = _ns_rig("2026-11-22T23:30")
+    push = rig.push
+    rig.notifier.current = None
+    q = {"on": True, "start": "22:00", "end": "07:00", "tz": "America/Los_Angeles"}
+    rig.store.set_settings({"quiet": q})
+    check("the urgent list says which, and the defaults are the money-losing three",
+          set(push.URGENT) == {"trader-halt", "gateway", "dispatch", "credentials"}
+          and rig.store.settings()["urgent"] == {"bypass": True,
+                                                 "checks": ["trader-halt", "gateway", "dispatch"]})
+
+    def health(check_, evidence, fp):
+        return push.health_message({"project": "trader", "check": check_, "summary": "failing",
+                                    "evidence": evidence, "fingerprint": fp}, {"id": "tsk_" + fp})
+    halt = health("healthcheck", ["FAIL halt: TRADING HALTED for momentum", "run 2026-11-22"], "h1")
+    stale = health("healthcheck", ["FAIL universe: 140 days old"], "u1")
+    gw = health("gateway", ["gateway: not listening"], "g1")
+    check("a halt is told apart from another healthcheck failure by its own check's name",
+          "trader/healthcheck:halt" in halt["signals"] and "trader/healthcheck:halt" not in stale["signals"],
+          str(halt["signals"]))
+    check("a halt item's own move knows it is a halt, from its fingerprint",
+          "trader/healthcheck:halt" in push._ref_signals("trader/healthcheck@halt,universe:abc123")
+          and push._ref_signals("trader/gateway@g1") == ["trader/gateway"])
+    o_halt = rig.notifier.deliver(halt)
+    o_gw = rig.notifier.deliver(gw)
+    o_stale = rig.notifier.deliver(stale)
+    check("a trader halt is sent at night", o_halt["sent"] == 1, str(o_halt))
+    check("so is the Gateway down or logged out", o_gw["sent"] == 1, str(o_gw))
+    check("and both are sent as urgent to the push service, so an idle phone wakes",
+          [c["urgency"] for c in rig.service.calls] == ["high", "high"], str(rig.service.calls))
+    bare = push.health_message({"project": "trader", "check": "gateway", "summary": "down",
+                                "fingerprint": "nb"}, None)
+    rig.notifier.deliver(bare)
+    check("urgent because it bypasses, even with no item to carry a task",
+          "task" not in bare and rig.service.calls[-1]["urgency"] == "high", rig.service.calls[-1]["urgency"])
+    check("a stale universe waits for morning", o_stale["skipped"] == "held for quiet hours", str(o_stale))
+    check("an ordinary needs-you waits too", rig.notifier.deliver(push.needs_you(
+        {"id": "tsk_n", "state": rig.T.FAILED, "title": "x", "project": "trader"}))["skipped"]
+          == "held for quiet hours")
+    rig.store.set_settings({"quiet": q, "urgent": {"bypass": True, "checks": ["gateway"]}})
+    check("an item unticked waits", rig.notifier.deliver(health("healthcheck", ["FAIL halt: x"], "h2"))
+          ["skipped"] == "held for quiet hours")
+    check("a ticked one still comes", rig.notifier.deliver(health("gateway", [], "g2"))["sent"] == 1)
+    rig.store.set_settings({"quiet": q, "urgent": {"bypass": False}})
+    check("with the bypass off, nothing comes through", rig.notifier.deliver(health("gateway", [], "g3"))
+          ["skipped"] == "held for quiet hours")
+    rig.store.set_settings({"quiet": q, "kinds": {"health": False}})
+    check("urgent does not override switching its kind off",
+          rig.notifier.deliver(health("gateway", [], "g4"))["skipped"] == "health is switched off")
+    rig.store.set_settings({"quiet": q, "projects": {"trader": False}})
+    check("nor its project", rig.notifier.deliver(health("gateway", [], "g5"))["skipped"]
+          == "trader is switched off")
+    item = push.needs_you({"id": "tsk_hi", "state": rig.T.NEEDS_INPUT, "title": "trader gateway",
+                           "project": "trader", "source": "health", "source_ref": "trader/gateway@fp"})
+    rig.store.set_settings({"quiet": q})
+    check("a Gateway item reaching needs-you by a move comes through too",
+          rig.notifier.deliver(item)["sent"] == 1)
+
+
+def test_push_settings_persist_and_are_checked():
+    print("\nnotification settings are kept in push.json, checked, and answered over /push")
+    tmp = Path(tempfile.mkdtemp())
+    rig = _push_rig(tmp)
+    push = rig.push
+    want = {"kinds": {"reply": False}, "projects": {"cadence": False, "saga": True},
+            "quiet": {"on": True, "start": "23:15", "end": "06:45", "tz": "Europe/London"},
+            "urgent": {"bypass": True, "checks": ["gateway", "credentials"]}}
+    r = push.handle({"action": "save-settings", "settings": want}, rig.store, rig.notifier)
+    check("saved over /push", r["ok"] and r["settings"]["quiet"]["start"] == "23:15", str(r))
+    back = push.PushStore(tmp / "push.json").settings()
+    check("read back after a restart, exactly", back["kinds"]["reply"] is False
+          and back["kinds"]["needs_you"] is True and back["projects"] == {"cadence": False}
+          and back["quiet"] == want["quiet"] and back["urgent"]["checks"] == ["gateway", "credentials"],
+          str(back))
+    check("subscriptions are untouched by it", push.PushStore(tmp / "push.json").count() == 1)
+    got = push.handle({"action": "settings"}, rig.store, rig.notifier)
+    check("the screen is told the kinds and urgent items with their words",
+          got["ok"] and [k["id"] for k in got["kinds"]] == list(push.KINDS)
+          and [u["id"] for u in got["urgent"]] == list(push.URGENT)
+          and all(u["label"] for u in got["urgent"]) and got["held"] == 0 and "quiet_now" in got)
+    for bad, why in (({"kinds": {"pings": False}}, "kinds are"),
+                     ({"quiet": {"on": True, "start": "25:00", "end": "07:00"}}, "HH:MM"),
+                     ({"quiet": {"on": True, "start": "7pm", "end": "07:00"}}, "HH:MM"),
+                     ({"quiet": {"on": True, "start": "07:00", "end": "07:00"}}, "same time"),
+                     ({"quiet": {"tz": "Mars/Olympus"}}, "time zone"),
+                     ({"urgent": {"checks": ["everything"]}}, "urgent items"),
+                     ("nope", "object")):
+        r = push.handle({"action": "save-settings", "settings": bad}, rig.store, rig.notifier)
+        check(f"refused: {why}", not r["ok"] and why in r["error"], str(r))
+    check("and a refusal changes nothing", push.PushStore(tmp / "push.json").settings()["quiet"]
+          == want["quiet"])
+    raw = json.loads((tmp / "push.json").read_text())
+    raw["settings"] = {"kinds": {"bogus": 1}}
+    (tmp / "push.json").write_text(json.dumps(raw))
+    fallback = push.PushStore(tmp / "push.json")
+    check("an unreadable settings block reads as the defaults, subscriptions kept",
+          fallback.settings() == push.default_settings() and fallback.count() == 1)
+    check("a push.json from before settings existed reads as the defaults",
+          push.PushStore(Path(tempfile.mkdtemp()) / "push.json").settings() == push.default_settings())
+    check("the held list is capped", push.MAX_HELD >= 50)
+
+
+def test_push_settings_wired_into_every_send():
+    print("\nevery kind reaches the one send path: health, landing, deploy, replies with their project")
+    src = (BASE / "bot.py").read_text()
+    tree = ast.parse(src)
+    fn = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    ah = ast.unparse(fn["announce_health"])
+    check("a health check's first failure is pushed, before the Slack channel is even asked",
+          "PUSH.event(push.health_message(rec, item))" in ah
+          and ah.index("PUSH.event") < ah.index("home_channel()"))
+    land = ast.unparse(fn["land_and_record"])
+    check("every landing outcome is pushed, Slack thread or not",
+          "PUSH.event(push.landing_message(" in land and land.index("PUSH.event") < land.index("if channel"))
+    tell = ast.unparse(fn["handle_tell"])
+    check("a deploy's report through /tell is pushed as a result",
+          "payload.get('kind') == 'deploy'" in tell and "push.deploy_message(" in tell)
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("and `silkworm deploy` marks its report as one",
+          '"/tell", {"key": thread, "text": text, "kind": "deploy"}' in cli)
+    replies = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "PUSH.reply"]
+    check("both reply notifications carry their thread's project",
+          len(replies) == 2 and all("project" in {k.arg for k in c.keywords} for c in replies))
+    psrc = (BASE / "push.py").read_text()
+    deliver = ast.unparse(next(n for n in ast.walk(ast.parse(psrc))
+                               if isinstance(n, ast.FunctionDef) and n.name == "deliver"))
+    check("deliver applies the settings: suppress, then claim, then hold or send",
+          deliver.index("suppressed(") < deliver.index("claim(") < deliver.index("in_quiet(")
+          < deliver.index("self.send_all("))
+    # A health item opening notifies through the bot's own announce_health.
+    tmp = Path(tempfile.mkdtemp())
+    rig = _push_rig(tmp)
+    sent = []
+    rig.notifier.event = lambda m: sent.append(m)
+    announce = _bot_func("announce_health", PUSH=rig.notifier, push=rig.push,
+                         home_channel=lambda: "", task_store=rig.ts)
+    announce({"project": "trader", "check": "gateway", "summary": "down"}, {"id": "tsk_1"}, True)
+    announce({"project": "trader", "check": "gateway", "summary": "up"}, {"id": "tsk_1"}, False)
+    check("opening pushes once, with no home channel; passing again does not",
+          len(sent) == 1 and sent[0]["kind"] == "health" and "trader/gateway" in sent[0]["signals"],
+          str(sent))
+
+
+NOTIFY_HARNESS_TAIL = r"""
+const FIX = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+let saveAnswer = null;
+answer = (url, b) => {
+  if (url === "/api/push" && b && b.action === "settings") return FIX.settings;
+  if (url === "/api/push" && b && b.action === "save-settings")
+    return saveAnswer || {ok: true, settings: b.settings};
+  if (url === "/api/projects") return {ok: true, projects: FIX.projects};
+  return BASE(url);
+};
+(0, eval)(SRC + `
+;globalThis.__m = {notifySettings, saveNotifySettings, openLink, form: () => boardForm};`);
+const M = globalThis.__m, out = {};
+const flushAsync = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
+// The modal's inputs as the browser would hold them, read from its markup.
+function sync(html) {
+  for (const m of html.matchAll(/<input type="(\w+)" id="([\w-]+)"([^>]*)>/g)) {
+    const el = byId(m[2]);
+    if (m[1] === "checkbox") el.checked = / checked/.test(m[3]);
+    else { const v = /value="([^"]*)"/.exec(m[3]); el.value = v ? v[1] : ""; }
+  }
+}
+const toasts = [];
+globalThis.toast = t => toasts.push(t);
+(async () => {
+  await M.notifySettings(); await flushAsync();
+  out.html = byId("fbox").innerHTML;
+  out.open = byId("fmodal").style.display;
+  sync(out.html);
+  // Unticked: thread replies, the second project; quiet hours on; the
+  // credentials item ticked; the time changed.
+  byId("nsk_reply").checked = false;
+  byId("nsp_1").checked = false;
+  byId("nsq_on").checked = true;
+  byId("nsq_start").value = "21:30";
+  byId("nsu_credentials").checked = true;
+  byId("nsu_gateway").checked = false;
+  calls.length = 0;
+  await M.saveNotifySettings(); await flushAsync();
+  out.saved = calls.filter(c => c.url === "/api/push").map(c => c.body);
+  out.closed = byId("fmodal").style.display;
+  // A refusal stays open with the reason.
+  await M.notifySettings(); await flushAsync();
+  sync(byId("fbox").innerHTML);
+  saveAnswer = {ok: false, error: "'Mars/Olympus' is not a time zone this machine knows"};
+  await M.saveNotifySettings(); await flushAsync();
+  out.refused = {err: byId("tferr").textContent, open: byId("fmodal").style.display};
+  // The same time twice is caught before asking.
+  saveAnswer = null;
+  byId("nsq_on").checked = true; byId("nsq_start").value = "07:00"; byId("nsq_end").value = "07:00";
+  calls.length = 0;
+  await M.saveNotifySettings(); await flushAsync();
+  out.same = {err: byId("tferr").textContent, asked: calls.some(c => c.body && c.body.action === "save-settings")};
+  // Offline: a toast, no modal drawn over nothing.
+  FIX.settings = {ok: false, error: "bot is offline"};
+  byId("fbox").innerHTML = ""; byId("fmodal").style.display = "none";
+  await M.notifySettings(); await flushAsync();
+  out.offline = {open: byId("fmodal").style.display, toast: toasts[toasts.length - 1]};
+  FIX.settings = FIX.settings2;
+  await M.openLink(new URLSearchParams("modal=notify")); await flushAsync();
+  out.link = byId("fbox").innerHTML.includes("Notification settings");
+  out.toasts = toasts;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_dashboard_notification_settings_screen():
+    import re
+    import push
+    import visualizer as V
+    print("\nthe notification settings screen: drawn from /push settings, saved as the form says")
+    rig = _push_rig(Path(tempfile.mkdtemp()))
+    rig.store.set_settings({"projects": {"oldproj": False},
+                            "quiet": {"on": False, "start": "22:00", "end": "07:00", "tz": ""}})
+    answer_ = push.handle({"action": "settings"}, rig.store, rig.notifier)
+    fix = {"settings": answer_, "settings2": answer_,
+           "projects": [{"slug": "cadence", "title": "Cadence"}, {"slug": "trader", "title": "trader"},
+                        {"slug": "gone", "title": "Gone", "archived": True}]}
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    sect = js[js.index("// --- notification settings"):
+              js.index("// Already allowed: keep the bot's copy")]
+    check("the screen holds no copy of the kinds or urgent list: both come from the route",
+          "needs_you" not in sect and "trader-halt" not in sect and "IB Gateway" not in sect)
+    check("it reaches the bot only through /push", "pushCall(" in sect and "/api/push" not in sect)
+    check("a header button opens it", 'onclick="notifySettings()"' in V.PAGE)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the settings screen checked by text only")
+        return
+    head = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(head + NOTIFY_HARNESS_TAIL)
+    (d / "fix.json").write_text(json.dumps(fix))
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), "", str(d / "fix.json")],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the settings harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    h = o["html"]
+    check("opened in the shared modal", o["open"] == "flex" and "Notification settings" in h, h[:200])
+    check("a box per kind, all on, in the route's words",
+          all(f'id="nsk_{k}" checked' in h for k in push.KINDS)
+          and "Deploy and landing results" in h and "Thread replies" in h, h[:900])
+    check("a box per live project, archived ones left out, one already off still listed (and off)",
+          'id="nsp_0" checked' in h and 'id="nsp_1" checked' in h and 'id="nsp_2">' in h
+          and "Cadence" in h and "oldproj" in h and "Gone" not in h, h)
+    check("quiet hours with a start, an end and the owner's zone (the browser's, when none is kept)",
+          'id="nsq_on">' in h and 'id="nsq_start" value="22:00"' in h and 'id="nsq_end" value="07:00"' in h
+          and re.search(r'id="nsq_tz" value="[A-Za-z_]+(/[A-Za-z_]+)*"', h), h)
+    check("the urgent items, with the defaults ticked",
+          'id="nsu_bypass" checked' in h and 'id="nsu_trader-halt" checked' in h
+          and 'id="nsu_gateway" checked' in h and 'id="nsu_credentials">' in h
+          and "IB Gateway down or logged out" in h and "Trader halted" in h, h)
+    saved = [b for b in o["saved"] if b.get("action") == "save-settings"]
+    s = saved[0]["settings"] if saved else {}
+    check("Save sends exactly what the form says",
+          len(saved) == 1 and s.get("kinds") == {"needs_you": True, "reply": False, "health": True,
+                                                 "results": True}
+          and s.get("projects") == {"trader": False, "oldproj": False}
+          and s["quiet"]["on"] is True and s["quiet"]["start"] == "21:30" and s["quiet"]["end"] == "07:00"
+          and s["quiet"]["tz"]
+          and s["urgent"] == {"bypass": True, "checks": ["trader-halt", "dispatch", "credentials"]}, str(s))
+    check("and what it sends the route takes as it is", push.check_settings(s)["urgent"]["checks"]
+          == ["trader-halt", "dispatch", "credentials"] if s else False)
+    check("saved, the modal closes and says so", o["closed"] != "flex"
+          and any("quiet 21:30–07:00" in t for t in o["toasts"]), str(o["toasts"]))
+    check("a refusal is shown in the modal, which stays open",
+          "not a time zone" in o["refused"]["err"] and o["refused"]["open"] == "flex", str(o["refused"]))
+    check("the same start and end is caught before asking", "same time" in o["same"]["err"]
+          and not o["same"]["asked"], str(o["same"]))
+    check("the bot offline: a toast, no empty modal", o["offline"]["open"] != "flex"
+          and "offline" in (o["offline"]["toast"] or ""), str(o["offline"]))
+    check("?modal=notify opens it", o["link"])
 
 
 if __name__ == "__main__":

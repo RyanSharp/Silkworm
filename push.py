@@ -30,6 +30,18 @@ finished reply in a thread, never for a scheduled check that found nothing.
 A transient failure (quota, overload) parks a task in `blocked` with a retry
 time (bot.fail_or_retry), which is not a state that notifies.
 
+What the owner hears is theirs to choose (the dashboard's notification
+settings, kept in push.json beside the subscriptions): each kind -- needs
+you, thread replies, health failures, deploy and landing results -- and each
+project can be switched off, and quiet hours in their own time zone hold
+everything for one summary once they end. A few needs-you items cannot wait
+for morning (URGENT: a trader halt, the IB Gateway down or logged out, a
+missed dispatch); those bypass quiet hours, each one a setting. All of it is
+decided in Notifier.deliver, the one send path, after a task's move has
+settled and before anything is sent or claimed as sent. The bot-is-down
+alert (alert_main) is the one exception: it goes out whatever is set,
+because it is sent by the watchdog when nothing else can be.
+
 Python 3.9-compatible: bin/silkworm imports this under the system python3.
 """
 
@@ -48,6 +60,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -99,6 +112,150 @@ QUEUE_MAX = 200
 
 TITLE_MAX = 60
 BODY_MAX = 120
+
+# --- what the owner chose to hear ------------------------------------------------
+
+#: The kinds a notification can be, as the settings screen names them.
+KINDS = {
+    "needs_you": "Needs you: approvals, questions, failures",
+    "reply": "Thread replies",
+    "health": "Health failures",
+    "results": "Deploy and landing results",
+}
+#: Needs-you items that may bypass quiet hours, each its own setting: id ->
+#: (what the screen says, the health signals it covers). A signal is
+#: "project/check", or "project/check:name" for one named check inside the
+#: trader's own healthcheck (paper_healthcheck.py prints "FAIL halt: ...").
+URGENT = {
+    "trader-halt": ("Trader halted or paused (a drawdown halt tripped)",
+                    ("trader/healthcheck:halt", "trader/healthcheck:paused")),
+    "gateway": ("IB Gateway down or logged out",
+                ("trader/gateway", "trader/healthcheck:gateway")),
+    "dispatch": ("Trader missed a dispatch, or its daemon is down",
+                 ("trader/dispatching", "trader/healthcheck:daemon")),
+    "credentials": ("The mini's Claude or Apple credentials failing",
+                    ("mini/credentials",)),
+}
+#: Bypassing by default: the ones where a night's wait costs money.
+URGENT_DEFAULT = ("trader-halt", "gateway", "dispatch")
+DEFAULT_QUIET = {"on": False, "start": "22:00", "end": "07:00", "tz": ""}
+#: Held during quiet hours, at most this many (the oldest go first).
+MAX_HELD = 200
+#: How often the sender wakes with nothing to send, to see if quiet hours ended.
+FLUSH_POLL_S = 60.0
+#: The summary names this many of what it held; the rest are a count.
+SUMMARY_NAMES = 3
+
+
+def default_settings() -> dict:
+    return {"kinds": {k: True for k in KINDS}, "projects": {},
+            "quiet": dict(DEFAULT_QUIET),
+            "urgent": {"bypass": True, "checks": list(URGENT_DEFAULT)}}
+
+
+def _hhmm(text) -> int | None:
+    """Minutes past midnight of "HH:MM", or None."""
+    t = str(text or "").strip()
+    if len(t) != 5 or t[2] != ":" or not (t[:2] + t[3:]).isdigit():
+        return None
+    h, m = int(t[:2]), int(t[3:])
+    return h * 60 + m if h < 24 and m < 60 else None
+
+
+def _zone(name: str):
+    """The tzinfo of an IANA zone name, or None for "" (the mini's own)."""
+    if not name:
+        return None
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(name)
+
+
+def check_settings(raw) -> dict:
+    """Settings as asked for, checked: ValueError with a sentence if not.
+
+    Anything not given keeps its default; kinds and urgent ids not known
+    here are refused rather than kept, so a typo cannot read as a setting.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be an object")
+    out = default_settings()
+    kinds = raw.get("kinds") or {}
+    if not isinstance(kinds, dict) or set(kinds) - set(KINDS):
+        raise ValueError(f"kinds are {', '.join(KINDS)}")
+    for k, v in kinds.items():
+        out["kinds"][k] = bool(v)
+    projects = raw.get("projects") or {}
+    if not isinstance(projects, dict):
+        raise ValueError("projects must map a project to on or off")
+    for slug, v in projects.items():
+        slug = str(slug).strip()
+        if not slug or len(slug) > 80:
+            raise ValueError("a project name is empty or too long")
+        if not v:
+            out["projects"][slug] = False      # only what is off is kept
+    quiet = raw.get("quiet") or {}
+    if not isinstance(quiet, dict):
+        raise ValueError("quiet must be an object")
+    q = dict(DEFAULT_QUIET, **{k: quiet[k] for k in DEFAULT_QUIET if k in quiet})
+    q["on"] = bool(q["on"])
+    for end in ("start", "end"):
+        if _hhmm(q[end]) is None:
+            raise ValueError(f"quiet hours' {end} must be HH:MM, 24-hour")
+    if q["on"] and q["start"] == q["end"]:
+        raise ValueError("quiet hours start and end at the same time")
+    q["tz"] = str(q["tz"] or "").strip()
+    try:
+        _zone(q["tz"])
+    except Exception:
+        raise ValueError(f"{q['tz']!r} is not a time zone this machine knows")
+    out["quiet"] = q
+    urgent = raw.get("urgent") or {}
+    if not isinstance(urgent, dict):
+        raise ValueError("urgent must be an object")
+    if "bypass" in urgent:
+        out["urgent"]["bypass"] = bool(urgent["bypass"])
+    if "checks" in urgent:
+        checks = urgent["checks"]
+        if not isinstance(checks, list) or set(checks) - set(URGENT):
+            raise ValueError(f"urgent items are {', '.join(URGENT)}")
+        out["urgent"]["checks"] = [c for c in URGENT if c in checks]
+    return out
+
+
+def in_quiet(settings: dict, now: float) -> bool:
+    """Whether `now` falls in the quiet hours, in their own time zone.
+    The window is [start, end), and may run past midnight."""
+    q = (settings or {}).get("quiet") or {}
+    start, end = _hhmm(q.get("start")), _hhmm(q.get("end"))
+    if not q.get("on") or start is None or end is None or start == end:
+        return False
+    try:
+        local = datetime.fromtimestamp(now, _zone(q.get("tz") or ""))
+    except Exception:
+        local = datetime.fromtimestamp(now)       # a zone gone from the machine
+    m = local.hour * 60 + local.minute
+    return start <= m < end if start < end else (m >= start or m < end)
+
+
+def suppressed(msg: dict, settings: dict) -> str:
+    """Why `msg` is switched off ("" if it is not)."""
+    kind = msg.get("kind") or ""
+    if kind and not ((settings or {}).get("kinds") or {}).get(kind, True):
+        return f"{kind} is switched off"
+    project = msg.get("project") or ""
+    if project and ((settings or {}).get("projects") or {}).get(project, True) is False:
+        return f"{project} is switched off"
+    return ""
+
+
+def bypasses(msg: dict, settings: dict) -> bool:
+    """Whether `msg` is urgent enough, by the owner's settings, to be sent
+    during quiet hours."""
+    urgent = (settings or {}).get("urgent") or {}
+    if not urgent.get("bypass"):
+        return False
+    signals = set(msg.get("signals") or ())
+    return any(signals & set(URGENT[c][1]) for c in urgent.get("checks") or () if c in URGENT)
 
 
 class Unavailable(RuntimeError):
@@ -306,10 +463,50 @@ class PushStore:
         data = jsonstore.load(self._path, default={}) or {}
         self._subs: dict = dict(data.get("subscriptions") or {})
         self._sent: dict = dict(data.get("sent") or {})
+        try:
+            self._settings = check_settings(data.get("settings") or {})
+        except ValueError:
+            log.warning("push.json's notification settings are unreadable; using the defaults")
+            self._settings = default_settings()
+        self._held: list = [m for m in (data.get("held") or []) if isinstance(m, dict)]
 
     def _save(self) -> None:
         jsonstore.save(self._path, {"version": 1, "subscriptions": self._subs,
-                                    "sent": self._sent})
+                                    "sent": self._sent, "settings": self._settings,
+                                    "held": self._held})
+
+    # --- the owner's notification settings, and what quiet hours hold ---
+
+    def settings(self) -> dict:
+        # No lock, for the same reason as count(): it is read on the send
+        # path, and set_settings replaces the dict rather than editing it.
+        return json.loads(json.dumps(self._settings))
+
+    def set_settings(self, raw) -> dict:
+        clean = check_settings(raw)
+        with self._lock:
+            self._settings = clean
+            self._save()
+        return self.settings()
+
+    def hold(self, msg: dict) -> int:
+        with self._lock:
+            self._held.append(dict(msg))
+            del self._held[:-MAX_HELD]
+            self._save()
+            return len(self._held)
+
+    def held(self) -> list[dict]:
+        with self._lock:
+            return [dict(m) for m in self._held]
+
+    def take_held(self) -> list[dict]:
+        """Everything held, and nothing held after."""
+        with self._lock:
+            out, self._held = self._held, []
+            if out:
+                self._save()
+            return out
 
     def add(self, sub, agent: str = "") -> dict:
         clean = check_subscription(sub)
@@ -378,16 +575,114 @@ def needs_you(rec: dict | None) -> dict | None:
         return None
     label = NEEDS_YOU[state]
     project = rec.get("project") or ""
+    health = rec.get("source") == "health"
     return {"title": _line(f"{label} · {project}" if project else label, TITLE_MAX),
             "body": _line(rec.get("title") or rec.get("id"), BODY_MAX),
             "url": f"/?task={rec['id']}",
             "tag": f"task-{rec['id']}",
             "dedupe": f"task:{rec['id']}:{state}",
-            "task": rec["id"], "state": state}
+            "task": rec["id"], "state": state,
+            "kind": "health" if health else "needs_you", "project": project,
+            "signals": _ref_signals(rec.get("source_ref")) if health else []}
+
+
+def _ref_signals(ref) -> list[str]:
+    """A health item's signals from its source_ref ("slug/check@fp"): its
+    "project/check", and for the trader's healthcheck, whose fingerprint
+    starts with the failing names ("halt,universe:<hash>"), each of those."""
+    head, _, fp = str(ref or "").partition("@")
+    if "/" not in head:
+        return []
+    out = [head]
+    if head.endswith("/healthcheck") and ":" in fp:
+        out += [f"{head}:{n.strip()}" for n in fp.split(":", 1)[0].split(",") if n.strip()]
+    return out
+
+
+def health_signals(rec: dict) -> list[str]:
+    """What a failing health record is, for URGENT: "project/check", and for
+    a check that runs named checks of its own (the trader's healthcheck, whose
+    evidence reads "FAIL halt: ..."), "project/check:name" for each failing."""
+    base = f"{rec.get('project') or ''}/{rec.get('check') or ''}"
+    out = [base]
+    for line in rec.get("evidence") or ():
+        line = str(line)
+        if line.startswith("FAIL ") and ":" in line:
+            out.append(f"{base}:{line[5:].split(':', 1)[0].strip()}")
+    return out
+
+
+def health_message(rec: dict, item: dict | None) -> dict | None:
+    """The notification a health check's first failure sends (health.surface
+    said "opened"), or None. Its line is the check's own one-line summary,
+    which the probes write to be read, never raw evidence."""
+    rec = rec or {}
+    project, check = rec.get("project") or "", rec.get("check") or ""
+    if not project or not check:
+        return None
+    tid = (item or {}).get("id") or ""
+    # Its item, when it has one, as a task's move would carry it: so a check
+    # that passes again before the message is sent -- or before quiet hours
+    # end -- closes the item and the message goes unsent.
+    task = {"task": tid, "state": tasks.NEEDS_INPUT} if tid else {}
+    return {**task, "title": _line(f"Health failing · {project} {check}", TITLE_MAX),
+            "body": _line(rec.get("summary") or "failing", BODY_MAX),
+            "url": f"/?task={tid}" if tid else f"/?view=project&slug={project}&sec=health",
+            "tag": f"health-{project}-{check}",
+            "dedupe": f"health:{tid or project + '/' + check}:{rec.get('fingerprint') or ''}",
+            "kind": "health", "project": project, "signals": health_signals(rec)}
+
+
+def landing_message(task: dict, outcome: dict) -> dict | None:
+    """The notification a finished landing sends: landed, or refused and why.
+    Not for one still under way, nor a project that does not land."""
+    task, outcome = task or {}, outcome or {}
+    stage = outcome.get("stage") or ""
+    if not task.get("id") or stage in ("not-enabled", "in-progress"):
+        return None
+    landed = bool(outcome.get("landed"))
+    project = task.get("project") or ""
+    head = "Landed" if landed else f"Landing refused ({stage or 'unknown'})"
+    return {"title": _line(f"{head} · {project}" if project else head, TITLE_MAX),
+            "body": _line(task.get("title") or task["id"], BODY_MAX),
+            "url": f"/?task={task['id']}",
+            "tag": f"land-{task['id']}",
+            # The same refusal again (a retry refused alike) is not news.
+            "dedupe": f"land:{task['id']}:{outcome.get('head') or ''}:{stage}:{landed}",
+            "kind": "results", "project": project}
+
+
+def deploy_message(text: str, project: str = "", key: str = "") -> dict | None:
+    """The notification a deploy's report sends (`silkworm deploy`, via the
+    bot's /tell). Its first line only: the rest is in the thread."""
+    first = next((ln for ln in str(text or "").splitlines() if ln.strip()), "")
+    if not first:
+        return None
+    return {"title": "Deploy", "body": _line(first.strip(" *_`"), BODY_MAX),
+            "url": f"/?thread={key}" if key else "/", "tag": "deploy",
+            "kind": "results", "project": project or ""}
+
+
+def summary_message(held: list[dict]) -> dict | None:
+    """What quiet hours held, as one notification: the thing itself if it
+    was only one, else a count, the first few titles, and the inbox."""
+    held = [m for m in held or () if m.get("title")]
+    if not held:
+        return None
+    if len(held) == 1:
+        one = dict(held[0])
+        one.pop("dedupe", None)
+        return one
+    names = "; ".join(m["title"] for m in held[:SUMMARY_NAMES])
+    more = len(held) - SUMMARY_NAMES
+    return {"title": f"{len(held)} notifications from quiet hours",
+            "body": _line(names + (f"; and {more} more" if more > 0 else ""), BODY_MAX),
+            "url": "/?view=inbox", "tag": "quiet-summary",
+            "urgent_send": any(m.get("task") for m in held)}
 
 
 def reply_message(key: str, task_id: str, title: str = "", text: str = "",
-                  source: str = "") -> dict | None:
+                  source: str = "", project: str = "") -> dict | None:
     """The notification a finished reply in thread `key` sends, or None.
 
     Never for a scheduled check that found nothing (defer.QUIET): a watch
@@ -403,7 +698,8 @@ def reply_message(key: str, task_id: str, title: str = "", text: str = "",
             "body": _line(title or "in your conversation", BODY_MAX),
             "url": f"/?thread={key}",
             "tag": f"thread-{key}",
-            "dedupe": f"reply:{task_id}"}
+            "dedupe": f"reply:{task_id}",
+            "kind": "reply", "project": project or ""}
 
 
 def wire(msg: dict) -> bytes:
@@ -432,12 +728,15 @@ class Notifier:
     returns at once and never raises."""
 
     def __init__(self, store: PushStore | None, key_dir: Path | None = None, *,
-                 current=None, sender=None, settle: float = SETTLE_S):
+                 current=None, sender=None, settle: float = SETTLE_S, clock=None,
+                 poll: float = FLUSH_POLL_S):
         self.store = store
         self.key_dir = Path(key_dir or key_dir_default())
         self.current = current            # tid -> record, to re-read after settling
         self.sender = sender or post
         self.settle = settle
+        self.clock = clock or time.time   # quiet hours read this; tests set it
+        self.poll = poll
         self._q: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
         self._worker = None
         self._start_lock = threading.Lock()
@@ -457,13 +756,31 @@ class Notifier:
             log.exception("push: could not queue a notification for a task move")
 
     def reply(self, key: str, task_id: str, title: str = "", text: str = "",
-              source: str = "") -> None:
+              source: str = "", project: str = "") -> None:
         try:
-            msg = reply_message(key, task_id, title, text, source)
+            msg = reply_message(key, task_id, title, text, source, project)
             if msg:
                 self._enqueue(msg)
         except Exception:
             log.exception("push: could not queue a reply notification")
+
+    def event(self, msg: dict | None) -> None:
+        """Queue a message made by health_message, landing_message or
+        deploy_message. Never raises."""
+        try:
+            if msg:
+                self._enqueue(dict(msg))
+        except Exception:
+            log.exception("push: could not queue a notification")
+
+    def resume(self) -> None:
+        """At startup: if a restart came while quiet hours held anything,
+        start the sender so the summary still goes out when they end."""
+        try:
+            if self.store is not None and self.store.held():
+                self._ensure_worker()
+        except Exception:
+            log.exception("push: could not resume held notifications")
 
     def _enqueue(self, msg: dict) -> None:
         if self.store is None or not self.store.count():
@@ -483,11 +800,19 @@ class Notifier:
 
     def _work(self) -> None:
         while True:
-            msg = self._q.get()
             try:
-                self.deliver(msg)
+                msg = self._q.get(timeout=self.poll)
+            except queue.Empty:
+                msg = None
+            if msg is not None:
+                try:
+                    self.deliver(msg)
+                except Exception:
+                    log.exception("push: delivery failed")
+            try:
+                self.flush()
             except Exception:
-                log.exception("push: delivery failed")
+                log.exception("push: sending what quiet hours held failed")
 
     # --- delivery (the worker's thread) ---
 
@@ -502,10 +827,59 @@ class Notifier:
             if now.get("state") != msg.get("state"):
                 out["skipped"] = "moved on"
                 return out
+        settings = self.store.settings()
+        why = suppressed(msg, settings)
+        if why:
+            # Not claimed: switched back on, the next such move is sent.
+            out["skipped"] = why
+            return out
         if msg.get("dedupe") and not self.store.claim(msg["dedupe"]):
             out["skipped"] = "already sent"
             return out
+        if bypasses(msg, settings):
+            # Urgent enough to wake the owner, so urgent to the push service.
+            msg = dict(msg, urgent_send=True)
+        elif in_quiet(settings, self.clock()):
+            self.store.hold(dict(msg, held_at=self.clock()))
+            out["skipped"] = "held for quiet hours"
+            return out
         return self.send_all(msg, out)
+
+    def flush(self, force: bool = False) -> dict | None:
+        """Once quiet hours are over, send what they held as one summary.
+
+        Held messages are read again first: a task that has moved on since is
+        not news, and a kind or project switched off meanwhile stays off.
+        """
+        if self.store is None:
+            return None
+        settings = self.store.settings()
+        if not force and in_quiet(settings, self.clock()):
+            return None
+        held = self.store.take_held()
+        if not held:
+            return None
+        kept = []
+        for m in held:
+            if suppressed(m, settings):
+                continue
+            if m.get("task") and self.current is not None:
+                if (self.current(m["task"]) or {}).get("state") != m.get("state"):
+                    continue
+            kept.append(m)
+        msg = summary_message(kept)
+        if not msg:
+            return {"sent": 0, "pruned": 0, "failed": 0, "skipped": "nothing left to say",
+                    "held": len(held)}
+        out = self.send_all(msg)
+        if not out["sent"] and out["failed"]:
+            # Nobody took it (the network down at the end of the night):
+            # kept, and tried again at the sender's next wake.
+            for m in kept:
+                self.store.hold(m)
+            log.warning("push: the quiet-hours summary could not be sent; kept %d", len(kept))
+            out["skipped"] = "kept: not sent"
+        return dict(out, held=len(held), summarised=len(kept))
 
     def send_all(self, msg: dict, out: dict | None = None) -> dict:
         out = out if out is not None else {"sent": 0, "pruned": 0, "failed": 0, "skipped": ""}
@@ -516,7 +890,8 @@ class Notifier:
                 payload = encrypt(body, sub["keys"]["p256dh"], sub["keys"]["auth"])
                 status = self.sender(sub["endpoint"], payload,
                                      vapid_header(sub["endpoint"], self.key_dir),
-                                     "high" if msg.get("task") else "normal")
+                                     "high" if msg.get("task") or msg.get("urgent_send")
+                                     else "normal")
             except Exception as e:
                 out["failed"] += 1
                 # The host only: an endpoint is a capability URL.
@@ -541,7 +916,19 @@ class Notifier:
 
 # --- the bot's /push route -------------------------------------------------------
 
-ACTIONS = ("key", "subscribe", "unsubscribe", "status", "test", "forget-all")
+ACTIONS = ("key", "subscribe", "unsubscribe", "status", "test", "forget-all",
+           "settings", "save-settings")
+
+
+def settings_answer(store: PushStore, notifier: Notifier | None = None) -> dict:
+    """What the settings screen draws: the settings, and the words for them."""
+    st = store.settings()
+    clock = notifier.clock if notifier is not None else time.time
+    return {"ok": True, "settings": st,
+            "kinds": [{"id": k, "label": v} for k, v in KINDS.items()],
+            "urgent": [{"id": k, "label": v[0], "signals": list(v[1])}
+                       for k, v in URGENT.items()],
+            "held": len(store.held()), "quiet_now": in_quiet(st, clock())}
 
 
 def handle(payload: dict, store: PushStore | None, notifier: Notifier,
@@ -554,6 +941,8 @@ def handle(payload: dict, store: PushStore | None, notifier: Notifier,
     status       keys, subscriptions, whether cryptography is installed
     test         send a test notification to every subscription, now
     forget-all   drop every subscription
+    settings     the notification settings (settings_answer)
+    save-settings {settings}: replace them, checked (check_settings)
     """
     action = str((payload or {}).get("action") or "")
     d = Path(key_dir or key_dir_default())
@@ -578,6 +967,18 @@ def handle(payload: dict, store: PushStore | None, notifier: Notifier,
             return {"ok": True, "removed": store.remove(str(payload.get("endpoint") or ""))}
         if action == "forget-all":
             return {"ok": True, "forgot": store.clear()}
+        if action == "settings":
+            return settings_answer(store, notifier)
+        if action == "save-settings":
+            try:
+                store.set_settings(payload.get("settings"))
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            # Quiet hours switched off, or moved to end before now: what
+            # they held goes at the sender's next wake, within a minute.
+            if store.held():
+                notifier._ensure_worker()
+            return settings_answer(store, notifier)
         if not store.count():
             return {"ok": False, "error": "no subscriptions: tap Enable notifications "
                                           "in the dashboard on the phone first"}
