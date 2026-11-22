@@ -75,7 +75,7 @@ class Drain:
             return self._why if self._until > time.time() else ""
 
 
-def busy(records, landing=(), live=(), releasing=()) -> list[dict]:
+def busy(records, landing=(), live=(), releasing=(), plans=()) -> list[dict]:
     """What a restart right now would kill, as rows for a person to read.
 
     Every task in `running` counts, whatever drives it: a Slack conversation is
@@ -87,7 +87,8 @@ def busy(records, landing=(), live=(), releasing=()) -> list[dict]:
     A release in flight counts for the same reason, and worse: a restart can
     stop it with a target's migrations pushed but its functions not deployed,
     or a tag pushed and the targets after it never run. `releasing` is the set
-    of project slugs this process is releasing.
+    of project slugs this process is releasing. `plans`: the operator's plans
+    whose entries this process is running for a press on the dashboard.
 
     `live` is the set of task ids this process holds a child for. A `running`
     record that is not among them is still reported -- the board says it is
@@ -116,5 +117,8 @@ def busy(records, landing=(), live=(), releasing=()) -> list[dict]:
                      "driver": "", "since": 0, "live": True})
     for slug in sorted(releasing):
         rows.append({"id": slug, "kind": "release", "title": f"release of {slug}"[:80],
+                     "driver": "", "since": 0, "live": True})
+    for pid in sorted(plans):
+        rows.append({"id": pid, "kind": "plan", "title": f"the operator's plan {pid}"[:80],
                      "driver": "", "since": 0, "live": True})
     return rows

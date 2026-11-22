@@ -931,6 +931,10 @@ def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> s
     if not live or live.get("id") != gp.get("id"):
         return (f"refused: the plan the user answered ({gp.get('id')}) has expired or "
                 "been replaced; ask them about the current one")
+    if str(live.get("answered") or "").startswith("dashboard:"):
+        return ("refused: the user answered this plan with its card on the dashboard, and "
+                "the bot ran what they chose there (`silkworm ops plan` shows each "
+                "entry's outcome); there is nothing left for you to run")
     if str(live.get("answered") or "") != str(grant.get("ts") or ""):
         return ("refused: the plan was answered by another of the user's messages, not "
                 "this one; record it again and ask")
@@ -970,7 +974,65 @@ def plan_lines(rec: dict) -> list:
                if e.get("guard") else "")
             + (" (done)" if e.get("used") and e.get("guard") else
                " (ran)" if e.get("used") else "")
+            # Run from the dashboard's card: what it came to.
+            + ({"ok": " -- ok", "failed": " -- failed"}.get(
+                (e.get("result") or {}).get("state"), ""))
             for e in (rec or {}).get("entries") or []]
+
+
+#: What each guarded plan entry is, said plainly, for the dashboard's card.
+_GUARDED_PLAIN = {"land": "Land this task's branch into its base",
+                  "approve": "Approve this task, which lands its branch",
+                  "publish": "Turn publishing on for this project"}
+
+
+def _op_changes(name: str, args) -> str:
+    """What running op `name` with `args` changes, in a line."""
+    args = [str(a) for a in args or []]
+    if name == "trader-env-set" and len(args) == 2:
+        return (f"sets {args[0]}={args[1]} in trader's .env (backed up first); "
+                "the trading daemon reads it at its next restart")
+    if name == "trader-refetch-revisions":
+        return ("writes Yahoo's revised bars into trader's store (backed up first)"
+                if "--apply" in args else "writes nothing: it reports a plan")
+    if name.startswith("trader-launchd"):
+        return f"trader's installed launchd job {args[0] if args else '?'}"
+    if name == "tailscale-on":
+        return "what this machine serves to the tailnet (never Funnel)"
+    if name == "project-test":
+        return f"nothing: it runs {args[0] if args else 'a project'}'s test suite"
+    return "something on this machine"
+
+
+def plan_card(view: dict | None, descriptions: dict | None = None) -> dict | None:
+    """The dashboard's card for a plan (State.plan_view): its entries
+    numbered, each with the command, a plain description and what it
+    changes, whether it has run and what it came to; what can be pressed
+    (`runnable`: only while it waits for its answer, and only the entries
+    not yet run). `descriptions`: op name -> its plain description
+    (ops.describe)."""
+    if not view:
+        return None
+    descriptions = descriptions or {}
+    status = view.get("status") or ""
+    entries = []
+    for e in view.get("entries") or []:
+        args = [str(a) for a in e.get("args") or []]
+        guard = e.get("guard") or ""
+        entries.append({
+            "n": e.get("n"), "command": " ".join([str(e.get("name") or "?"), *args]),
+            "description": (_GUARDED_PLAIN.get(e.get("name"), "") if guard
+                            else descriptions.get(e.get("name"), "")),
+            "changes": (e.get("summary") or "") if guard else _op_changes(e.get("name"), args),
+            "guard": guard, "used": bool(e.get("used")),
+            "chosen": e.get("n") in (view.get("chosen") or []),
+            "result": e.get("result") or None})
+    return {"id": view.get("id") or "", "thread": view.get("thread") or "",
+            "at": view.get("at") or 0, "expires_at": view.get("expires_at") or 0,
+            "status": status, "runnable": status == "waiting",
+            "answered_via": view.get("answered_via") or ("message" if view.get("answered") else ""),
+            "answered_by": view.get("answered_by") or "",
+            "declined": bool(view.get("declined")), "entries": entries}
 
 
 def _landing_refused(task: dict) -> bool:
@@ -1187,14 +1249,132 @@ class State:
                 self._save(data)
             return dict(snap, answered=str(ts))
 
-    def use_plan_entry(self, plan_id: str, n: int, run_by: str = "",
-                       now: float | None = None) -> bool:
-        """Mark entry `n` of plan `plan_id` run, if that plan is still the live
-        one and the entry has not run. True if it was claimed now."""
+    def plan_view(self, now: float | None = None) -> dict | None:
+        """The last plan recorded, live or not, for the dashboard's card: a
+        copy with `status` -- "waiting" (live, unanswered), "answered"
+        (answered by a message or a button: what it chose runs, nothing else
+        does), "spent" (every entry has run), "expired" (PLAN_TTL_S passed
+        unanswered), "replaced" (the operator moved to another thread) -- and
+        `expires_at`. None if none was ever recorded."""
+        now = time.time() if now is None else now
+        data = self._load()
+        p = data.get("plan")
+        if not isinstance(p, dict) or not p.get("entries"):
+            return None
+        out = json.loads(json.dumps(p))
+        out["expires_at"] = float(p.get("at") or 0) + PLAN_TTL_S
+        if all(e.get("used") for e in p["entries"]):
+            out["status"] = "spent"
+        elif p.get("answered"):
+            out["status"] = "answered"
+        elif now >= out["expires_at"]:
+            out["status"] = "expired"
+        elif not data.get("thread") or p.get("thread") != data.get("thread"):
+            out["status"] = "replaced"
+        else:
+            out["status"] = "waiting"
+        return out
+
+    def answer_plan_from_dashboard(self, plan_id: str, chosen, by: str, via: str = "",
+                                   now: float | None = None) -> tuple[dict | None, str]:
+        """Your press of Run all, Run selected or Not now on the plan's card,
+        as the answer to plan `plan_id` -- exactly what a typed reply is
+        (answer_plan): the first answer, and the only one; the plan must be
+        the live one (not expired or replaced) and unanswered. `chosen`: the
+        entry numbers to run, none to decline it. Marks it answered (by
+        "dashboard:<token>", which no message's ts can equal, so no later
+        message answers it) and returns (the plan as answered, ""), or
+        (None, why not)."""
+        now = time.time() if now is None else now
+        try:
+            chosen = sorted({int(n) for n in chosen or ()})
+        except (TypeError, ValueError):
+            return None, "entries are entry numbers"
+        with _STATE_LOCK:
+            p = self.plan(now)
+            if not p or p.get("id") != plan_id:
+                view = self.plan_view(now)
+                if view and view.get("id") == plan_id and view["status"] != "waiting":
+                    return None, {"answered": "this plan has already been answered",
+                                  "spent": "every entry of this plan has run",
+                                  "expired": "this plan expired unanswered (plans wait a day)",
+                                  "replaced": "the operator has moved to another thread"
+                                  }.get(view["status"], "this plan is no longer live")
+                return None, "that is not the plan waiting now; read it again"
+            data = self._load()
+            if data["plan"].get("answered"):
+                return None, "this plan has already been answered"
+            left = {e["n"] for e in data["plan"]["entries"] if not e.get("used")}
+            bad = [n for n in chosen if n not in left]
+            if bad:
+                return None, (f"the plan has no entry {bad[0]} left to run"
+                              if bad[0] not in {e["n"] for e in data["plan"]["entries"]}
+                              else f"entry {bad[0]} of the plan has already run")
+            data["plan"].update(answered="dashboard:" + secrets.token_hex(6),
+                                answered_via=VIA_DASHBOARD, answered_by=str(by),
+                                answered_detail=str(via)[:200], answered_at=now,
+                                chosen=chosen, declined=not chosen)
+            self._save(data)
+            return json.loads(json.dumps(data["plan"])), ""
+
+    def clear_interrupted_results(self, now: float | None = None) -> list:
+        """At startup: entries a press left "queued" or "running" when the bot
+        stopped (a crash; a deploy drains first) are marked failed, saying a
+        restart cut them off, rather than showing as running for ever. Returns
+        the entry numbers changed."""
         now = time.time() if now is None else now
         with _STATE_LOCK:
             data = self._load()
-            p = self.plan(now)
+            p = data.get("plan")
+            if not isinstance(p, dict):
+                return []
+            hit = []
+            for e in p.get("entries") or []:
+                if (e.get("result") or {}).get("state") in ("queued", "running"):
+                    e["result"] = {"state": "failed", "at": now, "tail": (
+                        "not finished: the bot restarted while it was "
+                        + ("running; check what it did" if e["result"]["state"] == "running"
+                           else "waiting its turn, so it never ran")
+                        + " -- ask the operator to record it again")}
+                    hit.append(e.get("n"))
+            if hit:
+                self._save(data)
+            return hit
+
+    def set_entry_result(self, plan_id: str, n: int, result: dict) -> None:
+        """What running entry `n` of plan `plan_id` came to (or that it is
+        running), for the card to show."""
+        with _STATE_LOCK:
+            data = self._load()
+            p = data.get("plan")
+            if not isinstance(p, dict) or p.get("id") != plan_id:
+                return
+            for e in p.get("entries") or []:
+                if e.get("n") == n:
+                    e["result"] = dict(result)
+                    self._save(data)
+                    return
+
+    def use_plan_entry(self, plan_id: str, n: int, run_by: str = "",
+                       now: float | None = None, answer: str = "") -> bool:
+        """Mark entry `n` of plan `plan_id` run, if that plan is still the live
+        one and the entry has not run. True if it was claimed now.
+
+        `answer`: the press on the dashboard's card that answered it
+        (answer_plan_from_dashboard's "dashboard:<token>"), and that chose
+        entry `n`. Its entries were chosen while the plan was live, so they
+        run even if the day runs out, or the operator moves thread, while
+        the earlier ones are still running."""
+        now = time.time() if now is None else now
+        with _STATE_LOCK:
+            data = self._load()
+            if answer:
+                p = data.get("plan") if isinstance(data.get("plan"), dict) else None
+                if (not p or p.get("id") != plan_id or p.get("answered") != answer
+                        or n not in (p.get("chosen") or [])):
+                    return False
+            else:
+                p = self.plan(now)
             if not p or p.get("id") != plan_id:
                 return False
             for e in data["plan"]["entries"]:

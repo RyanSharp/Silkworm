@@ -145,11 +145,12 @@ def _task_item(rec: dict, by_id: dict, unmerged: dict) -> dict | None:
 
 
 def plan_item(plan: dict | None) -> dict | None:
-    """The operator's live ops plan, as one item: Run plan answers it "yes"
-    in its thread, which is exactly what your typed yes would be."""
+    """The operator's live ops plan, as one item: the dashboard draws it as
+    the plan's card (its entries ticked or not, Run all, Run selected, Not
+    now), whose buttons answer it as your typed reply would (bot.handle_plan)."""
     if not plan or plan.get("answered"):
         # Answered (yes, no, or some of it): no later message answers it
-        # (OperatorState.answer_plan), so a Run plan would say yes to nothing.
+        # (OperatorState.answer_plan), so its buttons would answer nothing.
         return None
     left = [e for e in plan.get("entries") or [] if not e.get("used")]
     if not left:
@@ -159,7 +160,8 @@ def plan_item(plan: dict | None) -> dict | None:
             "state": "", "role": "", "project": OPERATOR,
             "title": f"The operator's plan: {len(left)} step{'' if len(left) == 1 else 's'}",
             "line": _clip("; ".join(f"{e.get('n')}. {s}" for e, s in zip(left, steps))),
-            "steps": steps, "actions": ["run-plan"], "recommendation": None,
+            "steps": steps, "entries": [{"n": e.get("n"), "command": s} for e, s in zip(left, steps)],
+            "actions": ["run-all", "run-selected", "not-now"], "recommendation": None,
             "round": "", "needs_user": None, "thread": plan.get("thread") or "",
             "thread_link": slacklinks.for_key(plan.get("thread") or ""),
             "at": plan.get("at") or 0}

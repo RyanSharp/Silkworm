@@ -1251,6 +1251,27 @@ waiting, so your yes after it still runs it (`plan_answer`), and the operator
 says in its reply that the plan is still waiting; from then on a bare "ok" or
 "sure" (likely about that reply) no longer answers it — say "yes" or the
 entries. Once answered, a later "ok thanks" or "yes" answers nothing.
+**Or press it on the plan's card.** The dashboard draws the live plan as a
+card in the operator's thread and on *Needs you*: each entry numbered, with
+its command, a plain description and what it changes, a checkbox, and **Run
+all**, **Run selected** and **Not now**. A press is your answer, exactly as a
+typed reply is — the first answer only (after it no message answers the
+plan, and after a typed one the card is disabled), only while the plan is
+live (a day, not replaced), each entry once — and goes through its own route
+(`/api/plan` → the bot's `/plan`, `handle_plan`), past the dashboard's token
+and cross-site checks and only when the dashboard verifies it is you (the
+same `dashowner.verify` a typed dashboard "yes" needs to carry your grant;
+the bot takes that only from the visualizer's own connection). Never from a
+turn: a request a sweep, a wake-up or any turn stamped is refused, and so is
+one while a deploy drains. The bot then runs what you chose, in order, itself
+— an op as `ops run` would (logged, with "dashboard (login on device)" as
+who decided), a land, approve or publish entry as its own dashboard button
+would (the task records the plan and entry) — and writes each entry's
+outcome onto the plan: the card shows it running, then ok or failed with the
+exit code and the output's tail, and the operator's thread is told what ran.
+Not now declines the plan; nothing in it runs. An expired, answered or spent
+plan's card stays, saying which, with nothing to press.
+
 An op not in the plan still needs naming. Each run
 records the plan id, the entry and your message's ts; `silkworm ops plan`
 alone shows the pending plan. Your own terminal and the dashboard carry no turn and
@@ -1547,9 +1568,10 @@ A local web dashboard for every thread session (localhost-only):
   research dug deeper, drops it), and offers exactly the buttons the item
   allows, each the same /tasks action the task panel sends: Accept, Dismiss
   and Retry go at once with Undo (as a swipe does); Approve, Land, Drop, Close,
-  Done and Run plan ask first; Send back / Answer and Dig deeper ask for your
-  words. Run plan says "yes" in the operator's thread, as you would, after
-  checking the plan is still the one the card shows. On a laptop it sits in
+  Done ask first; Send back / Answer and Dig deeper ask for your words. The
+  operator's plan is its own card — Run all, Run selected, Not now (see
+  *Plans* above) — and stays on the list while what you chose runs, showing
+  each step's result. On a laptop it sits in
   the main pane while no thread is open (**📥 Needs you** above the list comes
   back to it); on a phone it is the first of two tabs, **Needs you** and
   **Threads**. `?view=inbox` / `?view=threads` open either.

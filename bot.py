@@ -2026,7 +2026,8 @@ def handle_drain(payload: dict) -> dict:
             "running": drain.busy(list(task_store.all().values()),
                                   landing=set(_landing_now),
                                   live=set(RUNNING_TASKS),
-                                  releasing=set(_releasing)),
+                                  releasing=set(_releasing),
+                                  plans=set(_plan_runs)),
             "revision": REVISION.get("sha") or ""}
 
 
@@ -3989,6 +3990,192 @@ def handle_hide(payload: dict) -> dict:
     return {"ok": ok, "key": key, "hidden": action != "unhide"}
 
 
+#: Plan ids whose entries this process is running for a press on the
+#: dashboard: a restart would cut them off part-way, so a drain waits on them
+#: (drain.busy) and none starts while one is in force.
+_plan_runs: set[str] = set()
+_plan_runs_guard = threading.Lock()
+
+
+def plan_card_now() -> dict | None:
+    """The last recorded plan as the dashboard's card (operator_role.plan_card)."""
+    descriptions = {d["name"]: d["description"] for d in ops.describe()}
+    card = operator_role.plan_card(OPERATOR.plan_view(), descriptions)
+    if card:
+        with _plan_runs_guard:
+            card["running"] = card["id"] in _plan_runs
+    return card
+
+
+def handle_plan(payload: dict, client=None, server=None) -> dict:
+    """Route for /plan -- the operator's recorded plan of ops, as the
+    dashboard's card shows it (`show`), and the card's buttons: `run`
+    (`entries`: "all" or the entry numbers ticked) and `decline` (Not now).
+
+    A press answers the plan exactly as your typed reply in its thread would
+    (OperatorState.answer_plan_from_dashboard): only the live plan -- recorded
+    less than a day ago in the operator's current thread -- only while no
+    answer has been given, and only once; what it does not choose never runs,
+    and after it no message answers the plan. The bot then runs the chosen
+    entries itself, one at a time, each claimed once (use_plan_entry), and
+    writes each one's outcome onto the plan for the card to show.
+
+    Your press, verifiably: a `dashboard_owner` the visualizer vouched for
+    (dashowner.verify, as for a typed message that carries your grant) on a
+    connection the visualizer's launchd job opened (from_visualizer) -- the
+    same bar a "yes" typed in the dashboard's chat must clear. Never from
+    inside a turn: a request the CLI stamped (a sweep, a wake-up, any turn)
+    is refused, so nothing the operator does can press the button."""
+    payload = dict(payload or {})
+    action = str(payload.get("action") or "show")
+    if action == "show":
+        return {"ok": True, "plan": plan_card_now()}
+    if action not in ("run", "decline"):
+        return {"ok": False, "error": f"unknown action {action!r}"}
+    if any(payload.get(k) for k in ("caller_role", "caller_thread", "caller_task",
+                                    "caller_grant")):
+        return {"ok": False, "refused": "turn",
+                "error": "refused: a plan is answered by you, on the dashboard or in its "
+                         "thread -- never from inside a turn (a sweep, a wake-up or any other)"}
+    owner = None
+    if "dashboard_owner" in payload:
+        ok, why = dashowner.from_visualizer(client, server, WEB_PEER_PROBE)
+        if ok:
+            owner = dashboard_owner({"_web": True, "_web_owner": payload["dashboard_owner"]})
+        else:
+            log.warning("plan: dashboard_owner dropped -- %s", why)
+    if not owner:
+        return {"ok": False, "refused": "owner",
+                "error": "refused: only you can answer the operator's plan -- open the "
+                         "dashboard through Tailscale on your own device (or say yes in "
+                         "its thread)"}
+    plan_id = str(payload.get("plan_id") or "")
+    if action == "decline":
+        chosen = []
+    else:
+        want = payload.get("entries")
+        live = OPERATOR.plan() or {}
+        if want == "all":
+            chosen = [e["n"] for e in live.get("entries") or [] if not e.get("used")]
+        elif isinstance(want, list) and want:
+            chosen = want
+        else:
+            return {"ok": False, "error": "tick at least one entry, or press Run all"}
+    via = f"dashboard ({owner.get('login') or '?'} on {owner.get('node') or '?'})"
+    with _plan_runs_guard:
+        # Under the guard the drain waits on (drain.busy reads _plan_runs):
+        # a run either was refused here or is in _plan_runs.
+        if action == "run" and DRAIN.remaining() > 0:
+            return {"ok": False, "refused": "drain",
+                    "error": "a deploy is draining the bot, and a restart would cut the plan "
+                             "off part-way; nothing ran -- press again once it has restarted"}
+        if plan_id in _plan_runs:
+            return {"ok": False, "error": "this plan is already running"}
+        answered, why = OPERATOR.answer_plan_from_dashboard(
+            plan_id, chosen, by=str(owner.get("login") or ""), via=via)
+        if answered:
+            # What the plan recorded as chosen (whole numbers, once each, in
+            # order) -- never the request's own list.
+            chosen = list(answered.get("chosen") or [])
+            if chosen:
+                _plan_runs.add(plan_id)
+    if not answered:
+        # Outside the guard: the card reads it too.
+        return {"ok": False, "refused": "plan", "error": f"refused: {why}",
+                "plan": plan_card_now()}
+    thread = answered.get("thread") or ""
+    log.info("plan %s %s on the dashboard by %s%s", plan_id,
+             "run" if chosen else "declined", owner.get("login"),
+             f": entries {', '.join(map(str, chosen))}" if chosen else "")
+    if not chosen:
+        tell_thread(thread, f":no_entry_sign: Not now -- you declined plan {plan_id} on the "
+                            "dashboard; nothing in it runs.")
+        return {"ok": True, "declined": True, "plan": plan_card_now()}
+    for n in chosen:
+        OPERATOR.set_entry_result(plan_id, n, {"state": "queued"})
+    threading.Thread(target=run_plan_entries, name=f"plan-{plan_id}", daemon=True,
+                     args=(answered, chosen, owner, via)).start()
+    return {"ok": True, "running": chosen, "plan": plan_card_now()}
+
+
+def run_plan_entries(plan: dict, chosen: list, owner: dict, via: str) -> None:
+    """The entries of `plan` your press chose, run in order, each once: an op
+    as `silkworm ops run` would (ops.run), a guarded entry as its dashboard
+    button would (land or approve the task, turn publish on) -- you pressed
+    it. Each one's outcome is written onto the plan (State.set_entry_result),
+    and the thread is told what ran."""
+    plan_id, lines = plan["id"], []
+    by = str(owner.get("login") or "")
+    try:
+        for n in chosen:
+            entry = next((e for e in plan.get("entries") or [] if e.get("n") == n), None)
+            if not entry:
+                continue
+            OPERATOR.set_entry_result(plan_id, n, {"state": "running", "at": time.time()})
+            if not OPERATOR.use_plan_entry(plan_id, n, run_by="dashboard",
+                                           answer=plan.get("answered") or "-"):
+                res = {"ok": False, "tail": "not run: it has already run, or the plan changed"}
+            else:
+                try:
+                    res = run_plan_entry(plan_id, entry, by, via)
+                except Exception as e:
+                    log.exception("plan %s entry %s failed", plan_id, n)
+                    res = {"ok": False, "tail": f"could not run it: {type(e).__name__}: {e}"}
+                if res.get("not_started"):
+                    # Never began (the op was already running): not spent, so
+                    # the card does not call it run -- though only a new plan
+                    # can ask for it again, this one being answered.
+                    OPERATOR.release_plan_entry(plan_id, n)
+            res.pop("not_started", None)
+            res = dict(res, state="ok" if res.get("ok") else "failed", at=time.time(),
+                       tail=str(res.get("tail") or "")[-ops.TAIL_CHARS:])
+            OPERATOR.set_entry_result(plan_id, n, res)
+            cmd = " ".join([entry["name"], *entry.get("args", [])])
+            lines.append(f"{n}. `{cmd}` -- {'ok' if res['ok'] else 'failed'}"
+                         + (f": {res['tail'][-200:]}" if res["tail"] and not res["ok"] else ""))
+    finally:
+        with _plan_runs_guard:
+            _plan_runs.discard(plan_id)
+    tell_thread(plan.get("thread") or "",
+                f":arrow_forward: You ran plan {plan_id} from the dashboard:\n" + "\n".join(lines))
+
+
+def run_plan_entry(plan_id: str, entry: dict, by: str, via: str) -> dict:
+    """{ok, exit?, tail} of one entry, run on your press."""
+    name, args, n = entry["name"], list(entry.get("args") or []), entry["n"]
+    if entry.get("guard"):
+        item = args[0] if args else ""
+        if name == "publish":
+            out = handle_projects({"action": "publish", "slug": item, "on": True})
+        else:
+            out = handle_tasks({"action": name, "id": item})
+            if out.get("ok"):
+                lift = {"guard": entry["guard"], "how": "plan", "plan_id": plan_id,
+                        "entry": n, "via": operator_role.VIA_DASHBOARD}
+                try:
+                    task_store.record_decision(
+                        item, f"{name} from the operator's plan {plan_id} entry {n}, "
+                              f"pressed on the {via}", f"user via {via}"[:80],
+                        f"dashboard:{plan_id}:{n}", via=via, lift=lift)
+                except Exception:
+                    log.exception("could not record the plan press on %s", item)
+        return {"ok": bool(out.get("ok")),
+                "tail": str(out.get("note") or out.get("error") or ("done" if out.get("ok")
+                                                                    else "refused"))}
+    p = ops.plan(name, args, ops_context())
+    env = git_guard.strip(dict(os.environ))
+    env.pop(operator_role.GRANT_VAR, None)
+    record = {"by": by or "dashboard", "notes": f"plan {plan_id} entry {n}, pressed on the {via}",
+              "caller_role": "", "thread": "", "task": "", "plan_id": plan_id,
+              "plan_entry": n, "decided_via": via}
+    try:
+        rec = ops.run(p, env=env, log_path=OPS_LOG, record=record)
+    except ops.Refused as e:
+        return {"ok": False, "not_started": True,
+                "tail": f"not run: {e} -- ask the operator to record it again"}
+    return {"ok": bool(rec.get("ok")), "exit": rec.get("exit"), "tail": rec.get("tail") or ""}
+
+
 #: Every run of a named op (ops.py), and every refusal of a well-formed one.
 OPS_LOG = BASE_DIR / "logs" / "ops.jsonl"
 
@@ -4178,6 +4365,7 @@ def record_ops_plan(payload: dict) -> dict:
 
 
 server = LocalServer(APPROVAL_PORT)
+server.route("/plan", handle_plan, peer=True)
 server.route("/session-event", handle_session_event)
 server.route("/status", handle_status)
 server.route("/drain", handle_drain)
@@ -7859,6 +8047,14 @@ def _task_scheduler() -> None:
         clear_interrupted_landings()
     except Exception:
         log.exception("clearing interrupted landings failed")
+    try:
+        # A press on the plan's card runs on a daemon thread too: what a
+        # restart cut off is said to be, not left "running…" on the card.
+        cut = OPERATOR.clear_interrupted_results()
+        if cut:
+            log.info("plan entries cut off by a restart: %s", ", ".join(map(str, cut)))
+    except Exception:
+        log.exception("clearing interrupted plan entries failed")
     # After the requeue, not before: a reviewer the restart is about to put
     # back in the queue has not stranded its parent, and auditing first would
     # say it had.

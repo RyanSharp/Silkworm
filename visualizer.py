@@ -1379,6 +1379,19 @@ class Handler(BaseHTTPRequestHandler):
             # and attached files travel inside the request.
             answer = bot_call("/web-message", payload, timeout=SEND_WAIT_S)
             self._json(send_answer(answer))
+        elif url.path == "/api/plan":
+            # The operator's plan card, and its Run / Not now buttons: an
+            # answer to the plan only on the owner this route vouches for,
+            # exactly as /api/send does for a typed "yes" (bot.handle_plan).
+            payload.pop("dashboard_owner", None)
+            if payload.get("action", "show") != "show":
+                owner, why = self._owner()
+                if owner:
+                    payload["dashboard_owner"] = owner
+                elif proxied(self.headers):
+                    log_owner_refusal(why)
+            answer = bot_call("/plan", payload, timeout=15)
+            self._json(answer or {"ok": False, "error": "bot is offline"})
         elif url.path == "/api/seen":
             # A write: behind the same token, tailnet and cross-site checks
             # as every other POST, all above.
@@ -2022,6 +2035,27 @@ PAGE = r"""<!doctype html>
   .icard .acts { margin-top: var(--sp-2); display: flex; gap: var(--sp-15); flex-wrap: wrap; }
   .icard .acts button { font-size: var(--fs-sm); }
   .icard .acts button.rec { box-shadow: 0 0 0 2px var(--accent-line); }
+  .pcard .pents { list-style: none; margin: var(--sp-2) 0 0; padding: 0; }
+  .pcard .pent { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-15) 0;
+                 border-top: 1px solid var(--line); }
+  .pcard .pent:first-child { border-top: 0; }
+  .pcard .pent input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
+  .pcard .pbody { min-width: 0; flex: 1; }
+  .pcard .pcmd { font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+  .pcard .pcmd b { color: var(--gold); margin-right: var(--sp-1); }
+  .pcard .pdesc { font-size: var(--fs-sm); margin-top: var(--sp-05); overflow-wrap: anywhere; }
+  .pcard .pchg { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--sp-05); overflow-wrap: anywhere; }
+  .pcard .pres { font-size: var(--fs-sm); margin-top: var(--sp-1); font-weight: var(--fw-semi); }
+  .pcard .pres.ok { color: var(--ok); }
+  .pcard .pres.failed { color: var(--bad); }
+  .pcard .pres.running, .pcard .pres.queued { color: var(--info); }
+  .pcard .ptail { font-family: var(--mono); font-size: var(--fs-2xs); white-space: pre-wrap; overflow-wrap: anywhere;
+                  background: var(--fill-2); border-radius: var(--r-xs); padding: var(--sp-1) var(--sp-15);
+                  margin: var(--sp-1) 0 0; max-height: 9em; overflow: auto; }
+  .pcard .pnote { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--sp-2); overflow-wrap: anywhere; }
+  .pcard button[disabled] { opacity: .45; cursor: default; }
+  #tplan { margin: var(--sp-3) 0; }
+  #tplan:empty { display: none; }
   .inbox .iempty { color: var(--muted); font-size: var(--fs-md); padding: var(--sp-6) 0; text-align: center; }
   .inbox .iempty b { display: block; color: var(--ink); font-size: var(--fs-lg); font-weight: var(--fw-semi);
                      margin-bottom: var(--sp-1); }
@@ -2955,7 +2989,7 @@ PAGE = r"""<!doctype html>
     <div id="content">
       <div id="inbox" class="inbox"></div>
       <div id="dash"></div>
-      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div></div>
+      <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div><div id="tplan"></div></div>
     </div>
     <div id="composer">
       <button id="jumppill" onclick="toEnd(true)">↓ New messages</button>
@@ -3932,7 +3966,7 @@ function cardHtml(s) {
 const cardEls = new Map();
 function openSession(key) {
   active = lastSessions.find(x => x.key === key) || active;
-  loadList(); loadTranscript(true);
+  loadList(); loadTranscript(true); drawPlan();
 }
 function renderList(shown) {
   shown = sortShown(shown);
@@ -4670,6 +4704,7 @@ async function loadTranscript(scroll) {
   want.files = files || [];
   keepEnd(() => {
     setHTML(document.getElementById("thead"), transcriptHead(s));
+    drawPlanThread();            // the operator's plan, under its own thread
     if (data.error) {
       msgs.innerHTML = `<div class="empty">${esc(data.error)}</div>`;
       chatEls.clear();
@@ -7679,7 +7714,8 @@ async function archiveProject(slug, on) {
 // task panel already sends (taskAction), through the same route and checks.
 // The reversible ones -- Accept, Dismiss, Retry -- go at once with Undo, as a
 // swipe does (deferTask); the ones that cannot be taken back ask first.
-// Run plan says "yes" in the operator's thread, as you would type it there.
+// The operator's plan is its own card (planCardHtml): Run all, Run selected
+// and Not now answer it as your typed reply in its thread would.
 let inboxData = null, inboxAsk = 0;
 let homeTab = "inbox";
 const INBOX_BUTTON = {
@@ -7694,7 +7730,6 @@ const INBOX_BUTTON = {
   rework:  {label: "Send back…", cls: "ghost"},
   resolve: {label: "Done", cls: "ghost"},
   release: {label: "Release", cls: "act"},
-  "run-plan": {label: "Run plan", cls: "act"},
   discuss: {label: "Discuss", cls: "ghost"},
 };
 const INBOX_UNDONE = {accept: "Accepted", dismiss: "Dismissed", retry: "Retried"};
@@ -7702,6 +7737,7 @@ function inboxItems(d) {
   return ((d && d.groups) || []).flatMap(g => g.items || []);
 }
 function inboxCard(it) {
+  if (it.kind === "plan") return planCardHtml(planView && planView.id === it.id ? planView : planFromItem(it), "inbox");
   const rec = it.recommendation && INBOX_BUTTON[it.recommendation.action] ? it.recommendation : null;
   const isTask = it.kind !== "plan" && it.kind !== "decision";
   // A question's Send back is its answer: it resumes with what you say.
@@ -7729,8 +7765,12 @@ function inboxHtml(d) {
   const groups = ((d && d.groups) || []).map(g => ({...g, items: (g.items || []).filter(notGone)}))
     .filter(g => g.items.length);
   const n = groups.reduce((k, g) => k + g.items.length, 0);
+  const ran = planRecent(), hasPlan = groups.some(g => g.items.some(i => i.kind === "plan"));
+  const ranHtml = ran && !hasPlan ? `<div class="igroup" data-project="operator"><h4>The operator's plan</h4>${
+    planCardHtml(ran, "inbox")}</div>` : "";
+  if (!n && ranHtml) return ranHtml;
   if (!n) return `<div class="iempty"><b>Nothing needs you</b>Proposals, approvals, questions and failures turn up here.</div>`;
-  return `<div class="ihd"><h3>Needs you</h3><span class="n">${n}</span></div>` + groups.map(g =>
+  return `<div class="ihd"><h3>Needs you</h3><span class="n">${n}</span></div>` + ranHtml + groups.map(g =>
     `<div class="igroup" data-project="${esc(g.project)}"><h4>${esc(g.title)}<span class="n">${g.items.length}</span></h4>${
       g.items.map(inboxCard).join("")}</div>`).join("");
 }
@@ -7796,7 +7836,6 @@ async function inboxAct(el) {
   if (act === "dig") return digDeeper(id, round);
   if (act === "rework") return sendBack(id, d.state === "needs_input");
   if (act === "release") return releaseStep(id, round);
-  if (act === "run-plan") return runPlan(id, d.thread);
   if (act === "discuss") return openThread(d.thread);
 }
 function openThread(key) {
@@ -7804,25 +7843,143 @@ function openThread(key) {
   if (lastSessions.some(x => x.key === key)) openSession(key);
   else jumpTo(key);
 }
-// The plan the card was drawn for, or none: a "yes" answers whichever plan
-// the operator recorded last, so one recorded since must not be run unread.
-async function runPlan(planId, thread) {
-  if (!confirm("Run the operator's plan?\n\nThis says “yes” in the operator's thread — the same as "
-               + "typing it there — and every step not yet run goes ahead. That can't be undone from here."))
-    return;
+// --- the operator's plan ---
+// The ops the operator recorded for you to answer (`silkworm ops plan`), as a
+// card: in its thread, and on Needs you. Run all, Run selected and Not now
+// answer it as your typed reply in the thread would -- the first answer only,
+// while it waits (a day), from your own device (bot.handle_plan) -- and each
+// step's outcome comes back into the card as it runs. A typed yes still works.
+let planView = null, planAsk = 0, planTick = 0, planDrawn = {};
+const planTicks = new Map();          // plan id -> the entry numbers ticked
+const PLAN_STATE = {queued: "Waiting its turn", running: "Running…", ok: "✓ ok", failed: "✗ failed"};
+function planFromItem(it) {
+  // Drawn from the inbox's item until the plan itself has been read.
+  return {id: it.id, thread: it.thread, at: it.at, status: "waiting", runnable: true, running: false,
+          entries: (it.entries || []).map(e => ({n: e.n, command: e.command, description: "",
+                                                 changes: "", used: false, result: null}))};
+}
+function planNote(c) {
+  if (c.running) return "Running what you chose — each step's result appears here as it finishes.";
+  const by = c.answered_by ? ` by ${c.answered_by}` : "";
+  return {
+    waiting: c.expires_at ? `Waits for your answer until ${new Date(c.expires_at * 1000).toLocaleString()} — or say “yes”, “do 2” in its thread.` : "",
+    answered: c.declined ? `You said not now${by}: nothing in it runs.`
+      : c.answered_via === "dashboard" ? `Answered on the dashboard${by}: only what was chosen runs.`
+      : "Answered by your message in its thread: nothing more runs from here.",
+    spent: "Every step has run.",
+    expired: "Expired unanswered — a plan waits a day. The operator records it again to ask.",
+    replaced: "The operator has moved to another thread: this plan can no longer run.",
+  }[c.status] || "";
+}
+function planLeft(c) { return (c.entries || []).filter(e => !e.used); }
+function planCardHtml(c, where) {
+  if (!c) return "";
+  const live = !!c.runnable && !c.running, left = planLeft(c);
+  const ticks = planTicks.get(c.id) || new Set();
+  const picked = left.filter(e => ticks.has(e.n)).length;
+  const ents = (c.entries || []).map(e => {
+    const r = e.result, can = live && !e.used;
+    const res = r && r.state
+      ? `<div class="pres ${esc(r.state)}">${esc(PLAN_STATE[r.state] || r.state)}${
+          r.state === "failed" && r.exit != null ? ` (exit ${esc(String(r.exit))})` : ""}</div>${
+          r.tail ? `<pre class="ptail">${esc(r.tail)}</pre>` : ""}`
+      : e.used ? `<div class="pres ok">Already run</div>` : "";
+    return `<li class="pent"><input type="checkbox" data-plan="${esc(c.id)}" data-n="${esc(String(e.n))}"${
+      can && ticks.has(e.n) ? " checked" : ""}${can ? "" : " disabled"} onchange="planTickEntry(this)" aria-label="step ${esc(String(e.n))}">
+      <div class="pbody"><div class="pcmd"><b>${esc(String(e.n))}.</b>${esc(e.command)}</div>${
+      e.description ? `<div class="pdesc">${esc(e.description)}</div>` : ""}${
+      e.changes ? `<div class="pchg">Changes: ${esc(e.changes)}</div>` : ""}${res}</div></li>`;
+  }).join("");
+  const btn = (act, cls, label, on) => `<button class="${cls}" data-pact="${act}" data-plan="${esc(c.id)}"${
+    on ? "" : " disabled"} onclick="planPress(this)">${label}</button>`;
+  const n = (c.entries || []).length, note = planNote(c);
+  const head = live ? `${left.length} step${left.length === 1 ? "" : "s"} waiting for you`
+             : c.running ? "running" : {spent: "done", expired: "expired", replaced: "no longer live"}[c.status]
+             || (c.declined ? "declined" : "answered");
+  return `<div class="icard k-plan pcard" data-id="${esc(c.id)}" data-where="${where}" data-status="${
+      esc(c.running ? "running" : c.status || "")}">
+    <div class="ihead"><span class="ikind k-plan">Ops plan</span><span>${esc(c.id)}</span><span class="iage">${
+      c.at ? age(c.at) : ""}</span></div>
+    <div class="tt">The operator's plan (${n} step${n === 1 ? "" : "s"}): ${esc(head)}</div>
+    <ol class="pents">${ents}</ol>
+    <div class="acts">${btn("all", "act", "Run all", live && left.length)}${
+      btn("selected", "ghost", `Run selected${picked ? ` (${picked})` : ""}`, live && picked)}${
+      btn("decline", "ghost", "Not now", live)}</div>${note ? `<div class="pnote">${esc(note)}</div>` : ""}</div>`;
+}
+// The plan your press just answered, still on Needs you while it runs and a
+// little after: the inbox lists only plans waiting for an answer.
+function planRecent() {
+  const c = planView;
+  if (!c || c.answered_via !== "dashboard") return null;
+  if (c.running) return c;
+  const last = Math.max(0, ...(c.entries || []).map(e => (e.result && e.result.at) || 0));
+  return last && Date.now() / 1000 - last < 600 ? c : null;
+}
+// Under the open thread when it is the plan's; drawn only when it changed.
+function drawPlanThread() {
+  const el = document.getElementById("tplan");
+  const html = active && planView && planView.thread === active.key ? planCardHtml(planView, "thread") : "";
+  if (el && planDrawn.thread !== html) { setHTML(el, html); planDrawn.thread = html; }
+}
+function drawPlan() {
+  drawPlanThread();
+  if (inboxData) drawInbox(inboxData);
+}
+async function loadPlan() {
+  const ask = ++planAsk;
   let r;
-  try { r = await taskCall({action: "inbox"}); } catch (e) { r = null; }
-  const live = r && r.ok ? inboxItems(r).find(i => i.kind === "plan") : null;
-  if (!live || live.id !== planId || !live.thread) {
-    toast("The plan changed since this was drawn — read it again before running it", 5000, {bad: true});
-    if (r && r.ok) { inboxData = r; drawInbox(r); }
-    return;
+  try {
+    r = await (await fetch("/api/plan", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "show"})})).json();
+  } catch (e) { return; }                      // the last card is kept
+  if (ask !== planAsk || !r || !r.ok) return;
+  if (JSON.stringify(r.plan || null) === JSON.stringify(planView)) return;
+  planView = r.plan || null;
+  drawPlan();
+}
+// Read every tick while a plan runs (its results stream in), else now and then.
+function planWanted() { return !!(planView && planView.running) || (++planTick % 4 === 0); }
+function planTickEntry(el) {
+  const id = el.dataset.plan, n = Number(el.dataset.n);
+  const s = planTicks.get(id) || new Set();
+  if (el.checked) s.add(n); else s.delete(n);
+  planTicks.set(id, s);
+  drawPlan();
+}
+function planCard(id) {
+  if (planView && planView.id === id) return planView;
+  const it = inboxItems(inboxData).find(i => i.kind === "plan" && i.id === id);
+  return it ? planFromItem(it) : null;
+}
+async function planPress(el) {
+  const id = el.dataset.plan, kind = el.dataset.pact, c = planCard(id);
+  if (!c || !c.runnable || c.running) return;     // drawn disabled: nothing to answer
+  const left = planLeft(c), ticks = planTicks.get(id) || new Set();
+  const what = kind === "all" ? left : kind === "selected" ? left.filter(e => ticks.has(e.n)) : [];
+  if (kind !== "decline") {
+    if (!what.length) { toast("Tick a step first, or press Run all", 4000, {bad: true}); return; }
+    if (!confirm(`Run ${what.length} step${what.length === 1 ? "" : "s"} of the operator's plan?\n\n`
+                 + what.map(e => `${e.n}. ${e.command}`).join("\n")
+                 + "\n\nThis answers the plan as your “yes” in its thread would: steps left out never run. "
+                 + "That can't be undone from here.")) return;
   }
-  const s = await sendOnce({key: live.thread, text: "yes", files: [], client_id: newClientId()});
-  if (!s || !s.ok) { toast(`Not sent: ${(s && s.error) || "refused"}`, 5000, {bad: true}); return; }
-  toast("Said “yes” in the operator's thread");
+  planAsk++;                 // a read sent before this press must not draw over its answer
+  const body = {action: kind === "decline" ? "decline" : "run", plan_id: id,
+                ...(kind === "decline" ? {} : {entries: kind === "all" ? "all" : what.map(e => e.n)})};
+  let r;
+  try {
+    r = await (await fetch("/api/plan", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body)})).json();
+  } catch (e) { r = {ok: false, error: "could not reach the dashboard"}; }
+  if (r && "plan" in r) planView = r.plan || null;
+  if (!r || !r.ok) toast(`Not done: ${(r && r.error) || "refused"}`, 6000, {bad: true});
+  else {
+    planTicks.delete(id);
+    toast(kind === "decline" ? "Not now: the plan is declined, nothing in it runs"
+                             : "Running — each step's result appears on the card");
+  }
+  drawPlan();
   loadInbox();
-  openThread(live.thread);
 }
 // Whether the inbox is on screen: no thread open, and on a phone its tab.
 // Polled only then -- each read asks the branch survey.
@@ -8267,9 +8424,11 @@ const pollList = poller(loadList), pollStats = poller(loadStats),
       pollLive = poller(() => threadBusy() ? loadTranscript(false) : null),
       pollBoard = poller(() => boardIsOpen() ? refreshBoard() : null),
       pollTrader = poller(() => traderIsOpen() ? refreshTrader() : null),
-      pollInbox = poller(() => inboxVisible() ? loadInbox() : null);
-loadList(); loadStats(); loadInbox();
+      pollInbox = poller(() => inboxVisible() ? loadInbox() : null),
+      pollPlan = poller(() => planWanted() ? loadPlan() : null);
+loadList(); loadStats(); loadInbox(); loadPlan();
 setInterval(pollInbox, 5000);
+setInterval(pollPlan, 2500);
 setInterval(pollList, 5000);
 setInterval(pollStats, 30000);
 setInterval(pollTranscript, 4000);
@@ -8277,7 +8436,7 @@ setInterval(pollLive, 1500);
 setInterval(pollBoard, 5000);
 setInterval(pollTrader, TRADER_POLL_MS);
 document.addEventListener("visibilitychange", () => {
-  if (visible()) { checkBuild(); pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); pollInbox(); }
+  if (visible()) { checkBuild(); pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); pollInbox(); pollPlan(); }
 });
 </script>
 </body>

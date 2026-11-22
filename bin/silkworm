@@ -1795,7 +1795,9 @@ def do_ops_plan(rest: list, ask) -> int:
     head = ("recorded" if payload["action"] == "plan" else "pending") + f" plan {plan['id']}"
     print(head + " -- show the user these, numbered; a plain 'yes' runs them all, "
           "'do 2' just that one, 'all but 1' the rest (a guarded entry, once approved, "
-          "you carry out with its own command and --notes):")
+          "you carry out with its own command and --notes); they can also press Run all, "
+          "Run selected or Not now on its card in the dashboard, which runs the entries "
+          "itself -- nothing is left for you to run then:")
     for line in r.get("lines") or []:
         print(line)
     return EXIT_OK

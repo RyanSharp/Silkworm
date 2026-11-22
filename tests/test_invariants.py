@@ -21534,8 +21534,9 @@ def test_dashboard_polls_without_redrawing():
           and "/api/session" in o["backFetches"], o["backFetches"])
     # 1500: the open thread while something is under way in it (threadBusy);
     # 60000: the Trader view, which only reads while it is open. The third
-    # 5000 is the Needs you inbox, the home screen (loadInbox).
-    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 4000, 5000, 5000, 5000, 30000, 60000],
+    # 5000 is the Needs you inbox, the home screen (loadInbox); 2500 the
+    # operator's plan card, read every fourth tick unless it is running.
+    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 2500, 4000, 5000, 5000, 5000, 30000, 60000],
           o["intervals"])
 
 
@@ -35304,7 +35305,7 @@ def test_trader_view_draws_the_document():
     check("it is polled every minute while open, and on focus and on showing the tab",
           "const TRADER_POLL_MS = 60000;" in js and "setInterval(pollTrader, TRADER_POLL_MS)" in js
           and "traderIsOpen() ? refreshTrader()" in js and 'addEventListener("focus"' in js
-          and "pollBoard(); pollTrader(); pollInbox(); }" in js)
+          and "pollBoard(); pollTrader(); pollInbox(); pollPlan(); }" in js)
     # Nothing on the view posts: its markup's buttons are its close button and
     # the five tabs (which only change what is drawn), and it has no form.
     modal = re.search(r'<div id="tradermodal".*?\n</div>\n', V.PAGE, re.S).group(0)
@@ -38869,7 +38870,8 @@ def test_inbox_lists_everything_waiting_on_you():
     check("the operator's plan is one item, its steps not yet run",
           items.get("pl_1", {}).get("kind") == "plan"
           and items["pl_1"]["steps"] == ["tailscale-on", "trader-refetch-revisions --apply"]
-          and items["pl_1"]["actions"] == ["run-plan"] and "2 steps" in items["pl_1"]["title"],
+          and items["pl_1"]["actions"] == ["run-all", "run-selected", "not-now"]
+          and [e["n"] for e in items["pl_1"]["entries"]] == [1, 2] and "2 steps" in items["pl_1"]["title"],
           str(items.get("pl_1")))
     dec = items.get("health:mondays:app-store") or {}
     check("a health check naming your decision is listed as one, with Discuss in the operator's thread",
@@ -39093,7 +39095,6 @@ const posts = () => calls.filter(c => (c.url === "/api/tasks" || c.url === "/api
   CONFIRM = false;
   out.approveDeclined = await run("approve", ids.approval);
   out.landDeclined = await run("land", ids.landing);
-  out.planDeclined = await run("run-plan", "pl_1", {thread: "D1:1.0"});
   CONFIRM = true;
   out.approve = await run("approve", ids.approval);
   out.land = await run("land", ids.landing);
@@ -39105,9 +39106,6 @@ const posts = () => calls.filter(c => (c.url === "/api/tasks" || c.url === "/api
   out.retryNow = await run("retry", ids.failed);
   runTimers(now + 5100); await flushAsync();
   out.retrySent = posts().filter(p => p.id === ids.failed);
-  out.plan = await run("run-plan", "pl_1", {thread: "D1:1.0"});
-  out.planStale = await run("run-plan", "pl_old", {thread: "D1:1.0"});
-  out.planStaleToast = toastEl.text;
   PROMPT = null;
   out.reworkCancelled = await run("rework", ids.approval, {state: "awaiting_approval"});
   // --- the phone's tabs ---
@@ -39181,8 +39179,10 @@ def test_dashboard_inbox_renders_and_acts():
         "question": ["resolve", "rework", "dismiss"], "findings": ["close", "dig", "dismiss"],
         "failed": ["retry", "dismiss"], "landing": ["land", "drop"]}, str(per))
     check("in words people use", all(w in desk for w in (">Accept<", ">Dismiss<", ">Approve<", ">Land<",
-                                                         ">Close<", ">Send back…<", ">Run plan<")))
-    check("the plan and the decision are cards too", acts("pl_1") == ["run-plan"]
+                                                         ">Close<", ">Send back…<", ">Run all<")))
+    check("the plan and the decision are cards too: the plan's own, with its three buttons",
+          re.findall(r'data-pact="(\w+)"', card("pl_1")) == ["all", "selected", "decline"]
+          and 'data-n="2"' in card("pl_1")
           and acts("health:mondays:app-store") == ["discuss"]
           and "decide: submit 1.3 for review, or hold it" in card("health:mondays:app-store"))
     a = card(ids["approval"])
@@ -39213,8 +39213,8 @@ def test_dashboard_inbox_renders_and_acts():
           and o["undone"] == {"posts": [], "pending": False}, str(o["undone"]))
     check("Dismiss on findings carries their round",
           [(x["action"], x.get("round")) for x in o["dismissSent"]] == [("dismiss", "r7")], str(o["dismissSent"]))
-    check("Approve, Land and Run plan ask first; declined, nothing is sent",
-          o["approveDeclined"] == [] and o["landDeclined"] == [] and o["planDeclined"] == [])
+    check("Approve and Land ask first; declined, nothing is sent",
+          o["approveDeclined"] == [] and o["landDeclined"] == [])
     one = lambda xs: [(x["action"], x.get("notes", ""), x.get("round", "")) for x in xs]
     check("confirmed, Approve sends approve", one(o["approve"]) == [("approve", "", "")], str(o["approve"]))
     check("Land sends land, Drop sends drop", one(o["land"]) == [("land", "", "")]
@@ -39227,11 +39227,6 @@ def test_dashboard_inbox_renders_and_acts():
     check("Done sends resolve", one(o["resolve"]) == [("resolve", "", "")], str(o["resolve"]))
     check("Retry is undoable, then sent as retry", o["retryNow"] == []
           and [x["action"] for x in o["retrySent"]] == ["retry"], str(o["retrySent"]))
-    check("Run plan says yes in the operator's thread, through the chat's own send",
-          [(x["url"], x.get("key"), x.get("text")) for x in o["plan"]] == [("/api/send", "D1:1.0", "yes")],
-          str(o["plan"]))
-    check("but not for a plan other than the one now recorded", o["planStale"] == []
-          and "plan changed" in o["planStaleToast"], f"{o['planStale']} {o['planStaleToast']}")
     check("the phone's tabs switch between Needs you and Threads",
           o["threads"] == {"cls": True, "tab": "threads", "on": "on"}
           and o["inboxTab"] == {"cls": False, "on": "on"}, f"{o['threads']} {o['inboxTab']}")
@@ -39239,6 +39234,536 @@ def test_dashboard_inbox_renders_and_acts():
           "Nothing needs you" in o["empty"] and o["emptyCount"] == "", o["empty"])
     check("a failed read is not taken for an empty one: the last list is kept",
           o["offlineKeeps"] == o["empty"])
+
+
+# --- the operator's plan, as a card with buttons -----------------------------------
+# 2026-11-21: a plan of ops the operator recorded waited for a typed "yes". Its
+# card (in the thread and on Needs you) answers it with Run all, Run selected or
+# Not now -- the same once-only, day-long answer, on the owner's own device,
+# never from a turn -- and the bot runs what was chosen, writing each step's
+# outcome back for the card.
+
+class _SyncThread:
+    """threading.Thread, run where it is started: the card's results are
+    there to read the moment the press returns."""
+    def __init__(self, target=None, args=(), kwargs=None, **_):
+        self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+    def start(self):
+        self.target(*self.args, **(self.kwargs or {}))
+
+
+def _plan_card_world(**env):
+    """_ops_world, with /plan as shipped (handle_plan and the runner it
+    starts), a visualizer probe that vouches for the connection, and the
+    guarded actions' routes stood in for."""
+    import threading as _th
+    import dashowner as DO
+    import ops as OPS
+    import operator_role as O
+    w = _ops_world()
+    told, tasks_called, projects_called, decided = [], [], [], []
+    w.probe = _VizProbe()
+    w.drain = types.SimpleNamespace(left=0)
+    ns = lift("handle_plan", "run_plan_entries", "run_plan_entry", "plan_card_now",
+              "dashboard_owner",
+              ops=OPS, OPS_LOG=w.log, os=os, time=time, log=logging.getLogger("t"),
+              git_guard=__import__("git_guard"), operator_role=O, OPERATOR=w.state,
+              dashowner=DO, WEB_PEER_PROBE=w.probe, envfile=__import__("envfile"),
+              BASE_DIR=w.tmp,
+              threading=types.SimpleNamespace(Thread=_SyncThread, Lock=_th.Lock),
+              DRAIN=types.SimpleNamespace(remaining=lambda: w.drain.left),
+              tell_thread=lambda key, text: told.append((key, text)),
+              handle_tasks=lambda p: tasks_called.append(p) or {"ok": True, "note": "landing under way"},
+              handle_projects=lambda p: projects_called.append(p) or {"ok": True},
+              task_store=types.SimpleNamespace(
+                  record_decision=lambda *a, **k: decided.append((a, k))),
+              ops_context=lambda: w.ctx, _plan_runs=set(), _plan_runs_guard=_th.Lock())
+    w.pns, w.told, w.tasks_called, w.projects_called, w.decided = (
+        ns, told, tasks_called, projects_called, decided)
+    return w
+
+
+#: What the visualizer vouches for (dashowner.verify) on a press from your phone.
+_OWNER = {"login": "owner@example.com", "peer": "100.64.0.2", "node": "phone1"}
+_VIZ_CONN = (("127.0.0.1", 55072), ("127.0.0.1", 8787))
+
+
+def _press(w, action, plan_id, entries=None, owner=_OWNER, conn=_VIZ_CONN, **extra):
+    payload = {"action": action, "plan_id": plan_id, **extra}
+    if entries is not None:
+        payload["entries"] = entries
+    if owner is not None:
+        payload["dashboard_owner"] = dict(owner)
+    try:
+        return w.pns["handle_plan"](payload, *(conn or (None, None)))
+    except Exception as e:
+        return {"ok": None, "error": f"raised {e!r}"}
+
+
+def _card(w):
+    return w.pns["handle_plan"]({"action": "show"})["plan"]
+
+
+def test_ops_plan_card_shows_what_each_entry_changes():
+    print("\nthe plan's card: each recorded entry numbered, said plainly, with what it changes")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    with _fake_path(w):
+        check("no plan recorded: no card", _card(w) is None)
+        r = _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on")
+        check("the operator records a plan", r.returncode == 0, r.stdout + r.stderr)
+        c = _card(w)
+    ents = c["entries"]
+    check("both entries, numbered as the thread shows them",
+          [(e["n"], e["command"]) for e in ents]
+          == [(1, "trader-env-set MOMENTUM_UNIVERSE pit"), (2, "tailscale-on")], str(ents))
+    check("each with its op's plain description", "set one allowed key of trader's .env"
+          in ents[0]["description"] and "serve the dashboard to the tailnet" in ents[1]["description"])
+    check("and what it changes, from its arguments",
+          ents[0]["changes"].startswith("sets MOMENTUM_UNIVERSE=pit in trader's .env")
+          and "tailnet" in ents[1]["changes"], str([e["changes"] for e in ents]))
+    check("waiting, runnable, its expiry a day after it was recorded, nothing run",
+          c["status"] == "waiting" and c["runnable"] and not c["running"]
+          and abs(c["expires_at"] - c["at"] - 24 * 3600) < 1
+          and not any(e["used"] or e["result"] for e in ents), str(c))
+    check("in the operator's thread", c["thread"] == "D1:1.0")
+    import operator_role as O
+    st = O.State(w.tmp / "g.json")
+    st.set_thread("D1:1.0")
+    st.set_plan([{"name": "land", "args": ["tsk_ab12"], "guard": "trader-config",
+                  "summary": "lands silkworm/tsk_ab12 into main; changes trader's live config: config.py"}],
+                by="operator", thread="D1:1.0")
+    g = O.plan_card(st.plan_view())["entries"][0]
+    check("a guarded entry says what it is and what changes live",
+          g["description"] == "Land this task's branch into its base" and g["guard"] == "trader-config"
+          and "config.py" in g["changes"], str(g))
+
+
+def test_ops_plan_card_runs_only_the_entries_selected():
+    import operator_role as O
+    print("\nthe plan's card: Run selected answers the plan with those entries, and runs only them")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    with _fake_path(w):
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on")
+        pid = _card(w)["id"]
+        w.calls.write_text("")
+        r = _press(w, "run", pid, [2])
+        c = _card(w)
+        e1, e2 = c["entries"]
+        check("pressed with entry 2 ticked: the answer is taken", r.get("ok") and r["running"] == [2], str(r))
+        check("entry 2 ran (tailscale serve), entry 1 did not (.env untouched)",
+              any(x.startswith("tailscale serve --bg") for x in _calls(w))
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None and not e1["used"] and e2["used"],
+              str(_calls(w)))
+        check("its outcome is on the card: ok or failed, with the output's tail",
+              e2["result"]["state"] in ("ok", "failed") and isinstance(e2["result"].get("tail"), str)
+              and e1["result"] is None, str(e2))
+        check("the plan is answered, from the dashboard, by you: nothing more is runnable",
+              c["status"] == "answered" and not c["runnable"] and c["answered_via"] == "dashboard"
+              and c["answered_by"] == _OWNER["login"] and [e["chosen"] for e in c["entries"]] == [False, True],
+              str(c))
+        import ops as OPS
+        runs = [x for x in OPS.read_log(w.log, 50) if x.get("plan_entry") and not x.get("refused")]
+        check("the ops log records the plan, the entry, and that you pressed it on your phone",
+              [x["plan_entry"] for x in runs] == [2] and runs[0]["plan_id"] == pid
+              and "dashboard (owner@example.com on phone1)" in runs[0]["decided_via"], str(runs))
+        check("the operator's thread is told what ran", w.told and w.told[-1][0] == "D1:1.0"
+              and "2. `tailscale-on`" in w.told[-1][1] and "1." not in w.told[-1][1].split("\n", 1)[1],
+              str(w.told))
+        ts = f"{time.time() + 1:.6f}"
+        check("after it, a typed 'yes' answers nothing: entry 1 never runs",
+              w.state.answer_plan(ts, "yes") is None)
+        g = w.grants.open("D1:1.0", ts, "U_ME", "yes", "tsk_turn_mine", plan=None)
+        r2 = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("nor can the operator run it on that yes", r2.returncode == 1
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, r2.stderr)
+        why = O.plan_refusal({"plan": {"id": pid}, "ts": ts, "text": "yes"}, 1, "trader-env-set",
+                             ["MOMENTUM_UNIVERSE", "pit"], w.state.plan())
+        check("and a turn holding a grant on that plan is told you answered it on the card",
+              "card on the dashboard" in why and "nothing left for you to run" in why, why)
+        r3 = _press(w, "run", pid, [1])
+        check("and the card cannot be pressed again: answered once", not r3.get("ok")
+              and "already been answered" in r3["error"] and _env_value(w, "MOMENTUM_UNIVERSE") is None,
+              str(r3))
+
+        # Run all: every entry not yet run, then the plan is spent.
+        (w.trader / ".env").write_text(w.env_text)
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on")
+        pid = _card(w)["id"]
+        r = _press(w, "run", pid, "all")
+        c = _card(w)
+        check("Run all runs every entry, in order", r.get("ok") and r["running"] == [1, 2]
+              and _env_value(w, "MOMENTUM_UNIVERSE") == "pit"
+              and [e["result"]["state"] for e in c["entries"]][0] == "ok", str(c["entries"]))
+        check("and a plan whose every entry ran shows spent, not runnable",
+              c["status"] == "spent" and not c["runnable"])
+
+        # Ticked nothing; an entry that is not there.
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        check("Run selected with nothing ticked is refused, the plan still waiting",
+              not _press(w, "run", pid, []).get("ok") and _card(w)["status"] == "waiting")
+        r = _press(w, "run", pid, [5])
+        check("so is an entry the plan does not have", not r.get("ok") and "no entry 5" in r["error"]
+              and _card(w)["status"] == "waiting", str(r))
+        check("and a plan other than the live one", not _press(w, "run", "plan_old", "all").get("ok")
+              and _card(w)["status"] == "waiting")
+
+        # Not now.
+        w.calls.write_text("")
+        r = _press(w, "decline", pid)
+        c = _card(w)
+        check("Not now declines it: nothing runs, the plan is answered no",
+              r.get("ok") and r["declined"] and not _calls(w) and c["status"] == "answered"
+              and c["declined"] and not c["runnable"], str(c))
+        check("and the thread is told", "Not now" in w.told[-1][1])
+        check("after which a typed yes answers nothing",
+              w.state.answer_plan(f"{time.time() + 1:.6f}", "yes") is None)
+
+
+def test_ops_plan_card_runs_guarded_entries_as_their_buttons():
+    import operator_role as O
+    print("\nthe plan's card: a land or publish entry is done as its own dashboard button would")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    w.state.set_plan([{"name": "land", "args": ["tsk_ab12"], "guard": "trader-config", "summary": "x"},
+                      {"name": "publish", "args": ["cadence"], "guard": "publish", "summary": "y"}],
+                     by="operator", thread="D1:1.0")
+    pid = _card(w)["id"]
+    r = _press(w, "run", pid, "all")
+    check("the landing goes through /tasks, the publish through /projects",
+          r.get("ok") and w.tasks_called == [{"action": "land", "id": "tsk_ab12"}]
+          and w.projects_called == [{"action": "publish", "slug": "cadence", "on": True}],
+          f"{w.tasks_called} {w.projects_called}")
+    a, k = w.decided[0]
+    check("the task records that your press decided it, with the plan and entry",
+          a[0] == "tsk_ab12" and "dashboard" in k["via"] and k["lift"]["plan_id"] == pid
+          and k["lift"]["entry"] == 1 and k["lift"]["via"] == "dashboard", str(w.decided))
+    check("each outcome is on the card", [e["result"]["state"] for e in _card(w)["entries"]] == ["ok", "ok"])
+
+
+def test_ops_plan_card_refuses_without_you():
+    print("\nthe plan's card: refused unless it is verifiably you, and never from a turn or a sweep")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    with _fake_path(w):
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        pid = _card(w)["id"]
+        cases = {
+            "no owner vouched for": _press(w, "run", pid, "all", owner=None),
+            "the owner claimed by a process that is not the visualizer":
+                (setattr(w.probe, "opener", 9999), _press(w, "run", pid, "all"))[1],
+            "no connection to check": (setattr(w.probe, "opener", 4242),
+                                       _press(w, "run", pid, "all", conn=False))[1],
+            "another login": _press(w, "run", pid, "all", owner=dict(_OWNER, login="someone@else")),
+            "a peer not on the tailnet": _press(w, "run", pid, "all", owner=dict(_OWNER, peer="10.0.0.5")),
+        }
+        for what, r in cases.items():
+            check(f"refused: {what}", r.get("ok") is False and r.get("refused") == "owner", str(r))
+        sweep = _press(w, "run", pid, "all", caller_role="operator", caller_thread="D1:1.0",
+                       caller_task="tsk_sweep")
+        check("refused from inside a turn -- a sweep stamps its role, thread and task -- even with your owner",
+              sweep.get("ok") is False and sweep.get("refused") == "turn" and "sweep" in sweep["error"],
+              str(sweep))
+        check("so is any turn that stamps only its task or grant",
+              _press(w, "run", pid, "all", caller_task="tsk_wake").get("refused") == "turn"
+              and _press(w, "decline", pid, caller_grant="g1").get("refused") == "turn")
+        check("and Not now is held to the same", _press(w, "decline", pid, owner=None).get("refused") == "owner")
+        check("none of them answered the plan or ran anything",
+              _card(w)["status"] == "waiting" and _env_value(w, "MOMENTUM_UNIVERSE") is None)
+        w.drain.left = 600
+        r = _press(w, "run", pid, "all")
+        check("while a deploy drains the bot, nothing starts", r.get("refused") == "drain"
+              and _card(w)["status"] == "waiting", str(r))
+        w.drain.left = 0
+        r = _ops_cli(w, "run", "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--plan-entry", "1",
+                     "--by", "operator", "--notes", "sweep", task="tsk_sweep")
+        check("and the sweep's own way to run an entry is refused as before",
+              r.returncode == 1 and _env_value(w, "MOMENTUM_UNIVERSE") is None, r.stderr)
+
+
+def test_ops_plan_card_expired_or_answered_is_disabled():
+    import operator_role as O
+    print("\nthe plan's card: an expired, answered or spent plan shows, and can't be pressed")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    with _fake_path(w):
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        pid = _card(w)["id"]
+        data = json.loads(w.statefile.read_text())
+        data["plan"]["at"] -= O.PLAN_TTL_S + 60
+        w.statefile.write_text(json.dumps(data))
+        c = _card(w)
+        check("a day old and unanswered: shown expired, not runnable",
+              c["status"] == "expired" and not c["runnable"], str(c))
+        r = _press(w, "run", pid, "all")
+        check("and a press is refused, saying it expired", not r.get("ok") and "expired" in r["error"]
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, str(r))
+
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        pid = _card(w)["id"]
+        g = _plan_turn(w, "yes")
+        c = _card(w)
+        check("answered by a typed yes: shown answered by your message, not runnable",
+              c["status"] == "answered" and c["answered_via"] == "message" and not c["runnable"], str(c))
+        r = _press(w, "run", pid, "all")
+        check("and the card cannot answer it a second time",
+              not r.get("ok") and "already been answered" in r["error"]
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, str(r))
+        r = _plan_run(w, g, 1, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        check("while the typed yes still runs it, as before", r.returncode == 0
+              and _env_value(w, "MOMENTUM_UNIVERSE") == "pit", r.stdout + r.stderr)
+        c = _card(w)
+        check("and once it has, the card shows it spent", c["status"] == "spent" and c["entries"][0]["used"])
+        w.state.set_thread("D9:9.0")
+        _plan_record(w, "tailscale-on", task="tsk_x")      # refused: not its thread now
+        w.state.set_thread("D1:1.0")
+        _plan_record(w, "tailscale-on")
+        w.state.set_thread("D2:2.0")
+        c = _card(w)
+        check("the operator moved threads: shown replaced, not runnable",
+              c["status"] == "replaced" and not c["runnable"], str(c))
+        check("and refused", "another thread" in _press(w, "run", c["id"], "all").get("error", ""))
+
+
+#: The plan card's harness: the page's own card and buttons, against cards
+#: the bot made, with /api/plan answered as the test says.
+def _plan_card_harness():
+    head = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    return head + r"""
+const FIX = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+let CONFIRM = true;
+const asked = [];
+globalThis.confirm = m => { asked.push(m); return CONFIRM; };
+let planAnswer = {ok: true, plan: FIX.waiting};
+let pressAnswer = {ok: true, running: [2], plan: FIX.ran};
+answer = (url, b) => url === "/api/plan" ? (b.action === "show" ? planAnswer : pressAnswer) : BASE(url);
+(0, eval)(SRC + `
+;globalThis.__m = {loadPlan, planCardHtml, planPress, planTickEntry, drawPlan,
+  setActive: a => { active = a; }, plan: () => planView};`);
+const M = globalThis.__m, out = {};
+const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+const presses = () => calls.filter(c => c.url === "/api/plan" && c.body && c.body.action !== "show").map(c => c.body);
+const btn = (pact, plan) => { const e = E("BUTTON"); Object.assign(e.dataset, {pact, plan}); return e; };
+const box = (plan, n, on) => { const e = E("INPUT"); Object.assign(e.dataset, {plan, n: String(n)}); e.checked = on; return e; };
+(async () => {
+  out.waiting = M.planCardHtml(FIX.waiting, "thread");
+  out.expired = M.planCardHtml(FIX.expired, "thread");
+  out.spent = M.planCardHtml(FIX.spent, "thread");
+  out.answered = M.planCardHtml(FIX.answered, "thread");
+  out.ran = M.planCardHtml(FIX.ran, "thread");
+  await M.loadPlan(); await flushAsync();
+  M.setActive({key: FIX.waiting.thread}); M.drawPlan();
+  out.inThread = byId("tplan").innerHTML;
+  M.setActive({key: "C9:9.9"}); M.drawPlan();
+  out.otherThread = byId("tplan").innerHTML;
+  M.setActive({key: FIX.waiting.thread});
+  const id = FIX.waiting.id;
+  await M.planPress(btn("selected", id)); await flushAsync();
+  out.nothingTicked = presses();
+  M.planTickEntry(box(id, 2, true));
+  out.afterTick = byId("tplan").innerHTML;
+  CONFIRM = false;
+  await M.planPress(btn("selected", id)); await flushAsync();
+  out.declinedConfirm = presses();
+  CONFIRM = true;
+  await M.planPress(btn("selected", id)); await flushAsync();
+  out.selected = presses();
+  out.confirmText = asked[asked.length - 1];
+  out.afterPress = byId("tplan").innerHTML;
+  planAnswer = {ok: true, plan: FIX.waiting};
+  pressAnswer = {ok: true, running: [1, 2], plan: FIX.ran};
+  await M.loadPlan(); await flushAsync();
+  await M.planPress(btn("all", id)); await flushAsync();
+  out.all = presses().slice(-1);
+  await M.planPress(btn("all", id)); await flushAsync();
+  out.allAgain = presses().length;       // the card it drew is answered: nothing more goes
+  await M.loadPlan(); await flushAsync();
+  pressAnswer = {ok: true, declined: true, plan: FIX.answered};
+  await M.planPress(btn("decline", id)); await flushAsync();
+  out.decline = presses().slice(-1);
+  planAnswer = {ok: true, plan: FIX.waiting};
+  await M.loadPlan(); await flushAsync();
+  pressAnswer = {ok: false, refused: "owner", error: "refused: only you can answer the operator's plan"};
+  await M.planPress(btn("all", id)); await flushAsync();
+  out.refusedToast = toastEl.text;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_dashboard_plan_card_renders_and_presses():
+    import re
+    import operator_role as O
+    import visualizer as V
+    print("\nthe dashboard's plan card: drawn from the bot's card, its buttons the plan's answer")
+    page = V.PAGE
+    js = re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+    check("the thread has a slot for it", '<div id="tplan"></div>' in page)
+    check("it is polled, and its route is /api/plan", "pollPlan = poller(" in js
+          and '"/api/plan"' in js and 'elif url.path == "/api/plan":' in Path(V.__file__).read_text())
+    check("the inbox's typed-yes Run plan is gone: the card answers the plan",
+          '"run-plan"' not in js and "runPlan(" not in js)
+    src = Path(V.__file__).read_text()
+    route = src[src.index('elif url.path == "/api/plan":'):src.index('elif url.path == "/api/seen":')]
+    check("the route vouches for the owner only on a press, as /api/send does, dropping one the page sent",
+          'payload.pop("dashboard_owner", None)' in route and "self._owner()" in route
+          and '!= "show"' in route)
+    tmp = Path(tempfile.mkdtemp())
+    st = O.State(tmp / "op.json")
+    st.set_thread("D1:1.0")
+    st.set_plan([{"name": "trader-env-set", "args": ["MOMENTUM_UNIVERSE", "pit"]},
+                 {"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
+    import ops as OPS
+    desc = {d["name"]: d["description"] for d in OPS.describe()}
+    card = lambda: dict(O.plan_card(st.plan_view(), desc), running=False)
+    waiting = card()
+    pid = waiting["id"]
+    expired = dict(O.plan_card(st.plan_view(now=time.time() + O.PLAN_TTL_S + 5), desc), running=False)
+    st.answer_plan_from_dashboard(pid, [2], by="owner@example.com")
+    st.use_plan_entry(pid, 2, run_by="dashboard")
+    st.set_entry_result(pid, 2, {"state": "failed", "exit": 3, "tail": "tailscale: <not connected>"})
+    ran = card()
+    st.set_entry_result(pid, 2, {"state": "ok", "tail": "serving"})
+    st.use_plan_entry(pid, 1)
+    spent = card()
+    st2 = O.State(tmp / "op2.json"); st2.set_thread("D1:1.0")
+    st2.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
+    st2.answer_plan_from_dashboard(st2.plan_view()["id"], [], by="owner@example.com")
+    answered = dict(O.plan_card(st2.plan_view(), desc), running=False)
+    fix = {"waiting": waiting, "expired": expired, "ran": ran, "spent": spent, "answered": answered}
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the card checked by text only")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(_plan_card_harness())
+    (d / "fix.json").write_text(json.dumps(fix))
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), "", str(d / "fix.json")],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the plan card harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    wt = o["waiting"]
+    boxes = re.findall(r'<input type="checkbox"[^>]*>', wt)
+    check("waiting: a numbered entry each, with a checkbox, unticked and enabled",
+          len(boxes) == 2 and not any("disabled" in b or "checked" in b for b in boxes)
+          and "<b>1.</b>trader-env-set MOMENTUM_UNIVERSE pit" in wt and "<b>2.</b>tailscale-on" in wt, wt[:900])
+    check("each with its plain description and what it changes",
+          "set one allowed key of trader&#39;s .env" in wt or "set one allowed key of trader's .env" in wt)
+    check("the change said from the entry's own arguments", "Changes: sets MOMENTUM_UNIVERSE=pit" in wt, wt[:1500])
+    pacts = lambda h: [(m.group(1), " disabled" in m.group(0))
+                       for m in re.finditer(r'<button[^>]*data-pact="(\w+)"[^>]*>', h)]
+    btns = dict(pacts(wt))
+    check("Run all and Not now pressable; Run selected not until something is ticked",
+          btns == {"all": False, "selected": True, "decline": False}, str(btns))
+    check("it says how long it waits, and that a typed yes still works", "Waits for your answer until" in wt
+          and "say “yes”" in wt)
+    for name in ("expired", "spent", "answered"):
+        h = o[name]
+        dis = [d for _, d in pacts(h)]
+        check(f"{name}: every button and checkbox disabled",
+              dis == [True] * 3 and all("disabled" in b for b in re.findall(r'<input[^>]*>', h)), h[:600])
+    check("expired says so", "Expired unanswered" in o["expired"])
+    check("declined says nothing in it runs", "You said not now" in o["answered"])
+    check("spent says every step has run, and each shows its outcome",
+          "Every step has run" in o["spent"] and "Already run" in o["spent"] and "✓ ok" in o["spent"])
+    check("a failed step shows failed, its exit code and the output's tail",
+          "✗ failed (exit 3)" in o["ran"] and "tailscale: &lt;not connected&gt;" in o["ran"], o["ran"][:1500])
+    check("drawn in the operator's thread when it is open, and in no other",
+          'data-id="%s"' % pid in o["inThread"] and o["otherThread"] == "")
+    check("Run selected with nothing ticked sends nothing", o["nothingTicked"] == [])
+    check("ticking an entry enables Run selected, counting it",
+          ">Run selected (1)<" in o["afterTick"] and 'data-n="2" checked' in o["afterTick"], o["afterTick"][:1200])
+    check("declining the confirmation sends nothing", o["declinedConfirm"] == [])
+    check("Run selected sends a run of just the ticked entries, for this plan",
+          o["selected"] == [{"action": "run", "plan_id": pid, "entries": [2]}], str(o["selected"]))
+    check("having asked first, naming the step", "1 step" in o["confirmText"] and "2. tailscale-on" in o["confirmText"]
+          and "1. trader-env-set" not in o["confirmText"], o["confirmText"])
+    check("the result streams back into the card", "✗ failed (exit 3)" in o["afterPress"])
+    check("Run all sends entries all", o["all"] == [{"action": "run", "plan_id": pid, "entries": "all"}], str(o["all"]))
+    check("once a press is answered, its drawn-disabled card sends nothing more",
+          o["allAgain"] == 2, str(o["allAgain"]))
+    check("Not now sends decline", o["decline"] == [{"action": "decline", "plan_id": pid}], str(o["decline"]))
+    check("a refusal is said", "only you can answer" in o["refusedToast"], o["refusedToast"])
+
+
+def test_ops_plan_card_runs_what_the_plan_recorded():
+    import ops as OPS
+    import operator_role as O
+    print("\nthe plan's card: what runs is what the plan recorded as chosen, each once, and "
+          "an entry that never started is not called run")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    with _fake_path(w):
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on")
+        pid = _card(w)["id"]
+        r = _press(w, "run", pid, [2, "1", 2])
+        c = _card(w)
+        check("a hand-made [2, '1', 2] runs 1 then 2, once each, as the plan recorded them",
+              r.get("ok") and r["running"] == [1, 2] and _env_value(w, "MOMENTUM_UNIVERSE") == "pit"
+              and [e["result"]["state"] for e in c["entries"]][0] == "ok"
+              and "already run" not in (c["entries"][1]["result"]["tail"] or ""), str(c["entries"]))
+
+        # The op already running: it never started, so it is not spent.
+        (w.trader / ".env").write_text(w.env_text)
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit")
+        pid = _card(w)["id"]
+        with OPS._running_guard:
+            OPS._running.add(("trader-env-set", "trader"))
+        try:
+            r = _press(w, "run", pid, "all")
+        finally:
+            with OPS._running_guard:
+                OPS._running.discard(("trader-env-set", "trader"))
+        e = _card(w)["entries"][0]
+        check("an op already running: failed, saying so, and not marked run",
+              e["result"]["state"] == "failed" and "already running" in e["result"]["tail"]
+              and not e["used"] and _card(w)["status"] == "answered"
+              and _env_value(w, "MOMENTUM_UNIVERSE") is None, str(e))
+
+        # Chosen in time, run after the day is up: still runs.
+        _plan_record(w, "trader-env-set", "MOMENTUM_UNIVERSE", "pit", "--op", "tailscale-on")
+        pid = _card(w)["id"]
+        snap, why = w.state.answer_plan_from_dashboard(pid, [1], by="me")
+        data = json.loads(w.statefile.read_text())
+        data["plan"]["at"] -= O.PLAN_TTL_S + 60
+        w.statefile.write_text(json.dumps(data))
+        check("an entry the press chose is claimed by that press though the day ran out mid-run",
+              w.state.use_plan_entry(pid, 1, answer=snap["answered"]))
+        check("but not one it did not choose", not w.state.use_plan_entry(pid, 2, answer=snap["answered"]))
+        check("nor by any other answer", not w.state.use_plan_entry(pid, 1, answer="dashboard:x"))
+
+
+def test_ops_plan_card_restart_says_what_it_cut_off():
+    import operator_role as O
+    print("\nthe plan's card: entries a restart cut off are said to be, not left running")
+    tmp = Path(tempfile.mkdtemp())
+    st = O.State(tmp / "op.json")
+    st.set_thread("D1:1.0")
+    rec = st.set_plan([{"name": "tailscale-on"}, {"name": "project-test", "args": ["alpha"]},
+                       {"name": "trader-launchd-retire", "args": ["com.x"]}], by="operator",
+                      thread="D1:1.0")
+    st.answer_plan_from_dashboard(rec["id"], [1, 2, 3], by="me")
+    st.set_entry_result(rec["id"], 1, {"state": "ok", "tail": "done"})
+    st.set_entry_result(rec["id"], 2, {"state": "running"})
+    st.set_entry_result(rec["id"], 3, {"state": "queued"})
+    check("the running and the waiting one are changed", st.clear_interrupted_results() == [2, 3])
+    res = [e.get("result") for e in st.plan_view()["entries"]]
+    check("each failed, saying the restart cut it off, the finished one untouched",
+          res[0] == {"state": "ok", "tail": "done"}
+          and res[1]["state"] == "failed" and "while it was running" in res[1]["tail"]
+          and res[2]["state"] == "failed" and "never ran" in res[2]["tail"], str(res))
+    check("and a second sweep changes nothing", st.clear_interrupted_results() == [])
+    src = (BASE / "bot.py").read_text()
+    check("the bot sweeps it at startup, beside interrupted landings",
+          "OPERATOR.clear_interrupted_results()" in src
+          and src.index("clear_interrupted_landings()\n    except")
+          < src.index("OPERATOR.clear_interrupted_results()"))
 
 
 if __name__ == "__main__":

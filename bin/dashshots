@@ -204,7 +204,9 @@ def stand_in(real_port: str):
                        "/learnings": READ_LEARNINGS}.get(self.path)
             if self.path in READ_ROUTES:
                 allowed, action = {action}, action
-            if self.path == "/releases" and action == "plan":
+            if self.path == "/plan" and action == "show":
+                answer = {"ok": True, "plan": sample_ops_plan()[1]}
+            elif self.path == "/releases" and action == "plan":
                 answer = SAMPLE_PLAN
             elif self.path == "/releases" and action == "status":
                 answer = {"ok": True, "run": None}
@@ -216,6 +218,8 @@ def stand_in(real_port: str):
                     # by this checkout's inbox.py, over the live state read
                     # only -- what the bot's own route would answer.
                     answer = local_inbox(real_port)
+                if self.path == "/tasks" and action == "inbox":
+                    answer = with_sample_plan(answer)
             else:
                 answer = {"ok": False, "error": "screenshot harness: read-only"}
             body = json.dumps(answer).encode()
@@ -232,6 +236,66 @@ def stand_in(real_port: str):
             self.end_headers()
 
     return Bot
+
+
+_SAMPLE_OPS_PLAN: list = []
+
+
+def sample_ops_plan() -> tuple[dict, dict]:
+    """The sample plan (_sample_ops_plan), made once: the inbox's item and the
+    plan's own read must name the same plan id, as the bot's do."""
+    if not _SAMPLE_OPS_PLAN:
+        _SAMPLE_OPS_PLAN.append(_sample_ops_plan())
+    return _SAMPLE_OPS_PLAN[0]
+
+
+def _sample_ops_plan() -> tuple[dict, dict]:
+    """(raw plan, card): a fixed plan of ops in the operator's real thread, for
+    its card -- the live one is usually spent, and a press here is refused.
+    DASHSHOTS_PLAN=ran photographs it after Run selected: entry 1 ok, entry 2
+    failed with its output, entry 3 not chosen."""
+    sys.path.insert(0, str(REPO))
+    import ops
+    import operator_role
+    try:
+        thread = operator_role.State(live_home() / "operator.json", readonly=True).thread()
+    except Exception:
+        thread = ""
+    st = operator_role.State(Path(tempfile.mkdtemp()) / "operator.json")
+    st.set_thread(thread or "D0:0.0")
+    rec = st.set_plan([
+        {"name": "trader-env-set", "args": ["MOMENTUM_UNIVERSE", "pit"]},
+        {"name": "tailscale-on", "args": []},
+        {"name": "land", "args": ["tsk_5c1e0a9b21"], "guard": "trader-config",
+         "summary": "lands silkworm/tsk_5c1e0a9b21 into main; changes trader's live config: "
+                    "config/sleeves.toml"}], by="operator", thread=thread or "D0:0.0",
+        now=time.time() - 40 * 60)
+    if os.environ.get("DASHSHOTS_PLAN") == "ran":
+        st.answer_plan_from_dashboard(rec["id"], [1, 2], by="owner@example.com")
+        for n, res in ((1, {"state": "ok", "exit": 0, "tail": "MOMENTUM_UNIVERSE: static -> pit"}),
+                       (2, {"state": "failed", "exit": 1,
+                            "tail": "tailscale serve: this machine is not logged in to Tailscale "
+                                    "(run `tailscale up`)"})):
+            st.use_plan_entry(rec["id"], n, run_by="dashboard")
+            st.set_entry_result(rec["id"], n, dict(res, at=time.time()))
+    desc = {d["name"]: d["description"] for d in ops.describe()}
+    return st.plan_view(), dict(operator_role.plan_card(st.plan_view(), desc), running=False)
+
+
+def with_sample_plan(answer: dict) -> dict:
+    """The inbox's answer with the sample plan's item, when it has no plan."""
+    if not answer.get("ok"):
+        return answer
+    if any(i.get("kind") == "plan" for g in answer.get("groups") or [] for i in g.get("items") or []):
+        return answer
+    import inbox
+    raw, _ = sample_ops_plan()
+    item = inbox.plan_item(raw)
+    if not item:
+        return answer
+    group = {"project": inbox.OPERATOR, "title": "The operator", "items": [item]}
+    return dict(answer, groups=[group, *(answer.get("groups") or [])],
+                count=(answer.get("count") or 0) + 1)
 
 
 def local_inbox(real_port: str) -> dict:
@@ -438,6 +502,12 @@ def get_json(url: str, payload=None):
 def pick_examples(base: str, project: str) -> dict:
     """A long conversation and a task with a review, from the copy's own data."""
     out = {"thread": "", "card": "", "task": ""}
+    try:
+        sys.path.insert(0, str(REPO))
+        import operator_role
+        out["operator"] = operator_role.State(live_home() / "operator.json", readonly=True).thread()
+    except Exception:
+        out["operator"] = ""
     sessions = get_json(base + "/api/sessions").get("sessions", [])
     convs = [s for s in sessions if (s.get("kind") or "thread") == "thread"
              and not s.get("hidden") and s.get("turns", 0) > 2]
@@ -473,6 +543,8 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("sessions-unread", "/?list=unread"),
         ("stats", "/?view=stats"),
         ("thread", f"/?thread={quote(ex['thread'])}"),
+        # The operator's thread, with the sample plan's card (DASHSHOTS_PLAN).
+        *([("thread-plan", f"/?thread={quote(ex['operator'])}")] if ex.get("operator") else []),
         *([("thread-running", f"/?thread={quote(ex['running'])}")] if ex.get("running") else []),
         # The thread's longest turn, its one tools line opened onto the chain.
         ("thread-tools", f"/?thread={quote(ex['thread'])}&tools=open"),
