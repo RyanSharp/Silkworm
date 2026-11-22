@@ -9041,7 +9041,7 @@ def test_home_tab():
     for st, acts in dash.items():
         # A task carrying a step (needs_user) is offered Release and Done as
         # well, on both surfaces; the dashboard's branch shows every button.
-        mine = {a for _, a, _, _ in home.BUTTONS.get(st, [])
+        mine = {a for _, a in home.BUTTONS.get(st, [])
                 + (home.STEP_BUTTONS if st == T.NEEDS_INPUT else [])}
         check(f"{st}: same actions as the dashboard", mine == acts,
               f"home {sorted(mine)} vs dashboard {sorted(acts)}")
@@ -20244,7 +20244,8 @@ def test_findings_actions_on_the_slack_board():
     check("an ordinary needs_input task is offered what it always was",
           home.buttons_for(dict(rec, role="implementor")) == home.BUTTONS[T.NEEDS_INPUT])
     check("Close is a relayed action with a confirmation",
-          "close" in home.DIRECT and dict((b[1], b[3]) for b in home.buttons_for(rec))["close"])
+          "close" in home.DIRECT
+          and home.confirm_modal(rec, "close")["submit"]["text"] == "Close findings")
     check("Dig deeper opens a window", "dig" in home.NOTES and "dig" not in home.DIRECT)
     line = home._task_line(rec, time.time(), "https://x.slack.com")
     opts = {o["value"].split("|")[0]: o for o in line["accessory"]["options"]}

@@ -53,39 +53,27 @@ HEADINGS = {
 }
 
 #: The same buttons the dashboard's taskButtons() offers, state for state.
-#: (label, action, style, confirm-text or None). "rework"/"answer" open a modal.
+#: (label, action). "rework"/"answer"/"dig" open a window for words; every
+#: other action opens confirm_modal(), which carries the detail that decides it.
 BUTTONS = {
-    tasks.PROPOSED: [("Accept", "accept", "primary", None),
-                     ("Dismiss", "dismiss", None, "Dismiss this proposal?")],
-    tasks.AWAITING_APPROVAL: [
-        ("Approve", "approve", "primary",
-         "Approve and land this branch on the base?"),
-        ("Send back…", "rework", None, None),
-        ("Dismiss", "dismiss", None, "Dismiss this task? Its branch is left as it is.")],
-    tasks.NEEDS_INPUT: [("Answer…", "answer", "primary", None),
-                        ("Dismiss", "dismiss", None, "Dismiss this task?")],
-    tasks.FAILED: [("Retry", "retry", "primary", None),
-                   ("Dismiss", "dismiss", None, "Dismiss this failure?")],
-    tasks.QUEUED: [("Cancel", "cancel", None, "Cancel this task?")],
-    tasks.BLOCKED: [("Cancel", "cancel", None, "Cancel this task?")],
+    tasks.PROPOSED: [("Accept", "accept"), ("Dismiss", "dismiss")],
+    tasks.AWAITING_APPROVAL: [("Approve", "approve"), ("Send back…", "rework"),
+                              ("Dismiss", "dismiss")],
+    tasks.NEEDS_INPUT: [("Answer…", "answer"), ("Dismiss", "dismiss")],
+    tasks.FAILED: [("Retry", "retry"), ("Dismiss", "dismiss")],
+    tasks.QUEUED: [("Cancel", "cancel")],
+    tasks.BLOCKED: [("Cancel", "cancel")],
 }
 
 #: Offered ahead of BUTTONS[needs_input] when the run left you a step
 #: (`needs_user`), as the dashboard does: Release only when that step is a
 #: `!release` the board can run, Done always. See buttons_for().
-STEP_BUTTONS = [("Release", "release", "primary", None),
-                ("Done", "resolve", None,
-                 "Mark this done? Only if you have taken the step yourself.")]
+STEP_BUTTONS = [("Release", "release"), ("Done", "resolve")]
 
 #: A research task waiting on you with its findings: in place of Answer, as
 #: the dashboard does. Close ends it, Dig deeper asks a follow-up question (a
 #: modal, like Answer), Discuss is the thread link drawn beside them.
-RESEARCH_BUTTONS = [
-    ("Close", "close", "primary",
-     "Close these findings? Nothing further runs; any next steps it filed "
-     "stay on the board for you to accept or dismiss."),
-    ("Dig deeper…", "dig", None, None),
-    ("Dismiss", "dismiss", None, "Dismiss this research?")]
+RESEARCH_BUTTONS = [("Close", "close"), ("Dig deeper…", "dig"), ("Dismiss", "dismiss")]
 
 #: Actions that are a plain call to handle_tasks; the others open a modal.
 DIRECT = ("accept", "dismiss", "approve", "retry", "cancel", "release", "resolve",
@@ -123,16 +111,9 @@ def buttons_for(task: dict) -> list:
         base = [b for b in base if b[1] != "retry"]
     if state != tasks.NEEDS_INPUT or not asks.get("action"):
         return base
-    step = []
-    for label_, action, style, confirm in STEP_BUTTONS:
-        if action == "resolve" and findings:
-            continue                     # Close is the same move, said once
-        if action == "release":
-            if not asks.get("release"):
-                continue
-            confirm = (f"Run `!release {asks['release']}` now? The result goes to "
-                       "the task's thread, and it is done only if the release goes out.")
-        step.append((label_, action, style, confirm))
+    step = [b for b in STEP_BUTTONS
+            if not (b[1] == "resolve" and findings)        # Close says it once
+            and not (b[1] == "release" and not asks.get("release"))]
     return step + base
 
 
