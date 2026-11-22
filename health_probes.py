@@ -70,6 +70,7 @@ from pathlib import Path
 import credentials
 import envfile
 import health
+from redaction import SECRETS as _SECRETS, scrub  # noqa: F401
 import releases
 import tailnet
 from health import FAIL, OK, UNKNOWN, WARN, result, unknown
@@ -111,31 +112,7 @@ class Unavailable(Exception):
 
 
 # --- secrets ---------------------------------------------------------------------
-
-_SECRETS = [
-    re.compile(r"sbp_[A-Za-z0-9]{8,}"),                 # Supabase management token
-    re.compile(r"sb_(?:secret|publishable)_[A-Za-z0-9_-]{8,}"),
-    re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}"),            # Anthropic / claude token
-    re.compile(r"xox[abposr]-[A-Za-z0-9-]{8,}"),         # Slack
-    re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),  # a JWT
-    re.compile(r"(?i)(bearer\s+)[^\s\"']+"),
-    re.compile(r"\b(?:nodekey|mkey|discokey|nlpub|privkey):[0-9a-f]{8,}"),  # Tailscale keys
-    re.compile(r"tskey-[A-Za-z0-9-]{8,}"),               # a Tailscale auth key
-    re.compile(r"(login\.tailscale\.com/a/)[A-Za-z0-9]+"),  # a login link
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
-]
-
-
-def scrub(text, known=()) -> str:
-    """`text` with anything shaped like a credential -- and any value in
-    `known`, the credentials a probe actually read -- replaced."""
-    out = str(text or "")
-    for value in known:
-        if value and len(value) >= 6:
-            out = out.replace(value, "[redacted]")
-    for pat in _SECRETS:
-        out = pat.sub(lambda m: (m.group(1) if m.groups() else "") + "[redacted]", out)
-    return out
+# redaction.py: `scrub` is imported above, and used throughout, from there.
 
 
 def _safe(res: dict, known=()) -> dict:

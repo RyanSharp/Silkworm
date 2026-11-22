@@ -690,8 +690,8 @@ _running_guard = threading.Lock()
 
 def _scrub(text: str) -> str:
     try:
-        import health_probes
-        return health_probes.scrub(text)
+        import redaction
+        return redaction.scrub(text)
     except Exception:
         return text
 

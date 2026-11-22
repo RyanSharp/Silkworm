@@ -477,7 +477,8 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
     if (source / "assets").is_dir():
         shutil.copytree(source / "assets", tmp / "assets")
     # operator.json: whose thread the list pins (the operator's home).
-    for name in ("sessions.json", "operator.json"):
+    # tasks.json: what search finds tasks in (visualizer.SearchIndex).
+    for name in ("sessions.json", "operator.json", "tasks.json"):
         if (home / name).exists():
             shutil.copy2(home / name, tmp / name)
     own_turn(tmp / "sessions.json")
@@ -607,6 +608,8 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         # turn writes: the page draws it from the key alone.
         ("thread-new", f"/?thread={quote(NEW_THREAD)}"),
         ("search", "/?q=" + quote("tailscale")),
+        # A task id's first characters: the id match first, then mentions.
+        ("search-id", "/?q=" + quote(ex["task"][:9])),
         ("new-thread", "/?modal=new-thread"),
         ("alerts", "/?modal=alerts"),
         ("tasks", "/?view=tasks"),

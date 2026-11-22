@@ -1583,7 +1583,19 @@ A local web dashboard for every thread session (localhost-only):
   polled from the bot; a dot in the header shows whether the bot is up.
 - **Transcripts** — markdown-rendered messages with per-turn token usage and
   cache-hit %, collapsible tool calls, results, and thinking.
-- **Full-text search** across all thread transcripts.
+- **Search threads and tasks** — one field (⌘K / Ctrl-K jumps to it; 🔍 on
+  a phone) finds threads by title, summary and the words of their messages,
+  and tasks by id (`tsk_…`, whole or its first characters), title, goal and
+  result. Results come in two groups, the better first, each showing its
+  first six (the rest on a tap) with the words around the match and the match
+  marked; at most 50 come back, each group sure of ten. ↑ ↓ and Return pick
+  one; a thread opens in place, a task as its card on the board. Answered
+  from an index in memory (visualizer.SearchIndex): the stores are re-read
+  only when they change, and a transcript only from where it was last read —
+  about 10ms a search on the real stores, the first after startup built in
+  the background. Everything indexed is scrubbed of credentials first
+  (health_probes.scrub), so a secret can be neither shown nor found.
+  `?q=<words>` opens a search.
 - **Files** — everything exchanged with a thread (Slack uploads in, generated
   files out) listed with download links; outbound files are archived under
   `artifacts/`.

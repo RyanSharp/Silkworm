@@ -35,6 +35,7 @@ import envfile
 import jsonstore
 import operator_role
 import procs
+import redaction
 import slacklinks
 import unread
 
@@ -928,32 +929,318 @@ def cached_stats() -> dict:
     return _stats_cache["data"]
 
 
-def search(query: str) -> list[dict]:
-    q = query.lower()
-    results = []
-    if not q:
-        return results
-    for key, entry in raw_sessions().items():
-        sid = entry.get("session_id", "")
+# --- search ---------------------------------------------------------------------
+# One field finds threads (by title, summary and the words of their messages)
+# and tasks (by id, title, goal and result). Answered from an index held in
+# memory and brought up to date on each search: sessions.json and tasks.json
+# are read again only when they change, and a transcript only from where it
+# was last read -- a full read of every transcript is over a second, and a
+# search is a keystroke away. Everything indexed is scrubbed of anything
+# shaped like a credential first (redaction.scrub, the redaction the
+# health checks use), so no search can match a secret, let alone show one.
+
+TASKS_FILE = BASE_DIR / "tasks.json"
+#: Results in one answer, threads and tasks together.
+SEARCH_LIMIT = 50
+#: Of those, how many each group (tasks, threads) is sure of when it has them.
+SEARCH_GROUP_FLOOR = 10
+#: Characters of context either side of a match in a snippet.
+SNIPPET_CONTEXT = 60
+#: A field's weight in a hit's score: a match in a title says more than one
+#: somewhere in a long transcript.
+SEARCH_WEIGHT = {"id": 1000, "title": 100, "summary": 40, "goal": 40,
+                 "result": 20, "message": 10}
+_TASK_ID = re.compile(r"tsk_[0-9a-z]*")
+#: A message whose content is a plain string rather than blocks.
+_STRING_CONTENT = re.compile(rb'"content":\s*"')
+
+
+def _redact(text) -> str:
+    """`text` scrubbed of credentials -- or, when the scrubber cannot be had,
+    nothing at all: an unscrubbed snippet is the one thing never to show."""
+    try:
+        return redaction.scrub(text)
+    except Exception:
+        return ""
+
+
+def _search_text(v) -> str:
+    return _redact(v if isinstance(v, str) else "") if v else ""
+
+
+class SearchIndex:
+    """Threads and tasks, as the search reads them. Each field is held as
+    (text, text.lower()); a thread's messages as (role, ts, text, lower)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sessions_sig = None
+        self.tasks_sig = None
+        self.threads: dict = {}     # key -> {"title", "summary", "kind", "hidden", "updated", "sid"}
+        self.tasks: list = []       # [{"id", "title", "goal", "result", "state", "project", "updated"}]
+        self.transcripts: dict = {}  # session id -> {"path", "offset", "msgs": [...]}
+        # raw text -> its field, from the last read of the stores: tasks.json
+        # is rewritten every few seconds while the bot works, and scrubbing
+        # all of it again each time is most of a reload.
+        self._memo: dict = {}
+        self._next_memo: dict = {}
+
+    @staticmethod
+    def _sig(path: Path):
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    def _field(self, v) -> tuple:
+        if not isinstance(v, str) or not v:
+            return ("", "")
+        got = self._memo.get(v) or self._next_memo.get(v)
+        if got is None:
+            t = _search_text(v)
+            got = (t, t.lower())
+        self._next_memo[v] = got
+        return got
+
+    def _load_sessions(self):
+        sig = self._sig(SESSIONS_FILE)
+        threads = {}
+        for key, e in raw_sessions().items():
+            if not isinstance(e, dict):
+                continue
+            threads[key] = {"title": self._field(e.get("title")),
+                            "summary": self._field(e.get("summary")),
+                            "kind": e.get("kind") or "thread",
+                            "hidden": bool(e.get("hidden")),
+                            "project": e.get("project") or "",
+                            "updated": float(e.get("updated") or 0),
+                            "sid": e.get("session_id") or ""}
+        self.threads, self.sessions_sig = threads, sig
+
+    def _load_tasks(self):
+        sig = self._sig(TASKS_FILE)
+        raw = jsonstore.load(TASKS_FILE, default={}, repair=False) or {}
+        rows = raw.values() if isinstance(raw, dict) else raw
+        tasks = []
+        for t in rows:
+            if not isinstance(t, dict) or not t.get("id"):
+                continue
+            res = t.get("result")
+            tasks.append({"id": str(t["id"]),
+                          "title": self._field(t.get("title")),
+                          "goal": self._field(t.get("goal")),
+                          "result": self._field(res.get("text") if isinstance(res, dict) else None),
+                          "state": t.get("state") or "", "role": t.get("role") or "",
+                          "project": t.get("project") or "",
+                          "updated": float(t.get("updated") or t.get("created") or 0)})
+        self.tasks, self.tasks_sig = tasks, sig
+
+    def _read_transcript(self, sid: str):
         path = find_transcript(sid)
-        if not path:
-            continue
-        for d in iter_entries(path):
-            for b in _block_list((d.get("message") or {}).get("content")):
-                if b["type"] != "text":
-                    continue
-                low = b["text"].lower()
-                i = low.find(q)
-                if i < 0:
-                    continue
-                start = max(0, i - 60)
-                snippet = b["text"][start:i + len(query) + 60].replace("\n", " ")
-                results.append({"key": key, "session_id": sid, "role": d["type"],
-                                "ts": d.get("timestamp", ""), "snippet": snippet})
-                if len(results) >= 50:
-                    return results
-                break  # one hit per message is enough
-    return results
+        rec = self.transcripts.get(sid)
+        if path is None:
+            self.transcripts.pop(sid, None)
+            return
+        if rec is None or rec["path"] != path:
+            rec = self.transcripts[sid] = {"path": path, "offset": 0, "msgs": []}
+        try:
+            if path.stat().st_size == rec["offset"]:
+                return
+            lines, rec["offset"], reset = _complete_lines(path, rec["offset"])
+        except OSError:
+            return
+        if reset:
+            rec["msgs"] = []
+        for raw in lines:
+            # Most of a transcript is tool calls and their output: no text
+            # block, no string content, no json.loads.
+            if b'"text"' not in raw and not _STRING_CONTENT.search(raw):
+                continue
+            try:
+                for d in _entries_of((raw,)):
+                    msg = d.get("message")
+                    if d.get("isMeta") or not isinstance(msg, dict):
+                        continue
+                    for b in _block_list(msg.get("content")):
+                        if b["type"] == "text":
+                            t = _redact(b["text"])
+                            if t:
+                                rec["msgs"].append((d["type"], d.get("timestamp", ""), t, t.lower()))
+                    # (a line of some other shape is skipped, not the rest of the read)
+            except Exception:
+                continue
+
+    def refresh(self):
+        changed = (self._sig(SESSIONS_FILE) != self.sessions_sig
+                   or self._sig(TASKS_FILE) != self.tasks_sig)
+        if changed:
+            # Both stores are re-read through one memo, or a sessions read
+            # would forget every task's fields the tasks read left in it.
+            self.sessions_sig = self.tasks_sig = None
+            self._next_memo = {}
+            self._load_sessions()
+            self._load_tasks()
+            self._memo, self._next_memo = self._next_memo, {}
+        live = {t["sid"] for t in self.threads.values() if t["sid"]}
+        for sid in list(self.transcripts):
+            if sid not in live:
+                del self.transcripts[sid]
+        for sid in live:
+            self._read_transcript(sid)
+
+    def search(self, query: str, limit: int = SEARCH_LIMIT) -> dict:
+        if not _terms(query):
+            return rank(query, {}, [], {}, limit)
+        with self.lock:
+            self.refresh()
+            return rank(query, self.threads, self.tasks, self.transcripts, limit)
+
+
+def _terms(query: str) -> list:
+    return [w for w in query.lower().split() if w]
+
+
+def _match(field: tuple, terms: list) -> tuple | None:
+    """(score bonus, position of the first term) when every term is in the
+    field, else None. The whole query as one phrase scores higher."""
+    low = field[1]
+    pos = []
+    for w in terms:
+        i = low.find(w)
+        if i < 0:
+            return None
+        pos.append(i)
+    phrase = " ".join(terms)
+    i = low.find(phrase)
+    return (2 if i >= 0 else 1, i if i >= 0 else min(pos))
+
+
+def snippet(text: str, at: int, terms: list, context: int = SNIPPET_CONTEXT) -> dict:
+    """The words around `at`, on one line, and where each term falls in them
+    as [start, end) pairs -- so the page marks matches without ever putting
+    the text into HTML unescaped. Short fields come back whole."""
+    if text and len(text) != len(text.lower()) and terms:
+        # `at` was found in the lowered text, which is not the same length.
+        m = re.search(re.escape(terms[0]), text, re.IGNORECASE)
+        at = m.start() if m else 0
+    start = 0 if len(text) <= 2 * context + 40 else max(0, at - context)
+    end = min(len(text), max(at, start) + 2 * context + max((len(w) for w in terms), default=0))
+    cut = text[start:end].replace("\n", " ").replace("\r", " ")
+    pre, post = ("…" if start > 0 else ""), ("…" if end < len(text) else "")
+    s = pre + cut + post
+    marks = []
+    for w in terms:
+        # Found in the text itself, case-insensitively: lowercasing can change
+        # a string's length ('İ' is two characters lowered), which would
+        # shift every mark after it.
+        marks += [[m.start(), m.end()] for m in re.finditer(re.escape(w), s, re.IGNORECASE)]
+    marks.sort()
+    merged = []
+    for a, b in marks:                       # overlapping terms: one mark
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    # As the page counts: JavaScript strings are UTF-16, so an emoji before a
+    # match is two of its characters and one of Python's.
+    u16 = lambda i: len(s[:i].encode("utf-16-le")) // 2
+    merged = [[u16(a), u16(b)] for a, b in merged]
+    return {"text": s, "marks": merged}
+
+
+def rank(query: str, threads: dict, tasks: list, transcripts: dict,
+         limit: int = SEARCH_LIMIT) -> dict:
+    """The best `limit` hits for `query`, as groups (tasks, threads), the
+    group with the best hit first. One hit per thread or task: its best
+    field. Within a score, the most recently updated first."""
+    q = query.strip()
+    terms = _terms(q)
+    empty = {"query": q, "groups": [], "total": 0, "truncated": False}
+    if not terms:
+        return empty
+    hits = []
+    idq = q.lower()
+    by_id = len(terms) == 1 and len(idq) > len("tsk_") and _TASK_ID.fullmatch(idq)
+    for t in tasks:
+        best = None
+        if by_id and t["id"].startswith(idq):
+            exact = t["id"] == idq
+            best = (SEARCH_WEIGHT["id"] * (2 if exact else 1), "id",
+                    {"text": t["id"], "marks": [[0, len(idq)]]})
+        else:
+            for name in ("title", "goal", "result"):
+                m = _match(t[name], terms)
+                if m:
+                    score = SEARCH_WEIGHT[name] * m[0]
+                    if best is None or score > best[0]:
+                        best = (score, name, snippet(t[name][0], m[1], terms))
+        if best:
+            hits.append({"type": "task", "score": best[0], "updated": t["updated"],
+                         "id": t["id"], "title": t["title"][0][:200],
+                         "state": t["state"], "role": t["role"], "project": t["project"],
+                         "field": best[1], "snippet": best[2]})
+    for key, th in threads.items():
+        best = None
+        for name in ("title", "summary"):
+            m = _match(th[name], terms)
+            if m:
+                score = SEARCH_WEIGHT[name] * m[0]
+                if best is None or score > best[0]:
+                    best = (score, name, snippet(th[name][0], m[1], terms), "", "")
+        count = 0
+        for role, ts, text, low in (transcripts.get(th["sid"]) or {}).get("msgs", ()):
+            m = _match((text, low), terms)
+            if not m:
+                continue
+            count += 1
+            score = SEARCH_WEIGHT["message"] * m[0]
+            if best is None or score > best[0]:
+                best = (score, "message", snippet(text, m[1], terms), role, ts)
+        if best:
+            hits.append({"type": "thread", "score": best[0], "updated": th["updated"],
+                         "key": key, "title": th["title"][0][:200], "kind": th["kind"],
+                         "hidden": th["hidden"], "project": th["project"],
+                         "session_id": th["sid"], "field": best[1],
+                         "snippet": best[2], "role": best[3], "ts": best[4],
+                         "messages": count})
+    hits.sort(key=lambda h: (-h["score"], -h["updated"]))
+    # Each group keeps its best few whatever the other scores: forty tasks
+    # titled with the word would otherwise leave no room for the one thread
+    # where it was discussed.
+    floor = min(SEARCH_GROUP_FLOOR, limit // 2)
+    kept, seen = [], set()
+    for kind in ("task", "thread"):
+        for h in [h for h in hits if h["type"] == kind][:floor]:
+            kept.append(h)
+            seen.add(id(h))
+    kept += [h for h in hits if id(h) not in seen][:max(0, limit - len(kept))]
+    kept.sort(key=lambda h: (-h["score"], -h["updated"]))
+    groups = []
+    for kind, name in (("task", "tasks"), ("thread", "threads")):
+        items = [h for h in kept if h["type"] == kind]
+        if items:
+            groups.append({"kind": name, "items": items,
+                           "count": sum(1 for h in hits if h["type"] == kind)})
+    groups.sort(key=lambda g: (-g["items"][0]["score"], g["kind"]))
+    return {"query": q, "groups": groups, "total": len(hits),
+            "truncated": len(hits) > limit}
+
+
+SEARCH_INDEX = SearchIndex()
+
+
+def search(query: str, limit: int = SEARCH_LIMIT) -> dict:
+    return SEARCH_INDEX.search(query, limit)
+
+
+def warm_search() -> None:
+    """Build the index before the first search wants it (a full read)."""
+    try:
+        with SEARCH_INDEX.lock:
+            SEARCH_INDEX.refresh()
+    except Exception:
+        pass
 
 
 def artifacts(key: str) -> list[dict]:
@@ -2111,6 +2398,19 @@ PAGE = r"""<!doctype html>
                         cursor: pointer; font-size: var(--fs-sm); }
   #searchresults .hit:hover { background: var(--panel); }
   #searchresults .hit .k { font-family: var(--mono); font-size: var(--fs-xs); color: var(--gold); }
+  #searchresults .hit .ht { font-weight: var(--fw-semi); white-space: nowrap; overflow: hidden;
+                            text-overflow: ellipsis; }
+  #searchresults .hit .sn { color: var(--muted); margin-top: var(--sp-05); overflow-wrap: anywhere; }
+  #searchresults .hit.pick { background: var(--panel); }
+  #searchresults .hit.sub { color: var(--muted); cursor: default; }
+  #searchresults .hit.more { color: var(--gold); font-size: var(--fs-xs); }
+  #searchresults mark { background: color-mix(in srgb, var(--gold) 35%, transparent); color: var(--ink);
+                        border-radius: var(--r-xs); padding: 0 1px; }
+  #searchresults .sg { position: sticky; top: 0; background: var(--sunken); z-index: 1;
+                       padding: var(--sp-2) var(--sp-3) var(--sp-1); font-size: var(--fs-xs);
+                       text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+                       border-bottom: 1px solid var(--line2); }
+  #searchresults .sg .sub { text-transform: none; letter-spacing: 0; }
   /* A deploy landed while this page was open (see "--- updates ---"). */
   #updbar { position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 50%;
             transform: translateX(-50%); z-index: 60; display: none; cursor: pointer;
@@ -3029,7 +3329,7 @@ PAGE = r"""<!doctype html>
   <button class="ghost hbtn hfirst" onclick="toggleTasks()">📋<span class="lbl"> Tasks</span><span id="taskbadge"></span></button>
   <button class="ghost hbtn" onclick="toggleBoard()" title="per-project boards and backlogs">🗂<span class="lbl"> Projects</span></button>
   <button class="ghost hbtn phoneonly" onclick="newThreadForm()" title="new thread" aria-label="new thread">✏️</button>
-  <button class="ghost hbtn phoneonly" onclick="toggleSearch()" title="search transcripts">🔍</button>
+  <button class="ghost hbtn phoneonly" onclick="toggleSearch()" title="search threads and tasks">🔍</button>
   <button class="ghost hbtn phoneonly" id="menubtn" onclick="toggleMenu(event)" title="more" aria-haspopup="true">⋯</button>
   <div class="hmore" onclick="closeMenu()">
   <button class="ghost hbtn" onclick="toggleLearn()" title="learnings">🧠<span class="lbl"> Learnings</span></button>
@@ -3038,7 +3338,7 @@ PAGE = r"""<!doctype html>
   <button class="ghost hbtn" id="notifybtn" onclick="enableNotifications()" title="Enable notifications">🔔<span class="lbl" id="notifylbl"> Notify</span></button>
   <button class="ghost hbtn" id="themebtn" onclick="cycleTheme()" title="theme: dark, light, or the system's">◐<span class="lbl" id="themelbl"> Dark</span></button>
   </div>
-  <input id="search" placeholder="Search transcripts…" autocomplete="off">
+  <input id="search" placeholder="Search threads and tasks…" autocomplete="off" aria-label="Search threads and tasks (⌘K)" title="Search threads and tasks (⌘K / Ctrl-K)">
 </header>
 <div id="alertbar"></div>
 <div id="searchresults"></div>
@@ -5291,35 +5591,152 @@ async function submitNewThread() {
 }
 
 // --- search ---
-let searchTimer = null;
+// One field for threads and tasks (/api/search, SearchIndex): results come
+// grouped, best group first, each with the words around its match and the
+// match marked. ⌘K / Ctrl-K jumps to it from anywhere; ↑ ↓ and Return pick a
+// result without the mouse; Escape closes them.
+let searchTimer = null, searchSeq = 0, searchHits = [], searchPick = -1;
+const SEARCH_FIELD = {id: "id", title: "title", summary: "summary", goal: "goal",
+                      result: "result", message: "message"};
+// The snippet's text with its marks as <mark>: every piece escaped, so only
+// the marks themselves are markup.
+function markSnippet(sn) {
+  if (!sn || !sn.text) return "";
+  const t = sn.text;
+  let out = "", at = 0;
+  for (const [a, b] of sn.marks || []) {
+    if (a < at || b <= a || b > t.length) continue;
+    out += esc(t.slice(at, a)) + "<mark>" + esc(t.slice(a, b)) + "</mark>";
+    at = b;
+  }
+  return out + esc(t.slice(at));
+}
+// A title match is marked in the title itself, which is then all it shows.
+function hitTitle(h, fallback) {
+  if (h.field === "title" && h.snippet && h.snippet.text === h.title) return markSnippet(h.snippet);
+  return esc(h.title || fallback);
+}
+function searchHitHTML(h, i) {
+  const where = SEARCH_FIELD[h.field] || "";
+  if (h.type === "task") {
+    const meta = [h.id, h.state, h.project].filter(Boolean).map(esc).join(" · ");
+    return `<div class="hit" data-i="${i}" data-task="${esc(h.id)}">
+      <div class="ht">${hitTitle(h, h.id)}</div>
+      <div class="k">${meta}${where && where !== "title" && where !== "id" ? ` · in ${where}` : ""}</div>
+      ${where === "title" ? "" : `<div class="sn">${markSnippet(h.snippet)}</div>`}</div>`;
+  }
+  const meta = [h.kind === "task" ? "task run" : "", h.project,
+                where === "message" ? (h.role === "user" ? "you wrote" : "reply") : where && where !== "title" ? "in " + where : "",
+                h.messages > 1 ? `${h.messages} messages` : "", h.ts ? age(Date.parse(h.ts) / 1000) : ""]
+    .filter(Boolean).map(esc).join(" · ");
+  return `<div class="hit" data-i="${i}" data-key="${esc(h.key)}">
+    <div class="ht">${hitTitle(h, h.key)}</div>
+    <div class="k">${meta}</div>
+    ${where === "title" ? "" : `<div class="sn">${markSnippet(h.snippet)}</div>`}</div>`;
+}
+// Each group shows its first few; the rest of it opens on a tap, so a word
+// in forty task titles leaves the threads in view beneath them.
+const SEARCH_SHOWN = 6;
+let searchLast = null, searchOpenGroups = new Set();
+// Stopped here: redrawn, the row tapped is no longer in the results, and the
+// document's click-away would close them.
+function moreSearch(e, kind) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  searchOpenGroups.add(kind); renderSearch(searchLast);
+}
+function renderSearch(r) {
+  const box = document.getElementById("searchresults");
+  if (r !== searchLast) { searchLast = r; searchOpenGroups = new Set(); }
+  const groups = (r && r.groups) || [];
+  searchHits = [];
+  const html = groups.map(g => {
+    const shown = searchOpenGroups.has(g.kind) ? g.items : g.items.slice(0, SEARCH_SHOWN);
+    const items = shown.map(h => { searchHits.push(h); return searchHitHTML(h, searchHits.length - 1); }).join("");
+    const more = g.count > g.items.length ? ` <span class="sub">of ${g.count}</span>` : "";
+    const rest = g.items.length - shown.length;
+    const open = rest > 0 ? `<div class="hit more" onclick="moreSearch(event, '${g.kind}')">Show ${rest} more ${g.kind}</div>` : "";
+    return `<div class="sg">${g.kind === "tasks" ? "Tasks" : "Threads"} <b>${g.items.length}</b>${more}</div>${items}${open}`;
+  }).join("");
+  box.innerHTML = html
+    ? html + (r.truncated ? `<div class="hit sub">Showing the best ${groups.reduce((n, g) => n + g.items.length, 0)} of ${r.total}. Add a word to narrow it.</div>` : "")
+    : `<div class="hit">No threads or tasks match.</div>`;
+  searchPick = -1;
+  // On a phone the header wraps (and sits below the notch in the app), so
+  // the results go under wherever it ends rather than a fixed 52px.
+  const head = phone() && document.querySelector && document.querySelector("header");
+  box.style.top = head ? Math.ceil(head.getBoundingClientRect().bottom + 4) + "px" : "";
+  box.style.display = "block";
+  box.querySelectorAll(".hit[data-i]").forEach(el => el.onclick = () => openSearchHit(+el.dataset.i));
+}
+function closeSearch() {
+  document.getElementById("searchresults").style.display = "none";
+  document.getElementById("search").value = "";
+  searchHits = []; searchPick = -1;
+  if (document.body.classList.contains("searching")) document.body.classList.remove("searching");
+}
+async function openSearchHit(i) {
+  const h = searchHits[i];
+  if (!h) return;
+  closeSearch();
+  if (h.type === "task") return openLink(new URLSearchParams({card: h.id}));
+  return openTarget("/?thread=" + encodeURIComponent(h.key));
+}
+async function runSearch(q) {
+  const seq = ++searchSeq;
+  let r;
+  try {
+    const resp = await fetch("/api/search?q=" + encodeURIComponent(q));
+    r = resp.ok === false ? null : await resp.json();
+  } catch (e) { r = null; }
+  if (seq !== searchSeq) return;          // a later keystroke's answer wins
+  if (!document.getElementById("search").value.trim()) return;
+  if (!r || !Array.isArray(r.groups)) {
+    const box = document.getElementById("searchresults");
+    box.innerHTML = `<div class="hit sub">Search failed — the dashboard did not answer. Try again.</div>`;
+    box.style.display = "block";
+    return;
+  }
+  renderSearch(r);
+}
 document.getElementById("search").addEventListener("input", e => {
   clearTimeout(searchTimer);
   const q = e.target.value.trim();
-  const box = document.getElementById("searchresults");
-  if (!q) { box.style.display = "none"; return; }
-  searchTimer = setTimeout(async () => {
-    const hits = await (await fetch("/api/search?q=" + encodeURIComponent(q))).json();
-    box.innerHTML = hits.length ? hits.map(h =>
-      `<div class="hit" data-key="${esc(h.key)}" data-sid="${esc(h.session_id)}">
-         <div class="k">${esc(h.key)} · ${h.role}</div>${esc(h.snippet)}</div>`).join("")
-      : `<div class="hit">No matches.</div>`;
-    // On a phone the header wraps (and sits below the notch in the app), so
-    // the results go under wherever it ends rather than a fixed 52px.
-    const head = phone() && document.querySelector && document.querySelector("header");
-    box.style.top = head ? Math.ceil(head.getBoundingClientRect().bottom + 4) + "px" : "";
-    box.style.display = "block";
-    box.querySelectorAll(".hit[data-key]").forEach(hit => hit.onclick = async () => {
-      box.style.display = "none";
-      document.getElementById("search").value = "";
-      const data = await readJSON("/api/sessions");
-      active = data.sessions.find(s => s.key === hit.dataset.key) || null;
-      loadList(); if (active) loadTranscript(true);
-    });
-  }, 250);
+  // What is on screen no longer answers what is typed: Return waits for the new answer.
+  searchHits = []; searchPick = -1;
+  if (!q) { searchSeq++; document.getElementById("searchresults").style.display = "none"; return; }
+  searchTimer = setTimeout(() => runSearch(q), 200);
+});
+function pickSearch(i) {
+  const rows = document.getElementById("searchresults").querySelectorAll(".hit[data-i]");
+  if (!rows.length) return;
+  searchPick = (i + rows.length) % rows.length;
+  rows.forEach((el, n) => el.classList.toggle("pick", n === searchPick));
+  const el = rows[searchPick];
+  if (el && el.scrollIntoView) el.scrollIntoView({block: "nearest"});
+}
+document.getElementById("search").addEventListener("keydown", e => {
+  if (e.key === "ArrowDown") { e.preventDefault(); pickSearch(searchPick + 1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); pickSearch(searchPick - 1); }
+  else if (e.key === "Enter") {
+    e.preventDefault();
+    if (searchHits.length) openSearchHit(searchPick >= 0 ? searchPick : 0);
+  } else if (e.key === "Escape") { e.preventDefault(); closeSearch(); e.target.blur(); }
+});
+// ⌘K / Ctrl-K: to the search field from anywhere, the phone's row opened.
+document.addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.key === "k" || e.key === "K")) {
+    e.preventDefault();
+    const box = document.getElementById("search");
+    if (phone()) document.body.classList.add("searching");
+    box.focus();
+    if (box.select) box.select();
+  }
 });
 document.addEventListener("click", e => {
-  if (!e.target.closest("#searchresults") && e.target.id !== "search")
+  if (!e.target.closest("#searchresults") && e.target.id !== "search") {
     document.getElementById("searchresults").style.display = "none";
+    searchHits = []; searchPick = -1;     // Return opens nothing that is not shown
+  }
 });
 // On a phone the header is one row: search is a 🔍 that opens a row under it,
 // and Learnings, Name untitled and Notify live behind ⋯. On a laptop both
@@ -5328,7 +5745,7 @@ function toggleSearch() {
   const on = document.body.classList.toggle("searching");
   const box = document.getElementById("search");
   if (on) box.focus();
-  else { box.value = ""; document.getElementById("searchresults").style.display = "none"; }
+  else { box.value = ""; document.getElementById("searchresults").style.display = "none"; searchHits = []; }
 }
 function toggleMenu(e) {
   if (e) e.stopPropagation();
@@ -8335,7 +8752,7 @@ if (window.addEventListener)
 //   ?view=trader[&tab=sleeves|activity|plumbing|shadow]
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
-//   ?q=<words>                            transcript search
+//   ?q=<words>                            search: threads and tasks
 //   ?list=unread                          the list narrowed to unread threads
 //   &theme=dark | light | auto            drawn in that theme, this view only
 // Runs `fn` with transitions held: a link lands on the state it names, not
@@ -8749,6 +9166,7 @@ if __name__ == "__main__":
             "    VIZ_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')\n\n"
             "then open http://<host>:%d/?token=$VIZ_TOKEN once." % PORT)
     server = make_server(BIND, PORT)
+    threading.Thread(target=warm_search, name="search-warm", daemon=True).start()
     # An IPv6 bind answers only on that address (::1 refuses 127.0.0.1).
     where = f"[{BIND}]" if ":" in BIND else ("127.0.0.1" if LOOPBACK else BIND)
     print(f"Silkworm visualizer: http://{where}:{PORT} (bot bridge on :{BOT_PORT})"

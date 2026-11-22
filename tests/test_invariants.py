@@ -21182,6 +21182,531 @@ def test_stats_read_incrementally():
         V._usage.clear()
 
 
+
+# --- search across threads and tasks ------------------------------------------
+# One field finds a thread by its title, summary or messages and a task by its
+# id, title, goal or result -- from an index held in memory, so a keystroke's
+# search does not read every transcript again. Snippets never carry a secret.
+
+def _search_fixture(tasks, sessions, transcripts):
+    """A temp sessions.json, tasks.json and projects dir, the visualizer's
+    search pointed at them with a fresh index. Returns (V, restore, d, proj)."""
+    sys.argv = ["x"]
+    import visualizer as V
+    d = Path(tempfile.mkdtemp())
+    proj = d / "projects"
+    (proj / "-a").mkdir(parents=True)
+    (d / "sessions.json").write_text(json.dumps(sessions))
+    (d / "tasks.json").write_text(json.dumps({t["id"]: t for t in tasks}))
+    for sid, lines in transcripts.items():
+        (proj / "-a" / f"{sid}.jsonl").write_text("".join(lines))
+    saved = (V.SESSIONS_FILE, V.TASKS_FILE, V.PROJECTS_DIR, V.INDEX_RECHECK_S, V.SEARCH_INDEX)
+    V.SESSIONS_FILE, V.TASKS_FILE, V.PROJECTS_DIR = d / "sessions.json", d / "tasks.json", proj
+    V.INDEX_RECHECK_S = 0
+    V.SEARCH_INDEX = V.SearchIndex()
+
+    def restore():
+        (V.SESSIONS_FILE, V.TASKS_FILE, V.PROJECTS_DIR, V.INDEX_RECHECK_S,
+         V.SEARCH_INDEX) = saved
+    return V, restore, d, proj
+
+
+def _hits(r, kind=None):
+    return [h for g in r["groups"] if kind in (None, g["kind"]) for h in g["items"]]
+
+
+def test_search_threads_and_tasks():
+    print("\nsearch finds threads and tasks, grouped and ranked")
+    now = time.time()
+    tasks = [
+        {"id": "tsk_abc1234567", "title": "Fix the landing gate", "goal": "rebase then test",
+         "state": "done", "project": "silkworm", "updated": now - 100,
+         "result": {"text": "Landed; the zebra suite passed", "cost": 1}},
+        {"id": "tsk_abc9999999", "title": "Another", "goal": "mentions tsk_abc1234567 in passing",
+         "state": "queued", "updated": now},
+        {"id": "tsk_zzz0000000", "title": "Zebra crossing", "goal": "paint stripes",
+         "state": "proposed", "updated": now - 500},
+        {"id": "tsk_old0000000", "title": "old", "goal": "zebra crossing again",
+         "state": "done", "updated": now - 9000, "result": None},
+    ]
+    sessions = {
+        "D1:1.1": {"session_id": "sid-one", "title": "Kitchen tiles", "updated": now - 10,
+                   "summary": "Picking a zebra-free grout colour"},
+        "D1:2.2": {"session_id": "sid-two", "title": "Zebra talk", "updated": now - 20},
+        "D1:3.3": {"session_id": "sid-three", "title": "Quiet", "updated": now,
+                   "kind": "task"},
+    }
+    transcripts = {
+        "sid-one": [_tline("user", "what grout goes with oak?"),
+                    _tline("assistant", "Bone, probably.")],
+        "sid-three": [_tline("user", "nothing here"),
+                      _tline("assistant", "The zebra crossing is painted.\nDone."),
+                      json.dumps({"type": "user", "isMeta": True, "message": {
+                          "content": "meta zebra caveat"}}) + "\n",
+                      # content a plain string, however the line is spaced
+                      json.dumps({"type": "user", "message": {"content": "plain walrus words"}})
+                      + "\n"],
+    }
+    V, restore, d, proj = _search_fixture(tasks, sessions, transcripts)
+    try:
+        r = V.search("tsk_abc1234567")
+        ids = [h.get("id") or h.get("key") for h in _hits(r)]
+        check("an exact task id comes first", ids[:1] == ["tsk_abc1234567"], str(ids))
+        check("as an id match, marked whole",
+              _hits(r)[0]["field"] == "id"
+              and _hits(r)[0]["snippet"]["marks"] == [[0, 14]], str(_hits(r)[0]))
+        check("a task merely mentioning the id is found after it",
+              "tsk_abc9999999" in ids[1:], str(ids))
+        r = V.search("TSK_ABC")
+        ids = sorted(h["id"] for h in _hits(r, "tasks") if h["field"] == "id")
+        check("an id prefix finds every task it starts, in any case",
+              ids == ["tsk_abc1234567", "tsk_abc9999999"], str(ids))
+        check("and not one it does not start", "tsk_zzz0000000" not in ids)
+        r = V.search("tsk_nothing")
+        check("an id that matches nothing finds nothing", r["total"] == 0, str(r))
+
+        r = V.search("zebra")
+        tk = [h["id"] for h in _hits(r, "tasks")]
+        th = [h["key"] for h in _hits(r, "threads")]
+        check("a task by title, goal and result",
+              set(tk) == {"tsk_zzz0000000", "tsk_old0000000", "tsk_abc1234567"}, str(tk))
+        check("a title match ranks above a goal or result match",
+              tk[0] == "tsk_zzz0000000", str(tk))
+        check("a goal match above a result match", tk.index("tsk_old0000000")
+              < tk.index("tsk_abc1234567"), str(tk))
+        check("a thread by title, summary and message text",
+              set(th) == {"D1:1.1", "D1:2.2", "D1:3.3"}, str(th))
+        check("thread title, then summary, then message",
+              th == ["D1:2.2", "D1:1.1", "D1:3.3"], str(th))
+        msg = next(h for h in _hits(r, "threads") if h["key"] == "D1:3.3")
+        check("a message hit says whose it was, and it is the reply",
+              msg["field"] == "message" and msg["role"] == "assistant", str(msg))
+        check("the snippet is one line with the match marked",
+              "\n" not in msg["snippet"]["text"]
+              and [msg["snippet"]["text"][a:b] for a, b in msg["snippet"]["marks"]] == ["zebra"],
+              str(msg["snippet"]))
+        check("an isMeta entry is not a message", msg["messages"] == 1, str(msg))
+        check("groups: tasks and threads, the better group first",
+              [g["kind"] for g in r["groups"]] == ["tasks", "threads"]
+              and r["groups"][0]["items"][0]["score"] >= r["groups"][1]["items"][0]["score"],
+              str([g["kind"] for g in r["groups"]]))
+        check("one hit per task or thread", len(tk) == len(set(tk)) and len(th) == len(set(th)))
+
+        r = V.search("zebra crossing")
+        tk = [h["id"] for h in _hits(r, "tasks")]
+        check("every word must be there", tk == ["tsk_zzz0000000", "tsk_old0000000"], str(tk))
+        r = V.search("crossing zebra")
+        tk = [h["id"] for h in _hits(r, "tasks")]
+        check("in any order", set(tk) == {"tsk_zzz0000000", "tsk_old0000000"}, str(tk))
+        check("each word marked", [_hits(r, "tasks")[0]["snippet"]["text"][a:b].lower()
+                                   for a, b in _hits(r, "tasks")[0]["snippet"]["marks"]]
+              == ["zebra", "crossing"], str(_hits(r, "tasks")[0]["snippet"]))
+        sessions["D1:4.4"] = {"session_id": "sid-four", "title": "Zebra again",
+                              "updated": now}
+        (d / "sessions.json").write_text(json.dumps(sessions))
+        th = [h["key"] for h in _hits(V.search("zebra"), "threads")]
+        check("within a score, the newest first; a new thread is found at once",
+              th[:2] == ["D1:4.4", "D1:2.2"], str(th))
+        with open(proj / "-a" / "sid-one.jsonl", "a") as f:
+            f.write(_tline("assistant", "Try the walrus grey."))
+        th = [h["key"] for h in _hits(V.search("walrus"), "threads")]
+        check("a message appended since is found, and string content is text",
+              sorted(th) == ["D1:1.1", "D1:3.3"], str(th))
+        tasks.append({"id": "tsk_new0000000", "title": "walrus", "state": "queued",
+                      "updated": now})
+        (d / "tasks.json").write_text(json.dumps({t["id"]: t for t in tasks}))
+        check("and a task filed since", [h["id"] for h in _hits(V.search("walrus"), "tasks")]
+              == ["tsk_new0000000"])
+        sn = V.snippet("🚀🚀 deploy done", 3, ["deploy"])
+        check("marks count as the page does (UTF-16): an emoji before a match is two",
+              sn["marks"] == [[5, 11]], str(sn))
+        sn = V.snippet("İİ Deploy", 3, ["deploy"])
+        check("a letter that lowercases longer does not shift the mark",
+              sn["marks"] == [[3, 9]], str(sn))
+        check("a bare tsk_ is a word, not every task by id",
+              all(h["field"] != "id" for h in _hits(V.search("tsk_"))))
+        with open(proj / "-a" / "sid-one.jsonl", "a") as f:
+            f.write(json.dumps({"type": "user", "message": "a string, not a dict"}) + "\n")
+            f.write(json.dumps({"type": "user", "message": {"content": [7, {"type": "text", "text": "x"}]}}) + "\n")
+            f.write(_tline("assistant", "the narwhal survives"))
+        check("a line of an odd shape is skipped, not the rest of the read",
+              [h["key"] for h in _hits(V.search("narwhal"))] == ["D1:1.1"])
+        check("an empty query finds nothing and reads nothing",
+              V.search("   ") == {"query": "", "groups": [], "total": 0, "truncated": False})
+    finally:
+        restore()
+
+
+def test_search_reads_only_what_changed():
+    print("\nsearch reads a transcript once, then only what is appended")
+    now = time.time()
+    sessions = {f"D1:{i}.{i}": {"session_id": f"sid-{i}", "title": f"t{i}", "updated": now}
+                for i in range(3)}
+    transcripts = {f"sid-{i}": [_tline("user", f"hello {i}")] for i in range(3)}
+    V, restore, d, proj = _search_fixture([], sessions, transcripts)
+    saved = V._complete_lines
+    reads = []
+    try:
+        V._complete_lines = lambda p, s: reads.append(Path(p).name) or saved(p, s)
+        V.search("hello")
+        check("the first search reads each transcript", sorted(reads) ==
+              ["sid-0.jsonl", "sid-1.jsonl", "sid-2.jsonl"], str(reads))
+        n = len(reads)
+        V.search("hello")
+        check("unchanged, nothing is read again", len(reads) == n, str(reads[n:]))
+        with open(proj / "-a" / "sid-1.jsonl", "a") as f:
+            f.write(_tline("assistant", "goodbye"))
+        r = V.search("goodbye")
+        check("an append reads only that file", reads[n:] == ["sid-1.jsonl"], str(reads[n:]))
+        check("and finds it", [h["key"] for h in _hits(r)] == ["D1:1.1"])
+        (proj / "-a" / "sid-1.jsonl").write_text(_tline("user", "hi"))
+        check("a transcript replaced by a shorter one is reread, not added to",
+              V.search("goodbye")["total"] == 0 and V.search("hi")["total"] == 1)
+    finally:
+        V._complete_lines = saved
+        restore()
+
+
+def test_search_redacts():
+    print("\nno search shows or matches a secret")
+    tok = "sk-ant-" + "oat01" + "Q" * 30        # built in pieces: never a literal
+    slack = "xoxb-" + "1234567890-abcdefghij"
+    now = time.time()
+    tasks = [{"id": "tsk_sec0000000", "title": "rotate the key", "state": "done",
+              "updated": now, "goal": f"the old key was {tok} -- rotate it",
+              "result": {"text": f"posted with {slack} fine"}}]
+    sessions = {"D1:1.1": {"session_id": "sid-s", "title": "keys", "updated": now,
+                           "summary": f"set CLAUDE token {tok}"}}
+    transcripts = {"sid-s": [_tline("user", f"here it is: {tok} please rotate")]}
+    V, restore, d, proj = _search_fixture(tasks, sessions, transcripts)
+    try:
+        everything = json.dumps(V.search("rotate")) + json.dumps(V.search("old key")) \
+            + json.dumps(V.search("posted")) + json.dumps(V.search("token"))
+        check("found, with the match", "rotate" in everything and "posted" in everything)
+        check("no snippet carries a secret", tok not in everything and slack not in everything
+              and "Q" * 20 not in everything, everything[:300])
+        check("it is shown redacted", "[redacted]" in everything)
+        check("searching the secret itself finds nothing",
+              V.search(tok)["total"] == 0 and V.search("Q" * 20)["total"] == 0
+              and V.search("abcdefghij")["total"] == 0)
+        import redaction
+        real = redaction.scrub
+        try:
+            def boom(text, known=()):
+                raise RuntimeError("no scrubber")
+            redaction.scrub = boom
+            V.SEARCH_INDEX = V.SearchIndex()
+            out = json.dumps(V.search("rotate"))
+            check("without the scrubber nothing is indexed at all, rather than unscrubbed",
+                  tok not in out and V.search("rotate")["total"] == 0, out[:200])
+        finally:
+            redaction.scrub = real
+    finally:
+        restore()
+
+
+def test_search_scrubber_has_no_side_effects():
+    print("\nthe scrubber search uses registers nothing anywhere")
+    import subprocess as _sp
+    # health_probes registers its checks into health.REGISTRY on import; a
+    # scrubber taken from there made the dashboard's search change which
+    # checks every later caller saw. redaction.py is the scrubber, alone.
+    # In a process of its own: importing health_probes here would change the
+    # registry for every test after this one -- the very leak under test.
+    code = ("import sys; sys.argv=['x']; import health; before = sorted(health.REGISTRY); "
+            "import visualizer; visualizer._redact('x'); "
+            "print(before == sorted(health.REGISTRY), 'health_probes' in sys.modules); "
+            "import health_probes, redaction; print(health_probes.scrub is redaction.scrub)")
+    r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                cwd=str(Path(__file__).resolve().parent.parent))
+    lines = r.stdout.strip().splitlines()
+    check("importing the dashboard and scrubbing registers no health check",
+          lines[:1] == ["True False"], (r.stdout + r.stderr)[-300:])
+    check("the health checks scrub with the same function", lines[1:2] == ["True"],
+          (r.stdout + r.stderr)[-300:])
+    import redaction
+    gh = "ghp_" + "A1b2" * 6
+    pat = "github_pat_" + "11ABC" * 5
+    out = redaction.scrub(f"push with {gh} or {pat} and xapp-" + "1-A1234567890-" + "f" * 12)
+    check("GitHub and Slack app tokens are scrubbed too",
+          gh not in out and pat not in out and "f" * 12 not in out, out)
+
+
+def test_search_bounded():
+    print("\nsearch answers at most fifty, and says how many there were")
+    now = time.time()
+    tasks = [{"id": f"tsk_b{i:09d}", "title": f"needle {i}", "state": "done",
+              "updated": now - i} for i in range(120)]
+    # Threads match only in their summaries: every task's title outranks them.
+    sessions = {f"D1:{i}.{i}": {"session_id": "", "title": f"thread {i}",
+                                "summary": f"about a needle {i}", "updated": now - i}
+                for i in range(30)}
+    V, restore, d, proj = _search_fixture(tasks, sessions, {})
+    try:
+        r = V.search("needle")
+        hits = _hits(r)
+        check("fifty, no more", len(hits) == V.SEARCH_LIMIT == 50, str(len(hits)))
+        check("with the true total, and said to be cut", r["total"] == 150 and r["truncated"],
+              str((r["total"], r["truncated"])))
+        counts = {g["kind"]: (len(g["items"]), g["count"]) for g in r["groups"]}
+        counts = {"tasks": (0, 0), "threads": (0, 0), **counts}
+        check("each group says how many it had in all",
+              counts["tasks"][1] == 120 and counts["threads"][1] == 30
+              and counts["tasks"][0] + counts["threads"][0] == 50, str(counts))
+        check("threads that rank below every task still get their floor of ten",
+              counts["threads"][0] == V.SEARCH_GROUP_FLOOR == 10 and counts["tasks"][0] == 40,
+              str(counts))
+        check("the newest of equals are the ones kept",
+              [h["id"] for h in _hits(r, "tasks")][:2] == ["tsk_b000000000", "tsk_b000000001"])
+        check("a smaller ask is honoured", len(_hits(V.search("needle", 5))) == 5)
+        check("a narrower query is not cut", not V.search("needle 7")["truncated"])
+    finally:
+        restore()
+
+
+def test_search_fast_at_scale():
+    print("\nsearch at the real stores' size stays well under 300ms")
+    import random
+    rnd = random.Random(7)
+    words = ("tailscale serve dashboard grout landing rebase review thread task "
+             "zebra kitchen premium mondays trader universe sleeve the a of").split()
+    say = lambda n: " ".join(rnd.choice(words) for _ in range(n))
+    now = time.time()
+    # About what the live machine holds (2026-11-22): 2,400 tasks in a 9.5MB
+    # tasks.json, 670 threads, 170 transcripts with 5,400 text messages.
+    tasks = [{"id": f"tsk_{i:010x}", "title": say(8), "goal": say(400), "state": "done",
+              "updated": now - i, "result": {"text": say(150)} if i % 4 == 0 else {"cost": 1}}
+             for i in range(2400)]
+    sessions = {f"D1:{i}.{i}": {"session_id": f"sid-{i}" if i < 170 else "",
+                                "title": say(6), "summary": say(60), "updated": now - i}
+                for i in range(670)}
+    transcripts = {f"sid-{i}": [_tline("user" if j % 2 else "assistant", say(80))
+                                for j in range(32)] for i in range(170)}
+    V, restore, d, proj = _search_fixture(tasks, sessions, transcripts)
+    try:
+        t0 = time.perf_counter()
+        V.search("warm")
+        cold = time.perf_counter() - t0
+        worst = 0.0
+        for q in ("tailscale", "the", "a", "zebra kitchen", "tsk_0000000", "nothing-here"):
+            t0 = time.perf_counter()
+            V.search(q)
+            worst = max(worst, time.perf_counter() - t0)
+        check("a warm search, common words included, is under 300ms", worst < 0.3,
+              f"{worst * 1000:.0f}ms (cold build {cold * 1000:.0f}ms)")
+        os.utime(d / "tasks.json")                 # rewritten, as the bot does every few seconds
+        (d / "tasks.json").write_text((d / "tasks.json").read_text() + " ")
+        t0 = time.perf_counter()
+        V.search("tailscale")
+        reread = time.perf_counter() - t0
+        check("and so is one just after tasks.json changed", reread < 0.3,
+              f"{reread * 1000:.0f}ms")
+    finally:
+        restore()
+
+
+def test_search_route():
+    import threading
+    import urllib.request
+    print("\n/api/search is a read, answered from the index")
+    now = time.time()
+    V, restore, d, proj = _search_fixture(
+        [{"id": "tsk_route00000", "title": "route me", "state": "done", "updated": now}],
+        {"D1:1.1": {"session_id": "", "title": "route thread", "updated": now}}, {})
+    saved_bot = V.bot_call
+    srv = None
+    try:
+        V.bot_call = lambda *a, **k: {}
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_address[1]}/api/search?q=route"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            body = json.loads(resp.read())
+        check("both groups come back over HTTP",
+              sorted(g["kind"] for g in body["groups"]) == ["tasks", "threads"], str(body)[:200])
+        req = urllib.request.Request(url, data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            posted = True
+        except urllib.error.HTTPError:
+            posted = False
+        check("and there is no POST /api/search", not posted)
+        src = Path(V.__file__).read_text()
+        body_src = src[src.index("class SearchIndex"):src.index("SEARCH_INDEX = SearchIndex()")]
+        check("the index only reads: no store is saved from it",
+              ".save(" not in body_src and "write_text" not in body_src
+              and "repair=False" in body_src)
+    finally:
+        if srv:
+            srv.shutdown()
+        V.bot_call = saved_bot
+        restore()
+
+
+SEARCH_DRIVER = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[2], "utf8");
+process.on("unhandledRejection", () => {});
+const els = {}, docListeners = {}, opened = [];
+function el(id) {
+  if (els[id]) return els[id];
+  const l = {};
+  return els[id] = {id, innerHTML: "", value: "", style: {}, dataset: {}, focused: false,
+    classList: {_s: new Set(), add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
+                toggle(c, on) { (on === undefined ? !this._s.has(c) : on) ? this._s.add(c) : this._s.delete(c); },
+                contains(c) { return this._s.has(c); }},
+    appendChild() {}, focus() { this.focused = true; }, select() {}, blur() {},
+    addEventListener(k, f) { (l[k] = l[k] || []).push(f); }, _l: l,
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    getBoundingClientRect() { return {top: 0, bottom: 40}; }};
+}
+globalThis.document = {getElementById: el, body: el("body"),
+  addEventListener(k, f) { (docListeners[k] = docListeners[k] || []).push(f); },
+  createElement: () => el("_new"), querySelector: () => null, querySelectorAll: () => []};
+globalThis.window = globalThis;
+globalThis.location = {href: "http://x/", search: ""};
+let lastFetch = "";
+globalThis.fetch = async (u) => { lastFetch = String(u); return {ok: true, status: 200,
+  json: async () => ({sessions: [], tasks: []}), text: async () => "", headers: {get: () => null}}; };
+globalThis.setInterval = () => 0;
+let timers = [];
+globalThis.setTimeout = (f) => { timers.push(f); return timers.length; };
+globalThis.clearTimeout = () => {};
+globalThis.localStorage = {getItem: () => null, setItem() {}, removeItem() {}};
+globalThis.matchMedia = () => ({matches: false, addEventListener() {}, addListener() {}});
+globalThis.navigator = {};
+(async () => {
+eval(src);
+openLink = async (q) => { opened.push(["link", q.toString()]); };
+openTarget = async (h) => { opened.push(["target", h]); };
+phone = () => false;
+const R = {query: "zebra", total: 60, truncated: true, groups: [
+  {kind: "tasks", count: 40, items: [
+    {type: "task", id: "tsk_aaa", title: "Zebra <b>bold</b>", state: "done", project: "p",
+     field: "goal", score: 80, snippet: {text: "a zebra & <script>x</script> zebra", marks: [[2, 7], [29, 34]]}}]},
+  {kind: "threads", count: 20, items: [
+    {type: "thread", key: "D1:1.1", title: "Kitchen", kind: "thread", field: "message",
+     role: "assistant", ts: "", messages: 3, score: 10,
+     snippet: {text: "the zebra grout", marks: [[4, 9]]}}]}]};
+renderSearch(R);
+const box = el("searchresults");
+const out = {html: box.innerHTML, shown: box.style.display};
+openSearchHit(0); renderSearch(R); openSearchHit(1);
+out.opened = opened.slice();
+out.cleared = el("search").value === "" && box.style.display === "none";
+renderSearch({groups: [], total: 0});
+out.empty = box.innerHTML;
+// ⌘K and Ctrl-K focus the field; plain K does not
+el("search").focused = false;
+let prevented = 0;
+const key = (o) => (docListeners.keydown || []).forEach(f => f(Object.assign(
+  {key: "k", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false,
+   target: {id: "body"}, preventDefault() { prevented++; }}, o)));
+key({}); out.plainK = el("search").focused;
+key({metaKey: true}); out.cmdK = el("search").focused;
+el("search").focused = false;
+key({ctrlKey: true}); out.ctrlK = el("search").focused;
+out.prevented = prevented;
+// typing searches the server after a pause; Enter opens the first hit
+el("search").value = "zebra";
+el("search")._l.input.forEach(f => f({target: el("search")}));
+timers.forEach(f => f());
+out.fetched = lastFetch;
+renderSearch(R); opened.length = 0;
+el("search")._l.keydown.forEach(f => f({key: "Enter", target: el("search"), preventDefault() {}}));
+out.enter = opened.slice();
+out.marked = markSnippet({text: "<i>ab</i>", marks: [[3, 5], [99, 120]]});
+// a group of many shows its first six, and the rest on a tap
+const many = (n, kind) => Array.from({length: n}, (_, i) => kind === "tasks"
+  ? {type: "task", id: "tsk_m" + i, title: "t" + i, field: "title", score: 100, snippet: {text: "t" + i, marks: []}}
+  : {type: "thread", key: "K" + i, title: "k" + i, field: "message", score: 10, snippet: {text: "k", marks: []}});
+const BIG = {total: 50, truncated: false, groups: [{kind: "tasks", count: 40, items: many(40, "tasks")},
+                                                  {kind: "threads", count: 10, items: many(10, "threads")}]};
+renderSearch(BIG);
+out.firstRows = (box.innerHTML.match(/data-i=/g) || []).length;
+out.moreRow = /Show 34 more tasks/.test(box.innerHTML) && /Show 4 more threads/.test(box.innerHTML);
+out.threadsInView = box.innerHTML.indexOf("Threads") < box.innerHTML.indexOf("Show 34 more") + 400;
+let stopped = false;
+moreSearch({stopPropagation() { stopped = true; }}, "tasks");
+out.afterMore = (box.innerHTML.match(/data-i=/g) || []).length;
+out.stopped = stopped;
+renderSearch(BIG);
+out.reopened = (box.innerHTML.match(/data-i=/g) || []).length;
+renderSearch({...BIG});
+out.newAnswer = (box.innerHTML.match(/data-i=/g) || []).length;
+// typed past what is shown: Return opens nothing stale
+renderSearch(R); opened.length = 0;
+el("search").value = "zebr";
+el("search")._l.input.forEach(f => f({target: el("search")}));
+el("search")._l.keydown.forEach(f => f({key: "Enter", target: el("search"), preventDefault() {}}));
+out.staleEnter = opened.slice();
+// a failed answer is said to have failed, not to have found nothing
+globalThis.fetch = async () => ({ok: false, status: 500, json: async () => { throw new Error("x"); }});
+timers = [];
+el("search").value = "zebra";
+el("search")._l.input.forEach(f => f({target: el("search")}));
+timers.forEach(f => f());
+await new Promise(ok => setImmediate(ok));
+out.failed = box.innerHTML;
+console.log(JSON.stringify(out));
+})();
+"""
+
+
+def test_search_page():
+    import re as _re
+    import subprocess as _sp
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\nthe search box: grouped, marked, escaped, ⌘K, and a tap opens it")
+    js = _re.search(r"<script>(.*?)</script>", V.PAGE, _re.S).group(1)
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "page.js").write_text(js)
+    (tmp / "drive.js").write_text(SEARCH_DRIVER)
+    r = _sp.run(["node", str(tmp / "drive.js"), str(tmp / "page.js")],
+                capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or not r.stdout.strip():
+        check("the search runs in a browser-like context", False, (r.stderr or "")[-400:])
+        return
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    html = out["html"]
+    check("both groups are drawn, tasks first as the server ranked them",
+          0 <= html.index("Tasks") < html.index("Threads"), html[:200])
+    check("each with how many it shows and has", "<b>1</b>" in html and "of 40" in html
+          and "of 20" in html)
+    check("the matches are marked", html.count("<mark>zebra</mark>") == 3, html)
+    check("and everything else escaped", "<script>" not in html and "&lt;script&gt;" in html
+          and "&lt;b&gt;bold" in html, html)
+    check("a cut answer says so", "best 2 of 60" in html, html[-200:])
+    check("shown", out["shown"] == "block")
+    check("a task opens its card; a thread opens the thread",
+          out["opened"] == [["link", "card=tsk_aaa"], ["target", "/?thread=D1%3A1.1"]],
+          str(out["opened"]))
+    check("and the box is cleared behind it", out["cleared"])
+    check("nothing found says so", "No threads or tasks match" in out["empty"])
+    check("⌘K and Ctrl-K go to the search field; a plain k does not",
+          out["cmdK"] and out["ctrlK"] and not out["plainK"] and out["prevented"] == 2,
+          str(out))
+    check("typing asks the server", out["fetched"] == "/api/search?q=zebra", out["fetched"])
+    check("Return opens the first hit", out["enter"] == [["link", "card=tsk_aaa"]],
+          str(out["enter"]))
+    check("a mark out of range is dropped, not drawn",
+          out["marked"] == "&lt;i&gt;<mark>ab</mark>&lt;/i&gt;", out["marked"])
+    check("a long group shows six, and says how many more", out["firstRows"] == 12
+          and out["moreRow"], str((out["firstRows"], out["moreRow"])))
+    check("so the next group is in view", out["threadsInView"])
+    check("a tap shows the rest of that group only, without closing the results",
+          out["afterMore"] == 46 and out["stopped"], str(out["afterMore"]))
+    check("it stays open while the same answer is redrawn; a new answer starts folded",
+          out["reopened"] == 46 and out["newAnswer"] == 12,
+          str((out["reopened"], out["newAnswer"])))
+    check("typing past the results, Return opens nothing stale", out["staleEnter"] == [],
+          str(out["staleEnter"]))
+    check("a failed search says it failed", "Search failed" in out["failed"]
+          and "No threads" not in out["failed"], out["failed"])
+
+
 PANEL_DRIVER = r"""
 // Draws the task panel twice through the page's own renderTasks: once from
 // whole tasks (what `list` used to send) and once from board.panel_row's slim
