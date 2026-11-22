@@ -1998,6 +1998,19 @@ PAGE = r"""<!doctype html>
                  min-height: 44px; }
   label.attach input { display: none; }
   #chips, .tform .chips { display: flex; flex-wrap: wrap; gap: var(--sp-15); }
+  /* Quick replies in the operator's thread: one row, scrolled sideways when
+     it is wider than the screen, never wrapped onto a second. */
+  #quick { display: flex; gap: var(--sp-15); overflow-x: auto; flex-wrap: nowrap;
+           scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  #quick[hidden] { display: none; }
+  #quick::-webkit-scrollbar { display: none; }
+  #quick button.qr { flex: none; white-space: nowrap; background: var(--panel); color: var(--ink);
+                     border: 1px solid var(--line); border-radius: var(--r-xl); cursor: pointer;
+                     font-size: var(--fs-sm); padding: var(--sp-1) var(--sp-25); min-height: 32px;
+                     transition: transform var(--t-fast) var(--ease); }
+  #quick button.qr:hover { border-color: var(--gold); }
+  #quick button.qr:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+  #quick button.qr:active { transform: scale(.95); }
   .chip { display: inline-flex; gap: var(--sp-15); align-items: center; background: var(--panel);
           border: 1px solid var(--line); border-radius: var(--r-lg); padding: var(--sp-05) var(--sp-1) var(--sp-05) var(--sp-25);
           font-size: var(--fs-sm); font-family: var(--mono); max-width: 100%; }
@@ -2815,6 +2828,7 @@ PAGE = r"""<!doctype html>
     body.kb #composer { padding-bottom: var(--sp-2); }      /* the keyboard covers the indicator */
     #composer textarea { min-height: var(--tap); }
     #composer .crow button.act { min-width: 64px; }
+    #quick button.qr { min-height: 36px; }
 
     /* the open thread is a chat: it has the screen, under its own header */
     body { height: var(--vvh, 100dvh); }
@@ -3047,6 +3061,7 @@ PAGE = r"""<!doctype html>
     </div>
     <div id="composer">
       <button id="jumppill" onclick="toEnd(true)">↓ New messages</button>
+      <div id="quick" role="toolbar" aria-label="Quick replies to the operator" hidden></div>
       <div id="chips"></div>
       <div class="crow">
         <label class="ghost attach" title="attach files or photos">📎<input type="file" id="attach" multiple onchange="addFiles(this.files, 'reply'); this.value = ''"></label>
@@ -3997,6 +4012,7 @@ async function loadList() {
     if (cur) active = cur;
     drawChatHead();
   }
+  drawQuick();                   // the operator's home may have moved
 }
 function cardHtml(s) {
   const t = s.turn;
@@ -4807,6 +4823,7 @@ async function loadTranscript(scroll) {
     drawLive();
     if (drawerIsOpen()) drawDrawer();
     document.getElementById("composer").style.display = "flex";
+    drawQuick();
   }, scroll);
   markSeen();
   if (want.again && tview === want) { want.again = false; loadTranscript(false); }
@@ -5095,11 +5112,60 @@ async function recheckSend(i) {
   }
 }
 function cmdSend(cmd) { sendText(cmd); }
+// --- quick replies ---
+// In the operator's home thread, the answers it most often waits for, one
+// tap each. A chip sends exactly its words through sendText -- what Send does
+// with typed words -- so a plan's "yes" and the owner's grant work as typed.
+// (The plan's own Run / Not now are its card's buttons, under the thread.)
+// Hidden while the phone's keyboard is up with a draft in the box: then the
+// row is space better given to what is being written.
+const QUICK_REPLIES = ["yes", "next", "not now", "accept all", "tell me more"];
+function quickShown() {
+  if (!active || !isPinned(active)) return false;
+  const box = document.getElementById("reply");
+  const draft = !!(box && (box.value || "").trim());
+  const kb = !!(document.body && document.body.classList && document.body.classList.contains("kb"));
+  return !(kb && draft);
+}
+let quickFor = "";
+function drawQuick() {
+  const row = document.getElementById("quick");
+  if (!row) return;
+  const on = quickShown();
+  row.hidden = !on;
+  const want = on ? active.key : "";
+  if (want === quickFor) return;      // drawn already: keeps focus and sideways scroll
+  quickFor = want;
+  row.innerHTML = on ? QUICK_REPLIES.map((t, i) => `<button type="button" class="qr" data-qi="${i}"
+    title="send “${esc(t)}” to the operator">${esc(t)}</button>`).join("") : "";
+}
+function quickSend(i) {
+  const t = QUICK_REPLIES[i];
+  if (t === undefined || !active || !isPinned(active)) return;
+  sendText(t);
+}
+(function () {
+  const row = document.getElementById("quick");
+  if (!row || !row.addEventListener) return;
+  row.addEventListener("click", e => {
+    const b = e.target && e.target.closest && e.target.closest("button.qr");
+    if (b) quickSend(+b.dataset.qi);
+  });
+  // Arrow keys move along the row, as in any toolbar; Tab goes past it.
+  row.addEventListener("keydown", e => {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    const bs = [...row.querySelectorAll("button.qr")];
+    const at = bs.indexOf(e.target);
+    if (at < 0) return;
+    const to = bs[(at + (e.key === "ArrowRight" ? 1 : bs.length - 1)) % bs.length];
+    if (to) { e.preventDefault(); to.focus(); }
+  });
+})();
 async function sendReply() {
   const box = document.getElementById("reply");
   const text = box.value, files = staged.reply.slice();
   if (!text.trim() && !files.length) return;
-  box.value = ""; staged.reply = []; renderChips("reply"); growReply();
+  box.value = ""; staged.reply = []; renderChips("reply"); growReply(); drawQuick();
   // Refused: put it back, so nothing typed or picked is lost. Not when the
   // outcome is unknown: it may have gone, and is shown as unconfirmed.
   if ((await sendText(text, files)) === false && !box.value) {
@@ -5126,7 +5192,7 @@ function growReply() {
   const box = document.getElementById("reply");
   if (!box) return;
   if (phone()) { box.placeholder = "Message (also in Slack)"; box.rows = 1; }
-  if (box.addEventListener) box.addEventListener("input", growReply);
+  if (box.addEventListener) box.addEventListener("input", () => { growReply(); drawQuick(); });
 })();
 // The phone's keyboard: the page is kept to what is visible above it, so the
 // composer sits on the keyboard rather than under it. In the home-screen app
@@ -5138,6 +5204,7 @@ function fitViewport() {
   if (!vv || !root || !root.style || !phone() || vv.scale > 1) return;
   root.style.setProperty("--vvh", Math.round(vv.height) + "px");
   if (document.body) document.body.classList.toggle("kb", window.innerHeight - vv.height > 120);
+  drawQuick();
   if (vv.offsetTop && window.scrollTo) window.scrollTo(0, 0);
   // The thread's box is now shorter (or taller): the last message stays
   // just above the composer, not under it, when it was being read.

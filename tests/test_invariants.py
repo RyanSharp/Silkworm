@@ -38210,6 +38210,134 @@ def test_operator_home_is_pinned_first_in_the_thread_list():
           o["none"]["order"] == ["A", "B", "D"] and o["none"]["pinned"] == [] and o["none"]["labelled"] == [], o["none"])
 
 
+QUICK_DRIVE = r"""
+const sess = (key, extra) => Object.assign({key, title: "T " + key, kind: "thread", project: "", summary: "",
+  session_id: "s" + key, turns: 3, cost: 0, updated: 1795000000, files: 0, events: [], running: false,
+  resume_cmd: "", slack_link: "", hidden: false, unread: 0}, extra || {});
+let home = "O";
+answer = (url, b) => url.startsWith("/api/sessions")
+  ? {bot_online: true, sessions: [sess("A"), sess("O")], slack: {}, operator_home: home}
+  : url.startsWith("/api/session?") ? {messages: [], cursor: 1, files: [], live: null}
+  : url === "/api/send" ? {ok: true, ref: "9.9", replies: [], finished: true}
+  : url.startsWith("/api/artifacts") ? [] : BASE(url, b);
+const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+const row = byId("quick"), reply = byId("reply");
+let focused = null;
+// innerHTML is not parsed here: the row's buttons are made from what was drawn.
+row.onHTML = v => {
+  for (const m of v.matchAll(/<button type="button" class="qr" data-qi="(\d+)"[^>]*>([^<]*)<\/button>/g)) {
+    const b = E("BUTTON"); b.className = "qr"; b.dataset.qi = m[1]; b.textContent = m[2];
+    b.focus = () => { focused = b; };
+    row.appendChild(b);
+  }
+};
+(0, eval)(SRC + `
+;globalThis.__m = {loadList, openSession, drawQuick, quickSend, sendReply,
+  activeKey() { return active && active.key; }};`);
+const M = globalThis.__m, out = {};
+const look = () => ({hidden: !!row.hidden, labels: row.children.map(c => c.textContent)});
+const sends = () => calls.filter(c => c.url === "/api/send").map(c => ({key: c.body.key, text: c.body.text}));
+const input = () => (reply.listeners.input || []).forEach(f => f({target: reply}));
+const click = b => row.listeners.click.forEach(f => f({target: b}));
+const key = (b, k) => { const ev = {key: k, target: b, prevented: false, preventDefault() { this.prevented = true; }};
+                        row.listeners.keydown.forEach(f => f(ev)); return ev; };
+(async () => {
+  await M.loadList(); await flushAsync();
+  M.openSession("A"); await flushAsync();
+  out.other = look();
+  M.openSession("O"); await flushAsync();
+  out.home = look();
+  out.markup = row.innerHTML;
+  // A tap sends exactly the chip's words, into this thread, leaving the draft alone.
+  reply.value = "half a thought";
+  PHONE = false; input();
+  out.desktopDraft = look();
+  click(row.children[3]); await flushAsync();
+  out.sent = sends();
+  out.draftKept = reply.value;
+  click(row.children[0]); await flushAsync();
+  out.sent2 = sends().slice(-1);
+  // The phone: keyboard up with a draft hides the row; either alone does not.
+  PHONE = true;
+  document.body.classList.add("kb"); input(); out.kbDraft = look();
+  reply.value = "  "; input(); out.kbBlank = look();
+  reply.value = ""; input(); out.kbEmpty = look();
+  document.body.classList.remove("kb");
+  reply.value = "typing"; input(); out.noKbDraft = look();
+  // Sent from the box: the draft is gone, the row is back with the keyboard up.
+  document.body.classList.add("kb"); input(); out.beforeSend = look().hidden;
+  await M.sendReply(); await flushAsync();
+  out.afterSend = look();
+  out.typedSend = sends().slice(-1);
+  document.body.classList.remove("kb");
+  // Keys: arrows move along the row and wrap; others are left to the browser.
+  const bs = row.children;
+  out.right = key(bs[0], "ArrowRight").prevented && focused === bs[1];
+  out.wrap = key(bs[0], "ArrowLeft").prevented && focused === bs[4];
+  out.enterLeft = !key(bs[0], "Enter").prevented;
+  // The home moved: the chips go with it.
+  home = "A"; await M.loadList(); await flushAsync();
+  out.moved = look();
+  const n = sends().length; M.quickSend(0); await flushAsync();
+  out.sentOutsideHome = sends().length - n;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_operator_thread_has_quick_reply_chips():
+    import re
+    import visualizer as V
+    print("\nquick replies in the operator's thread: one tap sends the words, as typed")
+    page = V.PAGE
+    check("the composer has the row, above the files and the box, as a labelled toolbar",
+          re.search(r'<div id="quick" role="toolbar" aria-label="[^"]+" hidden></div>\s*<div id="chips">', page)
+          is not None)
+    check("on a phone it scrolls sideways on one line rather than wrapping",
+          re.search(r"#quick \{[^}]*overflow-x: auto;[^}]*flex-wrap: nowrap;", page) is not None)
+    check("a chip has a visible keyboard focus", "#quick button.qr:focus-visible" in page)
+    js = re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+    check("the keyboard opening or closing redraws it",
+          re.search(r'classList\.toggle\("kb"[^\n]*\n\s*drawQuick\(\);', js) is not None)
+    check("a chip sends through sendText, as Send does",
+          re.search(r"function quickSend\(i\) \{[^}]*sendText\(t\);", js) is not None
+          and "sendText(text, files)" in js)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the chips checked by text only")
+        return
+    dom = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    t = Path(tempfile.mkdtemp())
+    (t / "dash.js").write_text(js)
+    (t / "drive.js").write_text(dom + QUICK_DRIVE)
+    p = subprocess.run([node, str(t / "drive.js"), str(t / "dash.js")], capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the quick-reply harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    want = ["yes", "next", "not now", "accept all", "tell me more"]
+    check("not in another thread", o["other"] == {"hidden": True, "labels": []}, o["other"])
+    check("in the operator's home: the five, in order", o["home"] == {"hidden": False, "labels": want}, o["home"])
+    check("each a real button (Tab reaches it, Enter and Space press it)",
+          o["markup"].count('<button type="button" class="qr"') == 5, o["markup"][:400])
+    check("a tap sends exactly its words, to the operator's thread",
+          o["sent"] == [{"key": "O", "text": "accept all"}] and o["sent2"] == [{"key": "O", "text": "yes"}],
+          (o["sent"], o["sent2"]))
+    check("...leaving what was being typed in the box", o["draftKept"] == "half a thought", o["draftKept"])
+    check("desktop: shown with a draft (no keyboard covers anything)", o["desktopDraft"]["hidden"] is False)
+    check("phone: hidden while the keyboard is up and the draft is not empty", o["kbDraft"]["hidden"] is True)
+    check("...shown with the keyboard up and nothing (or only spaces) typed",
+          o["kbBlank"]["hidden"] is False and o["kbEmpty"]["hidden"] is False)
+    check("...shown with a draft once the keyboard is down", o["noKbDraft"]["hidden"] is False)
+    check("sending the typed draft brings the row back",
+          o["beforeSend"] is True and o["afterSend"] == {"hidden": False, "labels": want}
+          and o["typedSend"] == [{"key": "O", "text": "typing"}], (o["afterSend"], o["typedSend"]))
+    check("arrow keys move along the row, wrapping", o["right"] and o["wrap"])
+    check("...and Enter is left to the button", o["enterLeft"])
+    check("the operator moved threads: no chips in the old home, and none sent from it",
+          o["moved"] == {"hidden": True, "labels": []} and o["sentOutsideHome"] == 0, o["moved"])
+
+
 def test_tidy_never_hides_the_operator_home():
     print("\ntidy keeps the operator's home thread")
     st = tmp_store()
