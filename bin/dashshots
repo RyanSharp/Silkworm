@@ -435,7 +435,8 @@ def start_dashboard(source: Path, home: Path, tmp: Path, bot_port: int, port: in
         inject_label(tmp / "visualizer.py", label, tap_ms)
     if (source / "assets").is_dir():
         shutil.copytree(source / "assets", tmp / "assets")
-    for name in ("sessions.json",):
+    # operator.json: whose thread the list pins (the operator's home).
+    for name in ("sessions.json", "operator.json"):
         if (home / name).exists():
             shutil.copy2(home / name, tmp / name)
     own_turn(tmp / "sessions.json")

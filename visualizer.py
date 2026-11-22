@@ -33,6 +33,7 @@ import secrets
 import dashowner
 import envfile
 import jsonstore
+import operator_role
 import procs
 import slacklinks
 import unread
@@ -517,6 +518,16 @@ def mark_seen(payload: dict) -> dict:
     return {"ok": True, "key": key, "seen": held}
 
 
+def operator_home() -> str:
+    """The operator's home thread: whichever thread last ran !operator, as
+    the bot recorded it in operator.json. Read-only (repair=False): the bot
+    owns that file. "" when there is none, or it cannot be read."""
+    try:
+        return operator_role.State(BASE_DIR / "operator.json", readonly=True).thread()
+    except Exception:
+        return ""
+
+
 def load_sessions() -> dict:
     status = bot_call("/status", {}, timeout=0.6)
     threads = status.get("threads", {})
@@ -568,7 +579,11 @@ def load_sessions() -> dict:
     out.sort(key=lambda s: -s["updated"])
     # bot_online only says the local server answered; it stayed true through a
     # seventeen-hour Slack outage. The link is a separate fact.
+    # Pinned at the top of the list, whatever the filter. Only a home that is
+    # a thread here: one recorded for a thread since forgotten pins nothing.
+    home = operator_home()
     return {"bot_online": bool(status.get("online")), "sessions": out,
+            "operator_home": home if home in entries else "",
             "slack": status.get("slack") or {},
             # A bot answering here is not a bot running the code on disk: it
             # merges onto its own main and nothing restarts it. A bot that
@@ -1616,6 +1631,10 @@ PAGE = r"""<!doctype html>
              border-left: 2px solid var(--ok); }
   .turnbar.bad { background: var(--bad-soft); border-left-color: var(--bad); }
   .badge.kind { background: var(--fill-2); color: var(--muted); border: 1px solid var(--line); }
+  /* The operator's home thread, pinned first: the label leads the row. */
+  .card .key .badge.pin { order: -1; background: var(--fill-2); color: var(--gold);
+                          border: 1px solid var(--gold); white-space: nowrap; flex: none; }
+  .card.pinned { border-left: 3px solid var(--gold); }
   /* Unread: a dot and how many replies, before the title; the title reads
      brighter until the thread is read. */
   .card .unread { margin-right: var(--sp-15); vertical-align: 1px; display: inline-flex; align-items: center; gap: var(--sp-1);
@@ -3708,6 +3727,14 @@ const KIND_LABEL = {thread: "Conversations", task: "Task runs"};
 // title, summary, cost history and file list.
 let showHidden = false;
 
+// The operator's home thread (whichever thread last ran !operator, from
+// /api/sessions' operator_home): pinned at the top under every filter and
+// sort, never put away by tidy, hide or a kind filter. "" -- no pin.
+let operatorHome = "";
+function isPinned(s) { return !!operatorHome && !!s && s.key === operatorHome; }
+// Put away: hidden, and not the pinned thread, which is shown regardless.
+function putAway(s) { return !!s.hidden && !isPinned(s); }
+
 // --- unread ---
 // A thread's `unread` is how many replies (not yours) arrived after you last
 // read it here at its bottom, on any device, or last wrote in it (unread.py,
@@ -3749,17 +3776,20 @@ function setUnreadFirst(on) {
 }
 // The unread threads first, newest first within each half; the server's
 // order (newest first) otherwise.
+// The operator's home goes first, whatever the order.
 function sortShown(shown) {
-  if (!unreadFirst) return shown;
-  return shown.map((s, i) => [s, i]).sort((a, b) =>
-    (unreadOf(b[0]) > 0) - (unreadOf(a[0]) > 0) || a[1] - b[1]).map(x => x[0]);
+  if (unreadFirst)
+    shown = shown.map((s, i) => [s, i]).sort((a, b) =>
+      (unreadOf(b[0]) > 0) - (unreadOf(a[0]) > 0) || a[1] - b[1]).map(x => x[0]);
+  const pin = shown.filter(isPinned);
+  return pin.length ? pin.concat(shown.filter(s => !isPinned(s))) : shown;
 }
 // The total, shown where the page is not: the home-screen app's icon
 // (navigator.setAppBadge, iOS 16.4+ home-screen apps, most desktop browsers)
 // and the tab's title. Hidden threads are put away, so they are not counted.
 let badgeShown = null;
 function showUnreadTotal(sessions) {
-  const n = (sessions || []).filter(s => !s.hidden).reduce((a, s) => a + unreadOf(s), 0);
+  const n = (sessions || []).filter(s => !putAway(s)).reduce((a, s) => a + unreadOf(s), 0);
   const title = (n ? `(${n}) ` : "") + BASE_TITLE;
   if (document.title !== title) document.title = title;
   if (n === badgeShown) return n;
@@ -3806,6 +3836,7 @@ function markSeen() {
 }
 
 function matchesKind(s) {
+  if (isPinned(s)) return true;
   if (!showHidden && s.hidden) return false;
   if (unreadOnly && !unreadOf(s) && !(active && active.key === s.key)) return false;
   return threadKind === "all" || (s.kind || "thread") === threadKind;
@@ -3874,7 +3905,7 @@ function renderKindFilter(sessions) {
   const kindBtns = kinds.length < 2 ? "" :
     btn("all", "All", sessions.length) +
     kinds.map(k => btn(k, KIND_LABEL[k] || k, counts[k])).join("");
-  const nUnread = sessions.filter(s => !s.hidden && unreadOf(s)).length;
+  const nUnread = sessions.filter(s => !putAway(s) && unreadOf(s)).length;
   // Only while there is something unread (or a toggle is on): with nothing
   // to narrow or reorder, they are noise.
   const unreadBtns = nUnread || unreadOnly || unreadFirst
@@ -3883,9 +3914,9 @@ function renderKindFilter(sessions) {
       `<button class="${unreadFirst ? "on" : ""}" onclick="setUnreadFirst(${!unreadFirst})"
          title="threads with unread replies at the top">unread first</button>`
     : "";
-  const nHidden = sessions.filter(s => s.hidden).length;
+  const nHidden = sessions.filter(putAway).length;
   const oldRuns = sessions.filter(
-    s => !s.hidden && (s.kind || "thread") === "task"
+    s => !s.hidden && !isPinned(s) && (s.kind || "thread") === "task"
          && (Date.now() / 1000 - s.updated) > 14 * 86400).length;
   setHTML(bar, kindBtns + unreadBtns +
     (nHidden ? `<button class="${showHidden ? "on" : ""}" onclick="toggleHidden()"
@@ -3921,6 +3952,7 @@ async function loadList() {
   renderAlerts(data.sessions, data.slack, data.revision);
   refreshTaskBadge();
   lastSessions = data.sessions;
+  operatorHome = data.operator_home || "";
   defaultKind(data.sessions);
   renderKindFilter(data.sessions);
   renderList(data.sessions.filter(matchesKind));
@@ -3947,10 +3979,13 @@ function cardHtml(s) {
   const label = s.title ? `<span class="title">${dot}${esc(s.title)}</span>`
                         : `<span class="untitled">${dot}untitled</span>`;
   const kindTag = s.kind === "task" ? `<span class="badge kind">task run</span>` : "";
-  const hideBtn = `<button class="hidebtn" title="${s.hidden ? "show again" : "hide"}"
+  // Pinned: the operator's thread, which no hide puts away -- so no ×.
+  const pinTag = isPinned(s) ? `<span class="badge pin" title="the operator's home thread, pinned to the top"
+      aria-label="pinned: operator">📌 Operator</span>` : "";
+  const hideBtn = isPinned(s) ? "" : `<button class="hidebtn" title="${s.hidden ? "show again" : "hide"}"
       onclick="hideThread('${s.key}', ${s.hidden ? "false" : "true"}, event)"
     >${s.hidden ? "↺" : "×"}</button>`;
-  return `<div class="key">${label}${kindTag}${badges}${hideBtn}
+  return `<div class="key">${pinTag}${label}${kindTag}${badges}${hideBtn}
       ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
     <div class="subkey">${esc(s.key)}</div>
     ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
@@ -3992,7 +4027,7 @@ function renderList(shown) {
       cardEls.set(s.key, div);
       born.add(div);
     }
-    const cls = "card" + (active && active.key === s.key ? " active" : "") + (unreadOf(s) ? " isunread" : "");
+    const cls = "card" + (isPinned(s) ? " pinned" : "") + (active && active.key === s.key ? " active" : "") + (unreadOf(s) ? " isunread" : "");
     if (div.className !== cls) div.className = cls;
     setHTML(div, cardHtml(s));
     return div;
@@ -7050,7 +7085,7 @@ function boardCard(t) {
 function unfiledThreads() {
   // Conversations filed under no project. Task-run threads are left out: the
   // tasks they narrate are on the board above.
-  const rows = lastSessions.filter(s => !s.project && !s.hidden && (s.kind || "thread") !== "task");
+  const rows = lastSessions.filter(s => !s.project && !putAway(s) && (s.kind || "thread") !== "task");
   return `<div class="bthreads"><div class="hint">💬 ${rows.length} thread${
     rows.length === 1 ? "" : "s"} with no project</div>` + rows.map(s =>
     `<button class="ghost b" title="${esc(s.key)}" onclick="closeBoard();jumpTo('${esc(s.key)}')">${
@@ -7069,7 +7104,7 @@ async function loadOverview() {
 function renderOverview(r) {
   const cards = (r.projects || []).map(projectCard);
   const u = r.unfiled;
-  const threads = lastSessions.filter(s => !s.project && !s.hidden && (s.kind || "thread") !== "task").length;
+  const threads = lastSessions.filter(s => !s.project && !putAway(s) && (s.kind || "thread") !== "task").length;
   if (u) cards.push(projectCard(u, threads));
   return `<div class="bhead"><h3>Projects</h3><button class="act" onclick="newProjectForm()">+ New project</button></div>`
     + `<div class="pcards">${cards.join("") || `<div class="hint">No projects yet.</div>`}</div>`

@@ -38092,6 +38092,150 @@ def test_unread_dot_filter_and_badge_in_the_page():
           not o["unreadOnlyCleared"] and "unread first" not in o["filterCleared"], o["filterCleared"])
 
 
+PIN_DRIVE = r"""
+const old = 1795000000 - 30 * 86400;
+const sess = (key, extra) => Object.assign({key, title: "T " + key, kind: "thread", project: "", summary: "",
+  session_id: "s" + key, turns: 3, cost: 0, updated: 1795000000, files: 0, events: [], running: false,
+  resume_cmd: "", slack_link: "", hidden: false, unread: 0}, extra || {});
+// O, the operator's home: oldest, hidden, a task run, nothing unread -- every
+// filter and sort would otherwise put it last or leave it out.
+let rows = [sess("A", {unread: 2}), sess("B"), sess("D", {kind: "task", updated: old}),
+            sess("O", {kind: "task", hidden: true, updated: old - 1})];
+let home = "O";
+Object.defineProperty(globalThis, "navigator", {value: {vibrate() { return true; }}, configurable: true});
+answer = (url, b) => url.startsWith("/api/sessions")
+  ? {bot_online: true, sessions: rows.map(r => Object.assign({}, r)), slack: {}, operator_home: home}
+  : url.startsWith("/api/session?") ? {messages: [], cursor: 1, files: [], live: null}
+  : url.startsWith("/api/artifacts") ? [] : BASE(url, b);
+const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+const order = () => byId("list").children.filter(c => [...M.cards.values()].includes(c))
+  .map(c => [...M.cards.entries()].find(([k, v]) => v === c)[0]);
+const look = () => ({order: order(),
+  pinned: [...M.cards.entries()].filter(([k, c]) => c.className.split(" ").includes("pinned")).map(([k]) => k),
+  labelled: [...M.cards.entries()].filter(([k, c]) => c.innerHTML.includes("📌 Operator")).map(([k]) => k),
+  hideBtnOnPin: home && M.cards.get(home) ? M.cards.get(home).innerHTML.includes("hidebtn") : null});
+(async () => {
+  const out = {};
+  await M.loadList(); await flushAsync();
+  out.first = look();          // whatever the device opens on
+  M.setKind("all"); await flushAsync();
+  out.all = look();
+  for (const k of ["thread", "task"]) { M.setKind(k); await flushAsync(); out[k] = look(); }
+  M.setKind("all"); await flushAsync();
+  M.setUnreadOnly(true); await flushAsync(); out.unreadOnly = look();
+  M.setUnreadOnly(false); await flushAsync();
+  M.setUnreadFirst(true); await flushAsync(); out.unreadFirst = look();
+  M.setUnreadFirst(false); await flushAsync();
+  M.toggleHidden(); await flushAsync(); out.showHidden = look();
+  M.toggleHidden(); await flushAsync();
+  out.filterBar = byId("kindfilter").innerHTML;
+  // Not hidden, the home is still an old task run: tidy would never touch it, so it is not counted.
+  rows[3].hidden = false; await M.loadList(); await flushAsync();
+  out.filterBarShown = byId("kindfilter").innerHTML;
+  rows[3].hidden = true; await M.loadList(); await flushAsync();
+  // A deep link to another thread opens it; the pin stays on top.
+  await M.openTarget("/?thread=D"); await flushAsync();
+  out.deepActive = M.activeKey(); out.deep = look();
+  M.clearActive();
+  // !operator in B: the home moves, and the pin with it.
+  home = "B"; M.setKind("thread"); await flushAsync();
+  out.moved = look();
+  M.setKind("all"); await flushAsync(); out.movedAll = look();
+  // No home: no pin, the plain newest-first order.
+  home = ""; await M.loadList(); await flushAsync();
+  out.none = look();
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_operator_home_is_pinned_first_in_the_thread_list():
+    import re
+    import visualizer as V
+    print("\nthe operator's home thread: pinned first under every filter and sort, moves with the home")
+    # The server: whichever thread operator.json names, and only one that is a thread.
+    d = Path(tempfile.mkdtemp())
+    (d / "operator.json").write_text(json.dumps({"thread": "C1:2"}))
+    was = (V.BASE_DIR, V.raw_sessions, V.bot_call)
+    try:
+        V.BASE_DIR = d
+        V.bot_call = lambda *a, **k: {}
+        V.raw_sessions = lambda: {"C1:1": {"updated": 2}, "C1:2": {"updated": 1}}
+        check("/api/sessions names the operator's home, read from operator.json",
+              V.load_sessions()["operator_home"] == "C1:2")
+        (d / "operator.json").write_text(json.dumps({"thread": "C1:9"}))
+        check("...not a home that is no thread here", V.load_sessions()["operator_home"] == "")
+        (d / "operator.json").unlink()
+        check("...and none without an operator", V.load_sessions()["operator_home"] == "")
+        check("...reading it never writes it", not (d / "operator.json").exists())
+    finally:
+        V.BASE_DIR, V.raw_sessions, V.bot_call = was
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the pin checked on the server only")
+        return
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    dom = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    expose = """
+;globalThis.__m = {loadList, setKind, setUnreadOnly, setUnreadFirst, toggleHidden, openTarget, cards: cardEls,
+  activeKey() { return active && active.key; }, clearActive() { active = null; }};"""
+    t = Path(tempfile.mkdtemp())
+    (t / "dash.js").write_text(js)
+    (t / "drive.js").write_text(dom + "(0, eval)(SRC + " + json.dumps(expose) + ");\nconst M = globalThis.__m;\n"
+                                + PIN_DRIVE)
+    p = subprocess.run([node, str(t / "drive.js"), str(t / "dash.js")], capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the pin harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    for name in ("first", "all", "thread", "task", "unreadOnly", "unreadFirst", "showHidden", "deep"):
+        v = o[name]
+        check(f"{name}: the home is first, once, marked pinned and labelled Operator",
+              v["order"][:1] == ["O"] and v["order"].count("O") == 1
+              and v["pinned"] == ["O"] and v["labelled"] == ["O"], v)
+    check("...the rest keep their order beneath it",
+          o["all"]["order"] == ["O", "A", "B", "D"] and o["thread"]["order"] == ["O", "A", "B"]
+          and o["unreadFirst"]["order"] == ["O", "A", "B", "D"]
+          and o["task"]["order"] == ["O", "D"] and o["unreadOnly"]["order"] == ["O", "A"]
+          and o["showHidden"]["order"] == ["O", "A", "B", "D"], o)
+    check("the pinned row has no × (no hide puts it away)", o["all"]["hideBtnOnPin"] is False)
+    check("...and is not counted hidden, nor as an old task run to tidy",
+          "hidden <b>" not in o["filterBar"] and "tidy <b>1</b>" in o["filterBar"]
+          and "tidy <b>1</b>" in o["filterBarShown"], (o["filterBar"], o["filterBarShown"]))
+    check("a ?thread= link still opens its thread", o["deepActive"] == "D", o["deepActive"])
+    check("the home moved: the pin moves with it, and the old home is an ordinary row again",
+          o["moved"]["order"] == ["B", "A"] and o["moved"]["pinned"] == ["B"]
+          and o["movedAll"]["order"] == ["B", "A", "D"] and o["movedAll"]["labelled"] == ["B"], (o["moved"], o["movedAll"]))
+    check("no home: no pin, newest first",
+          o["none"]["order"] == ["A", "B", "D"] and o["none"]["pinned"] == [] and o["none"]["labelled"] == [], o["none"])
+
+
+def test_tidy_never_hides_the_operator_home():
+    print("\ntidy keeps the operator's home thread")
+    st = tmp_store()
+    for k in ("C:1", "C:2"):
+        st.update(k, title="old task run " + k, kind="task")
+        st._data[k]["updated"] = time.time() - 30 * 86400
+    hidden = st.hide_older_than(14, kinds=("task",), keep={"C:2"})
+    check("a bulk tidy hides old task runs but not a kept one",
+          hidden == ["C:1"] and not st.get("C:2").get("hidden"), hidden)
+    bot = (BASE / "bot.py").read_text()
+    check("the bot's tidy keeps the operator's home",
+          "hide_older_than(days, kinds=kinds, keep={OPERATOR.thread()}" in bot)
+    # The route itself, lifted, against a store and an operator home.
+    import operator_role
+    d = Path(tempfile.mkdtemp())
+    op = operator_role.State(d / "operator.json")
+    op.set_thread("C:2")
+    fn = lift("handle_hide", store=st, OPERATOR=op, log=__import__("logging").getLogger("t"))["handle_hide"]
+    st.set_hidden("C:1", False)
+    r = fn({"action": "bulk", "days": 14, "kinds": ["task"]})
+    check("/hide bulk leaves the home shown", r["keys"] == ["C:1"] and not st.get("C:2").get("hidden"), r)
+    r = fn({"action": "hide", "key": "C:2"})
+    check("/hide refuses the home itself", r["ok"] is False and not st.get("C:2").get("hidden"), r)
+    check("...but hides any other thread", fn({"action": "hide", "key": "C:1"})["ok"] is True)
+
+
 # --- GitHub CI as the landing gate (ci.py) --------------------------------------
 # Cadence landed on the mini's own `make -C ios test`, pushed main, and only
 # then did GitHub run its workflows -- on another runner, after everybody was

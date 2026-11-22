@@ -273,16 +273,17 @@ class SessionStore:
             self._save()
             return True
 
-    def hide_older_than(self, days: float, kinds=()) -> list[str]:
+    def hide_older_than(self, days: float, kinds=(), keep=()) -> list[str]:
         """Hide threads untouched for `days`. Returns the keys hidden.
 
         `kinds` narrows it -- task-run threads are one-offs that pile up, while
-        a quiet conversation may still be one you return to.
+        a quiet conversation may still be one you return to. `keep` are never
+        hidden: the operator's home thread, which the dashboard pins.
         """
         cutoff = time.time() - days * 86400
         with self._lock:
             keys = [k for k, v in self._data.items()
-                    if not v.get("hidden")
+                    if not v.get("hidden") and k not in keep
                     and v.get("updated", 0) < cutoff
                     and not v.get("pending")
                     and (not kinds or (v.get("kind") or "thread") in kinds)]

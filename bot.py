@@ -3979,13 +3979,17 @@ def handle_hide(payload: dict) -> dict:
     if action == "bulk":
         days = float(payload.get("days") or 30)
         kinds = tuple(payload.get("kinds") or ())
-        keys = store.hide_older_than(days, kinds=kinds)
+        # The operator's home is pinned on the dashboard: tidy never puts it away.
+        keys = store.hide_older_than(days, kinds=kinds, keep={OPERATOR.thread()} - {""})
         log.info("hid %d thread(s) untouched for %sd%s", len(keys), days,
                  f" (kinds={','.join(kinds)})" if kinds else "")
         return {"ok": True, "hidden": len(keys), "keys": keys}
     key = payload.get("key", "")
     if not store.get(key):
         return {"ok": False, "error": "unknown thread"}
+    if action != "unhide" and key == OPERATOR.thread():
+        # Pinned on the dashboard, which offers no hide for it.
+        return {"ok": False, "error": "the operator's home thread is pinned, not hidden"}
     ok = store.set_hidden(key, action != "unhide")
     return {"ok": ok, "key": key, "hidden": action != "unhide"}
 
