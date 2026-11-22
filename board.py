@@ -22,6 +22,7 @@ import health
 import branches
 import inbox
 import costs
+import merge
 import projects as projects_mod
 import releases
 import research
@@ -656,4 +657,257 @@ def project_page(prec: dict, records, *, unmerged_rows=(), health_rows=(), relea
         "unmerged": unmerged, "counts": counts,
         "cost_week": costs.by_project(records, now=now, unfiled=UNFILED).get(slug),
         "days": days, "note": costs.NOTE,
+    }
+
+
+# --- one task's page ---------------------------------------------------------------
+
+#: The reply text a page carries. Replies run to tens of kilobytes; past this
+#: the page says it was cut rather than shipping a megabyte to a phone.
+PAGE_TEXT_MAX = 120_000
+
+#: What each state means, in plain words, for the line under a task's title.
+STATE_WORDS = {
+    tasks.PROPOSED: "Proposed. Nothing runs until you accept it.",
+    tasks.QUEUED: "Queued. The runner takes it when a worker is free.",
+    tasks.RUNNING: "Running now.",
+    tasks.BLOCKED: "Waiting on something else before it can go on.",
+    tasks.AWAITING_APPROVAL: "Finished and waiting for your approval. Approving lands it.",
+    tasks.NEEDS_INPUT: "Stopped to wait for you.",
+    tasks.FAILED: "Stopped without finishing.",
+    tasks.DONE: "Done.",
+    tasks.CANCELLED: "Cancelled. It will not run again unless it is filed again.",
+}
+
+#: The timeline's words for an event kind.
+EVENT_WORDS = {
+    tasks.QUEUED: "Queued", tasks.RUNNING: "Run started", tasks.BLOCKED: "Waiting",
+    tasks.AWAITING_APPROVAL: "Waiting for approval", tasks.NEEDS_INPUT: "Waiting for you",
+    tasks.FAILED: "Failed", tasks.DONE: "Done", tasks.CANCELLED: "Cancelled",
+    tasks.PROPOSED: "Proposed", "decided": "Decided by you", "edited": "Edited",
+    "priority": "Priority changed",
+}
+
+
+def _event_line(e: dict) -> tuple[str, str]:
+    """(label, detail) for one stored event, the who-and-how said first."""
+    kind, detail = str(e.get("kind") or ""), str(e.get("detail") or "")
+    words = EVENT_WORDS.get(kind, kind.replace("_", " ").capitalize() or "Event")
+    for verb, label in (("accept via ", "Accepted"), ("retry via ", "Retried"),
+                        ("dismiss via ", "Dismissed"), ("cancel via ", "Cancelled"),
+                        ("approve via ", "Approved")):
+        if detail.startswith(verb):
+            # "approve via ui (a note)": the who, then whatever was said with it.
+            who, _, note = detail[len(verb):].partition(" (")
+            who = "the dashboard" if who in ("ui", "you", "dashboard") else who
+            return f"{label} via {who}", note[:-1] if note.endswith(")") else note
+    via = str(e.get("via") or "")
+    if via and via not in detail:
+        detail = f"{detail} ({via})" if detail else via
+    return words, detail
+
+
+def state_words(rec: dict, by_id: dict, queue_pos: int | None = None) -> str:
+    """The line under a task's title: what its state means for this task."""
+    state = rec.get("state") or ""
+    result = rec.get("result") or {}
+    needs = rec.get("needs_user") or {}
+    if state == tasks.QUEUED and queue_pos:
+        return f"Queued, #{queue_pos} in line. The runner takes it when a worker is free."
+    if state == tasks.BLOCKED:
+        # A blocker no longer on record is not something to wait on.
+        open_ = [by_id[b] for b in rec.get("blocked_on") or [] if b in by_id]
+        open_ = [b for b in open_ if b.get("state") not in tasks.TERMINAL]
+        if any(b.get("role") == "reviewer" for b in open_):
+            return "Its run finished; waiting for its review before it comes to you."
+        if rec.get("retry_at"):
+            return "Held after a failure outside it (a quota or an outage); it retries on its own."
+        if open_:
+            return f"Waiting on {', '.join(b.get('id') or '?' for b in open_)} to finish."
+    if state == tasks.NEEDS_INPUT:
+        if research.has_findings(rec):
+            return "Research finished: read its findings, then close it or dig deeper."
+        if needs.get("action"):
+            return "It did everything it could and left one step that is yours to take."
+        return "It asked you something and waits for your answer."
+    if state == tasks.AWAITING_APPROVAL and needs.get("action"):
+        return "Finished, and it left one step for you; approving lands it."
+    if state == tasks.FAILED:
+        why = inbox._event_why(rec)
+        return f"Stopped without finishing: {why}" if why else STATE_WORDS[state]
+    if state == tasks.DONE:
+        l = result.get("landing") or {}
+        if l.get("landed") or result.get("landed"):
+            head = str(l.get("head") or result.get("landed") or "")[:8]
+            return f"Done, and landed onto {l.get('base') or 'its base'} as {head}."
+        words = landing_words(l)
+        if words:
+            return words
+        if research.is_research(rec):
+            return "Done; its findings were closed."
+    if state == tasks.CANCELLED and not (rec.get("attempts") or 0):
+        return "Dismissed before it ever ran."
+    return STATE_WORDS.get(state, state)
+
+
+#: Landing stages that are under way, not refused (the dashboard's landing()).
+LANDING_UNDERWAY = {"in-progress": "landing under way", "ci-wait": "waiting for CI before it lands"}
+
+
+def landing_words(l: dict) -> str:
+    """What a done task's landing record says, for its state line; "" when
+    there is none (or it landed: said with its head by the caller)."""
+    if not l or l.get("landed"):
+        return ""
+    stage = str(l.get("stage") or "?")
+    if stage == "nothing-to-land":
+        return "Done; its work was already on the base, so there was nothing to land."
+    if stage in LANDING_UNDERWAY:
+        return f"Done; {LANDING_UNDERWAY[stage]}."
+    if l.get("reworked_by"):
+        return (f"Done, but not landed ({stage}): handed to {l['reworked_by']} "
+                "to catch up with the base.")
+    if merge.needs_a_person(l):
+        return f"Done, but not landed ({stage}): its branch waits for you."
+    return f"Done, but not landed ({stage})."
+
+
+def _brief(r: dict | None) -> dict | None:
+    if not r:
+        return None
+    return {"id": r.get("id") or "", "title": r.get("title") or r.get("id") or "",
+            "state": r.get("state") or "", "role": r.get("role") or ""}
+
+
+def task_page(rec: dict, records, *, unmerged_rows=(), changes=None, project_title: str = "",
+              now: float | None = None) -> dict:
+    """Everything about one task on one page, read-only.
+
+    Named fields only: a record carries its scope (a checkout, an
+    environment), a session and checkpoint, and none of that is the page's.
+    `changes` is taskchanges.read's answer (bot.task_changes) -- None when the
+    task has no repository to read. The buttons are inbox.py's own for it, so
+    the page offers exactly what Needs you would, through the same actions.
+    """
+    now = time.time() if now is None else now
+    records = list(records)
+    by_id = {r.get("id"): r for r in records}
+    tid = rec.get("id") or ""
+    reviews = sorted((r for r in records if r.get("role") == "reviewer"
+                      and r.get("parent") == tid), key=lambda r: r.get("created") or 0)
+    kids = sorted((r for r in records if r.get("parent") == tid and r.get("role") != "reviewer"),
+                  key=lambda r: r.get("created") or 0)
+    # A branch that could not land is handed to a catch-up task filed with
+    # source_ref (not parent): its runs are this work's reruns.
+    catchups = sorted((r for r in records if r.get("source") == "rework"
+                       and r.get("source_ref") == tid and r.get("id") != tid),
+                      key=lambda r: r.get("created") or 0)
+    unmerged = {u.get("id"): u for u in unmerged_rows or ()}
+    item = inbox._task_item(rec, by_id, unmerged)
+    queue = sorted((r for r in records if _in_queue(r)), key=tasks.claim_order)
+    pos = next((i + 1 for i, r in enumerate(queue) if r.get("id") == tid), None)
+    result = rec.get("result") or {}
+    text = result.get("text") if isinstance(result.get("text"), str) else ""
+    cut = len(text) > PAGE_TEXT_MAX
+    project = rec.get("project") or (by_id.get(rec.get("parent") or "", {}).get("project")
+                                     if rec.get("role") == "reviewer" else "") or ""
+
+    # Cost: its own runs, each dated, and each review's.
+    runs = []
+    for r in result.get("cost_runs") or []:
+        if not (isinstance(r, (list, tuple)) and len(r) == 2):
+            continue
+        at, usd = r
+        runs.append({"at": at if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
+                     "usd": round(float(usd), 4) if isinstance(usd, (int, float))
+                     and not isinstance(usd, bool) else None})
+    total = costs.total(rec, [*reviews, *catchups])
+    cost = {"total": total, "own": costs.own(rec), "runs": runs,
+            "reviews": [{"id": r.get("id"), "state": r.get("state") or "",
+                         "usd": costs.own(r), "ran": costs.ran(r)} for r in reviews],
+            "catchups": [{"id": r.get("id"), "state": r.get("state") or "",
+                          "usd": costs.own(r), "ran": costs.ran(r)} for r in catchups],
+            "attempts": rec.get("attempts") or 0}
+
+    # The timeline: filed, every stored event, each review, the landing, the
+    # release that shipped it and whether the running bot has it.
+    tl = [{"at": rec.get("created") or 0, "kind": "created",
+           "label": "Filed" + (f" by the {rec['filed_by']}" if rec.get("filed_by") else ""),
+           "detail": f"from {rec.get('source')}" if rec.get("source") else ""}]
+    runs_seen = 0
+    for e in rec.get("events") or []:
+        if not isinstance(e, dict):
+            continue
+        label, detail = _event_line(e)
+        if e.get("kind") == tasks.RUNNING:
+            runs_seen += 1
+            label = f"Run {runs_seen} started"
+        at = e.get("at")
+        tl.append({"at": at if isinstance(at, (int, float)) and not isinstance(at, bool) else 0,
+                   "kind": str(e.get("kind") or ""), "label": label, "detail": detail[:300]})
+    for r in runs:
+        if r["at"]:
+            tl.append({"at": r["at"], "kind": "run-ended", "label": "Run ended",
+                       "detail": f"${r['usd']:.2f}" if r["usd"] is not None else "cost unknown"})
+    for r in catchups:
+        tl.append({"at": r.get("created") or 0, "kind": "catchup",
+                   "label": "Handed to a catch-up task", "detail": r.get("id") or "",
+                   "id": r.get("id") or ""})
+    for r in reviews:
+        rv_done = finished_at(r) if r.get("state") in tasks.TERMINAL else None
+        tl.append({"at": r.get("created") or 0, "kind": "review", "label": "Review started",
+                   "detail": r.get("id") or "", "id": r.get("id") or ""})
+        if rv_done:
+            tl.append({"at": rv_done, "kind": "review", "label": f"Review {r.get('state')}",
+                       "detail": r.get("id") or "", "id": r.get("id") or ""})
+    landing = result.get("landing") or {}
+    if landing.get("at"):
+        tl.append({"at": landing["at"], "kind": "landing",
+                   "label": (f"Landed onto {landing.get('base') or 'the base'}" if landing.get("landed")
+                             else "Nothing to land" if landing.get("stage") == "nothing-to-land"
+                             else (lambda w: w[:1].upper() + w[1:])(
+                                 LANDING_UNDERWAY.get(landing.get("stage") or "", ""))
+                             or f"Not landed ({landing.get('stage') or '?'})"),
+                   "detail": (str(landing.get("head") or "")[:8] if landing.get("landed")
+                              else str(landing.get("detail") or "")[-300:])})
+    ch = changes or {}
+    if (ch.get("released") or {}).get("at"):
+        tl.append({"at": ch["released"]["at"], "kind": "release",
+                   "label": f"Released in {ch['released']['tag']}", "detail": ""})
+    if ch.get("deployed") is True:
+        tl.append({"at": ch.get("deployed_at") or now, "kind": "deploy",
+                   "label": "Running in the bot", "detail": "the bot's running revision has it"})
+    tl.sort(key=lambda x: (x["at"] or 0))
+
+    review = result.get("review") or None
+    return {
+        "id": tid, "title": rec.get("title") or tid, "state": rec.get("state") or "",
+        "state_words": state_words(rec, by_id, pos), "role": rec.get("role") or "",
+        "project": project, "project_title": project_title or project,
+        "source": rec.get("source") or "", "filed_by": rec.get("filed_by") or "",
+        "created": rec.get("created") or 0, "updated": rec.get("updated") or 0,
+        "attempts": rec.get("attempts") or 0, "queue_pos": pos,
+        "goal": (rec.get("goal") or "")[:PAGE_TEXT_MAX],
+        "text": text[-PAGE_TEXT_MAX:] if cut else text, "text_cut": cut,
+        "needs_user": ({k: str((rec.get("needs_user") or {}).get(k) or "")[:500]
+                        for k in ("action", "why")}
+                       if (rec.get("needs_user") or {}).get("action") else None),
+        "item": item,
+        "result": {"review": review,
+                   "landing": ({**landing, "detail": str(landing.get("detail") or "")[-600:]}
+                               if landing else None),
+                   **({"decided_by": result["decided_by"]} if result.get("decided_by") else {}),
+                   **({"decided_via": result["decided_via"]} if result.get("decided_via") else {})},
+        "branch": rec.get("branch") or "", "commits": rec.get("commits") or 0,
+        "unmerged": unmerged_of(unmerged.get(tid)),
+        "changes": changes,
+        "cost": cost, "cost_total": cost["total"],
+        "timeline": tl,
+        "thread": rec.get("thread") or "",
+        "thread_link": slacklinks.for_key(rec.get("thread") or ""),
+        "parent": _brief(by_id.get(rec.get("parent") or "")),
+        "children": [_brief(r) for r in kids], "reviews": [_brief(r) for r in reviews],
+        "catchups": [_brief(r) for r in catchups],
+        "finished": finished_at(rec) if rec.get("state") in tasks.TERMINAL else None,
+        "note": costs.NOTE,
     }

@@ -60,8 +60,8 @@ def _goal_line(rec: dict) -> str:
 
 
 def _event_why(rec: dict) -> str:
-    ev = rec.get("events") or []
-    e = ([x for x in ev if (x or {}).get("kind") == rec.get("state")][-1:] or ev[-1:] or [{}])[0]
+    ev = [x for x in rec.get("events") or [] if isinstance(x, dict)]
+    e = ([x for x in ev if x.get("kind") == rec.get("state")][-1:] or ev[-1:] or [{}])[0]
     return str((e or {}).get("detail") or "")
 
 

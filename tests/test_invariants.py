@@ -122,7 +122,7 @@ STAND_INS = {
 #: A test that drives one of these routes supplies the name instead.
 TASK_ROUTES = ("CLAUDE_CWD", "HEALTH_WARN_DAYS", "_spend", "_with_costs", "approve_task",
                "board_release", "board_release_tags", "board_survey", "decide_findings", "land_or_drop", "operator_refused",
-               "project_store", "run_email_ingest", "stop_task", "task_contained",
+               "project_store", "run_email_ingest", "stop_task", "task_changes", "task_contained",
                "tell_thread", "tidy_checkout")
 PROJECT_ROUTES = ("GITHUB_OWNER", "install_git_guards", "operator_refused",
                   "set_ideate_lenses", "task_store", "unregistered_repos")
@@ -28147,15 +28147,22 @@ globalThis.fetch = async (url, opts) => {
     reads.push(url);
     out = {session_id: "s1", messages: [], cursor: 1, reset: false, live: liveNow};
   } else if (url.startsWith("/api/sessions")) out = {bot_online: true, sessions, slack: {}};
-  else if (url.startsWith("/api/tasks")) out = {ok: true, tasks: [], counts: {}};
+  else if (url.startsWith("/api/tasks")) {
+    const b = JSON.parse(opts.body); taskAsks.push(b);
+    out = b.action === "page" ? {ok: true, page: {id: b.id, title: "the task", state: "needs_input",
+                                                 state_words: "waiting", role: "implementor", project: "",
+                                                 created: 1, timeline: [], cost: {}, item: null}}
+        : {ok: true, tasks: [], counts: {}};
+  }
   else if (url.startsWith("/api/stats"))
     out = {total_cost: 1, cache_rate: 90, threads: 2, days: [], models: []};
   else if (url.startsWith("/api/artifacts")) out = [];
   else if (url.startsWith("/api/projects")) out = {ok: true, projects: []};
   return {status: 200, headers: {get: () => null}, json: async () => out};
 };
+const taskAsks = [];
 (0, eval)(src + `;globalThis.__p = {enableNotifications, pushSupport, sendReply, sendText, recheckSend,
-  openTarget, openTask, newThreadForm, submitNewThread, loadList, loadTranscript,
+  openTarget, newThreadForm, submitNewThread, loadList, loadTranscript,
   getActive: () => active, setActive(k) { active = lastSessions.find(s => s.key === k); },
   sent: k => sentFor(k)};`);
 const tick = async (n) => { for (let i = 0; i < (n || 20); i++) await new Promise(r => setImmediate(r)); };
@@ -28193,12 +28200,11 @@ const tick = async (n) => { for (let i = 0; i < (n || 20); i++) await new Promis
   await P.loadList();
   swMessage({data: {type: "open", url: "/?thread=D1:5.5"}}); await tick();
   out.openThread = {active: P.getActive() && P.getActive().key, read: reads[reads.length - 1] || ""};
-  // ...or the task, in the needs-you list, opened and marked.
-  rows["tsk_9"] = byId("row9"); rows["tsk_9"]._details = byId("det9");
-  byId("tproj").value = "some-other-project";
+  // ...or the task, on its own page (over the board's sheet).
   swMessage({data: {type: "open", url: "/?task=tsk_9"}}); await tick(40);
-  out.openTask = {modal: byId("taskmodal").style.display, details: byId("det9").open,
-                  flashed: byId("row9").flashed, filter: byId("tproj").value};
+  out.openTask = {board: byId("boardmodal").style.display,
+                  asked: taskAsks.filter(b => b.action === "page").map(b => b.id),
+                  drawn: byId("bover").innerHTML.includes("the task")};
 
   // A send whose outcome is unknown, every time: reconciled under the same
   // id, then left unconfirmed -- and the text is not put back.
@@ -28317,8 +28323,8 @@ def test_dashboard_notifications_and_reconcile():
     check("a tapped notification opens its thread in the app already open",
           o["openThread"]["active"] == "D1:5.5" and "key=D1%3A5.5" in o["openThread"]["read"],
           str(o["openThread"]))
-    check("or its task, in the needs-you list, opened and marked",
-          o["openTask"] == {"modal": "flex", "details": True, "flashed": True, "filter": ""},
+    check("or its task, on its own page",
+          o["openTask"] == {"board": "flex", "asked": ["tsk_9"], "drawn": True},
           str(o["openTask"]))
     c = outs["cold"]["cold"]
     check("a cold start on /?thread= opens that thread, and leaves / in the address bar",
@@ -40765,7 +40771,7 @@ def test_project_page_reads_one_project():
           "project" in V.READ_TASK_ACTIONS)
     dash = (BASE / "bin" / "dashshots").read_text()
     check("and the screenshot stand-in passes it through as one",
-          '"inbox", "project"}' in dash and 'f"/?view=project&slug={p}"' in dash
+          '"inbox", "project", "page"}' in dash and 'f"/?view=project&slug={p}"' in dash
           and 'f"/?view=board&slug={p}"' in dash)
     check("it is pure over what it is handed: no probe module, no network",
           "health_probes" not in (BASE / "board.py").read_text()
@@ -40916,6 +40922,424 @@ def test_dashboard_project_page_renders():
           str(o["badSec"]))
     check("an unreadable health store is said on the page", "the health store could not be read" in js)
 
+
+
+_TASK_SECRETS = ("sk-ant-TASKPAGE-1", "ghp_TASKPAGETOKEN2", "TASKPAGE-ENV-3", "TASKPAGE-SESSION-4")
+
+
+def _task_page_world():
+    """A real TaskStore holding a landed implementor with two runs, its two
+    reviews, a follow-up it filed, its parent, an approval with a step left
+    for you and a proposal -- records carrying planted secrets -- and the
+    bot's own /tasks `page` route over them, its git changes a fixed answer.
+    (handle, ids, store, changes_asked)."""
+    import board as B
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ids, now = {}, time.time()
+    secret_scope = {"cwd": "/tmp/alpha-secret-checkout", "env": {"TOKEN": _TASK_SECRETS[2]}}
+
+    def make(key, title, path, project="alpha", role="implementor", state0=T.QUEUED, **kw):
+        t = st.create(title + "\nWhat done looks like: it works.", title=title, state=state0,
+                      role=role, project=project if role != "reviewer" else "",
+                      source="dashboard", driver="queue", scope=secret_scope,
+                      parent=kw.pop("parent", None), thread=kw.pop("thread", "D9:100.5"))
+        for s, why in path:
+            st.transition(t["id"], s, why)
+        if kw:
+            st.update(t["id"], **kw)
+        ids[key] = t["id"]
+        return t["id"]
+    make("parent", "Plan the dashboard", [(T.RUNNING, ""), (T.DONE, "")])
+    make("main", "Draw the task page", [(T.QUEUED, "accept via ui"), (T.RUNNING, "claimed by the runner"),
+                                        (T.BLOCKED, "waiting on its review"),
+                                        (T.QUEUED, "sent back via review"), (T.RUNNING, "claimed by the runner"),
+                                        (T.DONE, "landed")],
+         state0=T.PROPOSED, parent=None,
+         session_id=_TASK_SECRETS[3], checkpoint={"session_id": _TASK_SECRETS[3], "at": now},
+         branch="silkworm/tsk_main", commits=2,
+         result={"text": "## Done\n\nThe page **reads well**:\n- one\n- `two`\n\n" + _TASK_SECRETS[0][:0]
+                 + "```\nmake test\n```",
+                 "cost": 3.0, "cost_runs": [[now + 5, 1.25], [now + 10, 1.75]],
+                 "review": {"ok": True, "summary": "clean", "findings": [], "followups": []},
+                 "landing": {"eligible": True, "landed": True, "stage": "done", "base": "main",
+                             "before": "1111111111", "head": "2222222222abc", "at": now + 20,
+                             "published": False},
+                 "decided_by": "U123", "decided_via": "dashboard message 9.9"})
+    st.update(ids["main"], parent=ids["parent"])
+    make("rev1", "Review: Draw the task page", [(T.RUNNING, ""), (T.DONE, "")], role="reviewer",
+         parent=ids["main"], result={"cost": 0.4})
+    make("rev2", "Review: Draw the task page (again)", [(T.RUNNING, ""), (T.DONE, "")], role="reviewer",
+         parent=ids["main"], result={"cost": 0.35})
+    make("kid", "Follow-up: cache the page", [], parent=ids["main"], state0=T.PROPOSED)
+    make("approval", "Ship the release", [(T.RUNNING, ""), (T.AWAITING_APPROVAL, "")],
+         needs_user={"action": "!release alpha all", "why": "the release is yours"},
+         result={"review": {"ok": True, "summary": "fine"}})
+    make("proposal", "A proposal", [], state0=T.PROPOSED)
+    make("other", "Another project's", [(T.RUNNING, ""), (T.DONE, "")], project="beta")
+    asked = []
+    changes = {"branch": "silkworm/tsk_main", "base": "main", "range": "11111111..22222222",
+               "landed": True, "commits": [{"sha": "2222222222", "subject": "Draw the task page", "at": now},
+                                           {"sha": "1a1a1a1a1a", "subject": "Its tests", "at": now}],
+               "commit_count": 2, "files": [{"path": "visualizer.py", "added": 120, "removed": 4},
+                                            {"path": "assets/x.png", "added": None, "removed": None}],
+               "file_count": 2, "added": 120, "removed": 4, "error": "",
+               "released": {"tag": "app/v1.4.0", "at": now + 30}, "deployed": True,
+               "deployed_at": now + 40}
+
+    def task_changes(rec):
+        asked.append(rec.get("id"))
+        return changes if rec.get("id") == ids["main"] else None
+    projects = {"alpha": {"slug": "alpha", "title": "Alpha", "scope": secret_scope,
+                          "brief": _TASK_SECRETS[1]}}
+    handle = _bot_func(
+        "handle_tasks", task_store=st, tasks=T, board=B, task_changes=task_changes,
+        project_store=types.SimpleNamespace(get=lambda s: projects.get(s),
+                                            scope_for=lambda s: secret_scope),
+        board_survey=lambda: [], log=logging.getLogger("test"))
+    return handle, ids, st, asked
+
+
+def test_task_page_reads_one_task():
+    print("\na task's page: state in words, the step it needs, the result, its changes, "
+          "cost with reviews and reruns, a timeline and its links, read-only with no secrets")
+    handle, ids, st, asked = _task_page_world()
+    before = json.dumps(st.all(), sort_keys=True)
+    r = handle({"action": "page", "id": ids["main"]})
+    check("the route answers for a task", r.get("ok"), str(r)[:300])
+    check("and refuses one it does not know",
+          handle({"action": "page", "id": "tsk_nope"}) == {"ok": False, "error": "unknown task"})
+    pg = r["page"]
+    check("title, state and the state in plain words",
+          pg["title"] == "Draw the task page" and pg["state"] == "done"
+          and pg["state_words"] == "Done, and landed onto main as 22222222.", pg["state_words"])
+    check("the reply text whole, for the page to draw as markdown",
+          pg["text"].startswith("## Done") and "**reads well**" in pg["text"] and not pg["text_cut"])
+    check("its changes are task_changes' answer for it",
+          pg["changes"]["commits"][0]["subject"] == "Draw the task page" and asked == [ids["main"]])
+    c = pg["cost"]
+    check("cost: its two runs and its two reviews, the total with both",
+          [x["usd"] for x in c["runs"]] == [1.25, 1.75]
+          and [x["usd"] for x in c["reviews"]] == [0.4, 0.35]
+          and c["total"] == {"usd": 3.75, "complete": True}, str(c))
+    labels = [e["label"] for e in pg["timeline"]]
+    check("the timeline opens with its filing, then who accepted it and how",
+          labels[0] == "Filed" and "from dashboard" in pg["timeline"][0]["detail"]
+          and labels[1] == "Accepted via the dashboard", str(labels[:4]))
+    check("each run numbered, the reruns among them",
+          labels.count("Run 1 started") == 1 and labels.count("Run 2 started") == 1, str(labels))
+    check("its reviews, the landing, the release and the deploy",
+          "Review started" in labels and "Review done" in labels and "Landed onto main" in labels
+          and "Released in app/v1.4.0" in labels and "Running in the bot" in labels, str(labels))
+    check("in time order", [e["at"] for e in pg["timeline"]] == sorted(e["at"] for e in pg["timeline"]))
+    check("links: its thread, project, parent, the follow-up it filed and its reviews",
+          pg["thread"] == "D9:100.5" and pg["project"] == "alpha" and pg["project_title"] == "Alpha"
+          and pg["parent"]["id"] == ids["parent"] and [k["id"] for k in pg["children"]] == [ids["kid"]]
+          and [k["id"] for k in pg["reviews"]] == [ids["rev1"], ids["rev2"]], str(pg["children"]))
+    check("a landed task waits on nobody: no buttons", pg["item"] is None)
+    a = handle({"action": "page", "id": ids["approval"]})["page"]
+    check("the step a task left for you, and the inbox's own buttons for it",
+          a["needs_user"] == {"action": "!release alpha all", "why": "the release is yours"}
+          and a["item"]["actions"] == ["approve", "rework", "dismiss"]
+          and "left one step for you" in a["state_words"], str(a["item"]))
+    p = handle({"action": "page", "id": ids["proposal"]})["page"]
+    check("a proposal: Accept and Dismiss, and what proposed means",
+          p["item"]["actions"] == ["accept", "dismiss"] and "until you accept it" in p["state_words"])
+    rv = handle({"action": "page", "id": ids["rev1"]})["page"]
+    check("a review belongs to its parent's project and links back to it",
+          rv["project"] == "alpha" and rv["parent"]["id"] == ids["main"])
+    whole = json.dumps([r, a, p, rv])
+    leaked = [s for s in _TASK_SECRETS if s in whole]
+    check("no secrets: not its scope's environment, the project's brief, nor its session",
+          not leaked and "/tmp/alpha-secret-checkout" not in whole and '"scope"' not in whole
+          and '"checkpoint"' not in whole and '"session_id"' not in whole, str(leaked))
+    check("and reading it moved nothing", json.dumps(st.all(), sort_keys=True) == before)
+    import visualizer as V
+    check("the dashboard treats it as a read", "page" in V.READ_TASK_ACTIONS)
+    dash = (BASE / "bin" / "dashshots").read_text()
+    check("and so does the screenshot stand-in", '"project", "page"}' in dash and "local_task_page" in dash)
+
+
+def test_task_page_odd_records():
+    import board as B
+    import merge as merge_mod
+    import taskchanges as C
+    print("\na task's page over records the happy path never makes: landings under way, "
+          "caught-up branches, damaged fields, a task that never ran")
+
+    def page(rec, others=()):
+        return B.task_page({"id": "tsk_a", "title": "a", "created": 1, **rec}, [*others])
+    for stage, words in (("in-progress", "landing under way"), ("ci-wait", "waiting for CI")):
+        p = page({"state": "done", "result": {"landing": {"eligible": True, "landed": False, "stage": stage,
+                                                          "at": 5}}})
+        check(f"a landing {stage} is said as under way, never as waiting for you",
+              words in p["state_words"] and "waits for you" not in p["state_words"]
+              and not any("refused" in e["label"].lower() or "Not landed" in e["label"] for e in p["timeline"]),
+              f"{p['state_words']} {[e['label'] for e in p['timeline']]}")
+        check(f"and the timeline says it in the same words ({stage})",
+              any(e["label"].lower() == words.lower() or e["label"].startswith(words[:1].upper() + words[1:])
+                  for e in p["timeline"]) and not any("ci before" in e["label"] for e in p["timeline"]),
+              str([e["label"] for e in p["timeline"]]))
+    held = page({"state": "done", "result": {"landing": {"eligible": True, "landed": False,
+                                                         "stage": merge_mod.BASE_FAILING, "at": 5}}})
+    check("a landing held for another reason is not plain Done",
+          held["state_words"] == f"Done, but not landed ({merge_mod.BASE_FAILING}).", held["state_words"])
+    catch = {"id": "tsk_c", "title": "Catch up: a", "state": "queued", "source": "rework",
+             "source_ref": "tsk_a", "created": 9, "result": {"cost": 0.5}, "attempts": 1}
+    hand = page({"state": "done", "result": {"cost": 1.0, "landing": {
+        "eligible": True, "landed": False, "stage": "rebase", "reworked_by": "tsk_c", "at": 8}}}, [catch])
+    check("a branch handed to a catch-up task says so, links it, and counts its cost",
+          "handed to tsk_c" in hand["state_words"] and [c["id"] for c in hand["catchups"]] == ["tsk_c"]
+          and hand["cost"]["total"] == {"usd": 1.5, "complete": True}
+          and any(e.get("id") == "tsk_c" for e in hand["timeline"]), str(hand["cost"]))
+    bad = page({"state": "failed", "events": [{"at": "5", "kind": 7, "detail": "x"}, "junk",
+                                               {"at": 3, "kind": "failed", "detail": "boom"}],
+                "result": {"cost": 1.0, "cost_runs": [[1, 2, 3], {"a": 1}, [4], [6, None], [7, 0.5]]}})
+    check("damaged events and runs are skipped or said unknown, never a crash",
+          [r["usd"] for r in bad["cost"]["runs"]] == [None, 0.5]
+          and [e["at"] for e in bad["timeline"]] == sorted(e["at"] for e in bad["timeline"]), str(bad["cost"]))
+    blocked = page({"state": "blocked", "blocked_on": ["tsk_pruned"]})
+    check("a blocker no longer on record is not waited on by a '?'",
+          "?" not in blocked["state_words"], blocked["state_words"])
+    noted = B._event_line({"kind": "cancelled", "detail": "dismiss via ui (checkout holds 2 uncommitted)"})
+    check("who is said apart from the note that came with it",
+          noted == ("Dismissed via the dashboard", "checkout holds 2 uncommitted"), str(noted))
+    fresh = C.for_task({"id": "tsk_new", "state": "proposed", "scope": {"cwd": str(BASE)}})
+    check("a task that never ran is said to have changed nothing, not to have lost its branch",
+          fresh and fresh.get("not_run") and not fresh["error"], str(fresh))
+    import visualizer as V
+    js = V.PAGE[V.PAGE.index("async function openLink"):]
+    js = js[:js.index("if (card) openCard(card);")]
+    check("a board deep link leaves the task page", "taskPageId = null;" in js)
+    check("a landing's `before` is kept, so its landed range is exact",
+          '"head", "base", "before",' in (BASE / "bot.py").read_text())
+
+
+def test_taskchanges_reads_git_read_only():
+    import taskchanges as C
+    print("\na task's changes, read from git through the operator's vetted read-only command")
+    git = shutil.which("git")
+    if not git:
+        print("  … git not installed")
+        return
+    d = Path(tempfile.mkdtemp())
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True, check=True).stdout.strip()
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@example.invalid"); g("config", "user.name", "T")
+    (d / "a.txt").write_text("one\n"); g("add", "."); g("commit", "-qm", "base")
+    base = g("rev-parse", "HEAD")
+    g("checkout", "-qb", "silkworm/tsk_x")
+    (d / "a.txt").write_text("one\ntwo\nthree\n"); g("commit", "-qam", "Add two lines")
+    (d / "b.txt").write_text("new\n"); g("add", "."); g("commit", "-qm", "Add b")
+    head = g("rev-parse", "HEAD")
+    g("checkout", "-q", "main")
+    r = C.read(d, branch="silkworm/tsk_x", bases=("refs/heads/main",))
+    check("the branch's commits, newest first, with subjects",
+          [c["subject"] for c in r["commits"]] == ["Add b", "Add two lines"] and r["commit_count"] == 2
+          and not r["error"], str(r))
+    check("and the files it touches, with lines added and removed",
+          {f["path"]: (f["added"], f["removed"]) for f in r["files"]} == {"a.txt": (2, 0), "b.txt": (1, 0)}
+          and r["added"] == 3 and r["removed"] == 0, str(r["files"]))
+    g("merge", "-q", "--ff-only", "silkworm/tsk_x"); g("branch", "-qD", "silkworm/tsk_x")
+    landed = C.read(d, landing={"landed": True, "before": base, "head": head, "base": "main"})
+    check("once landed, exactly the range the landing recorded",
+          landed["landed"] and len(landed["commits"]) == 2 and landed["file_count"] == 2
+          and landed["range"] == f"{base[:8]}..{head[:8]}", str(landed))
+    kept = C.read(d, landing={"landed": True, "head": head, "base": "main"}, count=2)
+    one = C.read(d, landing={"landed": True, "head": head, "base": "main"})
+    check("a stored landing keeps no `before`: the task's own commit count back from the head",
+          [c["subject"] for c in kept["commits"]] == ["Add b", "Add two lines"]
+          and kept["range"] == f"{head[:8]}~2..{head[:8]}"
+          and [c["subject"] for c in one["commits"]] == ["Add b"], f"{kept['range']} {one['commits']}")
+    gone = C.read(d, branch="silkworm/tsk_x", bases=("refs/heads/main",))
+    check("a branch no longer there is said, not drawn as no changes",
+          "not here" in gone["error"] and gone["commits"] is None, str(gone))
+    g("tag", "app/v1.0.0", head)
+    check("the release tag that shipped it", (C.released_in(d, head) or {}).get("tag") == "app/v1.0.0")
+    check("whether a revision has it", C.contains(d, base, head) is True and C.contains(d, head, base) is False)
+    check("a ref that reads as an option is refused before git is asked",
+          C.read(d, branch="--output=/tmp/x", bases=("refs/heads/main",))["error"]
+          and C.contains(d, "--output=x", head) is None)
+    ran = []
+
+    def spy(argv, **kw):
+        ran.append(argv)
+        return types.SimpleNamespace(returncode=0, stdout="")
+    C.read(d, landing={"landed": True, "before": base, "head": head})
+    C.read(d, landing={"landed": True, "before": base, "head": head}, run=spy)
+    check("every call is the vetted command: no textconv, no external diff, no pager",
+          ran and all(a[:2] == ["git", "--no-pager"] for a in ran)
+          and any("--no-textconv" in a and "--no-ext-diff" in a for a in ran if "diff" in a), str(ran[:1]))
+
+    def broken(argv, **kw):
+        return types.SimpleNamespace(returncode=128, stdout="")
+    b = C.read(d, landing={"landed": True, "before": base, "head": head}, run=broken)
+    check("git refusing is said, the lists left unknown",
+          b["error"] == "git could not read the changes" and b["commits"] is None and b["files"] is None)
+
+    def slow(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1)
+    check("and so is git timing out", C.read(d, landing={"landed": True, "before": base, "head": head},
+                                             run=slow)["commits"] is None)
+
+
+def _task_page_harness():
+    head = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    return head + r"""
+const FIX = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+let offline = false;
+globalThis.confirm = () => true;
+answer = (url, b) => (b && b.action === "page")
+  ? (offline ? {ok: false, error: "bot is offline"} : (FIX.pages[b.id] || {ok: false, error: "unknown task"}))
+  : url.startsWith("/api/artifacts") ? FIX.files
+  : (b && b.action === "project") ? {ok: false, error: "no project page in this fixture"}
+  : (b && ["approve", "accept", "dismiss", "rework", "land"].includes(b.action)) ? {ok: true}
+  : BASE(url);
+(0, eval)(SRC + `
+;globalThis.__m = {openLink, openTaskPage, closeTaskPage, renderDetail, inboxAct, sendAllDeferred,
+                   page: () => taskPageId, proj: () => pageSlug};`);
+const M = globalThis.__m, out = {};
+const flushAsync = async () => { for (let i = 0; i < 14; i++) await new Promise(r => setImmediate(r)); };
+// A button as the page drew it, pressed: its data-* from the markup.
+function press(html, act) {
+  const m = html.match(new RegExp('<button[^>]*data-act="' + act + '"[^>]*>'));
+  if (!m) return false;
+  const b = {dataset: {}};
+  for (const [, k, v] of m[0].matchAll(/data-(\w+)="([^"]*)"/g)) b.dataset[k] = v;
+  M.inboxAct(b);
+  return true;
+}
+(async () => {
+  await M.openLink(new URLSearchParams("task=" + FIX.ids.main)); await flushAsync();
+  out.main = byId("bover").innerHTML;
+  out.open = byId("boardmodal").style.display;
+  out.board = byId("bboard").innerHTML;
+  M.openTaskPage(FIX.ids.approval); await flushAsync();
+  out.approval = byId("bover").innerHTML;
+  calls.length = 0;
+  out.pressedApprove = press(out.approval, "approve"); await flushAsync();
+  out.approveCalls = calls.filter(c => c.url === "/api/tasks" && c.body && c.body.action === "approve").map(c => c.body);
+  M.openTaskPage(FIX.ids.proposal); await flushAsync();
+  out.proposal = byId("bover").innerHTML;
+  calls.length = 0;
+  out.pressedAccept = press(out.proposal, "accept"); await flushAsync();
+  out.hiddenWhilePending = byId("bover").innerHTML.includes('data-act="accept"');
+  M.sendAllDeferred(); await flushAsync();
+  out.acceptCalls = calls.filter(c => c.url === "/api/tasks" && c.body && c.body.action === "accept").map(c => c.body);
+  offline = true;
+  M.openTaskPage("tsk_gone"); await flushAsync();
+  out.offline = byId("bover").innerHTML;
+  offline = false;
+  M.openTaskPage(FIX.ids.main); await flushAsync();
+  M.closeTaskPage(); await flushAsync();
+  out.back = {page: M.page(), proj: M.proj()};
+  out.detail = M.renderDetail({id: "tsk_1", title: "work", project: "alpha", role: "implementor",
+                               state: "queued", created: 1, events: []});
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_dashboard_task_page_renders():
+    import re
+    import visualizer as V
+    print("\nthe task page, drawn from the route's answer: every section, markdown, images, buttons")
+    handle, ids, _st, _ = _task_page_world()
+    pages = {ids[k]: handle({"action": "page", "id": ids[k]}) for k in ("main", "approval", "proposal")}
+    created = pages[ids["main"]]["page"]["created"]
+    files = [
+        {"name": "shot-375.png", "path": "/a/1-shot-375.png", "direction": "out", "ts": created + 100,
+         "exists": True, "image": True},
+        {"name": "yours.png", "path": "/a/2-yours.png", "direction": "in", "ts": created + 100,
+         "exists": True, "image": True},
+        {"name": "old.png", "path": "/a/0-old.png", "direction": "out", "ts": created - 86400,
+         "exists": True, "image": True},
+        {"name": "notes.txt", "path": "/a/3-notes.txt", "direction": "out", "ts": created + 100,
+         "exists": True, "image": False}]
+    fix = {"pages": pages, "files": files, "ids": ids}
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    sect = js[js.index("// --- a task's own page"):js.index("// --- releasing a project, from its card")]
+    check("the page names no role and no state rule of its own",
+          "'assistant'" not in sect and '"implementor"' not in sect and "awaiting_approval" not in sect)
+    check("its only buttons are the inbox's and the page's own links",
+          set(re.findall(r'onclick="(\w+)\(', sect)) <= {
+              "closeTaskPage", "openTaskPage", "openProjectPage", "tpThread"},
+          str(set(re.findall(r'onclick="(\w+)\(', sect))))
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the task page checked by text only")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(_task_page_harness())
+    (d / "fix.json").write_text(json.dumps(fix))
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), "", str(d / "fix.json")],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the task page harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    m = o["main"]
+
+    def sec(page, key):
+        x = re.search(r'<section class="pgsec[^"]*" data-sec="%s">(.*?)</section>' % key, page, re.S)
+        return x.group(1) if x else ""
+    check("?task= opens it over the board's sheet, the board not drawn",
+          o["open"] == "flex" and o["board"] == "" and "<h3>Draw the task page</h3>" in m, m[:300])
+    check("its sections, in order",
+          re.findall(r'data-sec="(\w+)"', m) == ["state", "result", "changes", "images", "cost", "timeline", "links"],
+          str(re.findall(r'data-sec="(\w+)"', m)))
+    check("its state, in plain words", "Done, and landed onto main as 22222222." in sec(m, "state"))
+    r = sec(m, "result")
+    check("the result drawn as markdown, not raw",
+          "<h4>Done</h4>" in r and "<b>reads well</b>" in r and "<li><code>two</code></li>" in r
+          and "<pre><code>make test" in r and "**" not in r and "## Done" not in r, r[:500])
+    check("with its review and its landing", "Review passed" in r and "landed 22222222" in r)
+    ch = sec(m, "changes")
+    check("what changed: branch, range, commits with subjects, files with + and −",
+          "silkworm/tsk_main" in ch and "11111111..22222222" in ch and "Draw the task page" in ch
+          and "Its tests" in ch and "visualizer.py" in ch and "+120" in ch and "−4" in ch
+          and "2 commits" in ch and "+bin" in ch, ch[:700])
+    im = sec(m, "images")
+    check("its own images inline, from when it ran -- not yours, not older ones, not other files",
+          "1-shot-375.png" in im and "<img " in im and "2-yours.png" not in im and "0-old.png" not in im
+          and "notes.txt" not in im, im[:400])
+    co = sec(m, "cost")
+    check("cost: the total with its reviews, each run and each review",
+          "$3.75" in co and "run 1" in co and "run 2" in co and "$1.75" in co and "$0.40" in co
+          and "$0.35" in co, co[:500])
+    tl = sec(m, "timeline")
+    check("the timeline: filed, accepted by whom, runs, reviews, landing, release, deploy",
+          all(w in tl for w in ("Filed", "Accepted via the dashboard", "Run 1 started", "Run 2 started",
+                                "Review started", "Landed onto main", "Released in app/v1.4.0",
+                                "Running in the bot")), tl[:800])
+    ln = sec(m, "links")
+    check("links: its thread, its project's page, its parent and children",
+          'data-thread="D9:100.5"' in ln and "openProjectPage('alpha')" in ln
+          and f"openTaskPage('{ids['parent']}')" in ln and f"openTaskPage('{ids['kid']}')" in ln
+          and f"openTaskPage('{ids['rev1']}')" in ln, ln[:500])
+    check("a landed task has no buttons to press", "data-act=" not in m)
+    a = o["approval"]
+    check("the step it needs from you, prominently, with the inbox's buttons",
+          'class="tpneed"' in sec(a, "state") and "!release alpha all" in sec(a, "state")
+          and re.findall(r'data-act="(\w+)"', a) == ["approve", "rework", "dismiss"], sec(a, "state")[:400])
+    check("Approve calls the approve action for this task",
+          o["pressedApprove"] and o["approveCalls"] == [{"action": "approve", "id": ids["approval"]}],
+          str(o["approveCalls"]))
+    check("Accept calls accept once its Undo runs out, the button gone meanwhile",
+          o["pressedAccept"] and not o["hiddenWhilePending"]
+          and [c.get("action") for c in o["acceptCalls"]] == ["accept"]
+          and o["acceptCalls"][0]["id"] == ids["proposal"], str(o["acceptCalls"]))
+    whole = json.dumps(o)
+    check("no secrets drawn", not [s for s in _TASK_SECRETS if s in whole]
+          and "alpha-secret-checkout" not in whole)
+    check("a failed read says so rather than drawing an empty page",
+          "bot is offline" in o["offline"] and "tsk_gone" in o["offline"], o["offline"][:300])
+    check("‹ Back goes to its project's page", o["back"] == {"page": None, "proj": "alpha"}, str(o["back"]))
+    check("a card's detail links to the page", "openTaskPage('tsk_1')" in o["detail"])
+    check("a section key the page has not is ignored", "TP_SECTIONS.includes(pageScrollTo)" in js)
 
 
 if __name__ == "__main__":

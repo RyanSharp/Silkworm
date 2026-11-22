@@ -82,7 +82,7 @@ NEW_THREAD = "D0SHOTS:0000000000.000000"
 
 #: /tasks actions that only read (visualizer.READ_TASK_ACTIONS, plus nothing).
 READ_TASKS = {"list", "attention", "counts", "board", "overview", "task", "unmerged",
-              "holding", "roles", "watching", "inbox", "project"}
+              "holding", "roles", "watching", "inbox", "project", "page"}
 READ_PROJECTS = {"list", "get", "unregistered"}
 READ_LEARNINGS = {"list"}
 #: Routes that only ever read: whether the bot is up, and a thread's live turn.
@@ -223,6 +223,11 @@ def stand_in(real_port: str):
                     # A running bot older than the project page: built here
                     # by this checkout's board.py, over the live state read only.
                     answer = local_project(real_port, payload.get("project") or "")
+                if (self.path == "/tasks" and action == "page" and not answer.get("ok")
+                        and "unknown action" in str(answer.get("error") or "")):
+                    # A running bot older than the task page: built here
+                    # by this checkout's board.py, over the live state read only.
+                    answer = local_task_page(real_port, payload.get("id") or "")
                 if self.path == "/tasks" and action == "inbox":
                     answer = with_sample_plan(answer)
             else:
@@ -361,6 +366,34 @@ def local_project(real_port: str, slug: str) -> dict:
         return {"ok": True, "page": page}
     except Exception as e:
         return {"ok": False, "error": f"screenshot harness: could not build the project page ({e})"}
+
+
+def local_task_page(real_port: str, tid: str) -> dict:
+    """The /tasks `page` answer, built as local_project builds a project's:
+    tasks.json and projects.json read-only, the real bot's own branch survey,
+    and the task's changes read from git through taskchanges (read-only)."""
+    sys.path.insert(0, str(REPO))
+    try:
+        import board
+        import taskchanges
+        home = live_home()
+        tasks_ = json.loads((home / "tasks.json").read_text())
+        projects = json.loads((home / "projects.json").read_text())
+        rec = tasks_.get(tid)
+        if not rec:
+            return {"ok": False, "error": "unknown task"}
+
+        def scope_for(slug):
+            p = projects.get(slug) or next((x for x in projects.values() if x.get("slug") == slug), {})
+            return (p or {}).get("scope") or {}
+        survey = forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+        changes = taskchanges.for_task(rec, scope_for=scope_for)
+        prec = projects.get(rec.get("project") or "") or {}
+        page = board.task_page(rec, tasks_.values(), unmerged_rows=survey, changes=changes,
+                               project_title=prec.get("title") or "")
+        return {"ok": True, "page": page}
+    except Exception as e:
+        return {"ok": False, "error": f"screenshot harness: could not build the task page ({e})"}
 
 
 def forward(port: str, path: str, payload: dict) -> dict:
@@ -574,6 +607,26 @@ def pick_examples(base: str, project: str) -> dict:
     # ?task= opens the task panel on a row that needs you, so pick one that does.
     needs = get_json(base + "/api/tasks", {"action": "attention"}).get("tasks") or []
     out["task"] = needs[0]["id"] if needs else out["card"]
+    # A landed task with a reply, for the task page's result, changes and
+    # timeline -- one whose thread holds images, if any does.
+    try:
+        tasks_ = json.loads((live_home() / "tasks.json").read_text())
+        raw = json.loads((live_home() / "sessions.json").read_text())
+        raw = raw.get("sessions", raw) if isinstance(raw, dict) else {}
+
+        def images(t):
+            # As the page picks them (taskImages): Claude's, from when it ran.
+            at = t.get("created") or 0
+            return sum(1 for f in (raw.get(t.get("thread") or "") or {}).get("files") or []
+                       if f.get("direction") != "in" and (f.get("ts") or 0) >= at - 60
+                       and str(f.get("path") or "").lower().endswith((".png", ".jpg", ".jpeg")))
+        landed = [t for t in tasks_.values() if ((t.get("result") or {}).get("landing") or {}).get("landed")
+                  and (t.get("result") or {}).get("text") and t.get("role") != "reviewer"]
+        landed.sort(key=lambda t: (images(t) > 0, t.get("updated") or 0))
+        if landed:
+            out["landed"] = landed[-1]["id"]
+    except Exception:
+        pass
     # An app (one with App Store checks), for the project page's store section.
     try:
         sys.path.insert(0, str(REPO))
@@ -615,6 +668,9 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("tasks", "/?view=tasks"),
         ("tasks-all", "/?view=tasks&tab=all"),
         ("task", f"/?task={quote(ex['task'])}"),
+        *([("task-page", f"/?task={quote(ex['landed'])}"),
+           ("task-page-changes", f"/?task={quote(ex['landed'])}&sec=changes"),
+           ("task-page-timeline", f"/?task={quote(ex['landed'])}&sec=timeline")] if ex.get("landed") else []),
         ("projects", "/?view=projects"),
         # A project's own page (board.project_page), and an app's.
         ("project", f"/?view=project&slug={p}"),
@@ -639,6 +695,7 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("light-thread", f"/?thread={quote(ex['thread'])}&theme=light"),
         ("light-board", f"/?view=board&slug={p}&theme=light"),
         ("light-project", f"/?view=project&slug={p}&theme=light"),
+        *([("light-task-page", f"/?task={quote(ex['landed'])}&theme=light")] if ex.get("landed") else []),
     ]
 
 

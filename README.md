@@ -1658,9 +1658,26 @@ A local web dashboard for every thread session (localhost-only):
   to bots** — Slack gives apps no read receipts — so a thread you read only in
   Slack stays unread here until you open it on the dashboard or reply. Tracking
   starts when `seen.json` is first made: nothing before that is unread.
+- **A task's page** — `/?task=<id>` (and *Full page* on a card's detail, the
+  address a notification opens) shows one task top to bottom: its title and
+  state said in plain words, the step it left for you, prominently, with exactly
+  the buttons *Needs you* has for it (the same `/tasks` actions); its reply drawn
+  as markdown, with its review and landing; what it changed in git — its branch
+  or the landed `before..head`, commits with subjects, files with lines added
+  and removed — read through the operator's vetted read-only git command
+  (`taskchanges.py`: no pager, textconv, external diff or repo-named programs)
+  and cached a minute; the images it produced, its thread's own from the window
+  it ran in; what it cost, each run and each review; and a timeline from filing
+  (who accepted it and how) through runs, reviews, landing, the release tag that
+  shipped it and, for Silkworm itself, whether the running bot has it. Links go
+  to its thread, its project's page, its parent and what it filed.
+  `board.task_page` builds it from named fields only — a record's scope,
+  environment and session never reach the page — served by the bot's `/tasks`
+  `page` action.
 - **Deep links** — every view opens from its address, which is how a
   notification lands on a thread and how the screenshots below are taken:
-  `/?thread=<key>`, `/?task=<id>` (the task panel, on that row),
+  `/?thread=<key>`, `/?task=<id>` (the task's own page; `&sec=<section>` scrolls
+  to one), 
   `/?view=stats|tasks|projects|learnings` (`&tab=all` for every task),
   `/?view=project&slug=<slug>` (the project's own page: readiness, health,
   App Store and TestFlight state, the fortnight's landings and release tags,

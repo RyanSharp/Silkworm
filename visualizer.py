@@ -1410,7 +1410,7 @@ def trader_status(run=None, clock=time.time) -> dict:
 #: does something must always do it, whatever the page last saw.
 READ_TASK_ACTIONS = frozenset({"list", "attention", "counts", "board", "overview",
                                "task", "unmerged", "holding", "roles", "watching",
-                               "inbox", "project"})
+                               "inbox", "project", "page"})
 
 #: The largest POST taken: a message's attached files travel in it as base64
 #: (webthread.MAX_FILE_BYTES each, about 4/3 larger encoded).
@@ -2694,6 +2694,56 @@ PAGE = r"""<!doctype html>
   .pgpend { margin-top: var(--sp-15); }
   .pgmore > summary { margin: var(--sp-1) 0; font-size: var(--fs-xs); }
   .igroup h4 .ipl { text-decoration: none; }
+  /* a task's own page (taskPageHtml): one readable column, sections stacked */
+  .tpage { max-width: 860px; display: flex; flex-direction: column; gap: var(--sp-3); }
+  .tpsub { margin: calc(-1 * var(--sp-15)) 0 var(--sp-3); }
+  .tpstate { font-size: var(--fs-base); line-height: 1.5; }
+  .tpstate .st { margin-right: var(--sp-15); }
+  .tpneed { margin-top: var(--sp-25); padding: var(--sp-25) var(--sp-3); border-radius: var(--r-md);
+            background: var(--fill-2); border-left: 3px solid var(--gold); font-size: var(--fs-base); }
+  .tpneed code { font-family: inherit; font-size: inherit; background: none; padding: 0; word-break: break-word; }
+  .tpneed div { margin-top: var(--sp-1); color: var(--muted); font-size: var(--fs-sm); }
+  .tpacts { margin-top: var(--sp-25); }
+  .tpst .iline { margin-top: var(--sp-15); color: var(--muted); }
+  .tpmd { line-height: 1.55; overflow-wrap: anywhere; }
+  .tpmd p { margin: 0 0 var(--sp-2); } .tpmd ul { margin: var(--sp-1) 0; padding-left: var(--sp-6); }
+  .tpmd h4 { margin: var(--sp-3) 0 var(--sp-1); font-size: 1.02em; text-transform: none; letter-spacing: 0;
+             font-family: inherit; color: var(--fg); }
+  .tpmd code { font-family: var(--mono); font-size: .92em; background: var(--fill-2);
+               border-radius: var(--r-xs); padding: 1px var(--sp-1); }
+  .tpmd pre { background: var(--sunken); border-radius: var(--r-md); padding: var(--sp-25); overflow-x: auto;
+              font-size: var(--fs-xs); line-height: 1.45; }
+  .tpmd pre code { background: none; padding: 0; }
+  .tpgoal pre.goal { white-space: pre-wrap; font-size: var(--fs-xs); }
+  .tplbl { margin: var(--sp-2) 0 var(--sp-1); color: var(--muted); font-size: var(--fs-xs); font-family: var(--mono); }
+  .tpcommits { margin: 0; padding-left: var(--sp-5); } .tpcommits li { margin: var(--sp-05) 0; word-break: break-word; }
+  .tpcommits code, .tpfiles .p, .tpage .sub code { font-family: var(--mono); font-size: var(--fs-2xs); }
+  .tpfiles { border-collapse: collapse; width: 100%; font-size: var(--fs-2xs); font-family: var(--mono); }
+  .tpfiles td { padding: 2px var(--sp-1); border-top: 1px solid var(--line); }
+  .tpfiles .p { word-break: break-all; width: 100%; }
+  .tpadd { color: var(--ok); white-space: nowrap; } .tprem { color: var(--bad); white-space: nowrap; }
+  .tpimgs { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr)); gap: var(--sp-25); }
+  .tpimg { display: flex; flex-direction: column; gap: var(--sp-05); text-decoration: none; color: var(--muted);
+           font-size: var(--fs-2xs); font-family: var(--mono); min-width: 0; }
+  .tpimg img { width: 100%; height: 300px; object-fit: contain; background: var(--sunken);
+               border: 1px solid var(--line); border-radius: var(--r-md); }
+  .tpimg span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tpage .rev, .tpage .land { margin-top: var(--sp-25); }
+  .tpgoal { margin-top: var(--sp-25); }
+  .tptotal { margin-bottom: var(--sp-15); }
+  .tprow { display: flex; gap: var(--sp-25); align-items: baseline; padding: 2px 0; border-top: 1px solid var(--line); }
+  .tprow > :first-child { flex: 1; min-width: 0; } .tprow b { font-family: var(--mono); font-weight: var(--fw-regular); }
+  .tptime { list-style: none; margin: 0; padding: 0 0 0 var(--sp-3); border-left: 1px solid var(--line2); }
+  .tptime li { position: relative; padding: var(--sp-05) 0 var(--sp-05) var(--sp-15); word-break: break-word; }
+  .tptime li::before { content: ""; position: absolute; left: calc(-1 * var(--sp-3) - 4px); top: .7em; width: 7px; height: 7px;
+                       border-radius: 50%; background: var(--muted); }
+  .tptime li.k-landing::before, .tptime li.k-deploy::before, .tptime li.k-release::before { background: var(--ok); }
+  .tptime li.k-failed::before { background: var(--bad); }
+  .tptime li.k-needs_input::before, .tptime li.k-awaiting_approval::before, .tptime li.k-decided::before { background: var(--gold); }
+  .tptime .tpwhen { display: inline-block; min-width: 4.5em; color: var(--muted); font-family: var(--mono);
+                    font-size: var(--fs-2xs); }
+  .tptime b { font-weight: var(--fw-semi); } .tptime .d { color: var(--muted); font-size: var(--fs-xs); }
+  .tplinks { display: flex; flex-wrap: wrap; gap: var(--sp-15); margin-bottom: var(--sp-2); }
   .bhead h3 { margin: 0; font-size: var(--fs-base); }
   .bhead .warn, .tform .warn { color: var(--gold); font-size: var(--fs-sm); }
   .bcol > h4 button { float: right; font-size: var(--fs-xs); padding: 0 var(--sp-15); }
@@ -7438,6 +7488,7 @@ function setBoardCol(k) {
 function setBoardProject(p) {
   boardProject = p;
   pageSlug = null;
+  taskPageId = null;
   boardCol = "";
   // Back to the overview is back to all of it: a filter left set would only
   // turn it straight back into a board.
@@ -7489,14 +7540,14 @@ function fillSelect(id, values, label) {
 }
 async function renderBoard() {
   const box = document.querySelector("#boardmodal .box");
-  if (box && box.classList) box.classList.toggle("pagemode", !!pageSlug);
-  if (pageSlug) {
+  if (box && box.classList) box.classList.toggle("pagemode", !!(pageSlug || taskPageId));
+  if (pageSlug || taskPageId) {
     // None of the seg's three views is the one showing.
     for (const id of ["bvover", "bvall", "bvunfiled"]) {
       const b = document.getElementById(id);
       if (b) b.className = "";
     }
-    return loadProjectPage();
+    return taskPageId ? loadTaskPage() : loadProjectPage();
   }
   const role = document.getElementById("brole").value;
   const state = document.getElementById("bstate").value;
@@ -7565,6 +7616,7 @@ function openProjectPage(slug) {
   closeDetail();
   if (pageSlug !== slug) pageData = null;
   pageSlug = slug;
+  taskPageId = null;
   boardProject = slug;          // the board's own Back and project picker follow
   if (!boardIsOpen()) toggleBoard(); else renderBoard();
 }
@@ -7849,7 +7901,7 @@ function renderDetail(t) {
     <div class="sub">${esc(t.id)} · ${esc(t.role || "")}${t.lens ? ` · lens: ${esc(t.lens)}` : ""} · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>${
       t.project ? ` · ${projLink(t.project)}` : " · unfiled"} · ${esc(t.source || "")} · ${age(t.created)}${costText(t)}${
       t.branch ? ` · ${esc(t.branch)}${t.commits ? ` (${t.commits})` : ""}` : ""}</div>
-    <div class="acts u-mt2">${cardButtons(t)}${t.thread_link
+    <div class="acts u-mt2">${cardButtons(t)}<button class="ghost" onclick="openTaskPage('${esc(t.id)}')" title="the task in full: result, changes, images, cost, timeline">Full page</button>${t.thread_link
       ? `<a class="ghost" href="${esc(t.thread_link)}" target="_blank">Slack thread ↗</a>` : ""}</div>
     ${yoursToDo(t)}
     <div class="sect">goal</div><pre class="goal">${esc(t.goal || "")}</pre>
@@ -7863,6 +7915,173 @@ function renderDetail(t) {
       esc(l.stage || "")}${l.base ? ` · onto ${esc(l.base)}` : ""}${l.at ? ` · ${age(l.at)}` : ""}${
       l.detail && l.landed ? `<div>${esc(String(l.detail))}</div>` : ""}</div>` : ""}` : ""}
     <div class="sect">events · ${(t.events || []).length}</div>${events || `<div class="hint">none</div>`}`;
+}
+
+// --- a task's own page ---------------------------------------------------------------
+// ?task=<id>: one task in full, readable top to bottom -- its title and state
+// said in plain words, the step it left for you (with the same buttons Needs
+// you has for it, through the same actions), its reply drawn as markdown, what
+// it changed in git (branch, commits, files with lines added and removed), the
+// images it produced, what it cost with its reviews and reruns, and a timeline
+// from filing to landing. Read through the bot's /tasks `page` action
+// (board.task_page; git read-only via taskchanges), drawn over the board's
+// sheet as a project's page is. Its images are its thread's own, from the
+// window the task ran in.
+let taskPageId = null, taskPageData = null;
+const TP_SECTIONS = ["state", "result", "changes", "images", "cost", "timeline", "links"];
+function openTaskPage(id) {
+  if (!id) return;
+  const tm = document.getElementById("taskmodal");
+  if (tm && tm.style.display === "flex") toggleTasks();
+  closeDetail();
+  if (taskPageId !== id) taskPageData = null;
+  taskPageId = id;
+  pageSlug = null;
+  if (!boardIsOpen()) toggleBoard(); else renderBoard();
+}
+function closeTaskPage() {
+  const back = taskPageData && taskPageData.project;
+  taskPageId = null; taskPageData = null;
+  if (back) openProjectPage(back); else setBoardProject(null);
+}
+// The images a task produced: its thread's, Claude's own, from when it was
+// filed until a little after it finished (a thread can be a long conversation).
+function taskImages(pg, files) {
+  const from = (pg.created || 0) - 60, to = pg.finished ? pg.finished + 600 : Infinity;
+  return (files || []).filter(f => f && f.direction !== "in" && isImage(f) && f.exists
+                              && (f.ts || 0) >= from && (f.ts || 0) <= to)
+    .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+}
+async function loadTaskPage() {
+  const id = taskPageId, ask = ++boardAsk;
+  setHTML(document.getElementById("bboard"), "");
+  const el = document.getElementById("bover");
+  if (!taskPageData || taskPageData.id !== id) skelIfEmpty(el, "card", 4);
+  const r = await taskRead({action: "page", id});
+  if (ask !== boardAsk || taskPageId !== id) return;     // superseded meanwhile
+  if (!r || !r.ok) {
+    // Could not ask is not "no such task": said, the last page kept.
+    if (!taskPageData) setHTML(el, `<div class="bhead"><button class="ghost" onclick="closeTaskPage()">‹ Back</button><h3>${
+      esc(id)}</h3></div><div class="hint">${esc((r && r.error) || "bot offline")}</div>`);
+    return;
+  }
+  let files = [];
+  if (r.page.thread) {
+    try { files = await readJSON("/api/artifacts?key=" + encodeURIComponent(r.page.thread)); }
+    catch (e) { files = []; }
+    if (ask !== boardAsk || taskPageId !== id) return;
+  }
+  taskPageData = r.page;
+  drawKeyed(el, taskPageHtml(r.page, taskImages(r.page, Array.isArray(files) ? files : [])),
+            ".pgsec[data-sec]", "data-sec");
+  if (pageScrollTo) {
+    // Only a section the page has: the key comes from the address.
+    const key = TP_SECTIONS.includes(pageScrollTo) ? pageScrollTo : "";
+    pageScrollTo = "";
+    const sec = key && el.querySelector && el.querySelector(`.pgsec[data-sec="${key}"]`);
+    if (sec && sec.scrollIntoView) sec.scrollIntoView({block: "start"});
+  }
+}
+// Open its thread in the dashboard, the board's sheet out of the way.
+function tpThread(el) {
+  const key = el && el.dataset ? el.dataset.thread : "";
+  if (!key) return;
+  if (boardIsOpen()) toggleBoard();
+  openTarget("/?thread=" + encodeURIComponent(key));
+}
+function tpStamp(ts) {
+  if (!ts) return "";
+  return `<span class="tpwhen" title="${esc(new Date(ts * 1000).toLocaleString())}">${age(ts)}</span>`;
+}
+function tpTask(t, why) {
+  if (!t) return "";
+  return `<div class="pgrow open" onclick="openTaskPage('${esc(t.id)}')"><div class="tt">${esc(t.title || t.id)}</div>
+    <div class="sub">${why ? `${esc(why)} · ` : ""}${esc(t.id)}${t.role ? ` · ${esc(t.role)}` : ""} · <span class="st st-${
+      esc(t.state)}">${esc(t.state)}</span></div></div>`;
+}
+function tpChanges(c) {
+  if (c === null || c === undefined) return `<div class="off">no repository: nothing in git to show</div>`;
+  if (c.not_run) return `<div class="off">it has not run yet, so it has changed nothing</div>`;
+  const commits = c.commits, files = c.files;
+  const head = `<div class="sub">${c.branch ? `<code>${esc(c.branch)}</code>` : ""}${
+    c.range ? ` · ${c.landed ? "landed as " : ""}<code>${esc(c.range)}</code>` : ""}${
+    c.base ? ` · onto ${esc(c.base)}` : ""}</div>`;
+  const err = c.error ? `<div class="warn">${esc(c.error)}</div>` : "";
+  const cl = commits === null || commits === undefined ? "" : commits.length
+    ? `<div class="tplbl">${c.commit_count} commit${c.commit_count === 1 ? "" : "s"}</div><ul class="tpcommits">${
+      commits.map(x => `<li><code>${esc(x.sha.slice(0, 8))}</code> ${esc(x.subject)}</li>`).join("")}</ul>${
+      c.commit_count > commits.length ? `<div class="off">and ${c.commit_count - commits.length} more</div>` : ""}`
+    : `<div class="off">no commits</div>`;
+  const n = v => v === null || v === undefined ? "bin" : v;
+  const fl = files === null || files === undefined || !files.length ? "" :
+    `<div class="tplbl">${c.file_count} file${c.file_count === 1 ? "" : "s"} · <span class="tpadd">+${
+      c.added || 0}</span> <span class="tprem">−${c.removed || 0}</span></div><table class="tpfiles">${
+      files.map(f => `<tr><td class="p">${esc(f.path)}</td><td class="tpadd">+${n(f.added)}</td><td class="tprem">−${
+        n(f.removed)}</td></tr>`).join("")}</table>${
+      c.file_count > files.length ? `<div class="off">and ${c.file_count - files.length} more</div>` : ""}`;
+  return head + err + cl + fl;
+}
+function tpCost(pg) {
+  const c = pg.cost || {};
+  const runs = (c.runs || []).map((r, i) => `<div class="tprow"><span>run ${i + 1}</span>${tpStamp(r.at)}<b>${
+    r.usd === null || r.usd === undefined ? "$?" : "$" + r.usd.toFixed(2)}</b></div>`).join("");
+  const own = !runs && c.own !== null && c.own !== undefined
+    ? `<div class="tprow"><span>its runs</span><b>$${c.own.toFixed(2)}</b></div>` : "";
+  const line = (r, what) => `<div class="tprow"><span class="plink" role="link" onclick="openTaskPage('${
+    esc(r.id)}')">${what} ${esc(r.id)}</span><span class="off">${esc(r.state)}</span><b>${
+    r.usd === null || r.usd === undefined ? (r.ran ? "$?" : "—") : "$" + r.usd.toFixed(2)}</b></div>`;
+  const catchups = (c.catchups || []).map(r => line(r, "catch-up")).join("");
+  const revs = (c.reviews || []).map(r => `<div class="tprow"><span class="plink" role="link" onclick="openTaskPage('${
+    esc(r.id)}')">review ${esc(r.id)}</span><span class="off">${esc(r.state)}</span><b>${
+    r.usd === null || r.usd === undefined ? (r.ran ? "$?" : "—") : "$" + r.usd.toFixed(2)}</b></div>`).join("");
+  const total = fmtCost(c.total);
+  return `<div class="tptotal">${total ? `<b>${esc(total)}</b> in all` : `<span class="off">nothing spent yet</span>`}${
+    c.attempts > 1 ? ` · ${c.attempts} attempts` : ""}</div>${runs || own}${revs}${catchups}${
+    total ? `<div class="off">${esc(pg.note || "")}</div>` : ""}`;
+}
+function tpTimeline(tl) {
+  return `<ol class="tptime">${(tl || []).map(e => `<li class="k-${esc(e.kind || "")}">${tpStamp(e.at)}<b>${
+    e.id ? `<span class="plink" role="link" onclick="openTaskPage('${esc(e.id)}')">${esc(e.label)}</span>` : esc(e.label)}</b>${
+    e.detail && !e.id ? ` <span class="d">${esc(e.detail)}</span>` : ""}</li>`).join("")}</ol>`;
+}
+function taskPageHtml(pg, imgs) {
+  const it = pg.item;
+  const back = pg.project ? `‹ ${esc(pg.project_title || pg.project)}` : "‹ Projects";
+  const head = `<div class="bhead pghead"><button class="ghost" onclick="closeTaskPage()" title="back">${back}</button>
+    <h3>${esc(pg.title)}</h3></div>
+    <div class="tpsub sub">${esc(pg.id)} · ${esc(pg.role)}${pg.project ? ` · ${projLink(pg.project, pg.project_title)}` : " · unfiled"}${
+      pg.source ? ` · ${esc(pg.source)}` : ""} · filed ${tpStamp(pg.created)}</div>`;
+  const step = pg.needs_user ? `<div class="tpneed">🙋 <b>Yours to do:</b> <code>${esc(pg.needs_user.action)}</code>${
+    pg.needs_user.why ? `<div>${esc(pg.needs_user.why)}</div>` : ""}</div>` : "";
+  // Left off while its Undo shows, as the inbox leaves the card out (pendingGone).
+  const acts = it && notGone(it) ? inboxButtons(it) : {btns: "", chip: ""};
+  const state = `<section class="pgsec tpst" data-sec="state"><div class="tpstate"><span class="st st-${esc(pg.state)}">${
+    esc(pg.state.replace("_", " "))}</span> ${esc(pg.state_words)}</div>${step}${
+    it && it.line && !pg.needs_user ? `<div class="iline">${esc(it.line)}</div>` : ""}${acts.chip}${
+    acts.btns ? `<div class="acts tpacts">${acts.btns}</div>` : ""}</section>`;
+  const text = (pg.text || "").trim();
+  const result = `<section class="pgsec" data-sec="result"><h4>Result</h4>${
+    pg.text_cut ? `<div class="off">the reply is long; this is its end</div>` : ""}${
+    text ? `<div class="tpmd md">${md(text)}</div>` : `<div class="off">${
+      pg.state === "running" ? "still working; its reply shows here when it finishes" : "no reply recorded"}</div>`}${
+    review(pg)}${landing(pg)}${pg.goal ? `<details class="pgev tpgoal"><summary>What it was asked</summary><pre class="goal">${
+      esc(pg.goal)}</pre></details>` : ""}</section>`;
+  const changes = pgSection("changes", "What changed", null, tpChanges(pg.changes));
+  const images = imgs.length ? pgSection("images", "Images", imgs.length, `<div class="tpimgs">${imgs.map(f =>
+    `<a class="tpimg" href="/download?inline=1&amp;path=${encodeURIComponent(f.path)}" target="_blank" rel="noopener" title="${
+      esc(f.name)}"><img src="/download?inline=1&amp;path=${encodeURIComponent(f.path)}" alt="${esc(f.name)}" loading="lazy" decoding="async"><span>${
+      esc(f.name)}</span></a>`).join("")}</div>`) : "";
+  const cost = pgSection("cost", "Cost", null, tpCost(pg));
+  const timeline = pgSection("timeline", "Timeline", (pg.timeline || []).length, tpTimeline(pg.timeline));
+  const kids = (pg.children || []).map(t => tpTask(t, "filed from it")).join("")
+    + (pg.reviews || []).map(t => tpTask(t, "its review")).join("")
+    + (pg.catchups || []).map(t => tpTask(t, "caught up by")).join("");
+  const links = pgSection("links", "Links", null, `<div class="tplinks">${pg.thread
+    ? `<button class="ghost" data-thread="${esc(pg.thread)}" onclick="tpThread(this)">💬 Its thread</button>` : ""}${
+    pg.thread_link ? `<a class="ghost" href="${esc(pg.thread_link)}" target="_blank" rel="noopener">Slack ↗</a>` : ""}${
+    pg.project ? `<button class="ghost" onclick="openProjectPage('${esc(pg.project)}')">🗂 Project page</button>` : ""}</div>${
+    pg.parent ? tpTask(pg.parent, "filed from") : ""}${kids}`);
+  return head + `<div class="tpage">${state}${result}${changes}${images}${cost}${timeline}${links}</div>`;
 }
 
 // --- releasing a project, from its card or its board -----------------------------
@@ -8430,10 +8649,10 @@ const INBOX_UNDONE = {accept: "Accepted", dismiss: "Dismissed", retry: "Retried"
 function inboxItems(d) {
   return ((d && d.groups) || []).flatMap(g => g.items || []);
 }
-function inboxCard(it) {
-  if (it.kind === "plan") return planCardHtml(planView && planView.id === it.id ? planView : planFromItem(it), "inbox");
+// An item's buttons and the operator's suggestion, as its card draws them --
+// and a task's own page, which offers exactly what Needs you would.
+function inboxButtons(it) {
   const rec = it.recommendation && INBOX_BUTTON[it.recommendation.action] ? it.recommendation : null;
-  const isTask = it.kind !== "plan" && it.kind !== "decision";
   // A question's Send back is its answer: it resumes with what you say.
   const label = a => a === "rework" && it.state === "needs_input" ? "Answer…" : INBOX_BUTTON[a].label;
   const btns = (it.actions || []).filter(a => INBOX_BUTTON[a]).map(a => {
@@ -8446,6 +8665,12 @@ function inboxCard(it) {
   const who = rec && rec.by && rec.by !== "operator" ? `Suggested by ${rec.by}:` : "Operator suggests";
   const chip = rec ? `<div class="irec" title="a suggestion; it decides nothing">💡 ${esc(who)} <b>${
     esc(label(rec.action).replace("…", ""))}</b>${rec.why ? ` — ${esc(rec.why)}` : ""}</div>` : "";
+  return {btns, chip};
+}
+function inboxCard(it) {
+  if (it.kind === "plan") return planCardHtml(planView && planView.id === it.id ? planView : planFromItem(it), "inbox");
+  const isTask = it.kind !== "plan" && it.kind !== "decision";
+  const {btns, chip} = inboxButtons(it);
   const swipe = it.kind === "proposal" ? swipeAttr({state: it.state, role: it.role}) : "";
   return `<div class="icard k-${esc(it.kind)}" data-id="${esc(it.id)}"${swipe}>
     <div class="ihead"><span class="ikind k-${esc(it.kind)}">${esc(it.label || it.kind)}</span>${
@@ -8742,7 +8967,8 @@ if (window.addEventListener)
 // bin/dashshots (which photographs each view in a simulator with no way to
 // tap) all land on it the same way. Read once, then taken off the address
 // bar, so a reload opens the list rather than this again.
-//   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
+//   ?thread=<key> | ?task=<id>            a thread, or a task's own page
+//     [&sec=<section>]                    ...the task's page at a section (result, changes, timeline…)
 //     [&drawer=1] [&tools=open] [&files=1]  ...its attachments drawer, its longest turn's calls
 //                                         open, or its newest message with files in view
 //   ?view=inbox | threads                 the phone's home on Needs you (the default), or the list
@@ -8777,6 +9003,7 @@ async function openLink(q) {
   if (q.get("theme")) applyTheme(q.get("theme"), false);
   if (q.get("list") === "unread") { unreadOnly = true; setHome("threads"); loadList(); }
   // A thread or a task: the notification's own way in (openTarget, below).
+  if (q.get("task")) pageScrollTo = q.get("sec") || "";
   if (thread || q.get("task")) await openTarget("/?" + q.toString());
   // &drawer=1: the thread's attachments drawer; &tools=open: its longest turn's
   // line opened onto its chain -- once the thread has been read.
@@ -8823,6 +9050,7 @@ async function openLink(q) {
     boardProject = view === "project" || view === "board"
       ? (slug === "all" ? "" : slug === "unfiled" ? UNFILED : slug) : null;
     pageSlug = null;
+    taskPageId = null;
     if (!boardIsOpen()) toggleBoard(); else refreshBoard();
   } else if (view === "learnings") {
     toggleLearn();
@@ -8960,36 +9188,9 @@ async function openTarget(href) {
        resume_cmd: "", slack_link: "", running: false};
     loadList(); loadTranscript(true);
   } else if (task) {
-    await openTask(task);
+    // Its own page: what it is, what it did, what it needs from you.
+    openTaskPage(task);
   }
-}
-async function openTask(id) {
-  const m = document.getElementById("taskmodal");
-  // Whatever project the list was narrowed to, the task must be in it.
-  const sel = document.getElementById("tproj");
-  if (sel) sel.value = "";
-  taskView = "attention";
-  document.getElementById("tabneed").className = "on";
-  document.getElementById("taball").className = "";
-  if (m.style.display !== "flex") {
-    m.style.display = "flex";
-    renderUnregistered();
-    try { await renderProjects(); } catch (e) { /* the list below still draws */ }
-  }
-  try { await renderTasks(); } catch (e) { /* looked for below all the same */ }
-  for (let i = 0; i < 50; i++) {             // a list drawn meanwhile, if not this one
-    const row = document.querySelector(`[data-task="${CSS.escape(id)}"]`);
-    if (row) {
-      const more = row.querySelector("details");
-      if (more) more.open = true;
-      row.classList.add("flash");
-      if (row.scrollIntoView) row.scrollIntoView({block: "center"});
-      return true;
-    }
-    await new Promise(ok => setTimeout(ok, 100));
-  }
-  toast("That task no longer needs you");
-  return false;
 }
 if (typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.addEventListener)
   navigator.serviceWorker.addEventListener("message", e => {

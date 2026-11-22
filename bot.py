@@ -62,6 +62,7 @@ import slack_health
 import research
 import slacklinks
 import tasks
+import taskchanges
 import procs
 import push
 import webthread
@@ -2782,6 +2783,26 @@ def board_release_tags(slug: str) -> list:
     return _board_tags.get(slug, compute)
 
 
+_task_changes = board.TTLCache()
+
+
+def task_changes(rec: dict) -> dict | None:
+    """What a task changed in git, for its page (taskchanges.for_task):
+    read-only, through the operator's vetted git command, and cached a
+    minute per task and record write -- a page polled every few seconds asks
+    git once. None when the task has no repository to read."""
+    landing = (rec.get("result") or {}).get("landing") or {}
+    key = (rec.get("id"), str(landing.get("head") or ""), rec.get("updated"))
+
+    def compute():
+        out = taskchanges.for_task(rec, scope_for=project_store.scope_for,
+                                   own_repo=CODE_DIR, own_sha=REVISION.get("sha") or "")
+        if out and out.get("deployed"):
+            out["deployed_at"] = BOOTED
+        return out
+    return _task_changes.get(key, compute)
+
+
 def _task_title(raw, goal: str) -> tuple[str, str]:
     """(title, error) for a title typed into a form. Blank means "from the
     goal", which is what tasks.make does with no title at all."""
@@ -3035,6 +3056,21 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
             operator_thread=OPERATOR.thread() or "",
             action_of=lambda rec: health.action(rec, task_store,
                                                 warn_after=HEALTH_WARN_DAYS))}
+    if action == "page":
+        # One task's page (board.task_page): read-only, its git changes from
+        # task_changes (cached), its buttons inbox.py's own.
+        rec = task_store.get(payload.get("id", ""))
+        if not rec:
+            return {"ok": False, "error": "unknown task"}
+        try:
+            changes = task_changes(rec)
+        except Exception:
+            log.exception("reading the changes of %s failed", rec.get("id"))
+            changes = {"error": "git could not read the changes", "commits": None, "files": None}
+        prec = project_store.get(rec.get("project") or "") if rec.get("project") else None
+        return {"ok": True, "page": board.task_page(
+            rec, task_store.all().values(), unmerged_rows=board_survey(), changes=changes,
+            project_title=(prec or {}).get("title") or "")}
     if action == "inbox":
         # The dashboard's home screen: everything waiting on you, grouped by
         # project (inbox.py). Read-only; the survey is the board's cached one.
@@ -6883,7 +6919,7 @@ def record_landing(task: dict, outcome: dict) -> None:
     # and merging its outcome into a dict fetched before it started would drop
     # anything written in between -- the review verdict, most of all.
     current = task_store.get(task["id"]) or task
-    keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base",
+    keep = ("eligible", "landed", "stage", "detail", "branch", "head", "base", "before",
             "checkpointed", "base_before", "conflicts", "onto", "reworked_by",
             "ci", "ci_pushed", "retryable")
     # Dated, so "what landed yesterday" is answerable from the record alone:
