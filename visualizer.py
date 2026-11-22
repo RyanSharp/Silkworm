@@ -1123,7 +1123,7 @@ def trader_status(run=None, clock=time.time) -> dict:
 #: does something must always do it, whatever the page last saw.
 READ_TASK_ACTIONS = frozenset({"list", "attention", "counts", "board", "overview",
                                "task", "unmerged", "holding", "roles", "watching",
-                               "inbox"})
+                               "inbox", "project"})
 
 #: The largest POST taken: a message's attached files travel in it as base64
 #: (webthread.MAX_FILE_BYTES each, about 4/3 larger encoded).
@@ -2346,6 +2346,41 @@ PAGE = r"""<!doctype html>
   #bdetail .rev .lbl { display: block; margin-top: var(--sp-15); color: var(--muted); font-size: var(--fs-xs); }
   #bdetail .land .d { white-space: pre-wrap; font-size: var(--fs-2xs); margin-top: var(--sp-1); }
   .bhead { display: flex; gap: var(--sp-25); align-items: center; margin-bottom: var(--sp-25); }
+  .plink { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .plink:hover { color: var(--gold); }
+  #boardmodal .box.pagemode .bfilters, #boardmodal .box.pagemode > .hint { display: none; }
+  .pghead h3 .slug { font-family: var(--mono); font-size: var(--fs-2xs); color: var(--muted); font-weight: var(--fw-regular); }
+  .pghead h3 { min-width: 0; word-break: break-word; }
+  .pgready { font-size: var(--fs-sm); margin-bottom: var(--sp-3); line-height: 1.6; }
+  .pgready .on { color: var(--ok); } .pgready .off, .pgsec .off { color: var(--muted); }
+  .pgready .warn { color: var(--gold); }
+  .pgready .pgcmd { font-family: var(--mono); font-size: var(--fs-2xs); color: var(--muted); margin-left: var(--sp-15);
+                    word-break: break-all; }
+  .pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr));
+           gap: var(--sp-3); align-items: start; }
+  .pgsec { background: var(--fill-1); border: 1px solid var(--line2); border-radius: var(--r-md);
+           padding: var(--sp-25) var(--sp-3); font-size: var(--fs-sm); min-width: 0; }
+  .pgsec > h4 { margin: 0 0 var(--sp-2); font-size: var(--fs-sm); font-family: var(--mono); color: var(--muted);
+                text-transform: uppercase; letter-spacing: .06em; }
+  .pgsec[data-sec="needs"] { grid-column: 1 / -1; }
+  .pgsec { scroll-margin-top: var(--sp-5); }
+  .pgrow { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md);
+           padding: var(--sp-15) var(--sp-25); margin-bottom: var(--sp-15); word-break: break-word; }
+  .pgrow.open { cursor: pointer; } .pgrow.open:hover { border-color: var(--gold); }
+  .pgrow .tt { font-weight: var(--fw-semi); }
+  .pgrow .sub { color: var(--muted); font-size: var(--fs-2xs); font-family: var(--mono); margin-top: var(--sp-05); }
+  .pgrow .qpos { color: var(--gold); }
+  .pgrow code { font-family: var(--mono); font-size: var(--fs-xs); }
+  .pgrow .pgsum { margin-top: var(--sp-05); }
+  .pgrow .pgact { margin-top: var(--sp-05); font-size: var(--fs-xs); color: var(--muted); }
+  .pgrow .pgact.k-decision { color: var(--gold); }
+  .pgrow.st-fail { border-left: 2px solid var(--bad); } .pgrow.st-warn { border-left: 2px solid var(--gold); }
+  .pgrow a.ghost { font-size: var(--fs-2xs); padding: 0 var(--sp-1); }
+  .pgev { margin-top: var(--sp-05); font-size: var(--fs-2xs); font-family: var(--mono); color: var(--muted); }
+  .pgev summary { cursor: pointer; }
+  .pgpend { margin-top: var(--sp-15); }
+  .pgmore > summary { margin: var(--sp-1) 0; font-size: var(--fs-xs); }
+  .igroup h4 .ipl { text-decoration: none; }
   .bhead h3 { margin: 0; font-size: var(--fs-base); }
   .bhead .warn, .tform .warn { color: var(--gold); font-size: var(--fs-sm); }
   .bcol > h4 button { float: right; font-size: var(--fs-xs); padding: 0 var(--sp-15); }
@@ -3080,7 +3115,7 @@ PAGE = r"""<!doctype html>
       <span class="seg"><button id="bvover" class="on" onclick="setBoardProject(null)">Overview</button><button id="bvall" onclick="setBoardProject('')">All work</button><button id="bvunfiled" onclick="setBoardProject(UNFILED)">Unfiled</button></span></h2>
     <div class="hint">One card per project: what is open, running, landed and unmerged,
       whether it can take unsupervised work, what it spent this week and what is ready
-      to release. Open one for its board. Every button here is the task panel's own
+      to release. Open one for its page, and its board from there. Every button here is the task panel's own
       action; "Needs you" stays in 📋 Tasks.</div>
     <div class="bfilters">
       <select id="bproj" onchange="setBoardProject(this.value === '*' ? null : this.value)" title="project"></select>
@@ -3989,7 +4024,7 @@ function cardHtml(s) {
       ${s.cost_flag ? `<span class="badge cost" title="last turn $${s.cost_flag.last} vs median $${s.cost_flag.median}">${s.cost_flag.ratio}× cost</span>` : ""}</div>
     <div class="subkey">${esc(s.key)}</div>
     ${s.summary ? `<div class="summary">${esc(s.summary)}</div>` : ""}
-    <div class="meta"><span><b>${s.turns}</b> turns</span>
+    <div class="meta">${s.project ? projLink(s.project, s.project, "cproj") : ""}<span><b>${s.turns}</b> turns</span>
     <span title="API list-price equivalent, not billed"><b>$${(s.cost||0).toFixed(2)}</b></span>
     <span>${esc(s.model || "default")}</span>
     <span>${age(s.updated)}</span>
@@ -4651,7 +4686,7 @@ function chatHead(s, live, nAlerts, nFiles) {
     : s.updated ? `<span class="cst">${age(s.updated)}</span>` : "";
   return `<button class="cback" onclick="closeSession()" title="back to the list" aria-label="back to the list">‹</button>
     <div class="ctitle"><b class="${s.title ? "" : "untitled"}">${esc(s.title || "untitled")}</b>
-      <span class="csub">${s.project ? `<span class="cproj">${esc(s.project)}</span>` : ""}${state}${
+      <span class="csub">${s.project ? projLink(s.project, s.project, "cproj") : ""}${state}${
         queued ? `<span class="cst">· ${queued} queued</span>` : ""}</span></div>
     ${nAlerts ? `<button class="calert" onclick="openAlerts(event)" title="alerts">⚠ ${nAlerts}</button>` : ""}
     ${nFiles ? `<button class="cattach" onclick="openDrawer()" title="attachments" aria-label="Attachments (${nFiles})">📎 ${nFiles}</button>` : ""}
@@ -5773,7 +5808,7 @@ async function renderTasks() {
     return `<div class="task" data-task="${esc(t.id)}"${swipeAttr(t)}>
       <span class="st st-${esc(t.state)}">${esc(t.state)}</span>
       <span class="tt">${title}
-        <div class="sub">${t.project ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
+        <div class="sub">${t.project ? `${projLink(t.project)} · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.lens ? ` · lens: ${esc(t.lens)}` : ""}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
           age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${findings(t)}${review(t)}${landing(t)}</span>
       ${taskButtons(t)}</div>`;
@@ -6859,6 +6894,7 @@ const UNFILED = "__unfiled__";            // board.UNFILED: work under no projec
 const BOARD_COLUMNS = [["backlog", "Backlog"], ["running", "Running"],
   ["review", "In review"], ["needs", "Needs you"], ["done", "Done · 14d"]];
 let boardProject = null;                  // null: overview; "": all; UNFILED; a slug
+let pageSlug = null;                      // a project's own page (projectPage), over the board
 // "Show conversation turns": every message a thread takes is a task (recovery,
 // cost, the turn lock), but it is the conversation, not work, so the board,
 // the overview, the task panel and the badge leave them to their threads unless
@@ -6917,6 +6953,7 @@ function setBoardCol(k) {
 }
 function setBoardProject(p) {
   boardProject = p;
+  pageSlug = null;
   boardCol = "";
   // Back to the overview is back to all of it: a filter left set would only
   // turn it straight back into a board.
@@ -6967,6 +7004,16 @@ function fillSelect(id, values, label) {
   if (sel.value !== want) sel.value = want;
 }
 async function renderBoard() {
+  const box = document.querySelector("#boardmodal .box");
+  if (box && box.classList) box.classList.toggle("pagemode", !!pageSlug);
+  if (pageSlug) {
+    // None of the seg's three views is the one showing.
+    for (const id of ["bvover", "bvall", "bvunfiled"]) {
+      const b = document.getElementById(id);
+      if (b) b.className = "";
+    }
+    return loadProjectPage();
+  }
   const role = document.getElementById("brole").value;
   const state = document.getElementById("bstate").value;
   const q = document.getElementById("bq").value.trim();
@@ -7004,7 +7051,134 @@ function boardHead(info) {
     info.unready ? `<span class="warn" title="work the runner would take on its own is held in Needs you instead">⚠ ${
       esc(info.unready)}</span>` : ""}<button class="act" onclick="newTaskForm()">+ New task</button>${
     info.release ? `<button class="ghost" onclick="releaseForm('${esc(info.slug)}')">Release…</button>` : ""}<button class="ghost" onclick="projectSettings('${
-    esc(info.slug)}')">⚙ Settings</button></div>`;
+    esc(info.slug)}')">⚙ Settings</button><button class="ghost" title="readiness, health, landings, releases, branches" onclick="openProjectPage('${
+    esc(info.slug)}')">Project page</button></div>`;
+}
+// --- a project's own page ---------------------------------------------------------
+// ?view=project&slug=<p>: everything about one project in one place -- its
+// readiness, its latest health checks and what is decided or being done about
+// each, its App Store and TestFlight state where it is an app, what landed and
+// was released in the last two weeks, what waits on you, what is queued and
+// running, and its unmerged branches. Read through the bot's /tasks `project`
+// action (board.project_page): stored health results and the board's cached
+// survey and release plan, so opening it makes no network call of its own.
+// Read-only but for the buttons the inbox and the board already have.
+const HEALTH_ICON = {ok: "🟢", warn: "🟡", fail: "🔴", unknown: "⚪"};
+let pageData = null;
+let pageScrollTo = "";        // ?sec=<section>: scrolled into view once drawn
+const PAGE_SECTIONS = ["needs", "app", "health", "running", "queued", "unmerged", "landed", "releases"];
+// A link to a project's page, for a row that is itself a link: the press
+// opens the page and goes no further.
+function projLink(slug, label, cls) {
+  if (!slug || slug === UNFILED) return "";
+  return `<span class="${cls || "proj"} plink" role="link" title="open ${esc(slug)}'s page" onclick="event.stopPropagation();openProjectPage('${
+    esc(slug)}')">${esc(label || slug)}</span>`;
+}
+function openProjectPage(slug) {
+  if (!slug || slug === UNFILED) return;
+  const tm = document.getElementById("taskmodal");
+  if (tm && tm.style.display === "flex") toggleTasks();
+  closeDetail();
+  if (pageSlug !== slug) pageData = null;
+  pageSlug = slug;
+  boardProject = slug;          // the board's own Back and project picker follow
+  if (!boardIsOpen()) toggleBoard(); else renderBoard();
+}
+async function loadProjectPage() {
+  const slug = pageSlug, ask = ++boardAsk;
+  setHTML(document.getElementById("bboard"), "");
+  const el = document.getElementById("bover");
+  if (!pageData || pageData.slug !== slug) skelIfEmpty(el, "card", 4);
+  const r = await taskRead({action: "project", project: slug});
+  if (ask !== boardAsk || pageSlug !== slug) return;     // superseded meanwhile
+  if (!r || !r.ok) {
+    // Could not ask is not "nothing here": said, the last page kept.
+    if (!pageData) setHTML(el, `<div class="bhead"><button class="ghost" onclick="setBoardProject(null)">‹ Projects</button><h3>${
+      esc(slug)}</h3></div><div class="hint">${esc((r && r.error) || "bot offline")}</div>`);
+    return;
+  }
+  pageData = r.page;
+  drawKeyed(el, projectPageHtml(r.page), ".pgsec[data-sec]", "data-sec");
+  if (pageScrollTo) {
+    // Only a section the page has: the key comes from the address.
+    const key = PAGE_SECTIONS.includes(pageScrollTo) ? pageScrollTo : "";
+    pageScrollTo = "";
+    const sec = key && el.querySelector && el.querySelector(`.pgsec[data-sec="${key}"]`);
+    if (sec && sec.scrollIntoView) sec.scrollIntoView({block: "start"});
+  }
+}
+function pgSection(key, title, n, body, empty) {
+  return `<section class="pgsec" data-sec="${key}"><h4>${title}${n === null ? "" : ` · ${n}`}</h4>${
+    body || `<div class="off">${empty || "none"}</div>`}</section>`;
+}
+function pgCheck(c) {
+  const since = c.since ? ` · since ${age(c.since)}` : "";
+  return `<div class="pgrow hc st-${esc(c.status)}"><div><span title="${esc(c.status)}">${
+    HEALTH_ICON[c.status] || "?"}</span> <b>${esc(c.check)}</b> <span class="off">${esc(c.status)}${since}${
+    c.checked_at ? ` · checked ${age(c.checked_at)}` : ""}${
+    c.last_known ? ` · last known ${esc(c.last_known)}` : ""}</span>${
+    c.link ? ` <a class="ghost" href="${esc(c.link)}" target="_blank" rel="noopener">open ↗</a>` : ""}</div>
+    ${c.summary ? `<div class="pgsum">${esc(c.summary)}</div>` : ""}${
+    c.action ? `<div class="pgact k-${esc(c.action_kind)}">→ ${esc(c.action)}</div>` : ""}${
+    (c.evidence || []).length && c.status !== "ok" ? `<details class="pgev"><summary>evidence · ${
+      c.evidence.length}</summary>${c.evidence.map(e => `<div>${esc(e)}</div>`).join("")}</details>` : ""}</div>`;
+}
+// A long list shows its first few, the rest a tap away: a busy fortnight
+// lands forty things, and the sections under it would scroll off the phone.
+const PG_SHOWN = 8;
+function pgMore(rows, shown) {
+  const n = shown || PG_SHOWN;
+  if (rows.length <= n) return rows.join("");
+  return rows.slice(0, n).join("") + `<details class="pgev pgmore"><summary>${rows.length - n} more</summary>${
+    rows.slice(n).join("")}</details>`;
+}
+function pgTask(t) {
+  return `<div class="pgrow open" onclick="openCard('${esc(t.id)}')"><div class="tt">${esc(t.title)}</div>
+    <div class="sub">${esc(t.id)} · ${esc(t.role)} · ${age(t.created)}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""}${
+      t.queue_pos ? ` · <span class="qpos">${t.priority ? "📌 " : ""}#${t.queue_pos} in queue</span>` : ""}</div></div>`;
+}
+function projectPageHtml(pg) {
+  const rd = pg.readiness || {};
+  const yes = (on, label, tip) => `<span class="${on ? "on" : "off"}" title="${esc(tip || "")}">${on ? "✓" : "✗"} ${label}</span>`;
+  const needs = (pg.needs || []).filter(notGone);
+  const store = pg.app || [];
+  const checks = (pg.health || []).filter(c => !store.some(s => s.check === c.check));
+  const fail = pg.main_failing, bad = pg.checkout_failing;
+  const head = `<div class="bhead pghead"><button class="ghost" onclick="setBoardProject(null)" title="all projects">‹ Projects</button>
+    <h3>${esc(pg.title)} <span class="slug">${esc(pg.slug)}</span>${pg.archived ? ` <span class="off">archived</span>` : ""}</h3>
+    <button class="act" onclick="setBoardProject('${esc(pg.slug)}')">Board →</button>${
+    pg.release && (pg.release.targets || []).length ? `<button class="ghost" onclick="releaseForm('${esc(pg.slug)}')">Release…</button>` : ""}<button class="ghost" onclick="projectSettings('${
+    esc(pg.slug)}')">⚙ Settings</button></div>
+    <div class="pgready">${yes(rd.test_cmd, "tests", rd.test_cmd || "no test command")} · ${
+      yes(rd.auto_merge, "auto-merge", "reviewed, verified work lands without asking")} · ${
+      yes(rd.publish, "publish", "the base is pushed to origin after each landing")}${
+      pg.ci_gate ? ` · <span class="on" title="GitHub workflows that must pass before landing">✓ CI gate: ${esc(pg.ci_gate)}</span>` : ""}${
+      rd.test_cmd ? ` <code class="pgcmd">${esc(rd.test_cmd)}</code>` : ""}${
+      rd.unready ? `<div class="warn">⚠ ${esc(pg.slug)} ${esc(rd.unready)}</div>` : ""}${
+      fail ? `<div class="warn">🔴 ${esc(fail.line)}</div>` : ""}${
+      bad ? `<div class="warn">⚠️ ${esc(bad.line)}</div>` : ""}${
+      pg.cost_week ? `<div class="off">this week ${fmtCost(pg.cost_week)}</div>` : ""}</div>`;
+  const secs = [
+    pgSection("needs", "Needs you", needs.length, pgMore(needs.map(inboxCard), 3), "nothing waits on you here"),
+    store.length ? pgSection("app", "App Store &amp; TestFlight", null, store.map(pgCheck).join("")) : "",
+    pgSection("health", "Health", checks.length, checks.map(pgCheck).join(""),
+      pg.health_unread ? `<span class="warn">the health store could not be read (see the bot log)</span>` : "no checks have run for it"),
+    pgSection("running", "Running", (pg.running || []).length, (pg.running || []).map(pgTask).join(""), "nothing running"),
+    pgSection("queued", "Queued", (pg.queued || []).length, pgMore((pg.queued || []).map(pgTask)), "nothing queued"),
+    pgSection("unmerged", "Unmerged branches", (pg.unmerged || []).length, (pg.unmerged || []).map(u =>
+      `<div class="pgrow open" onclick="openCard('${esc(u.id)}')"><div class="tt">${esc(u.title || u.id)}</div>
+        <div class="sub"><code>${esc(u.branch || "")}</code> · ${u.commits === null || u.commits === undefined ? "?" : u.commits} commit${
+          u.commits === 1 ? "" : "s"}${u.local === false ? " · on the remote only" : ""}</div></div>`).join("")),
+    pgSection("landed", `Landed · ${pg.days || 14}d`, (pg.landed || []).length, pgMore((pg.landed || []).map(l =>
+      `<div class="pgrow open" onclick="openCard('${esc(l.id)}')"><div><code>${esc(l.head)}</code> ${esc(l.title)}</div>
+        <div class="sub">${age(l.at)}${l.base ? ` · onto ${esc(l.base)}` : ""}${
+          l.published === true ? " · pushed" : l.published === false ? " · not pushed" : ""}</div></div>`)), "nothing landed"),
+    pgSection("releases", `Releases · ${pg.days || 14}d`, (pg.releases || []).length, (pg.releases || []).map(t =>
+      `<div class="pgrow"><code>${esc(t.tag)}</code> <span class="off">${age(t.at)}</span></div>`).join("")
+      + (pg.release ? `<div class="pgpend">${releaseText(pg.release)}</div>` : ""),
+      pg.release ? `nothing released${releaseText(pg.release)}` : "nothing released"),
+  ];
+  return head + `<div class="pgrid">${secs.join("")}</div>`;
 }
 // On a phone the board is one column at a time (CSS shows the one named by
 // data-show), picked from a row of tabs; on a laptop the tabs are hidden and
@@ -7070,7 +7244,7 @@ function boardCard(t) {
   const cost = fmtCost(t.cost_total);
   return `<div class="bcard" data-id="${esc(t.id)}"${swipeAttr(t)} onclick="openCard('${esc(t.id)}')">
     <div class="tt">${esc(t.title || t.id)}</div>
-    <div class="sub">${t.project && boardProject === "" ? `<span class="proj">${esc(t.project)}</span> · ` : ""}${
+    <div class="sub">${t.project && boardProject === "" ? `${projLink(t.project)} · ` : ""}${
       esc(t.role)}${t.lens ? ` · <span class="lens" title="the nightly review lens it came from">${esc(t.lens)}</span>` : ""}${t.state === "blocked" || t.state === "proposed" || t.state === "failed"
         || t.state === "needs_input" || t.state === "awaiting_approval"
         ? ` · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>` : ""} · ${
@@ -7139,7 +7313,8 @@ function projectCard(p, threads) {
   const rd = p.readiness;
   const yes = (on, label, tip) => `<span class="${on ? "on" : "off"}" title="${esc(tip || "")}">${on ? "✓" : "✗"} ${label}</span>`;
   const slug = p.slug === UNFILED ? UNFILED : p.slug;
-  return `<div class="pcard" data-slug="${esc(slug)}" onclick="setBoardProject('${esc(slug)}')">
+  return `<div class="pcard" data-slug="${esc(slug)}" onclick="${p.slug === UNFILED
+    ? `setBoardProject('${esc(slug)}')` : `openProjectPage('${esc(slug)}')`}">
     <h3>${esc(p.title)}${p.slug !== UNFILED ? ` <span class="slug">${esc(p.slug)}</span>` : ""}${
       p.needs ? ` <span class="st st-failed">${p.needs} need you</span>` : ""}${
       p.slug !== UNFILED ? `<button class="ghost gear" title="settings" onclick="event.stopPropagation();projectSettings('${esc(p.slug)}')">⚙</button>` : ""}</h3>
@@ -7188,7 +7363,7 @@ function renderDetail(t) {
   return `<button class="ghost xclose" onclick="closeDetail()" title="close" aria-label="close">✕</button>
     <h3>${esc(t.title || t.id)}</h3>
     <div class="sub">${esc(t.id)} · ${esc(t.role || "")}${t.lens ? ` · lens: ${esc(t.lens)}` : ""} · <span class="st st-${esc(t.state)}">${esc(t.state)}</span>${
-      t.project ? ` · ${esc(t.project)}` : " · unfiled"} · ${esc(t.source || "")} · ${age(t.created)}${costText(t)}${
+      t.project ? ` · ${projLink(t.project)}` : " · unfiled"} · ${esc(t.source || "")} · ${age(t.created)}${costText(t)}${
       t.branch ? ` · ${esc(t.branch)}${t.commits ? ` (${t.commits})` : ""}` : ""}</div>
     <div class="acts u-mt2">${cardButtons(t)}${t.thread_link
       ? `<a class="ghost" href="${esc(t.thread_link)}" target="_blank">Slack thread ↗</a>` : ""}</div>
@@ -7806,7 +7981,8 @@ function inboxHtml(d) {
   if (!n && ranHtml) return ranHtml;
   if (!n) return `<div class="iempty"><b>Nothing needs you</b>Proposals, approvals, questions and failures turn up here.</div>`;
   return `<div class="ihd"><h3>Needs you</h3><span class="n">${n}</span></div>` + ranHtml + groups.map(g =>
-    `<div class="igroup" data-project="${esc(g.project)}"><h4>${esc(g.title)}<span class="n">${g.items.length}</span></h4>${
+    `<div class="igroup" data-project="${esc(g.project)}"><h4>${g.project && g.project !== UNFILED && g.project !== "__operator__"
+      ? projLink(g.project, g.title, "ipl") : esc(g.title)}<span class="n">${g.items.length}</span></h4>${
       g.items.map(inboxCard).join("")}</div>`).join("");
 }
 function drawInbox(d) {
@@ -8086,7 +8262,9 @@ if (window.addEventListener)
 //     [&drawer=1] [&tools=open] [&files=1]  ...its attachments drawer, its longest turn's calls
 //                                         open, or its newest message with files in view
 //   ?view=inbox | threads                 the phone's home on Needs you (the default), or the list
-//   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
+//   ?view=stats | tasks[&tab=all] | projects | learnings
+//   ?view=project&slug=<slug>[&sec=<section>]  the project's own page, at a section
+//   ?view=board&slug=<slug | all | unfiled>  its board, every project's, or the unfiled lane's
 //   ?view=trader[&tab=sleeves|activity|plumbing|shadow]
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
@@ -8154,8 +8332,13 @@ async function openLink(q) {
   } else if (view === "tasks") {
     toggleTasks();
     if (q.get("tab") === "all") setTaskView("all");
-  } else if (view === "projects" || view === "project" || card) {
-    boardProject = view === "project" ? (slug === "all" ? "" : slug === "unfiled" ? UNFILED : slug) : null;
+  } else if (view === "project" && slug && slug !== "all" && slug !== "unfiled") {
+    pageScrollTo = q.get("sec") || "";
+    openProjectPage(slug);
+  } else if (view === "projects" || view === "project" || view === "board" || card) {
+    boardProject = view === "project" || view === "board"
+      ? (slug === "all" ? "" : slug === "unfiled" ? UNFILED : slug) : null;
+    pageSlug = null;
     if (!boardIsOpen()) toggleBoard(); else refreshBoard();
   } else if (view === "learnings") {
     toggleLearn();

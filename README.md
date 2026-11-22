@@ -1650,8 +1650,11 @@ A local web dashboard for every thread session (localhost-only):
   notification lands on a thread and how the screenshots below are taken:
   `/?thread=<key>`, `/?task=<id>` (the task panel, on that row),
   `/?view=stats|tasks|projects|learnings` (`&tab=all` for every task),
-  `/?view=project&slug=<slug>` (`all`, `unfiled`), `&card=<task id>` (a task's
-  detail), `/?modal=new-thread|new-project|new-task|settings|release|alerts`
+  `/?view=project&slug=<slug>` (the project's own page: readiness, health,
+  App Store and TestFlight state, the fortnight's landings and release tags,
+  what waits on you, the queue and unmerged branches; `&sec=<section>` scrolls
+  to one), `/?view=board&slug=<slug>` (its board; `all`, `unfiled`),
+  `&card=<task id>` (a task's detail), `/?modal=new-thread|new-project|new-task|settings|release|alerts`
   (`&slug=` for the last two), `/?q=<words>` (search), `/?list=unread`, `&theme=dark|light|auto`
   (that view only). The address is cleared once read, so a reload opens the list.
 - **Look and feel** — one design system: CSS custom properties at `:root` for

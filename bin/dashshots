@@ -82,7 +82,7 @@ NEW_THREAD = "D0SHOTS:0000000000.000000"
 
 #: /tasks actions that only read (visualizer.READ_TASK_ACTIONS, plus nothing).
 READ_TASKS = {"list", "attention", "counts", "board", "overview", "task", "unmerged",
-              "holding", "roles", "watching", "inbox"}
+              "holding", "roles", "watching", "inbox", "project"}
 READ_PROJECTS = {"list", "get", "unregistered"}
 READ_LEARNINGS = {"list"}
 #: Routes that only ever read: whether the bot is up, and a thread's live turn.
@@ -218,6 +218,11 @@ def stand_in(real_port: str):
                     # by this checkout's inbox.py, over the live state read
                     # only -- what the bot's own route would answer.
                     answer = local_inbox(real_port)
+                if (self.path == "/tasks" and action == "project" and not answer.get("ok")
+                        and "unknown action" in str(answer.get("error") or "")):
+                    # A running bot older than the project page: built here
+                    # by this checkout's board.py, over the live state read only.
+                    answer = local_project(real_port, payload.get("project") or "")
                 if self.path == "/tasks" and action == "inbox":
                     answer = with_sample_plan(answer)
             else:
@@ -320,6 +325,42 @@ def local_inbox(real_port: str) -> dict:
         return {"ok": True, **out}
     except Exception as e:
         return {"ok": False, "error": f"screenshot harness: could not build the inbox ({e})"}
+
+
+def local_project(real_port: str, slug: str) -> dict:
+    """The /tasks `project` answer, built as local_inbox builds the inbox:
+    tasks.json, projects.json and health.json read-only, the real bot's own
+    branch survey, and the project's release tags read from git."""
+    sys.path.insert(0, str(REPO))
+    try:
+        import board
+        import health
+        import health_probes  # noqa: F401  (registers the checks and their decisions)
+        import releases
+        home = live_home()
+        tasks_ = json.loads((home / "tasks.json").read_text())
+        projects = json.loads((home / "projects.json").read_text())
+        prec = projects.get(slug) or next((p for p in projects.values() if p.get("slug") == slug), None)
+        if not prec:
+            return {"ok": False, "error": f"unknown project {slug!r}"}
+        rows = health.HealthStore(home / "health.json", readonly=True).all()
+        survey = forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+        cwd = (prec.get("scope") or {}).get("cwd") or ""
+        tags = releases.tags_since(cwd, time.time() - board.PAGE_DAYS * 86400) if cwd else []
+        rel = board.release_status(cwd) if cwd else None
+
+        class _Read:
+            def get(self, tid):
+                return tasks_.get(tid)
+
+            def all(self):
+                return tasks_
+        page = board.project_page(prec, tasks_.values(), unmerged_rows=survey, health_rows=rows,
+                                  release=rel, release_tags=tags,
+                                  action_of=lambda r: health.action(r, _Read()))
+        return {"ok": True, "page": page}
+    except Exception as e:
+        return {"ok": False, "error": f"screenshot harness: could not build the project page ({e})"}
 
 
 def forward(port: str, path: str, payload: dict) -> dict:
@@ -532,6 +573,17 @@ def pick_examples(base: str, project: str) -> dict:
     # ?task= opens the task panel on a row that needs you, so pick one that does.
     needs = get_json(base + "/api/tasks", {"action": "attention"}).get("tasks") or []
     out["task"] = needs[0]["id"] if needs else out["card"]
+    # An app (one with App Store checks), for the project page's store section.
+    try:
+        sys.path.insert(0, str(REPO))
+        import health
+        rows = health.HealthStore(live_home() / "health.json", readonly=True).all()
+        apps = sorted({r.get("project") for r in rows if r.get("check") in ("app-store", "testflight")
+                       and r.get("project") and r.get("project") != project})
+        if apps:
+            out["app"] = apps[0]
+    except Exception:
+        pass
     return out
 
 
@@ -561,9 +613,14 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("tasks-all", "/?view=tasks&tab=all"),
         ("task", f"/?task={quote(ex['task'])}"),
         ("projects", "/?view=projects"),
-        ("board", f"/?view=project&slug={p}"),
-        ("card", f"/?view=project&slug={p}&card={quote(ex['card'])}"),
-        ("new-task", f"/?view=project&slug={p}&modal=new-task"),
+        # A project's own page (board.project_page), and an app's.
+        ("project", f"/?view=project&slug={p}"),
+        *([("project-app", f"/?view=project&slug={quote(ex['app'])}"),
+           ("project-app-store", f"/?view=project&slug={quote(ex['app'])}&sec=app")] if ex.get("app") else []),
+        ("project-lower", f"/?view=project&slug={p}&sec=health"),
+        ("board", f"/?view=board&slug={p}"),
+        ("card", f"/?view=board&slug={p}&card={quote(ex['card'])}"),
+        ("new-task", f"/?view=board&slug={p}&modal=new-task"),
         ("settings", f"/?view=projects&modal=settings&slug={p}"),
         ("new-project", "/?modal=new-project"),
         ("release", f"/?view=projects&modal=release&slug={p}"),
@@ -577,7 +634,8 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("light-inbox", "/?theme=light"),
         ("light-sessions", "/?view=threads&theme=light"),
         ("light-thread", f"/?thread={quote(ex['thread'])}&theme=light"),
-        ("light-board", f"/?view=project&slug={p}&theme=light"),
+        ("light-board", f"/?view=board&slug={p}&theme=light"),
+        ("light-project", f"/?view=project&slug={p}&theme=light"),
     ]
 
 

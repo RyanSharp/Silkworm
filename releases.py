@@ -163,6 +163,11 @@ def tagged_since(repo, since: float) -> list[str]:
     first. Dated by the tag itself (its tagger date; the commit's for a
     lightweight tag), so a release of an old commit still counts as today's.
     Empty when git cannot say -- the digest omits what it cannot read."""
+    return [t["tag"] for t in tags_since(repo, since)]
+
+
+def tags_since(repo, since: float) -> list[dict]:
+    """tagged_since's tags with their dates: [{tag, at}], oldest first."""
     r = _git(repo, "for-each-ref", "--sort=creatordate",
              "--format=%(creatordate:unix) %(refname:short)", "refs/tags", timeout=30)
     if r.returncode != 0:
@@ -171,7 +176,7 @@ def tagged_since(repo, since: float) -> list[str]:
     for row in r.stdout.splitlines():
         when, _, name = row.strip().partition(" ")
         if when.isdigit() and int(when) >= since and _RELEASE_TAG.match(name):
-            out.append(name)
+            out.append({"tag": name, "at": int(when)})
     return out
 
 

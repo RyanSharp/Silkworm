@@ -20,6 +20,7 @@ from pathlib import Path
 import basered
 import health
 import branches
+import inbox
 import costs
 import projects as projects_mod
 import releases
@@ -442,6 +443,34 @@ def _summary(slug: str, title: str, recs: list, spend: dict, unmerged_rows,
     }
 
 
+def readiness(p: dict) -> dict:
+    """Whether a project can take unsupervised work, and its landing switches."""
+    return {
+        "test_cmd": (p.get("test_cmd") or "").strip(),
+        "auto_merge": bool(p.get("auto_merge")),
+        "publish": bool(p.get("publish")),
+        "unready": projects_mod.unready(p),
+    }
+
+
+def failing_lines(p: dict) -> dict:
+    """{main_failing, checkout_failing}: the project's one line while its base
+    fails its own tests, and while its own checkout fails tests the base
+    passes elsewhere; None for each that is not so."""
+    slug = p.get("slug") or ""
+    red = p.get("main_failing") or None
+    bad = p.get("checkout_failing") or None
+    return {
+        "main_failing": ({"line": basered.line(slug, red), "sha": red.get("sha"),
+                          "tests": list(red.get("tests") or []),
+                          "since": red.get("since")} if red else None),
+        "checkout_failing": ({"line": basered.checkout_line(slug, bad),
+                              "sha": bad.get("sha"),
+                              "tests": list(bad.get("tests") or []),
+                              "since": bad.get("since")} if bad else None),
+    }
+
+
 def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=None,
              now: float | None = None, health_rows=(), turns: bool = False) -> dict:
     """One card per active project, plus the unfiled lane's.
@@ -470,24 +499,9 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
         slug = p["slug"]
         row = _summary(slug, p.get("title") or slug, by_slug.get(slug, []), spend,
                        unmerged_rows, turns)
-        row["readiness"] = {
-            "test_cmd": (p.get("test_cmd") or "").strip(),
-            "auto_merge": bool(p.get("auto_merge")),
-            "publish": bool(p.get("publish")),
-            "unready": projects_mod.unready(p),
-        }
+        row["readiness"] = readiness(p)
         row["cwd"] = (p.get("scope") or {}).get("cwd") or ""
-        # The project's one line while its base fails its own tests.
-        red = p.get("main_failing") or None
-        row["main_failing"] = ({"line": basered.line(slug, red), "sha": red.get("sha"),
-                                "tests": list(red.get("tests") or []),
-                                "since": red.get("since")} if red else None)
-        # And while its own checkout fails tests the base passes elsewhere.
-        bad = p.get("checkout_failing") or None
-        row["checkout_failing"] = ({"line": basered.checkout_line(slug, bad),
-                                    "sha": bad.get("sha"),
-                                    "tests": list(bad.get("tests") or []),
-                                    "since": bad.get("since")} if bad else None)
+        row.update(failing_lines(p))
         row["release"] = releases_by_slug.get(slug)
         row["health"] = health.board_line(health_by.get(slug, ()))
         out.append(row)
@@ -502,3 +516,144 @@ def overview(project_records, records, *, unmerged_rows=(), releases_by_slug=Non
                        for p in project_records if p.get("archived")),
                       key=lambda r: r["title"].lower())
     return {"projects": out, "unfiled": unfiled, "archived": archived, "note": costs.NOTE}
+
+
+# --- one project's page ------------------------------------------------------------
+
+#: How far back the page's landings and releases reach.
+PAGE_DAYS = 14
+
+#: The health checks that are an app's store state, drawn as their own section.
+STORE_CHECKS = ("app-store", "testflight")
+
+#: Evidence lines a health row carries to the page.
+PAGE_EVIDENCE = 4
+
+
+def _health_row(rec: dict, action_of=None) -> dict:
+    """One stored health result, cut to what the page draws. Named fields
+    only: the store's records carry pointers and probe caches the page has
+    no business with, and nothing here is passed through whole."""
+    kind, words = ("", "")
+    if action_of and rec.get("status") != health.OK:
+        try:
+            kind, words = action_of(rec) or ("", "")
+        except Exception:
+            kind, words = "", ""
+    last = rec.get("last_known") or {}
+    return {
+        "check": str(rec.get("check") or ""),
+        "status": str(rec.get("status") or health.UNKNOWN),
+        "summary": str(rec.get("summary") or "")[:300],
+        "evidence": [str(e)[:300] for e in (rec.get("evidence") or [])[:PAGE_EVIDENCE]],
+        "link": str(rec.get("link") or ""),
+        "since": rec.get("last_changed") or None,
+        "checked_at": rec.get("checked_at") or None,
+        "was": str(rec.get("was") or ""),
+        "last_known": str(last.get("status") or "") if rec.get("status") == health.UNKNOWN else "",
+        "action_kind": kind or "",
+        "action": " ".join(str(words or "").split())[:300],
+    }
+
+
+def _task_row(rec: dict, queue_pos: dict) -> dict:
+    return {"id": rec.get("id"), "title": rec.get("title") or rec.get("id") or "",
+            "role": rec.get("role") or "", "state": rec.get("state") or "",
+            "created": rec.get("created") or 0, "attempts": rec.get("attempts") or 0,
+            "priority": bool(rec.get("priority")), "thread": rec.get("thread") or "",
+            "queue_pos": queue_pos.get(rec.get("id"))}
+
+
+def project_page(prec: dict, records, *, unmerged_rows=(), health_rows=(), release=None,
+                 release_tags=(), action_of=None, now: float | None = None,
+                 days: float = PAGE_DAYS, registry: dict | None = None,
+                 operator_thread: str = "") -> dict:
+    """Everything about one project on one page, read-only.
+
+    The header (its readiness and the base-red lines), its latest health
+    checks with what is being done or decided about each, its App Store and
+    TestFlight state where it is an app (those checks' stored results: no
+    probe is run for the page), the landings and release tags of the last
+    `days`, what waits on you (inbox.py's items for it), what is queued and
+    running, and its unmerged branches. `action_of(health_rec)` is
+    health.action bound to the task store; `release_tags` is
+    releases.tags_since's answer for its repository. `health_rows` None is
+    "the store could not be read", said as such (`health_unread`), never
+    drawn as a project with no checks.
+    """
+    health_unread = health_rows is None
+    now = time.time() if now is None else now
+    slug = prec["slug"]
+    since = now - days * 86400
+    records = list(records)
+    by_id = {r.get("id"): r for r in records}
+
+    def mine(r):
+        # A reviewer is filed under no project; it belongs to its parent's.
+        own = r.get("project") or (by_id.get(r.get("parent") or "", {}).get("project")
+                                   if r.get("role") == "reviewer" else "")
+        return (own or "") == slug
+    recs = [r for r in records if mine(r)]
+
+    rows = [r for r in (health_rows or ()) if (r.get("project") or "") == slug]
+    rows.sort(key=lambda r: (health.SEVERITY.get(r.get("status"), 9), r.get("check") or ""))
+    checks = [_health_row(r, action_of) for r in rows]
+    store = [c for c in checks if c["check"] in STORE_CHECKS]
+    store.sort(key=lambda c: STORE_CHECKS.index(c["check"]))
+
+    landed = []
+    for r in recs:
+        result = r.get("result") or {}
+        l = result.get("landing") or {}
+        head = result.get("landed") or (l.get("head") if l.get("landed") else None)
+        if not head:
+            continue
+        at = finished_at(r)
+        if at < since:
+            continue
+        landed.append({"id": r.get("id"), "title": r.get("title") or "", "head": str(head)[:8],
+                       "at": at, "base": str(l.get("base") or ""),
+                       "published": l.get("published")})
+    landed.sort(key=lambda x: -x["at"])
+
+    tags = sorted(({"tag": str(t.get("tag") or ""), "at": t.get("at") or 0}
+                   for t in (release_tags or ()) if (t.get("at") or 0) >= since),
+                  key=lambda t: -t["at"])
+
+    inbox_ = inbox.build(records, unmerged_rows=unmerged_rows, health_rows=rows,
+                         operator_thread=operator_thread,
+                         project_titles={slug: prec.get("title") or slug}, registry=registry)
+    needs = next((g["items"] for g in inbox_["groups"] if g["project"] == slug), [])
+
+    queue = sorted((r for r in records if _in_queue(r)), key=tasks.claim_order)
+    pos = {r.get("id"): i + 1 for i, r in enumerate(queue)}
+    shown = [r for r in recs if tasks.on_board(r)]
+    queued = sorted((_task_row(r, pos) for r in shown if r.get("state") == tasks.QUEUED
+                     and r.get("role") != "reviewer"),
+                    key=lambda t: (t["queue_pos"] or 10 ** 9, t["created"]))
+    running = sorted((_task_row(r, pos) for r in shown if r.get("state") == tasks.RUNNING),
+                     key=lambda t: t["created"])
+
+    titles = {r.get("id"): r.get("title") or "" for r in recs}
+    unmerged = sorted(({"id": u.get("id"), "title": titles.get(u.get("id")) or u.get("title") or "",
+                        **unmerged_of(u)}
+                       for u in unmerged_rows or () if (u.get("project") or "") == slug),
+                      key=lambda u: -(u.get("commits") or 0))
+
+    counts: dict = {}
+    for r in shown:
+        if r.get("role") != "reviewer":
+            counts[r.get("state") or "?"] = counts.get(r.get("state") or "?", 0) + 1
+    return {
+        "slug": slug, "title": prec.get("title") or slug,
+        "archived": bool(prec.get("archived")),
+        "readiness": readiness(prec), **failing_lines(prec),
+        "ci_gate": str(prec.get("ci_gate") or ""),
+        "health": checks, "app": store or None, "health_unread": health_unread,
+        "landed": landed, "releases": tags,
+        "release": release,
+        "needs": needs, "queued": queued, "running": running,
+        "unmerged": unmerged, "counts": counts,
+        "cost_week": costs.by_project(records, now=now, unfiled=UNFILED).get(slug),
+        "days": days, "note": costs.NOTE,
+    }

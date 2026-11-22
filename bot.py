@@ -2746,6 +2746,7 @@ def _spend(project: str = "") -> dict:
 #: task panel's own "unmerged" action still asks fresh.
 _board_survey = board.TTLCache()
 _board_releases = board.TTLCache()
+_board_tags = board.TTLCache()
 
 
 def board_survey() -> list:
@@ -2768,6 +2769,17 @@ def board_release(slug: str):
         cwd = (project_store.scope_for(slug) or {}).get("cwd")
         return board.release_status(cwd) if cwd and worktrees.is_repo(cwd) else None
     return _board_releases.get(slug, compute)
+
+
+def board_release_tags(slug: str) -> list:
+    """The project's release tags of the page's window, with their dates,
+    cached as the release plan is; [] without a repository."""
+    def compute():
+        cwd = (project_store.scope_for(slug) or {}).get("cwd")
+        if not (cwd and worktrees.is_repo(cwd)):
+            return []
+        return releases.tags_since(cwd, time.time() - board.PAGE_DAYS * 86400)
+    return _board_tags.get(slug, compute)
 
 
 def _task_title(raw, goal: str) -> tuple[str, str]:
@@ -3009,6 +3021,20 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                      # Whether it has release targets, for the header's Release…
                      "release": bool((board_release(prec["slug"]) or {}).get("targets"))}
             if prec else None}
+    if action == "project":
+        # One project's page (board.project_page). Read-only: the stored
+        # health results (no probe runs for it), the cached survey and
+        # release plan, and its release tags read from git, cached.
+        prec = project_store.get(project) if project and project != board.UNFILED else None
+        if not prec:
+            return {"ok": False, "error": f"unknown project {project!r}"}
+        return {"ok": True, "page": board.project_page(
+            prec, task_store.all().values(), unmerged_rows=board_survey(),
+            health_rows=health_rows(), release=board_release(prec["slug"]),
+            release_tags=board_release_tags(prec["slug"]),
+            operator_thread=OPERATOR.thread() or "",
+            action_of=lambda rec: health.action(rec, task_store,
+                                                warn_after=HEALTH_WARN_DAYS))}
     if action == "inbox":
         # The dashboard's home screen: everything waiting on you, grouped by
         # project (inbox.py). Read-only; the survey is the board's cached one.

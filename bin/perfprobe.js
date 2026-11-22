@@ -65,7 +65,7 @@
     toggleTasks();
     await sleep(800);
     // A project's board.
-    openLink(new URLSearchParams("view=project&slug=silkworm"));
+    openLink(new URLSearchParams("view=board&slug=silkworm"));
     await sleep(3500);
     out.scroll_board = await scrollRun(document.querySelector("#boardmodal .box"), 3000);
     closeBoard();
