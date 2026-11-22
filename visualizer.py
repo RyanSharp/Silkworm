@@ -1107,7 +1107,8 @@ def trader_status(run=None, clock=time.time) -> dict:
 #: /api/tasks actions that only read. Only these answer 304: an action that
 #: does something must always do it, whatever the page last saw.
 READ_TASK_ACTIONS = frozenset({"list", "attention", "counts", "board", "overview",
-                               "task", "unmerged", "holding", "roles", "watching"})
+                               "task", "unmerged", "holding", "roles", "watching",
+                               "inbox"})
 
 #: The largest POST taken: a message's attached files travel in it as base64
 #: (webthread.MAX_FILE_BYTES each, about 4/3 larger encoded).
@@ -1983,6 +1984,47 @@ PAGE = r"""<!doctype html>
                          font-size: var(--fs-md); }
   .listtop { display: flex; gap: var(--sp-2); padding: var(--sp-25) var(--sp-25) 0; }
   .listtop button { flex: 1; }
+  /* The home screen: Needs you, everything waiting on you (renderInbox).
+     Above the stats in main on a laptop while no thread is open; on a phone,
+     the first of the list column's two tabs. */
+  #hometabs, #inboxphone { display: none; }
+  #homecount { margin-left: var(--sp-15); font-family: var(--mono); font-size: var(--fs-xs); color: var(--gold); }
+  body:not(.reading) #homebtn { border-color: var(--accent-line); color: var(--gold); }
+  body.reading #inbox { display: none; }
+  .inbox { margin-bottom: var(--sp-4); }
+  .inbox .ihd { display: flex; align-items: baseline; gap: var(--sp-2); margin: 0 0 var(--sp-2); }
+  .inbox .ihd h3 { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-semi); }
+  .inbox .ihd .n { color: var(--muted); font-size: var(--fs-sm); }
+  .inbox .igroup { margin-bottom: var(--sp-35); }
+  .inbox .igroup > h4 { margin: 0 0 var(--sp-15); font-size: var(--fs-sm); font-weight: var(--fw-semi);
+                        color: var(--gold); text-transform: uppercase; letter-spacing: .06em; }
+  .inbox .igroup > h4 .n { color: var(--muted); margin-left: var(--sp-1); }
+  .icard { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md);
+           padding: var(--sp-25) var(--sp-3); margin-bottom: var(--sp-2); }
+  .icard.k-failed { border-left: 3px solid var(--bad); }
+  .icard.k-approval, .icard.k-plan { border-left: 3px solid var(--gold); }
+  .icard.k-question, .icard.k-findings, .icard.k-landing { border-left: 3px solid var(--info); }
+  .icard .ihead { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-2xs);
+                  font-family: var(--mono); color: var(--muted); }
+  .icard .ikind { border-radius: var(--r-xs); padding: 1px var(--sp-15); background: var(--fill-2); }
+  .icard .ikind.k-failed { background: var(--bad-soft); color: var(--bad); }
+  .icard .ikind.k-approval, .icard .ikind.k-plan, .icard .ikind.k-proposal { background: var(--accent-soft); color: var(--gold); }
+  .icard .ikind.k-question, .icard .ikind.k-findings, .icard .ikind.k-landing { background: var(--info-soft); color: var(--info); }
+  .icard .iage { margin-left: auto; }
+  .icard .tt { font-weight: var(--fw-semi); margin-top: var(--sp-1); overflow-wrap: anywhere; }
+  .icard .tt.open { cursor: pointer; }
+  .icard .tt.open:hover { color: var(--gold); }
+  .icard .iline { color: var(--muted); font-size: var(--fs-sm); margin-top: var(--sp-05); overflow-wrap: anywhere; }
+  .icard .irec { margin-top: var(--sp-15); font-size: var(--fs-sm); color: var(--ink);
+                 background: var(--accent-soft); border: 1px solid var(--accent-line);
+                 border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-2); overflow-wrap: anywhere; }
+  .icard .irec b { color: var(--gold); }
+  .icard .acts { margin-top: var(--sp-2); display: flex; gap: var(--sp-15); flex-wrap: wrap; }
+  .icard .acts button { font-size: var(--fs-sm); }
+  .icard .acts button.rec { box-shadow: 0 0 0 2px var(--accent-line); }
+  .inbox .iempty { color: var(--muted); font-size: var(--fs-md); padding: var(--sp-6) 0; text-align: center; }
+  .inbox .iempty b { display: block; color: var(--ink); font-size: var(--fs-lg); font-weight: var(--fw-semi);
+                     margin-bottom: var(--sp-1); }
   #dashm { display: none; margin: var(--sp-2) var(--sp-25) 0; }
   #dashm summary { font-family: inherit; font-size: var(--fs-md); color: var(--ink);
                    background: var(--panel); border: 1px solid var(--line);
@@ -2611,6 +2653,18 @@ PAGE = r"""<!doctype html>
     body.reading .listcol { display: none; }
     body.reading main { display: flex; }
     #dash { display: none; }
+    /* home: Needs you first; Threads is the list as it was */
+    #inbox { display: none; }
+    #hometabs { display: flex; margin: var(--sp-2) var(--safe-r) 0 var(--safe-l); }
+    #hometabs button { flex: 1; min-height: var(--tap); font-size: var(--fs-base); }
+    #hometabs #inboxcount { margin-left: var(--sp-15); font-family: var(--mono); font-size: var(--fs-xs); }
+    #homebtn, #inboxphone .ihd { display: none; }
+    body:not(.home-threads) .listtop, body:not(.home-threads) #dashm,
+      body:not(.home-threads) #kindfilter, body:not(.home-threads) #list { display: none; }
+    body:not(.home-threads) #inboxphone { display: block; flex: 1; min-height: 0; overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: var(--sp-25) var(--safe-r) calc(var(--sp-25) + var(--safe-b)) var(--safe-l); }
+    .icard .acts button { flex: 1 1 auto; }
     #dashm { display: block; }
     #dashphone .tiles { gap: var(--sp-35) var(--sp-6); }
     #dashphone .tile .n { font-size: var(--fs-xl); }
@@ -2888,7 +2942,9 @@ PAGE = r"""<!doctype html>
 <div id="searchresults"></div>
 <div class="layout">
   <div class="listcol">
-    <div class="listtop"><button class="act" onclick="newThreadForm()">+ New thread</button></div>
+    <div id="hometabs" class="seg" role="tablist"><button id="htinbox" class="on" role="tab" onclick="setHome('inbox')">Needs you<span id="inboxcount"></span></button><button id="htthreads" role="tab" onclick="setHome('threads')">Threads</button></div>
+    <div id="inboxphone" class="inbox"></div>
+    <div class="listtop"><button class="ghost" id="homebtn" onclick="goHome()" title="what needs you">📥 Needs you<span id="homecount"></span></button><button class="act" onclick="newThreadForm()">+ New thread</button></div>
     <details id="dashm"><summary id="dashsum">📊 Stats</summary><div id="dashphone"></div></details>
     <div id="kindfilter"></div>
     <nav id="list"><div id="listskel" class="skels" aria-hidden="true"><div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div></div></nav>
@@ -2897,6 +2953,7 @@ PAGE = r"""<!doctype html>
     <button id="backbtn" class="ghost" onclick="closeSession()">‹ Sessions</button>
     <div id="chathead"></div>
     <div id="content">
+      <div id="inbox" class="inbox"></div>
       <div id="dash"></div>
       <div id="transcript"><div id="thead"><div class="empty">Pick a session on the left.</div></div><div id="tmsgs"></div><div id="tlive"></div></div>
     </div>
@@ -3291,11 +3348,13 @@ function redrawWork() {
   const panel = document.getElementById("taskmodal");
   if (panel && panel.style.display === "flex") renderTasks();
   if (boardIsOpen()) renderBoard();
+  if (inboxData) drawInbox(inboxData);
 }
-function deferTask(id, action, label) {
+// `extra`: more of the request, as a findings Dismiss's round.
+function deferTask(id, action, label, extra) {
   if (pendingGone.has(id)) return;
   if (!undoBatch || undoBatch.items.every(q => q.sent)) undoBatch = {items: []};
-  const b = undoBatch, p = {id, action, label, batch: b};
+  const b = undoBatch, p = {id, action, label, batch: b, extra: extra || null};
   pendingGone.set(id, p);
   b.items.push(p);
   clearTimeout(b.timer);
@@ -3323,14 +3382,20 @@ async function sendDeferred(id) {
   // its Undo is over once nothing it covers is still waiting
   if (toast.owner === p.batch && p.batch.items.every(q => q.sent)) hideToast(document.getElementById("toast"));
   let r;
-  try { r = await taskCall({action: p.action, id}); }
+  try { r = await taskCall(Object.assign({}, p.extra || {}, {action: p.action, id})); }
   catch (e) { r = {ok: false, error: "could not reach the dashboard"}; }
   pendingGone.delete(id);
-  if (!r || !r.ok) toast(`Not ${p.action === "accept" ? "accepted" : "dismissed"}: ${
+  if (!r || !r.ok) toast(`Not ${pastTense(p.action)}: ${
     (r && r.error) || "refused"} — it is back`, 5000, {bad: true});
   redrawWork();
   refreshTaskBadge();
+  loadInbox();
 }
+// What a task action did, as a toast says it.
+const PAST = {accept: "accepted", dismiss: "dismissed", retry: "retried", approve: "approved",
+              cancel: "cancelled", rework: "sent back", land: "landing", drop: "dropped",
+              resolve: "marked done", close: "closed", dig: "sent to dig deeper", release: "released"};
+function pastTense(action) { return PAST[action] || `${action}ed`; }
 // Put away (another app, the screen locked) before Undo ran out: send now,
 // while the page can still talk.
 function sendAllDeferred() { for (const id of [...pendingGone.keys()]) sendDeferred(id); }
@@ -5386,7 +5451,7 @@ async function taskAction(id, action, notes, round) {
   // The row answers the tap at once -- dimmed, taking no second one -- and
   // is drawn again from what the server says once it has.
   const rows = document.querySelectorAll
-    ? [...document.querySelectorAll(`.task[data-task="${id}"], .bcard[data-id="${id}"]`)] : [];
+    ? [...document.querySelectorAll(`.task[data-task="${id}"], .bcard[data-id="${id}"], .icard[data-id="${id}"]`)] : [];
   rows.forEach(el => el.classList && el.classList.add("busy"));
   let r;
   try { r = await taskCall(p); }
@@ -5401,11 +5466,12 @@ async function taskAction(id, action, notes, round) {
                : action === "resolve" ? "Marked done"
                : action === "close" ? "Findings closed"
                : action === "dig" ? "Sent to dig deeper"
-               : `Task ${action}ed${r.note ? ` — ${r.note}` : ""}`)
+               : `Task ${pastTense(action)}${r.note ? ` — ${r.note}` : ""}`)
              : (r.error || "Not allowed"));
   renderTasks();
   refreshTaskBadge();
   if (boardIsOpen()) refreshBoard();
+  loadInbox();
 }
 function review(t) {
   // Show why it is waiting, so approving is an informed click rather than a leap.
@@ -7604,6 +7670,182 @@ async function archiveProject(slug, on) {
   if (boardIsOpen()) renderBoard();
 }
 
+// --- the inbox: what needs you ---
+// The home screen, on a phone and a laptop: one list of everything waiting
+// on you -- proposals, approvals, questions, failures, refused landings, the
+// operator's ops plan, and each health check that names a decision of yours
+// -- grouped by project, the most urgent first (inbox.py decides the order,
+// and which buttons each item allows). Every button is a /tasks action the
+// task panel already sends (taskAction), through the same route and checks.
+// The reversible ones -- Accept, Dismiss, Retry -- go at once with Undo, as a
+// swipe does (deferTask); the ones that cannot be taken back ask first.
+// Run plan says "yes" in the operator's thread, as you would type it there.
+let inboxData = null, inboxAsk = 0;
+let homeTab = "inbox";
+const INBOX_BUTTON = {
+  accept:  {label: "Accept", cls: "act", undo: true},
+  dismiss: {label: "Dismiss", cls: "ghost", undo: true},
+  retry:   {label: "Retry", cls: "ghost", undo: true},
+  approve: {label: "Approve", cls: "act"},
+  land:    {label: "Land", cls: "act"},
+  drop:    {label: "Drop", cls: "ghost"},
+  close:   {label: "Close", cls: "act"},
+  dig:     {label: "Dig deeper…", cls: "ghost"},
+  rework:  {label: "Send back…", cls: "ghost"},
+  resolve: {label: "Done", cls: "ghost"},
+  release: {label: "Release", cls: "act"},
+  "run-plan": {label: "Run plan", cls: "act"},
+  discuss: {label: "Discuss", cls: "ghost"},
+};
+const INBOX_UNDONE = {accept: "Accepted", dismiss: "Dismissed", retry: "Retried"};
+function inboxItems(d) {
+  return ((d && d.groups) || []).flatMap(g => g.items || []);
+}
+function inboxCard(it) {
+  const rec = it.recommendation && INBOX_BUTTON[it.recommendation.action] ? it.recommendation : null;
+  const isTask = it.kind !== "plan" && it.kind !== "decision";
+  // A question's Send back is its answer: it resumes with what you say.
+  const label = a => a === "rework" && it.state === "needs_input" ? "Answer…" : INBOX_BUTTON[a].label;
+  const btns = (it.actions || []).filter(a => INBOX_BUTTON[a]).map(a => {
+    const b = INBOX_BUTTON[a], on = rec && rec.action === a;
+    return `<button class="${on ? "act rec" : b.cls}" data-act="${a}" data-id="${esc(it.id)}" data-round="${
+      esc(it.round || "")}" data-state="${esc(it.state || "")}" data-thread="${esc(it.thread || "")}" data-title="${
+      esc(it.title || "")}" onclick="inboxAct(this)">${esc(label(a))}</button>`;
+  }).join("");
+  // Said as whose it is: the operator's, or whoever else set it (your CLI).
+  const who = rec && rec.by && rec.by !== "operator" ? `Suggested by ${rec.by}:` : "Operator suggests";
+  const chip = rec ? `<div class="irec" title="a suggestion; it decides nothing">💡 ${esc(who)} <b>${
+    esc(label(rec.action).replace("…", ""))}</b>${rec.why ? ` — ${esc(rec.why)}` : ""}</div>` : "";
+  const swipe = it.kind === "proposal" ? swipeAttr({state: it.state, role: it.role}) : "";
+  return `<div class="icard k-${esc(it.kind)}" data-id="${esc(it.id)}"${swipe}>
+    <div class="ihead"><span class="ikind k-${esc(it.kind)}">${esc(it.label || it.kind)}</span>${
+      isTask ? `<span>${esc(it.id)}</span>` : ""}<span class="iage">${it.at ? age(it.at) : ""}</span></div>
+    <div class="tt${isTask ? " open" : ""}"${isTask ? ` onclick="openCard('${esc(it.id)}')"` : ""}>${esc(it.title)}</div>
+    ${it.line ? `<div class="iline">${esc(it.line)}</div>` : ""}${chip}
+    ${btns ? `<div class="acts">${btns}</div>` : ""}</div>`;
+}
+function inboxHtml(d) {
+  // Left out while their Undo shows, as on the board (pendingGone).
+  const groups = ((d && d.groups) || []).map(g => ({...g, items: (g.items || []).filter(notGone)}))
+    .filter(g => g.items.length);
+  const n = groups.reduce((k, g) => k + g.items.length, 0);
+  if (!n) return `<div class="iempty"><b>Nothing needs you</b>Proposals, approvals, questions and failures turn up here.</div>`;
+  return `<div class="ihd"><h3>Needs you</h3><span class="n">${n}</span></div>` + groups.map(g =>
+    `<div class="igroup" data-project="${esc(g.project)}"><h4>${esc(g.title)}<span class="n">${g.items.length}</span></h4>${
+      g.items.map(inboxCard).join("")}</div>`).join("");
+}
+function drawInbox(d) {
+  const html = inboxHtml(d);
+  for (const id of ["inbox", "inboxphone"]) {
+    const el = document.getElementById(id);
+    // Not under a finger: a card mid-swipe stays the card it was (the next
+    // poll, or the swipe's own redraw, catches up).
+    if (el && !(swipe && swipe.on && el.contains(swipe.el))) setHTML(el, html);
+  }
+  const n = inboxItems(d).filter(notGone).length;
+  for (const id of ["inboxcount", "homecount"]) {
+    const c = document.getElementById(id);
+    if (c) c.textContent = n ? String(n) : "";
+  }
+}
+async function loadInbox() {
+  const ask = ++inboxAsk;
+  let r;
+  try { r = await taskRead({action: "inbox"}); }
+  catch (e) { r = {ok: false, error: "could not reach the dashboard"}; }
+  if (ask !== inboxAsk) return;               // a newer read is on its way
+  if (!r || !r.ok) {
+    // Could not ask is not "nothing needs you": said, and the last list kept.
+    if (!inboxData) for (const id of ["inbox", "inboxphone"]) {
+      const el = document.getElementById(id);
+      if (el) setHTML(el, `<div class="hint">Could not read what needs you — ${esc((r && r.error) || "bot offline")}</div>`);
+    }
+    return;
+  }
+  inboxData = r;
+  drawInbox(r);
+}
+async function inboxAct(el) {
+  const d = el.dataset, id = d.id, act = d.act, round = d.round || "";
+  const title = (d.title || id).trim();
+  if (INBOX_BUTTON[act] && INBOX_BUTTON[act].undo) {
+    deferTask(id, act, `${INBOX_UNDONE[act]}: ${title.slice(0, 60)}`, round ? {round} : null);
+    redrawWork();
+    return;
+  }
+  if (act === "approve") {
+    if (!confirm(`Approve “${title}”?\n\nApproving lands it: its branch is rebased onto the base, `
+                 + "tested and merged. That can't be undone from here.")) return;
+    return taskAction(id, "approve");
+  }
+  if (act === "land") {
+    if (!confirm(`Land “${title}”?\n\nIts branch is rebased onto the base, tested and merged. `
+                 + "That can't be undone from here.")) return;
+    return taskAction(id, "land");
+  }
+  if (act === "drop") {
+    if (!confirm(`Drop the branch of “${title}”?\n\nThe branch is deleted; its commits are kept `
+                 + "under a discarded/ tag.")) return;
+    return taskAction(id, "drop");
+  }
+  if (act === "resolve") {
+    if (!confirm(`Mark “${title}” done?\n\nSay so once you have taken the step it left for you.`)) return;
+    return taskAction(id, "resolve");
+  }
+  if (act === "close") return closeFindings(id, round);
+  if (act === "dig") return digDeeper(id, round);
+  if (act === "rework") return sendBack(id, d.state === "needs_input");
+  if (act === "release") return releaseStep(id, round);
+  if (act === "run-plan") return runPlan(id, d.thread);
+  if (act === "discuss") return openThread(d.thread);
+}
+function openThread(key) {
+  if (!key) return;
+  if (lastSessions.some(x => x.key === key)) openSession(key);
+  else jumpTo(key);
+}
+// The plan the card was drawn for, or none: a "yes" answers whichever plan
+// the operator recorded last, so one recorded since must not be run unread.
+async function runPlan(planId, thread) {
+  if (!confirm("Run the operator's plan?\n\nThis says “yes” in the operator's thread — the same as "
+               + "typing it there — and every step not yet run goes ahead. That can't be undone from here."))
+    return;
+  let r;
+  try { r = await taskCall({action: "inbox"}); } catch (e) { r = null; }
+  const live = r && r.ok ? inboxItems(r).find(i => i.kind === "plan") : null;
+  if (!live || live.id !== planId || !live.thread) {
+    toast("The plan changed since this was drawn — read it again before running it", 5000, {bad: true});
+    if (r && r.ok) { inboxData = r; drawInbox(r); }
+    return;
+  }
+  const s = await sendOnce({key: live.thread, text: "yes", files: [], client_id: newClientId()});
+  if (!s || !s.ok) { toast(`Not sent: ${(s && s.error) || "refused"}`, 5000, {bad: true}); return; }
+  toast("Said “yes” in the operator's thread");
+  loadInbox();
+  openThread(live.thread);
+}
+// Whether the inbox is on screen: no thread open, and on a phone its tab.
+// Polled only then -- each read asks the branch survey.
+function inboxVisible() {
+  const b = document.body;
+  if (b && b.classList && b.classList.contains("reading")) return false;
+  return !phone() || homeTab === "inbox";
+}
+// Home, from anywhere: the open thread closed, the inbox shown.
+function goHome() {
+  if (active || (document.body && document.body.classList.contains("reading"))) closeSession();
+  setHome("inbox");
+}
+// The phone's home: Needs you, or the thread list.
+function setHome(tab) {
+  homeTab = tab === "threads" ? "threads" : "inbox";
+  if (document.body && document.body.classList) document.body.classList.toggle("home-threads", homeTab === "threads");
+  const a = document.getElementById("htinbox"), b = document.getElementById("htthreads");
+  if (a) a.className = homeTab === "inbox" ? "on" : "";
+  if (b) b.className = homeTab === "threads" ? "on" : "";
+  if (homeTab === "inbox") loadInbox();
+}
+
 // --- phone ---
 // Under 700px wide the session list and the open thread take turns on the
 // screen: body.reading shows the thread, and ‹ Sessions goes back. Opening one
@@ -7651,6 +7893,7 @@ if (window.addEventListener)
 //   ?thread=<key> | ?task=<id>            a thread, or a task in the task panel
 //     [&drawer=1] [&tools=open] [&files=1]  ...its attachments drawer, its longest turn's calls
 //                                         open, or its newest message with files in view
+//   ?view=inbox | threads                 the phone's home on Needs you (the default), or the list
 //   ?view=stats | tasks[&tab=all] | projects | project&slug=<slug> | learnings
 //   ?view=trader[&tab=sleeves|activity|plumbing|shadow]
 //   ?card=<task id>                       a task's detail, over the board
@@ -7678,7 +7921,7 @@ async function openLink(q) {
   const view = q.get("view") || "", slug = q.get("slug") || "", modal = q.get("modal") || "";
   const thread = q.get("thread"), card = q.get("card"), words = q.get("q");
   if (q.get("theme")) applyTheme(q.get("theme"), false);
-  if (q.get("list") === "unread") { unreadOnly = true; loadList(); }
+  if (q.get("list") === "unread") { unreadOnly = true; setHome("threads"); loadList(); }
   // A thread or a task: the notification's own way in (openTarget, below).
   if (thread || q.get("task")) await openTarget("/?" + q.toString());
   // &drawer=1: the thread's attachments drawer; &tools=open: its longest turn's
@@ -7710,9 +7953,12 @@ async function openLink(q) {
       }
     }
   }));
+  if (view === "threads" || view === "stats") setHome("threads");
   if (view === "stats") {
     const d = document.getElementById("dashm");
     if (d) d.open = true;
+  } else if (view === "inbox") {
+    setHome("inbox");
   } else if (view === "tasks") {
     toggleTasks();
     if (q.get("tab") === "all") setTaskView("all");
@@ -8020,8 +8266,10 @@ const pollList = poller(loadList), pollStats = poller(loadStats),
       pollTranscript = poller(() => active ? loadTranscript(false) : null),
       pollLive = poller(() => threadBusy() ? loadTranscript(false) : null),
       pollBoard = poller(() => boardIsOpen() ? refreshBoard() : null),
-      pollTrader = poller(() => traderIsOpen() ? refreshTrader() : null);
-loadList(); loadStats();
+      pollTrader = poller(() => traderIsOpen() ? refreshTrader() : null),
+      pollInbox = poller(() => inboxVisible() ? loadInbox() : null);
+loadList(); loadStats(); loadInbox();
+setInterval(pollInbox, 5000);
 setInterval(pollList, 5000);
 setInterval(pollStats, 30000);
 setInterval(pollTranscript, 4000);
@@ -8029,7 +8277,7 @@ setInterval(pollLive, 1500);
 setInterval(pollBoard, 5000);
 setInterval(pollTrader, TRADER_POLL_MS);
 document.addEventListener("visibilitychange", () => {
-  if (visible()) { checkBuild(); pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); }
+  if (visible()) { checkBuild(); pollList(); pollStats(); pollTranscript(); pollBoard(); pollTrader(); pollInbox(); }
 });
 </script>
 </body>

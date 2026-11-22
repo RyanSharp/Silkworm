@@ -78,7 +78,8 @@ SHARED_HELPERS = ("send_back", "review_addendum", "task_base", "unmerged_survey"
                   "held_reason", "edit_task", "_task_title", "take_step", "release_steps",
                   "release_drain_refusal", "unreviewed_role", "filer_role", "health_rows",
                   "user_grant", "record_user_decision", "outage_summary",
-                  "dashboard_owner", "grant_starter", "plan_guard_refused", "release_lift")
+                  "dashboard_owner", "grant_starter", "plan_guard_refused", "release_lift",
+                  "recommend_task")
 
 
 #: What a lifted function gets for a bot.py global that is not a module and
@@ -21532,8 +21533,9 @@ def test_dashboard_polls_without_redrawing():
           "/api/sessions" in o["backFetches"] and "/api/stats" in o["backFetches"]
           and "/api/session" in o["backFetches"], o["backFetches"])
     # 1500: the open thread while something is under way in it (threadBusy);
-    # 60000: the Trader view, which only reads while it is open.
-    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 4000, 5000, 5000, 30000, 60000],
+    # 60000: the Trader view, which only reads while it is open. The third
+    # 5000 is the Needs you inbox, the home screen (loadInbox).
+    check("the polling cadence is unchanged", sorted(o["intervals"]) == [1500, 4000, 5000, 5000, 5000, 30000, 60000],
           o["intervals"])
 
 
@@ -35302,7 +35304,7 @@ def test_trader_view_draws_the_document():
     check("it is polled every minute while open, and on focus and on showing the tab",
           "const TRADER_POLL_MS = 60000;" in js and "setInterval(pollTrader, TRADER_POLL_MS)" in js
           and "traderIsOpen() ? refreshTrader()" in js and 'addEventListener("focus"' in js
-          and "pollBoard(); pollTrader(); }" in js)
+          and "pollBoard(); pollTrader(); pollInbox(); }" in js)
     # Nothing on the view posts: its markup's buttons are its close button and
     # the five tabs (which only change what is drawn), and it has no form.
     modal = re.search(r'<div id="tradermodal".*?\n</div>\n', V.PAGE, re.S).group(0)
@@ -38775,6 +38777,468 @@ def test_ci_gate_remembers_its_remote_branch():
                 _landing_now={done})["live_worktree_tasks"]()
     check("a landing under way keeps its checkout from the sweeper, task done or not",
           done in keep)
+
+
+
+# --- the inbox: everything waiting on you, the dashboard's home -----------------
+# The task panel's Needs you tab, the board's column, the operator's plan (in
+# its thread) and a health check's "decide:" line each held a part of what is
+# yours to do. inbox.py puts them in one list, which the page opens on.
+
+def _inbox_fixture():
+    """A real store holding one of everything the inbox lists, and some that
+    it must not: (store, ids, built inbox, registry)."""
+    import inbox as I
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    ids = {}
+
+    def make(key, title, state, **kw):
+        path = {T.PROPOSED: [], T.QUEUED: [], T.RUNNING: [T.RUNNING],
+                T.AWAITING_APPROVAL: [T.RUNNING, T.AWAITING_APPROVAL],
+                T.NEEDS_INPUT: [T.RUNNING, T.NEEDS_INPUT], T.FAILED: [T.RUNNING, T.FAILED],
+                T.DONE: [T.RUNNING, T.DONE]}[state]
+        first = T.PROPOSED if state == T.PROPOSED else T.QUEUED
+        role = kw.pop("role", "implementor")
+        t = st.create(kw.pop("goal", title + "\nWhat done looks like: it works."), title=title,
+                      state=first, role=role, project=kw.pop("project", "alpha"),
+                      source=kw.pop("source", "ideation"), driver="queue")
+        for s in path:
+            st.transition(t["id"], s, kw.pop("why", "") if s == state else "")
+        if kw:
+            st.update(t["id"], **kw)
+        ids[key] = t["id"]
+        return t["id"]
+    make("proposal", "Cache the release plan", T.PROPOSED)
+    make("approval", "Show sync errors in Settings", T.AWAITING_APPROVAL,
+         result={"review": {"ok": True, "summary": "clean, tests added"}})
+    make("question", "Ship the widget", T.NEEDS_INPUT, why="yours to do",
+         needs_user={"action": "!release cadence ios", "why": "a release is yours"})
+    make("findings", "Which simulator flakes", T.NEEDS_INPUT, role="researcher", why="findings")
+    make("failed", "Fix the flaky clock test", T.FAILED, why="tests failed: test_clock", project="beta")
+    make("landing", "Tidy the board", T.DONE,
+         result={"landing": {"eligible": True, "landed": False, "stage": "rebase",
+                             "detail": "CONFLICT in board.py"}})
+    # Not yours: queued, running, landed, a refused landing with no branch here,
+    # and a conversation turn that finished.
+    make("queued", "Queued work", T.QUEUED)
+    make("running", "Running work", T.RUNNING)
+    make("landed", "Landed work", T.DONE, result={"landing": {"eligible": True, "landed": True}})
+    make("gone", "Refused, branch gone", T.DONE,
+         result={"landing": {"eligible": True, "landed": False, "stage": "rebase"}})
+    make("turn", "a reply in a thread", T.DONE, source="slack", role="assistant")
+    # A recommendation for the state it is in, and one written before it moved.
+    rec, err = T.make_recommendation("approve", "review passed and the tests are green",
+                                     "operator", T.AWAITING_APPROVAL, now=1.0)
+    assert not err, err
+    st.update(ids["approval"], recommendation=rec)
+    stale, _ = T.make_recommendation("retry", "it was a quota blip", "operator", T.RUNNING, now=1.0)
+    st.update(ids["failed"], recommendation=stale)
+    mine, _ = T.make_recommendation("dismiss", "superseded by the widget task", "cli",
+                                    T.PROPOSED, now=1.0, since=T.entered(st.get(ids["proposal"])))
+    st.update(ids["proposal"], recommendation=mine)
+    unmerged = [{"id": ids["landing"], "commits": 2, "branch": "silkworm/" + ids["landing"],
+                 "local": True}]
+    plan = {"id": "pl_1", "thread": "D1:1.0", "at": 50.0, "entries": [
+        {"n": 1, "name": "tailscale-on", "args": []},
+        {"n": 2, "name": "trader-refetch-revisions", "args": ["--apply"]},
+        {"n": 3, "name": "tailscale-status", "args": [], "used": True}]}
+    registry = {"app-store": types.SimpleNamespace(
+        decision=lambda r: "submit 1.3 for review, or hold it")}
+    health_rows = [{"project": "mondays", "check": "app-store", "status": "warn",
+                    "summary": "1.3 is processed and not submitted", "last_changed": 40.0},
+                   {"project": "alpha", "check": "ci", "status": "fail", "summary": "red"}]
+    built = I.build(st.all().values(), unmerged_rows=unmerged, plan=plan,
+                    health_rows=health_rows, operator_thread="D1:1.0",
+                    project_titles={"alpha": "Alpha", "beta": "Beta", "mondays": "Mondays"},
+                    registry=registry)
+    return st, ids, built, registry
+
+
+def test_inbox_lists_everything_waiting_on_you():
+    import inbox as I
+    import tasks as T
+    print("\nthe inbox: one list of what waits on you, grouped by project, most urgent first")
+    st, ids, built, registry = _inbox_fixture()
+    items = {i["id"]: i for g in built["groups"] for i in g["items"]}
+    want = {ids[k] for k in ("proposal", "approval", "question", "findings", "failed", "landing")}
+    check("every proposal, approval, question, findings, failure and refused landing is listed",
+          want <= set(items), sorted(set(items)))
+    check("and nothing that is not yours: queued, running, landed, a gone branch, a turn",
+          not {ids[k] for k in ("queued", "running", "landed", "gone", "turn")} & set(items))
+    check("the operator's plan is one item, its steps not yet run",
+          items.get("pl_1", {}).get("kind") == "plan"
+          and items["pl_1"]["steps"] == ["tailscale-on", "trader-refetch-revisions --apply"]
+          and items["pl_1"]["actions"] == ["run-plan"] and "2 steps" in items["pl_1"]["title"],
+          str(items.get("pl_1")))
+    dec = items.get("health:mondays:app-store") or {}
+    check("a health check naming your decision is listed as one, with Discuss in the operator's thread",
+          dec.get("kind") == "decision" and dec.get("line") == "decide: submit 1.3 for review, or hold it"
+          and dec.get("actions") == ["discuss"] and dec.get("thread") == "D1:1.0", str(dec))
+    check("a failing check with no decision of yours is not (its fix is a task)",
+          "health:alpha:ci" not in items)
+    check("built from the plan entries alone, a spent plan is no item",
+          I.plan_item({"id": "p", "entries": [{"n": 1, "name": "x", "used": True}]}) is None
+          and I.plan_item(None) is None)
+    acts = {k: items[ids[k]]["actions"] for k in
+            ("proposal", "approval", "question", "findings", "failed", "landing")}
+    check("each item offers exactly what it allows", acts == {
+        "proposal": ["accept", "dismiss"], "approval": ["approve", "rework", "dismiss"],
+        "question": ["resolve", "rework", "dismiss"], "findings": ["close", "dig", "dismiss"],
+        "failed": ["retry", "dismiss"], "landing": ["land", "drop"]}, str(acts))
+    check("in plain words: the step a run left you, a review's verdict, why it failed",
+          items[ids["question"]]["line"] == "yours to do: !release cadence ios — a release is yours"
+          and items[ids["approval"]]["line"] == "review passed: clean, tests added"
+          and items[ids["failed"]]["line"] == "tests failed: test_clock"
+          and items[ids["landing"]]["line"] == "not landed (rebase) — CONFLICT in board.py"
+          and items[ids["proposal"]]["line"] == "What done looks like: it works.",
+          str({k: items[ids[k]]["line"] for k in ("question", "approval", "failed", "landing", "proposal")}))
+    check("the recommendation is on the item it was written for",
+          items[ids["approval"]]["recommendation"] == {
+              "action": "approve", "why": "review passed and the tests are green", "by": "operator"},
+          str(items[ids["approval"]]["recommendation"]))
+    check("one written before the task moved on is not shown",
+          items[ids["failed"]]["recommendation"] is None)
+    odd, _ = T.make_recommendation("land", "x", "operator", T.PROPOSED)
+    lone = st.create("A proposal", state=T.PROPOSED, project="alpha")["id"]
+    st.update(lone, recommendation=odd)
+    got = [i for g in I.build(st.all().values())["groups"] for i in g["items"] if i["id"] == lone]
+    check("nor one for a button its card does not have (Land on a proposal)",
+          got and got[0]["recommendation"] is None, str(got))
+    check("findings carry the round their buttons act on",
+          items[ids["findings"]]["round"] == T.parked_round(st.get(ids["findings"]))
+          and items[ids["findings"]]["round"])
+    order = [g["project"] for g in built["groups"]]
+    check("groups go by their most urgent item: a failure, then approvals and the plan, then decisions",
+          order[0] == "beta" and order.index("alpha") < order.index("mondays")
+          and order.index(I.OPERATOR) < order.index("mondays"), str(order))
+    alpha = next(g for g in built["groups"] if g["project"] == "alpha")
+    kinds = [i["kind"] for i in alpha["items"]]
+    check("and within one, the most urgent first, proposals last",
+          kinds[0] == "approval" and kinds[-1] == "proposal", str(kinds))
+    check("a group is headed with the project's title", alpha["title"] == "Alpha")
+    check("the count is every item", built["count"] == sum(len(g["items"]) for g in built["groups"]))
+    # Newest first among equals.
+    st2 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    a = st2.create("older proposal", state=T.PROPOSED, project="p")["id"]
+    b = st2.create("newer proposal", state=T.PROPOSED, project="p")["id"]
+    st2._data[a].update(created=100.0, events=[]); st2._data[b].update(created=200.0, events=[])
+    st2._data[a]["updated"] = 999.0                # a note written on it later
+    got = [i["id"] for i in I.build(st2.all().values())["groups"][0]["items"]]
+    check("among items as urgent, the newest first -- by when it came to need you, not its last write",
+          got == [b, a], str(got))
+    check("an answered plan is no item: no later message answers it",
+          I.plan_item({"id": "p", "answered": "1.0", "entries": [{"n": 1, "name": "x"}]}) is None)
+    check("with nothing waiting, nothing is listed",
+          I.build([]) == {"groups": [], "count": 0})
+    # A reviewer is filed under no project: it goes in its parent's group.
+    st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    par = st3.create("parent", state=T.QUEUED, project="gamma")["id"]
+    rv = st3.create("Review: parent", state=T.QUEUED, role="reviewer", project="", parent=par)["id"]
+    st3.transition(rv, T.RUNNING); st3.transition(rv, T.FAILED, "reviewer crashed")
+    g = I.build(st3.all().values())["groups"]
+    check("a failed review is listed under its parent's project",
+          [(x["project"], [i["id"] for i in x["items"]]) for x in g] == [("gamma", [rv])], str(g))
+
+
+def test_recommendation_field_and_route():
+    import tasks as T
+    print("\nthe operator's recommendation: a field, set by its own route, deciding nothing")
+    check("declared as a task field, empty by default",
+          "recommendation" in T.FIELDS and T.default("recommendation") is None)
+    rec, err = T.make_recommendation("Approve", "  clean  review ", "operator", "awaiting_approval", now=5.0)
+    check("a recommendation is an action the inbox offers, a reason, who and for which state",
+          not err and rec == {"action": "approve", "why": "clean review", "by": "operator",
+                              "state": "awaiting_approval", "since": 0.0, "at": 5.0}, f"{rec} {err}")
+    check("an action the inbox has no button for is refused",
+          T.make_recommendation("merge", "x", "o", "proposed")[0] is None)
+    check("and so is one with no reason",
+          "--why" in T.make_recommendation("accept", "  ", "o", "proposed")[1])
+    check("and one too long for a card",
+          T.make_recommendation("accept", "x" * (T.RECOMMEND_WHY_MAX + 1), "o", "proposed")[0] is None)
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    tid = st.create("Cache the release plan", state=T.PROPOSED, project="alpha")["id"]
+    handle = _bot_func("handle_tasks", task_store=st, tasks=T, log=logging.getLogger("test"),
+                       recommend_task=_bot_func("recommend_task", task_store=st, tasks=T,
+                                                merge=__import__("merge")))
+    r = handle({"action": "recommend", "id": tid, "recommend": "accept",
+                "why": "small, and the cache is measured", "by": "operator"})
+    t = st.get(tid)
+    check("the route writes it, stamped with the task's state, and moves nothing",
+          r.get("ok") and t["state"] == T.PROPOSED and t["recommendation"]["action"] == "accept"
+          and t["recommendation"]["state"] == T.PROPOSED and t["goal"] == "Cache the release plan",
+          f"{r} {t.get('recommendation')}")
+    check("it is shown while the task stands where it was written",
+          T.recommendation_for(t) == {"action": "accept", "why": "small, and the cache is measured",
+                                      "by": "operator"})
+    st.transition(tid, T.QUEUED, "accepted")
+    check("and not once it has moved on", T.recommendation_for(st.get(tid)) is None)
+    r = handle({"action": "recommend", "id": tid, "recommend": "bogus", "why": "x"})
+    check("a bad action is refused, naming the good ones", not r["ok"] and "approve" in r["error"], str(r))
+    r = handle({"action": "recommend", "id": tid, "recommend": "clear"})
+    check("clear takes it off", r["ok"] and st.get(tid)["recommendation"] is None, str(r))
+    st.transition(tid, T.RUNNING); st.transition(tid, T.DONE)
+    r = handle({"action": "recommend", "id": tid, "recommend": "land", "why": "x"})
+    check("nothing is recommended on finished work", not r["ok"] and "done" in r["error"], str(r))
+    st.update(tid, result={"landing": {"eligible": True, "landed": False, "stage": "rebase"}})
+    r = handle({"action": "recommend", "id": tid, "recommend": "land", "why": "rebased cleanly by hand"})
+    check("except a landing git refused, which is the inbox's Land and Drop",
+          r.get("ok") and T.recommendation_for(st.get(tid))["action"] == "land", str(r))
+    # The same state, a later stay in it: research dug deeper parks again.
+    rs = st.create("Which simulator flakes", state=T.QUEUED, role="researcher")["id"]
+    st.transition(rs, T.RUNNING); st.transition(rs, T.NEEDS_INPUT, "findings")
+    st._data[rs]["events"][-1]["at"] -= 100        # parked a while ago
+    r = handle({"action": "recommend", "id": rs, "recommend": "close", "why": "answered"})
+    check("written on the first findings, it shows on them",
+          r.get("ok") and (T.recommendation_for(st.get(rs)) or {}).get("action") == "close", str(r))
+    st.transition(rs, T.QUEUED, "dig deeper"); st.transition(rs, T.RUNNING)
+    st.transition(rs, T.NEEDS_INPUT, "findings")
+    check("not on the findings a dig deeper brought, though the state is the same",
+          st.get(rs)["state"] == T.NEEDS_INPUT and T.recommendation_for(st.get(rs)) is None)
+    check("an unknown task is said", not handle({"action": "recommend", "id": "nope",
+                                                   "recommend": "accept", "why": "x"})["ok"])
+
+
+def test_operator_recommends_without_approval():
+    import operator_role as O
+    import tasks as T
+    print("\nthe operator sets a recommendation with no approval: it decides nothing")
+    for state in ("proposed", "awaiting_approval", "needs_input", "failed", "queued"):
+        check(f"the guard asks nothing to recommend on {state} work",
+              O.tasks_guard("recommend", {"id": "t", "recommend": "accept", "goal": "x"},
+                            {"state": state, "role": "implementor"}) is None)
+    check("while an edit of a proposal is still accepting it",
+          O.tasks_guard("edit", {"id": "t", "title": "x"}, {"state": "proposed"}) == ("accept", "t"))
+    bot = _operator_bot()
+    st = bot.store
+    p = st.create("Add an appearance preference to Settings", state=T.PROPOSED,
+                  role="implementor", project="alpha")["id"]
+    r = _op_cli(bot, "edit", p, "--recommend", "accept", "--why", "small and well specified")
+    t = st.get(p)
+    check("through the CLI, the operator's --recommend is written, exit 0",
+          r.returncode == 0 and "recommends accept" in r.stdout
+          and (t.get("recommendation") or {}).get("action") == "accept"
+          and t["recommendation"]["why"] == "small and well specified"
+          and t["recommendation"]["by"] == "operator", r.stdout + r.stderr)
+    check("and the proposal is still a proposal: nothing was accepted",
+          t["state"] == T.PROPOSED and t["title"] == "Add an appearance preference to Settings")
+    check("with no approval asked for or recorded", "!approve" not in r.stderr
+          and (not bot.statefile.exists() or "recommend" not in bot.statefile.read_text()))
+    r = _op_cli(bot, "edit", p, "--recommend", "accept")
+    check("--recommend without --why is refused before asking (usage, exit 2)",
+          r.returncode == 2 and "--why" in r.stderr, r.stdout + r.stderr)
+    r = _op_cli(bot, "edit", p, "--recommend", "accept", "--why", "x", "--title", "New")
+    check("and not mixed with an edit of the goal or title", r.returncode == 2
+          and st.get(p)["title"] == "Add an appearance preference to Settings", r.stderr)
+    r = _op_cli(bot, "edit", p, "--recommend", "clear")
+    check("--recommend clear takes it off", r.returncode == 0
+          and st.get(p)["recommendation"] is None, r.stdout + r.stderr)
+    r = _op_cli(bot, "edit", p, "--title", "A different title")
+    check("while the operator's plain edit of a proposal is still refused",
+          r.returncode == 1 and st.get(p)["title"] == "Add an appearance preference to Settings",
+          r.stdout + r.stderr)
+    cli = _load_cli()
+    pay = cli.parse_action("edit", ["tsk_1", "--recommend", "approve", "--why", "green"])
+    check("the CLI sends it as the recommend action", pay["action"] == "recommend"
+          and pay["recommend"] == "approve" and pay["why"] == "green" and pay["id"] == "tsk_1", str(pay))
+
+
+#: The inbox's harness: the motion harness's DOM, timers, fetch and toast,
+#: driving the page's own inbox against what inbox.build makes of a real store.
+def _inbox_harness():
+    head = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    return head + r"""
+const FIX = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+let CONFIRM = true, PROMPT = "a note";
+const asked = [];
+globalThis.confirm = m => { asked.push(m); return CONFIRM; };
+globalThis.prompt = m => { asked.push(m); return PROMPT; };
+let inboxAnswer = FIX;
+answer = (url, b) => (b && b.action === "inbox") ? inboxAnswer : BASE(url);
+(0, eval)(SRC + `
+;globalThis.__m = {loadInbox, drawInbox, inboxAct, setHome, pendingGone, homeTab: () => homeTab};`);
+const M = globalThis.__m, out = {};
+const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
+const btn = (act, id, extra) => { const e = E("BUTTON"); Object.assign(e.dataset, {act, id, title: "T " + id}, extra || {}); return e; };
+const posts = () => calls.filter(c => (c.url === "/api/tasks" || c.url === "/api/send") && c.body
+  && c.body.action !== "inbox" && c.body.action !== "list" && c.body.action !== "attention"
+  && c.body.action !== "counts" && c.body.action !== "holding" && c.body.action !== "unmerged")
+  .map(c => Object.assign({url: c.url}, c.body));
+(async () => {
+  await M.loadInbox(); await flushAsync();
+  out.desk = byId("inbox").innerHTML;
+  out.phone = byId("inboxphone").innerHTML;
+  out.count = byId("inboxcount").textContent;
+  // --- each button's action ---
+  const run = async (act, id, extra) => {
+    const n = posts().length; await M.inboxAct(btn(act, id, extra)); await flushAsync();
+    return posts().slice(n);
+  };
+  const ids = FIX.__ids;
+  out.acceptNow = await run("accept", ids.proposal);
+  out.acceptPending = (M.pendingGone.get(ids.proposal) || {}).action || null;
+  out.hiddenWhilePending = !byId("inbox").innerHTML.includes(`data-id="${ids.proposal}"`);
+  runTimers(now + 5100); await flushAsync();
+  out.acceptSent = posts().filter(p => p.id === ids.proposal);
+  // Dismiss on findings: undoable, and carries its round. Undone, nothing goes.
+  await run("dismiss", ids.findings, {round: "r7"});
+  const undoBtn = toastEl.children.find(c => c.className === "undo");
+  out.undoOffered = !!undoBtn;
+  if (undoBtn) undoBtn.onclick();
+  runTimers(now + 6000); await flushAsync();
+  out.undone = {posts: posts().filter(p => p.id === ids.findings), pending: M.pendingGone.has(ids.findings)};
+  await run("dismiss", ids.findings, {round: "r7"});
+  runTimers(now + 5100); await flushAsync();
+  out.dismissSent = posts().filter(p => p.id === ids.findings);
+  CONFIRM = false;
+  out.approveDeclined = await run("approve", ids.approval);
+  out.landDeclined = await run("land", ids.landing);
+  out.planDeclined = await run("run-plan", "pl_1", {thread: "D1:1.0"});
+  CONFIRM = true;
+  out.approve = await run("approve", ids.approval);
+  out.land = await run("land", ids.landing);
+  out.drop = await run("drop", ids.landing);
+  out.close = await run("close", ids.findings, {round: "r7"});
+  out.dig = await run("dig", ids.findings, {round: "r7"});
+  out.rework = await run("rework", ids.approval, {state: "awaiting_approval"});
+  out.resolve = await run("resolve", ids.question);
+  out.retryNow = await run("retry", ids.failed);
+  runTimers(now + 5100); await flushAsync();
+  out.retrySent = posts().filter(p => p.id === ids.failed);
+  out.plan = await run("run-plan", "pl_1", {thread: "D1:1.0"});
+  out.planStale = await run("run-plan", "pl_old", {thread: "D1:1.0"});
+  out.planStaleToast = toastEl.text;
+  PROMPT = null;
+  out.reworkCancelled = await run("rework", ids.approval, {state: "awaiting_approval"});
+  // --- the phone's tabs ---
+  M.setHome("threads");
+  out.threads = {cls: body.classList.contains("home-threads"), tab: M.homeTab(), on: byId("htthreads").className};
+  M.setHome("inbox");
+  out.inboxTab = {cls: body.classList.contains("home-threads"), on: byId("htinbox").className};
+  // --- empty, and unreadable ---
+  inboxAnswer = {ok: true, groups: [], count: 0};
+  await M.loadInbox(); await flushAsync();
+  out.empty = byId("inbox").innerHTML;
+  out.emptyCount = byId("inboxcount").textContent;
+  inboxAnswer = {ok: false, error: "bot is offline"};
+  await M.loadInbox(); await flushAsync();
+  out.offlineKeeps = byId("inbox").innerHTML;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_dashboard_inbox_renders_and_acts():
+    import re
+    import visualizer as V
+    print("\nthe dashboard's home: the Needs you inbox, drawn from inbox.build, every button its action")
+    page = V.PAGE
+    js = re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+    check("the page has the inbox on the laptop's main and as the phone's first tab",
+          '<div id="inbox" class="inbox"></div>' in page and 'id="inboxphone"' in page
+          and 'id="hometabs"' in page and "setHome('threads')" in page)
+    check("its read is a read: cached, and passed through by the screenshot stand-in",
+          "inbox" in V.READ_TASK_ACTIONS)
+    check("it is polled, and redrawn with the board's work", "pollInbox = poller(" in js
+          and "if (inboxData) drawInbox(inboxData);" in js)
+    check("the page names no role", "'assistant'" not in js[js.index("// --- the inbox"):js.index("// --- phone ---")]
+          and '"implementor"' not in js[js.index("// --- the inbox"):js.index("// --- phone ---")])
+    st, ids, built, _ = _inbox_fixture()
+    fix = json.loads(json.dumps({"ok": True, **built}))
+    fix["__ids"] = ids
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the inbox checked by text only")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(_inbox_harness())
+    (d / "fix.json").write_text(json.dumps(fix))
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), "", str(d / "fix.json")],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the inbox harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    desk = o["desk"]
+
+    def card(tid):
+        m = re.search(r'<div class="icard[^"]*" data-id="%s".*?(?=<div class="icard|<div class="igroup|$)'
+                      % re.escape(tid), desk, re.S)
+        return m.group(0) if m else ""
+
+    def acts(tid):
+        return re.findall(r'data-act="([\w-]+)"', card(tid))
+    check("drawn on both: the laptop's main and the phone's tab", desk and o["phone"] == desk)
+    check("headed Needs you with the count, which the phone's tab shows too",
+          "<h3>Needs you</h3>" in desk and o["count"] == str(built["count"]), o["count"])
+    check("grouped by project under its title, in the order inbox.build gave",
+          re.findall(r'data-project="([^"]+)"', desk) == [g["project"] for g in built["groups"]]
+          and "<h4>Alpha<" in desk)
+    per = {k: acts(ids[k]) for k in ("proposal", "approval", "question", "findings", "failed", "landing")}
+    check("each card draws exactly the buttons its item allows", per == {
+        "proposal": ["accept", "dismiss"], "approval": ["approve", "rework", "dismiss"],
+        "question": ["resolve", "rework", "dismiss"], "findings": ["close", "dig", "dismiss"],
+        "failed": ["retry", "dismiss"], "landing": ["land", "drop"]}, str(per))
+    check("in words people use", all(w in desk for w in (">Accept<", ">Dismiss<", ">Approve<", ">Land<",
+                                                         ">Close<", ">Send back…<", ">Run plan<")))
+    check("the plan and the decision are cards too", acts("pl_1") == ["run-plan"]
+          and acts("health:mondays:app-store") == ["discuss"]
+          and "decide: submit 1.3 for review, or hold it" in card("health:mondays:app-store"))
+    a = card(ids["approval"])
+    check("the recommendation is a chip saying what and why, its button marked",
+          "Operator suggests <b>Approve</b> — review passed and the tests are green" in a
+          and re.search(r'class="act rec" data-act="approve"', a), a[:600])
+    check("and a card with none has no chip", "suggest" not in card(ids["failed"]).lower()
+          and "suggest" not in card(ids["landing"]).lower())
+    check("one you set yourself says so rather than crediting the operator",
+          "Suggested by cli: <b>Dismiss</b> — superseded by the widget task" in card(ids["proposal"]),
+          card(ids["proposal"])[:500])
+    check("a question's send-back is its Answer…, as on the task panel",
+          ">Answer…<" in card(ids["question"]) and ">Send back…<" not in card(ids["question"]))
+    check("a laptop has a way home from an open thread, with the count",
+          'id="homebtn" onclick="goHome()"' in page and 'id="homecount"' in page
+          and "body.reading #inbox { display: none; }" in page)
+    check("polled only while it can be seen", "poller(() => inboxVisible() ? loadInbox() : null)" in js)
+    check("the title and the one line are on the card",
+          "Show sync errors in Settings" in a and "review passed: clean, tests added" in a)
+    check("a proposal's card takes a swipe (the board's rule); nothing else's does",
+          'data-swipe="1"' in card(ids["proposal"]) and desk.count('data-swipe="1"') == 1)
+    # The buttons.
+    check("Accept goes at once with Undo: nothing sent, the card out of the list",
+          o["acceptNow"] == [] and o["acceptPending"] == "accept" and o["hiddenWhilePending"], str(o["acceptNow"]))
+    check("...sent once the Undo window is over, as the accept action",
+          [(x["url"], x["action"]) for x in o["acceptSent"]] == [("/api/tasks", "accept")], str(o["acceptSent"]))
+    check("Dismiss offers Undo, and undone sends nothing", o["undoOffered"]
+          and o["undone"] == {"posts": [], "pending": False}, str(o["undone"]))
+    check("Dismiss on findings carries their round",
+          [(x["action"], x.get("round")) for x in o["dismissSent"]] == [("dismiss", "r7")], str(o["dismissSent"]))
+    check("Approve, Land and Run plan ask first; declined, nothing is sent",
+          o["approveDeclined"] == [] and o["landDeclined"] == [] and o["planDeclined"] == [])
+    one = lambda xs: [(x["action"], x.get("notes", ""), x.get("round", "")) for x in xs]
+    check("confirmed, Approve sends approve", one(o["approve"]) == [("approve", "", "")], str(o["approve"]))
+    check("Land sends land, Drop sends drop", one(o["land"]) == [("land", "", "")]
+          and one(o["drop"]) == [("drop", "", "")], f"{o['land']} {o['drop']}")
+    check("Close sends close with the round", one(o["close"]) == [("close", "", "r7")], str(o["close"]))
+    check("Dig deeper sends your question with the round",
+          one(o["dig"]) == [("dig", "a note", "r7")], str(o["dig"]))
+    check("Send back sends rework with your note", one(o["rework"]) == [("rework", "a note", "")], str(o["rework"]))
+    check("and cancelling its note sends nothing", o["reworkCancelled"] == [])
+    check("Done sends resolve", one(o["resolve"]) == [("resolve", "", "")], str(o["resolve"]))
+    check("Retry is undoable, then sent as retry", o["retryNow"] == []
+          and [x["action"] for x in o["retrySent"]] == ["retry"], str(o["retrySent"]))
+    check("Run plan says yes in the operator's thread, through the chat's own send",
+          [(x["url"], x.get("key"), x.get("text")) for x in o["plan"]] == [("/api/send", "D1:1.0", "yes")],
+          str(o["plan"]))
+    check("but not for a plan other than the one now recorded", o["planStale"] == []
+          and "plan changed" in o["planStaleToast"], f"{o['planStale']} {o['planStaleToast']}")
+    check("the phone's tabs switch between Needs you and Threads",
+          o["threads"] == {"cls": True, "tab": "threads", "on": "on"}
+          and o["inboxTab"] == {"cls": False, "on": "on"}, f"{o['threads']} {o['inboxTab']}")
+    check("with nothing waiting: Nothing needs you, and no count",
+          "Nothing needs you" in o["empty"] and o["emptyCount"] == "", o["empty"])
+    check("a failed read is not taken for an empty one: the last list is kept",
+          o["offlineKeeps"] == o["empty"])
 
 
 if __name__ == "__main__":

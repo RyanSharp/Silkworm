@@ -82,7 +82,7 @@ NEW_THREAD = "D0SHOTS:0000000000.000000"
 
 #: /tasks actions that only read (visualizer.READ_TASK_ACTIONS, plus nothing).
 READ_TASKS = {"list", "attention", "counts", "board", "overview", "task", "unmerged",
-              "holding", "roles", "watching"}
+              "holding", "roles", "watching", "inbox"}
 READ_PROJECTS = {"list", "get", "unregistered"}
 READ_LEARNINGS = {"list"}
 #: Routes that only ever read: whether the bot is up, and a thread's live turn.
@@ -210,6 +210,12 @@ def stand_in(real_port: str):
                 answer = {"ok": True, "run": None}
             elif allowed is not None and action in allowed:
                 answer = forward(real_port, self.path, payload)
+                if (self.path == "/tasks" and action == "inbox" and not answer.get("ok")
+                        and "unknown action" in str(answer.get("error") or "")):
+                    # A running bot older than the inbox: built here instead,
+                    # by this checkout's inbox.py, over the live state read
+                    # only -- what the bot's own route would answer.
+                    answer = local_inbox(real_port)
             else:
                 answer = {"ok": False, "error": "screenshot harness: read-only"}
             body = json.dumps(answer).encode()
@@ -226,6 +232,30 @@ def stand_in(real_port: str):
             self.end_headers()
 
     return Bot
+
+
+def local_inbox(real_port: str) -> dict:
+    """The /tasks `inbox` answer, from tasks.json, projects.json, health.json
+    and operator.json in the live checkout (each loaded read-only) and the
+    real bot's own branch survey."""
+    sys.path.insert(0, str(REPO))
+    try:
+        import health
+        import health_probes  # noqa: F401  (registers the checks and their decisions)
+        import inbox
+        import operator_role
+        home = live_home()
+        tasks_ = json.loads((home / "tasks.json").read_text())
+        projects = list(json.loads((home / "projects.json").read_text()).values())
+        rows = health.HealthStore(home / "health.json", readonly=True).all()
+        op = operator_role.State(home / "operator.json", readonly=True)
+        survey = forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+        out = inbox.build(tasks_.values(), unmerged_rows=survey, plan=op.plan(),
+                          health_rows=rows, operator_thread=op.thread() or "",
+                          project_titles={p["slug"]: p.get("title") or p["slug"] for p in projects})
+        return {"ok": True, **out}
+    except Exception as e:
+        return {"ok": False, "error": f"screenshot harness: could not build the inbox ({e})"}
 
 
 def forward(port: str, path: str, payload: dict) -> dict:
@@ -437,7 +467,9 @@ def pick_examples(base: str, project: str) -> dict:
 def views(ex: dict, project: str) -> list[tuple[str, str]]:
     p = quote(project)
     return [
-        ("sessions", "/"),
+        # The home screen: Needs you (inbox.py), on a phone its first tab.
+        ("inbox", "/"),
+        ("sessions", "/?view=threads"),
         ("sessions-unread", "/?list=unread"),
         ("stats", "/?view=stats"),
         ("thread", f"/?thread={quote(ex['thread'])}"),
@@ -469,7 +501,8 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("trader-plumbing", "/?view=trader&tab=plumbing"),
         ("trader-shadow", "/?view=trader&tab=shadow"),
         # The light theme (⋯ › Theme), a list, a thread and a board in it.
-        ("light-sessions", "/?theme=light"),
+        ("light-inbox", "/?theme=light"),
+        ("light-sessions", "/?view=threads&theme=light"),
         ("light-thread", f"/?thread={quote(ex['thread'])}&theme=light"),
         ("light-board", f"/?view=project&slug={p}&theme=light"),
     ]

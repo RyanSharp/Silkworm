@@ -200,6 +200,10 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
     """
     tid = str((payload or {}).get("id") or "")
     state = (task or {}).get("state")
+    # A recommendation is a suggestion on the inbox card and nothing else: no
+    # state moves and nothing runs, so it is the operator's to set, unasked.
+    if action == "recommend":
+        return None
     # A landing that carries a project's live configuration needs that
     # approved, before anything else: Approve lands (bot.approve_task), and so
     # does Land on work you never accepted. Answering "accept" first let an
@@ -1627,7 +1631,12 @@ SWEEP_GOAL = (
     "<project>`, alongside any ops) and list it under Needs you numbered as "
     "it prints, with what it changes; their \"yes\" in this thread lifts it "
     "for that item. This sweep is not a turn the user started, so "
-    "nothing the user said earlier lifts them now.")
+    "nothing the user said earlier lifts them now.\n\n"
+    "Each task you list under Needs you, give your recommendation on its "
+    "card in the dashboard's inbox: `{bin} edit <id> --recommend <accept|"
+    "dismiss|approve|land|drop|close|dig|rework|retry|resolve|release> "
+    "--why \"<one line>\"`. It decides nothing, so it needs no approval; "
+    "`--recommend clear` takes it off.")
 
 SWEEP_NOTE = (
     "This is your daily sweep, filed by the scheduler, not a message from the "

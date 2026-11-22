@@ -51,6 +51,7 @@ import home
 import ideation
 import discard
 import holding
+import inbox
 import jsonstore
 import learnings_git
 import repos
@@ -2856,6 +2857,40 @@ def edit_task(payload: dict) -> dict:
     return {"ok": True, "task": t, "held": held_reason(t)}
 
 
+def recommend_task(payload: dict) -> dict:
+    """Set (or clear) the operator's recommendation on a task: what the inbox
+    card suggests you do with it, and why. It decides nothing -- no state
+    moves, nothing runs -- so the operator may set it with no approval
+    (operator_role.tasks_guard). Stamped with the task's state now: a task
+    that moves on stops showing it (tasks.recommendation_for)."""
+    tid = payload.get("id", "")
+    rec = task_store.get(tid)
+    if not rec:
+        return {"ok": False, "error": "unknown task"}
+    action = str(payload.get("recommend") or "").strip().lower()
+    if action in ("clear", "none"):
+        value, why = None, ""
+    else:
+        # Finished work waits on you only when git refused its landing (the
+        # inbox's Land and Drop); anything else done or cancelled does not.
+        landing = (rec.get("result") or {}).get("landing") or {}
+        if rec.get("state") in tasks.TERMINAL and not (
+                rec.get("state") == tasks.DONE and merge.needs_a_person(landing)):
+            return {"ok": False, "error": f"not recommended: it is {rec.get('state')}; "
+                                          "nothing is waiting on you there"}
+        value, why = tasks.make_recommendation(action, payload.get("why") or "",
+                                               str(payload.get("by") or "operator"),
+                                               rec.get("state") or "",
+                                               since=tasks.entered(rec))
+        if why:
+            return {"ok": False, "error": why}
+    t = task_store.update(tid, recommendation=value)
+    if t is None:
+        return {"ok": False, "error": "unknown task"}
+    return {"ok": True, "task": t,
+            "note": "recommendation cleared" if value is None else f"recommends {value['action']}"}
+
+
 def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted).
 
@@ -2973,6 +3008,17 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                      # Whether it has release targets, for the header's Release…
                      "release": bool((board_release(prec["slug"]) or {}).get("targets"))}
             if prec else None}
+    if action == "inbox":
+        # The dashboard's home screen: everything waiting on you, grouped by
+        # project (inbox.py). Read-only; the survey is the board's cached one.
+        everyone = project_store.all()
+        return {"ok": True, **inbox.build(
+            task_store.all().values(), unmerged_rows=board_survey(),
+            plan=OPERATOR.plan(), health_rows=health_rows() or (),
+            operator_thread=OPERATOR.thread() or "",
+            project_titles={p["slug"]: p.get("title") or p["slug"] for p in everyone})}
+    if action == "recommend":
+        return recommend_task(payload)
     if action == "task":
         rec = task_store.get(payload.get("id", ""))
         if not rec:

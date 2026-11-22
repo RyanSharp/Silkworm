@@ -24,6 +24,7 @@
     silkworm land <id>              land a finished task's branch  } the same handlers:
     silkworm drop <id>              delete it, tagging its tip     } a refusal prints
     silkworm edit <id> [--goal G] [--title T]  change unrun work   } the bot's reason
+    silkworm edit <id> --recommend <action> --why W  suggest one on its inbox card }
     silkworm rework <id> --notes N  send back with your notes      } and exits 1
     silkworm close <id> [--round R] close research findings        }
     silkworm dig <id> --notes N [--round R]  research: dig deeper  }
@@ -1329,7 +1330,11 @@ TASK_ACTIONS = {
     "dismiss": ("dismiss", {"--round": "round", "--notes": "notes"}, ()),
     "land":    ("land",    {"--notes": "notes"}, ()),
     "drop":    ("drop",    {"--notes": "notes"}, ()),
-    "edit":    ("edit",    {"--goal": "goal", "--title": "title", "--notes": "notes"}, ()),
+    # --recommend/--why: the operator's suggestion on the inbox card (sent as
+    # the `recommend` action). It decides nothing, so the operator needs no
+    # approval for it; `--recommend clear` takes it off.
+    "edit":    ("edit",    {"--goal": "goal", "--title": "title", "--notes": "notes",
+                            "--recommend": "recommend", "--why": "why"}, ()),
     # The send-back with notes. The route would take none, and send the work
     # back with only "another pass" -- a rerun of the same goal, which is
     # never what a command typed on purpose means. So the CLI asks for them.
@@ -1384,7 +1389,18 @@ def parse_action(cmd: str, argv: list) -> dict:
     missing = [f for f in required if f not in given]
     if missing:
         raise ValueError(f"{', '.join(missing)} is required\n{action_usage(cmd)}")
-    if cmd == "edit" and not given & {"--goal", "--title"}:
+    if cmd == "edit" and given & {"--recommend", "--why"}:
+        # Its own action: it is not an edit of unrun work, and is allowed on
+        # anything still waiting on you.
+        if given & {"--goal", "--title"}:
+            raise ValueError("--recommend is set on its own, not with --goal or --title\n"
+                             + action_usage(cmd))
+        if "--recommend" not in given:
+            raise ValueError(f"--why goes with --recommend\n{action_usage(cmd)}")
+        if payload["recommend"].strip().lower() not in ("clear", "none") and "--why" not in given:
+            raise ValueError(f"--recommend needs --why: one line saying why\n{action_usage(cmd)}")
+        payload["action"] = "recommend"
+    elif cmd == "edit" and not given & {"--goal", "--title"}:
         raise ValueError(f"say what to change\n{action_usage(cmd)}")
     payload["id"] = ids[0]
     if cmd == "tidy":

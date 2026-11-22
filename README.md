@@ -1015,6 +1015,11 @@ silkworm cancel <id>                       # end unfinished work, stopping it if
 silkworm land <id>                         # land a finished task's branch
 silkworm drop <id>                         # delete that branch, tagging its tip first
 silkworm edit <id> [--goal G] [--title T]  # change work that has not run yet
+silkworm edit <id> --recommend <action> --why W   # a suggestion on its Needs you card
+                                           #   (accept, dismiss, approve, land, drop, close,
+                                           #   dig, rework, retry, resolve, release; `clear`
+                                           #   takes it off). It decides nothing, so the
+                                           #   operator sets it without an approval
 silkworm rework <id> --notes N             # send back with your notes (Send back)
 silkworm close <id> [--round R]            # research: close the findings
 silkworm dig <id> --notes N [--round R]    # research: Dig deeper with a question
@@ -1531,6 +1536,23 @@ python3 visualizer.py    # http://127.0.0.1:8790
 
 A local web dashboard for every thread session (localhost-only):
 
+- **Needs you, the home screen** — the page opens on one list of everything
+  waiting on you (inbox.py): proposals, work waiting for approval, steps a run
+  left you and research findings, failures, landings git refused, the
+  operator's recorded ops plan, and health checks that name a decision of
+  yours. Grouped by project, the most urgent group and item first, newest
+  first among equals. Each card says what it is and why in a line, shows the
+  operator's recommendation when it set one (`silkworm edit <id> --recommend
+  … --why …`; only for the item as it stands — a task that has moved on, or
+  research dug deeper, drops it), and offers exactly the buttons the item
+  allows, each the same /tasks action the task panel sends: Accept, Dismiss
+  and Retry go at once with Undo (as a swipe does); Approve, Land, Drop, Close,
+  Done and Run plan ask first; Send back / Answer and Dig deeper ask for your
+  words. Run plan says "yes" in the operator's thread, as you would, after
+  checking the plan is still the one the card shows. On a laptop it sits in
+  the main pane while no thread is open (**📥 Needs you** above the list comes
+  back to it); on a phone it is the first of two tabs, **Needs you** and
+  **Threads**. `?view=inbox` / `?view=threads` open either.
 - **Cost & cache analytics** — stat tiles (total spend, 14-day tokens, cache
   hit rate) and a daily stacked bar chart of cache-read / fresh-input / output
   tokens, with hover tooltips and a table view. Cache misses show up as blue

@@ -420,6 +420,13 @@ FIELDS: dict[str, tuple] = {
     # Its own field rather than inside `result`, which the reviewer's verdict
     # and compaction both rewrite. See roles.parse_needs_user.
     "needs_user":  (None,  "{action, why, release} a step the run left for you"),
+    # The operator's suggestion for what you do with this item -- shown on its
+    # card in the dashboard's Needs you inbox, beside the buttons, and nothing
+    # more: it decides nothing, so the operator sets it without an approval
+    # (`silkworm edit <id> --recommend <action> --why <text>`). Stamped with
+    # the state it was written for: once the task moves on, it no longer
+    # speaks to what the card shows (recommendation_for).
+    "recommendation": (None, "{action, why, by, at, state} the operator's suggestion; decides nothing"),
     # The nightly review's lens (ideation.py): features, quality or
     # correctness, on the ideation task and on each proposal it filed, so the
     # acceptance rate per lens can be read off the board. "" for everything else.
@@ -433,6 +440,60 @@ FIELDS: dict[str, tuple] = {
     "created":     (0.0,   "unix time"),
     "updated":     (0.0,   "unix time of the last write"),
 }
+
+
+#: What a recommendation may suggest: the inbox's own buttons, by the
+#: /tasks action each one sends ("rework" is Send back).
+RECOMMEND_ACTIONS = ("accept", "dismiss", "approve", "land", "drop", "close", "dig",
+                     "rework", "retry", "resolve", "release")
+
+#: Room for one plain sentence on a card.
+RECOMMEND_WHY_MAX = 300
+
+
+def entered(rec: dict | None) -> float:
+    """When the task last moved into the state it is in: its latest event of
+    that kind (transition() writes one per move), else when it was made."""
+    rec = rec or {}
+    state = rec.get("state")
+    for e in reversed(rec.get("events") or []):
+        if (e or {}).get("kind") == state and (e or {}).get("at"):
+            return float(e["at"])
+    return float(rec.get("created") or 0)
+
+
+def make_recommendation(action: str, why: str, by: str, state: str,
+                        now: float | None = None, since: float = 0.0) -> tuple[dict | None, str]:
+    """(record, "") for a recommendation, or (None, why not). `since` is when
+    the task entered `state` (entered()): a recommendation is for that stay."""
+    action = (action or "").strip().lower()
+    if action not in RECOMMEND_ACTIONS:
+        return None, (f"unknown recommendation {action!r}: one of "
+                      + ", ".join(RECOMMEND_ACTIONS) + " (or clear)")
+    why = " ".join(str(why or "").split())
+    if not why:
+        return None, "a recommendation needs --why: one line saying why"
+    if len(why) > RECOMMEND_WHY_MAX:
+        return None, f"--why is {len(why)} characters; keep it under {RECOMMEND_WHY_MAX}"
+    return {"action": action, "why": why, "by": (by or "operator")[:60], "state": state,
+            "since": since, "at": time.time() if now is None else now}, ""
+
+
+def recommendation_for(rec: dict | None) -> dict | None:
+    """The task's recommendation while it still speaks to its state, else None.
+
+    Not the state alone: research dug deeper parks in needs_input again with
+    new findings, and work sent back comes to awaiting_approval again -- the
+    same state, a different thing to decide. So it holds for the stay in that
+    state it was written during (`since`, entered()), and no later one."""
+    r = (rec or {}).get("recommendation")
+    if not isinstance(r, dict) or not r.get("action"):
+        return None
+    if r.get("state") and r.get("state") != (rec or {}).get("state"):
+        return None
+    if r.get("since") and abs(float(r["since"]) - entered(rec)) > 1e-6:
+        return None
+    return {"action": r["action"], "why": r.get("why") or "", "by": r.get("by") or ""}
 
 
 def default(name: str):
