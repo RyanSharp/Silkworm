@@ -82,7 +82,7 @@ NEW_THREAD = "D0SHOTS:0000000000.000000"
 
 #: /tasks actions that only read (visualizer.READ_TASK_ACTIONS, plus nothing).
 READ_TASKS = {"list", "attention", "counts", "board", "overview", "task", "unmerged",
-              "holding", "roles", "watching", "inbox", "project", "page"}
+              "holding", "roles", "watching", "spend", "inbox", "project", "page"}
 READ_PROJECTS = {"list", "get", "unregistered"}
 READ_LEARNINGS = {"list"}
 #: Routes that only ever read: whether the bot is up, and a thread's live turn.
@@ -228,6 +228,11 @@ def stand_in(real_port: str):
                     # A running bot older than the task page: built here
                     # by this checkout's board.py, over the live state read only.
                     answer = local_task_page(real_port, payload.get("id") or "")
+                if (self.path == "/tasks" and action == "spend" and not answer.get("ok")
+                        and "unknown action" in str(answer.get("error") or "")):
+                    # A running bot older than the spend view: built here by
+                    # this checkout's spend.py, over tasks.json read only.
+                    answer = local_spend()
                 if self.path == "/tasks" and action == "inbox":
                     answer = with_sample_plan(answer)
             else:
@@ -394,6 +399,19 @@ def local_task_page(real_port: str, tid: str) -> dict:
         return {"ok": True, "page": page}
     except Exception as e:
         return {"ok": False, "error": f"screenshot harness: could not build the task page ({e})"}
+
+
+def local_spend() -> dict:
+    """The /tasks `spend` answer, built by this checkout's spend.py over the
+    live tasks.json read only -- what the bot's own route would answer."""
+    sys.path.insert(0, str(REPO))
+    try:
+        import board
+        import spend
+        tasks_ = json.loads((live_home() / "tasks.json").read_text())
+        return {"ok": True, "spend": spend.view(tasks_.values(), unfiled=board.UNFILED)}
+    except Exception as e:
+        return {"ok": False, "error": f"screenshot harness: could not build the spend view ({e})"}
 
 
 def forward(port: str, path: str, payload: dict) -> dict:
@@ -683,6 +701,10 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("settings", f"/?view=projects&modal=settings&slug={p}"),
         ("new-project", "/?modal=new-project"),
         ("release", f"/?view=projects&modal=release&slug={p}"),
+        # What was spent (spend.py): weeks by project, the month's dearest, roles.
+        ("spend", "/?view=spend"),
+        ("spend-chart", "/?view=spend&sec=weeks"),
+        ("spend-lower", "/?view=spend&sec=top"),
         ("learnings", "/?view=learnings"),
         ("trader", "/?view=trader"),
         ("trader-sleeves", "/?view=trader&tab=sleeves"),
@@ -695,6 +717,7 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("light-thread", f"/?thread={quote(ex['thread'])}&theme=light"),
         ("light-board", f"/?view=board&slug={p}&theme=light"),
         ("light-project", f"/?view=project&slug={p}&theme=light"),
+        ("light-spend", "/?view=spend&theme=light"),
         *([("light-task-page", f"/?task={quote(ex['landed'])}&theme=light")] if ex.get("landed") else []),
     ]
 

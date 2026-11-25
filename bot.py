@@ -52,6 +52,7 @@ import ideation
 import discard
 import holding
 import inbox
+import spend
 import jsonstore
 import learnings_git
 import repos
@@ -3045,6 +3046,11 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                      # Whether it has release targets, for the header's Release…
                      "release": bool((board_release(prec["slug"]) or {}).get("targets"))}
             if prec else None}
+    if action == "spend":
+        # The spend view (spend.py): what was spent per project per week,
+        # this week against the four before it, the month's dearest tasks
+        # and the split by role. Read-only, pure over the task records.
+        return {"ok": True, "spend": spend.view(task_store.all().values(), unfiled=board.UNFILED)}
     if action == "project":
         # One project's page (board.project_page). Read-only: the stored
         # health results (no probe runs for it), the cached survey and

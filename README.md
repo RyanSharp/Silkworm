@@ -1674,6 +1674,20 @@ A local web dashboard for every thread session (localhost-only):
   `board.task_page` builds it from named fields only — a record's scope,
   environment and session never reach the page — served by the bot's `/tasks`
   `page` action.
+- **Spend** — `/?view=spend` (💰 Spend on the projects overview, the stats
+  tile, or *by week* on the tasks panel's spend line): what was spent per
+  project per week over the last twelve seven-day weeks as stacked bars (a
+  table under them), this week against the four before it, the calendar
+  month's ten dearest tasks (each with its reviews, each opening its page) and
+  the split by role. `spend.py` builds it from the per-run cost records (the
+  delta-corrected ones, `turncost.py`), dated by when the money was spent,
+  through the same windowing as the digest and the week line
+  (`costs.by_project_between`), so for one window they agree. Figures are API
+  list-price equivalents (the bot runs on a subscription); a run with no
+  recorded cost is unknown — `$?`, or a `+` on a floor — never zero. Five
+  projects get their own colour (`--series-1..5`, slots by name so a colour
+  stays with its project), the rest fold into *other*. Read-only; served by
+  the bot's `/tasks` `spend` action.
 - **Deep links** — every view opens from its address, which is how a
   notification lands on a thread and how the screenshots below are taken:
   `/?thread=<key>`, `/?task=<id>` (the task's own page; `&sec=<section>` scrolls
@@ -1683,6 +1697,7 @@ A local web dashboard for every thread session (localhost-only):
   App Store and TestFlight state, the fortnight's landings and release tags,
   what waits on you, the queue and unmerged branches; `&sec=<section>` scrolls
   to one), `/?view=board&slug=<slug>` (its board; `all`, `unfiled`),
+  `/?view=spend` (what was spent; `&sec=weeks|top|roles`),
   `&card=<task id>` (a task's detail), `/?modal=new-thread|new-project|new-task|settings|release|alerts`
   (`&slug=` for the last two), `/?q=<words>` (search), `/?list=unread`, `&theme=dark|light|auto`
   (that view only). The address is cleared once read, so a reload opens the list.

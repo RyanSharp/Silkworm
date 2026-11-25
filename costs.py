@@ -93,7 +93,12 @@ def _ended(rec: dict):
 
 
 def spent_since(rec: dict, cutoff: float):
-    """Dollars this record spent at or after `cutoff`, or None if unknown.
+    """Dollars this record spent at or after `cutoff`, or None if unknown."""
+    return spent_between(rec, cutoff)
+
+
+def spent_between(rec: dict, start: float, end: float = float("inf")):
+    """Dollars this record spent in [start, end), or None if unknown.
 
     Dated per run when the runs were recorded; otherwise the whole cost is
     dated by when its last run ended, and only failing that by `updated`.
@@ -106,10 +111,36 @@ def spent_since(rec: dict, cutoff: float):
         # An undated carried-over run is counted only if the task itself is
         # this recent: unknown age is not evidence of recent spend.
         undated = rec.get("created") or 0
-        return sum(float(usd or 0.0) for at, usd in runs
-                   if (at if at is not None else undated) >= cutoff)
+        return sum(float(usd or 0.0) for at, usd in _dated(runs, undated) if start <= at < end)
     when = _ended(rec) or rec.get("updated") or rec.get("created") or 0
-    return cost if when >= cutoff else 0.0
+    return cost if start <= when < end else 0.0
+
+
+def _dated(runs, undated):
+    """(when, dollars) for each well-formed run; an entry of another shape
+    (not a pair, or not numbers) is skipped rather than failing every total
+    the record is in."""
+    if not isinstance(runs, (list, tuple)):
+        return []
+    out = []
+    for r in runs:
+        if not isinstance(r, (list, tuple)) or len(r) != 2:
+            continue
+        at, usd = r
+        at = undated if at is None else at
+        if (isinstance(at, bool) or not isinstance(at, (int, float))
+                or isinstance(usd, bool) or not isinstance(usd or 0, (int, float))):
+            continue
+        out.append((at, usd))
+    return out
+
+
+def unknown_between(rec: dict, start: float, end: float = float("inf")) -> bool:
+    """Whether this record ran in [start, end) and its cost there is unknown:
+    it has no recorded cost at all, and its last run ended in the window."""
+    if own(rec) is not None or not ran(rec):
+        return False
+    return start <= (_ended(rec) or rec.get("updated") or 0) < end
 
 
 def ran(rec: dict) -> bool:
@@ -159,26 +190,42 @@ def by_project(records, now: float | None = None,
     row to count them under -- a total of everything spent needs them.
     """
     now = time.time() if now is None else now
-    cutoff = now - days * 86400
+    return by_project_between(records, now - days * 86400, unfiled=unfiled)
+
+
+def project_of(rec: dict, parents: dict, unfiled: str | None = None) -> str:
+    """The project a record's spend is counted under: its own, else its
+    parent's (a reviewer is filed under none), else `unfiled` or ""."""
+    return rec.get("project") or parents.get(rec.get("parent"), "") or unfiled or ""
+
+
+def by_project_between(records, start: float, end: float = float("inf"),
+                       unfiled: str | None = None, key=None) -> dict:
+    """`by_project` over [start, end): the one place spend is put in windows,
+    so the digest, the panel's week line and the spend view all agree.
+
+    `key(rec, project)` picks the row a record counts under (by role, say);
+    by default it is the project.
+    """
     records = list(records)
-    project_of = {r.get("id"): r.get("project") or "" for r in records}
+    parents = {r.get("id"): r.get("project") or "" for r in records}
     out: dict = {}
     for rec in records:
-        # Nothing touched since the cutoff spent anything in the window.
-        if (rec.get("updated") or rec.get("created") or 0) < cutoff:
+        # Nothing touched since the start spent anything in the window.
+        if (rec.get("updated") or rec.get("created") or 0) < start:
             continue
-        proj = (rec.get("project") or project_of.get(rec.get("parent"), "")
-                or unfiled or "")
+        proj = project_of(rec, parents, unfiled)
         if not proj:
             continue
-        usd = spent_since(rec, cutoff)
+        usd = spent_between(rec, start, end)
         if usd is None:
             # Unknown: only if it ran, and ran in the window.
-            if not ran(rec) or (_ended(rec) or rec.get("updated") or 0) < cutoff:
+            if not unknown_between(rec, start, end):
                 continue
         elif not usd:
             continue
-        row = out.setdefault(proj, {"usd": 0.0, "complete": True, "tasks": 0})
+        row = out.setdefault(key(rec, proj) if key else proj,
+                             {"usd": 0.0, "complete": True, "tasks": 0})
         row["tasks"] += 1
         if usd is None:
             row["complete"] = False

@@ -1410,7 +1410,7 @@ def trader_status(run=None, clock=time.time) -> dict:
 #: does something must always do it, whatever the page last saw.
 READ_TASK_ACTIONS = frozenset({"list", "attention", "counts", "board", "overview",
                                "task", "unmerged", "holding", "roles", "watching",
-                               "inbox", "project", "page"})
+                               "inbox", "project", "page", "spend"})
 
 #: The largest POST taken: a message's attached files travel in it as base64
 #: (webthread.MAX_FILE_BYTES each, about 4/3 larger encoded).
@@ -1814,6 +1814,11 @@ PAGE = r"""<!doctype html>
     --viewer: #000000EE; --viewer-fade: #000000CC; --viewer-btn: #00000066;
     --c-cache: var(--accent-deep); --c-fresh: var(--info); --c-out: var(--bad);
     --chart-1: #6FB4E8; --chart-2: #C9A8CC; --chart-ax: #B9A3BC;
+    /* categorical series, in this fixed order (the spend view's projects);
+       validated as a set on --bg for lightness, chroma and colour-blind
+       separation. Anything past the fifth is folded into --series-0. */
+    --series-1: #3987E5; --series-2: #D95926; --series-3: #199E70; --series-4: #C98500;
+    --series-5: #D55181; --series-0: #8F7A92;
     --logo-bg: transparent;                        /* the cream worm needs the dark behind it */
     /* motion: 120-240ms on one standard curve; transform and opacity only */
     --dur-1: 120ms; --dur-2: 180ms; --dur-3: 240ms;
@@ -1848,6 +1853,8 @@ PAGE = r"""<!doctype html>
     --bad: #C2345F;  --bad-soft: #C2345F14;  --bad-line: #C2345F80;
     --info: #166A96; --info-soft: #166A9617; --info-line: #166A9666;
     --chart-1: #2F7FC0; --chart-2: #9A6FA0; --chart-ax: #6E5772; --logo-bg: #2C0E2E;
+    --series-1: #2A78D6; --series-2: #EB6834; --series-3: #1BAF7A; --series-4: #EDA100;
+    --series-5: #E87BA4; --series-0: #A898AB;
   }
   @media (prefers-color-scheme: light) {
     :root[data-theme="auto"] {
@@ -1865,6 +1872,8 @@ PAGE = r"""<!doctype html>
       --bad: #C2345F;  --bad-soft: #C2345F14;  --bad-line: #C2345F80;
       --info: #166A96; --info-soft: #166A9617; --info-line: #166A9666;
       --chart-1: #2F7FC0; --chart-2: #9A6FA0; --chart-ax: #6E5772; --logo-bg: #2C0E2E;
+      --series-1: #2A78D6; --series-2: #EB6834; --series-3: #1BAF7A; --series-4: #EDA100;
+      --series-5: #E87BA4; --series-0: #A898AB;
     }
   }
   * { box-sizing: border-box; }
@@ -2694,6 +2703,40 @@ PAGE = r"""<!doctype html>
   .pgpend { margin-top: var(--sp-15); }
   .pgmore > summary { margin: var(--sp-1) 0; font-size: var(--fs-xs); }
   .igroup h4 .ipl { text-decoration: none; }
+  /* the spend view (spendHtml): tiles, the stacked weeks, the month's top, roles */
+  .spnote { font-size: var(--fs-xs); color: var(--muted); margin: calc(-1 * var(--sp-1)) 0 var(--sp-3); max-width: 760px; }
+  .sptiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr)); gap: var(--sp-25);
+             margin-bottom: var(--sp-3); }
+  .sptile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-25) var(--sp-3); min-width: 0; }
+  .sptile .k { font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .sptile .sub { font-size: var(--fs-xs); color: var(--muted); }
+  .sptrend { font-size: var(--fs-md); font-weight: var(--fw-semi); margin-top: var(--sp-1); }
+  .sppage { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: var(--sp-3); align-items: start; }
+  .sppage .pgsec[data-sec="weeks"] { grid-column: 1 / -1; }
+  .spchart { display: block; width: 100%; max-width: 900px; height: auto; margin: var(--sp-1) 0; }
+  .spchart .g { stroke: var(--fill-2); } .spchart .base { stroke: var(--line); }
+  .spchart .ax { fill: var(--chart-ax); font-family: var(--mono); font-size: var(--fs-2xs); }
+  .spchart .now { fill: var(--ink); font-family: var(--mono); font-size: var(--fs-xs); font-weight: var(--fw-semi); }
+  .spchart .hit { fill: transparent; } .spchart .hit:hover { fill: var(--fill-2); }
+  .spchart .seg.s1 { fill: var(--series-1); } .spsw.s1 { background: var(--series-1); }
+  .spchart .seg.s2 { fill: var(--series-2); } .spsw.s2 { background: var(--series-2); }
+  .spchart .seg.s3 { fill: var(--series-3); } .spsw.s3 { background: var(--series-3); }
+  .spchart .seg.s4 { fill: var(--series-4); } .spsw.s4 { background: var(--series-4); }
+  .spchart .seg.s5 { fill: var(--series-5); } .spsw.s5 { background: var(--series-5); }
+  .spchart .seg.s0 { fill: var(--series-0); } .spsw.s0 { background: var(--series-0); }
+  .splegend { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-35); font-size: var(--fs-xs); }
+  .spli { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; }
+  .spli b { font-variant-numeric: tabular-nums; font-weight: var(--fw-semi); }
+  .spsw { display: inline-block; width: 10px; height: 10px; border-radius: var(--r-xs); flex: none; }
+  .sptable table, .sproles { border-collapse: collapse; width: 100%; font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+  .sptable td, .sptable th, .sproles td, .sproles th { padding: var(--sp-05) var(--sp-15); border-bottom: 1px solid var(--line-soft); text-align: left; }
+  .sptable th, .sproles th { color: var(--muted); font-weight: var(--fw-medium); }
+  .sptable .r, .sproles .r { text-align: right; white-space: nowrap; }
+  .sproles .spbar { width: 35%; }
+  .sproles .spbar i { display: block; height: 6px; border-radius: var(--r-xs); background: var(--chart-1); }
+  .sprank { display: inline-block; min-width: 1.4em; color: var(--muted); font-family: var(--mono); font-size: var(--fs-xs); }
+  .pgrow .spusd { color: var(--ink); }
+  .tile.open { cursor: pointer; } .tile.open:hover { border-color: var(--gold); }
   /* a task's own page (taskPageHtml): one readable column, sections stacked */
   .tpage { max-width: 860px; display: flex; flex-direction: column; gap: var(--sp-3); }
   .tpsub { margin: calc(-1 * var(--sp-15)) 0 var(--sp-3); }
@@ -3038,6 +3081,11 @@ PAGE = r"""<!doctype html>
      - anything tapped is at least --tap tall, and every field is --field-fs
        so iOS does not zoom the page on focus. */
   @media (max-width: 700px) {
+    /* the spend view: this week and the average side by side, the trend under */
+    .sptiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-2); }
+    .sptiles .sptile:last-child { grid-column: 1 / -1; }
+    .sptile .tr-big { font-size: var(--fs-xl); }
+    .spnote { font-size: var(--fs-2xs); }
     :root {
       --tap: 44px;                     /* Apple's minimum hit target */
       --field-fs: 16px;                /* below this, iOS zooms in on focus */
@@ -4066,7 +4114,7 @@ function renderDash() {
   const s = statsCache; if (!s) return;
   const tiles = `
     <div class="tiles">
-      <div class="tile"><div class="n">$${s.total_cost.toFixed(2)}</div><div class="l" title="what the API would charge at list price; this bot runs on a subscription token">total spend (API list price)</div></div>
+      <div class="tile open" role="link" title="spend per project per week" onclick="openSpend()"><div class="n">$${s.total_cost.toFixed(2)}</div><div class="l" title="what the API would charge at list price; this bot runs on a subscription token">total spend (API list price) →</div></div>
       <div class="tile"><div class="n">${fmtTok(s.days.reduce((a,d)=>a+d.cache_read+d.fresh_in+d.out,0))}</div><div class="l">tokens · 14d</div></div>
       <div class="tile"><div class="n">${s.cache_rate == null ? "—" : s.cache_rate + "%"}</div><div class="l">cache hit rate</div></div>
       <div class="tile"><div class="n">${s.threads}</div><div class="l">threads</div></div>
@@ -6327,7 +6375,7 @@ async function renderTasks() {
   if (!r.ok) { setHTML(list, `<div class="hint">${esc(r.error || "bot offline")}</div>`); return; }
   updateTaskBadge(r.counts);
   const spend = document.getElementById("spend");
-  if (spend) spend.textContent = r.spend_line ? `💰 ${r.spend_line}` : "";
+  if (spend) setHTML(spend, r.spend_line ? `💰 ${esc(r.spend_line)} <a class="plink" role="link" onclick="openSpend()">by week →</a>` : "");
   r.tasks = r.tasks.filter(notGone);
   if (!r.tasks.length) {
     setHTML(list, taskView === "attention"
@@ -7493,6 +7541,7 @@ function setBoardProject(p) {
   boardProject = p;
   pageSlug = null;
   taskPageId = null;
+  spendOpen = false;
   boardCol = "";
   // Back to the overview is back to all of it: a filter left set would only
   // turn it straight back into a board.
@@ -7544,14 +7593,14 @@ function fillSelect(id, values, label) {
 }
 async function renderBoard() {
   const box = document.querySelector("#boardmodal .box");
-  if (box && box.classList) box.classList.toggle("pagemode", !!(pageSlug || taskPageId));
-  if (pageSlug || taskPageId) {
+  if (box && box.classList) box.classList.toggle("pagemode", !!(pageSlug || taskPageId || spendOpen));
+  if (pageSlug || taskPageId || spendOpen) {
     // None of the seg's three views is the one showing.
     for (const id of ["bvover", "bvall", "bvunfiled"]) {
       const b = document.getElementById(id);
       if (b) b.className = "";
     }
-    return taskPageId ? loadTaskPage() : loadProjectPage();
+    return spendOpen ? loadSpend() : taskPageId ? loadTaskPage() : loadProjectPage();
   }
   const role = document.getElementById("brole").value;
   const state = document.getElementById("bstate").value;
@@ -7621,6 +7670,7 @@ function openProjectPage(slug) {
   if (pageSlug !== slug) pageData = null;
   pageSlug = slug;
   taskPageId = null;
+  spendOpen = false;
   boardProject = slug;          // the board's own Back and project picker follow
   if (!boardIsOpen()) toggleBoard(); else renderBoard();
 }
@@ -7820,7 +7870,7 @@ function renderOverview(r) {
   const u = r.unfiled;
   const threads = lastSessions.filter(s => !s.project && !putAway(s) && (s.kind || "thread") !== "task").length;
   if (u) cards.push(projectCard(u, threads));
-  return `<div class="bhead"><h3>Projects</h3><button class="act" onclick="newProjectForm()">+ New project</button></div>`
+  return `<div class="bhead"><h3>Projects</h3><button class="act" onclick="newProjectForm()">+ New project</button><button class="ghost" title="spend per project per week, at API list price" onclick="openSpend()">💰 Spend</button></div>`
     + `<div class="pcards">${cards.join("") || `<div class="hint">No projects yet.</div>`}</div>`
     + archivedSection(r.archived || [])
     + (r.note ? `<div class="hint u-mt2">Costs are ${esc(r.note)}.</div>` : "");
@@ -7941,6 +7991,7 @@ function openTaskPage(id) {
   if (taskPageId !== id) taskPageData = null;
   taskPageId = id;
   pageSlug = null;
+  spendOpen = false;
   if (!boardIsOpen()) toggleBoard(); else renderBoard();
 }
 function closeTaskPage() {
@@ -8287,6 +8338,167 @@ async function pollRelease(slug) {
   f.finished = done;
   if (!done) setTimeout(() => pollRelease(slug), 2000);
   else loadOverview();
+}
+
+// --- what was spent --------------------------------------------------------------
+// ?view=spend[&sec=weeks|top|roles]: per project per week for twelve weeks
+// (stacked bars, a table under them), this week against the four before it,
+// the month's dearest tasks (each opens its page) and the split by role.
+// Read through the bot's /tasks `spend` action (spend.py), which windows the
+// task records exactly as the daily digest does, so the two agree. Every
+// figure is an API list-price equivalent; "+" is a floor (some runs recorded
+// no cost) and "$?" all unknown -- never a silent zero. Read-only: its only
+// buttons go somewhere else.
+let spendOpen = false, spendData = null;
+const SP_SECTIONS = ["weeks", "top", "roles"];
+function openSpend() {
+  const tm = document.getElementById("taskmodal");
+  if (tm && tm.style.display === "flex") toggleTasks();
+  closeDetail();
+  spendOpen = true;
+  pageSlug = null;
+  taskPageId = null;
+  if (!boardIsOpen()) toggleBoard(); else renderBoard();
+}
+async function loadSpend() {
+  const ask = ++boardAsk;
+  setHTML(document.getElementById("bboard"), "");
+  const el = document.getElementById("bover");
+  if (!spendData) skelIfEmpty(el, "card", 3);
+  const r = await taskRead({action: "spend"});
+  if (ask !== boardAsk || !spendOpen) return;          // superseded meanwhile
+  if (!r || !r.ok) {
+    // Could not ask is not "spent nothing": said, over the last view if there is one.
+    const why = `<div class="hint warn">could not refresh: ${esc((r && r.error) || "bot offline")}</div>`;
+    setHTML(el, spendData ? spendHtml(spendData).replace("</h3></div>", "</h3></div>" + why)
+      : `<div class="bhead"><button class="ghost" onclick="setBoardProject(null)">‹ Projects</button><h3>Spend</h3></div>${why}`);
+    return;
+  }
+  spendData = r.spend;
+  drawKeyed(el, spendHtml(r.spend), ".pgsec[data-sec]", "data-sec");
+  if (pageScrollTo) {
+    const key = SP_SECTIONS.includes(pageScrollTo) ? pageScrollTo : "";
+    pageScrollTo = "";
+    const sec = key && el.querySelector && el.querySelector(`.pgsec[data-sec="${key}"]`);
+    if (sec && sec.scrollIntoView) sec.scrollIntoView({block: "start"});
+  }
+}
+function spName(key) { return key === UNFILED ? "unfiled" : key; }
+// A week by the day it ends on (its last whole day), "22 Nov".
+function spDay(ts) {
+  return new Date(ts * 1000).toLocaleDateString("en-GB", {day: "numeric", month: "short"});
+}
+function spWeekName(w) { return `${spDay(w.start)} – ${spDay(w.end - 1)}`; }
+// The week's figure for one series: a project's own, or the folded rest's.
+function spPart(w, s) {
+  const p = w.projects || {};
+  const keys = s.slot ? [s.key] : (s.of || []);
+  const figs = keys.map(k => p[k]).filter(Boolean);
+  if (!figs.length) return null;
+  return {usd: figs.reduce((a, f) => a + (f.usd || 0), 0), complete: figs.every(f => f.complete)};
+}
+function spSwatch(s) { return `<i class="spsw s${s.slot}"></i>`; }
+function spChart(sp) {
+  // A phone gets a narrower drawing, so its text is drawn near its own size
+  // rather than shrunk with a laptop's; every other week is named there.
+  const narrow = typeof window !== "undefined" && window.innerWidth > 0 && window.innerWidth <= 700;
+  const W = narrow ? 360 : 640, H = narrow ? 230 : 220, L = 40, R = 6, T = 16, B = 22;
+  const weeks = sp.weeks || [], series = sp.series || [];
+  const max = Math.max(0, ...weeks.map(w => (w.total || {}).usd || 0));
+  if (!weeks.length) return `<div class="off">no weeks to draw</div>`;
+  // A round top for the axis: 1, 2 or 5 times a power of ten.
+  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(max, 1))));
+  const top = [1, 2, 5, 10].map(m => m * mag).find(v => v >= max) || mag * 10;
+  const y = v => T + (H - T - B) * (1 - v / top);
+  const step = (W - L - R) / weeks.length, bw = Math.max(6, step * 0.62);
+  const grid = [0, top / 2, top].map(v => `<line class="g" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>`
+    + `<text class="ax" x="${L - 6}" y="${y(v) + 3}" text-anchor="end">$${v >= 1000 ? (v / 1000) + "k" : v}</text>`).join("");
+  const bars = weeks.map((w, i) => {
+    const x = L + i * step + (step - bw) / 2;
+    let base = 0, segs = "";
+    for (const s of series) {
+      const f = spPart(w, s);
+      if (!f || !f.usd) continue;
+      const y0 = y(base), y1 = y(base + f.usd);
+      // A 2px gap of the surface between segments; a sliver still shows.
+      const h = Math.max(1, y0 - y1 - (base ? 2 : 0));
+      segs += `<rect class="seg s${s.slot}" x="${x.toFixed(1)}" y="${(y0 - (base ? 2 : 0) - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="1.5"/>`;
+      base += f.usd;
+    }
+    const tot = w.total || {}, last = i === weeks.length - 1;
+    const tip = `${spWeekName(w)}: ${fmtCost(tot) || "$0"}` + series.map(s => {
+      const f = spPart(w, s);
+      return f ? `\n  ${s.slot ? spName(s.key) : "other"} ${fmtCost(f)}` : "";
+    }).join("");
+    // Labelled selectively: this week's total, and a "+" over any floor.
+    const lab = last ? fmtCost(tot) || "$0" : (tot.complete === false ? "+" : "");
+    // The last bar's label ends at the bar's right edge, so it never runs off the drawing.
+    return segs + (lab ? `<text class="${last ? "now" : "ax"}" x="${(last ? x + bw : x + bw / 2).toFixed(1)}" y="${(y(tot.usd || 0) - 4).toFixed(1)}" text-anchor="${last ? "end" : "middle"}">${esc(lab)}</text>` : "")
+      + (!narrow || (weeks.length - 1 - i) % 2 === 0
+        ? `<text class="ax" x="${(x + bw / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle">${esc(spDay(w.end - 1))}</text>` : "")
+      + `<rect class="hit" x="${(L + i * step).toFixed(1)}" y="${T}" width="${step.toFixed(1)}" height="${H - T - B}"><title>${esc(tip)}</title></rect>`;
+  }).join("");
+  return `<svg class="spchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="spend per project per week, last ${weeks.length} weeks">${grid}<line class="base" x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}"/>${bars}</svg>`;
+}
+function spLegend(sp) {
+  const weeks = sp.weeks || [];
+  return `<div class="splegend">${(sp.series || []).map(s => {
+    const all = weeks.map(w => spPart(w, s)).filter(Boolean);
+    const f = {usd: all.reduce((a, x) => a + x.usd, 0), complete: all.every(x => x.complete)};
+    const name = s.slot ? spName(s.key) : `other: ${(s.of || []).map(spName).join(", ")}`;
+    return `<span class="spli" title="${esc(name)}">${spSwatch(s)}${(s.slot && projLink(s.key, spName(s.key), "spn")) || `<span class="spn">${s.slot ? esc(name) : `other · ${(s.of || []).length}`}</span>`} <b>${fmtCost(f) || "$0"}</b></span>`;
+  }).join("")}</div>`;
+}
+// The chart as numbers: every week by every series, for whoever cannot tell
+// the colours apart (and to read a figure exactly).
+function spTable(sp) {
+  const series = sp.series || [], weeks = (sp.weeks || []).slice().reverse();
+  return `<details class="pgev sptable"><summary>table</summary><div class="tr-x"><table><tr><th>week</th>${
+    series.map(s => `<th class="r">${esc(s.slot ? spName(s.key) : "other")}</th>`).join("")}<th class="r">total</th></tr>${
+    weeks.map(w => `<tr><td class="tr-nw">${esc(spWeekName(w))}</td>${series.map(s =>
+      `<td class="r">${fmtCost(spPart(w, s)) || "–"}</td>`).join("")}<td class="r"><b>${fmtCost(w.total) || "$0"}</b></td></tr>`).join("")}</table></div></details>`;
+}
+function spTrend(sp) {
+  if (sp.trend === null || sp.trend === undefined) return `<span class="off">no spend in the ${sp.avg_weeks} weeks before to compare with</span>`;
+  const pct = Math.round(sp.trend * 100);
+  const word = pct > 0 ? `▲ ${pct}% above` : pct < 0 ? `▼ ${-pct}% below` : "level with";
+  const floor = (sp.this_week || {}).complete === false || (sp.avg || {}).complete === false;
+  return `${word} the ${sp.avg_weeks}-week average${floor ? ` <span class="off" title="some runs recorded no cost">(floors)</span>` : ""}`;
+}
+function spRoles(sp) {
+  const wk = (sp.roles || {}).week || [], all = (sp.roles || {}).all || [];
+  const names = [...new Set([...all.map(r => r.role), ...wk.map(r => r.role)])];
+  if (!names.length) return "";
+  const of = (rows, n) => rows.find(r => r.role === n);
+  const most = Math.max(1, ...all.map(r => r.usd || 0));
+  return `<div class="tr-x"><table class="sproles"><tr><th>role</th><th class="r">this week</th><th class="r">${
+    (sp.weeks || []).length} weeks</th><th></th></tr>${names.map(n => {
+    const a = of(all, n), w = of(wk, n);
+    return `<tr><td>${esc(n)}</td><td class="r">${w ? fmtCost(w) : "–"}</td><td class="r">${a ? fmtCost(a) : "–"}</td><td class="spbar"><i style="width:${
+      Math.round(100 * ((a && a.usd) || 0) / most)}%"></i></td></tr>`;
+  }).join("")}</table></div>`;
+}
+function spTop(sp) {
+  const t = sp.top || {}, rows = t.tasks || [];
+  return rows.map((r, i) => `<div class="pgrow open" onclick="openTaskPage('${esc(r.id)}')"><div class="tt"><span class="sprank">${i + 1}</span> ${esc(r.title)}</div>
+    <div class="sub"><b class="spusd">${fmtCost(r.cost)}</b> · ${esc(spName(r.project) || "unfiled")} · ${esc(r.role)} · ${esc(r.id)}</div></div>`).join("")
+    + (t.unknown ? `<div class="off u-mt2">${t.unknown} more ran this month with no cost recorded, so cannot be ranked.</div>` : "");
+}
+function spendHtml(sp) {
+  const head = `<div class="bhead pghead"><button class="ghost" onclick="setBoardProject(null)" title="all projects">‹ Projects</button><h3>Spend</h3></div>
+    <div class="spnote">At API list price, not billed: the bot runs on a subscription, so these are what the same work would cost through the API.
+      <b>+</b> marks a floor (some runs recorded no cost); <b>$?</b> means none did.</div>`;
+  const tiles = `<div class="sptiles"><div class="sptile"><div class="k">this week</div><div class="tr-big">${fmtCost(sp.this_week) || "$0"}</div><div class="sub">${
+    esc(spWeekName((sp.weeks || []).slice(-1)[0] || {start: sp.now - 604800, end: sp.now}))}</div></div>
+    <div class="sptile"><div class="k">${sp.avg_weeks}-week average</div><div class="tr-big">${fmtCost(sp.avg) || "$0"}</div><div class="sub">the ${sp.avg_weeks} weeks before</div></div>
+    <div class="sptile"><div class="k">trend</div><div class="sptrend">${spTrend(sp)}</div></div></div>`;
+  const month = new Date((sp.month_start || 0) * 1000).toLocaleDateString("en-GB", {day: "numeric", month: "short"});
+  const secs = [
+    pgSection("weeks", `By project · ${(sp.weeks || []).length} weeks`, null, spLegend(sp) + spChart(sp) + spTable(sp)),
+    pgSection("top", `Most expensive since ${esc(month)}`, ((sp.top || {}).tasks || []).length, spTop(sp), "nothing spent this month"),
+    pgSection("roles", "By role", null, spRoles(sp), "nothing spent"),
+  ];
+  return head + tiles + `<div class="sppage">${secs.join("")}</div>`;
 }
 
 // --- creating and editing tasks and projects, in one modal ---
@@ -8980,6 +9192,7 @@ if (window.addEventListener)
 //   ?view=project&slug=<slug>[&sec=<section>]  the project's own page, at a section
 //   ?view=board&slug=<slug | all | unfiled>  its board, every project's, or the unfiled lane's
 //   ?view=trader[&tab=sleeves|activity|plumbing|shadow]
+//   ?view=spend[&sec=weeks|top|roles]     what was spent, per project per week
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
 //   ?q=<words>                            search: threads and tasks
@@ -9055,7 +9268,11 @@ async function openLink(q) {
       ? (slug === "all" ? "" : slug === "unfiled" ? UNFILED : slug) : null;
     pageSlug = null;
     taskPageId = null;
+    spendOpen = false;
     if (!boardIsOpen()) toggleBoard(); else refreshBoard();
+  } else if (view === "spend") {
+    pageScrollTo = q.get("sec") || "";
+    openSpend();
   } else if (view === "learnings") {
     toggleLearn();
   } else if (view === "trader") {

@@ -41833,6 +41833,358 @@ def test_dashboard_notification_settings_screen():
     check("?modal=notify opens it", o["link"])
 
 
+# --- the spend view ---------------------------------------------------------------
+
+def _spend_world():
+    """Records spread over the spend view's windows, `now` a fixed local noon.
+    Every figure the tests expect is worked out by hand in their comments."""
+    from datetime import datetime as _dt
+    now = _dt(2026, 11, 22, 12, 0).timestamp()
+    W = 7 * 86400
+
+    def ev(*pairs):
+        return [{"kind": k, "at": at} for k, at in pairs]
+    recs = [
+        # alpha: one run exactly on this week's start (this week: start is
+        # inclusive), one a second before it (last week), one five seconds
+        # into week 9, and its review an hour ago.
+        {"id": "a1", "title": "Alpha work", "project": "alpha", "role": "implementor", "state": "done",
+         "attempts": 2, "created": now - 90 * 86400, "updated": now - 100,
+         "result": {"cost": 16.0, "cost_runs": [[now - W, 10.0], [now - W - 1, 4.0], [now - 3 * W + 5, 2.0]]}},
+        {"id": "r1", "title": "Review: Alpha work", "project": "", "parent": "a1", "role": "reviewer",
+         "state": "done", "attempts": 1, "created": now - 4000, "updated": now - 3600,
+         "result": {"cost": 1.5, "cost_runs": [[now - 3600, 1.5]]}},
+        # beta: a cost from before runs were dated, so dated by its run's end
+        # (week 9); and a failed run with no cost recorded at all (this week).
+        {"id": "b1", "title": "Beta research", "project": "beta", "role": "researcher", "state": "needs_input",
+         "attempts": 1, "created": now - 2 * W - 500, "updated": now - 2 * W - 10,
+         "events": ev(("running", now - 2 * W - 400), ("needs_input", now - 2 * W - 10)),
+         "result": {"cost": 3.0}},
+        {"id": "u1", "title": "Beta crash", "project": "beta", "role": "implementor", "state": "failed",
+         "attempts": 1, "created": now - 7200, "updated": now - 3600,
+         "events": ev(("running", now - 7000), ("failed", now - 3600)), "result": {}},
+        # under no project: a conversation turn and an operator sweep.
+        {"id": "t1", "title": "a conversation", "project": "", "role": "assistant", "state": "done",
+         "attempts": 1, "created": now - 200, "updated": now - 100,
+         "result": {"cost": 0.5, "cost_runs": [[now - 100, 0.5]]}},
+        {"id": "o1", "title": "Morning sweep", "project": "", "role": "operator", "state": "done",
+         "attempts": 1, "created": now - 2 * 86400 - 50, "updated": now - 2 * 86400,
+         "result": {"cost": 2.0, "cost_runs": [[now - 2 * 86400, 2.0]]}},
+        # never ran: no cost to know, so not "unknown" either.
+        {"id": "p1", "title": "A proposal", "project": "alpha", "role": "implementor", "state": "proposed",
+         "attempts": 0, "created": now - 50, "updated": now - 50, "result": {}},
+        # spent before the twelve weeks: in none of them.
+        {"id": "a2", "title": "Ancient", "project": "alpha", "role": "implementor", "state": "done",
+         "attempts": 1, "created": now - 14 * W, "updated": now - 13 * W,
+         "result": {"cost": 50.0, "cost_runs": [[now - 13 * W, 50.0]]}},
+    ]
+    return recs, now, W
+
+
+def test_spend_view_aggregates():
+    print("\nthe spend view: weeks, unknown costs, the trend, the month's top and roles, by hand")
+    import costs
+    import spend
+    recs, now, W = _spend_world()
+    v = spend.view(recs, now, unfiled="__unfiled__")
+    wk = v["weeks"]
+    check("twelve seven-day weeks, oldest first, the last ending now",
+          len(wk) == 12 and wk[-1]["end"] == now and wk[-1]["start"] == now - W
+          and all(wk[i]["end"] == wk[i + 1]["start"] for i in range(11)), str([w["start"] for w in wk]))
+    this = wk[-1]["projects"]
+    # alpha: 10 (on the boundary) + 1.5 (its review, under its parent's project).
+    check("a run on a week's first second is that week's; a review counts under its parent's project",
+          this["alpha"] == {"usd": 11.5, "complete": True, "tasks": 2}, str(this.get("alpha")))
+    check("the second before is last week's", wk[10]["projects"] == {"alpha": {"usd": 4.0, "complete": True, "tasks": 1}},
+          str(wk[10]["projects"]))
+    # Week 9: alpha's 2.0, and beta's undated 3.0 dated by when its run ended.
+    check("an undated cost is dated by when its run ended, not when it was last touched",
+          wk[9]["projects"] == {"alpha": {"usd": 2.0, "complete": True, "tasks": 1},
+                                "beta": {"usd": 3.0, "complete": True, "tasks": 1}}, str(wk[9]["projects"]))
+    check("a run with no cost is unknown, not zero: beta's week is a floor of $0, drawn as $?",
+          this["beta"] == {"usd": 0.0, "complete": False, "tasks": 1} and costs.fmt(this["beta"]) == "$?",
+          str(this.get("beta")))
+    check("a week with a known part and an unknown one is a floor, drawn with a +",
+          wk[-1]["total"] == {"usd": 14.0, "complete": False} and costs.fmt(wk[-1]["total"]) == "$14.00+",
+          str(wk[-1]["total"]))
+    check("work under no project is counted, as unfiled", this["__unfiled__"]["usd"] == 2.5, str(this))
+    check("a proposal that never ran is neither spend nor unknown, anywhere",
+          all(w["projects"].get("alpha", {}).get("tasks", 0) <= 2 for w in wk)
+          and "p1" not in [t["id"] for t in v["top"]["tasks"]])
+    check("spend before the twelve weeks is in none of them",
+          sum(w["total"]["usd"] for w in wk) == 11.5 + 2.5 + 4.0 + 5.0 and not any(w["projects"].get("alpha", {}).get("usd") == 50.0 for w in wk))
+    # The four weeks before: 0, 0, 5, 4 -> 2.25; this week 14 -> (14 - 2.25) / 2.25.
+    check("this week against the four before it, by hand",
+          v["this_week"]["usd"] == 14.0 and v["avg"] == {"usd": 2.25, "complete": True}
+          and abs(v["trend"] - (14 - 2.25) / 2.25) < 1e-3, f"{v['avg']} {v['trend']}")
+    quiet = spend.view([r for r in recs if r["id"] in ("t1",)], now)
+    check("with nothing in the four weeks before, there is no trend to state (not infinity, not 0%)",
+          quiet["trend"] is None and quiet["avg"]["usd"] == 0.0)
+    top = v["top"]
+    check("the month's dearest: a task with its review counted in, the review not listed apart",
+          [(t["id"], t["cost"]["usd"]) for t in top["tasks"]] == [("a1", 17.5), ("b1", 3.0), ("o1", 2.0), ("t1", 0.5)],
+          str([(t["id"], t["cost"]) for t in top["tasks"]]))
+    check("spend before the first of the month is not this month's", "a2" not in [t["id"] for t in top["tasks"]])
+    check("a run this month with no cost is counted, not ranked", top["unknown"] == 1, str(top["unknown"]))
+    check("each row has what its page link needs", top["tasks"][0]["title"] == "Alpha work"
+          and top["tasks"][0]["project"] == "alpha" and top["tasks"][0]["role"] == "implementor")
+    many = [{"id": f"x{i}", "title": f"x{i}", "project": "alpha", "role": "implementor", "state": "done",
+             "attempts": 1, "created": now - 100, "updated": now - 100,
+             "result": {"cost": float(i + 1), "cost_runs": [[now - 100, float(i + 1)]]}} for i in range(14)]
+    t10 = spend.top_tasks(many, spend.month_start(now))["tasks"]
+    check("at most ten, the dearest first", len(t10) == 10 and t10[0]["id"] == "x13" and t10[-1]["id"] == "x4")
+    wk_roles = {r["role"]: r for r in v["roles"]["week"]}
+    check("this week by role: the named roles in their order, unknown kept as a floor",
+          [r["role"] for r in v["roles"]["week"]] == ["implementor", "reviewer", "operator", "assistant"]
+          and wk_roles["implementor"] == {"role": "implementor", "usd": 10.0, "complete": False, "tasks": 2}
+          and wk_roles["reviewer"]["usd"] == 1.5 and wk_roles["operator"]["usd"] == 2.0
+          and wk_roles["assistant"]["usd"] == 0.5, str(v["roles"]["week"]))
+    all_roles = v["roles"]["all"]
+    check("over the twelve weeks every role, and roles add up to projects",
+          [r["role"] for r in all_roles] == ["implementor", "reviewer", "researcher", "operator", "assistant"]
+          and round(sum(r["usd"] for r in all_roles), 4) == round(sum(w["total"]["usd"] for w in wk), 4),
+          str(all_roles))
+    odd = spend.roles([{"id": "i1", "project": "z", "role": "ideator", "state": "done", "attempts": 1,
+                        "created": now - 10, "updated": now - 10,
+                        "result": {"cost": 1.0, "cost_runs": [[now - 10, 1.0]]}}], now - 100)
+    check("a role outside the five still shows, after them", [r["role"] for r in odd] == ["ideator"], str(odd))
+    check("the figures say they are list price", v["note"] == costs.NOTE and "list price" in v["note"])
+
+
+def test_spend_view_agrees_with_the_digest():
+    print("\nthe spend view's numbers are the digest's and the week line's for the same window")
+    import costs
+    import digest
+    import spend
+    recs, now, W = _spend_world()
+    v = spend.view(recs, now, unfiled=digest.UNFILED)
+    this = v["weeks"][-1]["projects"]
+    check("this week is the panel's week line exactly", this == costs.by_project(recs, now, unfiled=digest.UNFILED),
+          str(this))
+    real = digest.WINDOW_S
+    try:
+        digest.WINDOW_S = W          # the digest asked about the same seven days
+        secs = digest.sections(recs, now)
+    finally:
+        digest.WINDOW_S = real
+    got = {p: s["cost"][0] for p, s in secs.items() if "cost" in s}
+    check("and the digest, given the same seven days, prints the same figure per project",
+          got == {p: costs.fmt(f) for p, f in this.items()}, f"{got} vs {this}")
+    day = costs.by_project_between(recs, now - digest.WINDOW_S, unfiled=digest.UNFILED)
+    secs = digest.sections(recs, now)
+    check("and its own day too: the shared windowing gives the digest's 24h",
+          {p: s["cost"][0] for p, s in secs.items() if "cost" in s} == {p: costs.fmt(f) for p, f in day.items()},
+          str(day))
+    whole = costs.by_project(recs, now, days=12 * 7, unfiled=digest.UNFILED)
+    summed: dict = {}
+    for w in v["weeks"]:
+        for p, f in w["projects"].items():
+            summed[p] = round(summed.get(p, 0.0) + f["usd"], 4)
+    check("the twelve weeks add up to the twelve-week window: nothing counted twice or dropped",
+          summed == {p: f["usd"] for p, f in whole.items()}, f"{summed} vs {whole}")
+    probe = {"id": "q", "project": "p", "state": "done", "attempts": 1, "created": now - 10, "updated": now - 10,
+             "result": {"cost": 2.0, "cost_runs": [[now - 10, 1.0], [now - W - 10, 1.0]]}}
+    ahead = recs + [{"id": "f1", "title": "a clock ahead", "project": "alpha", "role": "assistant", "state": "done",
+                     "attempts": 1, "created": now - 5, "updated": now + 5,
+                     "result": {"cost": 0.25, "cost_runs": [[now + 5, 0.25]]}}]
+    va = spend.view(ahead, now, unfiled=digest.UNFILED)
+    check("a run stamped a moment after now is still this week's, as the week line has it",
+          va["weeks"][-1]["projects"] == costs.by_project(ahead, now, unfiled=digest.UNFILED)
+          and va["weeks"][-1]["projects"]["alpha"]["usd"] == 11.75, str(va["weeks"][-1]["projects"]))
+    edge = {"id": "e", "project": "p", "state": "done", "attempts": 1, "created": now - W - 50,
+            "updated": now - W, "result": {"cost": 5.0}}
+    check("an undated cost ending on a week's last instant is the next week's, never both",
+          costs.spent_between(edge, now - 2 * W, now - W) == 0.0 and costs.spent_between(edge, now - W, now) == 5.0)
+    bad = {"id": "m", "project": "p", "state": "done", "attempts": 1, "created": now - 10, "updated": now - 10,
+           "result": {"cost": 9.0, "cost_runs": [[now - 10, 1.0], [now - 10, 2.0, "x"], ["soon", 3.0], "junk",
+                                                  [now - 10, "4"], [None, 0.5]]}}
+    check("a malformed run entry is skipped, not a failure of every total it is in",
+          costs.spent_between(bad, now - W) == 1.5 and spend.view([bad], now)["this_week"]["usd"] == 1.5)
+    chain = [{"id": "P", "title": 7, "project": "p", "role": "implementor", "state": "done", "attempts": 1,
+              "created": now - 99, "updated": now - 9, "result": {"cost": 1.0, "cost_runs": [[now - 9, 1.0]]}},
+             {"id": "R1", "project": "", "parent": "P", "role": "reviewer", "state": "done", "attempts": 1,
+              "created": now - 99, "updated": now - 9, "result": {"cost": 2.0, "cost_runs": [[now - 9, 2.0]]}},
+             {"id": "R2", "project": "", "parent": "R1", "role": "reviewer", "state": "done", "attempts": 1,
+              "created": now - 99, "updated": now - 9, "result": {"cost": 5.0, "cost_runs": [[now - 9, 5.0]]}}]
+    tops = spend.top_tasks(chain, now - W)["tasks"]
+    check("a review of a review counts in the task at the top of the chain, and a title is text",
+          [(t["id"], t["cost"]["usd"], t["title"]) for t in tops] == [("P", 8.0, "7")], str(tops))
+    check("spent_since is spent_between with no end", costs.spent_since(probe, now - W) == 1.0
+          and costs.spent_between(probe, now - 2 * W, now - W) == 1.0
+          and costs.spent_between(probe, now - 2 * W) == 2.0)
+
+
+def test_spend_view_folds_projects_past_the_palette():
+    print("\nthe spend view's colours: five projects of their own, the rest folded, slots by name")
+    import spend
+    rows = [{f"p{i}": {"usd": float(10 - i), "complete": True, "tasks": 1} for i in range(8)}]
+    s = spend.series(rows)
+    check("the five biggest get a slot, alphabetically, the rest are 'other'",
+          [(x["key"], x["slot"]) for x in s] == [("p0", 1), ("p1", 2), ("p2", 3), ("p3", 4), ("p4", 5), ("other", 0)]
+          and s[-1]["of"] == ["p5", "p6", "p7"], str(s))
+    flipped = spend.series([{f"p{i}": {"usd": float(i + 1), "complete": True, "tasks": 1} for i in range(3)}])
+    check("a colour follows the project, not its rank", [(x["key"], x["slot"]) for x in flipped]
+          == [("p0", 1), ("p1", 2), ("p2", 3)], str(flipped))
+    six = spend.series([{f"p{i}": {"usd": float(10 - i), "complete": True, "tasks": 1} for i in range(6)}])
+    check("a sixth project folds into 'other': there are five series colours, never a slot without one",
+          [x["slot"] for x in six] == [1, 2, 3, 4, 5, 0] and six[-1]["of"] == ["p5"], str(six))
+    five = spend.series([{f"p{i}": {"usd": 1.0, "complete": True, "tasks": 1} for i in range(5)}])
+    check("five fit without an 'other'", [x["slot"] for x in five] == [1, 2, 3, 4, 5], str(five))
+    viz = (BASE / "visualizer.py").read_text()
+    for theme in ("--series-1: #3987E5", "--series-1: #2A78D6"):
+        check(f"the series colours are design tokens ({theme.split()[1]})", theme in viz)
+    check("each theme block defines all six", viz.count("--series-0:") == 3 and viz.count("--series-5:") == 3)
+
+
+def test_spend_route_reads_only():
+    print("\nthe bot's /tasks spend action: the view over the real store, nothing moved")
+    import board as B
+    import spend
+    import tasks as T
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    t = st.create("Some work\nWhat done looks like: it works.", title="Some work", state=T.QUEUED,
+                  role="implementor", project="alpha", source="ideation", driver="queue")
+    st.transition(t["id"], T.RUNNING, "")
+    st.update(t["id"], result={"cost": 3.25, "cost_runs": [[time.time() - 60, 3.25]]})
+    before = json.dumps(st.all(), sort_keys=True)
+    handle = _bot_func("handle_tasks", task_store=st, tasks=T, board=B, spend=spend,
+                       log=logging.getLogger("test"))
+    r = handle({"action": "spend"})
+    check("it answers with the view", r.get("ok") and r["spend"]["this_week"] == {"usd": 3.25, "complete": True},
+          str(r)[:300])
+    check("its top task is the one that spent", [x["id"] for x in r["spend"]["top"]["tasks"]] == [t["id"]])
+    check("nothing in the store changed", json.dumps(st.all(), sort_keys=True) == before)
+    import visualizer as V
+    check("the dashboard treats it as a read", "spend" in V.READ_TASK_ACTIONS)
+    shots = (BASE / "bin" / "dashshots").read_text()
+    check("and so does the screenshot harness, which shoots it", '"spend", "inbox", "project", "page"}' in shots and "?view=spend" in shots)
+
+
+def _spend_harness():
+    head = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    return head + r"""
+const FIX = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+let offline = false, asked = [];
+answer = (url, b) => {
+  if (b && b.action) asked.push(b.action);
+  return (b && b.action === "spend") ? (offline ? {ok: false, error: "bot is offline"} : FIX.spend)
+    : (b && b.action === "page") ? {ok: false, error: "the task page for " + b.id}
+    : (b && b.action === "project") ? {ok: false, error: "the project page for " + b.project}
+    : BASE(url);
+};
+(0, eval)(SRC + `
+;globalThis.__m = {openSpend, openLink, setBoardProject, openTaskPage, renderOverview,
+                   spend: () => spendOpen, task: () => taskPageId, page: () => pageSlug};`);
+const M = globalThis.__m, out = {};
+const flushAsync = async () => { for (let i = 0; i < 12; i++) await new Promise(r => setImmediate(r)); };
+(async () => {
+  M.openSpend(); await flushAsync();
+  out.html = byId("bover").innerHTML;
+  out.open = byId("boardmodal").style.display;
+  out.boardDrawn = byId("bboard").innerHTML;
+  out.overview = M.renderOverview({projects: [], archived: []});
+  M.openTaskPage("a1"); await flushAsync();
+  out.toTask = {spend: M.spend(), task: M.task(), html: byId("bover").innerHTML.includes("the task page for a1")};
+  M.setBoardProject(null);
+  out.back = M.spend();
+  await M.openLink(new URLSearchParams("view=spend&sec=top")); await flushAsync();
+  out.link = {spend: M.spend(), drawn: byId("bover").innerHTML.includes("Most expensive")};
+  await M.openLink(new URLSearchParams("view=project&slug=alpha")); await flushAsync();
+  out.leaves = {spend: M.spend(), page: M.page()};
+  M.openSpend(); await flushAsync();
+  await M.openLink(new URLSearchParams("view=board&slug=alpha")); await flushAsync();
+  out.toBoard = M.spend();
+  offline = true;
+  M.openSpend(); await flushAsync();
+  out.offlineKept = byId("bover").innerHTML.includes("Most expensive");
+  out.offlineSaid = byId("bover").innerHTML.includes("bot is offline");
+  out.asked = asked;
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_dashboard_spend_view_renders():
+    import re
+    import digest
+    import spend
+    import visualizer as V
+    print("\nthe spend view, drawn from the route's answer: tiles, stacked weeks, top ten, roles")
+    recs, now, W = _spend_world()
+    view = spend.view(recs, now, unfiled="__unfiled__")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    sect = js[js.index("// --- what was spent"):js.index("// --- creating and editing tasks")]
+    check("read-only: its only buttons go somewhere else",
+          set(re.findall(r'onclick="(\w+)\(', sect)) <= {"setBoardProject", "openTaskPage", "event"},
+          str(set(re.findall(r'onclick="(\w+)\(', sect))))
+    check("its colours are the design system's series tokens, no hex of its own",
+          not re.search(r"#[0-9a-fA-F]{6}", sect))
+    check("it names no role of its own", "implementor" not in sect and "'assistant'" not in sect)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — the spend view checked by text only")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    (d / "drive.js").write_text(_spend_harness())
+    (d / "fix.json").write_text(json.dumps({"spend": {"ok": True, "spend": view}}))
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), "", str(d / "fix.json")],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the spend harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    h = o["html"]
+
+    def sec(key):
+        x = re.search(r'<section class="pgsec" data-sec="%s">(.*?)</section>' % key, h, re.S)
+        return x.group(1) if x else ""
+    check("opened over the board's sheet, the board itself not drawn",
+          o["open"] == "flex" and o["boardDrawn"] == "" and "<h3>Spend</h3>" in h, h[:300])
+    check("it says the figures are list price, and what + and $? mean",
+          "API list price, not billed" in h and "subscription" in h and "floor" in h)
+    check("this week's total as a floor, the average, and the trend in words with an arrow",
+          "$14.00+" in h and "$2.25" in h and "▲ 522% above the 4-week average" in h, h[:1500])
+    check("its sections, in order", re.findall(r'data-sec="(\w+)"', h) == ["weeks", "top", "roles"])
+    w = sec("weeks")
+    svg = re.search(r"<svg class=\"spchart\".*?</svg>", w, re.S)
+    check("a chart", bool(svg))
+    svg = svg.group(0) if svg else ""
+    bars = re.findall(r'<rect class="seg s(\d)" x="([\d.]+)" y="([\d.]+)" width="[\d.]+" height="([\d.]+)"', svg)
+    # Segments: week 9 alpha+beta, week 10 alpha, this week alpha+beta(0, not drawn)+unfiled.
+    check("one segment per project per week that spent, none for $0", len(bars) == 5, str(bars))
+    slots = {x["key"]: x["slot"] for x in view["series"]}
+    check("each project wears its own slot's class, the same in every week",
+          {b[0] for b in bars} == {str(slots["alpha"]), str(slots["beta"]), str(slots["__unfiled__"])}, str(bars))
+    tall = {round(float(b[3])) for b in bars}
+    check("heights scale with the figure (alpha's 11.5 is the tallest segment)",
+          max(float(b[3]) for b in bars) == max(float(b[3]) for b in bars if b[0] == str(slots["alpha"])), str(tall))
+    check("a hover target per week, naming the week and each project's figure",
+          svg.count('class="hit"') == 12 and "alpha $11.50" in svg and "beta $?" in svg)
+    check("this week's total labelled on its bar, as the floor it is", 'class="now"' in svg and ">$14.00+</text>" in svg)
+    check("a legend with every series and its twelve-week total, projects linked to their pages",
+          "spsw s" in w and "openProjectPage('alpha')" in w and "$17.50" in w and ">unfiled<" in w, w[:800])
+    check("and the table view, every week a row", w.count("<tr>") == 13 and "<summary>table</summary>" in w)
+    t = sec("top")
+    check("the month's dearest, each opening its task page", "openTaskPage('a1')" in t and "Alpha work" in t
+          and t.index("a1") < t.index("b1") and "$17.50" in t
+          and "1 more ran this month with no cost recorded" in t, t[:600])
+    r = sec("roles")
+    check("roles: this week and twelve weeks, unknown as a floor",
+          "<td>implementor</td><td class=\"r\">$10.00+</td>" in r and "<td>researcher</td><td class=\"r\">–</td>" in r, r[:600])
+    check("the overview links to it", "openSpend()" in o["overview"])
+    check("a top task opens its own page, leaving the spend view",
+          o["toTask"] == {"spend": False, "task": "a1", "html": True}, str(o["toTask"]))
+    check("‹ Projects leaves it", o["back"] is False)
+    check("?view=spend&sec= opens it", o["link"] == {"spend": True, "drawn": True}, str(o["link"]))
+    check("a deep link elsewhere leaves it", o["leaves"] == {"spend": False, "page": "alpha"}, str(o["leaves"]))
+    check("and so does one to a board", o["toBoard"] is False)
+    check("a failed read draws the last view, not a blank, and says it could not refresh",
+          o["offlineKept"] and o["offlineSaid"])
+    writes = {"approve", "dismiss", "accept", "rework", "land", "drop", "edit", "priority", "create", "retry"}
+    check("it only ever reads", "spend" in o["asked"] and not writes & set(o["asked"]), str(o["asked"]))
+
+
 if __name__ == "__main__":
     tests = discover()
     if not tests:
