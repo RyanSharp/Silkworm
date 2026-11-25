@@ -485,10 +485,19 @@ claims it before older work (spent by that claim; reviews keep their own lane),
 and Backlog lists the queue in the order it will run. **⚙ Settings** covers a
 project's name, test command, auto-merge, publish, nightly review time and base
 branch — which must exist, and is flagged if it is already merged into the
-default branch — and archiving, which hides it from the overview and pickers
-without deleting anything; archived projects sit in a collapsed **Archived**
-section to be brought back. Anything destructive or that changes unattended
-behaviour asks first.
+default branch — and the two ways to put a project away. **Archive…** hides it
+from the overview and pickers, and its tasks and threads from every
+all-projects view — the board, the inbox (which says how many it is leaving
+out), the thread list (under **hidden**), the Slack board and the digest — while
+running and queued work still shows (archiving does not stop the queue);
+nothing is deleted, its settings stay, and its own
+page and board still list everything. **Retire…** is for a project you are done
+with: it archives it and dismisses its open tasks, listing them first, and is
+refused while one of them runs; done tasks and their branches are left alone.
+Archived projects sit in a collapsed **Archived** section to be brought back
+(dismissed tasks stay dismissed). In Slack, `!project archive|unarchive [name]`
+and `!project retire [name]` (then `… confirm`) do the same. Anything
+destructive or that changes unattended behaviour asks first.
 
 A project is **what a task belongs to**; `scope` is **where it may act**. They
 are separate deliberately — two projects can share a repo, one project can span

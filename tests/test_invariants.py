@@ -94,6 +94,9 @@ STAND_INS = {
     # filer_role asks who the operator is; a test that never set one up has
     # no operator, so nothing it files is the operator's.
     "OPERATOR": lambda: types.SimpleNamespace(thread=lambda: ""),
+    # The all-projects views leave out archived projects' work; a test that
+    # archived nothing has none archived.
+    "archived_projects": lambda: (lambda: set()),
     # user_grant asks the bot's live grants; a test that made none has none,
     # so nothing it asks for is on the user's word.
     "OPERATOR_GRANTS": lambda: __import__("operator_role").Grants(),
@@ -128,7 +131,7 @@ TASK_ROUTES = ("CLAUDE_CWD", "HEALTH_WARN_DAYS", "_spend", "_with_costs", "appro
                "project_store", "run_email_ingest", "stop_task", "task_changes", "task_contained",
                "tell_thread", "tidy_checkout")
 PROJECT_ROUTES = ("GITHUB_OWNER", "install_git_guards", "operator_refused",
-                  "set_ideate_lenses", "task_store", "unregistered_repos")
+                  "retire_project", "set_ideate_lenses", "task_store", "unregistered_repos")
 LANDING_ROUTES = ("LANDING_UNDERWAY", "hold_landing_for_base", "hold_landing_for_checkout",
                   "record_landing", "repo_guard", "task_store")
 #: take_step's, lifted along with handle_tasks: landing and releasing.
@@ -1529,7 +1532,7 @@ def test_hiding_threads():
 
     viz = (BASE / "visualizer.py").read_text()
     check("the list filters hidden out by default",
-          "if (!showHidden && s.hidden) return false;" in viz)
+          "if (!showHidden && (s.hidden || s.shelved)) return false;" in viz)
     check("hidden threads stay reachable", "function toggleHidden" in viz,
           "put away is not thrown away")
     check("the hide control does not open the thread it hides",
@@ -3344,6 +3347,9 @@ def _bot_func(name, **namespace):
     # The shared helpers lifted alongside it read globals of their own
     # (task_base reads `branches` and `project_store`), which the caller has
     # as little reason to supply as the function's own -- stubbed too.
+    # A mock archive answers "these are archived" (a mock is truthy) and the
+    # lists then drop everything; nothing archived is the install's state.
+    real["archived_projects"] = STAND_INS["archived_projects"]()
     lift(name, ns=mod.__dict__,
          stub=lambda free: real[free] if free in real else MagicMock(name=free))
     return mod.__dict__[name]
@@ -5264,6 +5270,13 @@ out.backToAll = S.filter(matchesKind).length;
 _bar.innerHTML = "";
 renderKindFilter([{key: "x", kind: "thread"}]);
 out.singleKindBar = _bar.innerHTML;
+// A thread filed under an archived project is put away with the hidden ones.
+const SH = [{key: "e", kind: "thread", shelved: true}, {key: "f", kind: "thread"}];
+out.shelvedOff = SH.filter(matchesKind).map(s => s.key);
+_bar.innerHTML = ""; renderKindFilter(SH); out.shelvedBar = _bar.innerHTML;
+toggleHidden();
+out.shelvedShown = SH.filter(matchesKind).map(s => s.key);
+toggleHidden();
 console.log(JSON.stringify(out));
 """
     harness = prelude + js + drive
@@ -5287,6 +5300,57 @@ console.log(JSON.stringify(out));
     check("and All comes back", out["backToAll"] == 4)
     check("one kind shows no filter at all", out["singleKindBar"] == "",
           "a single-option filter is noise, not a choice")
+    check("a thread under an archived project is off the list by default",
+          out["shelvedOff"] == ["f"], str(out["shelvedOff"]))
+    check("counted under hidden, and shown with them",
+          "hidden <b>1</b>" in out["shelvedBar"] and out["shelvedShown"] == ["e", "f"],
+          out["shelvedBar"])
+
+
+def test_archived_projects_leave_the_slack_board_and_thread_list():
+    import home, tasks as T, projects as P
+    sys.argv = ["x"]
+    import visualizer as V
+    print("\narchived projects: off the Slack board, and their threads put away")
+    ts = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    old = ts.create("Proposal under an old project", project="old", state="proposed",
+                    role="implementor")
+    rev = ts.create("Review: old", state="queued", role="reviewer", parent=old["id"])
+    ts.transition(rev["id"], "running"); ts.transition(rev["id"], "failed")
+    queued = ts.create("Queued under the old project", project="old", state="queued",
+                       role="implementor", driver="queue")
+    live = ts.create("Proposal under a live one", project="live", state="proposed",
+                     role="implementor")
+    shelved = {"old"}
+    b = _board_for(ts, lambda p: {"ok": True}, shelved=lambda: shelved)
+    ids = {r["id"] for r in b.listed()}
+    check("the Slack board lists the live project's work, not the archived one's",
+          live["id"] in ids and old["id"] not in ids, sorted(ids))
+    check("queued work stays: archiving does not stop the queue", queued["id"] in ids)
+    check("a reviewer is counted under its parent's project",
+          rev["id"] not in ids and P.project_of(ts.get(rev["id"]), ts.all()) == "old")
+    text = json.dumps(b.blocks())
+    check("and so does what it draws", "live one" in text and "old project" not in text)
+    shelved.clear()
+    check("unarchived, it is back", old["id"] in {r["id"] for r in b.listed()})
+    check("a board with no archive source shows everything",
+          old["id"] in {r["id"] for r in _board_for(ts, lambda p: {"ok": True}).listed()})
+
+    d = Path(tempfile.mkdtemp())
+    ps = P.ProjectStore(d / "projects.json")
+    ps.ensure("Old"); ps.ensure("Live"); ps.set_archived("old", True)
+    was = V.BASE_DIR
+    try:
+        V.BASE_DIR = d
+        check("the thread list reads the archived projects from projects.json",
+              V.archived_projects() == {"old"}, V.archived_projects())
+        (d / "projects.json").write_text("not json")
+        for extra in d.glob("projects.json.*"):
+            extra.unlink()                  # no backup to recover from either
+        check("and an unreadable file archives nothing rather than failing",
+              V.archived_projects() == set())
+    finally:
+        V.BASE_DIR = was
 
 
 # --- finished work that never reached the base -------------------------------
@@ -17886,7 +17950,8 @@ def _edit_routes(tmp=None):
           "CLAUDE_CWD": d / "scratch", "log": logging.getLogger("test"), "time": time}
     found = lift({"handle_tasks", "handle_projects", "edit_task", "held_reason",
                       "_task_title", "board_survey", "board_release", "_board_survey",
-                      "_board_releases", "_with_costs", "_spend"}, ns=ns,
+                      "_board_releases", "_with_costs", "_spend", "retire_project",
+                      "archived_projects"}, ns=ns,
                  absent=TASK_ROUTES + PROJECT_ROUTES + STEP_ROUTES)["__lifted__"]
     return ns, ts, ps, found
 
@@ -18204,6 +18269,91 @@ def test_project_settings_from_the_board():
           and "alpha" not in [a["slug"] for a in ov["archived"]])
     check("archiving an unknown project is refused",
           not hp({"action": "archive", "slug": "nope"})["ok"])
+
+    # Archived means off every all-projects list, not only the pickers.
+    idle = ts.create("An idea under alpha", project="alpha", state="proposed", role="implementor")
+    hp({"action": "archive", "slug": "alpha"})
+    run = ts.create("Running under alpha", project="alpha", state="queued",
+                    driver="queue", role="implementor")
+    ts.transition(run["id"], "running")
+    ids = lambda r: {x["id"] for x in r["tasks"]}
+    lst = ht({"action": "list"})
+    check("an archived project's tasks leave the all-projects list",
+          idle["id"] not in ids(lst), sorted(ids(lst)))
+    check("but running and queued work stays (it spends; deploy's wait reads this list)",
+          run["id"] in ids(lst) and t["id"] in ids(lst))
+    check("asking for the project by name still shows them",
+          idle["id"] in ids(ht({"action": "list", "project": "alpha"})))
+    check("and so does asking for archived ones",
+          idle["id"] in ids(ht({"action": "list", "archived": True})))
+    check("the badge counts leave it out too",
+          ht({"action": "counts"})["counts"].get("proposed", 0) == 0
+          and ht({"action": "counts", "archived": True})["counts"].get("proposed") == 1,
+          ht({"action": "counts"}))
+    brd = ht({"action": "board"})
+    on = {c["id"] for col in brd["columns"].values() for c in col}
+    check("the all-projects board leaves it out; its own board does not",
+          idle["id"] not in on and idle["id"] in {c["id"] for col in ht(
+              {"action": "board", "project": "alpha"})["columns"].values() for c in col})
+    # Narrowed lists (one state, attention) do not hold a reviewer's parent.
+    ts.transition(t["id"], "running"); ts.transition(t["id"], "blocked")
+    frev = ts.create("Review: under alpha", state="queued", role="reviewer", parent=t["id"],
+                     driver="queue")
+    ts.transition(frev["id"], "running"); ts.transition(frev["id"], "failed")
+    check("a failed review of archived work leaves the attention list, its parent unlisted",
+          frev["id"] not in ids(ht({"action": "attention"}))
+          and frev["id"] not in ids(ht({"action": "list", "state": "failed"})))
+    ts.transition(run["id"], "done")
+    hp({"action": "unarchive", "slug": "alpha"})
+    check("unarchived, they are back", idle["id"] in ids(ht({"action": "list"}))
+          and frev["id"] in ids(ht({"action": "attention"})))
+    ts.transition(frev["id"], "cancelled"); ts.transition(t["id"], "queued")
+    ts.transition(idle["id"], "cancelled")
+
+    # Retire: archive and dismiss the open work; preview first, refused while running.
+    prop = ts.create("A proposal under alpha", project="alpha", state="proposed", role="implementor")
+    rev = ts.create("Review: alpha", state="queued", role="reviewer", parent=t["id"], driver="queue")
+    turn = ts.create("a message waiting for its thread", project="alpha", state="queued",
+                     source="slack", source_ref="D1:1.0")
+    finished = ts.create("Landed work", project="alpha", state="queued", role="implementor")
+    ts.transition(finished["id"], "running"); ts.transition(finished["id"], "done")
+    pv = hp({"action": "retire-plan", "slug": "alpha"})
+    check("the preview names what it would close, and changes nothing",
+          pv["ok"] and {x["id"] for x in pv["close"]} == {t["id"], prop["id"]}
+          and not ps.get("alpha").get("archived") and ts.get(t["id"])["state"] == "queued", pv)
+    busy = ts.create("Busy under alpha", project="alpha", state="queued", role="implementor")
+    ts.transition(busy["id"], "running")
+    r = hp({"action": "retire", "slug": "alpha"})
+    check("retiring is refused while one of its tasks runs, and nothing moves",
+          not r["ok"] and "running" in r["error"] and not ps.get("alpha").get("archived")
+          and ts.get(prop["id"])["state"] == "proposed", r)
+    ts.transition(busy["id"], "done")
+    rrev = ts.create("Review: running", state="queued", role="reviewer", parent=prop["id"],
+                     driver="queue")
+    ts.transition(rrev["id"], "running")
+    r = hp({"action": "retire", "slug": "alpha"})
+    check("and while one of its reviews runs (cancelling the parent would not stop it)",
+          not r["ok"] and "running" in r["error"] and ts.get(prop["id"])["state"] == "proposed", r)
+    ts.transition(rrev["id"], "done")
+    ns["operator_refused"] = lambda *a: None       # the operator's guard lets it through...
+    r = hp({"action": "retire", "slug": "alpha", "caller_role": "operator", "caller_thread": "D1:9.0"})
+    check("and from inside a turn: dismissing is yours",
+          not r["ok"] and "yours" in r["error"] and ts.get(prop["id"])["state"] == "proposed", r)
+    r = hp({"action": "retire", "slug": "alpha"})
+    check("retiring archives it and dismisses its open tasks",
+          r["ok"] and ps.get("alpha")["archived"] and set(r["closed"]) == {t["id"], prop["id"]}
+          and ts.get(t["id"])["state"] == "cancelled" and ts.get(prop["id"])["state"] == "cancelled", r)
+    check("their reviews end with them", ts.get(rev["id"])["state"] == "cancelled",
+          ts.get(rev["id"])["state"])
+    check("a turn waiting for its thread is left alone",
+          ts.get(turn["id"])["state"] == "queued")
+    check("done work is left alone", ts.get(finished["id"])["state"] == "done")
+    check("its settings stay, so unarchiving restores it",
+          ps.get("alpha")["test_cmd"] == "./bin/test"
+          and hp({"action": "unarchive", "slug": "alpha"})["ok"] and not ps.get("alpha")["archived"])
+    check("retiring an unknown project is refused",
+          not hp({"action": "retire", "slug": "nope"})["ok"]
+          and not hp({"action": "retire-plan", "slug": "nope"})["ok"])
 
 
 BOARD_EDIT_DRIVER = r"""
@@ -26523,7 +26673,7 @@ def _web_bot(tmp: Path):
                absent=('CLAUDE_CWD', 'CLAUDE_MODEL', 'COST_NOTE', 'fmt_age',
                        'github_for_thread_project', 'install_git_guards', 'kill_terminal',
                        'learnings', 'new_project_from_thread', 'operator_command',
-                       'release_command', 'set_ideate_lenses'))
+                       'release_command', 'set_ideate_lenses', 'shelve_from_slack'))
     shared = dict(store=st, task_store=ts, tasks=T, webthread=webthread, RUNNING=running,
                   RUNNING_TASKS={}, app=app, Path=Path, UPLOADS_ROOT=tmp / "uploads",
                   OUTBOX_ROOT=tmp / "outbox", CLAUDE_CWD=tmp / "scratch")
@@ -36744,7 +36894,7 @@ def test_conversation_turns_through_the_route():
     route = (BASE / "bot.py").read_text()
     body = route[route.index("def handle_tasks("):route.index("def handle_projects(")]
     check("the route asks tasks.on_board, not a rule of its own",
-          "tasks.on_board(t, turns)" in body and "counts(turns)" in body)
+          "tasks.on_board(t, turns)" in body and "counts(turns, shelved)" in body)
 
 
 TURNS_DRIVER = r"""
@@ -39738,7 +39888,14 @@ def test_inbox_lists_everything_waiting_on_you():
     check("an answered plan is no item: no later message answers it",
           I.plan_item({"id": "p", "answered": "1.0", "entries": [{"n": 1, "name": "x"}]}) is None)
     check("with nothing waiting, nothing is listed",
-          I.build([]) == {"groups": [], "count": 0})
+          I.build([]) == {"groups": [], "count": 0, "shelved": 0})
+    # An archived project's items are left out and counted, not shown.
+    rec = {"id": "tsk_a1", "state": "proposed", "project": "old", "title": "x", "goal": "x",
+           "role": "implementor"}
+    out = I.build([rec, dict(rec, id="tsk_b1", project="live")], shelved={"old"})
+    check("an archived project's items are counted, not listed",
+          out["shelved"] == 1 and out["count"] == 1
+          and [g["project"] for g in out["groups"]] == ["live"], str(out))
     # A reviewer is filed under no project: it goes in its parent's group.
     st3 = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
     par = st3.create("parent", state=T.QUEUED, project="gamma")["id"]

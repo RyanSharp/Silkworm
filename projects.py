@@ -478,6 +478,92 @@ def unready(rec) -> str:
             if missing else "")
 
 
+def archived_slugs(records) -> set:
+    """Slugs of the archived projects among `records` (ProjectStore.all())."""
+    return {r["slug"] for r in records or () if r.get("archived") and r.get("slug")}
+
+
+def project_of(rec: dict, by_id: dict) -> str:
+    """The project a task is filed under. A reviewer is filed under none; it
+    belongs to its parent's, as the board and the digest already count it."""
+    rec = rec or {}
+    if rec.get("project"):
+        return rec["project"]
+    if rec.get("role") == "reviewer":
+        return (by_id.get(rec.get("parent") or "") or {}).get("project") or ""
+    return ""
+
+
+def unshelved(records, archived, by_id: dict | None = None) -> list:
+    """`records` without the tasks filed under an archived project.
+
+    Archiving a project takes it out of the default views -- the all-projects
+    board, the inbox, the Slack board, the digest -- not just the pickers:
+    otherwise a project you are done with keeps drawing its leftovers into
+    every list. Its own board and page still show everything, and
+    unarchiving brings it all back; nothing is changed by being left out.
+
+    A running or queued task stays wherever it is: it is spending, or about
+    to -- archiving does not stop the queue -- and the callers that must see
+    every running task (deploy's wait, `status --json`) read the same lists.
+    Retire is what closes queued work.
+
+    `by_id` is every task by id, for a reviewer's parent when `records` is
+    already narrowed (one state, needs-attention) and may not hold it.
+    """
+    records = list(records)
+    if not archived:
+        return records
+    by_id = by_id if by_id is not None else {r.get("id"): r for r in records}
+    return [r for r in records if r.get("state") in SHOWN_WHEN_ARCHIVED
+            or project_of(r, by_id) not in archived]
+
+
+#: What stays listed under an archived project: work spending, or about to.
+SHOWN_WHEN_ARCHIVED = (tasks_mod.RUNNING, tasks_mod.QUEUED)
+
+
+#: What Retire closes: everything still open under the project except a
+#: running task, which Retire refuses over rather than kills.
+RETIRE_CLOSES = (tasks_mod.PROPOSED, tasks_mod.QUEUED, tasks_mod.BLOCKED,
+                 tasks_mod.AWAITING_APPROVAL, tasks_mod.NEEDS_INPUT, tasks_mod.FAILED)
+
+
+def retire_plan(slug: str, records) -> dict:
+    """What retiring `slug` would do: {close: [task], running: [task]}.
+
+    Retiring is archiving plus closing the project's open work, so nothing of
+    it is left waiting on you, queued to run, or counted anywhere. Reviewers
+    are left out: a review ends with the task it reviews. Done tasks are not
+    touched, and neither are their branches -- an unlanded one stays listed
+    under the project's own page, and dropping it is still a separate choice.
+    """
+    records = list(records or ())
+    by_id = {r.get("id"): r for r in records}
+    close, running = [], []
+    for r in records:
+        if r.get("role") == "reviewer":
+            # Ends with the task it reviews -- unless it is running, which
+            # cancelling its parent would not stop.
+            if r.get("state") == tasks_mod.RUNNING and project_of(r, by_id) == slug:
+                running.append(r)
+            continue
+        if (r.get("project") or "") != slug:
+            continue
+        # A conversation turn is its thread's, not the project's work: one
+        # waiting for its thread, or a scheduled wake-up, is a message or a
+        # promise to you and is left alone. One that failed or handed you a
+        # step is on the board (tasks.on_board) and closes with the rest.
+        if not tasks_mod.on_board(r):
+            continue
+        if r.get("state") == tasks_mod.RUNNING:
+            running.append(r)
+        elif r.get("state") in RETIRE_CLOSES:
+            close.append(r)
+    close.sort(key=lambda r: r.get("created") or 0)
+    return {"close": close, "running": running}
+
+
 def due_for_ideation(records, now) -> list:
     """Slugs whose scheduled time has passed today and that have not run.
 

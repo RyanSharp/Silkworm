@@ -152,7 +152,7 @@ LIVE_CONFIG = {
 }
 
 #: /projects actions that only read.
-_PROJECT_READS = frozenset({"list", "get", "unregistered"})
+_PROJECT_READS = frozenset({"list", "get", "unregistered", "retire-plan"})
 
 
 def caller_is_operator(payload: dict, home_thread: str = "") -> bool:

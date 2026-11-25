@@ -1528,13 +1528,22 @@ class TaskStore:
                                 "late_s": round(late)})
         return sorted(out, key=lambda w: -w["late_s"])
 
-    def counts(self, turns: bool = False) -> dict[str, int]:
+    def counts(self, turns: bool = False, skip_projects=()) -> dict[str, int]:
         """{state: n} over what the board lists (on_board): conversation
-        turns only when `turns`, or while they wait on you."""
+        turns only when `turns`, or while they wait on you. `skip_projects`
+        are archived projects' slugs, left out as the lists leave them out
+        (projects.unshelved): a running or queued task still counts."""
+        skip = set(skip_projects or ())
         with self._lock:
             out: dict[str, int] = {}
             for rec in self._data.values():
                 if not on_board(rec, turns):
                     continue
+                if skip and rec.get("state") not in (RUNNING, QUEUED):
+                    slug = rec.get("project") or (
+                        (self._data.get(rec.get("parent") or "") or {}).get("project")
+                        if rec.get("role") == "reviewer" else "") or ""
+                    if slug in skip:
+                        continue
                 out[rec.get("state", "?")] = out.get(rec.get("state", "?"), 0) + 1
         return out

@@ -196,11 +196,14 @@ def _order(item: dict) -> tuple:
 
 def build(records, *, unmerged_rows=(), plan: dict | None = None, health_rows=(),
           operator_thread: str = "", project_titles: dict | None = None,
-          registry: dict | None = None) -> dict:
-    """{groups: [{project, title, items}], count}: what waits on you.
+          registry: dict | None = None, shelved=()) -> dict:
+    """{groups: [{project, title, items}], count, shelved}: what waits on you.
 
     Groups are ordered by their most urgent item, then by their newest; items
-    within a group the same way. `project_titles` is {slug: title}."""
+    within a group the same way. `project_titles` is {slug: title}.
+    `shelved` is the archived projects' slugs: their items are left out --
+    archiving is how you say a project no longer needs you -- and only
+    counted, so the page can say how many it is not showing."""
     records = list(records)
     by_id = {r.get("id"): r for r in records}
     unmerged = {u.get("id"): u for u in unmerged_rows or ()}
@@ -209,6 +212,9 @@ def build(records, *, unmerged_rows=(), plan: dict | None = None, health_rows=()
     if p:
         items.append(p)
     items += decision_items(health_rows, operator_thread, registry)
+    shelved = set(shelved or ())
+    hidden = [i for i in items if i["project"] in shelved]
+    items = [i for i in items if i["project"] not in shelved]
     titles = dict(project_titles or {})
     groups: dict = {}
     for it in items:
@@ -222,4 +228,4 @@ def build(records, *, unmerged_rows=(), plan: dict | None = None, health_rows=()
         out.append({"project": slug, "title": title, "items": its})
     out.sort(key=lambda g: (min(URGENCY.get(i["kind"], 9) for i in g["items"]),
                             -max(i.get("at") or 0 for i in g["items"]), g["title"].lower()))
-    return {"groups": out, "count": len(items)}
+    return {"groups": out, "count": len(items), "shelved": len(hidden)}

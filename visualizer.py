@@ -529,6 +529,18 @@ def operator_home() -> str:
         return ""
 
 
+def archived_projects() -> set:
+    """The archived projects' slugs, from projects.json (read-only, so the
+    thread list keeps working with the bot down). Empty if it cannot be read."""
+    try:
+        data = jsonstore.load(BASE_DIR / "projects.json", default={}, repair=False) or {}
+        recs = data if isinstance(data, dict) else {}
+        return {slug for slug, r in recs.items()
+                if isinstance(r, dict) and r.get("archived")}
+    except Exception:
+        return set()
+
+
 def load_sessions() -> dict:
     status = bot_call("/status", {}, timeout=0.6)
     threads = status.get("threads", {})
@@ -538,6 +550,7 @@ def load_sessions() -> dict:
         [(e.get("pending") or {}).get("session_id") or e.get("session_id")
          for e in entries.values() if e.get("pending")])
     counts = unread_counts(entries)
+    shelved = archived_projects()
     out = []
     for key, entry in entries.items():
         channel, _, thread_ts = key.partition(":")
@@ -551,6 +564,8 @@ def load_sessions() -> dict:
             "kind": entry.get("kind") or "thread",
             # So the projects board can list threads filed under none.
             "project": entry.get("project") or "",
+            # Filed under an archived project: put away with the hidden ones.
+            "shelved": (entry.get("project") or "") in shelved,
             "summary": entry.get("summary") or "",
             "session_id": sid,
             "model": entry.get("model"),
@@ -4185,7 +4200,9 @@ let showHidden = false;
 let operatorHome = "";
 function isPinned(s) { return !!operatorHome && !!s && s.key === operatorHome; }
 // Put away: hidden, and not the pinned thread, which is shown regardless.
-function putAway(s) { return !!s.hidden && !isPinned(s); }
+// A thread filed under an archived project is put away with the hidden ones:
+// off the list and the unread counts, back under "hidden" (load_sessions).
+function putAway(s) { return !!(s.hidden || s.shelved) && !isPinned(s); }
 
 // --- unread ---
 // A thread's `unread` is how many replies (not yours) arrived after you last
@@ -4289,7 +4306,7 @@ function markSeen() {
 
 function matchesKind(s) {
   if (isPinned(s)) return true;
-  if (!showHidden && s.hidden) return false;
+  if (!showHidden && (s.hidden || s.shelved)) return false;
   if (unreadOnly && !unreadOf(s) && !(active && active.key === s.key)) return false;
   return threadKind === "all" || (s.kind || "thread") === threadKind;
 }
@@ -4372,7 +4389,7 @@ function renderKindFilter(sessions) {
          && (Date.now() / 1000 - s.updated) > 14 * 86400).length;
   setHTML(bar, kindBtns + unreadBtns +
     (nHidden ? `<button class="${showHidden ? "on" : ""}" onclick="toggleHidden()"
-                  title="hidden threads are kept, not deleted"
+                  title="hidden threads, and threads of archived projects: kept, not deleted"
                 >hidden <b>${nHidden}</b></button>` : "") +
     (oldRuns ? `<button onclick="hideOldTaskRuns()"
                   title="hide task runs untouched for 14 days"
@@ -7879,9 +7896,10 @@ function renderOverview(r) {
 function archivedSection(rows) {
   if (!rows.length) return "";
   return `<details class="parch"><summary>Archived · ${rows.length}</summary>${rows.map(p =>
-    `<div class="arow" data-slug="${esc(p.slug)}">${esc(p.title)} <span class="slug">${esc(p.slug)}</span>
+    `<div class="arow" data-slug="${esc(p.slug)}">${projLink(p.slug, p.title, "")} <span class="slug">${esc(p.slug)}</span>
       · ${p.tasks} task${p.tasks === 1 ? "" : "s"}
-      <button class="ghost" onclick="archiveProject('${esc(p.slug)}',false)">Unarchive</button></div>`).join("")}</details>`;
+      <button class="ghost" onclick="archiveProject('${esc(p.slug)}',false)">Unarchive</button>${
+      p.tasks ? `<button class="ghost" onclick="retireProject('${esc(p.slug)}')" title="dismiss its open tasks">Retire…</button>` : ""}</div>`).join("")}</details>`;
 }
 function releaseText(rel) {
   if (!rel) return "";
@@ -8751,6 +8769,7 @@ async function projectSettings(slug) {
     <div class="acts">${p.archived
       ? `<button class="ghost" onclick="archiveProject('${esc(slug)}',false)">Unarchive</button>`
       : `<button class="ghost" onclick="archiveProject('${esc(slug)}',true)">Archive…</button>`}
+      <button class="ghost" onclick="retireProject('${esc(slug)}')" title="archive it and dismiss its open tasks">Retire…</button>
       <button class="ghost" onclick="closeModal()">Close</button></div></div>`,
     {kind: "settings", slug});
 }
@@ -8822,15 +8841,44 @@ async function saveBase(slug) {
                      branch ? `Base: ${branch}` : "Base: the default branch");
 }
 async function archiveProject(slug, on) {
-  if (on && !confirm(`Archive ${slug}?\n\nIt is hidden from the overview and from project pickers. `
+  if (on && !confirm(`Archive ${slug}?\n\nIt is hidden from the overview and project pickers, and its tasks and threads `
+                     + "from the board, the inbox, the thread list, the Slack board and the digest (running and queued work still shows: archiving does not stop the queue). "
                      + "Nothing is deleted: its tasks keep their label and its settings stay as they are, "
-                     + "and it can be brought back from Archived."))
+                     + "and it can be brought back from Archived. To also close its open tasks, Retire it."))
     return;
   const r = await projectCall({action: on ? "archive" : "unarchive", slug});
   if (!r.ok) { if (modalIsOpen()) formError(r.error || "refused"); else toast(r.error || "refused"); return; }
   toast(on ? `${slug} archived` : `${slug} is back`);
   if (on && boardProject === slug) { closeModal(); setBoardProject(null); return; }
   if (boardForm && boardForm.kind === "settings") await projectSettings(slug);
+  if (boardIsOpen()) renderBoard();
+}
+
+// Retire: archive, and dismiss its open tasks. Asked with the list of what
+// would close (retire-plan); refused while one of its tasks runs.
+async function retireProject(slug) {
+  const p = await projectCall({action: "retire-plan", slug});
+  if (!p.ok) { if (modalIsOpen()) formError(p.error || "refused"); else toast(p.error || "refused", 4000, {bad: true}); return; }
+  if ((p.running || []).length) {
+    const msg = `${slug} has ${p.running.length} running task${p.running.length === 1 ? "" : "s"}; wait for ${p.running.length === 1 ? "it" : "them"} to finish, or cancel, then retire.`;
+    if (modalIsOpen()) formError(msg); else toast(msg, 5000, {bad: true});
+    return;
+  }
+  const close = p.close || [];
+  const list = close.slice(0, 12).map(t => `• ${t.state} — ${t.title || t.id}`).join("\n")
+    + (close.length > 12 ? `\n…and ${close.length - 12} more` : "");
+  if (!confirm(`Retire ${slug}?\n\nIt is archived` + (close.length
+        ? `, and its ${close.length} open task${close.length === 1 ? " is" : "s are"} dismissed:\n${list}`
+        : "; it has no open tasks to close.")
+      + "\n\nDone tasks and their branches are left as they are. Unarchive brings the project back; dismissed tasks stay dismissed."))
+    return;
+  const r = await projectCall({action: "retire", slug});
+  if (!r.ok) { if (modalIsOpen()) formError(r.error || "refused"); else toast(r.error || "refused", 5000, {bad: true}); return; }
+  const left = (r.left || []).length;
+  toast(`${slug} retired` + ((r.closed || []).length ? ` · ${r.closed.length} dismissed` : "")
+        + (left ? ` · ${left} could not be` : ""), 5000, left ? {bad: true} : undefined);
+  if (boardProject === slug) { closeModal(); setBoardProject(null); return; }
+  if (modalIsOpen()) closeModal();
   if (boardIsOpen()) renderBoard();
 }
 
@@ -8903,12 +8951,15 @@ function inboxHtml(d) {
   const ran = planRecent(), hasPlan = groups.some(g => g.items.some(i => i.kind === "plan"));
   const ranHtml = ran && !hasPlan ? `<div class="igroup" data-project="operator"><h4>The operator's plan</h4>${
     planCardHtml(ran, "inbox")}</div>` : "";
-  if (!n && ranHtml) return ranHtml;
-  if (!n) return `<div class="iempty"><b>Nothing needs you</b>Proposals, approvals, questions and failures turn up here.</div>`;
+  // Archived projects' items are left out (inbox.py); said, not silent.
+  const sh = (d && d.shelved) || 0;
+  const shHtml = sh ? `<div class="hint ishelved">${sh} item${sh === 1 ? "" : "s"} under archived projects not shown — Unarchive or Retire them from Projects › Archived.</div>` : "";
+  if (!n && ranHtml) return ranHtml + shHtml;
+  if (!n) return `<div class="iempty"><b>Nothing needs you</b>Proposals, approvals, questions and failures turn up here.</div>` + shHtml;
   return `<div class="ihd"><h3>Needs you</h3><span class="n">${n}</span></div>` + ranHtml + groups.map(g =>
     `<div class="igroup" data-project="${esc(g.project)}"><h4>${g.project && g.project !== UNFILED && g.project !== "__operator__"
       ? projLink(g.project, g.title, "ipl") : esc(g.title)}<span class="n">${g.items.length}</span></h4>${
-      g.items.map(inboxCard).join("")}</div>`).join("");
+      g.items.map(inboxCard).join("")}</div>`).join("") + shHtml;
 }
 function drawInbox(d) {
   const html = inboxHtml(d);

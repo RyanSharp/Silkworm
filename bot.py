@@ -1135,6 +1135,8 @@ HELP = """*Commands* (send inside a thread):
 • `!approve <accept|release|publish|trader-config|delete> <task id or project>` — let the operator do that one held-back thing, once (within a day); `!approve` lists what is approved. Never needed: tell the operator in its thread, or say yes to its plan (a trader live-config landing or publish lifts on a yes to its entry, or your message naming it: `land tsk_…`)
 • `!project <name>` — file this thread's tasks under a project
 • `!project github create` — make a private GitHub repo for this thread's project and push it
+• `!project archive|unarchive [name]` — take a project (and its tasks and threads) off the board, inbox, pickers and digest, or bring it back
+• `!project retire [name]` — archive it and dismiss its open tasks (shows them first)
 • `!project new <Name> [path] [--github] [--adopt] -- <purpose>` — make (or adopt) a project's directory, git repo and CLAUDE.md, register it, and move this thread there; `--github` also creates a private GitHub repo
 • `!release <project>` — what is ready to release, per target (nothing ships)
 • `!release <project> <target|all> [patch|minor|major|x.y.z]` — release it, dependencies first
@@ -1626,6 +1628,9 @@ def handle_command(cmd: str, key: str, say, thread_ts: str) -> bool:
             # A project already called "New Something" is still filed under
             # by name; only an unknown "new ..." is a request to make one.
             say(text=new_project_from_thread(key, arg[3:].strip()), thread_ts=thread_ts)
+        elif arg.lower().split()[0] in ("archive", "unarchive", "retire") \
+                and not project_store.get(project_store.slug_for(arg)):
+            say(text=shelve_from_slack(entry, arg), thread_ts=thread_ts)
         elif arg.lower() == "github" or arg.lower().startswith("github "):
             # Publishing is the one thing here that cannot be quietly undone,
             # so the bare word only explains; `github create` does it.
@@ -2968,7 +2973,13 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
     # "Show conversation turns", `silkworm tasks --all`, and the callers that
     # must see every running turn (deploy's wait, status --json).
     turns = bool(payload.get("turns"))
+    # Archived projects' tasks leave the all-projects lists and counts
+    # (projects.unshelved), not only the pickers; asking for the project by
+    # name, or `archived`, still shows them.
+    shelved = set() if project or payload.get("archived") else archived_projects()
     def _filter(items):
+        if shelved:
+            items = projects.unshelved(items, shelved, by_id=task_store.all())
         return [t for t in items if (not project or (t.get("project") or "") == project)
                 and tasks.on_board(t, turns)]
     # `slim`: rows cut to what the dashboard's task panel draws (board.panel_row);
@@ -2981,14 +2992,14 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
                  else sorted(task_store.all().values(),
                              key=lambda t: -(t.get("created") or 0)))
         return {"ok": True, "tasks": rows(_with_costs(_filter(items)[:200])),
-                "counts": task_store.counts(turns), **_spend(project)}
+                "counts": task_store.counts(turns, shelved), **_spend(project)}
     if action == "attention":
         return {"ok": True, "tasks": rows(_with_costs(_filter(task_store.needs_attention()))),
-                "counts": task_store.counts(turns), **_spend(project)}
+                "counts": task_store.counts(turns, shelved), **_spend(project)}
     if action == "counts":
         # The dashboard's badge, polled every five seconds: the counts and
         # nothing else, where `list` would hand it two hundred whole tasks.
-        return {"ok": True, "counts": task_store.counts(turns)}
+        return {"ok": True, "counts": task_store.counts(turns, shelved)}
     if action == "watching":
         # Scheduled wake-ups specifically, not everything parked in `blocked`:
         # a quota-blocked retry is the system waiting on itself, while a watch
@@ -3035,7 +3046,7 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
         # One project's columns -- or every project's, or board.UNFILED's.
         prec = project_store.get(project) if project and project != board.UNFILED else None
         return {"ok": True, "project": project, **board.board(
-            list(task_store.all().values()), project,
+            projects.unshelved(task_store.all().values(), shelved), project,
             role=payload.get("role") or "", state=payload.get("state") or "",
             q=payload.get("q") or "", unmerged_rows=board_survey(), turns=turns),
             # For the header and the new-task form: what the project is called
@@ -3085,7 +3096,7 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
         # project (inbox.py). Read-only; the survey is the board's cached one.
         everyone = project_store.all()
         return {"ok": True, **inbox.build(
-            task_store.all().values(), unmerged_rows=board_survey(),
+            task_store.all().values(), unmerged_rows=board_survey(), shelved=shelved,
             plan=OPERATOR.plan(), health_rows=health_rows() or (),
             operator_thread=OPERATOR.thread() or "",
             project_titles={p["slug"]: p.get("title") or p["slug"] for p in everyone})}
@@ -3563,13 +3574,129 @@ def handle_projects(payload: dict, _lifted: dict | None = None) -> dict:
             return {"ok": bool(rec), "project": rec,
                     "error": "" if rec else "unknown project"}
         return {"ok": True, "brief": project_store.brief_for(slug)}
+    if action in ("retire-plan", "retire"):
+        return retire_project(payload, action == "retire")
     if action in ("archive", "unarchive"):
-        # Hidden from the overview and the pickers; nothing is deleted, its
-        # tasks keep their label, and unarchiving brings it all back.
+        # Hidden from the overview and the pickers, and its tasks and threads
+        # from the all-projects lists (projects.unshelved); nothing is
+        # deleted, its tasks keep their label, and unarchiving brings it all
+        # back.
         ok = project_store.set_archived(payload.get("slug", ""), action == "archive")
         return {"ok": ok, "error": "" if ok else "unknown project",
                 "project": project_store.get(payload.get("slug", "")) if ok else None}
     return {"ok": False, "error": f"unknown action {action!r}"}
+
+
+def archived_projects() -> set:
+    """The archived projects' slugs: what the all-projects views leave out
+    (projects.unshelved). The one place they are read for that."""
+    return projects.archived_slugs(project_store.all())
+
+
+def shelve_from_slack(entry: dict, arg: str) -> str:
+    """`!project archive|unarchive|retire [name] [confirm]`: the dashboard's
+    Archive, Unarchive and Retire, for this thread's project or the one named.
+
+    Retire is shown first and done on `confirm`, as the dashboard asks before
+    it: it closes tasks. With nothing open to close there is nothing to ask.
+    """
+    words = arg.split()
+    verb = words[0].lower()
+    rest = words[1:]
+    confirm = bool(rest) and rest[-1].lower() == "confirm"
+    if confirm:
+        rest = rest[:-1]
+    name = " ".join(rest).strip()
+    slug = project_store.slug_for(name) if name else (entry.get("project") or "")
+    if not slug:
+        return f"Which project? `!project {verb} <name>`, or file this thread under one first."
+    rec = project_store.get(slug)
+    if not rec:
+        return f"No project called `{name or slug}`."
+    if verb in ("archive", "unarchive"):
+        out = handle_projects({"action": verb, "slug": slug})
+        if not out.get("ok"):
+            return f"Could not {verb} `{slug}`: {out.get('error')}"
+        return (f":file_cabinet: Archived *{rec.get('title') or slug}*: it and its tasks are off the "
+                "board, the inbox, the pickers and the digest. `!project unarchive "
+                f"{slug}` brings it all back." if verb == "archive" else
+                f"*{rec.get('title') or slug}* is back.")
+    plan = retire_project({"slug": slug}, act=False)
+    if plan["running"]:
+        return (f"`{slug}` has {len(plan['running'])} running task(s); wait for "
+                "them to finish, or cancel them, then retire.")
+    if plan["close"] and not confirm:
+        lines = "\n".join(f"• `{t['id']}` {t['state']} — {t['title']}" for t in plan["close"][:15])
+        more = f"\n…and {len(plan['close']) - 15} more" if len(plan["close"]) > 15 else ""
+        return (f"Retiring *{rec.get('title') or slug}* archives it and dismisses its "
+                f"{len(plan['close'])} open task(s):\n{lines}{more}\n"
+                f"Done tasks and their branches are left as they are. "
+                f"`!project retire {slug} confirm` to go ahead.")
+    out = retire_project({"slug": slug}, act=True)
+    if not out.get("ok"):
+        return f"Could not retire `{slug}`: {out.get('error')}"
+    left = out.get("left") or []
+    return (f":file_cabinet: Retired *{rec.get('title') or slug}*: archived, "
+            f"{len(out.get('closed') or [])} task(s) dismissed"
+            + (f", {len(left)} could not be ({', '.join(l['id'] for l in left)})" if left else "")
+            + f". `!project unarchive {slug}` brings the project back.")
+
+
+def retire_project(payload: dict, act: bool) -> dict:
+    """Retire a project: archive it and close its open work (projects.retire_plan).
+
+    `act` False is the preview the confirmation shows. Archiving alone hides
+    a project; retiring is for one you are done with, so nothing of it is
+    left queued to run, waiting on you, or counted. Refused while one of its
+    tasks runs -- Retire does not kill work -- and from inside a turn: it
+    dismisses tasks, which is yours to decide, from the dashboard or with
+    `!project retire` in Slack. Unarchiving brings the project back; the
+    closed tasks stay closed. Each is closed as Dismiss closes it, on the
+    state it was seen in, so one the runner claimed meanwhile is left alone.
+    """
+    slug = (payload.get("slug") or "").strip()
+    rec = project_store.get(slug)
+    if not rec:
+        return {"ok": False, "error": "unknown project"}
+    plan = projects.retire_plan(slug, task_store.all().values())
+    def brief(t):
+        return {"id": t.get("id"), "state": t.get("state"),
+                "title": (t.get("title") or "")[:120]}
+    preview = {"close": [brief(t) for t in plan["close"]],
+               "running": [brief(t) for t in plan["running"]]}
+    if not act:
+        return {"ok": True, "slug": slug, "archived": bool(rec.get("archived")), **preview}
+    if payload.get("caller_role") or payload.get("caller_thread"):
+        return {"ok": False, "error": "retiring a project closes its open tasks, which is "
+                                      "yours to decide: Retire on its dashboard page, or "
+                                      "`!project retire` in Slack", **preview}
+    if plan["running"]:
+        n = len(plan["running"])
+        return {"ok": False, "error": f"{n} of its tasks {'is' if n == 1 else 'are'} running; "
+                                      "wait for it to finish, or cancel it, then retire",
+                **preview}
+    closed, left = [], []
+    for t in plan["close"]:
+        tid = t.get("id")
+        try:
+            held = holding.for_task(t)
+            task_store.transition(tid, tasks.CANCELLED,
+                                  f"dismiss via retire {slug}"
+                                  + (f" ({holding.short(held)})" if held else ""),
+                                  expect=t.get("state") or "")
+            closed.append(tid)
+            if held:
+                tell_thread(t.get("thread", ""), holding.note(held))
+        except (tasks.InvalidTransition, tasks.NotEditable, KeyError) as e:
+            left.append({"id": tid, "error": str(e)})
+        except Exception:
+            log.exception("retire %s: closing %s failed", slug, tid)
+            left.append({"id": tid, "error": "closing it failed"})
+    ok = project_store.set_archived(slug, True)
+    log.info("retired %s: closed %d task(s), %d left", slug, len(closed), len(left))
+    return {"ok": ok, "slug": slug, "closed": closed, "left": left,
+            "error": "" if ok else "unknown project",
+            "project": project_store.get(slug)}
 
 
 def handle_release(payload: dict) -> dict:
@@ -4489,9 +4616,11 @@ BOARD = home.Board(
     store=task_store, call=handle_tasks, allowed_users=ALLOWED_USERS,
     base_url=TEAM_URL,
     watching=lambda: handle_tasks({"action": "watching"}).get("watching", []),
-    unmerged=lambda: branches.line(branches.survey(list(task_store.all().values()),
-                                                       scope_for=project_store.scope_for)),
-    releasable=releasable_projects, release_call=handle_releases)
+    unmerged=lambda: branches.line(branches.survey(
+        projects.unshelved(task_store.all().values(), archived_projects()),
+        scope_for=project_store.scope_for)),
+    releasable=releasable_projects, release_call=handle_releases,
+    shelved=lambda: archived_projects())
 home.register(app, BOARD)
 
 server.start()
@@ -7458,7 +7587,8 @@ def send_digest(schedule, now: datetime) -> dict:
     """Post today's digest to the home DM -- never the board channel, where
     any message pushes the board up the screen -- and mark the day only once
     it has actually gone out, so a failure is retried on the next beat."""
-    records = list(task_store.all().values())
+    # Archived projects are left out, as from the board (projects.unshelved).
+    records = projects.unshelved(task_store.all().values(), archived_projects())
     rows, released = digest_inputs(records)
     try:
         found = unregistered_repos()
@@ -7467,7 +7597,7 @@ def send_digest(schedule, now: datetime) -> dict:
         found = []
     try:
         red = {p["slug"]: p["main_failing"] for p in project_store.all()
-               if p.get("main_failing")}
+               if p.get("main_failing") and not p.get("archived")}
     except Exception:
         log.exception("digest: reading failing bases failed")
         red = {}

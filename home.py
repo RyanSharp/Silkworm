@@ -30,6 +30,7 @@ import threading
 import time
 
 import costs
+import projects
 import research
 import slacklinks
 import tasks
@@ -633,8 +634,12 @@ class Home:
     UNMERGED_S = 300   # the survey asks git about every branch; cache it
 
     def __init__(self, *, store, call, allowed_users, base_url="",
-                 watching=None, unmerged=None, releasable=None, release_call=None):
+                 watching=None, unmerged=None, releasable=None, release_call=None,
+                 shelved=None):
         self.store = store
+        #: The archived projects' slugs: their tasks are left off the board
+        #: as off the dashboard's (projects.unshelved).
+        self._shelved = shelved or (lambda: set())
         self.call = call
         #: bot.handle_releases, and the projects with something to release.
         self.release_call = release_call
@@ -1002,12 +1007,23 @@ class Board(Home):
         except Exception:
             log.exception("watching list failed")
             watching = []
-        items = tasks.mark_no_retry([dict(r, id=tid) for tid, r in self.store.all().items()])
+        items = tasks.mark_no_retry(self.listed())
         return render(items, now=now, watching=watching, unmerged=self.unmerged(),
                       base_url=self.base_url, max_blocks=self.MAX_BLOCKS,
                       max_attention=self.MAX_ATTENTION,
                       notice=self.current_notice(),
                       releasable=self.releasable())["blocks"]
+
+    def listed(self) -> list[dict]:
+        """Every task the board may show: all of them, less the archived
+        projects' (projects.unshelved), except work running or queued."""
+        recs = [dict(r, id=tid) for tid, r in self.store.all().items()]
+        try:
+            shelved = set(self._shelved() or ())
+        except Exception:
+            log.exception("reading archived projects failed")
+            shelved = set()
+        return projects.unshelved(recs, shelved)
 
     def current_notice(self) -> str:
         """The latest click's result, while it is fresh. On the board itself,
@@ -1024,8 +1040,8 @@ class Board(Home):
     def fingerprint(self) -> str:
         """What the board shows, minus the clock: which tasks, in which state,
         last touched when -- so a redraw happens when something did."""
-        rows = sorted((tid, r.get("state"), r.get("updated"))
-                      for tid, r in self.store.all().items()
+        rows = sorted((r.get("id"), r.get("state"), r.get("updated"))
+                      for r in self.listed()
                       if r.get("state") in tasks.NEEDS_ATTENTION + (tasks.RUNNING, tasks.QUEUED))
         try:
             watching = sorted(str(w.get("id")) for w in (self._watching() or []))
@@ -1088,7 +1104,7 @@ class Board(Home):
             if ts and not force and print_ == last and time.time() - at < self.STALE_S:
                 return "unchanged"
             blocks = self.blocks()
-            need = sum(1 for t in self.store.all().values()
+            need = sum(1 for t in self.listed()
                        if t.get("state") in tasks.NEEDS_ATTENTION)
             text = f"Silkworm board: {need} need you"
             if ts:
