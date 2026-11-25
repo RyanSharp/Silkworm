@@ -3859,7 +3859,8 @@ unstick(document.body, 1500);
 // gone from every redraw (pendingGone), polls included.
 // Swipes made while an Undo is still showing join it: one window for all of
 // them, restarted by each swipe, and one "Undo N" that brings them all back.
-// So no swipe is ever sent while the toast that could undo it is gone.
+// So no swipe is ever sent while the toast that could undo it is gone --
+// another toast over it included: its window waits and the Undo comes back.
 const pendingGone = new Map();         // task id -> {action, label, batch, sent}
 const UNDO_MS = 5000;
 let undoBatch = null;                  // {items, timer}: the swipes the toast's Undo covers
@@ -3877,10 +3878,19 @@ function deferTask(id, action, label, extra) {
   const b = undoBatch, p = {id, action, label, batch: b, extra: extra || null};
   pendingGone.set(id, p);
   b.items.push(p);
+  b.label = label;
+  b.show = () => showUndo(b);
+  showUndo(b);
+}
+// Still waiting on its Undo: something in it neither sent nor undone.
+function undoWaiting(b) { return !!(b && b.items && b.items.some(q => !q.sent && pendingGone.get(q.id) === q)); }
+// The batch's Undo toast, with a whole window from now. Also how it comes
+// back after another toast covered it (see toast(): its window waits).
+function showUndo(b) {
   clearTimeout(b.timer);
   b.timer = setTimeout(() => { for (const q of b.items) sendDeferred(q.id); }, UNDO_MS);
   const n = b.items.length;
-  toast(n > 1 ? `${label} (and ${n - 1} more)` : label, UNDO_MS, {undoLabel: n > 1 ? `Undo ${n}` : "Undo", undo: () => {
+  toast(n > 1 ? `${b.label} (and ${n - 1} more)` : b.label, UNDO_MS, {batch: b, undoLabel: n > 1 ? `Undo ${n}` : "Undo", undo: () => {
     // Too late once it has gone to the server (the app was put away, or the
     // window ran out): said, never shown as undone.
     const back = b.items.filter(q => !q.sent && pendingGone.get(q.id) === q);
@@ -4095,7 +4105,14 @@ function md(src) {
 function toast(msg, ms, opts) {
   const t = document.getElementById("toast");
   opts = opts || {};
-  toast.owner = null;                  // whoever set the last one: deferTask claims it after
+  // Covering a swipe's Undo (a thread hidden, a refusal, anything): its
+  // window waits, and the Undo comes back once this one goes -- so no swipe
+  // is sent while the toast that could undo it is out of sight.
+  let d = toast.displaced;
+  const prev = toast.owner;
+  if (prev && prev !== opts.batch && undoWaiting(prev)) { clearTimeout(prev.timer); d = prev; }
+  toast.displaced = d && d !== opts.batch && undoWaiting(d) ? d : null;
+  toast.owner = null;                  // whoever set the last one: showUndo claims it after
   clearTimeout(toast.timer); clearTimeout(toast.gone);
   if (opts.undo) {
     t.innerHTML = `<span class="tmsg"></span><button class="undo" type="button">Undo</button>`;
@@ -4115,6 +4132,9 @@ function toast(msg, ms, opts) {
 }
 function hideToast(t) {
   clearTimeout(toast.timer);
+  const d = toast.displaced;
+  toast.displaced = null;
+  if (undoWaiting(d)) { d.show(); return; }
   if (!moving() || !t.classList) { t.style.display = "none"; return; }
   t.classList.remove("show"); t.classList.add("leaving");
   toast.gone = setTimeout(() => { t.style.display = "none"; t.classList.remove("leaving"); }, 180);

@@ -37883,6 +37883,35 @@ const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r
   out.twoSent = {ids: posts().slice(s0).map(c => c.body.id), pending: M.pendingGone.size,
                  toastGone: toastEl.classList.contains("leaving") || toastEl.style.display === "none"};
 
+  // Another toast over a swipe's Undo (a thread hidden, a refusal): the swipe
+  // is not sent while it is covered, and its Undo comes back after.
+  const c1 = card("tsk_c1", "Covered"), c0 = posts().length;
+  drag(c1.t, -250, 0); up(); finishAll();
+  runTimers(now + 1000);
+  M.toast("Hidden: Some thread", 5000, {undo: () => {}});
+  out.covered = {text: toastEl.text};
+  runTimers(now + 4500); await flushAsync();       // past the swipe's own 5s, the other toast still up
+  out.coveredBeforeBack = {posts: posts().length - c0, pending: M.pendingGone.has("tsk_c1")};
+  runTimers(now + 600); runTimers(now + 300); await flushAsync();
+  out.coveredBack = {text: toastEl.text, display: toastEl.style.display, posts: posts().length - c0};
+  runTimers(now + 4000); await flushAsync();
+  out.coveredStillHeld = posts().length - c0;        // a whole window from when it came back
+  runTimers(now + 1100); await flushAsync();
+  out.coveredSent = {ids: posts().slice(c0).map(c => c.body.id), pending: M.pendingGone.has("tsk_c1")};
+  // The covering toast's own Undo tapped: the swipe's Undo is back at once.
+  const c2 = card("tsk_c2", "Covered again"), c3 = posts().length;
+  drag(c2.t, 250, 0); up(); finishAll();
+  M.toast("Hidden: Another", 5000, {undo: () => {}});
+  M.toast("Saved");                                  // and a third over that: still waiting
+  runTimers(now + 2600); runTimers(now + 300);
+  out.chainBack = toastEl.text;
+  M.toast("Hidden: Third", 5000, {undo: () => {}});
+  toastEl.children.find(c => c.className === "undo").onclick();
+  out.tappedBack = {text: toastEl.text, posts: posts().length - c3};
+  toastEl.children.find(c => c.className === "undo").onclick();
+  runTimers(now + 6000); await flushAsync();
+  out.coveredUndone = {posts: posts().length - c3, pending: M.pendingGone.has("tsk_c2")};
+
   // Not far enough: it springs back, nothing is pending.
   const e = card("tsk_e", "Almost");
   drag(e.t, -60, 0); up(); finishAll();
@@ -38309,6 +38338,19 @@ def test_dashboard_swipe_undo_and_optimism():
     check("...and 'Undo 2' brings both back with nothing sent", o["twoUndone"] == {"posts": 0, "pending": False}, o["twoUndone"])
     check("left alone, both are sent once the shared window is up, and the toast goes",
           o["twoSent"] == {"ids": ["tsk_s3", "tsk_s4"], "pending": 0, "toastGone": True}, o["twoSent"])
+    check("another toast over a swipe's Undo: the swipe is not sent while it is covered",
+          o["covered"] == {"text": "Hidden: Some thread Undo"}
+          and o["coveredBeforeBack"] == {"posts": 0, "pending": True}, (o["covered"], o["coveredBeforeBack"]))
+    check("...its Undo comes back once that toast goes, with a whole window, then it is sent",
+          o["coveredBack"] == {"text": "Dismissed: Covered Undo", "display": "flex", "posts": 0}
+          and o["coveredStillHeld"] == 0
+          and o["coveredSent"] == {"ids": ["tsk_c1"], "pending": False},
+          (o["coveredBack"], o["coveredStillHeld"], o["coveredSent"]))
+    check("toasts piled on toasts still give it back; so does tapping the covering toast's own Undo",
+          o["chainBack"] == "Accepted: Covered again Undo"
+          and o["tappedBack"] == {"text": "Accepted: Covered again Undo", "posts": 0}
+          and o["coveredUndone"] == {"posts": 0, "pending": False},
+          (o["chainBack"], o["tappedBack"], o["coveredUndone"]))
     check("not far enough, it springs back and nothing is pending",
           o["short"] == {"pending": False, "transform": "", "swiping": False}, o["short"])
     check("a mostly vertical drag is a scroll, not a swipe", o["vertical"] == {"pending": False, "swiping": False})
