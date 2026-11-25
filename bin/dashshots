@@ -205,7 +205,10 @@ def stand_in(real_port: str):
             if self.path in READ_ROUTES:
                 allowed, action = {action}, action
             if self.path == "/plan" and action == "show":
-                answer = {"ok": True, "plan": sample_ops_plan()[1]}
+                # DASHSHOTS_PLAN=live: the bot's own plan, as it is now (a read).
+                answer = (forward(real_port, self.path, payload)
+                          if os.environ.get("DASHSHOTS_PLAN") == "live"
+                          else {"ok": True, "plan": sample_ops_plan()[1]})
             elif self.path == "/releases" and action == "plan":
                 answer = SAMPLE_PLAN
             elif self.path == "/releases" and action == "status":
@@ -233,7 +236,8 @@ def stand_in(real_port: str):
                     # A running bot older than the spend view: built here by
                     # this checkout's spend.py, over tasks.json read only.
                     answer = local_spend()
-                if self.path == "/tasks" and action == "inbox":
+                if (self.path == "/tasks" and action == "inbox"
+                        and os.environ.get("DASHSHOTS_PLAN") != "live"):
                     answer = with_sample_plan(answer)
             else:
                 answer = {"ok": False, "error": "screenshot harness: read-only"}
@@ -268,7 +272,8 @@ def _sample_ops_plan() -> tuple[dict, dict]:
     """(raw plan, card): a fixed plan of ops in the operator's real thread, for
     its card -- the live one is usually spent, and a press here is refused.
     DASHSHOTS_PLAN=ran photographs it after Run selected: entry 1 ok, entry 2
-    failed with its output, entry 3 not chosen."""
+    failed with its output, entry 3 not chosen. DASHSHOTS_PLAN=live shows the
+    bot's own recorded plan instead (read through), and adds no sample."""
     sys.path.insert(0, str(REPO))
     import ops
     import operator_role

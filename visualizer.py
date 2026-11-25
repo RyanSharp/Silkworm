@@ -2378,25 +2378,31 @@ PAGE = r"""<!doctype html>
   .icard .acts { margin-top: var(--sp-2); display: flex; gap: var(--sp-15); flex-wrap: wrap; }
   .icard .acts button { font-size: var(--fs-sm); }
   .icard .acts button.rec { box-shadow: 0 0 0 2px var(--accent-line); }
-  .pcard .pents { list-style: none; margin: var(--sp-2) 0 0; padding: 0; }
-  .pcard .pent { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-15) 0;
+  .opcard .pents { list-style: none; margin: var(--sp-2) 0 0; padding: 0; }
+  .opcard .pent { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-15) 0;
                  border-top: 1px solid var(--line); }
-  .pcard .pent:first-child { border-top: 0; }
-  .pcard .pent input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
-  .pcard .pbody { min-width: 0; flex: 1; }
-  .pcard .pcmd { font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
-  .pcard .pcmd b { color: var(--gold); margin-right: var(--sp-1); }
-  .pcard .pdesc { font-size: var(--fs-sm); margin-top: var(--sp-05); overflow-wrap: anywhere; }
-  .pcard .pchg { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--sp-05); overflow-wrap: anywhere; }
-  .pcard .pres { font-size: var(--fs-sm); margin-top: var(--sp-1); font-weight: var(--fw-semi); }
-  .pcard .pres.ok { color: var(--ok); }
-  .pcard .pres.failed { color: var(--bad); }
-  .pcard .pres.running, .pcard .pres.queued { color: var(--info); }
-  .pcard .ptail { font-family: var(--mono); font-size: var(--fs-2xs); white-space: pre-wrap; overflow-wrap: anywhere;
+  .opcard .pent:first-child { border-top: 0; }
+  .opcard .pent input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
+  .opcard .pbody { min-width: 0; flex: 1; }
+  .opcard .pcmd { font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+  .opcard .pcmd b { color: var(--gold); margin-right: var(--sp-1); }
+  .opcard .pdesc { font-size: var(--fs-sm); margin-top: var(--sp-05); overflow-wrap: anywhere; }
+  .opcard .pchg { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--sp-05); overflow-wrap: anywhere; }
+  .opcard .pres { font-size: var(--fs-sm); margin-top: var(--sp-1); font-weight: var(--fw-semi); }
+  .opcard .pres.ok { color: var(--ok); }
+  .opcard .pres.failed { color: var(--bad); }
+  .opcard .pres.running, .opcard .pres.queued { color: var(--info); }
+  .opcard .ptail { font-family: var(--mono); font-size: var(--fs-2xs); white-space: pre-wrap; overflow-wrap: anywhere;
                   background: var(--fill-2); border-radius: var(--r-xs); padding: var(--sp-1) var(--sp-15);
                   margin: var(--sp-1) 0 0; max-height: 9em; overflow: auto; }
-  .pcard .pnote { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--sp-2); overflow-wrap: anywhere; }
-  .pcard button[disabled] { opacity: .45; cursor: default; }
+  .opcard .pnote { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--sp-2); overflow-wrap: anywhere; }
+  .opcard button[disabled] { opacity: .45; cursor: default; }
+  .opcard .px { min-width: var(--tap); min-height: var(--tap); padding: 0; flex: none;
+                 font-size: var(--fs-lg); line-height: 1; border: 0; color: var(--muted); }
+  .opcard.pline { display: flex; align-items: center; gap: var(--sp-2); padding-top: var(--sp-1);
+                  padding-bottom: var(--sp-1); color: var(--muted); font-size: var(--fs-sm); }
+  .opcard.pline .plt { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .opcard.pline .ikind, .opcard.pline .iage { font-family: var(--mono); font-size: var(--fs-2xs); flex: none; }
   #tplan { margin: var(--sp-3) 0; }
   #tplan:empty { display: none; }
   .inbox .iempty { color: var(--muted); font-size: var(--fs-md); padding: var(--sp-6) 0; text-align: center; }
@@ -8952,7 +8958,7 @@ function inboxButtons(it) {
   return {btns, chip};
 }
 function inboxCard(it) {
-  if (it.kind === "plan") return planCardHtml(planView && planView.id === it.id ? planView : planFromItem(it), "inbox");
+  if (it.kind === "plan") return planCardHtml(planForItem(it), "inbox");
   const isTask = it.kind !== "plan" && it.kind !== "decision";
   const {btns, chip} = inboxButtons(it);
   const swipe = it.kind === "proposal" ? swipeAttr({state: it.state, role: it.role}) : "";
@@ -8965,7 +8971,7 @@ function inboxCard(it) {
 }
 function inboxHtml(d) {
   // Left out while their Undo shows, as on the board (pendingGone).
-  const groups = ((d && d.groups) || []).map(g => ({...g, items: (g.items || []).filter(notGone)}))
+  const groups = ((d && d.groups) || []).map(g => ({...g, items: (g.items || []).filter(it => notGone(it) && planItemShown(it))}))
     .filter(g => g.items.length);
   const n = groups.reduce((k, g) => k + g.items.length, 0);
   const ran = planRecent(), hasPlan = groups.some(g => g.items.some(i => i.kind === "plan"));
@@ -8989,7 +8995,7 @@ function drawInbox(d) {
     // poll, or the swipe's own redraw, catches up).
     if (el && !(swipe && swipe.on && el.contains(swipe.el))) setHTML(el, html);
   }
-  const n = inboxItems(d).filter(notGone).length;
+  const n = inboxItems(d).filter(it => notGone(it) && planItemShown(it)).length;
   for (const id of ["inboxcount", "homecount"]) {
     const c = document.getElementById(id);
     if (c) c.textContent = n ? String(n) : "";
@@ -9058,12 +9064,37 @@ function openThread(key) {
 // step's outcome comes back into the card as it runs. A typed yes still works.
 let planView = null, planAsk = 0, planTick = 0, planDrawn = {};
 const planTicks = new Map();          // plan id -> the entry numbers ticked
+// Plans your Not now or × just cleared: gone from the screen at once, before
+// the bot answers (and back, with what went wrong, if it refuses).
+const planHidden = new Set();
 const PLAN_STATE = {queued: "Waiting its turn", running: "Running…", ok: "✓ ok", failed: "✗ failed"};
 function planFromItem(it) {
   // Drawn from the inbox's item until the plan itself has been read.
   return {id: it.id, thread: it.thread, at: it.at, status: "waiting", runnable: true, running: false,
           entries: (it.entries || []).map(e => ({n: e.n, command: e.command, description: "",
                                                  changes: "", used: false, result: null}))};
+}
+// The plan as it stands now: a waiting plan whose day has run out is expired
+// here too, whatever the last read said (the bot refuses it all the same).
+function planNow(c) {
+  if (c && c.status === "waiting" && c.expires_at && Date.now() / 1000 >= c.expires_at && !c.running)
+    return {...c, status: "expired", runnable: false};
+  return c;
+}
+// How a plan is drawn: "full" -- its card, with what can be pressed -- only
+// while it waits for you, while what you chose runs, and for ten minutes
+// after your press's last result came in (to read them); "line" -- a single
+// line saying what became of it, with its × -- once it can no longer be
+// pressed (spent, answered, declined, expired, replaced); "none" once
+// cleared (its ×, Not now, `silkworm ops plan --decline`), for good.
+function planMode(c) {
+  if (!c || c.dismissed || planHidden.has(c.id)) return "none";
+  if (c.running || c.runnable) return "full";
+  if (c.answered_via === "dashboard" && !c.declined) {
+    const last = Math.max(0, ...(c.entries || []).map(e => (e.result && e.result.at) || 0));
+    if (last && Date.now() / 1000 - last < 600) return "full";
+  }
+  return "line";
 }
 function planNote(c) {
   if (c.running) return "Running what you chose — each step's result appears here as it finishes.";
@@ -9078,9 +9109,35 @@ function planNote(c) {
     replaced: "The operator has moved to another thread: this plan can no longer run.",
   }[c.status] || "";
 }
+// The one line a plan that can no longer be pressed collapses to.
+function planLineText(c) {
+  const ents = c.entries || [], n = ents.length;
+  const failed = ents.filter(e => e.result && e.result.state === "failed").length;
+  const what = c.status === "spent" ? (n === 1 ? "its step has run" : `all ${n} steps have run`)
+    : c.status === "expired" ? "expired unanswered"
+    : c.status === "replaced" ? "replaced — the operator moved thread"
+    : c.declined ? (c.answered_via === "dashboard" ? "you said not now" : "declined")
+    : c.answered_via === "dashboard" ? "answered on the dashboard"
+    : "answered in its thread";
+  return what + (failed ? ` · ${failed} failed` : "");
+}
+function planX(c) {
+  // The ×: clears the card whatever its state (a waiting plan is declined).
+  return c.running ? "" : `<button class="ghost px" data-pact="dismiss" data-plan="${esc(c.id)}" title="${
+    c.runnable ? "Not now, and clear it" : "Clear it"}" aria-label="Clear this plan" onclick="planPress(this)">×</button>`;
+}
 function planLeft(c) { return (c.entries || []).filter(e => !e.used); }
 function planCardHtml(c, where) {
-  if (!c) return "";
+  c = planNow(c);
+  const mode = planMode(c);
+  if (mode === "none") return "";
+  if (mode === "line") {
+    // Needs you lists only what needs you: a plan done with is the thread's line.
+    if (where === "inbox") return "";
+    return `<div class="icard k-plan opcard pline" data-id="${esc(c.id)}" data-where="${where}" data-status="${
+        esc(c.status || "")}"><span class="ikind k-plan">Ops plan</span><span class="plt">${esc(c.id)}: ${
+        esc(planLineText(c))}</span><span class="iage">${c.at ? age(c.at) : ""}</span>${planX(c)}</div>`;
+  }
   const live = !!c.runnable && !c.running, left = planLeft(c);
   const ticks = planTicks.get(c.id) || new Set();
   const picked = left.filter(e => ticks.has(e.n)).length;
@@ -9103,24 +9160,38 @@ function planCardHtml(c, where) {
   const head = live ? `${left.length} step${left.length === 1 ? "" : "s"} waiting for you`
              : c.running ? "running" : {spent: "done", expired: "expired", replaced: "no longer live"}[c.status]
              || (c.declined ? "declined" : "answered");
-  return `<div class="icard k-plan pcard" data-id="${esc(c.id)}" data-where="${where}" data-status="${
+  // Only what can be pressed is drawn as a button: a run's card, once
+  // answered, keeps its results and its ×, not dead Run / Not now.
+  const acts = live ? `<div class="acts">${btn("all", "act", "Run all", left.length)}${
+      btn("selected", "ghost", `Run selected${picked ? ` (${picked})` : ""}`, picked)}${
+      btn("decline", "ghost", "Not now", true)}</div>` : "";
+  return `<div class="icard k-plan opcard" data-id="${esc(c.id)}" data-where="${where}" data-status="${
       esc(c.running ? "running" : c.status || "")}">
     <div class="ihead"><span class="ikind k-plan">Ops plan</span><span>${esc(c.id)}</span><span class="iage">${
-      c.at ? age(c.at) : ""}</span></div>
+      c.at ? age(c.at) : ""}</span>${planX(c)}</div>
     <div class="tt">The operator's plan (${n} step${n === 1 ? "" : "s"}): ${esc(head)}</div>
     <ol class="pents">${ents}</ol>
-    <div class="acts">${btn("all", "act", "Run all", live && left.length)}${
-      btn("selected", "ghost", `Run selected${picked ? ` (${picked})` : ""}`, live && picked)}${
-      btn("decline", "ghost", "Not now", live)}</div>${note ? `<div class="pnote">${esc(note)}</div>` : ""}</div>`;
+    ${acts}${note ? `<div class="pnote">${esc(note)}</div>` : ""}</div>`;
 }
 // The plan your press just answered, still on Needs you while it runs and a
 // little after: the inbox lists only plans waiting for an answer.
 function planRecent() {
   const c = planView;
-  if (!c || c.answered_via !== "dashboard") return null;
-  if (c.running) return c;
-  const last = Math.max(0, ...(c.entries || []).map(e => (e.result && e.result.at) || 0));
-  return last && Date.now() / 1000 - last < 600 ? c : null;
+  if (!c || c.answered_via !== "dashboard" || c.declined) return null;
+  return planMode(c) === "full" ? c : null;
+}
+// The plan an inbox item names, as last read from the bot: its own read when
+// that is the same plan; none when a newer plan has replaced it.
+function planForItem(it) {
+  if (planHidden.has(it.id)) return null;
+  if (planView && planView.id === it.id) return planView;
+  if (planView && (planView.at || 0) > (it.at || 0)) return null;
+  return planFromItem(it);
+}
+function planItemShown(it) {
+  if (it.kind !== "plan") return true;
+  const c = planForItem(it);
+  return !!c && planMode(planNow(c)) === "full";
 }
 // Under the open thread when it is the plan's; drawn only when it changed.
 function drawPlanThread() {
@@ -9137,10 +9208,10 @@ async function loadPlan() {
   let r;
   try {
     r = await (await fetch("/api/plan", {method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({action: "show"})})).json();
+      body: JSON.stringify({action: "show"}), cache: "no-store"})).json();
   } catch (e) { return; }                      // the last card is kept
   if (ask !== planAsk || !r || !r.ok) return;
-  if (JSON.stringify(r.plan || null) === JSON.stringify(planView)) return;
+  if (JSON.stringify(r.plan || null) === JSON.stringify(planView)) { drawPlan(); return; }
   planView = r.plan || null;
   drawPlan();
 }
@@ -9159,20 +9230,18 @@ function planCard(id) {
   return it ? planFromItem(it) : null;
 }
 async function planPress(el) {
-  const id = el.dataset.plan, kind = el.dataset.pact, c = planCard(id);
+  const id = el.dataset.plan, kind = el.dataset.pact, c = planNow(planCard(id));
+  if (kind === "decline" || kind === "dismiss") return planClear(id, kind, c);
   if (!c || !c.runnable || c.running) return;     // drawn disabled: nothing to answer
   const left = planLeft(c), ticks = planTicks.get(id) || new Set();
-  const what = kind === "all" ? left : kind === "selected" ? left.filter(e => ticks.has(e.n)) : [];
-  if (kind !== "decline") {
-    if (!what.length) { toast("Tick a step first, or press Run all", 4000, {bad: true}); return; }
-    if (!confirm(`Run ${what.length} step${what.length === 1 ? "" : "s"} of the operator's plan?\n\n`
-                 + what.map(e => `${e.n}. ${e.command}`).join("\n")
-                 + "\n\nThis answers the plan as your “yes” in its thread would: steps left out never run. "
-                 + "That can't be undone from here.")) return;
-  }
+  const what = kind === "all" ? left : left.filter(e => ticks.has(e.n));
+  if (!what.length) { toast("Tick a step first, or press Run all", 4000, {bad: true}); return; }
+  if (!confirm(`Run ${what.length} step${what.length === 1 ? "" : "s"} of the operator's plan?\n\n`
+               + what.map(e => `${e.n}. ${e.command}`).join("\n")
+               + "\n\nThis answers the plan as your “yes” in its thread would: steps left out never run. "
+               + "That can't be undone from here.")) return;
   planAsk++;                 // a read sent before this press must not draw over its answer
-  const body = {action: kind === "decline" ? "decline" : "run", plan_id: id,
-                ...(kind === "decline" ? {} : {entries: kind === "all" ? "all" : what.map(e => e.n)})};
+  const body = {action: "run", plan_id: id, entries: kind === "all" ? "all" : what.map(e => e.n)};
   let r;
   try {
     r = await (await fetch("/api/plan", {method: "POST", headers: {"Content-Type": "application/json"},
@@ -9182,8 +9251,31 @@ async function planPress(el) {
   if (!r || !r.ok) toast(`Not done: ${(r && r.error) || "refused"}`, 6000, {bad: true});
   else {
     planTicks.delete(id);
-    toast(kind === "decline" ? "Not now: the plan is declined, nothing in it runs"
-                             : "Running — each step's result appears on the card");
+    toast("Running — each step's result appears on the card");
+  }
+  drawPlan();
+  loadInbox();
+}
+// Not now, and the ×: the card goes at once; the bot declines the plan if it
+// still waits (nothing in it runs) and clears it for good, so a reload does
+// not bring it back. Refused, it comes back, saying why.
+async function planClear(id, kind, c) {
+  if (!id || (c && c.running)) return;
+  planHidden.add(id);
+  planTicks.delete(id);
+  drawPlan();
+  planAsk++;                 // a read sent before this press must not draw it back
+  let r;
+  try {
+    r = await (await fetch("/api/plan", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: kind, plan_id: id})})).json();
+  } catch (e) { r = {ok: false, error: "could not reach the dashboard"}; }
+  if (r && "plan" in r) planView = r.plan || null;
+  if (!r || !r.ok) {
+    planHidden.delete(id);
+    toast(`Not done: ${(r && r.error) || "refused"}`, 6000, {bad: true});
+  } else {
+    toast(r.declined ? "Not now: the plan is declined, nothing in it runs" : "Cleared the plan");
   }
   drawPlan();
   loadInbox();

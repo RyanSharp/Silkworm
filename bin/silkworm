@@ -49,6 +49,9 @@
                                     record the ops (and the guarded landings or publish
                                     it needs your word for) the operator proposed,
                                     numbered, so a plain "yes" or "do 2" from you runs them
+    silkworm ops plan --decline [<plan id>]
+                                    decline the waiting plan (nothing in it runs) and clear
+                                    its card off the dashboard -- a stuck one included
     silkworm publish <project> on|off [--notes N]   push landings to origin, or stop
     silkworm push [status|test|forget-all]  phone notifications: what is set up, send a
                                     test to every subscribed device, or drop them all
@@ -1557,7 +1560,8 @@ def do_release(argv: list, ask=None, state=None) -> int:
 OPS_USAGE = ("usage: silkworm ops list [--json] | log [-n N] [--json] | "
              "run <name> [args …] [--notes TEXT] [--by NAME] [--plan-entry N] | "
              "plan [<name> [args …] [--op <name> [args …]]… "
-             "[--land|--approve <task id>]… [--publish <project>]… --by NAME] [--json]")
+             "[--land|--approve <task id>]… [--publish <project>]… --by NAME] [--json] | "
+             "plan --decline [<plan id>] [--by NAME]")
 #: `ops plan` options that record a guarded action, not an op: landing or
 #: approving work that changes trader's live configuration (trader-config),
 #: or turning publish on where it is off (publish). Your answer to the plan
@@ -1753,6 +1757,8 @@ def do_ops_plan(rest: list, ask) -> int:
     record the ops just proposed as the pending plan, numbered from 1, for the
     user to answer with a plain "yes" or "do 2". With no op, print the live
     plan. Only an operator turn in its home thread records one."""
+    if "--decline" in rest:
+        return do_ops_plan_decline([a for a in rest if a != "--decline"], ask)
     as_json = "--json" in rest
     rest = [a for a in rest if a != "--json"]
     names = [a for a in rest if a != "--by"]
@@ -1800,6 +1806,52 @@ def do_ops_plan(rest: list, ask) -> int:
           "itself -- nothing is left for you to run then:")
     for line in r.get("lines") or []:
         print(line)
+    return EXIT_OK
+
+
+def do_ops_plan_decline(rest: list, ask) -> int:
+    """`silkworm ops plan --decline [<plan id>] [--by NAME]`: clear the
+    recorded plan's card off the dashboard. One still waiting for its answer
+    is declined -- nothing in it runs, as Not now on its card -- and one
+    already spent, answered, expired or replaced is just cleared, so a stuck
+    card can always go. With a plan id, only if that is the plan recorded."""
+    payload, pos, i = {"action": "decline-plan", "by": default_by()}, [], 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--by":
+            if i + 1 >= len(rest) or not rest[i + 1].strip() or rest[i + 1].startswith("--"):
+                print(f"--by needs a value\n{OPS_USAGE}", file=sys.stderr)
+                return EXIT_USAGE
+            payload["by"] = rest[i + 1].strip()
+            i += 2
+            continue
+        if a.startswith("-"):
+            print(f"unknown option {a}\n{OPS_USAGE}", file=sys.stderr)
+            return EXIT_USAGE
+        pos.append(a)
+        i += 1
+    if len(pos) > 1:
+        print(OPS_USAGE, file=sys.stderr)
+        return EXIT_USAGE
+    if pos:
+        payload["plan_id"] = pos[0]
+    try:
+        r = ask("/ops", payload)
+    except BotUnreachable as e:
+        print(f"not done: {e}", file=sys.stderr)
+        return EXIT_UNREACHABLE
+    if not r.get("ok"):
+        print(f"refused: ops plan --decline: {r.get('error') or 'the bot gave no reason'}",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    pid, what = r.get("plan_id") or "?", r.get("outcome") or ""
+    if what == "declined":
+        print(f"declined plan {pid}: nothing in it runs, and its card is off the dashboard")
+    elif what == "already":
+        print(f"plan {pid} was already cleared ({r.get('status') or '?'}); nothing to do")
+    else:
+        print(f"cleared plan {pid} off the dashboard (it was {r.get('status') or '?'}; "
+              "nothing in it was waiting to run)")
     return EXIT_OK
 
 

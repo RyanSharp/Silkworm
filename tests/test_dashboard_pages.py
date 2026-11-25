@@ -2144,8 +2144,8 @@ def test_dashboard_inbox_renders_and_acts():
         "failed": ["retry", "dismiss"], "landing": ["land", "drop"]}, str(per))
     check("in words people use", all(w in desk for w in (">Accept<", ">Dismiss<", ">Approve<", ">Land<",
                                                          ">Close<", ">Send back…<", ">Run all<")))
-    check("the plan and the decision are cards too: the plan's own, with its three buttons",
-          re.findall(r'data-pact="(\w+)"', card("pl_1")) == ["all", "selected", "decline"]
+    check("the plan and the decision are cards too: the plan's own, with its three buttons and its ×",
+          re.findall(r'data-pact="(\w+)"', card("pl_1")) == ["dismiss", "all", "selected", "decline"]
           and 'data-n="2"' in card("pl_1")
           and acts("health:mondays:app-store") == ["discuss"]
           and "decide: submit 1.3 for review, or hold it" in card("health:mondays:app-store"))
@@ -2226,7 +2226,8 @@ def _plan_card_world(**env):
     import ops as OPS
     import operator_role as O
     w = _ops_world()
-    told, tasks_called, projects_called, decided = [], [], [], []
+    # One list for what the thread is told, from /plan and /ops alike.
+    told, tasks_called, projects_called, decided = w.told, [], [], []
     w.probe = _VizProbe()
     w.drain = types.SimpleNamespace(left=0)
     ns = lift("handle_plan", "run_plan_entries", "run_plan_entry", "plan_card_now",
@@ -2387,6 +2388,165 @@ def test_ops_plan_card_runs_only_the_entries_selected():
               w.state.answer_plan(f"{time.time() + 1:.6f}", "yes") is None)
 
 
+def test_ops_plan_card_clears_for_good():
+    import operator_role as O
+    print("\nthe plan's card: Not now and its × clear it for good, whatever state it is in")
+    w = _plan_card_world()
+    os.environ["VIZ_TAILSCALE_LOGIN"] = _OWNER["login"]
+    with _fake_path(w):
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        r = _press(w, "dismiss", pid, owner=None)
+        check("not without you: refused, and still waiting", not r.get("ok") and r.get("refused") == "owner"
+              and _card(w)["status"] == "waiting" and not _card(w)["dismissed"], str(r))
+        r = _press(w, "dismiss", pid, caller_role="operator", caller_thread="D1:1.0")
+        check("nor from inside a turn", not r.get("ok") and r.get("refused") == "turn"
+              and not _card(w)["dismissed"], str(r))
+        r = _press(w, "dismiss", "plan_old")
+        check("nor for a plan other than the one recorded", not r.get("ok") and "read it again" in r["error"]
+              and not _card(w)["dismissed"], str(r))
+        w.calls.write_text("")
+        r = _press(w, "dismiss", pid)
+        c = _card(w)
+        check("its × on a waiting plan declines it: nothing runs, the card cleared",
+              r.get("ok") and r["declined"] and r["dismissed"] and not _calls(w)
+              and c["status"] == "answered" and c["declined"] and c["dismissed"] and not c["runnable"]
+              and c["answered_by"] == _OWNER["login"] and c["answered_via"] == "dashboard", str(c))
+        check("the thread is told", "Not now" in w.told[-1][1] and pid in w.told[-1][1])
+        check("a typed yes answers it no longer",
+              w.state.answer_plan(f"{time.time() + 1:.6f}", "yes") is None)
+        r = _press(w, "dismiss", pid)
+        check("a second × is fine: already cleared", r.get("ok") and not r["declined"] and _card(w)["dismissed"])
+
+        _plan_record(w, "tailscale-on")
+        c = _card(w)
+        check("a new plan is drawn again", c["id"] != pid and c["status"] == "waiting" and not c["dismissed"])
+        pid = c["id"]
+        r = _press(w, "decline", pid)
+        check("Not now declines it and clears its card, so a reload does not bring it back",
+              r.get("ok") and r["declined"] and _card(w)["dismissed"] and _card(w)["declined"], str(r))
+
+        for label, setup in (
+                ("spent", lambda p: w.state.use_plan_entry(p, 1)),
+                ("expired", lambda p: _age_plan(w, O.PLAN_TTL_S + 60)),
+                ("answered by a typed yes", lambda p: _plan_turn(w, "yes")),
+                ("replaced", lambda p: w.state.set_thread("D2:2.0"))):
+            w.state.set_thread("D1:1.0")
+            _plan_record(w, "tailscale-on")
+            pid = _card(w)["id"]
+            setup(pid)
+            before = _card(w)
+            told = len(w.told)
+            r = _press(w, "dismiss", pid)
+            c = _card(w)
+            check(f"{label}: its × clears it, its state left as it was, nobody told it was declined",
+                  before["status"] != "waiting" and r.get("ok") and not r["declined"] and c["dismissed"]
+                  and c["status"] == before["status"] and not c["declined"] and len(w.told) == told,
+                  f"{before['status']} -> {r} {c['status']}")
+        w.state.set_thread("D1:1.0")
+
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        w.state.answer_plan_from_dashboard(pid, [1], by="owner@example.com")
+        w.state.set_entry_result(pid, 1, {"state": "running"})
+        r = _press(w, "dismiss", pid)
+        check("not while what you chose is running: refused, its card kept",
+              not r.get("ok") and "running" in r["error"] and not _card(w)["dismissed"], str(r))
+        # The bot has claimed the run, its entries not yet marked queued: only
+        # _plan_runs says it is running.
+        w.state.set_entry_result(pid, 1, {})
+        w.pns["_plan_runs"].add(pid)
+        got = []
+        t = __import__("threading").Thread(target=lambda: got.append(_press(w, "decline", pid)),
+                                           daemon=True)
+        t.start()
+        t.join(10)
+        check("(nor while the bot is running it -- refused at once, never stuck on its own guard)",
+              got and not got[0].get("ok") and "running" in got[0]["error"]
+              and got[0].get("plan", {}).get("id") == pid, str(got) or "no answer in 10s")
+        if t.is_alive():
+            return                     # a deadlocked guard: nothing after this can run
+        w.pns["_plan_runs"].discard(pid)
+        w.state.set_entry_result(pid, 1, {"state": "ok"})
+        r = _press(w, "dismiss", "")
+        check("a clear names its plan: none named, refused", not r.get("ok") and "plan_id" in r["error"]
+              and not _card(w)["dismissed"], str(r))
+
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        w.state.set_thread("D2:2.0")
+        r = _press(w, "dismiss", pid)
+        w.state.set_thread("D1:1.0")
+        check("a cleared plan is over: its thread coming back does not make it live again",
+              r.get("ok") and w.state.plan() is None and _card(w)["dismissed"]
+              and not _press(w, "run", pid, "all").get("ok")
+              and w.state.answer_plan(f"{time.time() + 1:.6f}", "yes") is None, str(r))
+
+
+def _age_plan(w, by):
+    data = json.loads(w.statefile.read_text())
+    data["plan"]["at"] -= by
+    w.statefile.write_text(json.dumps(data))
+
+
+def test_ops_plan_decline_from_the_cli():
+    print("\nsilkworm ops plan --decline: a stuck plan card can always be cleared")
+    w = _plan_card_world()
+    with _fake_path(w):
+        r = _ops_cli(w, "plan", "--decline", role="", thread="")
+        check("no plan recorded: refused, saying so", r.returncode == 1 and "no plan" in r.stderr,
+              r.stdout + r.stderr)
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        r = _ops_cli(w, "plan", "--decline", "plan_nope", role="", thread="")
+        check("another plan's id: refused, and the plan left waiting",
+              r.returncode == 1 and "read it again" in r.stderr and _card(w)["status"] == "waiting",
+              r.stdout + r.stderr)
+        r = _ops_cli(w, "plan", "--decline", "--sideways", role="", thread="")
+        check("an unknown option is a usage error", r.returncode == 2 and "usage" in r.stderr, r.stderr)
+        r = _ops_cli(w, "plan", "--decline", role="implementor", thread="D5:5.0", task="tsk_other")
+        check("not from another task's turn: the user's answer stays theirs",
+              r.returncode == 1 and "only the operator" in r.stderr and _card(w)["status"] == "waiting",
+              r.stdout + r.stderr)
+        r = _ops_cli(w, "plan", "--decline", thread="D9:9.0", task="tsk_elsewhere")
+        check("nor from an operator turn outside its own thread",
+              r.returncode == 1 and "only the operator" in r.stderr and _card(w)["status"] == "waiting",
+              r.stdout + r.stderr)
+        w.calls.write_text("")
+        r = _ops_cli(w, "plan", "--decline", pid, role="", thread="")
+        c = _card(w)
+        check("from your terminal: the waiting plan is declined, nothing runs, its card cleared",
+              r.returncode == 0 and f"declined plan {pid}" in r.stdout and not _calls(w)
+              and c["declined"] and c["dismissed"] and c["status"] == "answered"
+              and c["answered_by"] == "cli" and c["answered_via"] == "cli", r.stdout + r.stderr + str(c))
+        check("the operator's thread is told", "declined" in w.told[-1][1] and pid in w.told[-1][1],
+              str(w.told[-1:]))
+        check("and no typed yes answers it after",
+              w.state.answer_plan(f"{time.time() + 1:.6f}", "yes") is None)
+        r = _ops_cli(w, "plan", "--decline", role="", thread="")
+        check("again: already cleared, said so", r.returncode == 0 and "already cleared" in r.stdout,
+              r.stdout + r.stderr)
+
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        w.state.use_plan_entry(pid, 1)
+        told = len(w.told)
+        r = _ops_cli(w, "plan", "--decline", "--by", "operator", task="tsk_sweep")
+        c = _card(w)
+        check("a spent plan, from the operator's own turn: just cleared, not declined",
+              r.returncode == 0 and f"cleared plan {pid}" in r.stdout and "spent" in r.stdout
+              and c["dismissed"] and c["status"] == "spent" and not c["declined"]
+              and len(w.told) == told, r.stdout + r.stderr)
+
+        _plan_record(w, "tailscale-on")
+        pid = _card(w)["id"]
+        w.state.answer_plan_from_dashboard(pid, [1], by="owner@example.com")
+        w.state.set_entry_result(pid, 1, {"state": "queued"})
+        r = _ops_cli(w, "plan", "--decline", role="", thread="")
+        check("not while what was chosen is still to run", r.returncode == 1 and "running" in r.stderr
+              and not _card(w)["dismissed"], r.stdout + r.stderr)
+
+
 def test_ops_plan_card_runs_guarded_entries_as_their_buttons():
     import operator_role as O
     print("\nthe plan's card: a land or publish entry is done as its own dashboard button would")
@@ -2505,8 +2665,8 @@ let planAnswer = {ok: true, plan: FIX.waiting};
 let pressAnswer = {ok: true, running: [2], plan: FIX.ran};
 answer = (url, b) => url === "/api/plan" ? (b.action === "show" ? planAnswer : pressAnswer) : BASE(url);
 (0, eval)(SRC + `
-;globalThis.__m = {loadPlan, planCardHtml, planPress, planTickEntry, drawPlan,
-  setActive: a => { active = a; }, plan: () => planView};`);
+;globalThis.__m = {loadPlan, planCardHtml, planPress, planTickEntry, drawPlan, inboxHtml,
+  setActive: a => { active = a; }, plan: () => planView, setPlan: p => { planView = p; }};`);
 const M = globalThis.__m, out = {};
 const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
 const presses = () => calls.filter(c => c.url === "/api/plan" && c.body && c.body.action !== "show").map(c => c.body);
@@ -2518,6 +2678,25 @@ const box = (plan, n, on) => { const e = E("INPUT"); Object.assign(e.dataset, {p
   out.spent = M.planCardHtml(FIX.spent, "thread");
   out.answered = M.planCardHtml(FIX.answered, "thread");
   out.ran = M.planCardHtml(FIX.ran, "thread");
+  out.ranLong = M.planCardHtml(FIX.ranLong, "thread");
+  out.replaced = M.planCardHtml(FIX.replaced, "thread");
+  out.dismissed = M.planCardHtml(FIX.dismissed, "thread");
+  out.dismissedInbox = M.planCardHtml(FIX.dismissed, "inbox");
+  out.lapsed = M.planCardHtml(FIX.lapsed, "thread");
+  out.inboxOf = {};
+  for (const k of ["expired", "spent", "answered", "replaced", "lapsed"]) out.inboxOf[k] = M.planCardHtml(FIX[k], "inbox");
+  // Needs you: the plan's item, against what the plan's own read says now.
+  const item = {kind: "plan", id: FIX.waiting.id, thread: FIX.waiting.thread, at: FIX.waiting.at,
+                title: "The operator's plan: 2 steps", entries: FIX.waiting.entries.map(e => ({n: e.n, command: e.command}))};
+  const inbox = {groups: [{project: "__operator__", title: "The operator", items: [item]}]};
+  const inboxWith = p => { M.setPlan(p); return M.inboxHtml(inbox); };
+  out.inboxWaiting = inboxWith(FIX.waiting);
+  out.inboxUnread = inboxWith(null);
+  out.inboxSpent = inboxWith(FIX.spent);
+  out.inboxExpired = inboxWith(FIX.expired);
+  out.inboxDismissed = inboxWith(Object.assign({}, FIX.spent, {dismissed: true, entries: FIX.spent.entries}));
+  out.inboxNewer = inboxWith(Object.assign({}, FIX.replaced, {at: FIX.waiting.at + 60}));
+  M.setPlan(null);
   await M.loadPlan(); await flushAsync();
   M.setActive({key: FIX.waiting.thread}); M.drawPlan();
   out.inThread = byId("tplan").innerHTML;
@@ -2545,9 +2724,34 @@ const box = (plan, n, on) => { const e = E("INPUT"); Object.assign(e.dataset, {p
   await M.planPress(btn("all", id)); await flushAsync();
   out.allAgain = presses().length;       // the card it drew is answered: nothing more goes
   await M.loadPlan(); await flushAsync();
-  pressAnswer = {ok: true, declined: true, plan: FIX.answered};
-  await M.planPress(btn("decline", id)); await flushAsync();
+  out.beforeDecline = byId("tplan").innerHTML;
+  pressAnswer = {ok: true, declined: true, dismissed: true, plan: FIX.declined};
+  const dp = M.planPress(btn("decline", id));
+  out.declineAtOnce = byId("tplan").innerHTML;        // before the bot has answered
+  await dp; await flushAsync();
   out.decline = presses().slice(-1);
+  out.afterDecline = byId("tplan").innerHTML;
+  out.declineToast = toastEl.text;
+  planAnswer = {ok: true, plan: FIX.declined};          // a reload: the bot's own read
+  await M.loadPlan(); await flushAsync();
+  out.afterReload = byId("tplan").innerHTML;
+  // The ×, on a plan that can no longer be pressed: refused, the line comes back.
+  planAnswer = {ok: true, plan: FIX.answered};
+  await M.loadPlan(); await flushAsync();
+  out.lineShown = byId("tplan").innerHTML;
+  pressAnswer = {ok: false, error: "refused: the bot is restarting"};
+  const xp = M.planPress(btn("dismiss", FIX.answered.id));
+  out.xAtOnce = byId("tplan").innerHTML;
+  await xp; await flushAsync();
+  out.xRefused = presses().slice(-1);
+  out.xRolledBack = byId("tplan").innerHTML;
+  out.xRefusedToast = toastEl.text;
+  pressAnswer = {ok: true, dismissed: true, plan: Object.assign({}, FIX.answered, {dismissed: true})};
+  await M.planPress(btn("dismiss", FIX.answered.id)); await flushAsync();
+  out.xGone = byId("tplan").innerHTML;
+  planAnswer = {ok: true, plan: Object.assign({}, FIX.answered, {dismissed: true})};
+  await M.loadPlan(); await flushAsync();
+  out.xAfterReload = byId("tplan").innerHTML;
   planAnswer = {ok: true, plan: FIX.waiting};
   await M.loadPlan(); await flushAsync();
   pressAnswer = {ok: false, refused: "owner", error: "refused: only you can answer the operator's plan"};
@@ -2588,8 +2792,12 @@ def test_dashboard_plan_card_renders_and_presses():
     expired = dict(O.plan_card(st.plan_view(now=time.time() + O.PLAN_TTL_S + 5), desc), running=False)
     st.answer_plan_from_dashboard(pid, [2], by="owner@example.com")
     st.use_plan_entry(pid, 2, run_by="dashboard")
-    st.set_entry_result(pid, 2, {"state": "failed", "exit": 3, "tail": "tailscale: <not connected>"})
+    st.set_entry_result(pid, 2, {"state": "failed", "exit": 3, "tail": "tailscale: <not connected>",
+                                 "at": time.time()})
     ran = card()
+    st.set_entry_result(pid, 2, {"state": "failed", "exit": 3, "tail": "tailscale: <not connected>",
+                                 "at": time.time() - 3600})
+    ran_long = card()
     st.set_entry_result(pid, 2, {"state": "ok", "tail": "serving"})
     st.use_plan_entry(pid, 1)
     spent = card()
@@ -2597,7 +2805,23 @@ def test_dashboard_plan_card_renders_and_presses():
     st2.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
     st2.answer_plan_from_dashboard(st2.plan_view()["id"], [], by="owner@example.com")
     answered = dict(O.plan_card(st2.plan_view(), desc), running=False)
-    fix = {"waiting": waiting, "expired": expired, "ran": ran, "spent": spent, "answered": answered}
+    st3 = O.State(tmp / "op3.json"); st3.set_thread("D1:1.0")
+    st3.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
+    st3.set_thread("D2:2.0")
+    replaced = dict(O.plan_card(st3.plan_view(), desc), running=False)
+    st4 = O.State(tmp / "op4.json"); st4.set_thread("D1:1.0")
+    st4.set_plan([{"name": "tailscale-on", "args": []}], by="operator", thread="D1:1.0")
+    st4.use_plan_entry(st4.plan_view()["id"], 1)
+    st4.dismiss_plan(by="owner@example.com")
+    dismissed = dict(O.plan_card(st4.plan_view(), desc), running=False)
+    # Read while it waited, and not since: its day has run out on the clock.
+    lapsed = dict(waiting, at=waiting["at"] - O.PLAN_TTL_S - 60,
+                  expires_at=waiting["expires_at"] - O.PLAN_TTL_S - 60)
+    declined = dict(waiting, status="answered", runnable=False, declined=True, dismissed=True,
+                    answered_via="dashboard", answered_by="owner@example.com")
+    fix = {"waiting": waiting, "expired": expired, "ran": ran, "ranLong": ran_long, "spent": spent,
+           "answered": answered, "replaced": replaced, "dismissed": dismissed, "lapsed": lapsed,
+           "declined": declined}
     node = shutil.which("node")
     if not node:
         print("  … node not installed — the card checked by text only")
@@ -2623,21 +2847,34 @@ def test_dashboard_plan_card_renders_and_presses():
     pacts = lambda h: [(m.group(1), " disabled" in m.group(0))
                        for m in re.finditer(r'<button[^>]*data-pact="(\w+)"[^>]*>', h)]
     btns = dict(pacts(wt))
-    check("Run all and Not now pressable; Run selected not until something is ticked",
-          btns == {"all": False, "selected": True, "decline": False}, str(btns))
+    check("Run all, Not now and its × pressable; Run selected not until something is ticked",
+          btns == {"dismiss": False, "all": False, "selected": True, "decline": False}, str(btns))
     check("it says how long it waits, and that a typed yes still works", "Waits for your answer until" in wt
           and "say “yes”" in wt)
-    for name in ("expired", "spent", "answered"):
+    lines = {"expired": "expired unanswered", "spent": "all 2 steps have run",
+             "answered": "you said not now", "replaced": "replaced — the operator moved thread",
+             "lapsed": "expired unanswered", "ranLong": "answered on the dashboard · 1 failed"}
+    for name, said in lines.items():
         h = o[name]
-        dis = [d for _, d in pacts(h)]
-        check(f"{name}: every button and checkbox disabled",
-              dis == [True] * 3 and all("disabled" in b for b in re.findall(r'<input[^>]*>', h)), h[:600])
-    check("expired says so", "Expired unanswered" in o["expired"])
-    check("declined says nothing in it runs", "You said not now" in o["answered"])
-    check("spent says every step has run, and each shows its outcome",
-          "Every step has run" in o["spent"] and "Already run" in o["spent"] and "✓ ok" in o["spent"])
-    check("a failed step shows failed, its exit code and the output's tail",
-          "✗ failed (exit 3)" in o["ran"] and "tailscale: &lt;not connected&gt;" in o["ran"], o["ran"][:1500])
+        check(f"{name}: not a card to press -- one line saying so, with only its ×",
+              'class="icard k-plan opcard pline"' in h and said in h
+              and pacts(h) == [("dismiss", False)] and "<input" not in h and "Run all" not in h
+              and "Not now" not in h, h[:700])
+        check(f"{name}: and nothing at all on Needs you", o["inboxOf"].get(name, "") == "",
+              o["inboxOf"].get(name, "")[:300])
+    check("cleared (its ×, Not now or ops plan --decline): drawn nowhere, for good",
+          o["dismissed"] == "" and o["dismissedInbox"] == "")
+    check("a run you pressed keeps its full card ten minutes, results showing, nothing left to press",
+          "✗ failed (exit 3)" in o["ran"] and "tailscale: &lt;not connected&gt;" in o["ran"]
+          and pacts(o["ran"]) == [("dismiss", False)] and "pline" not in o["ran"], o["ran"][:1500])
+    check("Needs you shows the plan's card while it waits",
+          'data-id="%s"' % pid in o["inboxWaiting"] and "Run all" in o["inboxWaiting"]
+          and 'data-id="%s"' % pid in o["inboxUnread"])
+    for k in ("inboxSpent", "inboxExpired", "inboxDismissed", "inboxNewer"):
+        check(f"{k}: the item's plan, as the bot reads it now, is not drawn as something to answer",
+              'data-pact="all"' not in o[k] and 'data-id="%s"' % pid not in o[k], o[k][:500])
+        check(f"{k}: nor counted -- no empty operator's group, Needs you says nothing needs you",
+              "__operator__" not in o[k] and "Nothing needs you" in o[k], o[k][:500])
     check("drawn in the operator's thread when it is open, and in no other",
           'data-id="%s"' % pid in o["inThread"] and o["otherThread"] == "")
     check("Run selected with nothing ticked sends nothing", o["nothingTicked"] == [])
@@ -2648,11 +2885,25 @@ def test_dashboard_plan_card_renders_and_presses():
           o["selected"] == [{"action": "run", "plan_id": pid, "entries": [2]}], str(o["selected"]))
     check("having asked first, naming the step", "1 step" in o["confirmText"] and "2. tailscale-on" in o["confirmText"]
           and "1. trader-env-set" not in o["confirmText"], o["confirmText"])
-    check("the result streams back into the card", "✗ failed (exit 3)" in o["afterPress"])
+    check("the result streams back into the card", "✗ failed (exit 3)" in o["afterPress"], o["afterPress"][:600])
     check("Run all sends entries all", o["all"] == [{"action": "run", "plan_id": pid, "entries": "all"}], str(o["all"]))
     check("once a press is answered, its drawn-disabled card sends nothing more",
           o["allAgain"] == 2, str(o["allAgain"]))
     check("Not now sends decline", o["decline"] == [{"action": "decline", "plan_id": pid}], str(o["decline"]))
+    check("the waiting card was there to decline", 'data-id="%s"' % pid in o["beforeDecline"]
+          and 'data-pact="decline"' in o["beforeDecline"], o["beforeDecline"][:300])
+    check("and it goes at once, before the bot answers", o["declineAtOnce"] == "", o["declineAtOnce"][:300])
+    check("and stays gone once it has, saying nothing in it runs",
+          o["afterDecline"] == "" and "nothing in it runs" in o["declineToast"], o["declineToast"])
+    check("and after a reload: the bot's own read says it is cleared", o["afterReload"] == "")
+    check("a plan done with shows its line", "pline" in o["lineShown"] and "you said not now" in o["lineShown"])
+    check("its × sends dismiss, for that plan",
+          o["xRefused"] == [{"action": "dismiss", "plan_id": answered["id"]}], str(o["xRefused"]))
+    check("the line goes at once", o["xAtOnce"] == "", o["xAtOnce"][:300])
+    check("refused, it comes back, saying why",
+          "pline" in o["xRolledBack"] and "the bot is restarting" in o["xRefusedToast"],
+          o["xRolledBack"][:300] + " / " + o["xRefusedToast"])
+    check("answered, it is gone, and stays gone after a reload", o["xGone"] == "" and o["xAfterReload"] == "")
     check("a refusal is said", "only you can answer" in o["refusedToast"], o["refusedToast"])
 
 

@@ -930,7 +930,8 @@ def plan_refusal(grant: dict | None, n, name: str, args, live: dict | None) -> s
                 "name the op")
     if not live or live.get("id") != gp.get("id"):
         return (f"refused: the plan the user answered ({gp.get('id')}) has expired or "
-                "been replaced; ask them about the current one")
+                "been replaced (or was cleared off the dashboard); ask them about the "
+                "current one")
     if str(live.get("answered") or "").startswith("dashboard:"):
         return ("refused: the user answered this plan with its card on the dashboard, and "
                 "the bot ran what they chose there (`silkworm ops plan` shows each "
@@ -1032,7 +1033,9 @@ def plan_card(view: dict | None, descriptions: dict | None = None) -> dict | Non
             "status": status, "runnable": status == "waiting",
             "answered_via": view.get("answered_via") or ("message" if view.get("answered") else ""),
             "answered_by": view.get("answered_by") or "",
-            "declined": bool(view.get("declined")), "entries": entries}
+            "declined": bool(view.get("declined")),
+            # Off the dashboard for good: its x, Not now or `ops plan --decline`.
+            "dismissed": bool(view.get("dismissed")), "entries": entries}
 
 
 def _landing_refused(task: dict) -> bool:
@@ -1184,7 +1187,7 @@ class State:
 
     def plan(self, now: float | None = None, spent: bool = False) -> dict | None:
         """The pending plan, while it is live: recorded in the current home
-        thread less than PLAN_TTL_S ago, and with an entry not yet run --
+        thread less than PLAN_TTL_S ago, not cleared, and with an entry not yet run --
         or, with `spent`, even if every entry has (so a second use of one
         can be told it was used, rather than that there is no plan)."""
         now = time.time() if now is None else now
@@ -1198,6 +1201,8 @@ class State:
             return None
         if not spent and all(e.get("used") for e in p["entries"]):
             return None
+        if p.get("dismissed_at"):
+            return None              # cleared (dismiss_plan): over, whatever its state
         return p
 
     def plan_before(self, ts, now: float | None = None) -> dict | None:
@@ -1254,8 +1259,9 @@ class State:
         copy with `status` -- "waiting" (live, unanswered), "answered"
         (answered by a message or a button: what it chose runs, nothing else
         does), "spent" (every entry has run), "expired" (PLAN_TTL_S passed
-        unanswered), "replaced" (the operator moved to another thread) -- and
-        `expires_at`. None if none was ever recorded."""
+        unanswered), "replaced" (the operator moved to another thread) -- with
+        `expires_at`, and `dismissed` once its card was cleared (dismiss_plan).
+        None if none was ever recorded."""
         now = time.time() if now is None else now
         data = self._load()
         p = data.get("plan")
@@ -1263,6 +1269,7 @@ class State:
             return None
         out = json.loads(json.dumps(p))
         out["expires_at"] = float(p.get("at") or 0) + PLAN_TTL_S
+        out["dismissed"] = bool(p.get("dismissed_at"))
         if all(e.get("used") for e in p["entries"]):
             out["status"] = "spent"
         elif p.get("answered"):
@@ -1316,6 +1323,48 @@ class State:
                                 chosen=chosen, declined=not chosen)
             self._save(data)
             return json.loads(json.dumps(data["plan"])), ""
+
+    def dismiss_plan(self, plan_id: str = "", by: str = "", via: str = "",
+                     now: float | None = None) -> tuple[dict | None, str]:
+        """Take the plan's card off the dashboard, for good: the card's x,
+        its Not now (after answer_plan_from_dashboard declined it), and
+        `silkworm ops plan --decline`. Whatever state it is in -- spent,
+        answered, expired, replaced -- it is marked `dismissed`, and no view
+        draws it again until the operator records a new plan.
+
+        A plan still waiting for its answer is declined first, exactly as
+        Not now declines it (nothing in it runs; no message answers it
+        after). Refused while entries a press chose are queued or running:
+        their results are still coming. `plan_id` "": whichever plan is
+        recorded. A cleared plan is over: plan() no longer returns it, so
+        nothing more from it runs (a typed yes's remaining entries included)
+        and nothing answers it. Returns (the plan, "declined" or "dismissed"
+        or "already"), or (None, why not)."""
+        now = time.time() if now is None else now
+        with _STATE_LOCK:
+            data = self._load()
+            p = data.get("plan")
+            if not isinstance(p, dict) or not p.get("entries"):
+                return None, "there is no plan to decline"
+            if plan_id and p.get("id") != plan_id:
+                return None, "that is not the plan recorded now; read it again"
+            if any((e.get("result") or {}).get("state") in ("queued", "running")
+                   for e in p["entries"]):
+                return None, "the plan is running what you chose; dismiss it once it has finished"
+            if p.get("dismissed_at"):
+                return json.loads(json.dumps(p)), "already"
+            what = "dismissed"
+            live = self.plan(now)
+            if live and live.get("id") == p.get("id") and not p.get("answered"):
+                on_card = str(via).startswith("dashboard")
+                p.update(answered=("dashboard:" if on_card else "cli:") + secrets.token_hex(6),
+                         answered_via=VIA_DASHBOARD if on_card else "cli",
+                         answered_by=str(by), answered_detail=str(via)[:200],
+                         answered_at=now, chosen=[], declined=True)
+                what = "declined"
+            p.update(dismissed_at=now, dismissed_by=str(by))
+            self._save(data)
+            return json.loads(json.dumps(p)), what
 
     def clear_interrupted_results(self, now: float | None = None) -> list:
         """At startup: entries a press left "queued" or "running" when the bot
@@ -1799,7 +1848,9 @@ SWEEP_GOAL = (
     "[args] [--op <op> [args]]… --by operator`), list them under Needs you "
     "numbered as it prints them, and say a plain \"yes\" in this thread "
     "runs them (\"do 2\" one, \"all but 1\" the rest) -- never ask the user "
-    "to run a command themselves.\n\n"
+    "to run a command themselves. A plan of yours that has gone moot (what it "
+    "would fix is fixed, or they said no), decline it -- `{bin} ops plan "
+    "--decline` -- rather than leave its card waiting.\n\n"
     "Not yours, whatever you are asked: deciding on proposals, reviewed work "
     "or research findings either way -- accepting, approving, dismissing, "
     "closing or digging on them -- dismissing or cancelling a queued, blocked, "

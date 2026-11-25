@@ -1109,12 +1109,15 @@ def _ops_world():
                  "beta": {"slug": "beta", "scope": {"cwd": str(alpha)}, "test_cmd": ""}}
     state = O.State(tmp / "operator.json")
     state.set_thread("D1:1.0")
-    ns = lift("handle_ops", "ops_context", "user_grant", "record_ops_plan",
+    told = []
+    ns = lift("handle_ops", "ops_context", "user_grant", "record_ops_plan", "decline_ops_plan",
                        ops=OPS, OPS_LOG=tmp / "ops.jsonl", sys=sys, os=os, Path=Path,
+                       tell_thread=lambda key, text: told.append((key, text)),
+                       _plan_runs=set(), _plan_runs_guard=__import__("threading").Lock(),
                        git_guard=git_guard, operator_role=O, OPERATOR=state,
                        OPERATOR_GRANTS=O.Grants(), SILKWORM_BIN=str(BASE / "bin" / "silkworm"),
                        project_store=types.SimpleNamespace(get=lambda s: projects_.get(s)),
-              absent=('guarded_plan_entry', 'tell_thread'))
+              absent=('guarded_plan_entry',))
     real_context = ns["ops_context"]
     ctx = OPS.Context(project=lambda s: projects_.get(s), python=sys.executable,
                       silkworm_bin=str(BASE / "bin" / "silkworm"), uid=501,
@@ -1130,7 +1133,8 @@ def _ops_world():
                               agents=agents, ns=ns, ctx=ctx, port=port, state=state,
                               log=tmp / "ops.jsonl", real_context=real_context,
                               grants=ns["OPERATOR_GRANTS"], statefile=tmp / "operator.json",
-                              projects=projects_, secrets=secrets, env_text=env_text)
+                              projects=projects_, secrets=secrets, env_text=env_text,
+                              told=told)
     return w
 
 

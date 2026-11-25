@@ -3131,7 +3131,8 @@ def _lift_bot(repo):
                       project=lambda slug: None, python=sys.executable, silkworm_bin="/s",
                       uid=os.getuid(), launch_agents=Path(tempfile.mkdtemp())))
     ns2 = lift("handle_ops", "record_ops_plan", "guarded_plan_entry",
-                        "handle_projects", **shared, absent=PROJECT_ROUTES + ('OPS_LOG',))
+                        "handle_projects", **shared,
+               absent=PROJECT_ROUTES + ('OPS_LOG', 'decline_ops_plan'))
     bot.ns2 = ns2
     bot.server.route("/ops", ns2["handle_ops"])
     bot.server.route("/projects", ns2["handle_projects"])

@@ -4232,7 +4232,7 @@ def handle_plan(payload: dict, client=None, server=None) -> dict:
     action = str(payload.get("action") or "show")
     if action == "show":
         return {"ok": True, "plan": plan_card_now()}
-    if action not in ("run", "decline"):
+    if action not in ("run", "decline", "dismiss"):
         return {"ok": False, "error": f"unknown action {action!r}"}
     if any(payload.get(k) for k in ("caller_role", "caller_thread", "caller_task",
                                     "caller_grant")):
@@ -4252,18 +4252,47 @@ def handle_plan(payload: dict, client=None, server=None) -> dict:
                          "dashboard through Tailscale on your own device (or say yes in "
                          "its thread)"}
     plan_id = str(payload.get("plan_id") or "")
-    if action == "decline":
-        chosen = []
-    else:
-        want = payload.get("entries")
-        live = OPERATOR.plan() or {}
-        if want == "all":
-            chosen = [e["n"] for e in live.get("entries") or [] if not e.get("used")]
-        elif isinstance(want, list) and want:
-            chosen = want
-        else:
-            return {"ok": False, "error": "tick at least one entry, or press Run all"}
     via = f"dashboard ({owner.get('login') or '?'} on {owner.get('node') or '?'})"
+    if action in ("decline", "dismiss"):
+        # Not now, and the card's x: the card goes for good, whatever state
+        # the plan is in -- a plan still waiting is declined (nothing in it
+        # runs), one spent, answered, expired or replaced just cleared.
+        if not plan_id:
+            return {"ok": False, "error": "name the plan to clear (plan_id)"}
+        with _plan_runs_guard:
+            # (plan_card_now takes this guard too: answer it after, not in here.)
+            running = plan_id in _plan_runs
+            if not running:
+                rec, what = OPERATOR.dismiss_plan(plan_id, by=str(owner.get("login") or ""),
+                                                  via=via)
+        if running:
+            return {"ok": False, "error": "this plan is running what you chose; "
+                                          "clear it once it has finished",
+                    "plan": plan_card_now()}
+        if not rec:
+            return {"ok": False, "refused": "plan", "error": f"refused: {what}",
+                    "plan": plan_card_now()}
+        log.info("plan %s %s on the dashboard by %s", plan_id, what, owner.get("login"))
+        if what == "declined":
+            tell_thread(rec.get("thread") or "",
+                        f":no_entry_sign: Not now -- you declined plan {plan_id} on the "
+                        "dashboard; nothing in it runs.")
+        return {"ok": True, "declined": what == "declined", "dismissed": True,
+                "plan": plan_card_now()}
+    want = payload.get("entries")
+    live = OPERATOR.plan() or {}
+    if want == "all":
+        chosen = [e["n"] for e in live.get("entries") or [] if not e.get("used")]
+    elif isinstance(want, list) and want:
+        chosen = want
+    else:
+        return {"ok": False, "error": "tick at least one entry, or press Run all"}
+    if not chosen and live.get("id") == plan_id:
+        # Run all on the live plan with nothing left: an answer that runs
+        # nothing is Not now's, never Run's. (Any other plan is refused below,
+        # saying why.)
+        return {"ok": False, "refused": "plan", "error": "refused: this plan has no entry left to run",
+                "plan": plan_card_now()}
     with _plan_runs_guard:
         # Under the guard the drain waits on (drain.busy reads _plan_runs):
         # a run either was refused here or is in _plan_runs.
@@ -4285,14 +4314,8 @@ def handle_plan(payload: dict, client=None, server=None) -> dict:
         # Outside the guard: the card reads it too.
         return {"ok": False, "refused": "plan", "error": f"refused: {why}",
                 "plan": plan_card_now()}
-    thread = answered.get("thread") or ""
-    log.info("plan %s %s on the dashboard by %s%s", plan_id,
-             "run" if chosen else "declined", owner.get("login"),
-             f": entries {', '.join(map(str, chosen))}" if chosen else "")
-    if not chosen:
-        tell_thread(thread, f":no_entry_sign: Not now -- you declined plan {plan_id} on the "
-                            "dashboard; nothing in it runs.")
-        return {"ok": True, "declined": True, "plan": plan_card_now()}
+    log.info("plan %s run on the dashboard by %s: entries %s", plan_id,
+             owner.get("login"), ", ".join(map(str, chosen)))
     for n in chosen:
         OPERATOR.set_entry_result(plan_id, n, {"state": "queued"})
     threading.Thread(target=run_plan_entries, name=f"plan-{plan_id}", daemon=True,
@@ -4388,6 +4411,43 @@ def ops_context() -> "ops.Context":
                        uid=os.getuid(), launch_agents=Path.home() / "Library" / "LaunchAgents")
 
 
+def decline_ops_plan(payload: dict) -> dict:
+    """`silkworm ops plan --decline`: the recorded plan's card cleared off
+    the dashboard, so a stuck one can always go. A plan still waiting for its
+    answer is declined (nothing in it runs, and no message answers it after,
+    as Not now on its card); one already spent, answered, expired or replaced
+    is just cleared, and nothing more from it runs. Your terminal, or the
+    operator withdrawing its own plan from a turn in its own thread -- no other
+    turn. Refused while entries a press chose are still running."""
+    payload = payload or {}
+    in_turn = bool(payload.get("caller_role") or payload.get("caller_thread"))
+    if in_turn and (payload.get("caller_role") != operator_role.ROLE
+                    or not OPERATOR.thread()
+                    or payload.get("caller_thread") != OPERATOR.thread()):
+        # Your answer is yours: from inside a turn, only the operator, in its
+        # own thread, may withdraw the plan it recorded.
+        return {"ok": False, "refused": "turn",
+                "error": "only the operator, in its own thread, declines its plan from a turn "
+                         "(or you, from your terminal or the dashboard)"}
+    by = str(payload.get("by") or ("operator" if in_turn else "cli"))
+    plan_id = str(payload.get("plan_id") or "")
+    with _plan_runs_guard:
+        rec = OPERATOR.plan_view()
+        if rec and rec.get("id") in _plan_runs:
+            return {"ok": False, "error": f"plan {rec['id']} is running what was chosen; "
+                                          "decline it once it has finished"}
+        rec, what = OPERATOR.dismiss_plan(plan_id, by=by, via=f"cli ({by})")
+    if not rec:
+        return {"ok": False, "error": what}
+    log.info("plan %s %s by %s (ops plan --decline)", rec.get("id"), what, by)
+    if what == "declined":
+        tell_thread(rec.get("thread") or "",
+                    f":no_entry_sign: Plan {rec.get('id')} declined (`silkworm ops plan "
+                    f"--decline`, by {by}); nothing in it runs.")
+    return {"ok": True, "plan_id": rec.get("id"), "outcome": what,
+            "status": (OPERATOR.plan_view() or {}).get("status") or ""}
+
+
 def handle_ops(payload: dict) -> dict:
     """Route for /ops: the named operations of ops.py -- `list`, `log`, and
     `run` (name, args, by, notes).
@@ -4414,6 +4474,8 @@ def handle_ops(payload: dict) -> dict:
     if action == "show-plan":
         live = OPERATOR.plan()
         return {"ok": True, "plan": live, "lines": operator_role.plan_lines(live)}
+    if action == "decline-plan":
+        return decline_ops_plan(payload)
     if action != "run":
         return {"ok": False, "error": f"unknown action {action!r}"}
     name = str(payload.get("name") or "")

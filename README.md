@@ -1278,8 +1278,15 @@ who decided), a land, approve or publish entry as its own dashboard button
 would (the task records the plan and entry) — and writes each entry's
 outcome onto the plan: the card shows it running, then ok or failed with the
 exit code and the output's tail, and the operator's thread is told what ran.
-Not now declines the plan; nothing in it runs. An expired, answered or spent
-plan's card stays, saying which, with nothing to press.
+Not now declines the plan; nothing in it runs, and the card goes at once
+(and stays gone after a reload). A plan that can no longer be pressed —
+spent, answered, declined, expired or replaced — is never drawn as a card
+with buttons: in its thread it collapses to one line saying which (a run
+you pressed keeps its full card for ten minutes, so its results can be
+read), and Needs you lists only a plan still waiting. Every card and line
+has an × that clears it for good (declining it first if it was still
+waiting); `silkworm ops plan --decline [<plan id>]` does the same from a
+terminal, so a stuck card can always go.
 
 An op not in the plan still needs naming. Each run
 records the plan id, the entry and your message's ts; `silkworm ops plan`
