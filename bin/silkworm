@@ -2188,7 +2188,7 @@ def run_suite() -> int:
     for k in ("SILKWORM_ROLE", "SILKWORM_THREAD", "SILKWORM_DEFERS", "SILKWORM_BOT",
               operator_role.GRANT_VAR):
         env.pop(k, None)
-    return subprocess.run([py, str(REPO / "tests" / "test_invariants.py")],
+    return subprocess.run([py, str(REPO / "tests" / "run.py")],
                           capture_output=True, text=True, env=env).returncode
 
 
@@ -3129,7 +3129,7 @@ def main() -> None:
     elif cmd == "test":
         print(f"{WORM} running regression tests…")
         py = venv_python()
-        sys.exit(subprocess.run([py, str(REPO / "tests" / "test_invariants.py")]).returncode)
+        sys.exit(subprocess.run([py, str(REPO / "tests" / "run.py")]).returncode)
     elif cmd == "discard":
         # The way to reset a backlog. Doing it with `git branch -D` is how
         # fifteen commits ended up reachable from nothing on 2026-09-12, with a
