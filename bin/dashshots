@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Screenshots of every dashboard view, on a phone and a laptop.
 
-    bin/dashshots [--out DIR] [--views sessions,board,...] [--widths 375,430,1280]
+    bin/dashshots [--out DIR] [--views sessions,board,...] [--widths 375,430,1280,1440,1920]
                   [--source DIR] [--before DIR] [--wait 5] [--list]
     bin/dashshots --perf [--before DIR] [--perf-runs 3] [--widths 375,430]
 
 Mobile Safari in an iOS Simulator for the phone widths (375: iPhone SE (3rd
 generation), 430: iPhone 16 Plus), and WebKit itself (a WKWebView snapshot,
-the engine desktop Safari uses) for the laptop width. Each view is opened by
+the engine desktop Safari uses) for laptop and desktop widths (1280, 1440,
+1920, or any other of 1024+). Each view is opened by
 URL -- the dashboard's own deep links, ?view= ?modal= ?thread= ?task= ?card= -- since
 the simulator has no tap automation. Files are DIR/<view>-<width>.png.
 
@@ -77,6 +78,11 @@ FORBIDDEN_DEVICES = {"Cadence Test iPhone 17"}
 DEVICES = {375: ("Silkworm Shots 375", "iPhone SE (3rd generation)"),
            430: ("Silkworm Shots 430", "iPhone 16 Plus")}
 DESKTOP = 1280
+#: Laptop and desktop widths WebKit is drawn at, and the window height each
+#: gets (a 16:10 laptop, a 1440 laptop, a 1080p monitor). Any other width of
+#: MIN_DESKTOP or more is drawn too, 860 tall.
+DESKTOPS = {1280: 860, 1440: 900, 1920: 1080}
+MIN_DESKTOP = 1024
 #: A thread key no session has: opened, it is an empty new thread.
 NEW_THREAD = "D0SHOTS:0000000000.000000"
 
@@ -687,6 +693,9 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         # A task id's first characters: the id match first, then mentions.
         ("search-id", "/?q=" + quote(ex["task"][:9])),
         ("new-thread", "/?modal=new-thread"),
+        # The laptop's shortcut list and Settings (the sidebar's), as dialogs.
+        ("keys", "/?modal=keys"),
+        ("prefs", "/?modal=prefs"),
         ("alerts", "/?modal=alerts"),
         ("tasks", "/?view=tasks"),
         ("tasks-all", "/?view=tasks&tab=all"),
@@ -694,6 +703,8 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         *([("task-page", f"/?task={quote(ex['landed'])}"),
            ("task-page-changes", f"/?task={quote(ex['landed'])}&sec=changes"),
            ("task-page-timeline", f"/?task={quote(ex['landed'])}&sec=timeline")] if ex.get("landed") else []),
+        # On a laptop, a task opened from Tasks: the list docked beside its page.
+        *([("task-split", f"/?task={quote(ex['landed'])}&view=tasks")] if ex.get("landed") else []),
         ("projects", "/?view=projects"),
         # A project's own page (board.project_page), and an app's.
         ("project", f"/?view=project&slug={p}"),
@@ -956,12 +967,13 @@ def snapper(tmp: Path) -> Path:
     return exe
 
 
-def shoot_desktop(targets, shots, out: Path, wait: float, tmp: Path):
+def shoot_desktop(targets, shots, out: Path, wait: float, tmp: Path, width: int = DESKTOP):
     exe = snapper(tmp)
+    height = DESKTOPS.get(width, 860)
     for view, path in shots:
         for suffix, base in targets:
-            dest = out / f"{view}-{DESKTOP}{suffix}.png"
-            r = subprocess.run([str(exe), base + path, str(dest), str(DESKTOP), "860", str(wait)],
+            dest = out / f"{view}-{width}{suffix}.png"
+            r = subprocess.run([str(exe), base + path, str(dest), str(width), str(height), str(wait)],
                                capture_output=True, text=True, timeout=120)
             print(f"    {dest.name}" + ("" if r.returncode == 0 else f"  FAILED {r.stdout}{r.stderr}"))
 
@@ -1051,13 +1063,14 @@ def main():
                 return
             print(f"dashboard copy at {base} (stand-in bot :{bot_port}) -> {out}")
             for w in [int(x) for x in a.widths.split(",") if x]:
-                if w == DESKTOP:
-                    print(f"  desktop {DESKTOP}px (WKWebView)")
-                    shoot_desktop(targets, shots, out, a.wait, tmp)
-                elif w in DEVICES:
+                if w in DEVICES:
                     shoot_phone(w, targets, shots, out, a.wait)
+                elif w >= MIN_DESKTOP:
+                    print(f"  desktop {w}px (WKWebView)")
+                    shoot_desktop(targets, shots, out, a.wait, tmp, w)
                 else:
-                    raise SystemExit(f"no device for width {w}; use {sorted(DEVICES)} or {DESKTOP}")
+                    raise SystemExit(f"no device for width {w}; use {sorted(DEVICES)} "
+                                     f"or a desktop width of {MIN_DESKTOP}+")
         finally:
             for pr in procs:
                 pr.terminate()

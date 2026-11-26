@@ -1591,12 +1591,37 @@ A local web dashboard for every thread session (localhost-only):
   the main pane while no thread is open (**📥 Needs you** above the list comes
   back to it); on a phone it is the first of two tabs, **Needs you** and
   **Threads**. `?view=inbox` / `?view=threads` open either.
+- **On a laptop or monitor (1024px and wider)** — an app's layout; nothing
+  below 1024px changes (the phone's page is pixel-for-pixel the same). A
+  sidebar that never goes away: **Needs you** (its count), **Threads** (unread
+  count; opens the newest thread if none is), **Projects**, **Trader**,
+  **Tasks** (the badge), **Spend**, **Learnings**, and at its foot Search,
+  Settings (theme, notifications, quiet hours, naming untitled threads) and
+  Shortcuts. The header is the search field. Tasks, Projects, Trader,
+  Learnings and Spend are pages beside the sidebar rather than sheets over a
+  dimmed page, centred at a reading width; the thread list sits beside the
+  open thread, and a task opened from Tasks (its **Open ›**, or Enter) sits
+  beside the list it came from. Both lists are resizable: drag the line
+  between, ←/→ on it once focused, double-click for the default; the width
+  is kept in the browser. What is open is kept in the address
+  (`?thread=`, `?task=…&view=tasks`, `?view=board&slug=…`, the deep links
+  below), so a reload or a bookmark comes back to it. Forms are centred
+  dialogs; a card's detail and the attachments are panels at the right.
+  Keys: **j/k** move through the list in front (the open panel's tasks or
+  cards, the threads while one is open, else Needs you; the pointer's last
+  list on the home screen), **Enter** opens, **e** accepts or approves, **d**
+  dismisses (each presses the row's own button), **/** or **⌘K** searches,
+  **Esc** closes what is on top, **?** lists them. None fires while a field
+  has the keyboard. Right-click a thread, task row, board or project card,
+  or Needs-you card for that row's own buttons — what the phone does by
+  swiping. `?modal=keys` and `?modal=prefs` open the shortcut list and
+  Settings.
 - **Cost & cache analytics** — stat tiles (total spend, 14-day tokens, cache
   hit rate) and a daily stacked bar chart of cache-read / fresh-input / output
   tokens, with hover tooltips and a table view. Cache misses show up as blue
   bars — if the gold disappears, something is invalidating your prompt cache.
 - **Live status badges** — running / checked out / in-terminal per thread,
-  polled from the bot; a dot in the header shows whether the bot is up.
+  polled from the bot; a dot in the header (beside the name in the laptop's sidebar) shows whether the bot is up.
 - **Transcripts** — markdown-rendered messages with per-turn token usage and
   cache-hit %, collapsible tool calls, results, and thinking.
 - **Search threads and tasks** — one field (⌘K / Ctrl-K jumps to it; 🔍 on
@@ -1740,13 +1765,19 @@ A local web dashboard for every thread session (localhost-only):
 ```sh
 bin/dashshots                          # artifacts/dashshots/<view>-<width>.png
 bin/dashshots --widths 375 --views board,card
+bin/dashshots --widths 1280,1440,1920 --views inbox,task-split,keys
 bin/dashshots --source /path/to/other/checkout --out /tmp/before
 bin/dashshots --scroll-probe --widths 430,375 --before /tmp/main-export --out /tmp/probe
 bin/dashshots --perf --before /tmp/main-export --perf-runs 5 --out /tmp/perf
 ```
 
 Mobile Safari in an iOS Simulator at 375px (iPhone SE (3rd generation)) and
-430px (iPhone 16 Plus), and WebKit's own snapshot at 1280px for the laptop.
+430px (iPhone 16 Plus), and WebKit's own snapshot for the laptop and desktop:
+1280px by default, and `--widths 1280,1440,1920` (or any width of 1024+) for
+more. To prove a change left the phone alone, shoot `--before` an export of
+main at 375,430 and compare each pair's pixels with `bin/pngdiff.swift`
+(`swiftc -O bin/pngdiff.swift -o pngdiff; ./pngdiff a.png b.png --skip-top 60`:
+the top rows are the simulator's clock).
 The dashboard shot is a copy of the code run from a temp directory against a
 copy of `sessions.json`, and the bot behind it is a stand-in that passes only
 reads through to the real one (board, projects, roles, learnings, status) and

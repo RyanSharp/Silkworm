@@ -3088,6 +3088,157 @@ PAGE = r"""<!doctype html>
   /* The phone's chat: its thread header, alert count and sheet, jump pill. */
   #alertslot, #chathead, #alertsheet { display: none; }
 
+  /* --- desktop (min-width: 1024px) ---------------------------------------
+     A laptop or a monitor gets an app's layout, built from the same tokens:
+     - a sidebar on the left that never goes away (Needs you with its count,
+       Threads, Projects, Trader, Tasks, Spend, Learnings; Search, Settings
+       and the shortcut list at its foot), so the header is only search;
+     - the thread list beside the open thread, the list's width dragged on
+       its grip (and kept), the chat and every document at a reading width;
+     - Tasks, Projects, Trader and Learnings are pages in the space beside
+       the sidebar, not sheets over a dimmed page; a task opened from Tasks
+       sits beside the list it came from, the split dragged as the list's;
+     - forms are dialogs in the middle of the screen, a card's detail and
+       the attachments a panel at the right;
+     - every row shows where a click or a key will land (hover, focus ring,
+       the j/k selection), and right-click offers a row's own buttons.
+     Nothing here applies under 1024px: the phone and a narrow window keep
+     exactly the page above and below. */
+  #sidenav, .grip, #ctxmenu, .deskonly { display: none; }
+  @media (min-width: 1024px) {
+    :root { --side-w: 224px; --head-h: 56px; --list-w: 340px; --tlist-w: 440px;
+            --read-max: 860px; --doc-max: 1120px; --wide-max: 1680px; --sn-h: 34px; }
+    body { padding-left: var(--side-w); }
+    #sidenav { display: flex; flex-direction: column; gap: var(--sp-05); position: fixed; left: 0; top: 0; bottom: 0;
+               width: var(--side-w); z-index: 46; overflow-y: auto; overscroll-behavior: contain;
+               background: var(--sunken); border-right: 1px solid var(--line);
+               padding: 0 var(--sp-25) var(--sp-3); }
+    .snbrand { display: flex; align-items: center; gap: var(--sp-25); height: var(--head-h); flex: none;
+               padding: 0 var(--sp-15); }
+    .snbrand svg { width: 34px; height: 22px; flex: none; background: var(--logo-bg); border-radius: var(--r-sm); }
+    .snname { font-size: var(--fs-lg); font-weight: var(--fw-semi); white-space: nowrap; }
+    #sndot { width: 8px; height: 8px; border-radius: var(--r-pill); background: var(--muted); flex: none; margin-left: auto; }
+    #sndot.on { background: var(--ok); }
+    .snnew { margin: var(--sp-1) 0 var(--sp-3); min-height: var(--sn-h); width: 100%; }
+    .sngroup { display: flex; flex-direction: column; gap: var(--sp-05); }
+    .snfill { flex: 1; min-height: var(--sp-4); }
+    .snitem { display: flex; align-items: center; gap: var(--sp-25); width: 100%; min-height: var(--sn-h);
+              padding: 0 var(--sp-25); border: 0; border-radius: var(--r-md); background: transparent;
+              color: var(--muted); font: inherit; font-size: var(--fs-md); text-align: left; cursor: pointer;
+              transition: background-color var(--dur-1) var(--ease-std), color var(--dur-1) var(--ease-std),
+                          box-shadow var(--dur-1) var(--ease-std); }
+    .snitem:hover { background: var(--fill-2); color: var(--ink); }
+    .snitem:active { background: var(--fill-3); }
+    .snitem.on { background: var(--accent-soft); color: var(--ink); box-shadow: inset 3px 0 0 var(--accent);
+                 font-weight: var(--fw-semi); }
+    .snitem .snl { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .snitem .sncount { font-family: var(--mono); font-size: var(--fs-2xs); font-weight: var(--fw-semi);
+                       min-width: var(--sp-5); text-align: center; padding: 1px var(--sp-15); border-radius: var(--r-pill);
+                       background: var(--fill-2); color: var(--muted); }
+    .snitem .sncount:empty { display: none; }
+    #sn-inbox .sncount { background: var(--accent); color: var(--on-accent); }
+    #sn-threads .sncount { background: var(--info-soft); color: var(--info); }
+    .snitem kbd, .kbd { font-family: var(--mono); font-size: var(--fs-2xs); color: var(--quiet);
+                        border: 1px solid var(--line); border-radius: var(--r-xs); padding: 0 var(--sp-1); }
+
+    /* the header is search, and the alerts beside it */
+    header { height: var(--head-h); padding: 0 var(--sp-6); gap: var(--sp-3); }
+    header > svg, header h1, header .hbtn, header .hmore, header #botdot { display: none; }
+    #search { order: -1; margin-left: 0; flex: 0 1 560px; width: auto; min-height: var(--sn-h);
+              padding: var(--sp-15) var(--sp-35); }
+    #search:hover { border-color: var(--muted); }
+    #searchresults { top: calc(var(--head-h) - var(--sp-1)); left: calc(var(--side-w) + var(--sp-6)); right: auto;
+                     width: min(640px, calc(100vw - var(--side-w) - var(--sp-8))); max-height: 70vh; z-index: 48; }
+    #alertbar { padding-left: var(--sp-6); padding-right: var(--sp-6); }
+    #toast { z-index: 55; }
+
+    /* the thread list beside the open thread, the line between them a grip */
+    .listcol { width: var(--list-w); }
+    #list { width: auto; flex: 1; min-height: 0; border-right: 0; }
+    .grip { display: block; flex: none; width: var(--sp-15); margin: 0 calc(-1 * var(--sp-05)); position: relative;
+            cursor: col-resize; z-index: 6; touch-action: none; }
+    .grip::after { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--line);
+                   transition: background-color var(--dur-1) var(--ease-std), box-shadow var(--dur-1) var(--ease-std); }
+    .grip:hover::after, .grip.dragging::after, .grip:focus-visible::after { background: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
+    .grip:focus-visible { outline: none; }
+    body.resizing, body.resizing * { cursor: col-resize !important; user-select: none; }
+    main > #content, main > #composer, main > #chathead { width: 100%; max-width: var(--read-max); margin-left: auto; margin-right: auto; }
+    main { padding-left: var(--sp-8); padding-right: var(--sp-8); }
+    .card { padding: var(--sp-25) var(--sp-3); }
+    .card .summary { -webkit-line-clamp: 2; }
+    .listtop { display: none; }      /* Needs you and + New thread live in the sidebar */
+
+    /* the panels are pages beside the sidebar: no backdrop, no floating box */
+    #taskmodal, #boardmodal, #learnmodal, #tradermodal { left: var(--side-w); top: var(--head-h); padding: 0;
+      background: var(--bg); align-items: stretch; justify-content: stretch; z-index: 40; }
+    #taskmodal .box, #boardmodal .box, #learnmodal .box, #tradermodal .box {
+      --box-pt: var(--sp-4); --page-max: var(--doc-max);
+      --box-px: max(var(--sp-8), calc((100vw - var(--side-w) - var(--page-max)) / 2));
+      width: 100%; max-width: none; max-height: none; height: 100%; border: 0; border-radius: 0; box-shadow: none;
+      animation: view-in var(--dur-2) var(--ease-out); --view-dx: 0px; }
+    #boardmodal .box, #tradermodal .box { --page-max: var(--wide-max); }
+    #boardmodal .box.pagemode { --page-max: var(--doc-max); }
+    :is(#taskmodal, #boardmodal, #learnmodal, #tradermodal) .box > h2 { font-size: var(--fs-xl); }
+    .bcols { grid-template-columns: repeat(5, minmax(0, 1fr)); overflow-x: visible; }
+    .bfilters input { width: auto; flex: 0 1 320px; }
+    .pcards { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); gap: var(--sp-4); }
+    .tr-grid { gap: var(--sp-4); }
+
+    /* a task opened from Tasks: the list stays, docked beside its page */
+    body.tsplit #taskmodal { right: auto; width: var(--tlist-w); border-right: 1px solid var(--line); }
+    body.tsplit #taskmodal .box { --box-px: var(--sp-5); animation: none; }
+    body.tsplit #taskmodal .box > :is(.hint, #nightly, #spend, #unmerged, #holding, #taskadd, #unregistered) { display: none; }
+    body.tsplit #taskmodal .task { flex-wrap: wrap; gap: var(--sp-15) var(--sp-2); padding-left: var(--sp-2); padding-right: var(--sp-2); }
+    body.tsplit #taskmodal .task .tt { flex: 1 1 calc(100% - var(--sp-8) * 3); min-width: 0; overflow-wrap: break-word; }
+    body.tsplit #taskmodal .task > :is(button, a.ghost) { font-size: var(--fs-xs); order: 1; }
+    body.tsplit #taskmodal .task::after { content: ""; flex: 1 0 100%; order: 0; }
+    body.tsplit #boardmodal { left: calc(var(--side-w) + var(--tlist-w)); }
+    body.tsplit #boardmodal .box { --box-px: max(var(--sp-6), calc((100vw - var(--side-w) - var(--tlist-w) - var(--page-max)) / 2)); }
+    body.tsplit #taskgrip { display: block; position: fixed; top: var(--head-h); bottom: 0; z-index: 41; margin: 0;
+                            left: calc(var(--side-w) + var(--tlist-w) - var(--sp-1)); width: var(--sp-2); }
+    body:not(.tsplit) #taskgrip { display: none; }
+    .task.open-page { box-shadow: inset 3px 0 0 var(--accent); background: var(--accent-soft); }
+    .deskonly { display: inline-flex; }
+
+    /* dialogs in the middle, detail and attachments at the right */
+    #fmodal { align-items: center; padding: var(--sp-8); }
+    #fmodal .fbox { max-height: 86vh; border-radius: var(--r-xl); }
+    #bdetail { top: var(--head-h); width: min(620px, 46vw); border-top-left-radius: var(--r-lg); }
+
+    /* where a click or a key lands */
+    .card:hover, .bcard:hover, .pcard:hover, .icard:hover { border-color: var(--accent-line); }
+    .task:hover { background: var(--fill-1); }
+    .ksel { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .task.ksel { outline-offset: -2px; border-radius: var(--r-md); }
+    button:focus-visible, a:focus-visible, [tabindex]:focus-visible, summary:focus-visible, select:focus-visible,
+    input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .tr-tab:hover, .seg button:hover:not(.on) { color: var(--ink); background: var(--fill-2); }
+    a.plink:hover, .plink:hover { color: var(--accent); }
+
+    /* the right-click menu: a row's own buttons */
+    #ctxmenu { position: fixed; z-index: 59; min-width: calc(var(--sp-8) * 6.5); padding: var(--sp-1); background: var(--panel);
+               border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: var(--el-3); flex-direction: column; }
+    #ctxmenu.open { display: flex; animation: fade-in var(--dur-1) var(--ease-out); }
+    #ctxmenu button { all: unset; box-sizing: border-box; display: flex; align-items: center; gap: var(--sp-2);
+                      min-height: var(--tap); padding: 0 var(--sp-3); border-radius: var(--r-sm); cursor: pointer;
+                      font-size: var(--fs-md); color: var(--ink); }
+    #ctxmenu button:hover, #ctxmenu button:focus-visible { background: var(--accent-soft); outline: none; }
+    #ctxmenu hr { border: 0; border-top: 1px solid var(--line2); margin: var(--sp-1) 0; }
+
+    /* the shortcut list */
+    .keys { display: grid; grid-template-columns: auto 1fr; gap: var(--sp-2) var(--sp-4); margin: var(--sp-3) 0; font-size: var(--fs-md); }
+    .keys .kbd { font-size: var(--fs-sm); padding: var(--sp-05) var(--sp-15); justify-self: start; }
+    .setrows { display: flex; flex-direction: column; gap: var(--sp-15); margin: var(--sp-3) 0; }
+    .setrows button { justify-content: flex-start; display: flex; gap: var(--sp-25); text-align: left; min-height: var(--sn-h); }
+    .setrows .note { color: var(--muted); font-size: var(--fs-sm); margin-left: auto; }
+  }
+  @media (min-width: 1440px) {
+    :root { --side-w: 240px; --list-w: 380px; --tlist-w: 480px; --read-max: 900px; }
+  }
+  @media (min-width: 1800px) {
+    :root { --list-w: 420px; --read-max: 960px; }
+  }
+
   /* --- phone (max-width: 700px) ----------------------------------------
      One breakpoint, one set of measures. On a phone:
      - the header is one row: brand, Tasks, Projects, 🔍 (search drops in
@@ -3435,6 +3586,33 @@ PAGE = r"""<!doctype html>
 </style>
 </head>
 <body>
+<aside id="sidenav" aria-label="Sections">
+  <div class="snbrand"><svg viewBox="40 100 440 280" aria-hidden="true">
+    <path d="M414,254 C 442,238 452,210 438,186 C 420,155 350,128 268,140 C 186,152 108,196 74,244 C 52,276 62,310 104,314"
+          fill="none" stroke="#ECB22E" stroke-width="14" stroke-linecap="round" stroke-dasharray="24 18"/>
+    <circle cx="118" cy="318" r="30" fill="#EFE2CC"/><circle cx="170" cy="296" r="38" fill="#F6EEDF"/>
+    <circle cx="228" cy="282" r="45" fill="#EFE2CC"/><circle cx="290" cy="276" r="51" fill="#F6EEDF"/>
+    <circle cx="360" cy="286" r="57" fill="#F6EEDF"/>
+    <circle cx="346" cy="270" r="7.5" fill="#331233"/><circle cx="382" cy="272" r="7.5" fill="#331233"/>
+    <path d="M352,296 q12,10 26,2" fill="none" stroke="#331233" stroke-width="5" stroke-linecap="round"/>
+  </svg><span class="snname">Silkworm</span><span id="sndot" title="bot status"></span></div>
+  <button class="snnew act" onclick="newThreadForm()" title="Start a new thread">+ New thread</button>
+  <div class="sngroup" role="navigation" aria-label="Sections">
+    <button class="snitem" id="sn-inbox" onclick="deskNav('inbox')" title="Needs you — what is waiting on you">📥<span class="snl">Needs you</span><span class="sncount" id="snc-inbox"></span></button>
+    <button class="snitem" id="sn-threads" onclick="deskNav('threads')" title="Threads — the conversations">💬<span class="snl">Threads</span><span class="sncount" id="snc-threads"></span></button>
+    <button class="snitem" id="sn-projects" onclick="deskNav('projects')" title="Projects — boards and backlogs">🗂<span class="snl">Projects</span></button>
+    <button class="snitem" id="sn-trader" onclick="deskNav('trader')" title="Trader — read-only status">📈<span class="snl">Trader</span></button>
+    <button class="snitem" id="sn-tasks" onclick="deskNav('tasks')" title="Tasks — the work Silkworm manages">📋<span class="snl">Tasks</span><span class="sncount" id="snc-tasks"></span></button>
+    <button class="snitem" id="sn-spend" onclick="deskNav('spend')" title="Spend — per project per week">💰<span class="snl">Spend</span></button>
+    <button class="snitem" id="sn-learnings" onclick="deskNav('learnings')" title="Learnings — what threads are told">🧠<span class="snl">Learnings</span></button>
+  </div>
+  <div class="snfill"></div>
+  <div class="sngroup">
+    <button class="snitem" id="sn-search" onclick="deskSearch()" title="Search threads and tasks (/ or ⌘K)">🔍<span class="snl">Search</span><kbd>⌘K</kbd></button>
+    <button class="snitem" id="sn-settings" onclick="deskSettings()" title="Settings — theme, notifications, quiet hours">⚙️<span class="snl">Settings</span></button>
+    <button class="snitem" id="sn-keys" onclick="deskKeys()" title="Keyboard shortcuts (?)">⌨️<span class="snl">Shortcuts</span><kbd>?</kbd></button>
+  </div>
+</aside>
 <header>
   <svg viewBox="40 100 440 280">
     <path d="M414,254 C 442,238 452,210 438,186 C 420,155 350,128 268,140 C 186,152 108,196 74,244 C 52,276 62,310 104,314"
@@ -3474,6 +3652,7 @@ PAGE = r"""<!doctype html>
     <div id="kindfilter"></div>
     <nav id="list"><div id="listskel" class="skels" aria-hidden="true"><div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div><div class="skel skel-card"></div></div></nav>
   </div>
+  <div id="listgrip" class="grip" role="separator" aria-orientation="vertical" aria-label="Resize the thread list" title="Drag to resize · double-click to reset" tabindex="0"></div>
   <main>
     <button id="backbtn" class="ghost" onclick="closeSession()">‹ Sessions</button>
     <div id="chathead"></div>
@@ -3495,6 +3674,8 @@ PAGE = r"""<!doctype html>
   </main>
 </div>
 <div id="tip"></div>
+<div id="taskgrip" class="grip" role="separator" aria-orientation="vertical" aria-label="Resize the task list" title="Drag to resize · double-click to reset" tabindex="0"></div>
+<div id="ctxmenu" role="menu" aria-label="Actions"></div>
 <div id="toast"></div>
 <button id="updbar" type="button" onclick="applyUpdate()">Updated — tap to reload</button>
 <div id="fxlayer" aria-hidden="true"></div>
@@ -4520,6 +4701,7 @@ function renderList(shown) {
     if (!div) {
       div = document.createElement("div");
       div.onclick = () => openSession(s.key);
+      if (div.dataset) div.dataset.key = s.key;
       cardEls.set(s.key, div);
       born.add(div);
     }
@@ -6440,7 +6622,7 @@ async function renderTasks() {
         <div class="sub">${t.project ? `${projLink(t.project)} · ` : ""}${
           esc(t.id)} · ${esc(t.source)}${t.lens ? ` · lens: ${esc(t.lens)}` : ""}${t.attempts > 1 ? ` · attempt ${t.attempts}` : ""} · ${
           age(t.created)}${costText(t)}${held(t)}</div>${yoursToDo(t)}${findings(t)}${review(t)}${landing(t)}</span>
-      ${taskButtons(t)}</div>`;
+      <button class="ghost deskonly" onclick="openTaskPage('${esc(t.id)}')" title="Open its page beside this list (Enter)">Open ›</button>${taskButtons(t)}</div>`;
   }).join(""), ".task[data-task]", "data-task");
 }
 // Work that finished and never reached the base. Nothing in the dashboard
@@ -8030,15 +8212,21 @@ const TP_SECTIONS = ["state", "result", "changes", "images", "cost", "timeline",
 function openTaskPage(id) {
   if (!id) return;
   const tm = document.getElementById("taskmodal");
-  if (tm && tm.style.display === "flex") toggleTasks();
+  // On a laptop the list stays, docked beside the page (the split).
+  if (tm && tm.style.display === "flex" && !desk()) toggleTasks();
   closeDetail();
   if (taskPageId !== id) taskPageData = null;
   taskPageId = id;
   pageSlug = null;
   spendOpen = false;
   if (!boardIsOpen()) toggleBoard(); else renderBoard();
+  if (desk()) deskSync();          // the split from its first frame, not the next tick
 }
 function closeTaskPage() {
+  // In the split, back is the list it was opened from.
+  if (desk() && document.getElementById("taskmodal").style.display === "flex") {
+    taskPageId = null; taskPageData = null; closeBoard(); deskSync(); return;
+  }
   const back = taskPageData && taskPageData.project;
   taskPageId = null; taskPageData = null;
   if (back) openProjectPage(back); else setBoardProject(null);
@@ -9358,6 +9546,7 @@ if (window.addEventListener)
 //   ?view=spend[&sec=weeks|top|roles]     what was spent, per project per week
 //   ?card=<task id>                       a task's detail, over the board
 //   ?modal=new-thread | new-project | new-task | settings&slug= | release&slug= | alerts
+//        | keys | prefs                  the shortcut list, and the sidebar's Settings
 //   ?q=<words>                            search: threads and tasks
 //   ?list=unread                          the list narrowed to unread threads
 //   &theme=dark | light | auto            drawn in that theme, this view only
@@ -9450,6 +9639,8 @@ async function openLink(q) {
   else if (modal === "release" && slug) releaseForm(slug);
   else if (modal === "alerts") openAlerts();
   else if (modal === "notify") notifySettings();
+  else if (modal === "keys") deskKeys();
+  else if (modal === "prefs") deskSettings();
   if (words) {
     document.body.classList.add("searching");     // the phone's search row
     const box = document.getElementById("search");
@@ -9773,6 +9964,432 @@ async function checkBuild() {
 })();
 if (typeof window !== "undefined" && window.addEventListener)
   window.addEventListener("pageshow", e => { if (e && e.persisted) checkBuild(); });
+
+// --- desktop (min-width: 1024px) ---
+// A laptop or a monitor gets the sidebar, the list beside what it opened,
+// the selection in the address, keys and right-click menus (the CSS block
+// "desktop" says how it looks). Nothing here runs under 1024px: the phone's
+// page, its history entries and its swipes are untouched.
+function desk() {
+  return typeof matchMedia === "function" && matchMedia("(min-width: 1024px)").matches;
+}
+function panelOpen(id) {
+  const el = document.getElementById(id);
+  return !!el && !!el.style && el.style.display === "flex";
+}
+// Which list j/k walk when no panel is open: Needs you (home) or the threads.
+let deskRegion = "inbox", kselKey = "";
+const DESK_SECTIONS = ["inbox", "threads", "projects", "trader", "tasks", "spend", "learnings"];
+// The sidebar item for what is on screen.
+function deskSection() {
+  if (boardIsOpen()) {
+    if (spendOpen) return "spend";
+    if (taskPageId && panelOpen("taskmodal")) return "tasks";
+    return "projects";
+  }
+  if (panelOpen("taskmodal")) return "tasks";
+  if (traderIsOpen()) return "trader";
+  if (panelOpen("learnmodal")) return "learnings";
+  return active ? "threads" : "inbox";
+}
+// Every panel shut but `keep`: the sidebar shows one section at a time.
+function closePanels(keep) {
+  if (keep !== "tasks" && panelOpen("taskmodal")) showSheet(document.getElementById("taskmodal"), false);
+  if (keep !== "board" && boardIsOpen()) { closeBoard(); taskPageId = null; spendOpen = false; }
+  if (keep !== "trader" && traderIsOpen()) toggleTrader();
+  if (keep !== "learnings" && panelOpen("learnmodal")) toggleLearn();
+  closeCtx();
+}
+function deskNav(k) {
+  if (k === "inbox") { closePanels(); deskRegion = "inbox"; goHome(); }
+  else if (k === "threads") {
+    closePanels(); deskRegion = "threads";
+    // A mail client's way: the section opens on its newest conversation.
+    if (!active) { const c = document.querySelector("#list .card"); if (c && c.click) c.click(); }
+  } else if (k === "tasks") { closePanels("tasks"); if (!panelOpen("taskmodal")) toggleTasks(); }
+  else if (k === "projects") {
+    closePanels("board");
+    // The overview, as setBoardProject(null) makes it: a filter left set would
+    // turn it straight back into the all-projects board.
+    if (boardIsOpen()) setBoardProject(null);
+    else {
+      boardProject = null; pageSlug = null; taskPageId = null; spendOpen = false;
+      for (const id of ["brole", "bstate", "bq"]) { const f = document.getElementById(id); if (f) f.value = ""; }
+      closeDetail();
+      toggleBoard();
+    }
+  } else if (k === "spend") { closePanels("board"); openSpend(); }
+  else if (k === "trader") { closePanels("trader"); if (!traderIsOpen()) toggleTrader(); }
+  else if (k === "learnings") { closePanels("learnings"); if (!panelOpen("learnmodal")) toggleLearn(); }
+  deskSync();
+}
+// What is open, as the address names it (the deep links openLink reads), so
+// a reload, a bookmark or a second window opens the same thing. A panel
+// names the panel; with none, the open thread.
+function deskQuery() {
+  const q = new URLSearchParams();
+  if (boardIsOpen()) {
+    if (spendOpen) q.set("view", "spend");
+    else if (taskPageId) {
+      q.set("task", taskPageId);
+      if (panelOpen("taskmodal")) q.set("view", "tasks");
+    } else if (pageSlug) { q.set("view", "project"); q.set("slug", pageSlug); }
+    else if (boardProject === null) q.set("view", "projects");
+    else {
+      q.set("view", "board");
+      q.set("slug", boardProject === "" ? "all" : boardProject === UNFILED ? "unfiled" : boardProject);
+    }
+    if (boardDetailId && !taskPageId && !spendOpen) q.set("card", boardDetailId);
+  } else if (panelOpen("taskmodal")) {
+    q.set("view", "tasks");
+    if (taskView === "all") q.set("tab", "all");
+  } else if (traderIsOpen()) {
+    q.set("view", "trader");
+    if (traderTab && traderTab !== "summary") q.set("tab", traderTab);
+  } else if (panelOpen("learnmodal")) q.set("view", "learnings");
+  else if (active) q.set("thread", active.key);
+  return q;
+}
+function deskUrl() {
+  if (typeof location === "undefined" || typeof history === "undefined" || !history.replaceState) return;
+  const s = deskQuery().toString(), want = s ? "/?" + s : "/";
+  if ((location.pathname || "/") + (location.search || "") !== want) history.replaceState(history.state, "", want);
+}
+// The sidebar, the split and the address brought up to what is on screen:
+// after a sidebar click, and every few hundred ms (panels open from many
+// places, and every one of them is caught this way).
+function deskSync() {
+  const b = document.body;
+  if (!b || !b.classList) return;
+  if (!desk()) { b.classList.remove("tsplit"); return; }
+  const split = boardIsOpen() && !!taskPageId && panelOpen("taskmodal");
+  b.classList.toggle("tsplit", split);
+  const sec = deskSection();
+  for (const k of DESK_SECTIONS) {
+    const el = document.getElementById("sn-" + k);
+    if (!el || !el.classList) continue;
+    el.classList.toggle("on", k === sec);
+    if (k === sec) el.setAttribute("aria-current", "page"); else el.removeAttribute("aria-current");
+  }
+  const num = id => ((document.getElementById(id) || {}).textContent || "").replace(/\D+/g, "");
+  const put = (id, v) => { const el = document.getElementById(id); if (el && el.textContent !== v) el.textContent = v; };
+  put("snc-inbox", num("inboxcount") || num("homecount"));
+  put("snc-tasks", num("taskbadge"));
+  const unread = lastSessions.filter(s => unreadOf(s)).length;
+  put("snc-threads", unread ? String(unread) : "");
+  const dot = document.getElementById("botdot"), sdot = document.getElementById("sndot");
+  if (dot && sdot && sdot.className !== dot.className) sdot.className = dot.className;
+  document.querySelectorAll("#tlist .task[data-task]").forEach(el =>
+    el.classList.toggle("open-page", split && el.dataset.task === taskPageId));
+  // the j/k selection survives a redraw of its list
+  if (kselKey) {
+    const front = kList(), sel = document.querySelector(".ksel");
+    if (sel && !front.includes(sel)) sel.classList.remove("ksel");      // its list is not in front now
+    if (!document.querySelector(".ksel")) {
+      const el = front.find(e => kKey(e) === kselKey);
+      if (el) el.classList.add("ksel");
+    }
+  }
+  deskUrl();
+}
+
+// --- keys ---
+// j/k move through the list in front (the open panel's tasks or cards, the
+// threads while one is open, else Needs you), Enter opens, e accepts, d
+// dismisses (by clicking the row's own button, so it is exactly what the
+// click does), / or ⌘K search, Esc closes, ? lists them. None fires while
+// a field has the keyboard: typing in the composer is typing.
+function typingIn(t) {
+  if (!t) return false;
+  const tag = String(t.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || !!t.isContentEditable;
+}
+function kList() {
+  if (modalIsOpen()) return [];
+  const tasks = panelOpen("taskmodal"), board = boardIsOpen();
+  if (tasks && (!board || (document.body && document.body.classList.contains("tsplit"))))
+    return [...document.querySelectorAll("#tlist .task[data-task]")];
+  if (board) return pageSlug || taskPageId || spendOpen ? []
+    : [...document.querySelectorAll("#bover .pcard, #bboard .bcard")];
+  if (traderIsOpen() || panelOpen("learnmodal")) return [];
+  if (active || deskRegion === "threads") return [...document.querySelectorAll("#list .card")];
+  return [...document.querySelectorAll("#inbox .icard")];
+}
+// Which list is in front, by name: a selection belongs to its list (the same
+// task is a row in Tasks and a card on the board; picked in one, it is not
+// picked in the other).
+function kKey(el) {
+  if (!el || !el.classList) return "";
+  const d = el.dataset || {};
+  const list = el.classList.contains("task") ? "tasks" : el.classList.contains("icard") ? "inbox"
+    : el.classList.contains("card") ? "threads" : "board";
+  return list + ":" + (d.task || d.id || d.key || d.slug || "");
+}
+function kCurrent() {
+  const els = kList();
+  return els.find(e => e.classList.contains("ksel")) || (kselKey && els.find(e => kKey(e) === kselKey)) || null;
+}
+function kSelect(el) {
+  document.querySelectorAll(".ksel").forEach(e => e.classList.remove("ksel"));
+  if (!el) { kselKey = ""; return; }
+  el.classList.add("ksel");
+  kselKey = kKey(el);
+  if (el.scrollIntoView) el.scrollIntoView({block: "nearest"});
+}
+function kMove(step) {
+  const els = kList();
+  if (!els.length) return;
+  const cur = kCurrent();
+  let i = cur ? els.indexOf(cur) : -1;
+  if (i < 0) i = els.findIndex(e => e.classList.contains("active"));
+  kSelect(els[i < 0 ? (step > 0 ? 0 : els.length - 1) : Math.max(0, Math.min(els.length - 1, i + step))]);
+}
+function kOpen(el) {
+  if (!el) return;
+  if (el.dataset && el.dataset.task && el.classList.contains("task")) return openTaskPage(el.dataset.task);
+  if (el.classList.contains("icard")) {
+    const t = el.querySelector(".tt.open");
+    if (t && t.click) t.click();
+    return;
+  }
+  if (el.click) el.click();
+}
+// e and d act as Needs you does, never more at once than a click there: an
+// accept or dismiss waits behind Undo (as a swipe's does), an approval asks
+// first -- it lands the branch. A Needs-you card's own button already does
+// exactly that, so it is pressed; a task row's or a board card's acts at
+// once on a click, so the key goes the Undo / confirm way instead.
+const K_WORDS = {accept: /^(accept|approve)\b/i, dismiss: /^dismiss\b/i};
+function kAct(el, what) {
+  const b = [...el.querySelectorAll("button")].find(x => !x.disabled
+    && ((x.dataset && (x.dataset.act === what || (what === "accept" && x.dataset.act === "approve")))
+        || K_WORDS[what].test((x.textContent || "").trim())));
+  if (!b) return toast(what === "accept" ? "Nothing to accept here" : "Nothing to dismiss here");
+  if (el.classList.contains("icard")) return b.click();
+  const d = el.dataset || {}, id = d.task || d.id || "";
+  const title = ((el.querySelector(".tt") || {}).textContent || id).trim().replace(/\s+/g, " ");
+  if (!id) return;
+  if (what === "accept" && /^approve\b/i.test((b.textContent || "").trim())) {
+    if (!confirm(`Approve “${title.slice(0, 80)}”?\n\nApproving lands it: its branch is rebased onto the base, `
+                 + "tested and merged. That can't be undone from here.")) return;
+    return taskAction(id, "approve");
+  }
+  deferTask(id, what, `${INBOX_UNDONE[what]}: ${title.slice(0, 60)}`);
+  redrawWork();
+}
+function deskSearch() {
+  closeCtx();
+  const box = document.getElementById("search");
+  if (!box) return;
+  box.focus();
+  if (box.select) box.select();
+}
+// Esc: the topmost thing closes. The image viewer, the drawer, a form and
+// the search field close themselves (their own listeners); this goes first
+// (capture), only to stand back for them.
+function deskEscape(e) {
+  const t = e.target;
+  if (t && t.id === "search") return;
+  if (typingIn(t)) { if (t.id !== "reply" && t.blur) t.blur(); return; }
+  if (viewerIsOpen() || drawerIsOpen() || modalIsOpen()) return;
+  if (ctxOpen()) { closeCtx(); return; }
+  const det = document.getElementById("bdetail");
+  if (det && det.style.display && det.style.display !== "none") { closeDetail(); return deskSync(); }
+  if (document.body.classList.contains("tsplit")) { taskPageId = null; taskPageData = null; closeBoard(); return deskSync(); }
+  if (boardIsOpen()) { closeBoard(); taskPageId = null; spendOpen = false; return deskSync(); }
+  if (traderIsOpen()) { toggleTrader(); return deskSync(); }
+  if (panelOpen("learnmodal")) { toggleLearn(); return deskSync(); }
+  if (panelOpen("taskmodal")) { toggleTasks(); return deskSync(); }
+  if (kselKey) kSelect(null);
+}
+document.addEventListener("keydown", e => {
+  if (!desk()) return;
+  if (e.key === "Escape") return deskEscape(e);
+  if (e.metaKey || e.ctrlKey || e.altKey || typingIn(e.target)) return;
+  if (viewerIsOpen() || modalIsOpen()) return;
+  if (ctxOpen() && (e.key === "ArrowDown" || e.key === "ArrowUp")) { e.preventDefault(); return ctxStep(e.key === "ArrowDown" ? 1 : -1); }
+  const k = e.key;
+  if (k === "/") { e.preventDefault(); deskSearch(); }
+  else if (k === "?") { e.preventDefault(); deskKeys(); }
+  else if (k === "j" || k === "k") { e.preventDefault(); kMove(k === "j" ? 1 : -1); }
+  else if (k === "Enter") {
+    // Enter on a focused button or link is that button's.
+    if (t_isControl(e.target)) return;
+    const el = kCurrent();
+    if (el) { e.preventDefault(); kOpen(el); }
+  } else if (k === "e" || k === "d") {
+    const el = kCurrent();
+    if (el) { e.preventDefault(); kAct(el, k === "e" ? "accept" : "dismiss"); }
+  }
+}, true);
+function t_isControl(t) {
+  return !!(t && t.closest && t.closest("button, a, summary, [role=menuitem], [tabindex], .grip"));
+}
+// Which region j/k walk on the home screen: wherever the pointer last was.
+document.addEventListener("pointerdown", e => {
+  if (!desk() || !e.target || !e.target.closest) return;
+  if (e.target.closest("#list")) deskRegion = "threads";
+  else if (e.target.closest("#inbox")) deskRegion = "inbox";
+  if (ctxOpen() && !e.target.closest("#ctxmenu")) closeCtx();
+}, true);
+const DESK_KEYS = [["j / k", "next / previous in the list in front"], ["Enter", "open it"],
+  ["e", "accept or approve it"], ["d", "dismiss it"], ["/ or ⌘K", "search threads and tasks"],
+  ["Esc", "close the panel, dialog or menu on top"], ["?", "this list"],
+  ["right-click", "a row's own actions"]];
+function deskKeys() {
+  openModal(`<div class="tform"><h3>⌨️ Keyboard shortcuts</h3>
+    <div class="sub">On a laptop or desktop. None of them fires while you are typing.</div>
+    <div class="keys">${DESK_KEYS.map(([k, d]) => `<span class="kbd">${esc(k)}</span><span>${esc(d)}</span>`).join("")}</div>
+    <div class="acts"><button class="ghost" onclick="closeModal()">Close</button></div></div>`);
+}
+// Settings: what the phone keeps behind ⋯, in one place.
+function deskSettings() {
+  const lbl = document.getElementById("themelbl"), nl = document.getElementById("notifylbl");
+  const row = (fn, icon, label, note) => `<button class="ghost" onclick="closeModal();${fn}">${icon} ${esc(label)}${
+    note ? `<span class="note">${esc(note)}</span>` : ""}</button>`;
+  openModal(`<div class="tform"><h3>⚙️ Settings</h3>
+    <div class="sub">Theme and notifications for this browser; quiet hours for every device.</div>
+    <div class="setrows">
+      ${row("cycleTheme();deskSettings()", "◐", "Theme", lbl ? lbl.textContent.trim() : "")}
+      ${row("enableNotifications()", "🔔", "Notifications on this device", nl ? nl.textContent.trim() : "")}
+      ${row("notifySettings()", "🔕", "Notification kinds, projects and quiet hours", "")}
+      ${row("nameAllThreads()", "✎", "Name every untitled thread", "")}
+      ${row("deskNav('learnings')", "🧠", "Learnings", "")}
+      ${row("deskKeys()", "⌨️", "Keyboard shortcuts", "?")}
+    </div>
+    <div class="acts"><button class="ghost" onclick="closeModal()">Close</button></div></div>`);
+}
+
+// --- right-click ---
+// A row's menu is its own buttons (and Open): what a phone does by swiping
+// or a tap on ×, a mouse does here, through the same handlers.
+let ctxItemsNow = [];
+function ctxOpen() {
+  const m = document.getElementById("ctxmenu");
+  return !!m && m.classList.contains("open");
+}
+function closeCtx() {
+  const m = document.getElementById("ctxmenu");
+  if (m && m.classList) { m.classList.remove("open"); setHTML(m, ""); }
+  ctxItemsNow = [];
+}
+function ctxItems(row) {
+  const out = [{label: "Open", run: () => kOpen(row)}], seen = new Set(["Open"]);
+  row.querySelectorAll("button").forEach(b => {
+    if (b.disabled) return;
+    const text = (b.textContent || "").trim();
+    const label = /[A-Za-z]{2}/.test(text) ? text : (b.getAttribute("title") || b.getAttribute("aria-label") || "");
+    const name = titleCase(label.replace(/\s+/g, " ").replace(/\s*[›»]$/, ""));
+    if (!name || seen.has(name)) return;
+    seen.add(name);
+    out.push({label: name, run: () => b.click()});
+  });
+  return out;
+}
+function openCtx(items, x, y) {
+  const m = document.getElementById("ctxmenu");
+  ctxItemsNow = items;
+  setHTML(m, items.map((it, i) => (i === 1 ? "<hr>" : "")
+    + `<button role="menuitem" data-i="${i}" onclick="ctxRun(${i})">${esc(it.label)}</button>`).join(""));
+  m.classList.add("open");
+  const w = m.offsetWidth || 220, h = m.offsetHeight || 40 * items.length;
+  const vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+  m.style.left = Math.max(4, Math.min(x, vw - w - 4)) + "px";
+  m.style.top = Math.max(4, Math.min(y, vh - h - 4)) + "px";
+  const first = m.querySelector("button");
+  if (first && first.focus) first.focus();
+}
+function ctxRun(i) {
+  const it = ctxItemsNow[i];
+  closeCtx();
+  if (it) it.run();
+}
+function ctxStep(d) {
+  const bs = [...document.querySelectorAll("#ctxmenu button")];
+  if (!bs.length) return;
+  const i = bs.indexOf(document.activeElement);
+  const n = bs[(i + d + bs.length) % bs.length];
+  if (n && n.focus) n.focus();
+}
+const CTX_ROWS = "#list .card, #tlist .task, .bcard, .pcard, #inbox .icard";
+document.addEventListener("contextmenu", e => {
+  if (!desk() || !e.target || !e.target.closest) return;
+  const row = e.target.closest(CTX_ROWS);
+  if (!row || e.target.closest("a, input, textarea, select")) return;
+  e.preventDefault();
+  kSelect(row);
+  openCtx(ctxItems(row), e.clientX, e.clientY);
+});
+for (const k of ["wheel", "scroll"])
+  document.addEventListener(k, () => { if (ctxOpen()) closeCtx(); }, {capture: true, passive: true});
+if (typeof window !== "undefined" && window.addEventListener) {
+  window.addEventListener("blur", () => closeCtx());
+  window.addEventListener("resize", () => { closeCtx(); gripFits.forEach(f => f()); deskWatch(); deskSync(); });
+}
+
+// --- resizable panes ---
+// The thread list's width and the task list's (in the split): dragged on
+// the line between, ←/→ when the grip has focus, double-click for the
+// default. Kept in localStorage, as a CSS variable the desktop block reads.
+const gripFits = [];
+function gripWire(id, cssVar, key, min, maxOf, leftOf, widthOf) {
+  const g = document.getElementById(id), root = document.documentElement;
+  if (!g || !g.addEventListener || !root || !root.style) return;
+  const set = w => {
+    w = Math.round(Math.max(min, Math.min(maxOf(), w)));
+    root.style.setProperty(cssVar, w + "px");
+    try { localStorage.setItem(key, String(w)); } catch (e) { /* kept for this page only */ }
+    g.setAttribute("aria-valuenow", String(w));
+    return w;
+  };
+  // A width kept from a wider window is held to this one (and kept as it
+  // was, for when the window is wide again).
+  const fit = () => {
+    let saved = NaN;
+    try { saved = parseInt(localStorage.getItem(key) || "", 10); } catch (e) { saved = NaN; }
+    if (saved > 0) root.style.setProperty(cssVar, Math.round(Math.max(min, Math.min(maxOf(), saved))) + "px");
+  };
+  fit();
+  gripFits.push(fit);
+  g.addEventListener("pointerdown", e => {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault();
+    if (g.setPointerCapture && e.pointerId !== undefined) g.setPointerCapture(e.pointerId);
+    g.classList.add("dragging"); document.body.classList.add("resizing");
+    const move = ev => set(ev.clientX - leftOf());
+    const up = () => {
+      g.classList.remove("dragging"); document.body.classList.remove("resizing");
+      g.removeEventListener("pointermove", move); g.removeEventListener("pointerup", up);
+      g.removeEventListener("pointercancel", up); g.removeEventListener("lostpointercapture", up);
+    };
+    g.addEventListener("pointermove", move); g.addEventListener("pointerup", up); g.addEventListener("pointercancel", up);
+    g.addEventListener("lostpointercapture", up);
+  });
+  g.addEventListener("dblclick", () => {
+    root.style.removeProperty(cssVar);
+    try { localStorage.removeItem(key); } catch (e) { /* nothing kept */ }
+  });
+  g.addEventListener("keydown", e => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    set(widthOf() + (e.key === "ArrowRight" ? 24 : -24));
+  });
+}
+const rectOf = sel => { const el = document.querySelector(sel); return el && el.getBoundingClientRect ? el.getBoundingClientRect() : {left: 0, width: 0}; };
+gripWire("listgrip", "--list-w", "sw-list-w", 260,
+         () => Math.min(680, (window.innerWidth || 1280) * 0.45),
+         () => rectOf(".listcol").left, () => rectOf(".listcol").width);
+gripWire("taskgrip", "--tlist-w", "sw-tlist-w", 320,
+         () => Math.max(360, (window.innerWidth || 1280) - rectOf("#sidenav").width - 520),
+         () => rectOf("#taskmodal").left, () => rectOf("#taskmodal").width);
+// Only a wide window keeps this in step (a phone has no sidebar to keep, and
+// no timer it does not need); one that is widened starts it then.
+let deskTimer = 0;
+function deskWatch() {
+  if (desk() && !deskTimer) deskTimer = setInterval(deskSync, 400);
+}
+deskSync();
+deskWatch();
 
 // --- polling ---
 // Each poll waits for its last one, so a slow tunnel queues nothing; a hidden
