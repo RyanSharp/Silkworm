@@ -41768,6 +41768,7 @@ def test_push_urgent_bypasses_quiet_hours():
     halt = health("healthcheck", ["FAIL halt: TRADING HALTED for momentum", "run 2026-11-22"], "h1")
     stale = health("healthcheck", ["FAIL universe: 140 days old"], "u1")
     gw = health("gateway", ["gateway: not listening"], "g1")
+    missed = health("healthcheck", ["FAIL dispatch: no heartbeat for the open slot"], "d1")
     check("a halt is told apart from another healthcheck failure by its own check's name",
           "trader/healthcheck:halt" in halt["signals"] and "trader/healthcheck:halt" not in stale["signals"],
           str(halt["signals"]))
@@ -41777,10 +41778,13 @@ def test_push_urgent_bypasses_quiet_hours():
     o_halt = rig.notifier.deliver(halt)
     o_gw = rig.notifier.deliver(gw)
     o_stale = rig.notifier.deliver(stale)
+    o_missed = rig.notifier.deliver(missed)
     check("a trader halt is sent at night", o_halt["sent"] == 1, str(o_halt))
     check("so is the Gateway down or logged out", o_gw["sent"] == 1, str(o_gw))
-    check("and both are sent as urgent to the push service, so an idle phone wakes",
-          [c["urgency"] for c in rig.service.calls] == ["high", "high"], str(rig.service.calls))
+    check("so is a missed dispatch the trader's own healthcheck reports (its check is named dispatch)",
+          o_missed["sent"] == 1 and "trader/healthcheck:dispatch" in missed["signals"], str(o_missed))
+    check("and all are sent as urgent to the push service, so an idle phone wakes",
+          [c["urgency"] for c in rig.service.calls] == ["high", "high", "high"], str(rig.service.calls))
     bare = push.health_message({"project": "trader", "check": "gateway", "summary": "down",
                                 "fingerprint": "nb"}, None)
     rig.notifier.deliver(bare)

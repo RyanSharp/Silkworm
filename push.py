@@ -132,7 +132,8 @@ URGENT = {
     "gateway": ("IB Gateway down or logged out",
                 ("trader/gateway", "trader/healthcheck:gateway")),
     "dispatch": ("Trader missed a dispatch, or its daemon is down",
-                 ("trader/dispatching", "trader/healthcheck:daemon")),
+                 ("trader/dispatching", "trader/healthcheck:daemon",
+                  "trader/healthcheck:dispatch")),
     "credentials": ("The mini's Claude or Apple credentials failing",
                     ("mini/credentials",)),
 }
