@@ -138,6 +138,7 @@ STAND_INS = {
 #: A test that drives one of these routes supplies the name instead.
 TASK_ROUTES = ("CLAUDE_CWD", "HEALTH_WARN_DAYS", "_spend", "_with_costs", "approve_task",
                "board_release", "board_release_tags", "board_survey", "decide_findings", "land_or_drop", "operator_refused",
+               "refile_to_land",
                "project_store", "run_email_ingest", "stop_task", "task_changes", "task_contained",
                "tell_thread", "tidy_checkout")
 PROJECT_ROUTES = ("GITHUB_OWNER", "install_git_guards", "operator_refused",

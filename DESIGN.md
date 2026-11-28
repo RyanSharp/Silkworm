@@ -589,12 +589,20 @@ two new facts a row can carry: a count git would not give is written as
 "commit count unknown" rather than `or 0`'s "0 commits", and a remote-only
 branch says which remote it is on.
 
-Those remote-only rows are named but not acted on. Land and Drop on the
-dashboard both work on the local branch — Land would report "its branch is
-gone: nothing to land" over commits sitting on origin, and Drop would delete
-nothing — so a remote-only row offers neither. `prune_merged` likewise only
-considers local branches, since it deletes through `discard.drop`, which
-touches `refs/heads/` alone.
+Those remote-only rows were at first named but not acted on. Since then Land
+restores the local branch from the remote copy (`restore_from_remote`), and
+Drop (2026-11-27) tags each remote tip under `discarded/` — the record
+`retired` reads — without deleting anything on the remote, so a remote-only
+row offers both. `prune_merged` still considers local branches only, and drops
+with `remote=False`: it decides on the local branch, and a local ref reset to
+the base while origin holds work must not retire that work on the way past.
+
+Every row also carries its `reason` (`branches.REASONS`). The `STRANDED`
+ones — an unreviewed role's commits, a dismissed or superseded task's, a
+dropped branch's leftover remote copy — are branches nothing lands on its own,
+so Needs you lists them with Drop and Refile to land (`bot.refile_to_land`,
+which moves the branch onto a new queued implementor task, as
+`rework_finished` does for a landing conflict).
 
 This is visibility, not automation: nothing in it merges, deletes or pushes.
 

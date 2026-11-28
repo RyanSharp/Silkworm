@@ -2359,13 +2359,13 @@ PAGE = r"""<!doctype html>
            padding: var(--sp-25) var(--sp-3); margin-bottom: var(--sp-2); }
   .icard.k-failed { border-left: 3px solid var(--bad); }
   .icard.k-approval, .icard.k-plan { border-left: 3px solid var(--gold); }
-  .icard.k-question, .icard.k-findings, .icard.k-landing { border-left: 3px solid var(--info); }
+  .icard.k-question, .icard.k-findings, .icard.k-landing, .icard.k-stranded { border-left: 3px solid var(--info); }
   .icard .ihead { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-2xs);
                   font-family: var(--mono); color: var(--muted); }
   .icard .ikind { border-radius: var(--r-xs); padding: 1px var(--sp-15); background: var(--fill-2); }
   .icard .ikind.k-failed { background: var(--bad-soft); color: var(--bad); }
   .icard .ikind.k-approval, .icard .ikind.k-plan, .icard .ikind.k-proposal { background: var(--accent-soft); color: var(--gold); }
-  .icard .ikind.k-question, .icard .ikind.k-findings, .icard .ikind.k-landing { background: var(--info-soft); color: var(--info); }
+  .icard .ikind.k-question, .icard .ikind.k-findings, .icard .ikind.k-landing, .icard .ikind.k-stranded { background: var(--info-soft); color: var(--info); }
   .icard .iage { margin-left: auto; }
   .icard .tt { font-weight: var(--fw-semi); margin-top: var(--sp-1); overflow-wrap: anywhere; }
   .icard .tt.open { cursor: pointer; }
@@ -4110,7 +4110,7 @@ async function sendDeferred(id) {
 }
 // What a task action did, as a toast says it.
 const PAST = {accept: "accepted", dismiss: "dismissed", retry: "retried", approve: "approved",
-              cancel: "cancelled", rework: "sent back", land: "landing", drop: "dropped",
+              cancel: "cancelled", rework: "sent back", land: "landing", drop: "dropped", refile: "refiled",
               resolve: "marked done", close: "closed", dig: "sent to dig deeper", release: "released"};
 function pastTense(action) { return PAST[action] || `${action}ed`; }
 // Put away (another app, the screen locked) before Undo ran out: send now,
@@ -6377,7 +6377,7 @@ async function taskAction(id, action, notes, round) {
   // Land only starts a landing; "Task landed" would claim a merge that has
   // not happened. Those two say what they did in their own words.
   // Release likewise only starts one; Done is not a verb to add -ed to.
-  toast(r.ok ? ((action === "land" || action === "drop" || action === "release") && r.note
+  toast(r.ok ? ((action === "land" || action === "drop" || action === "refile" || action === "release") && r.note
                  ? r.note
                : action === "resolve" ? "Marked done"
                : action === "close" ? "Findings closed"
@@ -6649,23 +6649,25 @@ async function renderUnmerged() {
       // where it is.
       const where = (b.local === false && b.remote) ? esc(b.remote) + "/" : "";
       const tip = `${esc(b.title)}\n${esc(b.head)} · ${esc(b.id)} · ${
-        esc(b.state)} · off ${esc(b.base)}${
+        esc(b.state)} · off ${esc(b.base)}${b.why ? "\n" + esc(b.why) : ""}${
         n === "?" ? "\ngit could not count its commits" : ""}${
         where ? "\nno local branch — only on " + esc(b.remote) : ""}\n${esc(b.repo)}`;
       const label = `${where}${esc(b.branch.replace(/^silkworm\//, ""))} <b>${n}</b>`;
       const name = b.thread
         ? `<button class="b" title="${tip}" onclick="toggleTasks();jumpTo('${esc(b.thread)}')">${label}</button>`
         : `<span class="b" title="${tip}">${label}</span>`;
-      // Land: the same landing Approve starts (rebase, suite, merge, suite).
-      // Drop: delete the branch, tagging what no other ref holds first.
-      // Both buttons act on the local branch. With none, Land would report
-      // "its branch is gone: nothing to land" over commits sitting on the
-      // remote, and Drop would delete nothing -- so neither is offered, and
-      // the row stays a name to go and fetch.
-      if (where) return `<span class="ub">${name}</span>`;
+      // Land: the same landing Approve starts (rebase, suite, merge, suite),
+      // restoring the local branch from a remote copy when that is all there
+      // is. Drop: delete the branch, tagging what no other ref holds first;
+      // a remote-only copy is tagged as discarded, which takes it off here.
+      // A stranded branch (an unreviewed role's, a dismissed or superseded
+      // task's) gets Refile instead of Land, which would refuse it.
       return `<span class="ub">${name}`
-        + `<button class="ghost" title="rebase onto the base, test, merge, test" `
-        + `onclick="taskAction('${esc(b.id)}','land')">Land</button>`
+        + (b.stranded
+          ? `<button class="ghost" title="a new task takes the branch over, is reviewed and lands it" `
+            + `onclick="if(confirm('Refile ${esc(b.branch)} to land? A new task takes it over, and is reviewed before it lands.'))taskAction('${esc(b.id)}','refile')">Refile</button>`
+          : `<button class="ghost" title="rebase onto the base, test, merge, test" `
+            + `onclick="taskAction('${esc(b.id)}','land')">Land</button>`)
         + `<button class="ghost" title="delete the branch; its commits are kept under a tag" `
         + `onclick="if(confirm('Drop ${esc(b.branch)}? Its commits are kept under a discarded/ tag.'))taskAction('${esc(b.id)}','drop')">Drop</button></span>`;
     }).join("");
@@ -8027,9 +8029,10 @@ function cardReview(t) {
 function cardLanding(t) {
   // The same words as the task panel's landing(); a card only drops the detail.
   if (t.landing) return landing({result: {landing: t.landing}});
-  if (t.state === "done" && t.unmerged)
+  if ((t.state === "done" || t.state === "cancelled") && t.unmerged)
     return `<div class="land bad">not landed — ${esc(t.unmerged.branch || "its branch")} holds ${
-      t.unmerged.commits === null ? "?" : t.unmerged.commits} commit(s)</div>`;
+      t.unmerged.commits === null ? "?" : t.unmerged.commits} commit(s)${
+      t.unmerged.why ? ": " + esc(t.unmerged.why) : ""}</div>`;
   return "";
 }
 function cardButtons(t) {
@@ -8043,13 +8046,15 @@ function cardButtons(t) {
     b += t.priority
       ? `<button class="ghost" title="back to its place, oldest first" onclick="runNext('${esc(t.id)}',false)">Unpin</button>`
       : `<button class="ghost" title="the runner claims this before older queued work" onclick="runNext('${esc(t.id)}',true)">Run next</button>`;
-  // Land and Drop, for finished work the survey says never reached the base --
-  // the unmerged strip's buttons, offered only on a local branch for the same
-  // reason as there.
-  if (t.state === "done" && t.unmerged && t.unmerged.local !== false
+  // Land (or Refile, for a stranded branch) and Drop, for finished work the
+  // survey says never reached the base -- the unmerged strip's buttons.
+  if ((t.state === "done" || t.state === "cancelled") && t.unmerged
       && !(t.landing && t.landing.reworked_by)) {
-    b += `<button class="ghost" title="rebase onto the base, test, merge, test" `
-      + `onclick="taskAction('${esc(t.id)}','land')">Land</button>`
+    b += (t.unmerged.stranded
+      ? `<button class="ghost" title="a new task takes the branch over, is reviewed and lands it" `
+        + `onclick="if(confirm('Refile ${esc(t.unmerged.branch || t.id)} to land? A new task takes it over, and is reviewed before it lands.'))taskAction('${esc(t.id)}','refile')">Refile</button>`
+      : t.state === "done" ? `<button class="ghost" title="rebase onto the base, test, merge, test" `
+        + `onclick="taskAction('${esc(t.id)}','land')">Land</button>` : "")
       + `<button class="ghost" title="delete the branch; its commits are kept under a tag" `
       + `onclick="if(confirm('Drop ${esc(t.unmerged.branch || t.id)}? Its commits are kept under a discarded/ tag.'))taskAction('${esc(t.id)}','drop')">Drop</button>`;
   }
@@ -9116,6 +9121,7 @@ const INBOX_BUTTON = {
   approve: {label: "Approve", cls: "act"},
   land:    {label: "Land", cls: "act"},
   drop:    {label: "Drop", cls: "ghost"},
+  refile:  {label: "Refile to land", cls: "act"},
   close:   {label: "Close", cls: "act"},
   dig:     {label: "Dig deeper…", cls: "ghost"},
   rework:  {label: "Send back…", cls: "ghost"},
@@ -9228,6 +9234,11 @@ async function inboxAct(el) {
     if (!confirm(`Drop the branch of “${title}”?\n\nThe branch is deleted; its commits are kept `
                  + "under a discarded/ tag.")) return;
     return taskAction(id, "drop");
+  }
+  if (act === "refile") {
+    if (!confirm(`Refile the branch of “${title}” to land?\n\nA new task takes the `
+                 + "branch over, is reviewed like any other, and lands it if it passes.")) return;
+    return taskAction(id, "refile");
   }
   if (act === "resolve") {
     if (!confirm(`Mark “${title}” done?\n\nSay so once you have taken the step it left for you.`)) return;

@@ -444,8 +444,8 @@ FIELDS: dict[str, tuple] = {
 
 #: What a recommendation may suggest: the inbox's own buttons, by the
 #: /tasks action each one sends ("rework" is Send back).
-RECOMMEND_ACTIONS = ("accept", "dismiss", "approve", "land", "drop", "close", "dig",
-                     "rework", "retry", "resolve", "release")
+RECOMMEND_ACTIONS = ("accept", "dismiss", "approve", "land", "drop", "refile", "close",
+                     "dig", "rework", "retry", "resolve", "release")
 
 #: Room for one plain sentence on a card.
 RECOMMEND_WHY_MAX = 300

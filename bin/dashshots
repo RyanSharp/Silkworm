@@ -219,6 +219,15 @@ def stand_in(real_port: str):
                 answer = SAMPLE_PLAN
             elif self.path == "/releases" and action == "status":
                 answer = {"ok": True, "run": None}
+            elif LOCAL and self.path == "/tasks" and action in LOCAL_ACTIONS:
+                fn = globals()[LOCAL_ACTIONS[action]]
+                answer = (fn(real_port) if action == "inbox" else
+                          fn(real_port, payload.get("project") or payload.get("id") or ""))
+                if action == "inbox" and os.environ.get("DASHSHOTS_PLAN") != "live":
+                    answer = with_sample_plan(answer)
+            elif LOCAL and self.path == "/tasks" and action == "unmerged":
+                rows = survey_for(real_port)
+                answer = {"ok": True, "unmerged": rows, "summary": ""}
             elif allowed is not None and action in allowed:
                 answer = forward(real_port, self.path, payload)
                 if (self.path == "/tasks" and action == "inbox" and not answer.get("ok")
@@ -324,6 +333,31 @@ def with_sample_plan(answer: dict) -> dict:
                 count=(answer.get("count") or 0) + 1)
 
 
+#: DASHSHOTS_LOCAL=1: build the inbox, project and task pages, and the branch
+#: survey under them, with this checkout's code over the live state read only,
+#: even when the running bot answers those itself. For shooting a change to
+#: what they contain before the bot runs it.
+LOCAL = os.environ.get("DASHSHOTS_LOCAL") == "1"
+LOCAL_ACTIONS = {"inbox": "local_inbox", "project": "local_project", "page": "local_task_page"}
+
+
+def survey_for(real_port: str) -> list:
+    """The branch survey: the real bot's, or (LOCAL) this checkout's
+    branches.survey over the live tasks.json -- git asked, nothing changed."""
+    if not LOCAL:
+        return forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+    sys.path.insert(0, str(REPO))
+    import branches
+    home = live_home()
+    tasks_ = json.loads((home / "tasks.json").read_text())
+    projects = json.loads((home / "projects.json").read_text())
+
+    def scope_for(slug):
+        p = projects.get(slug) or next((x for x in projects.values() if x.get("slug") == slug), {})
+        return (p or {}).get("scope") or {}
+    return branches.survey([dict(v, id=k) for k, v in tasks_.items()], scope_for=scope_for)
+
+
 def local_inbox(real_port: str) -> dict:
     """The /tasks `inbox` answer, from tasks.json, projects.json, health.json
     and operator.json in the live checkout (each loaded read-only) and the
@@ -339,7 +373,7 @@ def local_inbox(real_port: str) -> dict:
         projects = list(json.loads((home / "projects.json").read_text()).values())
         rows = health.HealthStore(home / "health.json", readonly=True).all()
         op = operator_role.State(home / "operator.json", readonly=True)
-        survey = forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+        survey = survey_for(real_port)
         out = inbox.build(tasks_.values(), unmerged_rows=survey, plan=op.plan(),
                           health_rows=rows, operator_thread=op.thread() or "",
                           project_titles={p["slug"]: p.get("title") or p["slug"] for p in projects})
@@ -365,7 +399,7 @@ def local_project(real_port: str, slug: str) -> dict:
         if not prec:
             return {"ok": False, "error": f"unknown project {slug!r}"}
         rows = health.HealthStore(home / "health.json", readonly=True).all()
-        survey = forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+        survey = survey_for(real_port)
         cwd = (prec.get("scope") or {}).get("cwd") or ""
         tags = releases.tags_since(cwd, time.time() - board.PAGE_DAYS * 86400) if cwd else []
         rel = board.release_status(cwd) if cwd else None
@@ -402,7 +436,7 @@ def local_task_page(real_port: str, tid: str) -> dict:
         def scope_for(slug):
             p = projects.get(slug) or next((x for x in projects.values() if x.get("slug") == slug), {})
             return (p or {}).get("scope") or {}
-        survey = forward(real_port, "/tasks", {"action": "unmerged"}).get("unmerged") or []
+        survey = survey_for(real_port)
         changes = taskchanges.for_task(rec, scope_for=scope_for)
         prec = projects.get(rec.get("project") or "") or {}
         page = board.task_page(rec, tasks_.values(), unmerged_rows=survey, changes=changes,
@@ -636,6 +670,16 @@ def pick_examples(base: str, project: str) -> dict:
     # ?task= opens the task panel on a row that needs you, so pick one that does.
     needs = get_json(base + "/api/tasks", {"action": "attention"}).get("tasks") or []
     out["task"] = needs[0]["id"] if needs else out["card"]
+    # A stranded branch's task (inbox.py's "stranded" kind: Refile or Drop),
+    # for its page and its project's Needs you.
+    try:
+        inbox_ = get_json(base + "/api/tasks", {"action": "inbox"})
+        stranded = [i for g in inbox_.get("groups") or () for i in g.get("items") or ()
+                    if i.get("kind") == "stranded"]
+        if stranded:
+            out["stranded"], out["stranded_project"] = stranded[0]["id"], stranded[0].get("project") or ""
+    except Exception:
+        pass
     # A landed task with a reply, for the task page's result, changes and
     # timeline -- one whose thread holds images, if any does.
     try:
@@ -705,6 +749,9 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
            ("task-page-timeline", f"/?task={quote(ex['landed'])}&sec=timeline")] if ex.get("landed") else []),
         # On a laptop, a task opened from Tasks: the list docked beside its page.
         *([("task-split", f"/?task={quote(ex['landed'])}&view=tasks")] if ex.get("landed") else []),
+        *([("task-stranded", f"/?task={quote(ex['stranded'])}")] if ex.get("stranded") else []),
+        *([("project-stranded", f"/?view=project&slug={quote(ex['stranded_project'])}")]
+          if ex.get("stranded_project") else []),
         ("projects", "/?view=projects"),
         # A project's own page (board.project_page), and an app's.
         ("project", f"/?view=project&slug={p}"),

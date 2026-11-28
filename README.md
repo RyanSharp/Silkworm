@@ -1575,16 +1575,20 @@ A local web dashboard for every thread session (localhost-only):
 
 - **Needs you, the home screen** — the page opens on one list of everything
   waiting on you (inbox.py): proposals, work waiting for approval, steps a run
-  left you and research findings, failures, landings git refused, the
-  operator's recorded ops plan, and health checks that name a decision of
-  yours. Grouped by project, the most urgent group and item first, newest
+  left you and research findings, failures, landings git refused, unlanded
+  branches nothing will land on its own (a researcher's or assistant's
+  commits, a dismissed or superseded task's, a dropped branch's leftover
+  remote copy — each with its reason, and **Refile to land**, which hands the
+  branch to a new implementor task that is reviewed and lands it, or
+  **Drop**), the operator's recorded ops plan, and health checks that name a
+  decision of yours. Grouped by project, the most urgent group and item first, newest
   first among equals. Each card says what it is and why in a line, shows the
   operator's recommendation when it set one (`silkworm edit <id> --recommend
   … --why …`; only for the item as it stands — a task that has moved on, or
   research dug deeper, drops it), and offers exactly the buttons the item
   allows, each the same /tasks action the task panel sends: Accept, Dismiss
-  and Retry go at once with Undo (as a swipe does); Approve, Land, Drop, Close,
-  Done ask first; Send back / Answer and Dig deeper ask for your words. The
+  and Retry go at once with Undo (as a swipe does); Approve, Land, Drop, Refile
+  to land, Close, Done ask first; Send back / Answer and Dig deeper ask for your words. The
   operator's plan is its own card — Run all, Run selected, Not now (see
   *Plans* above) — and stays on the list while what you chose runs, showing
   each step's result. On a laptop it sits in

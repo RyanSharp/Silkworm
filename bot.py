@@ -2675,6 +2675,140 @@ def land_or_drop(action: str, payload: dict) -> dict:
                                  else "dropped") + extra}
 
 
+#: How much of the original goal a refiled task carries. Its own instructions
+#: come first and are short; the goal is context, and tasks have a size limit.
+REFILE_GOAL_MAX = 2500
+
+
+def refile_goal(task: dict, branch: str, base: str, why: str) -> str:
+    """What an implementor refiled to land another task's branch is told."""
+    tid = task.get("id") or ""
+    goal = (task.get("goal") or task.get("title") or "").strip()
+    if len(goal) > REFILE_GOAL_MAX:
+        goal = goal[:REFILE_GOAL_MAX].rstrip() + " …"
+    return (
+        f"Refiled from {tid} ({why}) so that its work is reviewed and can land. "
+        f"Its commits are on `{branch}`, which your checkout starts from. Read what "
+        f"they change against the base (`git log {base}..HEAD`, `git diff "
+        f"{base}...HEAD`). Keep what still serves the original goal below and take "
+        f"out anything that should not be merged -- scratch output, caches, research "
+        f"artifacts. Rebase onto `{base}`, resolving conflicts in favour of what the "
+        f"base has since replaced, run the full test suite, and commit the result on "
+        f"the branch. If nothing on it is worth landing, say so and leave the branch "
+        f"with no commits beyond the base. Do not merge into, reset or push "
+        f"`{base}`: Silkworm lands it after verification and review.\n\n"
+        f"The original task's goal:\n\n{goal}")
+
+
+def refile_to_land(payload: dict) -> dict:
+    """Hand a finished task's stranded branch to a new implementor task.
+
+    The other half of Drop, for branches nothing lands on its own
+    (branches.STRANDED): a researcher's or an assistant's commits, which may
+    not land unreviewed (unreviewed_role), and a dismissed or superseded
+    task's, which were never approved. Like rework_finished, the work moves
+    rather than the task: the branch becomes the new task's `silkworm/<id>` --
+    the one name its first run reattaches -- and the old task records who took
+    it over, which takes its row off the survey so nothing offers it twice. A
+    branch left only on a remote is given a local branch at that remote tip.
+
+    Queued, as a click is your decision; on a project that does not take
+    unsupervised work the queue holds it, and the reply says so.
+    """
+    tid = payload.get("id", "")
+    task = task_store.get(tid)
+    if not task:
+        return {"ok": False, "error": "unknown task"}
+    if task.get("state") not in (tasks.DONE, tasks.CANCELLED):
+        return {"ok": False, "error": f"only finished work; this one is {task.get('state')}"}
+    task = dict(task, id=tid)
+    taken = ((task.get("result") or {}).get("landing") or {}).get("reworked_by")
+    if taken:
+        return {"ok": False, "error": f"its branch was already handed to {taken}"}
+    repo = branches.repo_for(task)
+    old = branches.name_for(task)
+    if not repo:
+        return {"ok": False, "error": "it has no repository to refile a branch from"}
+    # The base's refs and the name they go by: "" in the project means its
+    # default branch, which the survey resolves the same way.
+    refs, base = branches.base_for(repo, task_base(task))
+    gone = branches.nothing_to_land(repo, old, base)
+    if gone:
+        return {"ok": False, "error": gone}
+    sid = tasks.new_id()
+    new = worktrees.BRANCH_PREFIX + sid
+    reason = branches.reason_for(task)
+    why = branches.REASONS.get(reason) or "it never landed"
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
+                              text=True, timeout=60)
+    scope = {k: v for k, v in (task.get("scope") or {}).items() if k != "worktree"}
+    before = (task.get("result") or {}).get("landing")
+
+    def undo_mark():
+        # Back to exactly what the record said: no landing invented for it.
+        result = dict((task_store.get(tid) or {}).get("result") or {})
+        if before is None:
+            result.pop("landing", None)
+        else:
+            result["landing"] = before
+        task_store.update(tid, result=result)
+    try:
+        with repo_guard(str(repo)):
+            ref, sha = branches.work_tip(repo, old, refs)
+            if not sha:
+                return {"ok": False, "error": f"no copy of {old} holds work the base lacks"}
+            # The local branch moves over when it is the work; otherwise the
+            # new branch starts at the remote copy that is (branches.work_tip),
+            # and an empty local ref is left for the prune.
+            renamed = ref == f"refs/heads/{old}"
+            held = git("worktree", "list", "--porcelain").stdout.splitlines()
+            if renamed and f"branch refs/heads/{old}" in held:
+                return {"ok": False, "error": f"{old} is checked out somewhere; "
+                                              "release that checkout first"}
+            # Said before the branch moves, as rework_finished does: no moment
+            # in which the work is under the new name while the old record
+            # still offers it.
+            record_landing(task, {"eligible": False, "landed": False, "stage": "refiled",
+                                  "branch": old, "reworked_by": sid,
+                                  "detail": f"refiled as {sid} to be reviewed and landed"})
+            r = (git("branch", "-m", old, new) if renamed
+                 else git("branch", "--no-track", new, sha))
+            if r.returncode != 0:
+                undo_mark()
+                return {"ok": False, "error": f"could not take over {old}: "
+                                              + (r.stderr or "").strip()[-200:]}
+            try:
+                task_store.create(
+                    refile_goal(task, new, base or "the base branch", why),
+                    id=sid, title=f"Land: {(task.get('title') or tid)[:52]}",
+                    role="implementor", project=task.get("project") or "",
+                    state=tasks.QUEUED, driver="queue", isolate=True,
+                    source="refile", source_ref=tid,
+                    root=task.get("root") or tid, thread=task.get("thread") or "",
+                    scope=scope, branch=new)
+            except Exception as e:
+                log.exception("could not file the refile of %s", tid)
+                git(*(["branch", "-m", new, old] if renamed
+                      else ["branch", "-D", new]))
+                undo_mark()
+                return {"ok": False, "error": f"could not file it: {e}"}
+    except Exception as e:
+        log.exception("refiling %s failed", tid)
+        return {"ok": False, "error": f"refiling failed: {e}"}
+    log.info("refiled %s's branch %s as %s (%s) via %s", tid, old, sid, reason,
+             payload.get("by", "ui"))
+    held_back = projects.unready(project_store.get(task.get("project") or ""))
+    tell_thread(task.get("thread", ""),
+                f":arrows_counterclockwise: *Refiled to land* as `{sid}`, which takes "
+                f"over the branch (now `{new}`) to have it reviewed and landed.")
+    return {"ok": True, "id": sid,
+            "note": f"refiled as {sid} on {new}" + (
+                f"; it waits in the queue: {task.get('project') or 'it'} {held_back}"
+                if held_back else "")}
+
+
 def tidy_checkout(payload: dict) -> dict:
     """Remove a finished task's checkout whose only changes are generated.
 
@@ -3281,6 +3415,8 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
         return decide_findings(action, payload)
     if action in ("land", "drop"):
         return land_or_drop(action, payload)
+    if action == "refile":
+        return refile_to_land(payload)
     if action in ("accept", "dismiss", "retry", "cancel"):
         target = {"accept": tasks.QUEUED, "retry": tasks.QUEUED,
                   "dismiss": tasks.CANCELLED, "cancel": tasks.CANCELLED}[action]

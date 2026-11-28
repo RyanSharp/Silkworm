@@ -280,7 +280,11 @@ def unmerged_of(row: dict | None) -> dict | None:
     if not row:
         return None
     return {"commits": row.get("commits"), "branch": row.get("branch"),
-            "local": row.get("local"), "remote": row.get("remote")}
+            "local": row.get("local"), "remote": row.get("remote"),
+            # Why it is still here (branches.REASONS), and whether only a
+            # person can move it on -- Refile then stands in for Land.
+            "reason": row.get("reason") or "", "why": row.get("why") or "",
+            "stranded": bool(row.get("stranded"))}
 
 
 def board(records, project: str = "", *, role: str = "", state: str = "",

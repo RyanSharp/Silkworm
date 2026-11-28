@@ -30,12 +30,13 @@ import tasks
 #: landings, then the owner's health decisions, and last the proposals --
 #: nothing runs until you accept one, and nothing breaks while it waits.
 URGENCY = {"failed": 0, "approval": 1, "plan": 1, "question": 2, "findings": 2,
-           "landing": 2, "decision": 3, "proposal": 4}
+           "landing": 2, "stranded": 2, "decision": 3, "proposal": 4}
 
 #: The plain-words label each kind's card is headed with.
 KIND_LABEL = {"failed": "Failed", "approval": "Waiting for approval", "plan": "Ops plan",
               "question": "Your step", "findings": "Findings to read",
-              "landing": "Not landed", "decision": "Decide", "proposal": "Proposal"}
+              "landing": "Not landed", "stranded": "Unlanded branch",
+              "decision": "Decide", "proposal": "Proposal"}
 
 #: The group for items filed under no project, and the operator's own (its plan).
 UNFILED = "__unfiled__"
@@ -105,20 +106,35 @@ def _task_item(rec: dict, by_id: dict, unmerged: dict) -> dict | None:
         line = _event_why(rec) or "stopped with no reason recorded"
         no_retry = tasks.no_retry(rec, by_id)
         acts = ([] if no_retry else ["retry"]) + ["dismiss"]
-    elif state == tasks.DONE:
+    elif state in (tasks.DONE, tasks.CANCELLED):
         landing = (rec.get("result") or {}).get("landing") or {}
         row = unmerged.get(tid)
-        # A landing git refused, on a branch still here to land: the one done
-        # task that is yours (merge.needs_a_person). Not one handed on to a
-        # catch-up task, and not one whose branch lives only on a remote --
-        # Land and Drop act on the local branch, as the task panel says.
-        if (not merge.needs_a_person(landing) or landing.get("reworked_by") or not row
-                or row.get("local") is False):
+        # Only with a branch the survey still counts, and not one handed on to
+        # a task that took it over (that task answers for it now). A branch
+        # living only on a remote counts: Land restores the local branch from
+        # it (branches.restore_from_remote), and Drop marks it discarded.
+        if not row or landing.get("reworked_by"):
             return None
-        kind = "landing"
-        line = f"not landed ({landing.get('stage') or '?'})" + (
-            f" — {landing.get('detail')}" if landing.get("detail") else "")
-        acts = ["land", "drop"]
+        if row.get("stranded"):
+            # Nothing lands this on its own -- an unreviewed role's work, or a
+            # dismissed or superseded task's -- so it is a decision: throw it
+            # away, or hand it to an implementor whose work is reviewed.
+            kind = "stranded"
+            n = row.get("commits")
+            size = ("unmeasured commits" if n is None
+                    else f"{n} commit{'' if n == 1 else 's'}")
+            where = (f"{row.get('remote')}/" if row.get("local") is False
+                     and row.get("remote") else "")
+            line = f"{row.get('why') or 'not landed'} — {size} on {where}{row.get('branch')}"
+            acts = ["refile", "drop"]
+        elif state == tasks.DONE and merge.needs_a_person(landing):
+            # A landing git refused, on a branch still here to land.
+            kind = "landing"
+            line = f"not landed ({landing.get('stage') or '?'})" + (
+                f" — {landing.get('detail')}" if landing.get("detail") else "")
+            acts = ["land", "drop"]
+        else:
+            return None
     else:
         return None
     if not tasks.on_board(rec):

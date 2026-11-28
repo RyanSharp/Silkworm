@@ -23,6 +23,7 @@
     silkworm approve <id> / cancel <id>  approve reviewed work / end work   }
     silkworm land <id>              land a finished task's branch  } the same handlers:
     silkworm drop <id>              delete it, tagging its tip     } a refusal prints
+    silkworm refile <id>            hand its branch to a reviewed implementor task }
     silkworm edit <id> [--goal G] [--title T]  change unrun work   } the bot's reason
     silkworm edit <id> --recommend <action> --why W  suggest one on its inbox card }
     silkworm rework <id> --notes N  send back with your notes      } and exits 1
@@ -1333,6 +1334,9 @@ TASK_ACTIONS = {
     "dismiss": ("dismiss", {"--round": "round", "--notes": "notes"}, ()),
     "land":    ("land",    {"--notes": "notes"}, ()),
     "drop":    ("drop",    {"--notes": "notes"}, ()),
+    # A stranded branch (unreviewed role, dismissed, superseded) handed to a
+    # new implementor task that is reviewed and lands it.
+    "refile":  ("refile",  {"--notes": "notes"}, ()),
     # --recommend/--why: the operator's suggestion on the inbox card (sent as
     # the `recommend` action). It decides nothing, so the operator needs no
     # approval for it; `--recommend clear` takes it off.

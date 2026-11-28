@@ -41,7 +41,7 @@ VIZ_TAILSCALE_LOGIN, from another tailnet device, never from the mini) --
 carries a grant (`Grants`): a token the bot made for that one turn,
 handed to its CLI in the environment and forgotten when the turn ends. While
 it lives, the operator may do what you told it -- accept, dismiss, close,
-dig, rework, land, drop, file, release -- on the items you named, each with
+dig, rework, land, drop, refile, file, release -- on the items you named, each with
 --notes saying what you decided (`said_refusal`), and the task records your
 message, where it came from, and `decided_by`. A sweep, a wake-up, a deploy
 note, or a dashboard message it cannot vouch for starts no turn of yours and
@@ -211,6 +211,10 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
     if action in ("land", "approve") and task and live_paths and live_paths(task):
         return "trader-config", tid
     if action in ("accept", "approve"):
+        return "accept", tid
+    # Refile-to-land queues a new implementor over a branch you never
+    # approved (bot.refile_to_land): filing work into the queue, so accepting.
+    if action == "refile":
         return "accept", tid
     # Every other way into the queue for work you never accepted is
     # accepting it: retry or rework on a proposal (proposed -> queued is
@@ -1865,7 +1869,7 @@ SWEEP_GOAL = (
     "nothing the user said earlier lifts them now.\n\n"
     "Each task you list under Needs you, give your recommendation on its "
     "card in the dashboard's inbox: `{bin} edit <id> --recommend <accept|"
-    "dismiss|approve|land|drop|close|dig|rework|retry|resolve|release> "
+    "dismiss|approve|land|drop|refile|close|dig|rework|retry|resolve|release> "
     "--why \"<one line>\"`. It decides nothing, so it needs no approval; "
     "`--recommend clear` takes it off.")
 

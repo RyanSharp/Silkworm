@@ -620,16 +620,16 @@ def test_unmerged_branches():
     check("the fixture is a branch the survey would otherwise report",
           len(B.survey([finished("tsk_rrr")])) == 1,
           "nothing to silence means this proves nothing")
-    dropped, tag, _ = D.drop(repo, "silkworm/tsk_rrr", when="2026-09-12")
-    check("discard has nothing local left to delete once it is remote-only",
-          not dropped and not tag,
-          "the fixture is meant to be past the point where -D can help")
-    # So do what the real reset did while the branch was still local: tag the
-    # tip under the discarded namespace. That tag is the decision record.
     fff_tip = git(repo, "rev-parse",
                   "refs/remotes/origin/silkworm/tsk_rrr").stdout.strip()
-    git(repo, "tag", "-a", D.tag_for("silkworm/tsk_rrr", fff_tip, "2026-09-12"),
-        fff_tip, "-m", "retired")
+    # Nothing local is left to delete, and drop used to answer "no branch"
+    # here. It now tags the remote tip under the discarded namespace -- what
+    # the real reset did while the branch was still local. That tag is the
+    # decision record.
+    dropped, tag, _ = D.drop(repo, "silkworm/tsk_rrr", when="2026-09-12")
+    check("a remote-only branch is dropped by tagging its tip as discarded",
+          dropped and tag == D.tag_for("silkworm/tsk_rrr", fff_tip, "2026-09-12"),
+          f"{dropped} {tag}")
     check("a tip somebody deliberately retired is not resurrected",
           B.survey([finished("tsk_rrr")]) == [],
           "nothing prunes the remote copy, so this would never go quiet again")
@@ -1208,8 +1208,12 @@ const ROWS = [
   {id: "tsk_3", title: "pushed then deleted", branch: "silkworm/tsk_3",
    base: "main", commits: 1, head: "abcdef56", state: "done", repo: "/r",
    thread: "", local: false, remote: "origin"},
+  {id: "tsk_4", title: "a researcher's", branch: "silkworm/tsk_4", base: "main",
+   commits: 1, head: "abcdef78", state: "done", repo: "/r", thread: "",
+   local: true, remote: "", reason: "unreviewed", stranded: true,
+   why: "finished by a role that is never reviewed, so it cannot land as it is"},
 ];
-taskCall = async () => ({ok: true, unmerged: ROWS, summary: "3 finished tasks"});
+taskCall = async () => ({ok: true, unmerged: ROWS, summary: "4 finished tasks"});
 renderUnmerged().then(() => {
   console.log(JSON.stringify({html: _el("unmerged").innerHTML}));
 });
@@ -1224,7 +1228,7 @@ renderUnmerged().then(() => {
     html = _j.loads(r.stdout.strip().splitlines()[-1])["html"]
 
     check("every branch the survey found reaches the panel",
-          html.count("<b>") == 3, html)
+          html.count("<b>") == 4, html)
     check("an ordinary branch shows its count", "tsk_1 <b>2</b>" in html, html)
     check("a count git would not give is shown as a question, not as null",
           "tsk_2 <b>?</b>" in html and "null" not in html,
@@ -1235,16 +1239,19 @@ renderUnmerged().then(() => {
           "origin/tsk_3 <b>1</b>" in html, html)
     check("and says so in full on hover",
           "no local branch" in html, html)
-    # Land and Drop both act on the local branch. On a remote-only row Land
-    # would answer "its branch is gone: nothing to land" over commits sitting
-    # on origin, so neither button may be offered there.
+    # A remote-only row offers both: Land restores the local branch from the
+    # remote copy (branches.restore_from_remote) and Drop tags its tip as
+    # discarded (discard.drop), which takes it off this panel.
     rows_html = html.split('<span class="ub">')[1:]
     remote_row = next((h for h in rows_html if "origin/tsk_3" in h), "")
-    check("a remote-only branch offers no Land or Drop to misreport it",
-          remote_row and "'land'" not in remote_row and "'drop'" not in remote_row,
-          remote_row)
-    check("while a local branch keeps both",
-          sum("'land'" in h and "'drop'" in h for h in rows_html) == 2, html)
+    check("a remote-only branch offers Land and Drop too",
+          remote_row and "'land'" in remote_row and "'drop'" in remote_row, remote_row)
+    check("as every row does that is not stranded",
+          sum("'land'" in h and "'drop'" in h for h in rows_html) == 3, html)
+    stranded = next((h for h in rows_html if "tsk_4" in h), "")
+    check("a stranded branch offers Refile and Drop, not a Land that would refuse it",
+          "'refile'" in stranded and "'drop'" in stranded and "'land'" not in stranded, stranded)
+    check("and its tip says why it is stranded", "never reviewed" in stranded, stranded)
 
 
 def test_dashboard_js_is_whole():
@@ -2153,3 +2160,282 @@ def test_generated_paths_setting():
           'arg.lower().startswith("generated ")' in src)
     check("landing passes the project's list to merge",
           'generated=list(proj.get("generated") or [])' in src)
+
+
+# --- stranded branches: flagged with their reason, dropped or refiled ----------
+# Branches nothing lands on its own -- a researcher's or assistant's commits, a
+# dismissed or superseded task's -- sat on the unmerged strip with no reason
+# and nothing asking for a decision. And Drop answered "no branch" for a copy
+# left only on origin, while trader's origin/silkworm/tsk_6e9eb16020 stayed on
+# the survey after its drop: a recovery/ tag already held its tip, so no
+# discarded/ tag was written, and nothing else retires a remote copy.
+
+def _stranded_world():
+    def git(where, *a):
+        return subprocess.run(["git", "-C", str(where), "-c", "user.email=t@t",
+                               "-c", "user.name=t", *a], capture_output=True, text=True)
+    origin = Path(tempfile.mkdtemp())
+    git(origin, "init", "-q", "--bare", "-b", "main")
+    repo = Path(tempfile.mkdtemp())
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+    git(repo, "push", "-q", "origin", "main")
+
+    def work(tid, push=False, keep_local=True):
+        git(repo, "checkout", "-q", "-b", f"silkworm/{tid}", "main")
+        (repo / f"{tid}.txt").write_text(f"{tid} work\n")
+        git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", f"{tid} work")
+        git(repo, "checkout", "-q", "main")
+        if push:
+            git(repo, "push", "-q", "origin", f"silkworm/{tid}")
+            git(repo, "fetch", "-q", "origin")
+        if not keep_local:
+            git(repo, "branch", "-D", f"silkworm/{tid}")
+        return git(repo, "rev-parse", f"refs/remotes/origin/silkworm/{tid}" if not keep_local
+                   else f"silkworm/{tid}").stdout.strip()
+    return repo, git, work
+
+
+def test_stranded_branches_are_flagged():
+    import branches as B
+    import inbox as I
+    import tasks as T
+    print("\nstranded branches: the survey says why, Needs you offers Drop and Refile")
+    repo, git, work = _stranded_world()
+    for tid in ("tsk_res", "tsk_dis", "tsk_sup", "tsk_imp", "tsk_ref"):
+        work(tid)
+    work("tsk_far", push=True, keep_local=False)
+    sc = {"cwd": str(repo)}
+
+    def ev(kind, detail):
+        return [{"kind": kind, "detail": detail, "at": 1.0}]
+    recs = [
+        {"id": "tsk_res", "state": "done", "role": "researcher", "scope": sc, "title": "R",
+         "project": "p", "updated": 6},
+        {"id": "tsk_dis", "state": "cancelled", "role": "implementor", "scope": sc,
+         "events": ev("cancelled", "dismiss via operator"), "project": "p", "updated": 5},
+        {"id": "tsk_sup", "state": "cancelled", "role": "implementor", "scope": sc,
+         "events": ev("cancelled", "superseded by a later successful turn"),
+         "project": "p", "updated": 4},
+        {"id": "tsk_imp", "state": "done", "role": "implementor", "scope": sc,
+         "project": "p", "updated": 3},
+        {"id": "tsk_ref", "state": "done", "role": "implementor", "scope": sc, "project": "p",
+         "result": {"landing": {"eligible": True, "landed": False, "stage": "rebase",
+                                "detail": "CONFLICT"}}, "updated": 2},
+        {"id": "tsk_far", "state": "done", "role": "assistant", "scope": sc,
+         "project": "p", "updated": 1},
+    ]
+    rows = {r["id"]: r for r in B.survey(recs)}
+    got = {k: (v["reason"], v["stranded"]) for k, v in rows.items()}
+    check("each row says why it is still here", got == {
+        "tsk_res": ("unreviewed", True), "tsk_dis": ("dismissed", True),
+        "tsk_sup": ("superseded", True), "tsk_imp": ("unlanded", False),
+        "tsk_ref": ("refused", False), "tsk_far": ("unreviewed", True)}, str(got))
+    check("in words, too", all(r["why"] == B.REASONS[r["reason"]] and r["why"]
+                               for r in rows.values()))
+    check("a remote-only branch keeps its row", rows["tsk_far"]["local"] is False
+          and rows["tsk_far"]["commits"] == 1, str(rows["tsk_far"]))
+    check("a failed task's branch is a different reason, not stranded",
+          B.reason_for({"state": "failed", "role": "implementor"}) == "failed")
+    check("a drop that left a copy behind is stranded",
+          B.reason_for({"state": "done", "role": "implementor",
+                        "result": {"landing": {"stage": "dropped"}}}) == "dropped"
+          and "dropped" in B.STRANDED)
+
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    for r in recs:
+        st._data[r["id"]] = dict({"goal": r["id"], "created": 1.0, "source": "dashboard",
+                                  "source_ref": ""}, **{k: v for k, v in r.items() if k != "id"})
+    items = {i["id"]: i for g in I.build(
+        [dict(v, id=k) for k, v in st._data.items()], unmerged_rows=list(rows.values()))["groups"]
+        for i in g["items"]}
+    kinds = {k: (v["kind"], v["actions"]) for k, v in items.items()}
+    want = {k: ("stranded", ["refile", "drop"]) for k in ("tsk_res", "tsk_dis", "tsk_sup", "tsk_far")}
+    want["tsk_ref"] = ("landing", ["land", "drop"])
+    check("Needs you lists every stranded branch with Refile and Drop, and the refused landing",
+          kinds == want, str(kinds))
+    check("an implementor's unlanded work on a project that does not land is not yours",
+          "tsk_imp" not in items)
+    line = lambda k: (items.get(k) or {}).get("line") or ""
+    check("the card says why and where",
+          "never reviewed" in line("tsk_res") and "1 commit on silkworm/tsk_res" in line("tsk_res")
+          and "origin/silkworm/tsk_far" in line("tsk_far"), line("tsk_far"))
+    # A refused landing on a branch only origin holds: Land restores it from
+    # origin (restore_from_remote) and Drop now marks it -- so it is listed.
+    far = dict(rows["tsk_far"], stranded=False, reason="refused")
+    recf = dict(st._data["tsk_far"], id="tsk_far", role="implementor",
+                result={"landing": {"eligible": True, "landed": False, "stage": "rebase"}})
+    got = I.build([recf], unmerged_rows=[far])["groups"]
+    check("a refused landing whose branch is only on origin is listed, with Land and Drop",
+          got and got[0]["items"][0]["actions"] == ["land", "drop"], str(got))
+    taken = dict(recs[0], result={"landing": {"reworked_by": "tsk_new"}}, goal="x")
+    check("one handed to a task that took the branch over is not",
+          I.build([taken], unmerged_rows=[rows["tsk_res"]])["count"] == 0)
+    import board as Bd
+    check("a card's unmerged summary carries the reason and stranded flag",
+          Bd.unmerged_of(rows["tsk_dis"])["stranded"] is True
+          and Bd.unmerged_of(rows["tsk_dis"])["reason"] == "dismissed")
+
+
+def test_drop_handles_remote_only_branches():
+    import branches as B
+    import discard as D
+    print("\ndrop handles a branch only origin holds, and one a recovery tag already holds")
+    repo, git, work = _stranded_world()
+    sc = {"cwd": str(repo)}
+    tip = work("tsk_far", push=True, keep_local=False)
+    rec = [{"id": "tsk_far", "state": "done", "role": "implementor", "scope": sc}]
+    check("fixture: remote-only, on the survey",
+          not B.exists(repo, "silkworm/tsk_far") and len(B.survey(rec)) == 1)
+    deleted, tag, note = D.drop(repo, "silkworm/tsk_far")
+    check("drop answers for it rather than 'no branch'", deleted and tag, f"{deleted} {tag} {note}")
+    check("by tagging its tip as discarded",
+          git(repo, "rev-parse", f"refs/tags/{tag}^{{commit}}").stdout.strip() == tip
+          and tag.startswith("discarded/"), tag)
+    check("which takes it off the survey", B.survey(rec) == [], str(B.survey(rec)))
+    check("and leaves origin alone",
+          git(repo, "ls-remote", "origin", "silkworm/tsk_far").stdout.strip() != "")
+    check("the note says it is still on the remote", "still on the remote" in note, note)
+
+    # Pushed, and already held by a non-discard tag: the old preserve saw the
+    # tip held elsewhere and wrote no discarded/ tag, so the remote copy stayed.
+    tip2 = work("tsk_rec", push=True)
+    git(repo, "tag", f"recovery/tsk_rec-{tip2[:7]}", tip2)
+    rec2 = [{"id": "tsk_rec", "state": "done", "role": "implementor", "scope": sc}]
+    deleted, tag, note = D.drop(repo, "silkworm/tsk_rec")
+    check("a tip a recovery tag holds is still tagged as discarded when a remote copy exists",
+          deleted and tag.startswith("discarded/") and not B.exists(repo, "silkworm/tsk_rec"),
+          f"{deleted} {tag} {note}")
+    check("so the remote copy leaves the survey", B.survey(rec2) == [], str(B.survey(rec2)))
+
+    # Already in main and pushed: a branch holds it, so no tag is needed.
+    tip3 = work("tsk_in", push=True)
+    git(repo, "merge", "-q", "--ff-only", "silkworm/tsk_in")
+    deleted, tag, note = D.drop(repo, "silkworm/tsk_in")
+    check("a merged branch's drop writes no tag even with a remote copy",
+          deleted and tag == "" and not B.exists(repo, "silkworm/tsk_in"), f"{tag} {note}")
+    # The merged-branch prune decides on the local branch alone. A local ref
+    # reset to the base while origin holds work is "contained" -- and the
+    # prune must not retire origin's copy on the way past (review finding).
+    tip4 = work("tsk_rst", push=True)
+    git(repo, "branch", "-f", "silkworm/tsk_rst", "main")
+    rec4 = [{"id": "tsk_rst", "state": "done", "role": "implementor", "scope": sc}]
+    check("fixture: local at the base, origin's copy on the survey",
+          len(B.survey(rec4)) == 1 and B.contained(repo, "main", "silkworm/tsk_rst"))
+    pruned = B.prune_merged(rec4)
+    check("the prune deletes the empty local branch",
+          pruned == ["silkworm/tsk_rst"] and not B.exists(repo, "silkworm/tsk_rst"), str(pruned))
+    check("but does not retire origin's work: it stays on the survey, untagged",
+          len(B.survey(rec4)) == 1 and ("silkworm/tsk_rst", tip4[:7]) not in B.retired(repo)
+          and B.nothing_to_land(repo, "silkworm/tsk_rst", "main") == "",
+          str(B.survey(rec4)))
+    # A remote tip another task's branch was cut from is held by that branch,
+    # which is unmerged work too -- not a reason to skip the discard tag.
+    tip5 = work("tsk_cut", push=True, keep_local=False)
+    git(repo, "branch", "silkworm/tsk_child", tip5)
+    rec5 = [{"id": "tsk_cut", "state": "done", "role": "implementor", "scope": sc}]
+    deleted, tag, note = D.drop(repo, "silkworm/tsk_cut")
+    check("a remote tip another task branch holds is still tagged when dropped",
+          deleted and tag.startswith("discarded/") and B.survey(rec5) == [], f"{tag} {note}")
+    check("no branch anywhere is still 'no branch'",
+          D.drop(repo, "silkworm/tsk_none") == (False, "", "no branch silkworm/tsk_none"))
+    check("remote_tips matches the name whole, not a suffix",
+          D.remote_tips(repo, "tsk_far") == {}
+          and set(D.remote_tips(repo, "silkworm/tsk_far")) == {"refs/remotes/origin/silkworm/tsk_far"})
+
+
+def test_refile_to_land():
+    import logging
+    import branches as B
+    import tasks as T
+    import worktrees as W
+    print("\nRefile to land hands a stranded branch to a reviewed implementor task")
+    repo, git, work = _stranded_world()
+    sc = {"cwd": str(repo)}
+    own = work("tsk_res")
+    far = work("tsk_far", push=True, keep_local=False)
+    work("tsk_busy")
+    st = T.TaskStore(Path(tempfile.mkdtemp()) / "t.json")
+    for tid, state, role in (("tsk_res", T.DONE, "researcher"), ("tsk_far", T.CANCELLED, "implementor"),
+                             ("tsk_run", T.RUNNING, "implementor"), ("tsk_busy", T.DONE, "assistant"),
+                             ("tsk_none", T.DONE, "researcher")):
+        st._data[tid] = {"goal": f"Goal of {tid}", "title": f"Title {tid}", "state": state,
+                         "role": role, "project": "p", "scope": sc, "thread": "C1:1.0",
+                         "created": 1.0, "updated": 1.0, "events": []}
+    told = []
+    import contextlib
+    ns = lift({"refile_to_land", "refile_goal", "REFILE_GOAL_MAX", "record_landing", "task_base"},
+              task_store=st, branches=B, worktrees=W, tasks=T, log=logging.getLogger("t"),
+              repo_guard=lambda _p: contextlib.nullcontext(),
+              project_store=types.SimpleNamespace(scope_for=lambda s: {}, get=lambda s: None),
+              tell_thread=lambda key, text: told.append((key, text)))
+    refile = ns["refile_to_land"]
+
+    r = refile({"id": "tsk_res"})
+    sid = r.get("id") or ""
+    new = st.get(sid) or {}
+    check("a researcher's branch is refiled as a queued implementor task",
+          r.get("ok") and new.get("role") == "implementor" and new.get("state") == T.QUEUED
+          and new.get("branch") == f"silkworm/{sid}" and new.get("source") == "refile"
+          and new.get("source_ref") == "tsk_res" and new.get("project") == "p"
+          and new.get("isolate") and new.get("driver") == "queue", repr(r))
+    check("which takes the branch over: same commits, the new name",
+          git(repo, "rev-parse", f"silkworm/{sid}").stdout.strip() == own
+          and not B.exists(repo, "silkworm/tsk_res"))
+    check("its goal says what to do with it, and carries the original",
+          f"silkworm/{sid}" in new.get("goal", "") and "Goal of tsk_res" in new.get("goal", "")
+          and "never reviewed" in new.get("goal", ""), new.get("goal", "")[:300])
+    old = st.get("tsk_res")["result"]["landing"]
+    check("the old task records who took it, so the survey drops it",
+          old.get("reworked_by") == sid and old.get("stage") == "refiled"
+          and not [x for x in B.survey([dict(st.get("tsk_res"), id="tsk_res")])], str(old))
+    check("the reply says the project's queue will hold it",
+          "waits in the queue" in r.get("note", ""), r.get("note"))
+    check("its thread is told", told and told[-1][0] == "C1:1.0" and sid in told[-1][1])
+    check("refiling it again is refused",
+          not refile({"id": "tsk_res"}).get("ok"))
+
+    r = refile({"id": "tsk_far"})
+    sid2 = r.get("id") or ""
+    check("a dismissed task's branch only origin holds gets a local branch at origin's tip",
+          r.get("ok") and git(repo, "rev-parse", f"silkworm/{sid2}").stdout.strip() == far
+          and git(repo, "config", f"branch.silkworm/{sid2}.remote").stdout == "", repr(r))
+    # Local reset to the base, the work only on origin: the new branch must
+    # start at origin's copy, not at the empty local ref (review finding).
+    pushed = work("tsk_rst", push=True)
+    git(repo, "branch", "-f", "silkworm/tsk_rst", "main")
+    st._data["tsk_rst"] = dict(st._data["tsk_far"], state=T.DONE, role="researcher",
+                               goal="Goal of tsk_rst", events=[])
+    st._data["tsk_rst"].pop("result", None)
+    r = refile({"id": "tsk_rst"})
+    sid3 = r.get("id") or ""
+    check("a local branch at the base with the work on origin is refiled from origin's tip",
+          r.get("ok") and git(repo, "rev-parse", f"silkworm/{sid3}").stdout.strip() == pushed,
+          repr(r))
+    r = refile({"id": "tsk_run"})
+    check("not on running work", not r.get("ok") and "running" in r.get("error", ""), repr(r))
+    r = refile({"id": "tsk_none"})
+    check("not on a task with no branch", not r.get("ok") and "gone" in r.get("error", ""), repr(r))
+    wt = Path(tempfile.mkdtemp()) / "wt"
+    git(repo, "worktree", "add", "-q", str(wt), "silkworm/tsk_busy")
+    r = refile({"id": "tsk_busy"})
+    check("not on a branch checked out somewhere, and nothing is marked",
+          not r.get("ok") and "checked out" in r.get("error", "")
+          and "landing" not in (st.get("tsk_busy").get("result") or {}), repr(r))
+    check("an unknown task is refused", not refile({"id": "tsk_nope"}).get("ok"))
+
+
+def test_refile_is_routed_guarded_and_on_the_cli():
+    import operator_role as O
+    import tasks as T
+    print("\nRefile to land: routed by /tasks, an accept for the operator, a CLI verb")
+    src = (BASE / "bot.py").read_text()
+    check("handle_tasks sends refile to refile_to_land",
+          'if action == "refile":\n        return refile_to_land(payload)' in src)
+    check("for the operator it is accepting: it queues work you never approved",
+          O.tasks_guard("refile", {"id": "tsk_x"}, {"state": "done"}) == ("accept", "tsk_x"))
+    check("and it can be recommended on an inbox card", "refile" in T.RECOMMEND_ACTIONS)
+    cli = (BASE / "bin" / "silkworm").read_text()
+    check("the CLI has it, through the same action",
+          '"refile":  ("refile",  {"--notes": "notes"}, ()),' in cli)

@@ -37,6 +37,7 @@ import subprocess
 from pathlib import Path
 
 import discard
+import roles
 import tasks
 import worktrees
 
@@ -50,6 +51,61 @@ log = logging.getLogger("silkworm.branches")
 #: added later then errs towards being surveyed, and the failure mode of this
 #: module is naming a branch too eagerly, not hiding one.
 IN_FLIGHT = (tasks.PROPOSED, tasks.QUEUED, tasks.RUNNING, tasks.BLOCKED)
+
+
+#: Why a stopped task's branch still holds unmerged commits: the survey row's
+#: `reason`, and the words for it (`why`).
+#:
+#: The first four are branches nothing will ever land on its own. Approve and
+#: the landing gate are the only ways into the base, and none of these goes
+#: through them: an unreviewed role's work may not land without a review, and
+#: a dismissed or superseded task's work was never approved at all. They used
+#: to sit on the unmerged strip with no reason and nothing asking for a
+#: decision, which is how the strip filled up. So they are flagged on Needs
+#: you, each with Drop and Refile-to-land (`STRANDED`).
+REASONS = {
+    "unreviewed": "finished by a role that is never reviewed, so it cannot land as it is",
+    "dismissed": "its task was dismissed with commits still on its branch",
+    "superseded": "its task was superseded with commits still on its branch",
+    "dropped": "dropped, but a remote copy of it was left behind",
+    "refused": "its landing was refused",
+    "unlanded": "finished and never landed",
+    "failed": "its task failed with commits on its branch",
+}
+STRANDED = ("unreviewed", "dismissed", "superseded", "dropped")
+
+
+def _ended_why(rec: dict) -> str:
+    """The detail of the event that put a record in its current state."""
+    ev = [e for e in rec.get("events") or []
+          if isinstance(e, dict) and e.get("kind") == rec.get("state")]
+    return str((ev[-1] if ev else {}).get("detail") or "")
+
+
+def reason_for(rec: dict) -> str:
+    """Why this stopped task's branch is still unmerged (a REASONS key).
+
+    Read from the record alone, as git already said the branch holds work.
+    A cancelled task is superseded when its cancelling event says so
+    (tasks.supersede_failed, a duplicate) and otherwise dismissed. A done task
+    by a role that is never reviewed is that first (bot.unreviewed_role says
+    Land would refuse it), whatever its landing said; then a recorded landing
+    that did not land is a refusal, or a drop when the drop left a copy.
+    """
+    state = rec.get("state")
+    if state == tasks.CANCELLED:
+        why = _ended_why(rec).lower()
+        return "superseded" if ("supersed" in why or "duplicate" in why) else "dismissed"
+    if state == tasks.FAILED:
+        return "failed"
+    landing = (rec.get("result") or {}).get("landing") or {}
+    if not roles.needs_review(rec.get("role") or "assistant"):
+        return "unreviewed"
+    if landing.get("stage") == "dropped":
+        return "dropped"
+    if landing.get("stage") and not landing.get("landed"):
+        return "refused"
+    return "unlanded"
 
 
 class _Failed:
@@ -361,6 +417,34 @@ def _unlanded(repo, bases, ref: str) -> int | None:
     return min(counts) if counts else None
 
 
+def work_tip(repo, branch: str, bases) -> tuple:
+    """(ref, sha) of the copy of `branch` holding its work, or ("", "").
+
+    The copy Land would land, measured as the survey measures: the local
+    branch when it has commits the base lacks (or git would not say), else
+    the remote copy with the most -- origin first among equals -- leaving out
+    copies discarded on purpose and stale copies already landed under other
+    hashes. A local ref reset to the base while origin holds the work is the
+    case this exists for: taking the local ref there hands over nothing.
+    `bases` are the base's refs, as `base_for` gives them.
+    """
+    found = existing(repo).get(branch)
+    refs = _live(repo, branch, found, retired(repo))
+    if not refs:
+        return "", ""
+    bases = (bases,) if isinstance(bases, str) else tuple(bases or ())
+    counts = _waiting(repo, bases, refs) if bases else {ref: None for ref in refs}
+    local = f"{_HEADS}{branch}"
+    if local in counts and counts[local] != 0:
+        return local, _tip(repo, local)
+    remote = [(n, ref.startswith(f"{_REMOTES}origin/"), ref) for ref, n in counts.items()
+              if ref != local and n != 0]
+    if not remote:
+        return "", ""
+    _, _, ref = max(remote, key=lambda x: ((x[0] if x[0] is not None else 0), x[1]))
+    return ref, _tip(repo, ref)
+
+
 def restore_from_remote(repo, branch: str, base: str) -> str:
     """Point the local branch at a remote copy's work when it has none of its own.
 
@@ -556,6 +640,11 @@ def survey(records, scope_for=None) -> list:
                 # module had.
                 "base": shown,
                 "commits": count,
+                # Why it is still here (REASONS), and whether it is one only a
+                # person can move on (STRANDED: Drop or Refile-to-land).
+                "reason": (reason := reason_for(rec)),
+                "why": REASONS.get(reason, ""),
+                "stranded": reason in STRANDED,
                 "repo": repo,
                 "head": found["sha"][:8],
                 # Where the branch actually is. A row with no local copy is
@@ -643,7 +732,9 @@ def _prune_repo(repo, pref: str, group) -> list:
     for name in names:
         if not contained(repo, base, name):
             continue
-        deleted, tag, msg = discard.drop(repo, name)
+        # Local only: containment was asked of the local branch, and a remote
+        # copy holding work the base lacks is still work (`discard.drop`).
+        deleted, tag, msg = discard.drop(repo, name, remote=False)
         if deleted:
             pruned.append(name)
             log.info("pruned merged branch %s in %s%s", name, repo,

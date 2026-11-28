@@ -44,6 +44,28 @@ def tip(repo, branch: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def remote_tips(repo, branch: str) -> dict:
+    """{remote-tracking ref: sha} for every remote copy of `branch`.
+
+    A branch can outlive its local ref on a remote: pushed for a CI-gated
+    landing, then deleted here by a drop or a sweep. `git fetch` without
+    `--prune` recreates `refs/remotes/<remote>/<branch>` for as long as the
+    remote has it, and the survey reads those -- so a drop that only knew
+    `refs/heads/` answered "no branch" for exactly the copy still listed.
+    """
+    r = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/")
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        ref, _, sha = line.partition(" ")
+        # refs/remotes/<remote>/<branch>: a remote's name is one segment.
+        rest = ref[len("refs/remotes/"):].split("/", 1)
+        if len(rest) == 2 and rest[1] == branch and sha:
+            out[ref] = sha.strip()
+    return out
+
+
 def held_elsewhere(repo, sha: str, ignore: str = "") -> list:
     """Refs other than `ignore` that already keep `sha` alive.
 
@@ -70,6 +92,23 @@ def held_elsewhere(repo, sha: str, ignore: str = "") -> list:
                      and ref.endswith(same))]
 
 
+def _branch_holders(refs) -> list:
+    """Of the refs holding a tip, the branches -- not tags.
+
+    For a tip that also has a remote copy, the discarded/ tag is not only a
+    rescue but the record that it was thrown away (`branches.retired`), and
+    any other tag holding it is no such record. Measured: trader's
+    `origin/silkworm/tsk_6e9eb16020` was dropped, its tip was already held by
+    `recovery/tsk_6e9eb16020-50a6598`, so no discarded/ tag was written -- and
+    the remote copy stayed on the unmerged survey with nothing able to clear
+    it. A branch holding it (main, say) means it is not unmerged work at all.
+    """
+    # Nor another task's branch: one cut from this tip (or a rename of it)
+    # is itself unmerged work, not evidence this tip reached anywhere.
+    return [ref for ref in refs if not ref.startswith("refs/tags/")
+            and "/silkworm/" not in ref]
+
+
 def tag_for(branch: str, sha: str, when: str = "") -> str:
     """`discarded/<date>/<branch>-<short sha>`.
 
@@ -82,8 +121,13 @@ def tag_for(branch: str, sha: str, when: str = "") -> str:
     return f"{NAMESPACE}/{when or date.today().isoformat()}/{branch}-{sha[:7]}"
 
 
-def preserve(repo, branch: str, sha: str = "", when: str = "") -> str:
+def preserve(repo, branch: str, sha: str = "", when: str = "",
+             retire: bool = False) -> str:
     """Tag a branch tip so that deleting the branch cannot lose it.
+
+    `retire`: the tip also has a remote copy, which nothing here deletes, so
+    the tag is the record that keeps that copy off the survey; only another
+    *branch* holding the tip then makes it unnecessary (`_branch_holders`).
 
     Returns the tag name, "" if nothing needed keeping, or raises if the tag
     could not be written -- the caller must not delete on a raise.
@@ -91,7 +135,10 @@ def preserve(repo, branch: str, sha: str = "", when: str = "") -> str:
     sha = sha or tip(repo, branch)
     if not sha:
         raise ValueError(f"no branch {branch} in {repo}")
-    if held_elsewhere(repo, sha, ignore=branch):
+    held = held_elsewhere(repo, sha, ignore=branch)
+    if retire:
+        held = _branch_holders(held)
+    if held:
         return ""
     name = tag_for(branch, sha, when)
     if _git(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{name}").returncode == 0:
@@ -110,21 +157,46 @@ def preserve(repo, branch: str, sha: str = "", when: str = "") -> str:
     return name
 
 
-def drop(repo, branch: str, when: str = "") -> tuple:
+def drop(repo, branch: str, when: str = "", remote: bool = True) -> tuple:
     """Preserve then delete. Returns (deleted, tag, note).
 
     The order is the point. Tagging after the delete is a race with gc and a
     race with a crash; tagging first means the worst case is a tag for a branch
     that is still there, which is noise rather than loss.
+
+    A branch that also -- or only -- has a remote copy is handled too. The
+    remote copy is not deleted (nothing on a remote is a drop's to delete),
+    but each remote tip is tagged as discarded, which is what keeps it off
+    the unmerged survey (`branches.retired`). Remote-only, that tag is the
+    whole of the drop, and `deleted` is True once it is written. The tag
+    returned is the local tip's when there is one, else the first remote's.
+
+    `remote=False` leaves remote copies out of it entirely: the local branch
+    alone is tagged (as before) and deleted. For the merged-branch prune,
+    which decides on the local branch only -- a local ref reset to the base
+    while origin still holds work is contained, and retiring origin's copy
+    there would hide that work from the survey with nobody deciding to.
     """
     sha = tip(repo, branch)
-    if not sha:
+    remotes = remote_tips(repo, branch) if remote else {}
+    if not sha and not remotes:
         return False, "", f"no branch {branch}"
+    tags = []
     try:
-        tag = preserve(repo, branch, sha, when)
+        if sha:
+            tags.append(preserve(repo, branch, sha, when, retire=bool(remotes)))
+        for rsha in dict.fromkeys(remotes.values()):
+            if rsha != sha:
+                tags.append(preserve(repo, branch, rsha, when, retire=True))
     except Exception as exc:                     # noqa: BLE001 - never delete blind
         log.warning("not deleting %s: could not preserve it: %s", branch, exc)
         return False, "", f"kept {branch}: {exc}"
+    tag = next((t for t in tags if t), "")
+    where = ", ".join(sorted(r[len("refs/remotes/"):] for r in remotes))
+    if not sha:
+        return True, tag, (f"{where} -> {tag}; still on the remote, marked discarded"
+                           if tag else f"{where} (nothing on it that a branch did not "
+                                       "already hold)")
     r = _git(repo, "branch", "-D", branch)
     if r.returncode != 0:
         return False, tag, f"could not delete {branch}: {(r.stderr or '').strip()[-200:]}"

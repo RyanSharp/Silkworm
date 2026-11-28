@@ -2059,7 +2059,9 @@ const posts = () => calls.filter(c => (c.url === "/api/tasks" || c.url === "/api
   CONFIRM = false;
   out.approveDeclined = await run("approve", ids.approval);
   out.landDeclined = await run("land", ids.landing);
+  out.refileDeclined = await run("refile", ids.landing);
   CONFIRM = true;
+  out.refile = await run("refile", ids.landing);
   out.approve = await run("approve", ids.approval);
   out.land = await run("land", ids.landing);
   out.drop = await run("drop", ids.landing);
@@ -2183,6 +2185,8 @@ def test_dashboard_inbox_renders_and_acts():
     check("confirmed, Approve sends approve", one(o["approve"]) == [("approve", "", "")], str(o["approve"]))
     check("Land sends land, Drop sends drop", one(o["land"]) == [("land", "", "")]
           and one(o["drop"]) == [("drop", "", "")], f"{o['land']} {o['drop']}")
+    check("Refile to land asks first; declined, nothing is sent; confirmed, it sends refile",
+          o["refileDeclined"] == [] and one(o["refile"]) == [("refile", "", "")], str(o["refile"]))
     check("Close sends close with the round", one(o["close"]) == [("close", "", "r7")], str(o["close"]))
     check("Dig deeper sends your question with the round",
           one(o["dig"]) == [("dig", "a note", "r7")], str(o["dig"]))
