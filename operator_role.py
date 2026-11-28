@@ -204,6 +204,11 @@ def tasks_guard(action: str, payload: dict, task: dict | None, *,
     # state moves and nothing runs, so it is the operator's to set, unasked.
     if action == "recommend":
         return None
+    # Linking queued work -- accepted already -- to its project's failing-base
+    # item as the fix only lets it run now, past the hold, rather than once
+    # the base passes (bot.link_base_fix): nothing is accepted or decided.
+    if action == "fixes-base":
+        return None
     # A landing that carries a project's live configuration needs that
     # approved, before anything else: Approve lands (bot.approve_task), and so
     # does Land on work you never accepted. Answering "accept" first let an
@@ -1871,7 +1876,12 @@ SWEEP_GOAL = (
     "card in the dashboard's inbox: `{bin} edit <id> --recommend <accept|"
     "dismiss|approve|land|drop|refile|close|dig|rework|retry|resolve|release> "
     "--why \"<one line>\"`. It decides nothing, so it needs no approval; "
-    "`--recommend clear` takes it off.")
+    "`--recommend clear` takes it off.\n\n"
+    "A project whose base fails its own tests holds its implementor work; a "
+    "fix for that base runs only if it is linked to the base-red item. Filing "
+    "one, name the item: `{bin} task --fixes <item id> ...` (or the id in the "
+    "goal; `--fixes base --project <slug>` on the user's word). A fix already "
+    "queued unlinked: `{bin} fixes-base <id> --notes \"<why>\"`.")
 
 SWEEP_NOTE = (
     "This is your daily sweep, filed by the scheduler, not a message from the "

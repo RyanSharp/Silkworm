@@ -1083,6 +1083,30 @@ class TaskStore:
             self._save_or_restore(tid, prior)
             return dict(rec)
 
+    def link_fix(self, tid: str, parent: str, detail: str) -> dict | None:
+        """Put queued task `tid` under `parent` (a failing base's item), with
+        an event saying so, in one save under the store's lock -- so a claim
+        between a caller's read and this write cannot be lost or relinked.
+        Its `root`, if it has one, stays. Raises ValueError if it is no longer
+        queued or already has a parent; None if there is no such task."""
+        with self._lock:
+            rec = self._data.get(tid)
+            if rec is None:
+                return None
+            if rec.get("state") != QUEUED:
+                raise ValueError(f"it is {rec.get('state')}")
+            if rec.get("parent") and rec.get("parent") != parent:
+                raise ValueError(f"it is already under {rec['parent']}")
+            prior = copy.deepcopy(rec)
+            rec["parent"] = parent
+            rec["root"] = rec.get("root") or parent
+            rec["updated"] = time.time()
+            events = rec.setdefault("events", [])
+            events.append({"at": time.time(), "kind": "linked", "detail": detail})
+            del events[:-50]
+            self._save_or_restore(tid, prior)
+            return copy.deepcopy(rec)
+
     def record_decision(self, tid: str, detail: str, decided_by: str, ts: str,
                         via: str = "", lift: dict | None = None) -> dict | None:
         """Note on a task that a person decided what was just done to it:
@@ -1248,8 +1272,11 @@ class TaskStore:
                     r = self._data.get(r.get("source_ref") or "")
                     if r is None:
                         return False
-                return (self._data.get(r.get("parent") or "") or {}).get(
-                    "source") in fixes_from
+                # And only while the item is open: once its base passes the
+                # item closes, and a fix still queued from that spell is no
+                # exemption from the next one, which a new item tracks.
+                item = self._data.get(r.get("parent") or "") or {}
+                return item.get("source") in fixes_from and item.get("state") not in ENDED
 
             def fits(r) -> bool:
                 role = r.get("role") or "assistant"

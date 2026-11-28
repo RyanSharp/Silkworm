@@ -30,6 +30,7 @@
     silkworm close <id> [--round R] close research findings        }
     silkworm dig <id> --notes N [--round R]  research: dig deeper  }
     silkworm retry <id> / run-next <id>   requeue failed work / put it first
+    silkworm fixes-base <id> [--item I]  let queued work past a red base: it is the fix
     silkworm release <project> [<target>|all] [--level patch|minor]
                                     the Release button: plan, then start it
     silkworm tidy <checkout path>   remove a finished checkout holding only generated files
@@ -1150,13 +1151,14 @@ def do_file_task(argv) -> None:
         print("no thread — `task` only works from inside a Silkworm turn")
         raise SystemExit(1)
     project, role, goal, propose, check = "", "", [], False, ""
-    requested, notes = False, ""
+    requested, notes, fixes = False, "", ""
     usage = ('usage: silkworm task [--propose] [--project <slug>] '
              '[--role implementor|assistant|researcher] '
              '[--health <project>/<check>] '
              '[--requested-by-user --notes "<the user\'s request>"] '
+             '[--fixes <base-red item id>|base] '
              '[--by <name>] "<goal>"')
-    valued = ("--notes", "--project", "--role", "--health", "--by")
+    valued = ("--notes", "--project", "--role", "--health", "--by", "--fixes")
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1180,6 +1182,8 @@ def do_file_task(argv) -> None:
                 role = v
             elif a == "--health":
                 check = v
+            elif a == "--fixes":
+                fixes = v
             # --by is taken because every other action takes it and the
             # operator is told to pass it; who filed a task is recorded from
             # the run itself (bot.filer_role), not from this. Before it was
@@ -1204,6 +1208,9 @@ def do_file_task(argv) -> None:
                                 # A fix for this health check: proposed, once
                                 # per (project, check), its evidence attached.
                                 "health": check,
+                                # What it fixes: a failing base's item, so the
+                                # runner lets it past that base's hold.
+                                **({"fixes": fixes.strip()} if fixes.strip() else {}),
                                 "project": project, "role": role or "implementor",
                                 # What this run *is*, from the environment the
                                 # bot set up for it, not from anything the turn
@@ -1228,6 +1235,7 @@ def do_file_task(argv) -> None:
           + (" on the user's request" if r.get("requested_by_user") else "")
           + (f" ({r['decided_via']})" if r.get("decided_via") else "")
           + (f" under {r['project']}" if r.get("project") else "")
+          + (f", the fix for {r['fixes']}" if r.get("fixes") else "")
           + f" in {r.get('cwd') or '?'} ({r['remaining']} more allowed this turn)")
 
 
@@ -1352,6 +1360,9 @@ TASK_ACTIONS = {
     # The dashboard's Retry and Run next. Tidy takes a checkout's path, not a
     # task id: it removes a finished task's checkout holding only generated
     # files, and refuses one holding anything else.
+    # A queued task linked to its project's failing-base item as the fix, so
+    # the runner lets it past the hold (bot.link_base_fix). Queued work only.
+    "fixes-base": ("fixes-base", {"--item": "item", "--notes": "notes"}, ()),
     "retry":    ("retry",    {"--notes": "notes"}, ()),
     "run-next": ("run-next", {}, ()),
     "tidy":     ("tidy",     {}, ()),

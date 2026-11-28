@@ -3068,6 +3068,53 @@ def recommend_task(payload: dict) -> dict:
             "note": "recommendation cleared" if value is None else f"recommends {value['action']}"}
 
 
+def link_base_fix(payload: dict) -> dict:
+    """Link a queued task to its project's failing-base item as the fix
+    (`silkworm fixes-base <id> [--item <base-red id>]`), so the runner lets
+    it through the hold (tasks.claim's `fixes_from`).
+
+    For work already in the queue that was filed before it could say what it
+    fixes -- tsk_5c129269af waited from 2026-11-25 behind the very failure it
+    was filed to end. Queued only: it is work somebody already accepted, and
+    the link only lets it run now rather than once the base passes, where its
+    tests are still judged against the base's as any task's are. Not one
+    already under another parent, whose link would be lost; not a proposal,
+    which is the user's to accept first.
+    """
+    tid = str(payload.get("id") or "")
+    rec = task_store.get(tid)
+    if not rec:
+        return {"ok": False, "error": "unknown task"}
+    if rec.get("state") != tasks.QUEUED:
+        return {"ok": False, "error": f"not linked: it is {rec.get('state')}; "
+                                      "only queued work is held behind a red base"}
+    slug = rec.get("project") or ""
+    item = basered.open_item(project_store, task_store, slug)
+    if not item:
+        return {"ok": False, "error": f"not linked: {slug or 'its project'}'s base "
+                                      "is not marked as failing its tests"}
+    named = str(payload.get("item") or "").strip()
+    if named and named != item["id"]:
+        return {"ok": False, "error": f"not linked: {slug}'s failing base is tracked by "
+                                      f"{item['id']}, not {named}"}
+    if rec.get("parent") == item["id"]:
+        return {"ok": True, "task": rec, "note": f"already the fix for {item['id']}"}
+    if rec.get("parent"):
+        return {"ok": False, "error": f"not linked: it is already under {rec['parent']}"}
+    notes = " ".join(str(payload.get("notes") or "").split())[:300]
+    try:
+        t = task_store.link_fix(
+            tid, item["id"], f"linked as the fix for {slug}'s failing base ({item['id']}) "
+                             f"by {payload.get('by') or 'operator'}"
+                             + (f": {notes}" if notes else ""))
+    except ValueError as e:
+        return {"ok": False, "error": f"not linked: {e}"}
+    if t is None:
+        return {"ok": False, "error": "unknown task"}
+    log.info("task %s linked as the fix for %s's red base (%s)", tid, slug, item["id"])
+    return {"ok": True, "task": t, "note": f"linked as the fix for {item['id']}"}
+
+
 def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
     """Route for /tasks — read and triage tasks (localhost-trusted).
 
@@ -3236,6 +3283,8 @@ def handle_tasks(payload: dict, _decided: dict | None = None) -> dict:
             project_titles={p["slug"]: p.get("title") or p["slug"] for p in everyone})}
     if action == "recommend":
         return recommend_task(payload)
+    if action == "fixes-base":
+        return link_base_fix(payload)
     if action == "task":
         rec = task_store.get(payload.get("id", ""))
         if not rec:
@@ -4140,6 +4189,29 @@ def handle_file_task(payload: dict) -> dict:
         proj = fixing.get("project") or proj
     else:
         fixing = None
+    # Filed anywhere else -- the operator's home thread, on your word -- it is
+    # the fix when it names the item (`--fixes <id>`, or the id in its goal),
+    # or is filed on your word against the project's red base (`--fixes
+    # base`). Without this a fix filed away from the item's thread was held
+    # with everything else, behind the failure it was filed to end.
+    fixes = str(payload.get("fixes") or "").strip()
+    if not fixing and not parent and not hrec:
+        fixing = basered.named_fix(
+            project_store, task_store, project_store.slug_for(proj) if proj else "",
+            goal, fixes, on_users_word=requested is not None)
+        if fixing:
+            proj = fixing.get("project") or proj
+    if fixes and not hrec and (not fixing or fixes not in ("base", fixing["id"])):
+        why = (f"--fixes {fixes}: " + (
+            "a research run's next steps are filed under it, not under a red base"
+            if parent else
+            f"this thread's work fixes {fixing['id']}, not {fixes}" if fixing else
+            "only on the user's word (--requested-by-user), in a project (--project, "
+            "or the thread's own) whose base fails its tests" if fixes == "base" else
+            "names no open item of a failing base" + (f" in {proj}" if proj else ""))
+            + "; file it without --fixes, or name the base-red item's id")
+        held(why)
+        return {"ok": False, "error": why}
     if hrec:
         proj, fixing = hrec["project"], None
     slug = project_store.slug_for(proj) if proj else ""
@@ -4256,7 +4328,11 @@ def handle_file_task(payload: dict) -> dict:
              task["id"], key, proj or "-", role, state,
              " restricted-caller" if restricted else "",
              f" next step of {parent['id']}" if parent else "")
+    if fixing:
+        log.info("filed task %s fixes %s's red base (%s)", task["id"],
+                 fixing.get("project") or "-", fixing["id"])
     return {"ok": True, "id": task["id"], "project": proj, "state": state,
+            **({"fixes": fixing["id"]} if fixing else {}),
             "role": role, "cwd": scope.get("cwd", ""),
             "requested_by_user": requested is not None,
             **({"decided_via": requested["source"]} if requested is not None else {}),

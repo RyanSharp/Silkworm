@@ -2674,6 +2674,12 @@ def test_runner_lets_the_base_fix_through():
     check("the item's own child runs", fix["id"] in got)
     check("and its catch-up rework, by source_ref", redo["id"] in got)
     check("and a rework of that rework", redo2["id"] in got)
+    ended = ts.create("fix the old spell", project="trader", role="implementor",
+                      driver="queue", parent=item, root=item)
+    ts.transition(item, T.CANCELLED, "the base passed; a new spell has its own item")
+    check("a fix under an item that has ended is held like the rest",
+          ts.claim(hold_implementors=red, fixes_from={B.SOURCE}) is None
+          and ts.get(ended["id"])["state"] == T.QUEUED)
     check("a review follow-up on the fix stays held",
           followup["id"] not in got, str(got))
     check("and so does the follow-up's catch-up rework, though it shares the root",
@@ -2724,6 +2730,169 @@ def test_filing_from_the_base_red_item_links_to_it():
                 "project": "trader"})
     t = ts.get(r.get("id") or "") or {}
     check("filed anywhere else: not linked", not t.get("parent"), str(t))
+
+
+def _red_filing(slug="mondays"):
+    """handle_file_task over real project and task stores, `slug`'s base red.
+
+    The harness's project store is a stand-in that records what is ensured;
+    the base-red lookups also want `get` and `all`, which come from a real
+    store holding the red state. `requested_filing` is the grant check (not
+    under test here): it vouches for any filing that asks."""
+    import basered as B
+    import tasks as T
+    handle, budget, begin, _ts, made = _file_task_impl()
+    ps, ts = _red_stores(slug)
+    g = handle.__globals__
+    g["task_store"] = ts
+    g["project_store"] = types.SimpleNamespace(
+        get=ps.get, all=ps.all, slug_for=g["project_store"].slug_for,
+        ensure=lambda n, **kw: {"slug": n}, home=lambda n, create=False: None,
+        scope_for=lambda n: None)
+    g["requested_filing"] = lambda payload, key, role, parent, research: (
+        {"by": "U_ME", "ts": "1.0", "notes": payload.get("notes") or "", "source": "Slack",
+         "via": "slack", "at": time.time()}, "")
+    state, _ = B.mark_red(ps, ts, slug, {"sha": "a" * 40, "failed": ["t1"]}, "main")
+    ts.update(state["attention"], thread="D0:100.0")
+    return handle, ps, ts, state["attention"]
+
+
+def _claimed(ps, ts):
+    import basered as B
+    import tasks as T
+    got = []
+    while True:
+        r = ts.claim(hold_implementors=B.failing(ps), fixes_from={B.SOURCE})
+        if not r:
+            return got
+        got.append(r["id"])
+        ts.transition(r["id"], T.DONE, "ran")
+
+
+def test_a_base_fix_filed_from_the_operator_thread_runs():
+    import tasks as T
+    print("\na fix for a red base filed away from its item's thread is not held behind it")
+    handle, ps, ts, item = _red_filing()
+    # tsk_5c129269af, 2026-11-25: filed by the operator from its home thread
+    # on the user's word, naming the base-red item in its goal -- and held
+    # with every other Mondays implementor until the base it fixes passed.
+    stuck = handle({"key": "D5:5.0", "goal": "Fix Mondays main, which fails its own "
+                    f"tests ({item}): reproduce on clean main, then fix the cause",
+                    "role": "implementor", "project": "mondays", "caller_role": "operator",
+                    "requested_by_user": True, "notes": "user: go with your recommendations"})
+    t = ts.get(stuck.get("id") or "") or {}
+    check("naming the item in its goal: filed under it",
+          stuck.get("ok") and t.get("parent") == item and t.get("root") == item
+          and stuck.get("fixes") == item, str(stuck))
+    flag = handle({"key": "D5:5.0", "goal": "Repair the push preference test on Mondays main",
+                   "role": "implementor", "project": "mondays", "fixes": item})
+    check("--fixes <item id>: filed under it",
+          (ts.get(flag.get("id") or "") or {}).get("parent") == item, str(flag))
+    base = handle({"key": "D5:5.0", "goal": "Make the Mondays store tests pass on main again",
+                   "role": "implementor", "project": "mondays", "fixes": "base",
+                   "requested_by_user": True, "notes": "user: fix main"})
+    check("--fixes base, on the user's word: filed under the project's item",
+          (ts.get(base.get("id") or "") or {}).get("parent") == item, str(base))
+    other = handle({"key": "D5:5.0", "goal": "Add a share sheet to the Mondays issue view",
+                    "role": "implementor", "project": "mondays"})
+    aside = handle({"key": "D5:5.0", "goal": f"Add a share sheet to Mondays; {item} can wait",
+                    "role": "implementor", "project": "mondays"})
+    check("a goal merely mentioning the item, not on the user's word: not linked",
+          aside.get("ok") and not (ts.get(aside["id"]) or {}).get("parent"), str(aside))
+    loose = handle({"key": "D5:5.0", "goal": f"Fix the base {item} tracks, somewhere",
+                    "role": "implementor", "requested_by_user": True, "notes": "user: fix it"})
+    check("named in the goal with no project: not linked, nor moved into the red one",
+          loose.get("ok") and not (ts.get(loose["id"]) or {}).get("parent")
+          and (ts.get(loose["id"]) or {}).get("project") != "mondays", str(loose))
+    check("unrelated work filed there: not linked",
+          other.get("ok") and not (ts.get(other["id"]) or {}).get("parent"), str(other))
+    bare = handle({"key": "D5:5.0", "goal": "Make the Mondays store tests pass on main",
+                   "role": "implementor", "project": "mondays", "fixes": "base"})
+    check("--fixes base not on the user's word: refused, nothing filed",
+          not bare.get("ok") and "user's word" in (bare.get("error") or ""), str(bare))
+    wrong = handle({"key": "D5:5.0", "goal": "Repair the Mondays push preference test",
+                    "role": "implementor", "project": "mondays", "fixes": "tsk_nothere"})
+    check("--fixes naming no open item: refused",
+          not wrong.get("ok") and "no open item" in (wrong.get("error") or ""), str(wrong))
+    elsewhere = handle({"key": "D5:5.0", "goal": f"Tidy cadence's settings, unlike {item}",
+                        "role": "implementor", "project": "cadence"})
+    check("naming the item under another project: not that base's fix",
+          not (ts.get(elsewhere.get("id") or "") or {}).get("parent"), str(elsewhere))
+    got = _claimed(ps, ts)
+    check("the fixes run while the base is red",
+          {stuck["id"], flag["id"], base["id"]} <= set(got), str(got))
+    check("unrelated implementor work on the project stays held",
+          other["id"] not in got and aside["id"] not in got
+          and ts.get(other["id"])["state"] == T.QUEUED, str(got))
+    check("another project's work is not held", elsewhere["id"] in got, str(got))
+    ts.transition(item, T.CANCELLED, "dismissed")
+    late = handle({"key": "D5:5.0", "goal": f"Fix Mondays main per {item}, once more",
+                   "role": "implementor", "project": "mondays",
+                   "requested_by_user": True, "notes": "user: once more"})
+    check("naming an item that has ended links nothing",
+          late.get("ok") and not (ts.get(late["id"]) or {}).get("parent"), str(late))
+
+
+def test_the_operator_links_a_queued_task_as_the_base_fix():
+    import basered as B
+    import tasks as T
+    print("\nqueued work filed before it could say so is linked as the base's fix")
+    ps, ts = _red_stores("mondays")
+    state, _ = B.mark_red(ps, ts, "mondays", {"sha": "a" * 40, "failed": ["t1"]}, "main")
+    item = state["attention"]
+    link = _bot_func("link_base_fix", task_store=ts, project_store=ps, basered=B,
+                     tasks=T, time=time, log=logging.getLogger("test"))
+    stuck = ts.create("Fix Mondays main", project="mondays", role="implementor",
+                      driver="queue", source="scoped", filed_by="operator")
+    other = ts.create("unrelated", project="mondays", role="implementor", driver="queue")
+    check("the stuck case: held while unlinked", _claimed(ps, ts) == [])
+    r = link({"id": stuck["id"], "notes": "user asked to fix main", "by": "operator"})
+    t = ts.get(stuck["id"])
+    check("linked under the item", r.get("ok") and t.get("parent") == item
+          and t.get("root") == item, str(r))
+    check("and says so in its events", any(e.get("kind") == "linked" and item in e.get("detail", "")
+                                           for e in t.get("events") or []))
+    check("again: already linked, still ok", link({"id": stuck["id"]}).get("ok"))
+    check("naming another item: refused",
+          not link({"id": other["id"], "item": "tsk_nope"}).get("ok")
+          and not ts.get(other["id"]).get("parent"))
+    prop = ts.create("an idea", project="mondays", role="implementor", driver="queue",
+                     state=T.PROPOSED)
+    check("a proposal: refused, it is the user's to accept",
+          not link({"id": prop["id"]}).get("ok") and not ts.get(prop["id"]).get("parent"))
+    green = ts.create("work", project="cadence", role="implementor", driver="queue")
+    check("a project whose base is not red: refused", not link({"id": green["id"]}).get("ok"))
+    research = ts.create("dig", project="mondays", role="researcher", driver="queue",
+                         state=T.NEEDS_INPUT)
+    under = ts.create("next", project="mondays", role="implementor", driver="queue",
+                      parent=research["id"])
+    check("already under another parent: refused",
+          not link({"id": under["id"]}).get("ok")
+          and ts.get(under["id"])["parent"] == research["id"])
+    got = _claimed(ps, ts)
+    check("the linked task runs; unrelated work stays held",
+          stuck["id"] in got and other["id"] not in got, str(got))
+    import operator_role as O
+    check("the operator needs no approval to link (only queued work)",
+          O.tasks_guard("fixes-base", {"id": stuck["id"]}, dict(stuck, state="queued")) is None)
+    cli = _load_cli()
+    pay = cli.parse_action("fixes-base", [stuck["id"], "--item", item, "--notes", "why"])
+    check("`silkworm fixes-base` sends the action, the item and the notes",
+          pay.get("action") == "fixes-base" and pay.get("item") == item
+          and pay.get("id") == stuck["id"] and pay.get("notes") == "why", str(pay))
+    src = (BASE / "bot.py").read_text()
+    check("/tasks routes fixes-base to link_base_fix",
+          'if action == "fixes-base":\n        return link_base_fix(payload)' in src)
+    do_file_task, sent = _cli_file_task_impl()
+    os.environ["SILKWORM_THREAD"] = "D5:5.0"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            do_file_task(["--fixes", item, "Repair", "the", "push", "test"])
+    finally:
+        os.environ.pop("SILKWORM_THREAD", None)
+    check("`silkworm task --fixes` sends it, the goal alone as goal",
+          sent and sent[-1][1].get("fixes") == item
+          and sent[-1][1].get("goal") == "Repair the push test", str(sent))
 
 
 def _base_glue(ps, ts, *, suite, base=("main", "b" * 40), moved=True, verify_ok=True):

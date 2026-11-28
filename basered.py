@@ -19,8 +19,10 @@ is the task's and is handled exactly as it always was. If the base fails:
     is held at stage merge.BASE_FAILING;
   - the runner takes no new implementor work for the project (tasks.claim's
     `hold_implementors`), since every one of them would only be held too --
-    except work filed from the item's own conversation (`fix_item`), which is
-    the attempt to fix the base and would otherwise wait for itself;
+    except work filed from the item's own conversation (`fix_item`), or filed
+    elsewhere naming the item as what it fixes (`named_fix`), or linked to it
+    afterwards by the operator (bot.link_base_fix): the attempt to fix the
+    base, which would otherwise wait for itself;
   - and when a later base commit passes (`recover`), all of that is undone:
     the item closes, and the held tasks are verified or landed again.
 
@@ -33,6 +35,7 @@ suite, checking out the base and talking to Slack are the bot's.
 """
 
 import logging
+import re
 import threading
 import time
 
@@ -211,6 +214,45 @@ def fix_item(task_store, key: str, caller_task: str = "") -> dict | None:
         if (caller_task and t.get("id") == caller_task) or (
                 key and t.get("thread") == key):
             return t
+    return None
+
+
+def open_item(project_store, task_store, slug: str) -> dict | None:
+    """The needs-you item of `slug`'s failing base, while both are current:
+    the project is still marked and the item has not ended. Else None."""
+    state = (project_store.get(slug) or {}).get("main_failing") or {} if slug else {}
+    item = task_store.get(state.get("attention") or "") if state else None
+    if item and item.get("source") == SOURCE and item.get("state") not in tasks.ENDED:
+        return item
+    return None
+
+
+def named_fix(project_store, task_store, slug: str, goal: str, fixes: str = "",
+              on_users_word: bool = False) -> dict | None:
+    """The base-red item a filing made away from its thread fixes, or None.
+
+    `fix_item` only vouches for work filed on the item's own thread, so a fix
+    the operator filed from its home thread on your word (tsk_5c129269af,
+    2026-11-25, to fix the base tsk_c903a669ad tracks) was held behind the
+    very failure it was filed to end, and never ran. A filing counts as the
+    fix when it names the item: `fixes` is the item's id, or the goal names
+    it -- or, on your word only, `fixes` is "base", meaning `slug`'s red base
+    whichever item tracks it. The goal naming it counts on your word only, and
+    only under its project: a goal may mention a red base in passing ("not
+    the one tsk_x tracks"), and that is no claim to fix it. Only an open item
+    of a project still failing: naming one that has closed links nothing.
+    With no `slug`, only `fixes` can name an item, of any failing project.
+    """
+    fixes = (fixes or "").strip()
+    for s in ([slug] if slug else sorted(failing(project_store))):
+        item = open_item(project_store, task_store, s)
+        if not item:
+            continue
+        if fixes == item["id"] or (fixes == "base" and on_users_word and slug) or (
+                on_users_word and slug and not fixes and re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(item['id'])}(?![A-Za-z0-9_])",
+                    goal or "")):
+            return item
     return None
 
 

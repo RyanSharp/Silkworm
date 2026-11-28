@@ -138,7 +138,7 @@ STAND_INS = {
 #: A test that drives one of these routes supplies the name instead.
 TASK_ROUTES = ("CLAUDE_CWD", "HEALTH_WARN_DAYS", "_spend", "_with_costs", "approve_task",
                "board_release", "board_release_tags", "board_survey", "decide_findings", "land_or_drop", "operator_refused",
-               "refile_to_land",
+               "refile_to_land", "link_base_fix",
                "project_store", "run_email_ingest", "stop_task", "task_changes", "task_contained",
                "tell_thread", "tidy_checkout")
 PROJECT_ROUTES = ("GITHUB_OWNER", "install_git_guards", "operator_refused",
@@ -441,7 +441,9 @@ def _file_task_impl():
             # What the real store answers when no project was renamed.
             slug_for=lambda n: __import__("projects").slugify(n),
             home=lambda n, create=False: made.append(n),
-            scope_for=lambda n: None),
+            scope_for=lambda n: None,
+            # No project's base is failing (basered.named_fix asks).
+            get=lambda n: None, all=lambda: []),
     )
     lift(want, ns=mod.__dict__, absent=('HEALTH_WARN_DAYS', 'requested_filing'))
     return mod.handle_file_task, mod._filed_this_turn, mod.begin_turn, ts, made
@@ -1225,7 +1227,9 @@ def _requested_world():
         CLAUDE_CWD=tmp, store=types.SimpleNamespace(get=lambda k: {}),
         project_store=types.SimpleNamespace(
             ensure=lambda n, **kw: {"slug": n}, slug_for=lambda n: P.slugify(n),
-            home=lambda n, create=False: None, scope_for=lambda n: {"cwd": str(tmp)}))
+            home=lambda n, create=False: None, scope_for=lambda n: {"cwd": str(tmp)},
+            # No project's base is failing (basered.named_fix asks).
+            get=lambda n: None, all=lambda: []))
     return types.SimpleNamespace(file=ns["handle_file_task"], ts=ts, state=state,
                                  grants=grants, ns=ns)
 
