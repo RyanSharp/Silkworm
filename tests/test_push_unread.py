@@ -1270,6 +1270,91 @@ def test_unread_watermark_survives_a_restart():
         ["git", "check-ignore", "-q", U.SEEN_NAME], cwd=BASE).returncode == 0)
 
 
+def test_unread_mark_all_and_the_idle_baseline():
+    import threading
+    import urllib.request
+    import unread as U
+    import visualizer as V
+    print("\nunread: Mark all read, and threads idle two days read once on deploy")
+    tmp = Path(tempfile.mkdtemp())
+    path = tmp / U.SEEN_NAME
+    T0 = 1795000000.0
+    now = [T0]
+    path.write_text(json.dumps({"since": T0 - 30 * 86400, "threads": {"fresh": T0 - 100}}))
+    s = U.Seen(path, clock=lambda: now[0])
+    entries = {"old": {"updated": T0 - 3 * 86400}, "fresh": {"updated": T0 - 3600},
+               "edge": {"updated": T0 - 2 * 86400 + 60}, "noupdated": {}, "odd": {"updated": "x"}}
+    check("the baseline marks only threads idle over two days, now",
+          s.baseline_idle(entries) == 1 and s.get("old") == T0 and s.get("fresh") == T0 - 100
+          and s.get("edge") == s.since() and s.get("noupdated") == s.since(), s.all())
+    check("...a thread whose last use is not known is left as it was", "noupdated" not in s.all()
+          and "odd" not in s.all())
+    now[0] = T0 + 10 * 86400
+    check("...once: recorded in seen.json, so it never runs again",
+          s.baseline_idle(entries) == 0 and U.Seen(path).baseline_idle(entries) == 0
+          and json.loads(path.read_text())["idle_baseline"] == T0)
+    check("Mark all read: since moves to now, so every thread is read as of now",
+          s.mark_all() == now[0] and all(s.get(k) == now[0] for k in ("old", "fresh", "never-seen")))
+    check("...stored, so another device (another Seen on the same file) agrees",
+          U.Seen(path).get("fresh") == now[0])
+    now[0] = T0
+    check("...and never back", s.mark_all() == T0 + 10 * 86400)
+    now[0] = T0 + 20 * 86400
+    check("as of when the page's list was counted, not later: a reply since stays unread",
+          s.mark_all(T0 + 15 * 86400) == T0 + 15 * 86400)
+    check("...and never past now (a page's clock running fast)", s.mark_all(T0 + 99 * 86400) == now[0])
+    path.write_text("{not json"); (tmp / (U.SEEN_NAME + ".prev")).write_text("{nor")
+    broken = U.Seen(path)
+    check("unreadable: nothing marked, nothing written",
+          broken.mark_all() is None and broken.baseline_idle(entries) == 0 and path.read_text() == "{not json")
+    # Through the route and the sessions list, on a copy shaped like the live store.
+    saved = (V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.PROJECTS_DIR, V.ENV_FILE, V.bot_call)
+    tmp = Path(tempfile.mkdtemp())
+    proj = tmp / "projects" / "-w"
+    proj.mkdir(parents=True)
+    for sid in ("sa", "sb", "sc"):
+        (proj / f"{sid}.jsonl").write_text(_uline("user", _uts(0), "go") + _uline("assistant", _uts(10), "one"))
+    (tmp / "sessions.json").write_text(json.dumps({
+        "D1:1.0": {"session_id": "sa", "title": "A", "updated": time.time()},
+        "D1:2.0": {"session_id": "sb", "title": "B", "updated": time.time()},
+        "D1:3.0": {"session_id": "sc", "title": "idle", "kind": "task", "updated": time.time() - 3 * 86400}}))
+    (tmp / "seen.json").write_text(json.dumps({"since": T0 - 100, "threads": {}}))
+    srv = None
+    try:
+        V.LOOPBACK, V.TOKEN = True, ""
+        V.SESSIONS_FILE, V.PROJECTS_DIR = tmp / "sessions.json", tmp / "projects"
+        V.ENV_FILE = tmp / "no.env"
+        V._seen.clear()
+        V.bot_call = lambda path, payload, timeout=1.0: {}
+        rows = {r["key"]: r["unread"] for r in V.load_sessions()["sessions"]}
+        check("the first read after deploy baselines the idle one; two in use stay unread",
+              rows == {"D1:1.0": 1, "D1:2.0": 1, "D1:3.0": 0}, rows)
+        srv = V.make_server("127.0.0.1", 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/api/seen", method="POST",
+                                     data=json.dumps({"action": "all", "ts": time.time()}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            ans = json.loads(r.read())
+        check("POST /api/seen {action: all} is stored", ans.get("ok") and ans.get("since"), ans)
+        V._seen.clear()                          # the other device's dashboard, as it were
+        rows = {r["key"]: r["unread"] for r in V.load_sessions()["sessions"]}
+        check("...and every thread is read, read back from seen.json",
+              rows == {"D1:1.0": 0, "D1:2.0": 0, "D1:3.0": 0}, rows)
+        with open(proj / "sa.jsonl", "a") as f:
+            f.write(_uline("assistant", datetime.fromtimestamp(time.time() + 1, timezone.utc)
+                           .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", "new"))
+        os.utime(proj / "sa.jsonl", (time.time() + 2, time.time() + 2))
+        rows = {r["key"]: r["unread"] for r in V.load_sessions()["sessions"]}
+        check("a new reply after it: that thread is unread by one",
+              rows == {"D1:1.0": 1, "D1:2.0": 0, "D1:3.0": 0}, rows)
+    finally:
+        V.LOOPBACK, V.TOKEN, V.SESSIONS_FILE, V.PROJECTS_DIR, V.ENV_FILE, V.bot_call = saved
+        V._seen.clear()
+        if srv is not None:
+            srv.shutdown(); srv.server_close()
+
+
 def test_unread_in_the_sessions_list_and_the_seen_route():
     import threading
     import urllib.error
@@ -1427,13 +1512,16 @@ UNREAD_DRIVE = r"""
 const sess = (key, unread, extra) => Object.assign({key, title: "T " + key, kind: "thread", project: "", summary: "",
   session_id: "s" + key, turns: 3, cost: 0, updated: 1795000000, files: 0, events: [], running: false,
   resume_cmd: "", slack_link: "", hidden: false, unread}, extra || {});
-let rows = [sess("A", 3), sess("B", 0), sess("C", 2, {hidden: true}), sess("D", 1, {updated: 1794000000})];
+let rows = [sess("A", 3), sess("B", 0), sess("C", 2, {hidden: true}), sess("D", 1, {updated: 1794000000}),
+            sess("R", 40, {kind: "task", updated: 1793000000})];
+let counts = {};
 const badge = [];
 Object.defineProperty(globalThis, "navigator", {value: {vibrate() { return true; },
   setAppBadge(n) { badge.push(["set", n]); return Promise.resolve(); },
   clearAppBadge() { badge.push(["clear"]); return Promise.resolve(); }}, configurable: true});
 answer = (url, b) => url.startsWith("/api/sessions") ? {bot_online: true, sessions: rows.map(r => Object.assign({}, r)), slack: {}}
-  : url === "/api/seen" ? {ok: true} : BASE(url, b);
+  : url === "/api/seen" ? {ok: true}
+  : b && b.action === "counts" ? {ok: true, counts} : BASE(url, b);
 const flushAsync = async () => { for (let i = 0; i < 8; i++) await new Promise(r => setImmediate(r)); };
 const card = key => M.cards.get(key);
 const order = () => byId("list").children.filter(c => M.cards.has && [...M.cards.values()].includes(c))
@@ -1490,6 +1578,30 @@ const order = () => byId("list").children.filter(c => M.cards.has && [...M.cards
   M.markSeen(); await flushAsync();
   out.postsWhileUp = calls.filter(c => c.url === "/api/seen").length;
   M.clearActive();
+  // Needs you counts too: two awaiting approval, one failed.
+  counts = {awaiting_approval: 2, failed: 1, running: 5};
+  await M.loadList(); await flushAsync();
+  out.titleWithNeeds = document.title;
+  // A new reply in a conversation: up by one; another in a task run: no change.
+  rows[1].unread = 1; await M.loadList(); await flushAsync();
+  out.titleNewReply = document.title;
+  rows[4].unread = 41; await M.loadList(); await flushAsync();
+  out.titleTaskReply = document.title;
+  // Mark all read: every row clears at once, posted once as {action: "all"}.
+  const allBefore = calls.filter(c => c.url === "/api/seen").length;
+  out.markAllBtn = /markAllRead\(\)/.test(byId("kindfilter").innerHTML);
+  M.markAllRead(); await flushAsync();
+  out.markAllPosts = calls.filter(c => c.url === "/api/seen").slice(allBefore).map(c => c.body);
+  out.titleAllRead = document.title;
+  out.dotsAllRead = [...M.cards.values()].some(c => c.innerHTML.includes('class="unread"'));
+  // Refused: the counts come back.
+  const was2 = answer;
+  answer = (url, b) => url === "/api/seen" ? {ok: false, error: "no"} : was2(url, b);
+  rows[1].unread = 2; await M.loadList(); await flushAsync();
+  M.markAllRead(); await flushAsync();
+  out.titleAllRefused = document.title;
+  answer = was2;
+  counts = {};
   rows = rows.map(r => Object.assign(r, {unread: 0}));
   badge.length = 0;
   await M.loadList(); await flushAsync();
@@ -1510,14 +1622,15 @@ def test_unread_dot_filter_and_badge_in_the_page():
           "nav.setAppBadge(n)" in js and "nav.clearAppBadge()" in js)
     check("read state is posted to /api/seen as JSON (the write gates' content type)",
           'fetch("/api/seen", {method: "POST", headers: {"Content-Type": "application/json"}' in js)
-    check("no new per-message fetch: counts come with /api/sessions", js.count('"/api/seen"') == 1)
+    check("no new per-message fetch: counts come with /api/sessions; the only posts are a read and Mark all read",
+          js.count('"/api/seen"') == 2)
     node = shutil.which("node")
     if not node:
         print("  … node not installed — the unread page code checked by text only")
         return
     dom = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
     expose = """
-;globalThis.__m = {loadList, markSeen, setUnreadOnly, setUnreadFirst, renderList, cards: cardEls,
+;globalThis.__m = {loadList, markSeen, markAllRead, setUnreadOnly, setUnreadFirst, renderList, cards: cardEls,
   setActive(key, msgs, atBottom) { active = lastSessions.find(x => x.key === key);
     tview = {key, sid: "", cursor: 1, busy: false, error: false, msgs, files: []}; pinned = atBottom; },
   clearActive() { active = null; }};"""
@@ -1534,11 +1647,12 @@ def test_unread_dot_filter_and_badge_in_the_page():
     check("the dot sits inside the title, which a phone sizes to the row less its ×", o["dotInTitle"])
     check("...and reads as unread; a read one has neither",
           "isunread" in o["clsA"] and not o["dotB"] and "isunread" not in o["clsB"], (o["clsA"], o["clsB"]))
-    check("the title carries the total (hidden threads not counted)", o["title"] == "(4) Silkworm — Sessions", o["title"])
+    check("the title counts conversations with unread replies, not replies, not hidden ones, not task runs",
+          o["title"] == "(2) Silkworm — Sessions", o["title"])
     check("the app icon's badge is the same total (cleared before, while the list was empty)",
-          o["badge"][-1] == ["set", 4] and ["set", 4] not in o["badge"][:-1]
+          o["badge"][-1] == ["set", 2] and ["set", 2] not in o["badge"][:-1]
           and all(b == ["clear"] for b in o["badge"][:-1]), o["badge"])
-    check("the Unread filter counts the unread threads shown", "Unread <b>2</b>" in o["filterBar"], o["filterBar"])
+    check("the Unread filter counts the unread threads shown", "Unread <b>3</b>" in o["filterBar"], o["filterBar"])
     check("the list is newest first", o["orderAll"] == ["A", "B", "D"], o["orderAll"])
     check("Unread narrows it to the unread", o["orderUnread"] == ["A", "D"], o["orderUnread"])
     check("unread first puts them on top, newest first within", o["orderFirst"] == ["A", "D", "B"], o["orderFirst"])
@@ -1555,8 +1669,20 @@ def test_unread_dot_filter_and_badge_in_the_page():
     check("a refused post puts the row back, and the next read asks again",
           o["dotAfterRefused"] and o["postsAfterRefused"] == 3, (o["dotAfterRefused"], o["postsAfterRefused"]))
     check("scrolled up the thread is not read", o["postsWhileUp"] == 3, o["postsWhileUp"])
+    check("Needs you adds to it (awaiting approval and failed; running does not)",
+          o["titleWithNeeds"] == "(4) Silkworm — Sessions", o["titleWithNeeds"])
+    check("a new reply in a conversation puts it up by one", o["titleNewReply"] == "(5) Silkworm — Sessions", o["titleNewReply"])
+    check("...one in a task run does not", o["titleTaskReply"] == "(5) Silkworm — Sessions", o["titleTaskReply"])
+    check("Mark all read is offered while something is unread", o["markAllBtn"])
+    check("...posts once, {action: all}, as of when the list on screen was read",
+          len(o["markAllPosts"]) == 1 and o["markAllPosts"][0]["action"] == "all"
+          and abs(o["markAllPosts"][0]["ts"] - time.time()) < 120, o["markAllPosts"])
+    check("...and every row clears at once: only Needs you is left",
+          o["titleAllRead"] == "(3) Silkworm — Sessions" and not o["dotsAllRead"], o["titleAllRead"])
+    check("...refused, what it cleared comes back (B, with a new reply; the rest were read by the first)",
+          o["titleAllRefused"] == "(4) Silkworm — Sessions", o["titleAllRefused"])
     check("nothing unread: the badge is cleared and the title is plain",
-          o["badgeCleared"] == [["clear"]] and o["titleCleared"] == "Silkworm — Sessions", (o["badgeCleared"], o["titleCleared"]))
+          o["badgeCleared"][-1:] == [["clear"]] and o["titleCleared"] == "Silkworm — Sessions", (o["badgeCleared"], o["titleCleared"]))
     check("...and the Unread filter and unread first are gone: nothing to narrow",
           not o["unreadOnlyCleared"] and "unread first" not in o["filterCleared"], o["filterCleared"])
 

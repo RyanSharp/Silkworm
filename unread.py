@@ -46,6 +46,10 @@ SEEN_NAME = "seen.json"
 #: page's clock is not trusted to mark tomorrow's replies read).
 FUTURE_SLACK_S = 5.0
 
+#: Threads idle longer than this when the idle baseline first runs are
+#: marked read then (Seen.baseline_idle): two days.
+IDLE_BASELINE_S = 2 * 86400.0
+
 
 def parse_ts(value) -> float | None:
     """A transcript timestamp ("2026-11-21T10:00:00.123Z") or unix seconds, as
@@ -112,6 +116,45 @@ class Seen:
     def all(self) -> dict:
         with self._lock:
             return dict(self._loaded().get("threads") or {})
+
+    def mark_all(self, at: float | None = None) -> float | None:
+        """Every thread read as of `at` ("Mark all read"): `since` moves up to
+        it, and get() is never earlier than it. `at` is when the page's list
+        was counted, so a reply landing after it, which the owner never saw,
+        stays unread; never later than now. Stored here, on the mini, so the
+        phone and the laptop both clear. The new `since`, or None when it
+        could not be stored."""
+        with self._lock:
+            d = self._loaded()
+            if self._data is None:
+                return None
+            now = self._clock() if at is None else min(float(at), self._clock())
+            if now > float(d.get("since") or 0.0):
+                d["since"] = now
+                jsonstore.save(self._path, d)
+            return float(d["since"])
+
+    def baseline_idle(self, entries: dict, idle_s: float = IDLE_BASELINE_S) -> int:
+        """Once per seen.json: every thread untouched for `idle_s` is marked
+        read now, so threads nobody opened in days stop counting. Recorded
+        (`idle_baseline`) so it never runs again. How many it marked."""
+        with self._lock:
+            d = self._loaded()
+            if self._data is None or d.get("idle_baseline"):
+                return 0
+            now = self._clock()
+            threads, n = d["threads"], 0
+            for key, entry in (entries or {}).items():
+                try:
+                    updated = float((entry or {}).get("updated"))
+                except (TypeError, ValueError):
+                    continue                 # when it was last used is unknown: left as is
+                if now - updated > idle_s and now > float(threads.get(key) or 0.0):
+                    threads[key] = now
+                    n += 1
+            d["idle_baseline"] = now
+            jsonstore.save(self._path, d)
+            return n
 
     def mark(self, key: str, at: float) -> float | None:
         """Move `key`'s watermark to `at` (never back, never past now).

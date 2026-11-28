@@ -494,6 +494,10 @@ def unread_counts(entries: dict) -> dict:
         since = seen.since()
         if seen.error:
             return {}
+        # Once, on the first read after this shipped: threads idle two days
+        # are read, so hundreds of never-opened task runs stop counting.
+        if seen.baseline_idle(entries):
+            since = seen.since()
         out = {}
         for key, entry in entries.items():
             mark = unread.watermark(seen.get(key), entry.get("owner_said"))
@@ -507,6 +511,18 @@ def unread_counts(entries: dict) -> dict:
 def mark_seen(payload: dict) -> dict:
     """POST /api/seen: the owner has read `key` down to `ts` (the newest
     message the page has drawn, by the transcript's own clock)."""
+    if payload.get("action") == "all":
+        # Mark all read: every thread, on every device (seen.json, here).
+        seen = seen_store()
+        if seen is None:
+            return {"ok": False, "error": "no threads"}
+        at = unread.parse_ts(payload.get("ts"))
+        if at is None:
+            return {"ok": False, "error": "needs the time the list was read"}
+        held = seen.mark_all(at)
+        if held is None:
+            return {"ok": False, "error": seen.error or "could not save"}
+        return {"ok": True, "since": held}
     key = payload.get("key")
     at = unread.parse_ts(payload.get("ts"))
     if not isinstance(key, str) or not key or at is None:
@@ -4658,12 +4674,29 @@ function sortShown(shown) {
   const pin = shown.filter(isPinned);
   return pin.length ? pin.concat(shown.filter(s => !isPinned(s))) : shown;
 }
-// The total, shown where the page is not: the home-screen app's icon
-// (navigator.setAppBadge, iOS 16.4+ home-screen apps, most desktop browsers)
-// and the tab's title. Hidden threads are put away, so they are not counted.
+// What needs the owner, shown where the page is not: the home-screen app's
+// icon (navigator.setAppBadge, iOS 16.4+ home-screen apps, most desktop
+// browsers) and the tab's title. Not a message total: one per conversation
+// (kind "thread", one the owner started) with a reply they have not read,
+// plus the Needs-you count. Task runs and their reviewers live on Needs you
+// when they want something; their chatter is not counted. Hidden threads are
+// put away, so they are not counted either. Summing every reply in every
+// thread came to 500-odd on 2026-11-28.
 let badgeShown = null;
+// The Needs-you count: the tasks' needs-you states, polled with this list,
+// or the inbox's own count (those plus plans, health and stranded branches)
+// when it was drawn in the last two minutes -- it is polled only while on
+// screen, so an older one may be stale. Whichever is larger.
+let needInbox = null, needInboxAt = 0, needTasks = 0;
+function needsYouCount() {
+  const inbox = needInbox !== null && Date.now() - needInboxAt < 120000 ? needInbox : 0;
+  return Math.max(inbox, needTasks);
+}
+function unreadConversations(sessions) {
+  return (sessions || []).filter(s => !putAway(s) && (s.kind || "thread") === "thread" && unreadOf(s) > 0).length;
+}
 function showUnreadTotal(sessions) {
-  const n = (sessions || []).filter(s => !putAway(s)).reduce((a, s) => a + unreadOf(s), 0);
+  const n = unreadConversations(sessions) + needsYouCount();
   const title = (n ? `(${n}) ` : "") + BASE_TITLE;
   if (document.title !== title) document.title = title;
   if (n === badgeShown) return n;
@@ -4707,6 +4740,31 @@ function markSeen() {
                       body: JSON.stringify({key, ts})})
     .then(r => r.json()).then(r => { if (!r || r.ok === false) failed(); })
     .catch(failed);
+}
+
+// Every thread read, at once here and told to the mini (seen.json), so the
+// other device clears on its next poll. Refused: the counts come back.
+let listAt = 0;                  // when loadList last had the server's answer
+function markAllRead() {
+  const marked = [];
+  for (const s of lastSessions || []) if (unreadOf(s)) { readHere.set(s.key, {base: s.unread}); marked.push(s.key); }
+  const redraw = () => {
+    renderKindFilter(lastSessions);
+    renderList(lastSessions.filter(matchesKind));
+    showUnreadTotal(lastSessions);
+  };
+  redraw();
+  const failed = msg => {
+    marked.forEach(k => readHere.delete(k));
+    redraw();
+    toast(`Not marked read: ${msg || "refused"}`, 5000, {bad: true});
+  };
+  // As of when the list on screen was counted: a reply since, never shown, stays unread.
+  return fetch("/api/seen", {method: "POST", headers: {"Content-Type": "application/json"},
+                             body: JSON.stringify({action: "all", ts: listAt / 1000})})
+    .then(r => r.json().catch(() => ({ok: false, error: `refused (${r.status})`})))
+    .then(r => { if (!r || r.ok === false) failed(r && r.error); else loadList(); })
+    .catch(() => failed("could not reach the dashboard"));
 }
 
 function matchesKind(s) {
@@ -4786,7 +4844,9 @@ function renderKindFilter(sessions) {
     ? `<button class="${unreadOnly ? "on" : ""}" onclick="setUnreadOnly(${!unreadOnly})"
          title="only threads with replies you have not read">Unread <b>${nUnread}</b></button>` +
       `<button class="${unreadFirst ? "on" : ""}" onclick="setUnreadFirst(${!unreadFirst})"
-         title="threads with unread replies at the top">unread first</button>`
+         title="threads with unread replies at the top">unread first</button>` +
+      (nUnread ? `<button onclick="markAllRead()"
+         title="every thread read, on the phone and the laptop alike">Mark all read</button>` : "")
     : "";
   const nHidden = sessions.filter(putAway).length;
   const oldRuns = sessions.filter(
@@ -4820,6 +4880,7 @@ function freshAges(data) {
 }
 async function loadList() {
   const data = await readJSON("/api/sessions");
+  listAt = Date.now();
   freshAges(data);
   document.getElementById("botdot").className = data.bot_online ? "on" : "";
   document.getElementById("botdot").title = data.bot_online ? "bot online" : "bot offline";
@@ -6937,6 +6998,8 @@ function updateTaskBadge(counts) {
   const need = ["proposed", "awaiting_approval", "needs_input", "failed"]
     .reduce((n, k) => n + ((counts || {})[k] || 0), 0);
   document.getElementById("taskbadge").textContent = need ? String(need) : "";
+  needTasks = need;
+  if (lastSessions) showUnreadTotal(lastSessions);
 }
 async function refreshTaskBadge() {
   // Polled with the session list: the counts alone, not two hundred tasks.
@@ -9416,6 +9479,8 @@ function drawInbox(d) {
     const c = document.getElementById(id);
     if (c) c.textContent = n ? String(n) : "";
   }
+  needInbox = n;
+  if (lastSessions) showUnreadTotal(lastSessions);
 }
 async function loadInbox() {
   const ask = ++inboxAsk;
@@ -9432,6 +9497,7 @@ async function loadInbox() {
     return;
   }
   inboxData = r;
+  needInboxAt = Date.now();      // fresh from the bot; a redraw of this answer is not
   drawInbox(r);
 }
 async function inboxAct(el) {
