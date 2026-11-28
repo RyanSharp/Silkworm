@@ -6,7 +6,8 @@
     bin/dashshots --perf [--before DIR] [--perf-runs 3] [--widths 375,430]
 
 Mobile Safari in an iOS Simulator for the phone widths (375: iPhone SE (3rd
-generation), 430: iPhone 16 Plus), and WebKit itself (a WKWebView snapshot,
+generation), 430: iPhone 16 Plus) and 1032 (an iPad Pro, upright: the desktop
+layout in a Safari that runs it live), and WebKit itself (a WKWebView snapshot,
 the engine desktop Safari uses) for laptop and desktop widths (1280, 1440,
 1920, or any other of 1024+). Each view is opened by
 URL -- the dashboard's own deep links, ?view= ?modal= ?thread= ?task= ?card= -- since
@@ -44,6 +45,14 @@ which leaves words typed in a new thread's composer before the deploy; there
 the page's update banner is tapped by the injected script (no tap automation)
 and -2b-banner-tapped.png shows where that left the draft.
 
+--video-probe plays videos instead of photographing views: bin/videoprobe.js,
+injected into the copy, opens the drawer of the thread with the most videos
+on disk and, in Safari's own player, plays the first of each kind (.mp4,
+.mov, .m4v, .webm), seeks it to 60% and checks it plays on from there --
+through the dashboard's own Range route. DIR/videoprobe-<width>.png (and one
+frame per video, -<n>-<kind>.png) and .json; exits 1 unless every one did.
+Widths 375, 430 and 1032.
+
 --perf measures instead of photographing: bin/perfprobe.js, injected into
 the copy, reads the browser's paint timing and counts frames while the list,
 the task panel, a board and the longest thread are scrolled along a fixed
@@ -76,7 +85,11 @@ REPO = Path(__file__).resolve().parent.parent
 SWIFT_SRC = REPO / "bin" / "websnap.swift"
 FORBIDDEN_DEVICES = {"Cadence Test iPhone 17"}
 DEVICES = {375: ("Silkworm Shots 375", "iPhone SE (3rd generation)"),
-           430: ("Silkworm Shots 430", "iPhone 16 Plus")}
+           430: ("Silkworm Shots 430", "iPhone 16 Plus"),
+           # An iPad Pro held upright: 1032 wide, so the desktop layout, in
+           # Safari that asks for desktop sites -- where --video-probe plays a
+           # laptop's players (a WKWebView snapshot cannot run the page).
+           1032: ("Silkworm Shots 1032", "iPad Pro 13-inch (M4)")}
 DESKTOP = 1280
 #: Laptop and desktop widths WebKit is drawn at, and the window height each
 #: gets (a 16:10 laptop, a 1440 laptop, a 1080p monitor). Any other width of
@@ -502,6 +515,7 @@ def trader_projects(home: Path, tmp: Path, live: bool) -> None:
 
 PROBE_JS = REPO / "bin" / "scrollprobe.js"
 PERF_JS = REPO / "bin" / "perfprobe.js"
+VIDEO_JS = REPO / "bin" / "videoprobe.js"
 
 
 def inject_probe(viz: Path, bot_port: int, probe_js: Path = PROBE_JS) -> None:
@@ -656,6 +670,22 @@ def pick_examples(base: str, project: str) -> dict:
     filed = [s for s in sessions if not s.get("hidden") and s.get("files", 0) > 0]
     if filed:
         out["files"] = max(filed, key=lambda s: (s.get("files", 0), s.get("updated", 0)))["key"]
+    # The thread with the most videos, for their players (and --video-probe).
+    try:
+        raw = json.loads((live_home() / "sessions.json").read_text())
+        raw = raw.get("sessions", raw) if isinstance(raw, dict) else {}
+        n = {k: sum(1 for f in (e or {}).get("files") or []
+                    if str(f.get("path") or "").lower().endswith((".mp4", ".mov", ".m4v", ".webm"))
+                    and Path(f["path"]).is_file())
+             for k, e in raw.items()}
+        vids = [s for s in sessions if not s.get("hidden") and n.get(s["key"], 0) > 0]
+        if vids:
+            out["videos"] = max(vids, key=lambda s: (n[s["key"]], s.get("updated", 0)))["key"]
+            # The latest such thread, for players on their messages (an old
+            # one's transcript may be gone, leaving only its drawer).
+            out["videos_chat"] = max(vids, key=lambda s: s.get("updated", 0))["key"]
+    except Exception:
+        pass
     # A turn in progress: the harness's own thread when a Silkworm turn runs
     # it (that turn is running while it shoots), else any live one.
     running = [s for s in sessions if s.get("turn") and not s["turn"].get("stalled")]
@@ -730,6 +760,9 @@ def views(ex: dict, project: str) -> list[tuple[str, str]]:
         ("thread-tools", f"/?thread={quote(ex['thread'])}&tools=open"),
         *([("thread-files", f"/?thread={quote(ex['files'])}&files=1"),
            ("thread-drawer", f"/?thread={quote(ex['files'])}&drawer=1")] if ex.get("files") else []),
+        # Videos: players on their messages, and the drawer's Videos.
+        *([("thread-videos", f"/?thread={quote(ex['videos_chat'])}&files=1"),
+           ("thread-videos-drawer", f"/?thread={quote(ex['videos'])}&drawer=1")] if ex.get("videos") else []),
         # A thread with no session yet is what a new thread is until its first
         # turn writes: the page draws it from the key alone.
         ("thread-new", f"/?thread={quote(NEW_THREAD)}"),
@@ -902,6 +935,52 @@ def probe_phone(width: int, targets, out: Path, runs: str, timeout: float = 600)
     return results
 
 
+def video_phone(width: int, base: str, path: str, out: Path, timeout: float = 240):
+    """bin/videoprobe.js plays and seeks the page's videos in Mobile Safari;
+    photographed when it is done, and what it found written to
+    out/videoprobe-<width>.json. True when every one played and seeked."""
+    udid = device_for(width)
+    print(f"  {DEVICES[width][0]} ({udid})")
+    state = json.loads(simctl("list", "devices", "-j"))
+    booted_before = any(d["udid"] == udid and d["state"] == "Booted"
+                        for devs in state["devices"].values() for d in devs)
+    try:
+        if not booted_before:
+            simctl("boot", udid)
+        simctl("bootstatus", udid, "-b")
+        simctl("ui", udid, "appearance", "dark", check=False)
+        simctl("openurl", udid, base + "/")       # Safari's first open is slow on a fresh boot
+        time.sleep(8)
+        PROBE.reset()
+        simctl("openurl", udid, base + path + "&vprobe=1")
+        t0, done, shot = time.time(), None, 0
+        while time.time() - t0 < timeout:
+            with PROBE.lock:
+                log = list(PROBE.log)
+            # A frame as each video finishes (its seeked frame on screen), and at the end.
+            for e in [e for e in log if e.get("phase") == "video"][shot:]:
+                shot += 1
+                simctl("io", udid, "screenshot", str(out / f"videoprobe-{width}-{shot}-{e.get('kind')}.png"))
+            done = next((e for e in log if e.get("phase") in ("done", "error")), None)
+            if done:
+                break
+            time.sleep(0.25)
+        time.sleep(1)
+        simctl("io", udid, "screenshot", str(out / f"videoprobe-{width}.png"))
+        (out / f"videoprobe-{width}.json").write_text(json.dumps(done, indent=1))
+        for r in (done or {}).get("results") or []:
+            print(f"    {'ok ' if r.get('ok') else 'BAD'} .{r.get('kind')} {r.get('name')}: "
+                  f"played to {r.get('played_to')}s, seeked to {r.get('seeked_to')}s of {r.get('duration')}s, "
+                  f"on to {r.get('after')}s")
+        if not done:
+            print("    no answer from the probe")
+        elif done.get("phase") == "error":
+            print("    probe error:", done.get("error"))
+        return bool(done and done.get("ok"))
+    finally:
+        simctl("shutdown", udid, check=False)
+
+
 def perf_phone(width: int, targets, out: Path, runs: int = 3, timeout: float = 180):
     """Each target's page runs the performance probe in Mobile Safari `runs`
     times, alternating targets so neither always goes first; what it measured
@@ -1050,6 +1129,9 @@ def main():
                     help="photograph a deploy landing while the app is open (phone widths)")
     ap.add_argument("--deploy-from", default="",
                     help="with --deploy: the checkout the app is open on before it (default --source)")
+    ap.add_argument("--video-probe", action="store_true",
+                    help="play and seek the videos of the thread with the most (bin/videoprobe.js): "
+                         "Mobile Safari on the phone widths, WebKit on a desktop width")
     ap.add_argument("--trader-live", action="store_true",
                     help="draw the trader view from the real trader checkout, not the fixture")
     a = ap.parse_args()
@@ -1078,7 +1160,7 @@ def main():
             return
         port = free_port()
         proc = start_dashboard(Path(a.source).resolve(), home, tmp, bot_port, port, a.trader_live,
-                               PERF_JS if a.perf else a.scroll_probe)
+                               PERF_JS if a.perf else VIDEO_JS if a.video_probe else a.scroll_probe)
         base = f"http://127.0.0.1:{port}"
         procs, targets = [proc], [("", base)]
         try:
@@ -1100,6 +1182,23 @@ def main():
                     probe_phone(w, targets, out, a.runs)
                 return
             ex = pick_examples(base, a.project)
+            if a.video_probe:
+                if not ex.get("videos"):
+                    raise SystemExit("--video-probe: no thread has a video on disk")
+                path = f"/?thread={quote(ex['videos'])}&drawer=1"
+                print(f"video probe: {path} at {base} (stand-in bot :{bot_port}) -> {out}")
+                good = True
+                for w in [int(x) for x in a.widths.split(",") if x]:
+                    if w in DEVICES:
+                        good &= video_phone(w, base, path, out)
+                    else:
+                        # A WKWebView snapshot's window is never on screen: WebKit
+                        # stops the page's timers, so nothing would play.
+                        raise SystemExit(f"--video-probe: no device for width {w}; use {sorted(DEVICES)} "
+                                         f"(1032: an iPad's Safari, given the desktop layout)")
+                if not good:
+                    raise SystemExit(1)
+                return
             shots = views(ex, a.project)
             if a.views:
                 want = set(a.views.split(","))

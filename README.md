@@ -1655,7 +1655,12 @@ A local web dashboard for every thread session (localhost-only):
   turn runs (the open thread is read every 1.5s then, 4s otherwise). 📎
   attaches files and photos (25 MB each, ten per message): they are saved in
   `uploads/<thread>/` like Slack uploads, and the turn is told to Read an
-  image. Files the bot produces are listed with download links. `!commands`
+  image. Files the bot produces are listed with download links. Videos
+  (`.mp4`, `.mov`/`.m4v`, `.webm`), sent or produced, play where they were
+  sent -- in chat, the attachments drawer and a task's page -- in a player with
+  a Quick Look still, its Download link kept: served inline as their own type,
+  never sniffed, in byte ranges (206) so iPhone Safari can play and seek them.
+  Anything else (an `.html`, an `.svg`) is only ever a download. `!commands`
   (`!project`, `!stop`, `!reset`, `!brief`, …) go through the bot's own
   handler and their replies are shown under them.
   In Slack, a message sent from the dashboard appears in the thread posted by
@@ -1773,6 +1778,7 @@ bin/dashshots --widths 1280,1440,1920 --views inbox,task-split,keys
 bin/dashshots --source /path/to/other/checkout --out /tmp/before
 bin/dashshots --scroll-probe --widths 430,375 --before /tmp/main-export --out /tmp/probe
 bin/dashshots --perf --before /tmp/main-export --perf-runs 5 --out /tmp/perf
+bin/dashshots --video-probe --widths 375,1032 --out /tmp/videos
 ```
 
 Mobile Safari in an iOS Simulator at 375px (iPhone SE (3rd generation)) and
@@ -1812,6 +1818,18 @@ list, the task panel, a board and the longest thread are scrolled along a fixed
 path, and while a panel or a thread opens. With `--before`, both copies run
 `--perf-runs` times each into `perf-<width>.json`. Phone widths only: the
 laptop's offscreen WebKit view runs no animation clock.
+
+`--video-probe` plays videos. `bin/videoprobe.js` opens the drawer of the
+thread with the most videos on disk and, in Safari's own player, plays the
+first `.mp4`, `.mov`, `.m4v` and `.webm`, seeks each to 60% and checks it plays
+on from there -- through the dashboard's Range route. It writes
+`videoprobe-<width>.png` (and a frame as each finishes) and `.json`, and exits
+1 unless every one played and seeked. Widths 375, 430 and 1032: 1032 is an
+iPad Pro held upright (`Silkworm Shots 1032`), the desktop layout in a Safari
+that runs it live -- the laptop's WebKit snapshot is a window never on screen,
+where WebKit stops the page's timers and nothing would play (it still draws
+the players, without their pictures). The `thread-videos` and
+`thread-videos-drawer` views photograph the players.
 
 ## Notes & limits
 

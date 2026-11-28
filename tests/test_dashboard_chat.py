@@ -1736,3 +1736,253 @@ def test_tasks_show_prints_one_task_and_changes_nothing():
               tools)
     check("the ideator is told it is the way to read a task",
           "/x/bin/silkworm tasks show <id>" in R.system_prompt("ideator", "/x/bin/silkworm"))
+
+
+# --- videos, played in the page --------------------------------------------------
+# A video the bot recorded (an upload or an artifact) plays where it was sent,
+# in a <video> player: served inline as itself, never sniffed, in byte ranges
+# so iPhone Safari can play and seek it. Everything else stays as it was.
+
+def test_video_byte_ranges():
+    import visualizer as V
+    print("\na video's Range header: one range, open, from the end, past the end, malformed")
+    br = V.byte_range
+    check("no header, or not bytes: the whole file", br("", 100) is None and br("items=0-5", 100) is None)
+    check("bytes=0-1 is Safari's probe: two bytes", br("bytes=0-1", 100) == (0, 1))
+    check("an open range runs to the end", br("bytes=40-", 100) == (40, 99))
+    check("a range past the end is cut to it", br("bytes=90-500", 100) == (90, 99))
+    check("bytes=-N is the last N", br("bytes=-10", 100) == (90, 99) and br("bytes=-500", 100) == (0, 99))
+    check("starting at or past the end cannot be met",
+          br("bytes=100-", 100) == "unsatisfiable" and br("bytes=500-600", 100) == "unsatisfiable"
+          and br("bytes=-0", 100) == "unsatisfiable" and br("bytes=0-", 0) == "unsatisfiable")
+    check("malformed or several ranges are ignored: the whole file",
+          all(br(h, 100) is None for h in ("bytes=", "bytes=-", "bytes=a-b", "bytes=5-2", "bytes=0-1,5-6",
+                                           "bytes=1.5-3", "bytes=--3", "bytes 0-1")))
+    check("a non-ASCII digit or a number past any file is malformed, not a crash",
+          br("bytes=\u00b2-5", 100) is None and br("bytes=0-\u0665", 100) is None
+          and br("bytes=0-" + "9" * 5000, 100) is None and br("bytes=" + "9" * 19 + "-", 100) is None)
+    big = 3 * V.RANGE_CHUNK
+    check("one answer is at most RANGE_CHUNK bytes; the player asks again",
+          br("bytes=0-", big) == (0, V.RANGE_CHUNK - 1)
+          and br(f"bytes={V.RANGE_CHUNK}-", big) == (V.RANGE_CHUNK, 2 * V.RANGE_CHUNK - 1))
+
+
+def test_videos_are_served_inline_in_ranges():
+    import visualizer as V
+    import urllib.request
+    import urllib.error
+    import threading
+    from http.server import ThreadingHTTPServer
+    from urllib.parse import quote
+    print("\na video plays in the page: its own type, nosniff, Range and 206, behind the gate")
+    tmp = Path(tempfile.mkdtemp())
+    vids = {"clip.mp4": "video/mp4", "phone.MOV": "video/quicktime", "old.m4v": "video/mp4",
+            "web.webm": "video/webm"}
+    data = bytes(range(256)) * 40                  # 10240 bytes, every offset knowable
+    for name in vids:
+        (tmp / name).write_bytes(data)
+    page = tmp / "page.html"
+    page.write_text("<script>alert(1)</script>")
+    files = [{"name": n, "path": str(tmp / n), "direction": "out", "ts": 1.0} for n in [*vids, "page.html"]]
+    sessions = tmp / "sessions.json"
+    sessions.write_text(json.dumps({"D1:1.0": {"files": files}}))
+    fake_ql = tmp / "qlmanage"
+    # Quick Look's way: -o DIR, writes DIR/<name>.png.
+    fake_ql.write_text('#!/bin/sh\nwhile [ $# -gt 1 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+                       'printf "\\211PNG-still" > "$out/$(basename "$1").png"\n')
+    fake_ql.chmod(0o755)
+    saved = (V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR, V.TOKEN, V.QLMANAGE)
+    V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR, V.QLMANAGE = sessions, True, tmp / "thumbs", str(fake_ql)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), V.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def get(path, method="GET", **headers):
+        req = urllib.request.Request(base + path, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+    clip = "/download?inline=1&path=" + quote(str(tmp / "clip.mp4"))
+    try:
+        listed = {f["name"]: f for f in V.artifacts("D1:1.0")}
+        check("the thread's files say which are videos",
+              all(listed[n]["video"] is True and listed[n]["image"] is False for n in vids)
+              and listed["page.html"]["video"] is False, str(listed))
+        for name, ctype in vids.items():
+            st, h, body = get("/download?inline=1&path=" + quote(str(tmp / name)))
+            check(f"{name} asked for inline is the whole video, as {ctype}, never sniffed, ranges offered",
+                  st == 200 and h["Content-Type"] == ctype and h["Content-Disposition"] == "inline"
+                  and h["X-Content-Type-Options"] == "nosniff" and h["Accept-Ranges"] == "bytes"
+                  and h["Content-Length"] == str(len(data)) and body == data, f"{st} {dict(h)}")
+        st, h, body = get(clip, Range="bytes=0-1")
+        check("Safari's bytes=0-1 probe: 206, two bytes, the total said",
+              st == 206 and body == data[:2] and h["Content-Range"] == f"bytes 0-1/{len(data)}"
+              and h["Content-Length"] == "2" and h["Content-Type"] == "video/mp4"
+              and h["X-Content-Type-Options"] == "nosniff", f"{st} {dict(h)}")
+        st, h, body = get(clip, Range="bytes=5000-5099")
+        check("a seek: exactly the bytes asked for", st == 206 and body == data[5000:5100]
+              and h["Content-Range"] == f"bytes 5000-5099/{len(data)}", f"{st} {dict(h)}")
+        st, h, body = get(clip, Range="bytes=10000-")
+        check("an open range: to the end", st == 206 and body == data[10000:]
+              and h["Content-Range"] == f"bytes 10000-10239/{len(data)}", f"{st} {dict(h)}")
+        st, h, body = get(clip, Range="bytes=-40")
+        check("the last 40 bytes (where a .mov keeps its index)", st == 206 and body == data[-40:]
+              and h["Content-Range"] == f"bytes 10200-10239/{len(data)}", f"{st} {dict(h)}")
+        st, h, body = get(clip, Range="bytes=10000-999999")
+        check("a range past the end is cut to it", st == 206 and body == data[10000:], f"{st} {dict(h)}")
+        st, h, body = get(clip, Range="bytes=10240-")
+        check("a range starting past the end: 416, with the size",
+              st == 416 and h["Content-Range"] == f"bytes */{len(data)}" and body == b"", f"{st} {dict(h)}")
+        for bad in ("bytes=abc", "bytes=9-3", "bytes=0-1,4-5", "pages=0-1"):
+            st, h, body = get(clip, Range=bad)
+            check(f"a malformed or multiple range ({bad}) is ignored: 200 with all of it",
+                  st == 200 and body == data and "Content-Range" not in h, f"{st} {dict(h)}")
+        st, h0, _ = get(clip)
+        st, h, body = get(clip, Range="bytes=0-9", **{"If-Range": h0["ETag"]})
+        check("If-Range naming this file's version: the range", st == 206 and body == data[:10], str(st))
+        st, h, body = get(clip, Range="bytes=0-9", **{"If-Range": '"another-version"'})
+        check("If-Range naming another version: all of it", st == 200 and body == data, str(st))
+        st, h, body = get(clip, method="HEAD")
+        check("a HEAD says the type, size and ranges, and sends no body",
+              st == 200 and h["Content-Type"] == "video/mp4" and h["Content-Length"] == str(len(data))
+              and h["Accept-Ranges"] == "bytes" and body == b"", f"{st} {dict(h)}")
+        st, h, body = get("/download?path=" + quote(str(tmp / "clip.mp4")))
+        check("the Download link still downloads it, never sniffed",
+              st == 200 and h["Content-Type"] == "application/octet-stream"
+              and h["Content-Disposition"] == 'attachment; filename="clip.mp4"'
+              and h["X-Content-Type-Options"] == "nosniff" and body == data, dict(h))
+        st, h, _ = get("/download?inline=1&path=" + quote(str(page)), Range="bytes=0-3")
+        check(".html stays a download, even asked for inline with a range",
+              st == 200 and h["Content-Type"] == "application/octet-stream"
+              and h["Content-Disposition"].startswith("attachment") and "Accept-Ranges" not in h, dict(h))
+        st, _, _ = get("/download?inline=1&path=" + quote(str(tmp / "never.mp4")), Range="bytes=0-1")
+        check("a video the bot never recorded is not served", st == 404, str(st))
+        st, h, body = get("/thumb?path=" + quote(str(tmp / "clip.mp4")))
+        check("a video's still: a PNG from Quick Look, inline, never sniffed",
+              st == 200 and h["Content-Type"] == "image/png" and body == b"\x89PNG-still"
+              and h["X-Content-Type-Options"] == "nosniff", f"{st} {dict(h)} {body[:20]}")
+        get("/thumb?path=" + quote(str(tmp / "clip.mp4")))
+        check("made once and kept", len(list((tmp / "thumbs").glob("*.png"))) == 1
+              and not [p for p in (tmp / "thumbs").iterdir() if p.is_dir()])
+        V.QLMANAGE = str(tmp / "no-such-qlmanage")
+        st, _, _ = get("/thumb?path=" + quote(str(tmp / "web.webm")))
+        check("no still to be had: 404, and the player shows its first frame instead", st == 404, str(st))
+        # Quick Look runs but makes nothing (a .webm, often): said once, remembered.
+        calls = tmp / "ql-calls"
+        dud = tmp / "qlmanage-dud"
+        dud.write_text(f'#!/bin/sh\necho x >> "{calls}"\n')
+        dud.chmod(0o755)
+        V.QLMANAGE = str(dud)
+        for _ in range(3):
+            st, _, _ = get("/thumb?path=" + quote(str(tmp / "old.m4v")))
+        check("a video Quick Look cannot still is tried once, not on every load",
+              st == 404 and calls.read_text().count("x") == 1, f"{st} {calls.read_text()!r}")
+        gone = tmp / "gone.mp4"
+        gone.write_bytes(data)
+        files.append({"name": "gone.mp4", "path": str(gone), "direction": "out", "ts": 1.0})
+        sessions.write_text(json.dumps({"D1:1.0": {"files": files}}))
+        assert V.allowed_download(str(gone))
+        gone.unlink()
+        st, _, _ = get("/download?inline=1&path=" + quote(str(gone)), Range="bytes=0-1")
+        check("a video pruned since it was recorded is a 404, not a dropped connection", st == 404, str(st))
+        # Pruned between that lookup and the read (a race): still a 404, from
+        # the sender itself.
+        sent = []
+        racer = types.SimpleNamespace(headers={}, _send=lambda code, *a, **k: sent.append(code))
+        V.Handler._send_video(racer, gone, "video/mp4")
+        V.Handler._send_download(racer, gone)
+        check("a file gone between lookup and read: 404 from the senders too", sent == [404, 404], str(sent))
+        # The gate: off loopback, a video needs the token like everything else.
+        V.LOOPBACK, V.TOKEN = False, "t0ken-for-the-test"
+        for method in ("GET", "HEAD"):
+            st, h, body = get(clip, method=method, Range="bytes=0-1")
+            check(f"without the token a video {method} is refused, no bytes of it sent",
+                  st == 401 and data[:2] not in body, f"{st} {body[:40]}")
+        st, _, body = get(clip, Range="bytes=0-1", **{"X-Silkworm-Token": "wrong"})
+        check("with the wrong token too", st == 401, str(st))
+        st, _, body = get(clip, Range="bytes=0-1", **{"X-Silkworm-Token": "t0ken-for-the-test"})
+        check("with it, the range", st == 206 and body == data[:2], str(st))
+        st, _, body = get("/thumb?path=" + quote(str(tmp / "clip.mp4")))
+        check("a video's still is behind the gate too", st == 401, str(st))
+        V.LOOPBACK = True
+        st, _, _ = get("/", method="HEAD")
+        check("HEAD is offered for a video and nothing else", st == 405, str(st))
+    finally:
+        srv.shutdown()
+        V.SESSIONS_FILE, V.LOOPBACK, V.THUMB_DIR, V.TOKEN, V.QLMANAGE = saved
+
+
+def test_videos_play_in_chat_and_the_drawer():
+    import re
+    import visualizer as V
+    print("\na video on its message and in the drawer: a player, its still, its Download kept")
+    js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
+    check("the player is inline and plays in place on a phone",
+          "<video controls playsinline" in js and "#t=0.1" in js)
+    node = shutil.which("node")
+    if not node:
+        print("  … node not installed — checked by text only")
+        return
+    d = Path(tempfile.mkdtemp())
+    (d / "dash.js").write_text(js)
+    head = MOTION_HARNESS[:MOTION_HARNESS.index("(0, eval)(SRC")]
+    (d / "drive.js").write_text(head + r"""
+(0, eval)(SRC + `;globalThis.__m = {attachHtml, attachRow, drawerHtml, isVideo, closeDrawer};`);
+const M = globalThis.__m;
+const f = (name, extra) => ({name, path: "/art/1-" + name, direction: "out", ts: 5, exists: true,
+                             size: 2 * 1048576, ...extra});
+process.stdout.write(JSON.stringify({
+  mp4: M.attachHtml(f("demo.mp4", {video: true, image: false})),
+  mov: M.attachHtml(f("Clip <1>.MOV", {})),
+  gone: M.attachHtml(f("old.mp4", {video: true, exists: false})),
+  html: M.attachHtml(f("page.html", {video: false, image: false})),
+  svg: M.attachHtml(f("pic.svg", {})),
+  row: M.attachRow([f("a.mp4", {video: true}), f("b.png", {image: true})]),
+  drawer: M.drawerHtml([f("a.mp4", {video: true, ts: 9}), f("b.png", {image: true}),
+                        f("c.webm", {video: true, ts: 3}), f("d.zip", {})]),
+  ext: ["x.mp4", "x.MOV", "x.m4v", "x.webm", "x.mkv", "x.html", "x.svg"].map(n => M.isVideo({name: n})),
+  paused: (() => {
+    // The drawer's players, as its body holds them: closing it stops them.
+    const body = byId("drawerbody"), played = [];
+    const fake = () => ({paused: false, pause() { this.paused = true; played.push(this); }});
+    const vids = [fake(), fake()];
+    body.querySelectorAll = sel => sel === "video" ? vids : [];
+    byId("attdrawer").classList.add("open");
+    M.closeDrawer();
+    return vids.every(v => v.paused) && !byId("attdrawer").classList.contains("open");
+  })(),
+}));
+""")
+    p = subprocess.run([node, str(d / "drive.js"), str(d / "dash.js"), ""],
+                       capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        check("the harness runs the page's script", False, p.stderr.strip()[-900:])
+        return
+    o = json.loads(p.stdout)
+    m = o["mp4"]
+    check("a video is a player: controls, playsinline, metadata only until played",
+          m.startswith('<figure class="avid"><video controls playsinline preload="metadata"'), m)
+    check("its still from /thumb, its source the inline route (seekable, first frame shown)",
+          'poster="/thumb?path=%2Fart%2F1-demo.mp4"' in m
+          and 'src="/download?inline=1&amp;path=%2Fart%2F1-demo.mp4#t=0.1"' in m, m)
+    check("its name, size and a Download link kept",
+          '<a class="vdl" href="/download?path=%2Fart%2F1-demo.mp4" download="demo.mp4">Download</a>' in m
+          and "2.0 MB" in m and ">demo.mp4<" in m, m)
+    check("a .MOV is known by its name alone, and its name escaped",
+          "<video " in o["mov"] and "Clip &lt;1&gt;.MOV" in o["mov"] and "<1>" not in o["mov"], o["mov"])
+    check("a video no longer on disk is a muted chip, no player", "<video" not in o["gone"]
+          and 'class="fchip gone"' in o["gone"], o["gone"])
+    check(".html and .svg stay download chips", all("<video" not in o[k] and 'class="fchip"' in o[k]
+                                                    and " download=" in o[k] for k in ("html", "svg")))
+    check("on a message, beside the other files", o["row"].count("<video ") == 1
+          and 'class="athumb"' in o["row"], o["row"])
+    dr = o["drawer"]
+    check("the drawer has its videos as players, newest first, apart from images and files",
+          "<h3>Videos <span class=\"dn\">2</span></h3>" in dr and dr.count("<video ") == 2
+          and dr.index("1-a.mp4") < dr.index("1-c.webm") and "<h3>Files <span class=\"dn\">1</span>" in dr
+          and dr.index("Images") < dr.index("Videos") < dr.index("Files"), dr)
+    check("mp4, mov, m4v and webm play; nothing else does",
+          o["ext"] == [True, True, True, True, False, False, False], str(o["ext"]))
+    check("closing the drawer pauses its players (hidden is not stopped)", o["paused"] is True, str(o["paused"]))

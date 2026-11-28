@@ -29,6 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import email.header
 import secrets
+import shutil
 
 import dashowner
 import envfile
@@ -1265,7 +1266,8 @@ def artifacts(key: str) -> list[dict]:
         p = Path(rec.get("path", ""))
         out.append({**rec, "exists": p.is_file(),
                     "size": p.stat().st_size if p.is_file() else 0,
-                    "image": p.suffix.lower() in INLINE_IMAGES})
+                    "image": p.suffix.lower() in INLINE_IMAGES,
+                    "video": p.suffix.lower() in INLINE_VIDEOS})
     return out
 
 
@@ -1285,10 +1287,94 @@ def allowed_download(path_str: str) -> Path | None:
 INLINE_IMAGES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                  ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic"}
 
+#: Videos the page plays itself, in a <video> player. Served inline with
+#: their own type, never sniffed, and in byte ranges (206) -- iPhone Safari
+#: will not play a video whose server cannot answer a Range request.
+INLINE_VIDEOS = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+                 ".webm": "video/webm"}
+
+#: The most one ranged answer sends; a player asks again for the rest.
+RANGE_CHUNK = 8 * 1024 * 1024
+
+
+def byte_range(header: str, size: int):
+    """The one byte range `header` (a Range request header) asks of a file
+    of `size` bytes, as (first, last) inclusive and capped at RANGE_CHUNK;
+    None to send the whole file (no header, not bytes, malformed, or several
+    ranges -- all allowed to be ignored); "unsatisfiable" for a 416."""
+    header = (header or "").strip()
+    if not header:
+        return None
+    unit, _, spec = header.partition("=")
+    if unit.strip().lower() != "bytes" or "," in spec:
+        return None
+    # ASCII digits only (str.isdigit takes "²", which int() refuses), and few
+    # enough of them: a number past any file's size is malformed here, ignored.
+    m = re.fullmatch(r"\s*([0-9]{0,18})\s*-\s*([0-9]{0,18})\s*", spec)
+    if not m:
+        return None
+    first, last = m.groups()
+    if not first:                       # bytes=-N: the last N bytes
+        if not last:
+            return None
+        n = int(last)
+        if n == 0 or size == 0:
+            return "unsatisfiable"
+        start, end = max(0, size - n), size - 1
+    else:
+        start = int(first)
+        if last and int(last) < start:
+            return None                 # invalid: ignored, the whole file
+        if start >= size:
+            return "unsatisfiable"
+        end = min(int(last), size - 1) if last else size - 1
+    return start, min(end, start + RANGE_CHUNK - 1)
+
 #: Thumbnails, made once per file (and again if it changes) with macOS's sips.
 THUMB_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "silkworm-thumbs"
 THUMB_PX = 320
 THUMB_MIN_BYTES = 96 * 1024
+
+
+#: What makes a video's still (Quick Look); a test points it elsewhere.
+QLMANAGE = "/usr/bin/qlmanage"
+
+
+#: Stills made at once: a drawer of a dozen videos asks for a dozen together.
+POSTER_SLOTS = threading.BoundedSemaphore(2)
+
+
+def video_poster(p: Path) -> bytes | None:
+    """A still of video `p` for its player's poster, made once per file (and
+    again if it changes) with macOS's Quick Look; None when it cannot -- and
+    that remembered too (a .none beside it), so it is not tried on every load."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    tag = hashlib.sha1(f"{p}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:20]
+    out, none = THUMB_DIR / f"{tag}.png", THUMB_DIR / f"{tag}.none"
+    if not out.is_file() and not none.exists():
+        with POSTER_SLOTS:
+            if not out.is_file() and not none.exists():     # made meanwhile, by another request
+                tmp = THUMB_DIR / f"{tag}.{os.getpid()}.{threading.get_ident()}"
+                try:
+                    tmp.mkdir(parents=True, exist_ok=True)
+                    subprocess.run([QLMANAGE, "-t", "-s", str(THUMB_PX), "-o", str(tmp), str(p)],
+                                   capture_output=True, timeout=30)
+                    made = tmp / (p.name + ".png")
+                    if made.is_file() and made.stat().st_size:
+                        os.replace(made, out)
+                    else:
+                        none.touch()
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        return out.read_bytes() if out.is_file() else None
+    except OSError:
+        return None
 
 
 def thumbnail(p: Path) -> tuple[bytes, str]:
@@ -1498,6 +1584,76 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_video(self, p: Path, ctype: str) -> None:
+        """Video `p`, inline as `ctype`: the whole of it, or the byte range
+        asked for (206), or 416 for a range past its end. Streamed from disk,
+        never read whole -- a screen recording is hundreds of megabytes."""
+        try:
+            st = p.stat()
+        except OSError:                 # pruned since it was looked up
+            self._send(404, b"not an artifact", "text/plain")
+            return
+        size = st.st_size
+        tag = '"' + hashlib.sha1(f"{p}|{st.st_mtime_ns}|{size}".encode()).hexdigest()[:20] + '"'
+        common = {"Accept-Ranges": "bytes", "Content-Disposition": "inline",
+                  "X-Content-Type-Options": "nosniff", "ETag": tag,
+                  "Cache-Control": "private, max-age=86400"}
+        want = self.headers.get("Range", "")
+        held = self.headers.get("If-Range", "").strip()
+        if held and held != tag:
+            want = ""                   # changed since the player's first part: all of it
+        rng = byte_range(want, size)
+        if rng == "unsatisfiable":
+            self._send(416, b"", ctype, {**common, "Content-Range": f"bytes */{size}"})
+            return
+        start, end = rng if rng else (0, size - 1)
+        self.send_response(206 if rng else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(max(0, end - start + 1)))
+        self.send_header("X-Silkworm-Build", BUILD)
+        if rng:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        for k, v in common.items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        self._stream(p, start, end - start + 1)
+
+    def _stream(self, p: Path, start: int, length: int) -> None:
+        """`length` bytes of `p` from `start`, a chunk at a time, after the
+        headers. A reader that goes (a player seeking elsewhere aborts its
+        last request) or a file gone meanwhile ends it quietly: the headers
+        are out, so all that is left to do is stop."""
+        try:
+            with p.open("rb") as fh:
+                fh.seek(start)
+                while length > 0:
+                    chunk = fh.read(min(256 * 1024, length))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    length -= len(chunk)
+        except OSError:
+            self.close_connection = True
+
+    def _send_download(self, p: Path) -> None:
+        """`p` as a download, never sniffed, streamed (a recording would
+        otherwise be read whole into memory for every click on Download)."""
+        try:
+            size = p.stat().st_size
+        except OSError:
+            self._send(404, b"not an artifact", "text/plain")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("X-Silkworm-Build", BUILD)
+        self.send_header("Content-Disposition", f'attachment; filename="{p.name}"')
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self._stream(p, 0, size)
+
     def _json(self, data, tag: str | None = None) -> None:
         """Send `data`; with `tag`, as a conditional answer -- 304 and no body
         when the page already holds this exact answer (If-None-Match)."""
@@ -1640,16 +1796,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, b"not an artifact", "text/plain")
                 return
             image = INLINE_IMAGES.get(p.suffix.lower())
+            video = INLINE_VIDEOS.get(p.suffix.lower())
+            if qs.get("inline") and video:
+                self._send_video(p, video)
+                return
             if qs.get("inline") and image:
                 self._send(200, p.read_bytes(), image, {
                     "Content-Disposition": "inline", "X-Content-Type-Options": "nosniff",
                     "Cache-Control": "private, max-age=86400"})
                 return
-            self._send(200, p.read_bytes(), "application/octet-stream",
-                       {"Content-Disposition": f'attachment; filename="{p.name}"',
-                        "X-Content-Type-Options": "nosniff"})
+            self._send_download(p)
         elif url.path == "/thumb":
             p = allowed_download(qs.get("path", [""])[0])
+            if p and p.suffix.lower() in INLINE_VIDEOS:
+                still = video_poster(p)
+                if still is None:
+                    self._send(404, b"no still for this video", "text/plain")
+                else:
+                    self._send(200, still, "image/png", {
+                        "Content-Disposition": "inline", "X-Content-Type-Options": "nosniff",
+                        "Cache-Control": "private, max-age=86400"})
+                return
             if not p or p.suffix.lower() not in INLINE_IMAGES:
                 self._send(404, b"not an image artifact", "text/plain")
                 return
@@ -1659,6 +1826,23 @@ class Handler(BaseHTTPRequestHandler):
                                           "Cache-Control": "private, max-age=86400"})
         else:
             self._send(404, b"not found", "text/plain")
+
+    def do_HEAD(self):
+        # Only a video's inline answer: a player may ask its size and type
+        # first. Behind the same gate as GET; anything else is not offered.
+        url = urlparse(self.path)
+        if not self._authed(url):
+            return
+        qs = parse_qs(url.query)
+        p = allowed_download(qs.get("path", [""])[0]) if url.path == "/download" else None
+        video = p and INLINE_VIDEOS.get(p.suffix.lower())
+        if video and qs.get("inline"):
+            self._send_video(p, video)
+            return
+        self.send_response(405)
+        self.send_header("Allow", "GET")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         url = urlparse(self.path)
@@ -2239,6 +2423,20 @@ PAGE = r"""<!doctype html>
   .fchip .fdir, .fchip .fsize { flex: none; color: var(--quiet); font-size: var(--fs-2xs);
                                 font-family: var(--mono); }
   .fchip.gone { opacity: .5; }
+  /* a video: a player where it was sent, its name and Download underneath */
+  .avid { margin: 0; flex: 0 1 auto; width: min(360px, 100%); display: flex; flex-direction: column;
+          gap: var(--sp-05); min-width: 0; }
+  .avid video { display: block; width: 100%; max-height: 60vh; background: var(--sunken);
+                border: 1px solid var(--line); border-radius: var(--r-lg); }
+  .avid figcaption { display: flex; align-items: baseline; gap: var(--sp-15); min-width: 0;
+                     font-size: var(--fs-2xs); color: var(--muted); }
+  .avid .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+  .avid .fsize { flex: none; color: var(--quiet); font-family: var(--mono); }
+  .avid .vdl { flex: none; color: var(--gold); text-decoration: none; }
+  .avid .vdl:hover { text-decoration: underline; }
+  .dvids, .tpvids { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
+                    gap: var(--sp-25); }
+  .dvids .avid, .tpvids .avid { width: 100%; }
   /* the thread's files, newest first: a drawer from the right (a sheet from
      the bottom on a phone), sliding by transform */
   #attdrawer { position: fixed; inset: 0; z-index: 46; background: transparent; visibility: hidden;
@@ -4918,6 +5116,9 @@ function afterFold(fn) {
 // --- files on the messages they came with ---
 const IMG_EXT = /\.(png|jpe?g|gif|webp|heic)$/i;
 function isImage(f) { return f.image !== undefined ? !!f.image : IMG_EXT.test(f.name || ""); }
+// A video plays in the page: mp4, mov/m4v, webm (INLINE_VIDEOS on the server).
+const VID_EXT = /\.(mp4|m4v|mov|webm)$/i;
+function isVideo(f) { return f.video !== undefined ? !!f.video : VID_EXT.test(f.name || ""); }
 function fmtSize(n) {
   if (!(n > 0)) return "";
   if (n < 1024) return n + " B";
@@ -4975,6 +5176,7 @@ function attachHtml(f) {
   const gone = !f.exists;
   const why = gone ? (f.pruned ? "pruned " + new Date(f.pruned * 1000).toLocaleDateString() +
                                  "; the copy is in Slack" : "gone") : "";
+  if (isVideo(f) && !gone) return videoHtml(f);
   if (isImage(f) && !gone)
     return `<button type="button" class="athumb" data-path="${esc(f.path)}" onclick="viewImage(this.dataset.path)"
       title="${esc(f.name)}" aria-label="view ${esc(f.name)}"><img src="${fileLink(f, true)}" alt="${esc(f.name)}"
@@ -4983,6 +5185,16 @@ function attachHtml(f) {
     esc(f.name)}</span><span class="fsize">${fmtSize(f.size)}</span>`;
   if (gone) return `<span class="fchip gone" title="${esc(f.name)} (${esc(why)})">${inner}</span>`;
   return `<a class="fchip" href="${fileLink(f)}" download="${esc(f.name)}" title="${esc(f.name)}">${inner}</a>`;
+}
+// A video is a player, there and then: its still from /thumb until it is
+// played, #t=0.1 so a phone draws its first frame when there is no still,
+// and its Download link kept underneath.
+function videoHtml(f) {
+  const src = "/download?inline=1&path=" + encodeURIComponent(f.path);
+  return `<figure class="avid"><video controls playsinline preload="metadata" poster="${
+    esc(fileLink(f, true))}" src="${esc(src)}#t=0.1" title="${esc(f.name)}"></video><figcaption><span class="fname">${
+    esc(f.name)}</span><span class="fsize">${fmtSize(f.size)}</span><a class="vdl" href="${
+    esc(fileLink(f))}" download="${esc(f.name)}">Download</a></figcaption></figure>`;
 }
 function attachRow(files) {
   if (!files || !files.length) return "";
@@ -5133,10 +5345,13 @@ function toggleCall(id, i) {
 function drawerHtml(files) {
   const all = (files || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
   if (!all.length) return `<div class="empty">No files in this thread.</div>`;
-  const imgs = all.filter(f => isImage(f) && f.exists), rest = all.filter(f => !(isImage(f) && f.exists));
+  const imgs = all.filter(f => isImage(f) && f.exists), vids = all.filter(f => isVideo(f) && f.exists);
+  const rest = all.filter(f => !((isImage(f) || isVideo(f)) && f.exists));
   let h = "";
   if (imgs.length) h += `<h3>Images <span class="dn">${imgs.length}</span></h3><div class="dgrid">${
     imgs.map(attachHtml).join("")}</div>`;
+  if (vids.length) h += `<h3>Videos <span class="dn">${vids.length}</span></h3><div class="dvids">${
+    vids.map(attachHtml).join("")}</div>`;
   if (rest.length) h += `<h3>Files <span class="dn">${rest.length}</span></h3><ul class="dlist">${
     rest.map(f => `<li>${attachHtml(f)}<span class="dwhen">${f.direction === "in" ? "you" : "Claude"}${
       f.ts ? " · " + esc(chatTime(new Date(f.ts * 1000).toISOString())) : ""}</span></li>`).join("")}</ul>`;
@@ -5161,6 +5376,9 @@ function openDrawer() {
 function closeDrawer() {
   const d = document.getElementById("attdrawer");
   if (!d) return;
+  // Hidden is not stopped: a video playing in it would play on, unseen.
+  const body = document.getElementById("drawerbody");
+  if (body && body.querySelectorAll) for (const v of body.querySelectorAll("video")) if (v.pause) v.pause();
   d.classList.remove("open");
   if (d.setAttribute) d.setAttribute("aria-hidden", "true");
 }
@@ -8213,7 +8431,7 @@ function renderDetail(t) {
 // sheet as a project's page is. Its images are its thread's own, from the
 // window the task ran in.
 let taskPageId = null, taskPageData = null;
-const TP_SECTIONS = ["state", "result", "changes", "images", "cost", "timeline", "links"];
+const TP_SECTIONS = ["state", "result", "changes", "images", "videos", "cost", "timeline", "links"];
 function openTaskPage(id) {
   if (!id) return;
   const tm = document.getElementById("taskmodal");
@@ -8238,9 +8456,10 @@ function closeTaskPage() {
 }
 // The images a task produced: its thread's, Claude's own, from when it was
 // filed until a little after it finished (a thread can be a long conversation).
-function taskImages(pg, files) {
+function taskImages(pg, files, kind) {
   const from = (pg.created || 0) - 60, to = pg.finished ? pg.finished + 600 : Infinity;
-  return (files || []).filter(f => f && f.direction !== "in" && isImage(f) && f.exists
+  const is = kind === "video" ? isVideo : isImage;
+  return (files || []).filter(f => f && f.direction !== "in" && is(f) && f.exists
                               && (f.ts || 0) >= from && (f.ts || 0) <= to)
     .sort((a, b) => (a.ts || 0) - (b.ts || 0));
 }
@@ -8264,7 +8483,8 @@ async function loadTaskPage() {
     if (ask !== boardAsk || taskPageId !== id) return;
   }
   taskPageData = r.page;
-  drawKeyed(el, taskPageHtml(r.page, taskImages(r.page, Array.isArray(files) ? files : [])),
+  const got = Array.isArray(files) ? files : [];
+  drawKeyed(el, taskPageHtml(r.page, taskImages(r.page, got), taskImages(r.page, got, "video")),
             ".pgsec[data-sec]", "data-sec");
   if (pageScrollTo) {
     // Only a section the page has: the key comes from the address.
@@ -8336,7 +8556,7 @@ function tpTimeline(tl) {
     e.id ? `<span class="plink" role="link" onclick="openTaskPage('${esc(e.id)}')">${esc(e.label)}</span>` : esc(e.label)}</b>${
     e.detail && !e.id ? ` <span class="d">${esc(e.detail)}</span>` : ""}</li>`).join("")}</ol>`;
 }
-function taskPageHtml(pg, imgs) {
+function taskPageHtml(pg, imgs, vids) {
   const it = pg.item;
   const back = pg.project ? `‹ ${esc(pg.project_title || pg.project)}` : "‹ Projects";
   const head = `<div class="bhead pghead"><button class="ghost" onclick="closeTaskPage()" title="back">${back}</button>
@@ -8363,6 +8583,8 @@ function taskPageHtml(pg, imgs) {
     `<a class="tpimg" href="/download?inline=1&amp;path=${encodeURIComponent(f.path)}" target="_blank" rel="noopener" title="${
       esc(f.name)}"><img src="/download?inline=1&amp;path=${encodeURIComponent(f.path)}" alt="${esc(f.name)}" loading="lazy" decoding="async"><span>${
       esc(f.name)}</span></a>`).join("")}</div>`) : "";
+  const videos = vids && vids.length ? pgSection("videos", "Videos", vids.length,
+    `<div class="tpvids">${vids.map(videoHtml).join("")}</div>`) : "";
   const cost = pgSection("cost", "Cost", null, tpCost(pg));
   const timeline = pgSection("timeline", "Timeline", (pg.timeline || []).length, tpTimeline(pg.timeline));
   const kids = (pg.children || []).map(t => tpTask(t, "filed from it")).join("")
@@ -8373,7 +8595,7 @@ function taskPageHtml(pg, imgs) {
     pg.thread_link ? `<a class="ghost" href="${esc(pg.thread_link)}" target="_blank" rel="noopener">Slack ↗</a>` : ""}${
     pg.project ? `<button class="ghost" onclick="openProjectPage('${esc(pg.project)}')">🗂 Project page</button>` : ""}</div>${
     pg.parent ? tpTask(pg.parent, "filed from") : ""}${kids}`);
-  return head + `<div class="tpage">${state}${result}${changes}${images}${cost}${timeline}${links}</div>`;
+  return head + `<div class="tpage">${state}${result}${changes}${images}${videos}${cost}${timeline}${links}</div>`;
 }
 
 // --- releasing a project, from its card or its board -----------------------------
@@ -9590,9 +9812,11 @@ async function openLink(q) {
   if (thread && (q.get("drawer") || q.get("tools") || q.get("files"))) whenRead(thread, () => instantly(() => {
     if (q.get("drawer")) openDrawer();
     if (q.get("files")) {
-      // The newest message that came with files, at the top of the chat.
+      // The newest message that came with files, its files at the top of the
+      // chat (a long message's words would push a player out of sight).
       const b = chatItemsNow.filter(x => x.kind === "bubble" && x.files && x.files.length).pop();
-      const el = b && chatEls.get(b.id), m = scroller();
+      const msg = b && chatEls.get(b.id), m = scroller();
+      const el = (msg && msg.querySelector && msg.querySelector(".atts")) || msg;
       if (el && m && el.getBoundingClientRect) {
         pinned = false;
         m.scrollTop += el.getBoundingClientRect().top - m.getBoundingClientRect().top - 12;

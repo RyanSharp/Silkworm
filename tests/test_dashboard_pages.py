@@ -3672,7 +3672,11 @@ def test_dashboard_task_page_renders():
         {"name": "old.png", "path": "/a/0-old.png", "direction": "out", "ts": created - 86400,
          "exists": True, "image": True},
         {"name": "notes.txt", "path": "/a/3-notes.txt", "direction": "out", "ts": created + 100,
-         "exists": True, "image": False}]
+         "exists": True, "image": False},
+        {"name": "demo.mp4", "path": "/a/4-demo.mp4", "direction": "out", "ts": created + 120,
+         "exists": True, "image": False, "video": True, "size": 3 * 1048576},
+        {"name": "yours.mov", "path": "/a/5-yours.mov", "direction": "in", "ts": created + 120,
+         "exists": True, "image": False, "video": True}]
     fix = {"pages": pages, "files": files, "ids": ids}
     js = re.search(r"<script>(.*?)</script>", V.PAGE, re.S).group(1)
     sect = js[js.index("// --- a task's own page"):js.index("// --- releasing a project, from its card")]
@@ -3704,7 +3708,8 @@ def test_dashboard_task_page_renders():
     check("?task= opens it over the board's sheet, the board not drawn",
           o["open"] == "flex" and o["board"] == "" and "<h3>Draw the task page</h3>" in m, m[:300])
     check("its sections, in order",
-          re.findall(r'data-sec="(\w+)"', m) == ["state", "result", "changes", "images", "cost", "timeline", "links"],
+          re.findall(r'data-sec="(\w+)"', m) == ["state", "result", "changes", "images", "videos", "cost", "timeline",
+                                              "links"],
           str(re.findall(r'data-sec="(\w+)"', m)))
     check("its state, in plain words", "Done, and landed onto main as 22222222." in sec(m, "state"))
     r = sec(m, "result")
@@ -3720,7 +3725,15 @@ def test_dashboard_task_page_renders():
     im = sec(m, "images")
     check("its own images inline, from when it ran -- not yours, not older ones, not other files",
           "1-shot-375.png" in im and "<img " in im and "2-yours.png" not in im and "0-old.png" not in im
-          and "notes.txt" not in im, im[:400])
+          and "notes.txt" not in im and "demo.mp4" not in im, im[:400])
+    vi = sec(m, "videos")
+    check("its own videos play on the page: a player with a still, seekable source and its Download kept",
+          '<video controls playsinline preload="metadata"' in vi
+          and 'poster="/thumb?path=%2Fa%2F4-demo.mp4"' in vi
+          and 'src="/download?inline=1&amp;path=%2Fa%2F4-demo.mp4#t=0.1"' in vi
+          and 'href="/download?path=%2Fa%2F4-demo.mp4" download="demo.mp4"' in vi
+          and ">Download<" in vi and "3.0 MB" in vi
+          and "5-yours.mov" not in vi and "notes.txt" not in vi, vi[:600])
     co = sec(m, "cost")
     check("cost: the total with its reviews, each run and each review",
           "$3.75" in co and "run 1" in co and "run 2" in co and "$1.75" in co and "$0.40" in co

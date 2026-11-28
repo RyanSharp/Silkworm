@@ -1264,12 +1264,13 @@ def test_viz_tailscale_gate_runs_before_everything():
     fns = {n.name: n for n in handler.body if isinstance(n, ast.FunctionDef)}
     first = ast.unparse(fns["_authed"].body[1])     # body[0] is the docstring
     check("_authed asks tailnet_refusal first", "tailnet_refusal(self.headers)" in first, first)
-    for name in ("do_GET", "do_POST"):
+    # HEAD is a video's (a player may ask its size first): through the same gate.
+    for name in ("do_GET", "do_HEAD", "do_POST"):
         stmts = [ast.unparse(s) for s in fns[name].body[:3]]
         check(f"{name} checks _authed before any route",
               any("if not self._authed(url)" in s for s in stmts), str(stmts))
     check("no other HTTP verb is handled (they would skip _authed)",
-          sorted(n for n in fns if n.startswith("do_")) == ["do_GET", "do_POST"],
+          sorted(n for n in fns if n.startswith("do_")) == ["do_GET", "do_HEAD", "do_POST"],
           str(sorted(fns)))
 
 
